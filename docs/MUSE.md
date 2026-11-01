@@ -527,7 +527,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    the ask: read it, then record the answer on the ticket, or treat it as
    needs you. A station verification tag is not a question to a person: the
    brain or the verify pass takes it. If the command exits 1 its report is
-   incomplete: say so, and never report nothing from it.
+   incomplete: say so, and never report nothing from it. It prints within
+   40 seconds (`--deadline SECONDS`); a repo or ticket not read by then is
+   listed as unread, and it exits 1.
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,

@@ -23,7 +23,10 @@ bus/ask_state.py, and puts the item in one section:
 - needs you: a written ask to a person, open, with no later answer.
 
 An item that could not be read is listed as unread and the command exits 1:
-an unread ticket is never a ticket with nothing to do.
+an unread ticket is never a ticket with nothing to do. Repos, their pages and
+their items are read on a few threads at once, and the report is printed by
+--deadline (inside a Muse tick, loom#2394): a repo or item not read by then is
+listed as unread too.
 """
 from __future__ import annotations
 
@@ -31,13 +34,15 @@ import argparse
 import os
 import re
 import sys
+import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from dashboard import operators
 
-from . import answer, ask_state, brain, criteria_gate, decision_claim, status
-from .github import GitHub, GitHubError, auth_from_env
+from . import answer, ask_state, brain, criteria_gate, decision_claim, issue_reads, status
+from .github import GitHub, GitHubError, auth_from_env, urllib_transport
 from .labels import needs_human
 
 NEEDS_YOU, CHECK_FIRST, NO_ASK = "needs you", "check first", "no written ask"
@@ -52,6 +57,18 @@ HEADINGS = (
 )
 THE_OPERATOR = "the operator"
 _ASK_SIGNS = ("needs-operator", "needs:human", "loom:human")
+# Muse gives the command 45 seconds (loom#2394): the report is printed by
+# DEADLINE, with what was not read by then named. WORKERS reads run at once
+# (GitHub allows far more). A read that hangs is given up after
+# READ_TIMEOUT, so its retries still fit before the deadline.
+DEADLINE = 40.0
+WORKERS = 12
+READ_TIMEOUT = 10.0
+
+
+def _short_transport(method: str, url: str, headers: Dict[str, str],
+                     body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+    return urllib_transport(method, url, headers, body, READ_TIMEOUT)
 
 
 class Item(NamedTuple):
@@ -173,22 +190,56 @@ def read_item(gh: Any, repo: str, issue: Dict[str, Any], trusted: Sequence[str],
                  gh.paginate(base + "/timeline?per_page=100"), answerers)
 
 
-def read_repo(gh: Any, repo: str, trusted: Sequence[str], ops: Sequence[str],
-              answerers: Sequence[str] = ()) -> Tuple[List[Item], List[str]]:
-    """(the repo's items, what could not be read)."""
-    try:
-        issues = gh.paginate("/repos/%s/issues?state=open&per_page=100" % repo)
-    except (GitHubError, OSError) as err:
-        return [], ["%s: %s" % (repo, err)]
-    items, unread = [], []
-    for issue in issues:
-        if not isinstance(issue, dict) or not waits_on_person(_names(issue)):
-            continue
-        try:
-            items.append(read_item(gh, repo, issue, trusted, ops, answerers))
-        except (GitHubError, OSError) as err:
-            unread.append("%s#%s: %s" % (repo, issue.get("number"), err))
-    return items, unread
+LISTING = "/repos/%s/issues?state=open&per_page=100"
+
+
+def waiting(issues: Iterable[Any]) -> List[Dict[str, Any]]:
+    """The open issues and pull requests that wait on a person. One list of
+    every open issue costs fewer reads than one list per asking label, since
+    each needs:<login> is a label of its own."""
+    return [i for i in issues if isinstance(i, dict) and waits_on_person(_names(i))]
+
+
+Task = Tuple[str, Callable[[], List[Any]]]
+
+
+def drain(first: Sequence[Task], workers: int, seconds: float) -> List[str]:
+    """Run each task (a name and a callable that returns more tasks) on at
+    most `workers` threads, until every task is done or `seconds` pass. The
+    names of the tasks not done by then, sorted.
+
+    The threads are daemons: a read stuck past the deadline is left behind,
+    and the process still exits once the report is written."""
+    cond = threading.Condition()
+    todo: List[Task] = list(first)
+    pending = {name for name, _ in first}
+
+    def work() -> None:
+        while True:
+            with cond:
+                while not todo and pending:
+                    cond.wait()
+                if not todo:
+                    return
+                name, task = todo.pop(0)
+            more = task()
+            with cond:
+                for added in more:
+                    pending.add(added[0])
+                    todo.append(added)
+                pending.discard(name)
+                cond.notify_all()
+
+    for _ in range(max(1, workers)):
+        threading.Thread(target=work, daemon=True).start()
+    end = time.monotonic() + seconds
+    with cond:
+        while pending:
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            cond.wait(left)
+        return sorted(pending)
 
 
 def _quoted(text: str) -> List[str]:
@@ -234,21 +285,77 @@ def render(items: Sequence[Item], unread: Sequence[str]) -> str:
 
 
 def run(gh: Any, repos: Sequence[str], trusted: Sequence[str], ops: Sequence[str],
-        answerers: Sequence[str] = ()) -> Tuple[str, int]:
-    """(the report, the exit code)."""
+        answerers: Sequence[str] = (), deadline: Optional[float] = None,
+        workers: Optional[int] = None) -> Tuple[str, int]:
+    """(the report, the exit code). Repos and items are read on WORKERS
+    threads; what is not read by the deadline (DEADLINE seconds when None)
+    is named as unread, so a slow repo is a short report that says so, never
+    a report that does not come (loom#2394)."""
+    lock = threading.Lock()
     items: List[Item] = []
     unread: List[str] = []
-    for repo in repos:
-        found, missed = read_repo(gh, repo, trusted, ops, answerers)
-        items += found
-        unread += missed
-    return render(items, unread), 1 if unread else 0
+    # Each issue is read once a run: a listed ticket's own body read (its
+    # comments' status section) and a Blocked on issue many asks name.
+    reads = issue_reads.once(gh)
+
+    def one(repo: str, issue: Dict[str, Any]) -> Callable[[], List[Any]]:
+        def task() -> List[Any]:
+            try:
+                found = read_item(reads, repo, issue, trusted, ops, answerers)
+            except Exception as err:  # noqa: BLE001 - an unread ticket is named, never dropped
+                with lock:
+                    unread.append("%s#%s: %s" % (repo, issue.get("number"), err or repr(err)))
+            else:
+                with lock:
+                    items.append(found)
+            return []
+        return task
+
+    def items_of(repo: str, issues: List[Any]) -> List[Any]:
+        reads.keep_listed(repo, issues)
+        return [("%s#%s" % (repo, i.get("number")), one(repo, i)) for i in waiting(issues)]
+
+    def page(repo: str, url: str, number: int, final: bool) -> Callable[[], List[Any]]:
+        def task() -> List[Any]:
+            try:
+                return items_of(repo, gh.read_page(url, final))
+            except Exception as err:  # noqa: BLE001 - an unread page is named, never dropped
+                with lock:
+                    unread.append("%s: open issues page %d: %s" % (repo, number, err or repr(err)))
+                return []
+        return task
+
+    def listing(repo: str) -> Callable[[], List[Any]]:
+        """The first page of the repo's open issues; the later pages and
+        the items are tasks of their own."""
+        def task() -> List[Any]:
+            try:
+                first, later = gh.page_plan(LISTING % repo)
+            except Exception as err:  # noqa: BLE001 - an unread repo is named, never dropped
+                with lock:
+                    unread.append("%s: %s" % (repo, err or repr(err)))
+                return []
+            pages = [("%s open issues page %d" % (repo, n), page(repo, url, n, n == len(later) + 1))
+                     for n, url in enumerate(later, 2)]
+            return pages + items_of(repo, first)
+        return task
+
+    seconds = DEADLINE if deadline is None else deadline
+    late = drain([(repo, listing(repo)) for repo in dict.fromkeys(repos)],
+                 WORKERS if workers is None else workers, seconds)
+    with lock:
+        got, missed = list(items), list(unread)
+    missed += ["%s: not read within the %gs deadline" % (name, seconds) for name in late]
+    return render(got, missed), 1 if missed else 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m bus.needs_you")
     parser.add_argument("--repo", action="append", default=[], metavar="OWNER/NAME",
                         help="a repo to read, repeatable (default: LOOM_REPOS)")
+    parser.add_argument("--deadline", type=float, default=DEADLINE, metavar="SECONDS",
+                        help="print what was read by then and name the rest as unread "
+                             "(default %(default)gs, inside a Muse tick)")
     args = parser.parse_args(argv)
     repos = args.repo or os.environ.get("LOOM_REPOS", "").split()
     trusted = brain.trusted_authors()
@@ -257,11 +364,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # ask would read as open.
         print("error: set LOOM_BRIEF_AUTHORS, and LOOM_REPOS or --repo", file=sys.stderr)
         return 2
-    gh = GitHub(auth_from_env())
+    gh = GitHub(auth_from_env(), transport=_short_transport)
     gh.status_in_body = True  # read as the brain reads (bus.brain.main)
     gh.status_authors |= {login.lower() for login in trusted}
-    text, code = run(gh, repos, trusted, answer.operators(trusted=trusted), ask_state.answerers())
+    text, code = run(gh, repos, trusted, answer.operators(trusted=trusted), ask_state.answerers(),
+                     deadline=args.deadline)
     sys.stdout.write(text)
+    sys.stdout.flush()
     return code
 
 
