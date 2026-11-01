@@ -276,6 +276,16 @@ if [ "${FAKE_AGENT:-commit}" = early-limit ]; then
   for i in 1 2 3 4 5 6; do echo "working on step $i"; done
   exit 1
 fi
+if [ "${FAKE_AGENT:-commit}" = terminal-limit ]; then
+  echo "429: rate limit exceeded"
+  echo "AI_RetryError: retries exhausted"
+  sleep 300
+fi
+if [ "${FAKE_AGENT:-commit}" = retryable-429 ]; then
+  echo "429: rate limit exceeded"
+  echo "fixed" > fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkdir -p .loom-answers
   echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
@@ -688,9 +698,9 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", cwd=None, **env):
+    def run_lane(self, lane="codex", cwd=None, timeout=60, **env):
         return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=timeout)
 
     def lane_env(self, **env):
         return {
@@ -2120,6 +2130,25 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             '{"type":"tool_use","part":{"state":{"output":"ok"}}}\n'
             '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
         self.assertIn("[limit]", self.run_log())
+
+    def test_a_fake_agent_that_prints_a_terminal_limit_line_and_sleeps_is_stopped_within_2_minutes_and_the_lane_is_held(self):
+        self.drop_brief()
+        start = time.time()
+        result = self.run_lane(FAKE_AGENT="terminal-limit", timeout=120)
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("limit", beat["reason"])
+
+    def test_a_fake_agent_that_prints_one_retryable_429_and_goes_on_is_not_stopped(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="retryable-429")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        beat = self.beat("codex")
+        self.assertTrue(beat["available"])
 
     def test_a_full_free_pool_is_a_short_limit_not_the_agents_failure(self):
         # The shared free pool answered "has no lane available" 18 times; the

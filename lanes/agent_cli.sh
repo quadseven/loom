@@ -168,7 +168,7 @@ WORK_EVENT_RE='^\{"type":"(tool_use|text|reasoning|step_start|step_finish)"'
 
 # Stdin without the agent's work events, for the limit and credit patterns.
 provider_text() {
-  grep -vE "$WORK_EVENT_RE" || true
+  grep --line-buffered -vE "$WORK_EVENT_RE" || true
 }
 
 # The epoch the next UTC month begins.
