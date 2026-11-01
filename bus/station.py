@@ -8492,6 +8492,68 @@ class Station:
         urgent_sent = sent.get("urgent") if isinstance(sent.get("urgent"), list) else []
         return path, sent, urgent_sent
 
+    def _idle_pull_requests(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Read idle pull requests at most once per hour per watched repo."""
+        path = os.path.join(self.state, "idle_pulls.json")
+        saved = _read_json(path, {}, strict=False)
+        if not isinstance(saved, dict):
+            saved = {}
+        if isinstance(saved.get("at"), (int, float)) and self.now - saved["at"] < 3600:
+            cached = saved.get("items")
+            return [(str(row[0]), row[1]) for row in cached
+                    if isinstance(row, list) and len(row) == 2 and isinstance(row[1], dict)] \
+                if isinstance(cached, list) else []
+        found: List[Tuple[str, Dict[str, Any]]] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            query = "/search/issues?q=repo:%s+is:pr+is:open+label:grug:idle&per_page=100" % repo
+            data = self.gh.rest("GET", query).data
+            for issue in (data.get("items", []) if isinstance(data, dict) else []):
+                if isinstance(issue, dict) and "pull_request" in issue:
+                    if not self._hold_idle_lane_pull(repo, issue):
+                        found.append((repo, issue))
+        _write_json(path, {"at": self.now, "items": found})
+        return found
+
+    def _hold_idle_lane_pull(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Hold the linked ticket for an idle lane pull request without a new comment."""
+        number = int(issue.get("number") or 0)
+        if not number:
+            return False
+        pull = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        if not isinstance(pull, dict):
+            return False
+        branch = str((pull.get("head") or {}).get("ref") or "")
+        body = str(pull.get("body") or issue.get("body") or "")
+        lane = re.match(r"^loom/(\d+)(?:-|$)", branch)
+        cited = re.search(r"(?im)^\s*Refs\s+#(\d+)\b", body)
+        if not lane and not cited:
+            return False
+        ticket_number = int((lane or cited).group(1))
+        ticket = self._issue(repo, ticket_number)
+        was_stuck = WAIT + "stuck" in _label_names(ticket)
+        self._set_wait(repo, ticket, "stuck")
+        if not was_stuck:
+            self._routine(repo, ticket_number,
+                          "Idle review label on pull request #%d; held on the stuck path." % number)
+        return True
+
+    def _idle_pull_lines(self) -> List[str]:
+        """The operator choices for idle pull requests in the next digest."""
+        rows = []
+        for repo, issue in self._idle_pull_requests():
+            if not any(str(label.get("name") if isinstance(label, dict) else label) == "grug:idle"
+                       for label in issue.get("labels", [])):
+                continue
+            updated = self._epoch(str(issue.get("updated_at") or ""))
+            idle_days = max(0, int((self.now - updated) // 86400)) if updated else 0
+            title = " ".join(str(issue.get("title") or "").split())
+            unit = "day" if idle_days == 1 else "days"
+            rows.append("- %s #%s %s; idle %d %s; merge, close, or brief it as a ticket" %
+                        (repo, issue.get("number"), title, idle_days, unit))
+        return rows
+
     @staticmethod
     def _prune_urgent(ledger: Tuple[str, Dict[str, Any], List[str]], open_keys: set) -> None:
         """Forget urgent asks that are no longer open, so the ledger stays the
@@ -8535,9 +8597,11 @@ class Station:
         new = [a for a in (asks if ranked else reversed(asks))
                if prev.get(a[0]) != covered[a[0]]]
         seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
+        lines = [self._line(i) for _, _, i in new + seen]
+        lines.extend(self._idle_pull_lines())
         plan: Dict[str, Any] = {
             "day": today, "covered": covered, "new": len(new),
-            "lines": [self._line(i) for _, _, i in new + seen], "pages": {}}
+            "lines": lines, "pages": {}}
         whole = "\n".join([self._digest_head(plan)] + plan["lines"])
         if len(whole) <= DISCORD_MAX - MENTION_ROOM:
             return plan
@@ -8741,6 +8805,7 @@ class Station:
             # Not configured: skip quietly; a line every minute would only grow
             # the station log (docs/LANES.md says how to turn it on).
             return
+        self._idle_pull_requests()
         ledger = self._ask_ledger()
         today, digest_due = self._today_and_digest_due(ledger[1])
         keyed = self._gather_asks()
