@@ -173,7 +173,7 @@ def _brain_name(holder):
 
 
 def _brain_state(holder, record, tick, now):
-    if record and record.get("holder") == holder and record.get("step"):
+    if record and _brain_name(record.get("holder")) == holder and record.get("step"):
         return "running", record.get("step")
     if tick:
         try:
