@@ -131,6 +131,10 @@ def threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_DEMOTE_AT", DEFAULT_AT)
 
 
+def zero_done_hours(env: Optional[Mapping[str, str]] = None) -> int:
+    return _setting(os.environ if env is None else env, "LOOM_LANE_ZERO_DONE_HOURS", 24) * 3600
+
+
 def footer(body: Any) -> Optional[Tuple[str, str]]:
     """(lane, model) of the newest run the pull request's footer names."""
     found = FOOTER_RE.findall(str(body or ""))
@@ -384,11 +388,48 @@ class Scorecard:
         found |= {str(e.get("lane")) for e in self.data["audits"].values()}
         return sorted(found | {lane for lane, _ in AUDIT})
 
+    def _successful_briefs_in_window(self, lane: str) -> int:
+        """Count successfully completed briefs for a lane in the window."""
+        since = self.now - window(self.env)
+        count = 0
+        for record in self.data["records"].values():
+            if record.get("lane") != lane:
+                continue
+            if float(record.get("at") or 0) < since:
+                continue
+            # Only count real brief assignments (have a difficulty kind)
+            kind = record.get("kind", "-")
+            if kind == "-":
+                continue
+            if record.get("merged") and record.get("review") == CLEAN:
+                count += 1
+        return count
+
+    def _earliest_brief_assign(self, lane: str) -> Optional[float]:
+        """Earliest timestamp a real brief was assigned to this lane in the window."""
+        since = self.now - window(self.env)
+        earliest = None
+        for record in self.data["records"].values():
+            if record.get("lane") != lane:
+                continue
+            # Only consider real brief assignments (have a difficulty kind)
+            kind = record.get("kind", "-")
+            if kind == "-":
+                continue
+            at = float(record.get("at") or 0)
+            if at < since:
+                continue
+            if earliest is None or at < earliest:
+                earliest = at
+        return earliest
+
     def demote(self) -> List[str]:
         """Demote each lane whose bad outcomes reach the threshold; the
-        lanes newly demoted."""
+        lanes newly demoted. Also demote lanes with zero successful brief
+        completions past the LOOM_LANE_ZERO_DONE_HOURS threshold."""
         at = threshold(self.env)
         days = window(self.env) // 86400
+        zero_hours = zero_done_hours(self.env)
         newly = []
         for lane in self.lanes():
             if lane in self.data["demoted"]:
@@ -400,6 +441,16 @@ class Scorecard:
                 self.data["demoted"][lane] = {"at": self.now, "why": why}
                 newly.append(lane)
                 _say("demoted lane %s: %s" % (lane, why))
+                continue
+            done = self._successful_briefs_in_window(lane)
+            if done == 0:
+                earliest = self._earliest_brief_assign(lane)
+                if earliest is not None and self.now - earliest >= zero_hours:
+                    why = ("zero successful brief completions in %d hours (LOOM_LANE_ZERO_DONE_HOURS=%d)"
+                           % (zero_hours // 3600, zero_hours // 3600))
+                    self.data["demoted"][lane] = {"at": self.now, "why": why}
+                    newly.append(lane)
+                    _say("demoted lane %s: %s" % (lane, why))
         return newly
 
     def demoted(self) -> Dict[str, str]:

@@ -414,6 +414,26 @@ class RunnersTest(unittest.TestCase):
         # The declared size refuses it, before a byte of it is read.
         self.assertIn("report.enc is larger than 1000 bytes", self.failure_line())
 
+    def test_successful_run_consumes_brief_and_does_not_park_as_unfinished(self):
+        """A successful run with the brief in done/ moves the brief and does not
+        park it as 'runner run ended without finishing the brief' (bus/runners.py:508)."""
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {
+            "briefs/opencode-go-2/done/%s.md" % TICKET: BRIEF,
+            "logs/opencode-go-2/%s.log" % TICKET: "[t] %s done: https://github.com/owner/app/pull/9\n" % TICKET,
+            "logs/opencode-go-2/%s.result" % TICKET: "pr\n",
+        }, beat={"lane": "opencode-go-2", "at": 1, "available": True, "reason": ""})
+        self.finish(run, run_id, artifact, "success")
+        self.runner(now=self.now + 600).tend()
+        self.assertFalse((self.inbox / (TICKET + ".md")).exists(),
+                         "brief should be moved from inbox")
+        self.assertTrue((self.inbox / "done" / (TICKET + ".md")).exists(),
+                        "brief should be in done/")
+        log_text = (self.home / "logs" / "opencode-go-2" / (TICKET + ".log")).read_text()
+        self.assertNotIn("without finishing the brief", log_text,
+                         "should not park as unfinished brief")
+        self.assertIn("done: https://github.com/owner/app/pull/9", log_text)
+
 
 class StationHookTest(unittest.TestCase):
     def test_no_runner_slot_means_no_request(self):
