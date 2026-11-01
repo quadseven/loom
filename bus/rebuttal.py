@@ -279,6 +279,17 @@ def head_reader(gh: Any, repo: str, head: str) -> Tuple[Read, Ancestor]:
     return read, ancestor
 
 
+def commit_files(gh: Any, repo: str, sha: str) -> Tuple[str, List[str]]:
+    """(full sha, files it changed) of a commit; ("", []) when GitHub cannot
+    show it. GitHub lists a commit's first 300 files here, so a file past
+    those reads as unchanged and the thread stays open (the safe side)."""
+    data = _get(gh, "/repos/%s/commits/%s" % (repo, sha))
+    if not isinstance(data, dict):
+        return "", []
+    return (str(data.get("sha") or ""),
+            [str(f.get("filename")) for f in data.get("files") or [] if isinstance(f, dict)])
+
+
 def check_on_head(gh: Any, repo: str, head: str, answer: str, thread_path: str = "",
                   finding: str = "") -> str:
     """refusal() with reads from GitHub at the head commit; no head, no pass."""
