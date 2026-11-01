@@ -105,6 +105,11 @@ unset variables.
   check is recorded but does not stop the run (a ticket may exist to fix
   it). What setup leaves untracked goes into `.git/info/exclude`, so it is
   never committed.
+- On a host, a base check verdict is reused by repo, base revision, check
+  command and interpreter identity. Green verdicts last 24 hours; red
+  verdicts last five minutes and still follow the base-check incident path.
+  Setup still runs for each brief, and the final check on the agent's commit
+  is never cached. Verdicts live under the host's `state/base-verdicts/`.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
