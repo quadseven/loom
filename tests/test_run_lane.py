@@ -713,6 +713,8 @@ print('leak guard: clean (shape patterns only)')
             "LOOM_LEAK_SCANNER": str(self.scanner),
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
+            # The picked model has its own tests, which turn it on.
+            "LOOM_MODEL_PICK": "off",
             # The free lanes' usage meters (bus/meter.py) read a closed
             # loopback port, never the real provider, unless a test serves one.
             "LOOM_OPENROUTER_METER_URL": "http://127.0.0.1:9/meter",
@@ -4289,6 +4291,98 @@ exec /usr/bin/git "$@"
         self.assertEqual(len(defaults), 3, defaults)
         for model in defaults:
             self.assertIn(model, tickets.OPENCODE_GO_MODELS)
+
+    # bus/model_pick.py: a Go or Zen slot picks each run's model.
+    FAKE_OPENCODE_PICK = """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+[ "${1:-}" = models ] && exit 0
+args="$*"
+printf 'opencode %s\\n' "${args//$'\\n'/ }" >> "$TMPDIR/agent.log"
+case "$args" in
+  *"-m BROKEN "*)
+    echo 'Error: ProviderModelNotFoundError: model not found'
+    exit 1 ;;
+esac
+echo '{"type":"step_finish","part":{"tokens":{"output":3}}}'
+echo fixed > fix.txt
+"""
+
+    def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
+                 zen=("flint-40b-free",)):
+        self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
+        lists = Path(self._tmp.name) / "lists"
+        lists.mkdir(exist_ok=True)
+        (lists / "go.json").write_text(json.dumps({"data": [{"id": m} for m in go]}))
+        (lists / "zen.json").write_text(json.dumps({"data": [{"id": m} for m in zen]}))
+        (lists / "status.json").write_text(json.dumps({
+            "opencode-go": {"models": {m: {} for m in go}},
+            "opencode": {"models": {m: {} for m in zen}}}))
+        return dict(LOOM_MODEL_PICK="on", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+                    LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
+                    LOOM_ZEN_MODEL="opencode/flint-40b-free",
+                    LOOM_OPENCODE_GO_PROBE_URL="", LOOM_ZEN_PROBE_URL="",
+                    LOOM_OPENCODE_GO_MODELS_URL="file://%s/go.json" % lists,
+                    LOOM_ZEN_MODELS_URL="file://%s/zen.json" % lists,
+                    LOOM_MODELS_STATUS_URL="file://%s/status.json" % lists)
+
+    def pause_models(self, *keys):
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "model-pause.json").write_text(json.dumps(
+            {key: {"until": time.time() + 3600, "why": "paused by the test"} for key in keys}))
+
+    def runs(self):
+        return [c for c in self.calls() if c.startswith("opencode ")]
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_slot_ignores_its_pin_and_reports_the_free_model_it_picked(self):
+        inbox, result = self.api_lane("opencode-go", extra="Model: opencode-go/mimo-v2.6-flash\n",
+                                      **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/beam-free", self.runs()[-1])
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("model pick: opencode-go/beam-free (free)", log)
+        self.assertRegex(log, r"model report: opencode-go/beam-free \(free\), fallback: .*exit 0, edited")
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_gone_model_is_paused_and_the_brief_runs_on_the_next_free_model(self):
+        env = self.pick_env(broken="opencode-go/beam-free")
+        inbox, first = self.api_lane("opencode-go", **env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat("opencode-go")["available"])
+        second = self.run_lane("opencode-go", GH_TOKEN="fake-token-not-real", **env)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("opencode-go/beam-free paused for 86400 s", log)
+        self.assertIn("rotation 1 of 3", log)
+        self.assertIn("model pick: opencode-go/iceman-contributor-free (free)", log)
+        self.assertIn("-m opencode-go/iceman-contributor-free", self.runs()[-1])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_paid_run_for_a_private_repo_is_logged_and_settled(self):
+        self.pause_models("opencode-go/beam-free")
+        inbox, result = self.api_lane("opencode-go", FAKE_GH_PRIVATE="true", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/mimo-v2.6-flash", self.runs()[-1])
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("(paid)", log)
+        self.assertIn("no free model works", log)
+        ledger = (self.loom / "state" / "usage" / "go-budget.jsonl").read_text().splitlines()
+        self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
+
+    def test_a_slot_with_every_model_paused_takes_nothing_and_says_so(self):
+        self.pause_models("zen-free", "opencode/flint-40b-free")
+        inbox, result = self.api_lane("zen", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.runs(), [], result.stderr)
+        beat = self.beat("zen")
+        self.assertFalse(beat["available"], beat)
+        self.assertIn("no model can run", beat["reason"])
+        self.assertIn("retry_at", beat)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def slot_run(self, slot, **env):
         inbox, result = self.api_lane(
