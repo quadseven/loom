@@ -11,12 +11,12 @@ import types
 import unittest
 import unittest.mock
 from contextlib import redirect_stderr
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, journal, proof, text, tickets
+from bus import brain, journal, proof, station, text, tickets
 from bus.github import GitHub, GitHubError
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
@@ -99,7 +99,9 @@ def merge_takes(ticket=4):
     return (reply(200, {"number": ticket, "state": "open",
                         "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
             reply(200, {"mergeable": True, "mergeable_state": "clean"}),
-            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]))
+            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]),
+            reply(200, {"total_count": 0}),
+            reply(200, {"total_count": 0}))
 
 
 class BrainTests(unittest.TestCase):
@@ -388,6 +390,21 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIsNone(brain.goal_trunk({"body": "## Why\nno trunk"}))
         self.assertIsNone(brain.goal_trunk({"body": None}))
 
+    def test_status_gives_the_lane_table_its_age_and_calls_an_old_one_stale(self):
+        def lane_section(age_minutes):
+            table = brain.LANES_MARKER + "\nUpdated 2030-01-01T12:00:00Z\n\n| codex | yes | - |"
+            gh = GitHub("t", transport=Fake(
+                reply(200, [{"number": 1, "labels": [{"name": "loom:lanes"}]}]),
+                reply(200, [{"body": table, "user": {"login": BRAIN}}]), epic=False))
+            now = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc) + timedelta(minutes=age_minutes)
+            return brain.status(gh, [], REPO, env=TRUSTED, now=now)
+
+        limit = station.LANES_REPUBLISH // 60
+        self.assertIn("Updated 2030-01-01T12:00:00Z (%d min old, stale)\n" % (limit + 1),
+                      lane_section(limit + 1))
+        self.assertIn("Updated 2030-01-01T12:00:00Z (%d min old)\n" % (limit - 1),
+                      lane_section(limit - 1))
+
     def test_status_sections_and_request_ceiling(self):
         gh = GitHub("t", transport=Fake(
             reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"},
@@ -395,7 +412,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
             reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
-            reply(200, []), reply(200, []), reply(200, [])))
+            reply(200, []), reply(200, []), reply(200, []), reply(200, {"private": False})))
         report = brain.status(gh, [REPO], REPO, env={}, authors=())
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
             self.assertIn(section, report)
@@ -403,8 +420,9 @@ class SensitiveResumeTests(unittest.TestCase):
         # unproven-work read and epic list; the lane repo is the same repo,
         # so its issue list is the one already read (loom#2078), and with no
         # loom:lanes issue there is no comments read. Plus ticket issue fetch
-        # for goal home constraint checking.
-        self.assertEqual(gh.requests, 6)
+        # for goal home constraint checking. Plus the repo's visibility, for
+        # its "Waiting on you:" line.
+        self.assertEqual(gh.requests, 7)
 
     def test_status_ranks_open_tickets_across_repos_in_work_order(self):
         def t(number, priority=None, created="2030-01-01T00:00:00Z", labels=("loom:queued",)):
@@ -759,6 +777,29 @@ class SensitiveResumeTests(unittest.TestCase):
                                                 {"name": "loom:pr"}]}
         fake = Fake(pr, query, reply(200, issue), reply(200, []))
         with self.assertRaisesRegex(ValueError, "blocked: no criterion built"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_ticket_held_for_outside_work(self):
+        body = "Refs %s#9\n\n## Acceptance criteria\n- [x] one box" % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                                {"name": "claim:overflow"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "held by claim:overflow"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_merge_refuses_a_box_said_to_be_already_done_with_no_code(self):
+        body = ("Refs %s#9\n\n## Acceptance criteria\n"
+                "- [x] one box is built\n"
+                "- [ ] another; not built: already in tree") % REPO
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, []))
+        with self.assertRaisesRegex(ValueError, "cites no code"):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
@@ -1802,6 +1843,20 @@ class SensitiveResumeTests(unittest.TestCase):
             self.assertIn(text, note)
         self.assertNotIn("First works", note)
 
+    def test_the_brains_requeue_note_names_a_live_box_left_open_too(self):
+        # loom#2333: the note names every open box, not only the code ones.
+        body = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
+                "- [ ] Verify the shape holds\n")
+        pull = ("## Acceptance criteria\n- [x] First works; test.\n"
+                "- [ ] Second works.; not built: needs a key\n"
+                "- [ ] Verify the shape holds; not built: needs a key\n")
+        labels, fake = self._merge_with_files(self.CALLED, ticket_body=body, pull_body=pull)
+        self.assertEqual(labels, ["loom:ticket", "loom:queued"])
+        note = [c[2]["body"] for c in fake.calls if c[1].endswith("/issues/9/comments")][0]
+        self.assertIn("Second works.", note)
+        self.assertIn("Verify the shape holds", note)
+        self.assertNotIn("First works", note)
+
     def test_merge_of_a_pull_request_that_builds_every_box_marks_merged(self):
         pull = ("## Acceptance criteria\n- [x] First works; test.\n- [x] Second works.\n"
                 "- [x] `Third` works\n- [x] Fourth  works.\n")
@@ -2620,7 +2675,8 @@ class StatusMergeRefusalTests(unittest.TestCase):
           "labels": [{"name": "class:logic"}]}
 
     def lines(self, state="pr", mergeable=True, mergeable_state="clean",
-              files=("bus/a.py", "tests/test_a.py"), env=None):
+              files=("bus/a.py", "tests/test_a.py"), env=None,
+              search_count=0):
         issue = {"number": 7, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
         routes = {
@@ -2628,6 +2684,7 @@ class StatusMergeRefusalTests(unittest.TestCase):
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
                                              "mergeable_state": mergeable_state}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
+            ("GET", "/search/issues"): reply(200, {"total_count": search_count}),
         }
         gh = GitHub("t", transport=Routed(routes))
         with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
@@ -2648,6 +2705,15 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def test_a_pull_request_merge_would_take_is_ready(self):
         self.assertEqual(self.lines()[1], "- #9 Work - READY")
+
+    def test_a_pull_request_at_the_hourly_cap_blocks(self):
+        env = {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code",
+               "LOOM_AUTO_MERGE_PER_REPO_HOUR": "10",
+               "LOOM_AUTO_MERGE_PER_HOUR": "4"}
+        self.assertEqual(self.lines(env=env, search_count=4)[1],
+                         "- #9 Work - blocked: held by the hourly merge cap: 4 loom/ "
+                         "pull requests merged in the last hour, the cap is 4 "
+                         "(LOOM_AUTO_MERGE_PER_HOUR)")
 
 
 class ModelFlagTests(unittest.TestCase):
@@ -2910,7 +2976,48 @@ def lane_models(**models):
 LADDER_LANES = {"claude": "claude-sonnet-5-5", "codex": "gpt-6-luna"}
 
 
+def briefed_on(load, author=BRAIN):
+    """Open briefed tickets, `load[lane]` on each lane, in the shape the
+    GitHub issues list returns them (author included), so the factory's own
+    ticket read and trust filter decide which ones count."""
+    lanes = [lane for lane, count in load.items() for _ in range(count)]
+    return [{"number": 100 + i, "user": {"login": author}, "labels": [
+        {"name": "loom:ticket"}, {"name": "loom:briefed"}, {"name": "lane:" + lane}]}
+        for i, lane in enumerate(lanes)]
+
+
+class LoadRouted(Routed):
+    """Routed, answering each repo's open ticket list from `by_repo` (a
+    GitHubError for a repo in `unreadable`) and recording the repos read."""
+
+    def __init__(self, routes, by_repo, unreadable=(), author=BRAIN):
+        super().__init__(routes)
+        self.by_repo = by_repo
+        self.author = author
+        self.unreadable = unreadable
+        self.read = []
+
+    def __call__(self, method, url, headers, body):
+        if "labels=loom:ticket&state=open" in url:
+            repo = url.split("/repos/")[1].split("/issues")[0]
+            self.read.append(repo)
+            self.calls.append((method, url.split("api.github.com")[1], None))
+            if repo in self.unreadable:
+                return reply(500, {"message": "boom"})
+            return reply(200, briefed_on(self.by_repo.get(repo, {}), self.author))
+        return super().__call__(method, url, headers, body)
+
+
 class EscalateTests(unittest.TestCase):
+    def setUp(self):
+        # escalate counts lane load once per process over LOOM_REPOS: start
+        # each test from no count and the ticket's own repo only.
+        brain._LANE_LOAD.clear()
+        self.addCleanup(brain._LANE_LOAD.clear)
+        env = unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+
     def run_escalate(self, routes):
         fake = Routed(routes)
         gh = GitHub("t", transport=fake)
@@ -3040,6 +3147,113 @@ class EscalateTests(unittest.TestCase):
             stuck_ticket("failed"), TWICE, [claim("2030-01-01T00:11:00Z")], free=("claude", "anthropic-2")))
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
+
+    def escalate_over_repos(self, by_repo, history=(), unreadable=()):
+        """escalate on a failed ticket with claude and codex free, LOOM_REPOS
+        naming every repo in `by_repo`, and `by_repo[repo]` the open briefed
+        tickets per lane in each: (fake, outcome, repos read)."""
+        fake = LoadRouted(ticket_routes(stuck_ticket("failed"), TWICE, list(history),
+                                        free=("claude", "codex")), by_repo, unreadable)
+        authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors,
+                                                   "LOOM_REPOS": " ".join(by_repo)}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        return fake, outcome, fake.read
+
+    def escalate_with_load(self, load, history=()):
+        """escalate with `load[lane]` open briefed tickets on each lane of
+        the ticket's own repo: (fake, outcome)."""
+        fake, outcome, _ = self.escalate_over_repos({REPO: load}, history)
+        return fake, outcome
+
+    def test_escalate_spreads_one_lane_overflow_to_a_less_loaded_rung(self):
+        fake, outcome = self.escalate_with_load({"codex": 5, "claude": 1}, [claim("2030-01-01T00:11:00Z")])
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 2: lane codex load is 5", note)
+
+    def test_escalate_spreads_rung_one_overflow_to_rung_two(self):
+        fake, outcome = self.escalate_with_load({"claude": 5, "codex": 1})
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Skipped rung 1: lane claude load is 5", note)
+
+    def test_escalate_counts_only_tickets_the_factory_trusts(self):
+        # The factory's own ticket read drops a ticket whose author may not
+        # brief, so a lane full of them is not full.
+        fake = LoadRouted(ticket_routes(stuck_ticket("failed"), TWICE, [], free=("claude", "codex")),
+                          {REPO: {"claude": 5}}, author="stranger")
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+
+    def test_escalate_takes_a_briefed_ticket_off_its_old_lane_in_the_count(self):
+        # The stuck ticket sat briefed on claude, so it was counted there:
+        # moving it to codex takes one off claude and puts one on codex.
+        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD), [], [],
+                                        free=("claude", "codex")), {REPO: {"claude": 5, "codex": 1}})
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
+            outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(brain._LANE_LOAD[(REPO,)], {"claude": 4, "codex": 2})
+
+    def test_escalate_without_a_readable_repo_still_climbs_and_says_so(self):
+        # One repo of the station cannot be read: the sweep goes on with
+        # that repo counted as empty, says so on stderr, and does not keep
+        # the partial count for the next ticket.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            fake, outcome, _ = self.escalate_over_repos(
+                {REPO: {"claude": 5, "codex": 1}, "example-owner/other-repo": {}},
+                unreadable=("example-owner/other-repo",))
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertIn("lane load: cannot read example-owner/other-repo", buf.getvalue())
+        self.assertEqual(brain._LANE_LOAD, {})
+
+    def test_escalate_counts_lane_load_in_every_station_repo(self):
+        # Lanes are shared by every repo the station watches: rung 1's one
+        # lane full in another repo is full for this ticket too.
+        fake, outcome, read = self.escalate_over_repos(
+            {REPO: {}, "example-owner/other-repo": {"claude": 5}})
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(read, [REPO, "example-owner/other-repo"])
+        self.assertIn("Skipped rung 1: lane claude load is 5",
+                      fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_sweep_reads_load_once_and_counts_its_own_moves(self):
+        from bus import factory
+        by_repo = {REPO: {}, "example-owner/other-repo": {"claude": factory.ONE_LANE_MAX}}
+        _, first, read = self.escalate_over_repos(by_repo)
+        self.assertEqual(first, "rung 1 claude-sonnet-5-5 on claude")
+        _, second, read_again = self.escalate_over_repos(by_repo)
+        self.assertEqual(read_again, [])
+        # The first move put claude over ONE_LANE_MAX, so the next spills.
+        self.assertEqual(second, "rung 2 gpt-6-luna on codex")
+        self.assertEqual(brain._LANE_LOAD[tuple(by_repo)],
+                         {"claude": factory.ONE_LANE_MAX + 1, "codex": 1})
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_under_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX - 1, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+        from bus import factory
+        fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX, "codex": 0})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_an_overflowing_rung_when_no_later_lane_is_three_lower(self):
+        fake, outcome = self.escalate_with_load({"claude": 5, "codex": 3})
+        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_keeps_rung_two_after_rung_one_was_tried(self):
+        from bus import factory
+        _, outcome = self.escalate_with_load(
+            {"codex": factory.ONE_LANE_MAX - 1, "claude": 1}, [claim("2030-01-01T00:11:00Z")])
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
 
     def test_escalate_uses_the_codex_standin_and_anthropic_slot(self):
         _, outcome = self.run_escalate(ticket_routes(
@@ -3292,6 +3506,25 @@ class PastLastRungTests(unittest.TestCase):
         query = [c[2]["query"] for c in fake.calls if c[1].endswith("/graphql")][0]
         return section, query
 
+    def test_status_lists_the_kept_pull_request_under_past_the_last_rung(self):
+        # A kept pull request for a past-ladder ticket is listed under "Past the last rung".
+        node = dict(ready_node(threads=[]), mergeable="MERGEABLE", rulingThreads={"nodes": []})
+        past = dict(stuck_ticket("failed"), title="Past", created_at="2030-01-01T00:00:00Z")
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [past]),
+                  ("GET", "/issues/9/events"): reply(200, []),
+                  ("GET", "/issues/9/comments"): reply(200, list(rungs(1, 2, 3))),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [
+                      {"number": 4, "title": "PR", "head": {"ref": "loom/9-work"}}]),
+                  ("POST", "/graphql"): reply(200, {"data": {"repository": {"p4": node}}})}
+        routes.update(lanes_routes(()))
+        fake = Routed(routes)
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain"}
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO, env=env)
+        section = report.split(brain.PAST_RUNG_HEADING, 1)[1].split("\n#", 1)[0]
+        lines = [l for l in section.splitlines() if l.strip()]
+        self.assertEqual(lines[0], "- #9 Past - PR #4 - mergeable mergeable - 0 unresolved threads")
+        self.assertNotIn("no open pull request", section)
+
     def test_status_lists_a_ticket_past_rung_3_with_its_answered_high_thread(self):
         answered = {"isResolved": False, "comments": {"nodes": [
             {"databaseId": 71, "author": self.BOT, "body": "high | correctness | the cache is never cleared\nmore"},
@@ -3444,6 +3677,8 @@ class Routes:
         return answer
 
     def _read(self, path):
+        if path.startswith("/repos/%s/labels" % REPO):
+            return reply(200, [])
         if path == "/repos/%s/issues/1" % REPO:
             return reply(200, goal())
         if "/issues/1/sub_issues" in path:
@@ -3696,7 +3931,7 @@ class HumanAndRefsTests(unittest.TestCase):
                          {"body": brain.HUMAN_MARKER + "\nBuy a test phone.\nKind: hardware"})
         self.assertEqual(fake.calls[2][0], "DELETE")
         self.assertTrue(fake.calls[2][1].endswith("/issues/6/labels/loom%3Atriage"))
-        self.assertEqual(fake.calls[3][2], {"labels": ["loom:human"]})
+        self.assertEqual(fake.calls[3][2], {"labels": ["needs:human"]})
 
     def test_human_refusals_write_nothing(self):
         cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
@@ -3969,7 +4204,7 @@ class OnboardTests(unittest.TestCase):
         issue = posted[0][2]
         self.assertEqual(issue["title"], "Goal: Loom or a person works every open %s issue" % REPO)
         self.assertEqual(issue["labels"], ["loom:goal", "loom:backlog"])
-        for part in ("## Destination", "## Metric", "## Rules", "loom:human",
+        for part in ("## Destination", "## Metric", "## Rules", "needs:human",
                      "never closes an issue", "train on prompts"):
             self.assertIn(part, issue["body"])
         self.assertIn("backlog goal home: #100, created", lines)
@@ -5107,6 +5342,18 @@ class MoveFromGoalTests(unittest.TestCase):
         self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
+    def test_triage_files_a_ready_area_issue_under_its_area_epic(self):
+        routes = Routes([item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
+        areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
+        with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
+                unittest.mock.patch.object(brain, "intake_epic", return_value=70) as epic:
+            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+        read.assert_called_once()
+        self.assertEqual(epic.call_args_list,
+                         [unittest.mock.call(unittest.mock.ANY, REPO, 1, area="stability")] * 2)
+        self.assertEqual([c[1] for c in self.sub_issue_posts(routes.calls)],
+                         ["/repos/%s/issues/70/sub_issues" % REPO] * 2)
+
     def test_triage_does_not_take_an_issue_out_of_another_parent(self):
         other = "https://api.github.com/repos/%s/issues/77" % REPO
         routes = Routes([item(5, parent_issue_url=other), item(6)])
@@ -5214,6 +5461,7 @@ class OutsideEpicRepo:
         self.issues = {1: goal()}
         self.subs = {1: []}
         self.epics = []
+        self.labels = []
         self.open_tickets = []
         self.calls = []
 
@@ -5232,6 +5480,8 @@ class OutsideEpicRepo:
             return reply(200, self.open_tickets)
         if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
             return reply(200, self.epics)
+        if path.startswith("/repos/%s/labels" % REPO):
+            return reply(200, self.labels)
         if path.startswith("/repos/%s/issues?labels=epic&state=open" % REPO):
             return reply(200, [e for e in self.epics if e.get("state", "open") == "open"])
         if path == "/repos/%s/issues/1" % REPO:
@@ -5239,6 +5489,13 @@ class OutsideEpicRepo:
         raise AssertionError("unexpected read %s" % path)
 
     def _write(self, path, payload):
+        found = re.fullmatch(r"/repos/%s/issues/(\d+)/labels" % re.escape(REPO), path)
+        if found:
+            issue = self.issues[int(found.group(1))]
+            existing = {label["name"] for label in issue.get("labels", [])}
+            issue["labels"].extend({"name": label} for label in payload["labels"]
+                                   if label not in existing)
+            return reply(200, issue["labels"])
         if path.endswith("/sub_issues"):
             parent = int(path.split("/issues/")[1].split("/")[0])
             child = payload["sub_issue_id"] - 1000
@@ -5346,6 +5603,54 @@ class MoveOutsideEpicTests(unittest.TestCase):
         fake = self.repo(tickets=[self.ticket(10)], epics=[(60, 1)])
         self.move(fake)
         self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
+
+    def test_area_ticket_moves_under_its_area_epic(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, 1)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        fake.issues[60]["title"] = "Epic: stability"
+        self.assertEqual(self.move(fake), (1, 0))
+        self.assertEqual(fake.subs[60][-1], 10)
+
+    def test_a_repo_with_no_areas_reads_the_goal_tree_once(self):
+        fake = self.repo(tickets=[self.ticket(10), self.ticket(11)], epics=[(60, 1)])
+        with unittest.mock.patch.object(brain, "goal_tree", wraps=brain.goal_tree) as tree:
+            self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(tree.call_count, 1)
+
+    def test_a_pass_reads_the_repo_labels_once(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability")),
+                                  self.ticket(11, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, 1)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(sum(1 for c in fake.calls if "/labels?per_page" in c[1]), 1)
+
+    def test_full_area_epics_open_a_labeled_epic_for_that_area(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, brain.EPIC_TICKET_CAP)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        fake.issues[60]["title"] = "Epic: stability"
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        made = fake.subs[1][-1]
+        self.assertEqual(fake.issues[made]["title"], "Epic: stability")
+        self.assertIn({"name": "area:stability"}, fake.issues[made]["labels"])
+        self.assertEqual(fake.subs[made], [10])
+        self.assertIn({"name": "area:stability"}, fake.issues[10]["labels"])
+
+    def test_missing_area_is_inferred_from_label_descriptions(self):
+        ticket = self.ticket(10, labels=("loom:ticket",))
+        ticket["title"] = "Stability alert is stuck"
+        fake = self.repo(tickets=[ticket])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        self.assertEqual(self.move(fake), (1, 0))
+        made = fake.subs[1][-1]
+        self.assertEqual(fake.issues[made]["title"], "Epic: stability")
+        self.assertIn({"name": "area:stability"}, fake.issues[made]["labels"])
 
     def epic_under_goal(self, fake, number, state="open", tickets=()):
         """A (non-intake) epic of goal #1 holding the given tickets as its

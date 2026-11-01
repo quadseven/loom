@@ -2,7 +2,7 @@
 
 On 2026-10-27 the brain closed a lane pull request "per the operator decision
 recorded on" a ticket, and closed that ticket "per the operator decision",
-when the ticket held only an unanswered loom:human ask: no person had said
+when the ticket held only an unanswered needs:human ask: no person had said
 anything. An unanswered ask is not a decision. The brain may act on its own
 judgment and say so, but text that claims a person's decision is refused
 unless a person's comment or label, posted after the latest ask, records one
@@ -13,6 +13,7 @@ is the guard the brain's write commands call before they post.
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -32,6 +33,14 @@ _ACT = r"(?:decided|ruled|signed off|approved|chose|confirmed|agreed|answered|ok
 # decided" or "Dependabot decided" claims nothing about this factory.
 _NAMED_ACT = r"(?:decided|ruled|signed off|okayed|OK'd)"
 _NAME = r"([A-Za-z][\w-]*)"
+# How a brain records an answer the operator gave outside the ticket:
+# "Operator answer 2026-10-31: (a)". The date is the group; words after the
+# colon are required, so "Operator answer: none yet" is no record of one.
+ANSWER_LINE = re.compile(r"^\s*operator answer\s+(\d{4}-\d{2}-\d{2})\s*:\s*\S", re.I | re.M)
+# The undated lines that clear an ask (bus/ask_state.py): a trusted bot's may be
+# bare, and a bot not trusted here clears one only with words on the line.
+_TRUSTED_LINE = re.compile(r"^\s*(?:finished|done)\s*:", re.I | re.M)
+_WORDED_LINE = re.compile(r"^[ \t]*finished[ \t]*:[ \t]*\S", re.I | re.M)
 
 # Every phrasing that claims a person decided. A match that captures a name
 # is a claim only when that name is one of claim's `names`.
@@ -48,13 +57,15 @@ CLAIM_PATTERNS: Tuple[re.Pattern, ...] = tuple(re.compile(p, re.I) for p in (
     r"\b(?:per|following|according to|pursuant to) %s's %s" % (_NAME, _NOUN),
     # "NAME decided", "NAME has ruled"
     r"\b%s (?:has |had )?(?:already )?%s\b" % (_NAME, _NAMED_ACT),
+    # A dated record line (ANSWER_LINE), which clears an ask in bus/ask_state.py.
+    r"(?m)^\s*operator answer\s+\d{4}-\d{2}-\d{2}\s*:",
 ))
 
 # A loom marker comment is Loom's own record, even under a person's login:
 # an ask is written as the operator's login on some factories.
-_LOOM_MARKER = "<!-- loom:"
+LOOM_MARKER = "<!-- loom:"
 # Labels the factory sets and clears itself; a person adding one is not a
-# decision. A person taking the ask's own label off (loom:human, needs:*)
+# decision. A person taking the ask's own label off (needs:human, needs:*)
 # is an answer.
 _MACHINE_LABEL = re.compile(r"^(?:loom:|claim:|lane:|wait:|needs)", re.I)
 _ASK_LABEL = re.compile(r"^(?:loom:human|needs:.+|needs-operator)$", re.I)
@@ -77,7 +88,7 @@ _REF = re.compile(
 REF_LIMIT = 5
 
 REFUSAL = ("the text claims a person's decision (%r), but no person's comment or label "
-           "after the latest loom:human ask on %s records one. An unanswered ask is not a "
+           "after the latest needs:human ask on %s records one. An unanswered ask is not a "
            "decision: say the act was the brain's own judgment, or cite the person's "
            "comment by link once one exists")
 
@@ -130,7 +141,7 @@ def is_bot(who: Any) -> bool:
     return not login or login.lower().endswith("[bot]") or kind.lower() == "bot"
 
 
-def _when(value: Any) -> Optional[datetime]:
+def when(value: Any) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
     except ValueError:
@@ -143,16 +154,40 @@ def person_comment(comment: Any) -> bool:
     if not isinstance(comment, dict) or is_bot(comment.get("user") or comment.get("author")):
         return False
     body = str(comment.get("body") or "").strip()
-    return bool(body) and _LOOM_MARKER not in body and not body.startswith("/")
+    return bool(body) and LOOM_MARKER not in body and not body.startswith("/")
 
 
-def person_label(event: Any) -> bool:
+def client_login(gh: Any) -> str:
+    """The login this client writes as: the App's bot login, else
+    LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
+    installation token, which GET /user refuses), else the token's user (read
+    once and kept on the client)."""
+    login = gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", "").strip()
+    if login:
+        return login
+    if getattr(gh, "_journal_login", None) is None:
+        data = gh.rest("GET", "/user").data
+        gh._journal_login = str((data or {}).get("login") or "") if isinstance(data, dict) else ""
+    return gh._journal_login
+
+
+def _ask_removal(event: Any) -> bool:
+    """An ask label taken off by a login that does not read as a bot."""
+    return (isinstance(event, dict) and event.get("event") == "unlabeled"
+            and bool(_ASK_LABEL.match(str((event.get("label") or {}).get("name") or "")))
+            and not is_bot(event.get("actor")))
+
+
+def person_label(event: Any, automation: Iterable[str] = ()) -> bool:
     """A label a person added or took off, other than the factory's own, or
-    a person taking the ask's label (loom:human, needs:*) off."""
+    a person taking the ask's label (needs:human, needs:*) off. `automation`
+    are logins Loom writes as: a station on a personal token reads as no bot."""
     if not isinstance(event, dict) or event.get("event") not in ("labeled", "unlabeled"):
         return False
     name = str((event.get("label") or {}).get("name") or "")
     if not name or is_bot(event.get("actor")):
+        return False
+    if _login(event.get("actor"))[0].lower() in {str(a).lower() for a in automation}:
         return False
     if event.get("event") == "unlabeled" and _ASK_LABEL.match(name):
         return True
@@ -171,31 +206,63 @@ def body_decision(body: Any, since: Optional[datetime], logins: Iterable[str]) -
 
 
 def latest_ask(comments: Sequence[Any]) -> Optional[datetime]:
-    """When the newest loom:human ask among `comments` was posted."""
-    asks = [_when(c.get("created_at")) for c in comments
+    """When the newest needs:human ask among `comments` was posted."""
+    asks = [when(c.get("created_at")) for c in comments
             if isinstance(c, dict) and answer.HUMAN_MARKER in str(c.get("body") or "")]
     asks = [a for a in asks if a is not None]
     return max(asks) if asks else None
 
 
+def _clears_ask(comment: Dict[str, Any], trusted: Iterable[str]) -> bool:
+    """A bot's comment holds a line the label pass could clear an ask on, so
+    a hollow line does not erase a person's later removal."""
+    who = comment.get("user") or comment.get("author")
+    if not is_bot(who):
+        return False
+    body = str(comment.get("body") or "")
+    if ANSWER_LINE.search(body):
+        return True
+    listed = {str(t).lower() for t in trusted}
+    return bool((_TRUSTED_LINE if _login(who)[0].lower() in listed else _WORDED_LINE).search(body))
+
+
+def _after_brain_line(event: Dict[str, Any], comments: Sequence[Any],
+                      since: Optional[datetime], trusted: Iterable[str]) -> bool:
+    """The ask label came off after a bot's answer line: the label pass did
+    that, so the removal repeats the line and records no person. A personal
+    token the reader cannot name is told apart this way."""
+    at = when(event.get("created_at"))
+    for comment in comments:
+        stamp = when(comment.get("created_at")) if isinstance(comment, dict) else None
+        if (stamp is not None and at is not None and stamp <= at
+                and (since is None or stamp > since)
+                and _clears_ask(comment, trusted)):
+            return True
+    return False
+
+
 def recorded(comments: Sequence[Any], events: Sequence[Any],
-             trusted: Iterable[str] = (), ops: Iterable[str] = (), body: Any = "") -> bool:
+             trusted: Iterable[str] = (), ops: Iterable[str] = (), body: Any = "",
+             automation: Iterable[str] = ()) -> bool:
     """A person recorded a decision after the latest ask (or at all, when
     there is no ask): a person's comment, a person's label, a dashboard
     answer from an operator (bus/answer.py, posted as the App), or a
-    "## Decision (<login>, <date>)" heading in the issue body."""
+    "## Decision (<login>, <date>)" heading in the issue body. `automation`
+    is person_label's."""
     since = latest_ask(comments)
     trusted, ops = list(trusted), list(ops)
     if body_decision(body, since, person_logins(trusted, ops)):
         return True
 
     def after(item: Dict[str, Any]) -> bool:
-        stamp = _when(item.get("created_at"))
+        stamp = when(item.get("created_at"))
         return since is None or (stamp is not None and stamp > since)
 
     return (any(after(c) and (person_comment(c) or answer.trusted_answer(c, trusted, ops))
                 for c in comments if isinstance(c, dict))
-            or any(after(e) and person_label(e) for e in events if isinstance(e, dict)))
+            or any(after(e) and person_label(e, automation)
+                   and not (_ask_removal(e) and _after_brain_line(e, comments, since, trusted))
+                   for e in events if isinstance(e, dict)))
 
 
 def refs(text: Any, repo: str) -> List[Tuple[str, int]]:
@@ -228,7 +295,9 @@ def _decided_on(gh: Any, repo: str, number: int, trusted: Sequence[str],
         if err.status in (404, 410):
             return False
         raise
-    return recorded(comments, events, trusted, ops, issue.get("body"))
+    # Read only when it can matter: GET /user costs a request.
+    automation = [client_login(gh)] if any(_ask_removal(e) for e in events) else []
+    return recorded(comments, events, trusted, ops, issue.get("body"), automation)
 
 
 def check(gh: Any, repo: str, number: int, text: Any, trusted: Sequence[str] = (),
