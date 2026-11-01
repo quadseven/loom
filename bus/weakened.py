@@ -28,7 +28,7 @@ pre-check, never the only review.
 from __future__ import annotations
 
 import re
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Set, Tuple
 
 _TEST_SEGMENTS = {"test", "tests", "__tests__", "spec", "specs", "testing"}
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -154,17 +154,14 @@ def _hunks(patch: str) -> List[Tuple[List[Tuple[int, str]], List[Tuple[int, str]
     return hunks
 
 
-def _hunk_findings(path: str, removed: List[Tuple[int, str]],
-                   added: List[Tuple[int, str]], added_texts: set,
-                   removed_texts: set) -> List[str]:
-    """One hunk's findings. A loosened or skipped finding is numbered by
-    the added line, the line in the pull request's head the lane must fix;
-    a deleted assertion exists only before the change, so its finding
-    carries the number it had and quotes its text."""
+def _loosened(path: str, removed: List[Tuple[int, str]],
+              added_asserts: List[Tuple[int, str, Optional[Tuple[str, str]]]]
+              ) -> Tuple[List[str], Set[int]]:
+    """Findings for a strong assertion replaced by a weaker one on the same
+    subject, and the removed line numbers they account for."""
     found: List[str] = []
-    added_asserts = [(no, text, _assertion(text)) for no, text in added]
-    loosened_from = set()
-    loosened_to = set()
+    loosened_from: Set[int] = set()
+    loosened_to: Set[int] = set()
     for no, text in removed:
         mine = _assertion(text)
         if mine is None or _strength(mine[0]) < 2 or not mine[1]:
@@ -178,6 +175,15 @@ def _hunk_findings(path: str, removed: List[Tuple[int, str]],
                 found.append("%s:%d: assertion loosened: %s -> %s"
                              % (path, a_no, _shown(text), _shown(a_text)))
                 break
+    return found, loosened_from
+
+
+def _deleted(path: str, removed: List[Tuple[int, str]],
+             added_asserts: List[Tuple[int, str, Optional[Tuple[str, str]]]],
+             added_texts: set, loosened_from: Set[int]) -> List[str]:
+    """Findings for an assertion gone from the file: not loosened, not
+    moved, and not reworded in its hunk."""
+    found: List[str] = []
     for no, text in removed:
         mine = _assertion(text)
         if no in loosened_from or mine is None:
@@ -188,10 +194,21 @@ def _hunk_findings(path: str, removed: List[Tuple[int, str]],
                            for _, _, a_assert in added_asserts):
             continue  # reworded in its hunk; the pairing above judged it
         found.append("%s:%d: assertion deleted: %s" % (path, no, _shown(text)))
-    for no, text in added:
-        if _SKIP_RE.search(text) and _norm(text) not in removed_texts:
-            found.append("%s:%d: test skipped: %s" % (path, no, _shown(text)))
     return found
+
+
+def _hunk_findings(path: str, removed: List[Tuple[int, str]],
+                   added: List[Tuple[int, str]], added_texts: set,
+                   removed_texts: set) -> List[str]:
+    """One hunk's findings. A loosened or skipped finding is numbered by
+    the added line, the line in the pull request's head the lane must fix;
+    a deleted assertion exists only before the change, so its finding
+    carries the number it had and quotes its text."""
+    added_asserts = [(no, text, _assertion(text)) for no, text in added]
+    found, loosened_from = _loosened(path, removed, added_asserts)
+    found += _deleted(path, removed, added_asserts, added_texts, loosened_from)
+    return found + ["%s:%d: test skipped: %s" % (path, no, _shown(text)) for no, text in added
+                    if _SKIP_RE.search(text) and _norm(text) not in removed_texts]
 
 
 def find(entries: Sequence[Mapping[str, object]]) -> List[str]:
