@@ -6051,6 +6051,15 @@ exit %d
                           for name in ("T042-fix-the-thing.log", "T043-fix-the-thing.log"))
         self.assertEqual(logs.count("base-check-hit"), 3)  # two first-run checks, final only on second
 
+    def test_the_red_rerun_guard_reads_the_flag_not_the_verdict_file(self):
+        # Elder on PR 2406: the guard read the verdict file a second time, and
+        # a hit overwrote BASELINE_EXIT, so a green written by another lane
+        # after this lane's fresh red could hide a real red base.
+        text = RUNNER.read_text()
+        body = re.search(r"^prepare_validation\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        self.assertEqual(body.count("base_verdict_read"), 1, "read once, into cached_verdict")
+        self.assertIn('[ "$BASELINE_EXIT" -ne 0 ] && [ "$cached_verdict" -eq 0 ]', body)
+
     def test_the_interpreter_identity_is_the_resolved_line_not_a_second_run(self):
         # interp is already "path version"; the key must not run it again, or
         # its error text (which names the working directory) splits the key.
