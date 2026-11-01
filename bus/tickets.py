@@ -540,6 +540,21 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Every review thread a fix brief lists needs an answer (2026-10-31: about two
+# thirds of open threads on lane pull requests were findings no round
+# answered, so the merge gate held them). The runner posts each entry after
+# the push and names any listed thread left without one (lanes/run_lane.sh
+# unanswered_threads).
+REPLIES_NOTE = (
+    "Answer every review thread listed below: write .loom/replies.json as a JSON "
+    "array with one {\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
+    "object per thread (THREAD_ID is the id after `### Thread`). When this round's "
+    "change fixes the finding, set resolve true and say in the reply what changed "
+    "and where. When you do not fix it, set resolve false and give a concrete reason "
+    "that points at the code. A thread answered in `.loom-answers/` needs no entry "
+    "here. The runner posts the entries after the push and reports every listed "
+    "thread left without an answer.")
+
 # Where a run that timed out or hit a limit after editing left its edits (lanes/run_lane.sh
 # preserve_timedout), as the failure reason names it.
 TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
@@ -710,11 +725,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
                  "need and keep the rest of the work.\n\n%s\n\n"
-                 "You may also write .loom/replies.json as a JSON array of "
-                 "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
-                 "objects; the runner posts these after pushing and resolves threads marked "
-                 "true.\n\n%s\n"
-                 % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
+                 "%s\n\n%s\n"
+                 % (fix.pr, fix.branch, ANSWER_NOTE, REPLIES_NOTE, fix.findings))
     return text
 
 
@@ -825,6 +837,72 @@ def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
             "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
             "# T%d: Verify %s" % (number, title), ""]
     return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted, verify_template(texts))
+
+
+REVIEW_BRIEF = """\
+## Review
+
+This is a review run, not a build. Change no code, and open no pull request.
+A lane never moves a label: the station reads what you write and posts the
+verdict itself.
+
+Your work directory is pull request #%d's head branch, checked out by the
+runner; the Head-Sha: line above names the commit under review. The change
+is the diff against the base branch: read it with
+`git diff origin/%s...HEAD` (its commits are `git log origin/%s..HEAD`) and
+read the files around it in the tree. This run has no network: the GitHub
+API and every other host are out of reach, so do not try them.
+
+Judge the change the way the Elder review (the review check on the pull
+request) would: against the ticket below, and on the code itself -
+correctness, security, data loss, broken contracts, and tests missing for
+changed behavior. Then write review.json in the top of your work directory:
+
+{"blocking": [{"file": "<path>", "line": <line number in the file, or null>, "finding": "<what is wrong and why>"}],
+ "notes": [{"file": "<path>", "line": <line number in the file, or null>, "finding": "<what is worth saying>"}],
+ "summary": "<one or two sentences: what the change does and your verdict>"}
+
+"blocking" holds only findings that would fail a review on their own -
+critical or high severity: a bug, a security hole, data loss, a broken
+contract. Everything else worth saying goes in "notes"; notes never block.
+When the change is sound, "blocking" is an empty list. The station posts
+your verdict on the pull request in the Elder's markings shape, and the
+merge gate reads it for this head commit while the Elder's own route is
+down.
+"""
+
+
+def review_name(repo: str, number: int, stamp: int) -> str:
+    """The name of a review brief; the stamp keeps each run's name its own."""
+    return "%s-review-%d" % (ticket_name(repo, number), stamp)
+
+
+def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
+                        pr_number: int, head_branch: str, base_branch: str,
+                        head_sha: str) -> str:
+    """The brief that hands a codex lane slot one pull request to review
+    while the Elder's model route is degraded (loom#2142): the tree is the
+    pull request's own branch, no branch is pushed, and the result is
+    review.json, not a pull request. The Model: line pins the slot to
+    gpt-6-luna, the only model the codex lanes run."""
+    number = int(issue["number"])
+    title = " ".join(str(issue.get("title") or "").split())
+    head = ["# Brief: %s" % review_name(repo, number, stamp), "",
+            "Repo: %s" % repo,
+            "Branch: %s" % head_branch,
+            "Lane: %s" % lane,
+            "Issue: %s#%d" % (repo, number),
+            "Review-PR: %d" % pr_number,
+            "Head-Sha: %s" % head_sha,
+            "Base: %s" % base_branch,
+            "Model: gpt-6-luna",
+            "Deliverable: review", "",
+            "# T%d: Review pull request #%d: %s" % (number, pr_number, title), ""]
+    text = "\n".join(head) + "\n" + REVIEW_BRIEF % (pr_number, base_branch, base_branch)
+    body = str(issue.get("body") or "").rstrip("\n")
+    if body:
+        text += "\n## The ticket this change serves\n\n%s\n" % body
+    return text
 
 
 def _login(value: Any) -> str:

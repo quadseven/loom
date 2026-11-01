@@ -17,6 +17,7 @@ import subprocess
 from typing import Any, Dict, List, Tuple
 
 from . import brain, tickets
+from .kinds import HUMAN_KINDS
 from .text import SECRET_RE, scrub_paths
 from .github import GitHub
 
@@ -323,8 +324,8 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
                 raise Invalid("ask is longer than %d characters" % ASK_MAX)
             brain._check_written_text(ask)
             kind = str(answer.get("kind") or "").strip().lower()
-            if kind not in brain.HUMAN_KINDS:
-                raise Invalid("kind is not one of %s" % ", ".join(brain.HUMAN_KINDS))
+            if kind not in HUMAN_KINDS:
+                raise Invalid("kind is not one of %s" % ", ".join(HUMAN_KINDS))
             return "human", {"ask": "Kind: %s\n%s" % (kind, ask)}
         if action != "brief":
             raise Invalid("action is not brief, human or skip")
@@ -378,7 +379,7 @@ def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str) -> 
     elif action == "human":
         # The rewrite model only proposes it: free models labelled factory
         # work as person-only (GitHub access as "a credential", a Datadog
-        # monitor while Datadog is off), and every loom:human lands in the
+        # monitor while Datadog is off), and every needs:human lands in the
         # operator's digest. The brain decides; the issue stays loom:triage.
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
         print("rewrite: %s#%d proposed as person-only, left to the brain: %s"

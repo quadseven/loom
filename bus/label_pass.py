@@ -2,7 +2,7 @@
 step that is over (loom#2024).
 
 Issues kept labels that said two things at once: a ticket with loom:answered
-beside loom:human, needs-brain beside loom:human and needs:<login>,
+beside needs:human, needs-brain beside needs:human and needs:<login>,
 loom:triage on an issue long since handled, a lane label days after its lane
 answered no change. Every reader then saw two states. The station's
 clean_labels step reads each repo's open issues at most once every EVERY
@@ -11,12 +11,20 @@ seconds and, per issue, removes:
 - every Loom state label (loom:queued ... loom:verified) but one, keeping the
   newest the station set (its labeled events by a station login; else the
   newest by anyone; else the furthest state);
-- needs-brain, when loom:human or a needs:<login> label says a person holds
+- needs-brain, when needs:human or a needs:<login> label says a person holds
   the issue (the brain has nothing to review until they act);
 - loom:triage, once the issue is a loom:ticket or closed (triage is done);
 - every lane:* label of a ticket at loom:answered: its lane's run ended with
   an answer and no pull request (no change), so no lane holds it until the
-  brain briefs it again, which sets a lane label anew.
+  brain briefs it again, which sets a lane label anew;
+- every ask label once the answer is in the ticket (bus/ask_state.py), and
+  needs-brain goes on when that answer names a command someone must run. An
+  ask waiting on another ticket gets wait:blocked.
+
+An old ask label (bus/labels.py) moves to needs:human only on a ticket this
+pass writes to anyway, so no pass relabels on its own, PER_RUN bounds every
+write, and nothing here posts a comment. A claimed ticket's ask is its
+holder's.
 
 A body Part of #N that names a different issue than the sub-issue parent is
 not changed: it is one health note, kept in the step's state file and said
@@ -31,7 +39,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence
 
+from . import ask_state
 from .brain import STATES
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, OLD_HUMAN_LABELS, needs_human
 
 STATE_LABELS = tuple("loom:" + s for s in STATES)
 NEEDS_BRAIN = "needs-brain"
@@ -40,6 +50,9 @@ TRIAGE = "loom:triage"
 TICKET = "loom:ticket"
 ANSWERED = "loom:answered"
 LANE_PREFIX = "lane:"
+CLAIM_PREFIX = "claim:"
+WAIT_PREFIX = "wait:"
+WAIT_BLOCKED = "wait:blocked"
 NEEDS_LOGIN_RE = re.compile(r"^needs:[A-Za-z0-9][A-Za-z0-9-]*$")
 PART_OF_RE = re.compile(r"^Part of #(\d+)\s*$", re.M)
 PARENT_URL_RE = re.compile(r"/issues/(\d+)(?:[/?#]|$)")
@@ -57,6 +70,7 @@ class Removal(NamedTuple):
 class Plan(NamedTuple):
     remove: List[Removal]
     note: str          # "" or the one health note for the issue
+    add: Sequence[str] = ()
 
 
 def names_of(issue: Dict[str, Any]) -> List[str]:
@@ -119,11 +133,31 @@ def _held_removals(issue: Dict[str, Any], names: List[str]) -> List[Removal]:
     return found
 
 
+def _ask_changes(issue: Dict[str, Any], names: List[str], events: Iterable[Any],
+                 comments: Sequence[Any], trusted: Iterable[str], ops: Iterable[str],
+                 blockers: Iterable[int]) -> Plan:
+    """What the ask's answer or wait changes on the ticket."""
+    events, trusted, ops = list(events or []), list(trusted), list(ops)
+    said = ask_state.answer_of(issue, comments, events, trusted, ops)
+    if said is not None:
+        return Plan([Removal(n, "the answer is in the ticket") for n in names
+                     if n in HUMAN_LABELS], "",
+                    [NEEDS_BRAIN] if ask_state.names_command(said) else [])
+    if ask_state.state(issue, comments, events, trusted, ops, blockers) == ask_state.WAITING \
+            and not any(n.startswith(WAIT_PREFIX) for n in names):
+        return Plan([], "", [WAIT_BLOCKED])
+    return Plan([], "", [])
+
+
 def plan(issue: Dict[str, Any], events: Optional[Iterable[Any]] = None,
-         station: Iterable[str] = ()) -> Plan:
-    """The labels to remove from `issue` and its health note. `events` (the
-    issue's events, oldest first) is read only when it carries two or more
-    state labels; pass them then."""
+         station: Iterable[str] = (), comments: Optional[Sequence[Any]] = None,
+         trusted: Iterable[str] = (), ops: Iterable[str] = (),
+         blockers: Iterable[int] = ()) -> Plan:
+    """The labels to change on `issue` and its health note. `events` (the
+    issue's events, oldest first) is read only when needs_events says so;
+    pass them then. `comments` are an ask's comments, with who may answer
+    and the open issues its Blocked on section names; without them the ask
+    is not judged."""
     names = names_of(issue)
     remove = _state_removals(names, events, station)
     gone = {r.label for r in remove}
@@ -132,9 +166,22 @@ def plan(issue: Dict[str, Any], events: Optional[Iterable[Any]] = None,
     if left == [ANSWERED]:
         remove += [Removal(n, "its lane answered no change") for n in names
                    if n.startswith(LANE_PREFIX)]
-    return Plan(remove, parent_mismatch(issue))
+    add: List[str] = []
+    claimed = any(n.startswith(CLAIM_PREFIX) for n in names)
+    if needs_human(names) and comments is not None and not claimed:
+        asked = _ask_changes(issue, names, events or [], comments, trusted, ops, blockers)
+        remove += asked.remove
+        add += asked.add
+    gone = {r.label for r in remove}
+    old = [n for n in names if n in OLD_HUMAN_LABELS and n not in gone]
+    if old and (remove or add) and not claimed:
+        add.append(NEEDS_HUMAN)
+        remove += [Removal(n, "needs:human replaces it") for n in old]
+    return Plan(remove, parent_mismatch(issue), add)
 
 
 def needs_events(issue: Dict[str, Any]) -> bool:
-    """Whether plan() needs the issue's events (two or more state labels)."""
-    return sum(1 for n in names_of(issue) if n in STATE_LABELS) > 1
+    """Whether plan() needs the issue's events: two or more state labels,
+    or an ask."""
+    names = names_of(issue)
+    return sum(1 for n in names if n in STATE_LABELS) > 1 or needs_human(names)

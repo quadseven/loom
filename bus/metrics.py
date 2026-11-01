@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterator, List, Sequence
 from . import audit, brain, naming, proof, quiet
 from .github import GitHub, GitHubError, auth_from_env
 from .factory import lacks_test
-from .labels import LANES
+from .labels import HUMAN_LABELS, LANES, needs_human
 
 WAIT_STATES = ("queued", "briefed", "running", "pr", "failed", "merged", "shipped", "verified")
 WAIT_WINDOW = 7 * 86400
@@ -555,8 +555,8 @@ class Collector:
                 and any(state in labels for state in WORKABLE)):
             total.workable_repos.add(repo)
         created = stamp(issue.get("created_at"))
-        if created >= self.since and ("needs-operator" in labels or
-                self.label_time(repo, issue, "needs-operator")):
+        if created >= self.since and (needs_human(labels) or any(
+                self.label_time(repo, issue, name) for name in HUMAN_LABELS)):
             total.asks += 1
         if ("loom:urgent" in labels and issue.get("state") == "open"
                 and self._urgent_regression(repo, issue, created)):

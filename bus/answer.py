@@ -5,7 +5,7 @@ dashboard posts ONE comment on the issue as the Loom GitHub App:
 
     <!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>. <note>
 
-takes off loom:human and needs:<login> (and needs-operator), and adds
+takes off needs:human and needs:<login> (and needs-operator), and adds
 loom:answer-pending until the station has read it. This module is the shared
 part: the answer options an ask offers (derived from its words, no model),
 the comment's format, and how the station reads one back.
@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Seq
 
 ANSWER_MARKER = "<!-- loom:answer v1 -->"
 # Equal to bus.brain.HUMAN_MARKER (a test holds them together): the comment a
-# loom:human ask is written in. Not imported, so bus.brain can import this.
+# needs:human ask is written in. Not imported, so bus.brain can import this.
 HUMAN_MARKER = "<!-- loom:human v1 -->"
 # Not loom:answered: that is a ticket state (a runner's answer, docs/BRAIN.md).
 ANSWERED_LABEL = "loom:answer-pending"
@@ -34,9 +34,7 @@ NOTE_MAX = 1000
 CHOICE, NUMBER, TEXT = "choice", "number", "text"
 MERGE, HOLD = "Merge", "Hold"
 NOT_NOW = "Not now"
-# Kinds of loom:human ask (bus.brain.HUMAN_KINDS) a person settles by doing
-# the thing and saying so.
-DONE_KINDS = ("account", "physical", "hardware")
+from .kinds import DONE_KINDS
 
 
 class Options(NamedTuple):
