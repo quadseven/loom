@@ -33,8 +33,9 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
-# The only models an opencode-go lane may run: OpenCode Go's free models and
-# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# The only models an opencode-go lane may run: OpenCode Go's free models, the
+# paid ones with an allowance of at least 10,000 requests per 5 hours, and the
+# strong models bus/model_pick.py runs under its usage guard.
 # Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
 # 2026-10-23 (operator: "why the hell are we using the most expensive
 # models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
@@ -48,6 +49,8 @@ OPENCODE_GO_MODELS: Tuple[str, ...] = (
     "opencode-go/mimo-v2.6-flash",              # 30,100
     "opencode-go/deepseek-v4.1-flash",          # 34,670
     "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+    "opencode-go/gpt-6-luna",                   # 5,640; strong tier, guarded
+    "opencode-go/claude-haiku-5-5",             # 5,133; strong tier, guarded
 )
 # What a ticket's Model: line naming another opencode-go model runs instead.
 OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
@@ -733,7 +736,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = ()) -> str:
+                  linked: Sequence[str] = (), demoted_models: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -752,6 +755,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             # The Finding-<id> prefix also prevents a field() match in the runner.
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
+    if demoted_models:
+        out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":

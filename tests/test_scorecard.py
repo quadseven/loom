@@ -34,7 +34,8 @@ REPO = "example-owner/example-app"
 BOT = "grug-tribe"
 LANES_LOGIN = "loom-lanes[bot]"
 # The lanes the audit's damaging verdicts reach at the default threshold of 3.
-DEMOTED_AT_3 = {"claude", "codex", "spark", "opencode-go", "free"}
+# The audit's opencode-go records name their models, which each fall short.
+DEMOTED_AT_3 = {"claude", "codex", "spark", "free"}
 
 
 def iso(at):
@@ -108,6 +109,48 @@ class AuditCounts(unittest.TestCase):
             scorecard.main(["clear", "codex-2", "--state", state])
         self.assertIn("cleared lane codex-2", out.getvalue())
         self.assertNotIn("codex", card(state=state).demoted())
+
+    def test_a_demotion_on_a_picking_lane_binds_to_the_model(self):
+        got = card()
+        got.data["records"] = {
+            "r%d" % i: {"lane": lane, "model": model, "at": NOW - 60, "review": scorecard.BAD_WORK}
+            for i, (lane, model) in enumerate((("opencode-go", "opencode-go/beam-free"),
+                                               ("opencode-go-2", "opencode-go/beam-free"),
+                                               ("opencode-go", "opencode-go/beam-free"),
+                                               ("opencode-go-3", "opencode-go/gpt-6-luna")))}
+        self.assertEqual(quiet(got.demote), ["model:opencode-go/beam-free"])
+        slots = scorecard.demoted_slots(got.demoted(), ["opencode-go", "opencode-go-2", "opencode-go-3"])
+        self.assertEqual(slots, {})
+        self.assertTrue(got.clear("model:opencode-go/beam-free"))
+        self.assertEqual(got.demoted(), {})
+
+    def test_failed_proof_audits_still_demote_a_picking_lane(self):
+        got = card()
+        got.data["audits"] = {"a%d" % i: {"lane": "opencode-go", "at": NOW - 60} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_record_with_no_model_counts_against_a_picking_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "opencode-go", "model": "unknown", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_slot_that_does_not_pick_is_still_demoted_by_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "codex", "model": "gpt-6-luna", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["codex"])
+
+    def test_the_brief_line_names_demoted_models_or_says_the_card_is_unreadable(self):
+        state = tempfile.mkdtemp()
+        got = card(state=state)
+        self.assertEqual(scorecard.demoted_models_line(got), "none")
+        got.data["demoted"]["model:opencode-go/beam-free"] = {"why": "x"}
+        got.data["demoted"]["codex"] = {"why": "y"}
+        self.assertEqual(scorecard.demoted_models_line(got), "opencode-go/beam-free")
+        with open(os.path.join(state, scorecard.FILE), "w") as out:
+            out.write("{broken")
+        self.assertEqual(scorecard.demoted_models_line(card(state=state)), "unreadable")
 
     def test_demoted_lanes_cover_their_slots(self):
         slots = scorecard.demoted_slots({"codex": "x", "free": "y", "opencode-go": "z"},
@@ -226,7 +269,7 @@ class Table(unittest.TestCase):
         self.assertEqual([r["lane"] for r in views.parse_lane_rows(body)], ["codex"])
         page = views.render_lanes({"lanes": [], "scorecard": rows})
         self.assertIn("Scorecard", page)
-        self.assertIn("5 demoted", page)
+        self.assertIn("4 demoted", page)
         # The demoted lanes come first.
         self.assertIn('<tbody><tr class="scorecard-demoted"><th scope="row">claude', page)
 

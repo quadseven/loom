@@ -783,11 +783,11 @@ on hard work):
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
   public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
   lanes, openrouter and workersai, or on a public repo zen and zai (the
-  operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
+  operator wants every free tier used up, 2026-10-19); then opencode-go (its strong tier; opencode-go-4 on public repos only) or codex; an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (public repos only)
-  or codex, never a free lane. A hard ticket a spark
+- Hard: a spark slot first, then anthropic, claude, agy (public repos only),
+  opencode-go (its strong tier) or codex, never a free lane. A hard ticket a spark
   fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.
