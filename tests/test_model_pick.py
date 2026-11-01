@@ -3,6 +3,7 @@ paid model only under the budget."""
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bus import model_pick, tickets
@@ -165,17 +166,43 @@ class ModelPickTest(unittest.TestCase):
             self.assertLess(runs, 1000, "no budget stopped the paid runs")
         limit = model_pick.GO_PAID[MIMO][0]
         spent = runs * model_pick.RUN_RESERVE
-        self.assertLess(spent, limit * model_pick.BUDGET_SHARE + model_pick.RUN_RESERVE)
+        self.assertLessEqual(spent, limit * model_pick.MODEL_SHARE)
         self.assertGreater(runs, 0)
         self.assertEqual(self.pick(private=True).model, None)
 
     def test_the_budget_is_one_plan_across_paid_models(self):
         self.free_models_down()
-        share = model_pick.BUDGET_SHARE * model_pick.GO_PAID[MUSE][0]
+        share = model_pick.PLAN_SHARE * model_pick.GO_PAID[MUSE][0]
         model_pick.settle(self.home, self.now - 60, MUSE,
                           [json.dumps({"type": "step_finish", "part": {"tokens": {"output": 300}}})]
                           * int(share * 0.99) + ["x"], reserve=0)
         self.assertEqual(self.pick(private=True).model, None)
+
+    def test_a_verify_run_never_gets_a_paid_model(self):
+        self.free_models_down()
+        got = model_pick.pick("opencode-go", "slot", False, "fake-key", self.home, self.now,
+                              ENV, self.provider, paid_ok=False)
+        self.assertIsNone(got.model)
+        self.assertFalse(model_pick.budget_file(self.home).exists())
+
+    def test_the_billing_period_runs_from_renewal_to_renewal(self):
+        def stamp(*day):
+            return datetime(*day, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(model_pick.period(stamp(2026, 11, 1)), (stamp(2026, 10, 28), stamp(2026, 11, 28)))
+        self.assertEqual(model_pick.period(stamp(2026, 11, 28)), (stamp(2026, 11, 28), stamp(2026, 12, 28)))
+        self.assertEqual(model_pick.period(stamp(2027, 1, 2)), (stamp(2026, 12, 28), stamp(2027, 1, 28)))
+
+    def test_spending_follows_the_calendar_to_the_renewal(self):
+        self.free_models_down()
+        start, end = model_pick.period(self.now)
+        self.now = start + (end - start) * 0.05
+        monthly = model_pick.GO_PAID[MIMO][2]
+        allowed = (model_pick.PLAN_SHARE * 0.05 + model_pick.PACE_SLACK) * monthly
+        model_pick._spend(self.home, start + 1, MIMO, int(allowed))
+        self.assertIsNone(self.pick(private=True).model)
+        self.now = start + (end - start) * 0.2
+        self.free_models_down()
+        self.assertEqual(self.pick(private=True).model, MIMO)
 
     def test_the_budget_refills_as_the_window_passes(self):
         self.free_models_down()

@@ -2,8 +2,9 @@
 
 Free models come and go without notice, so no slot pins one: each run reads
 the live lists and takes the first free model that answers. Paid Go models
-run only when no free model works, under a budget below the published limits
-(on 2026-10-23 one pinned paid model spent the monthly allowance in hours).
+run only on build work when no free model works, paced to last until the
+plan renews and kept below the published limits (on 2026-10-23 one pinned
+paid model spent the monthly allowance in hours).
 
 A model that fails is paused for every slot until its reset, so no slot asks
 it again. Two pauses cover a whole group: the plan's limit covers every paid
@@ -24,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
@@ -62,10 +64,18 @@ GO_PAID: Dict[str, Tuple[int, int, int]] = {
     "opencode-go/muse-spark-1.3-contributor": (49_075, 122_740, 245_480),
 }
 WINDOWS = (5 * 3600, 7 * 86400, 30 * 86400)
-# The share of each published limit paid runs may spend. Every Go model bills
-# one plan, so requests are counted as a share of their own model's limit.
-# The key also serves other callers, who spend the rest.
-BUDGET_SHARE = 0.4
+# The operator wants the plan used, evenly, by its renewal. Every Go model
+# bills one plan, so requests count as a share of their own model's limit.
+# PLAN_SHARE of each published limit is the most all paid runs may spend (the
+# key also serves other callers, who spend the rest), and MODEL_SHARE the most
+# one model may, in any window. Within the billing period, spending also
+# follows the calendar: PLAN_SHARE of the monthly limit times the part of the
+# period gone, plus PACE_SLACK, so no burst spends the month early.
+PLAN_SHARE = 0.8
+MODEL_SHARE = 0.5
+PACE_SLACK = 0.01
+# The day of the month the plan renews, in UTC.
+RENEWAL_DAY = 28
 # Requests a paid run holds from its start, so slots starting together cannot
 # overrun the budget. A run that dies keeps its hold.
 RUN_RESERVE = 500
@@ -331,11 +341,14 @@ def _entries(home: Path) -> Iterable[Mapping[str, Any]]:
                 yield entry
 
 
-def spent(home: Path, now: float, model: str) -> Tuple[float, ...]:
-    """The share of the plan spent in each window, in units of each entry's
-    own model's limit; `model`'s limits stand in for a model since removed."""
+def spent(home: Path, now: float, model: str, only: Optional[str] = None) -> Tuple[float, ...]:
+    """The share spent in each window by the plan, or by the model `only`, in
+    units of each entry's own model's limit; `model`'s limits stand in for a
+    model since removed."""
     shares = [0.0] * len(WINDOWS)
     for entry in _entries(home):
+        if only and entry.get("model") != only:
+            continue
         limits = GO_PAID.get(str(entry.get("model")), GO_PAID[model])
         age = now - float(entry.get("at") or 0)
         for i, span in enumerate(WINDOWS):
@@ -344,10 +357,33 @@ def spent(home: Path, now: float, model: str) -> Tuple[float, ...]:
     return tuple(shares)
 
 
-def _has_room(home: Path, now: float, model: str) -> bool:
+def period(now: float, day: int = RENEWAL_DAY) -> Tuple[float, float]:
+    """The start and end of the billing period holding `now`."""
+    today = datetime.fromtimestamp(now, timezone.utc)
+    first = datetime(today.year, today.month, day, tzinfo=timezone.utc)
+    if first.timestamp() > now:
+        first = datetime(today.year - (today.month == 1), today.month - 1 or 12, day, tzinfo=timezone.utc)
+    last = datetime(first.year + (first.month == 12), first.month % 12 + 1, day, tzinfo=timezone.utc)
+    return first.timestamp(), last.timestamp()
+
+
+def _period_spent(home: Path, start: float, model: str) -> float:
+    monthly = len(WINDOWS) - 1
+    return sum(float(e.get("requests") or 0) / GO_PAID.get(str(e.get("model")), GO_PAID[model])[monthly]
+               for e in _entries(home) if float(e.get("at") or 0) >= start)
+
+
+def _has_room(home: Path, now: float, model: str, day: int = RENEWAL_DAY) -> bool:
     limits = GO_PAID[model]
-    return all(share + RUN_RESERVE / limits[i] <= BUDGET_SHARE
-               for i, share in enumerate(spent(home, now, model)))
+    plan = spent(home, now, model)
+    own = spent(home, now, model, only=model)
+    for i, limit in enumerate(limits):
+        run = RUN_RESERVE / limit
+        if plan[i] + run > PLAN_SHARE or own[i] + run > MODEL_SHARE:
+            return False
+    start, end = period(now, day)
+    paced = PLAN_SHARE * (now - start) / (end - start) + PACE_SLACK
+    return _period_spent(home, start, model) + RUN_RESERVE / limits[-1] <= paced
 
 
 def _spend(home: Path, now: float, model: str, requests: int) -> None:
@@ -356,9 +392,9 @@ def _spend(home: Path, now: float, model: str, requests: int) -> None:
         out.write(json.dumps({"at": now, "model": model, "requests": requests}) + "\n")
 
 
-def _reserve(home: Path, now: float, model: str) -> bool:
+def _reserve(home: Path, now: float, model: str, day: int = RENEWAL_DAY) -> bool:
     with _locked(home):
-        if not _has_room(home, now, model):
+        if not _has_room(home, now, model, day):
             return False
         _spend(home, now, model, RUN_RESERVE)
     return True
@@ -395,10 +431,14 @@ def settle(home: Path, now: float, model: str, events: Iterable[str],
 
 
 def pick(lane: str, slot: str, private: bool, key: str, home: Path, now: float,
-         env: Mapping[str, str], opener: Opener = _open) -> Pick:
-    """The model of one run: the first free model that answers, else the first
-    paid model the budget allows, else None and when to ask again."""
+         env: Mapping[str, str], opener: Opener = _open, paid_ok: bool = True) -> Pick:
+    """The model of one run: the first free model that answers, else, for
+    build work (`paid_ok`), the first paid model the budget allows, else None
+    and when to ask again."""
     free, paid = candidates(lane, private, _lists(home, now, env, opener))
+    if not paid_ok:
+        paid = []
+    day = int(env.get("LOOM_GO_RENEWAL_DAY") or RENEWAL_DAY)
     held = _pauses(home, now)
     skipped: List[str] = []
     waits: List[float] = []
@@ -425,7 +465,7 @@ def pick(lane: str, slot: str, private: bool, key: str, home: Path, now: float,
     for model in paid:
         if not usable(model):
             continue
-        if _reserve(home, now, model):
+        if _reserve(home, now, model, day):
             return Pick(model, "paid", "; ".join(["no free model works"] + skipped))
         skipped.append("%s: budget spent" % model)
     if not free and not paid:
@@ -472,9 +512,10 @@ def main(argv: Sequence[str]) -> int:
     home = Path(os.environ.get("LOOM_HOME") or os.path.expanduser("~/loom"))
     now = time.time()
     command = argv[0] if argv else ""
-    if command == "pick" and len(argv) == 4:
+    if command == "pick" and len(argv) == 5:
         key = sys.stdin.readline().strip()
-        got = pick(argv[1], argv[2], argv[3] == "true", key, home, now, os.environ)
+        got = pick(argv[1], argv[2], argv[3] == "true", key, home, now, os.environ,
+                   paid_ok=argv[4] == "true")
         if got.model is None:
             print("\t%d\t%s" % (got.until, got.note))
             return 3
@@ -492,7 +533,7 @@ def main(argv: Sequence[str]) -> int:
     if command == "settle" and len(argv) == 2:
         settle(home, now, argv[1], sys.stdin)
         return 0
-    print("usage: python3 -m bus.model_pick pick <lane> <slot> <private> | status <lane> "
+    print("usage: python3 -m bus.model_pick pick <lane> <slot> <private> <paid-ok> | status <lane> "
           "| failed <model> | settle <model>", file=sys.stderr)
     return 2
 

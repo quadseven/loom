@@ -1501,9 +1501,13 @@ cannot query the viewer or any other local service.
   shared limit. With nothing to keep, the brief stays in the inbox and the next
   pass picks another model, at most 3 times. A slot with every model paused
   reports unavailable until the first reset.
-- Paid Go runs use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on
-  public repos, Muse Spark 1.3 Contributor) and stop at 40% of the published 5
-  hour, weekly and monthly limits, counted in `state/usage/go-budget.jsonl`.
+- Paid Go runs serve build work only, never a verify, answer or review run,
+  and use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on public
+  repos, Muse Spark 1.3 Contributor). All paid runs stop at 80% of each
+  published 5 hour, weekly and monthly limit, one model at 50%, and spending
+  within the billing period follows the calendar to the renewal (day 28,
+  `LOOM_GO_RENEWAL_DAY`), so the plan lasts the month. Spending is counted in
+  `state/usage/go-budget.jsonl`.
   Each run holds 500 requests until it settles; output and hidden reasoning
   past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
   because of its hidden reasoning. Extra usage stays off.

@@ -4388,6 +4388,16 @@ echo fixed > fix.txt
         self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
 
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_verify_run_waits_rather_than_spend_a_paid_model(self):
+        self.pause_models("opencode-go/beam-free", "opencode-go/iceman-contributor-free", "zen-free")
+        inbox, result = self.api_lane("opencode-go", extra="Deliverable: verify\n", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.runs(), [])
+        self.assertTrue(self.beat("opencode-go")["available"])
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_slot_with_every_model_paused_takes_nothing_and_says_so(self):
         self.pause_models("zen-free", "opencode/flint-40b-free")
         inbox, result = self.api_lane("zen", **self.pick_env())

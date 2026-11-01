@@ -1832,8 +1832,10 @@ pick_refused() {
 # 0 with MODEL set for this run; the key goes to the picker on stdin. A run
 # reaches here with the slot's pin in MODEL, which it replaces.
 pick_run_model() {
-  local out
-  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" 2>> "$LOG")"; then
+  local out paid_ok=true
+  # Paid models run on build work only: a verify, answer or review run waits.
+  [ -z "$DELIVERABLE" ] || paid_ok=false
+  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$paid_ok" 2>> "$LOG")"; then
     pick_refused "$out"
     return 1
   fi
@@ -3668,6 +3670,11 @@ for BRIEF in "$INBOX"/*.md; do
   MODEL_PICKED="" MODEL_KIND="" MODEL_NOTE=""
   if picks_model; then
     if ! pick_run_model; then
+      # The paid models may still serve build work: only that kind of brief
+      # holds the slot.
+      if [ -n "$DELIVERABLE" ]; then
+        park "$BRIEF" "limit: no free model can run: $PICK_WHY" limit; continue
+      fi
       LIMITED=1
       LIMIT_WHY="no model can run: $PICK_WHY"
       heartbeat false "limit: $LIMIT_WHY; unavailable until $(utc "$PICK_UNTIL")" "$PICK_UNTIL"
