@@ -27,10 +27,9 @@ started. The list is rewritten in place only when it changes. A list that
 empties says "none"; after CLEAR_AFTER of none the issue closes with one
 cleared note (edited, not reposted, on a later clear), and a violation that
 returns reopens the same issue. A repo whose facts could not be read keeps
-its issue as it is. Older per-violation issues of those kinds close with no
-comment, their note at the foot of the body, FOLD_MAX a pass and never one
-rewritten into a ticket; the one comment is a running count on the tracking
-issue of their repo, edited in place.
+its issue as it is. Older per-violation issues of those kinds close with a
+comment saying why, FOLD_MAX a pass and never one rewritten into a ticket; a
+running count on the tracking issue of their repo is edited in place.
 Adding an invariant is one function in INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
@@ -221,6 +220,8 @@ ROLL_LABELS = [LABEL]
 # and this cap bounds those mails. FOLD_SUMMARY on the tracking issue counts
 # them, edited in place.
 FOLD_MAX = 2
+# One close's writes (its note and its PATCH) and the count on the tracking issue.
+FOLD_WRITES = 3
 FOLD_MARKER = "<!-- loom:invariant roll-folded -->"
 FOLD_SUMMARY = "%d older per-violation issues closed into this list so far (last at %s)."
 FOLD_COUNT_RE = re.compile(r"^([0-9]+) older per-violation issues", re.M)
@@ -1748,7 +1749,7 @@ class Filer:
 
     def _settle(self, current: Dict[str, Breach]) -> None:
         """Close the open issue of each gone SETTLES breach whose subject
-        settled for good, its note at the foot of the body. Walks the listing,
+        settled for good, its note as a comment. Walks the listing,
         not the local map, so a breach filed before the map or gone while the
         station was down settles too. run() calls it before filing anything,
         so the pass's writes go here first (loom#2451: filing spent them every
@@ -1760,7 +1761,7 @@ class Filer:
             if listing.get(key) is None or listing[key] in self._listed_closed:
                 self.subjects.pop(key, None)
         for key, number in listing.items():
-            if self.writes + 2 > WRITES_MAX or self.folds >= FOLD_MAX:
+            if self.writes + FOLD_WRITES > WRITES_MAX or self.folds >= FOLD_MAX:
                 return
             invariant = key.split("/", 1)[0]
             if (key in current or invariant not in SETTLES or key in self._rolls

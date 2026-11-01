@@ -33,6 +33,7 @@ SAID = {
 _STATE_CALLS = ("close", "close_pull", "reopen")
 _MUTATION = re.compile(r"\b(closeIssue|reopenIssue|closePullRequest|reopenPullRequest)\b")
 # A shell close: gh issue/pr close or reopen, or a state field on a gh api or curl.
+_GRAPHQL_STATE = re.compile(r"\bstate:\s*(CLOSED|OPEN)\b")
 _SHELL_VERB = re.compile(r"\bgh\s+(?:issue|pr)\s+(?:close|reopen)\b")
 _SHELL_FIELD = re.compile(r"""(?:\bstate=(?:closed|open)\b|["']?state["']?\s*:\s*["']?(?:closed|open)\b)""")
 
@@ -82,17 +83,30 @@ def direct_writes(source):
     for scope, assigned in _scopes(tree):
         for node in ast.walk(scope):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr in ("rest", "_rest") \
-                    and any(_names_state(arg, assigned) for arg in node.args[2:]):
+                    and node.func.attr != "guard" and _sends_state(node, assigned):
+                found.add(node.lineno)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and _sends_state(node, assigned):
                 found.add(node.lineno)
             if isinstance(node, ast.Assign) and any(
                     isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
                     and t.slice.value == "state" for t in node.targets) and _writes_body(node):
                 found.add(node.lineno)
             if isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                    and "mutation" in node.value and _MUTATION.search(node.value):
+                    and "mutation" in node.value and (
+                        _MUTATION.search(node.value) or _GRAPHQL_STATE.search(node.value)):
                 found.add(node.lineno)
     return sorted(found)
+
+
+def _sends_state(node, assigned):
+    """A client call, or any call handed "PATCH", with a body that sets state."""
+    named = isinstance(node.func, ast.Attribute) and node.func.attr in ("rest", "_rest")
+    if not named and not any(isinstance(a, ast.Constant) and a.value == "PATCH"
+                             for a in node.args):
+        return False
+    values = list(node.args[2:] if named else node.args) + [k.value for k in node.keywords]
+    return any(_names_state(value, assigned) for value in values)
 
 
 def _writes_body(node):
@@ -108,16 +122,17 @@ def shell_writes(text):
     for index, line in enumerate(lines):
         if line.lstrip().startswith("#"):
             continue
-        if _SHELL_FIELD.search(line) and re.search(r"\b(gh\s+api|curl)\b", line):
+        command = line
+        at = index
+        while command.rstrip().endswith("\\") and at + 1 < len(lines):
+            at += 1
+            command = command.rstrip()[:-1] + " " + lines[at]
+        if _SHELL_FIELD.search(command) and re.search(r"\b(gh\s+api|curl)\b", command):
             found.append(index + 1)
-        if _SHELL_VERB.search(line):
-            command = line
-            at = index
-            while command.rstrip().endswith("\\") and at + 1 < len(lines):
-                at += 1
-                command = command.rstrip()[:-1] + " " + lines[at]
-            if not re.search(r"""--comment\s+["'][^"']""", command):
-                found.append(index + 1)
+        # A variable may be empty, so the reason is written out.
+        if _SHELL_VERB.search(command) and not re.search(
+                r"""--comment\s+["'][^"'$]""", command):
+            found.append(index + 1)
     return found
 
 
@@ -154,14 +169,9 @@ class TheCodeHasNoDirectStateWrite(unittest.TestCase):
                  for lines in [direct_writes(text)] if lines}
         self.assertEqual(found, {}, "close or reopen through bus/closing.py")
 
-    def test_the_gateway_is_found_by_the_same_scan(self):
-        # bus/closing.py sends its change as a name: the scan must follow it,
-        # or an empty result above proves nothing.
+    def test_the_gateway_sends_one_state_change(self):
         text = (ROOT / GATEWAY).read_text()
-        self.assertIn("PATCH", text)
-        self.assertEqual(direct_writes(
-            'def f(gh, path):\n    change = {"state": "closed"}\n'
-            '    gh.rest("PATCH", path, change)\n'), [3])
+        self.assertEqual(text.count('gh.rest("PATCH"'), 1)
 
     def test_shell_closes_say_why(self):
         found = {name: lines for name, text in _shell()
@@ -191,7 +201,9 @@ class AnAgentsGhClose(unittest.TestCase):
     def test_with_no_reason_is_refused(self):
         for argv in (("issue", "close", "5"), ("pr", "close", "5", "--repo", "o/r"),
                      ("issue", "reopen", "5"), ("pr", "reopen", "5"),
-                     ("issue", "close", "5", "--comment", " "), ("pr", "close", "5", "-c")):
+                     ("issue", "close", "5", "--comment", " "), ("pr", "close", "5", "-c"),
+                     ("issue", "close", "5", "--comment", "<!-- a -->"),
+                     ("api", "-X", "PATCH", "repos/o/r/issues/5", "-f", "state=closed")):
             self.assertEqual(self.guard(*argv), 1, argv)
 
     def test_with_a_reason_goes_on(self):
@@ -208,6 +220,18 @@ class TheScanCatches(unittest.TestCase):
                      'dict(state="closed")', '{"state": "closed", "body": text}'):
             source = 'def f(gh, want, text):\n    gh.rest("PATCH", "/x", %s)\n' % body
             self.assertEqual(direct_writes(source), [2], body)
+
+    def test_a_body_by_keyword(self):
+        self.assertEqual(direct_writes(
+            'def f(gh):\n    gh.rest("PATCH", "/x", body={"state": "closed"})\n'), [2])
+
+    def test_a_helper_handed_the_method(self):
+        self.assertEqual(direct_writes(
+            'def f(gh):\n    write(gh, 1, "PATCH", "/x", {"state": "closed"})\n'), [2])
+
+    def test_a_graphql_state_update(self):
+        source = 'Q = "mutation { updateIssue(input: {id: $i, state: CLOSED}) { x } }"\n'
+        self.assertEqual(direct_writes(source), [1])
 
     def test_a_body_built_first(self):
         source = ('def f(gh):\n    body = {"title": "t"}\n    body["state"] = "closed"\n'
@@ -227,6 +251,8 @@ class TheScanCatches(unittest.TestCase):
         self.assertEqual(shell_writes('gh pr reopen 1 --repo o/r\n'), [1])
         self.assertEqual(shell_writes('gh issue close 1 --comment ""\n'), [1])
         self.assertEqual(shell_writes('gh api -X PATCH repos/o/r/issues/1 -f state=closed\n'), [1])
+        self.assertEqual(shell_writes('gh api -X PATCH repos/o/r/issues/1 \\\n  -f state=closed\n'), [1])
+        self.assertEqual(shell_writes('gh issue close 1 --comment "$why"\n'), [1])
 
     def test_a_shell_close_with_a_reason(self):
         self.assertEqual(shell_writes('gh issue close 1 \\\n  --comment "Cleared." >>log\n'), [])

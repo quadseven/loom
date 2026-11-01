@@ -1372,14 +1372,18 @@ plain-English reason in the thread, then changes the state. It refuses an empty
 reason, and a reason that is only an HTML comment. It sends no state change when
 the post fails, and it asks shadow mode and the acceptance-criteria check first,
 so a refused close leaves no comment saying it closed. Machine data in a reason
-goes in an HTML comment, since ticket comments are read as email.
+goes in an HTML comment, since ticket comments are read as email. When GitHub
+refuses the state change it deletes the comment, so a retry does not repeat it.
+A note Loom edits in place (a reopened or cleared invariant) is the reason for
+that thread, and no second comment is posted.
 
 `python3 -m bus.brain close` with no `--note` says the proof on a completed
 close; `--reason not_planned` needs `--note`. `tests/test_closing_gateway.py`
 fails on any direct state write, and on a shell close with no `--comment`. A
 close costs two writes, and each bulk path keeps its cap: `CLOSE_DONE_PER_PASS`,
 the invariants and watch `WRITES_MAX`, `FOLD_MAX`, and the factory and sweep
-`MAX_ACTIONS`.
+`MAX_ACTIONS`. A rung's `gh` guard refuses a `gh issue` or `gh pr` close or reopen
+with no `--comment`, and any `gh api` state write, shadow on or off.
 
 ## Where a new comment is posted
 
@@ -1416,7 +1420,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `proof` | The proof record of a verified or shipped move. |
 | `audit` | The result of a proof audit. |
 | `held` | A ticket held apart from open work, with what it waits for. |
-| `closed` | Why an issue was closed. |
+| `closed` | Why an issue or pull request was closed. |
 | `reopened` | Why an issue was opened again. |
 | `source` | A note on the source issue of a rewritten ticket. |
 | `repair` | The factory edited text instead of sending a pull request back. |
