@@ -3420,8 +3420,9 @@ class Station:
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open tickets filed by a briefing login. A
         loom:rewritten source an open ticket in this list was rewritten
-        from is not a ticket of its own, however many ticket and state
-        labels it kept (loom#1861): the verify sweep and the criteria gate
+        from is not a ticket of its own (loom#1861). A rewrite now takes
+        those labels off (brain._filed_rewrite); a source rewritten before
+        that still has them, and the verify sweep and the criteria gate
         read through here, so both skip it while its ticket is open."""
         found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         covers: Dict[int, set] = {}

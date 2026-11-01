@@ -2687,9 +2687,10 @@ def _in_place_refusal(source: Dict[str, Any], env: Optional[Dict[str, str]]) -> 
 
 
 # The labels a rewrite takes off its source: loom:ticket itself and every
-# state label a ticket carries (brain.STATES and tickets.TICKET_STATES).
+# state label a ticket carries (brain.STATES, tickets.TICKET_STATES and the
+# verifier's loom:awaiting-evidence).
 SOURCE_TICKET_LABELS = frozenset(
-    ["loom:ticket"] + ["loom:" + s for s in STATES + tickets.TICKET_STATES])
+    ["loom:ticket", AWAITING_EVIDENCE] + ["loom:" + s for s in STATES + tickets.TICKET_STATES])
 
 
 def _source_ticket_labels(source: Dict[str, Any]) -> List[str]:

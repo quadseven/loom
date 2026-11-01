@@ -3953,9 +3953,9 @@ class HumanAndRefsTests(unittest.TestCase):
         # loom:rewritten of its Loom labels.
         made = {"id": 202, "number": 20, "html_url": "https://example.com/t"}
         fake, url = self.brief_in_place(
-            self.source(labels=["loom:ticket", "loom:shipped"]),
+            self.source(labels=["loom:ticket", "loom:shipped", "loom:awaiting-evidence"]),
             reply(201, made), reply(201, {}), reply(201, {}),
-            reply(200, []), reply(200, []), reply(200, []), reply(200, []))
+            reply(200, []), reply(200, []), reply(200, []), reply(200, []), reply(200, []))
         self.assertEqual(url, "https://example.com/t")
         self.assertTrue(fake.calls[3][2]["body"].endswith(
             "\n\nRewritten from issue 6.\n\nPart of #2\n"))
@@ -3963,7 +3963,8 @@ class HumanAndRefsTests(unittest.TestCase):
         deletes = [c[1].split(REPO)[-1] for c in fake.calls if c[0] == "DELETE"]
         self.assertEqual(deletes, ["/issues/6/labels/loom%3Atriage",
                                    "/issues/6/labels/loom%3Aticket",
-                                   "/issues/6/labels/loom%3Ashipped"])
+                                   "/issues/6/labels/loom%3Ashipped",
+                                   "/issues/6/labels/loom%3Aawaiting-evidence"])
         self.assertEqual(fake.calls[-1][2], {"labels": ["loom:rewritten"]})
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
