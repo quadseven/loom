@@ -5197,7 +5197,7 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     if note is not None:
         _check_written_text(note)
         _check_decision_claim(gh, repo, number, note, env)
-    if reason == "not_planned" and not str(note or "").strip():
+    if reason == "not_planned" and not text.has_reason(note):
         raise ValueError("a dropped ticket needs --note saying why it closes")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     names = _labels(issue)
@@ -5217,9 +5217,9 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
                               source="bus.brain close")
         raise ShadowHeld("shadow mode: would close %s#%d as %s; recorded in the shadow ledger "
                          "and left open" % (repo, number, reason), entry)
-    said = note if str(note or "").strip() else (
+    words = note if text.has_reason(note) else (
         "Closed as completed: the ticket is verified (%s)." % _proof_words(number, proof_url))
-    closing.close(gh, repo, number, said, reason)
+    closing.close(gh, repo, number, words, reason)
     # After the close, so a refused close leaves the ticket's labels as they were.
     kept = closing_labels(names, trusted_authors(env))
     if kept != names:
@@ -5422,12 +5422,13 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
     if result == "pass":
         notify.post(gh, repo, number, comment, notify.AUDIT)
         return "audit of %s#%d passed" % (repo, number)
-    closed = issue.get("state") != "open"
-    if closed:
-        closing.reopen(gh, repo, number, comment)
+    if issue.get("state") != "open":
+        # Its own line: the audit comment comes last, since audit.unaudited
+        # finds the proof again only until it lands, so a failed step retries.
+        closing.reopen(gh, repo, number, "The audit of this ticket's proof failed, so the "
+                       "ticket is open again.")
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [audit.LABEL]})
-    # The reopen already posted the comment.
-    move(gh, repo, number, "shipped", note=None if closed else comment)
+    move(gh, repo, number, "shipped", note=comment)
     said = "audit of %s#%d failed: back to shipped, lane %s held" % (
         repo, number, audit.lane_of(found[1]))
     source = reopen_source(gh, repo, number, issue.get("body"), authors)

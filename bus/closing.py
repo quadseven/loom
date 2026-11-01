@@ -8,7 +8,10 @@ reason in the thread and then changes the state, so a thread always says why.
 It refuses, with no write sent, when the reason has no visible text, and it
 sends no state change when the comment could not be posted. It asks first
 everything that could stop the state change (shadow mode, unticked acceptance
-criteria), so a refused close leaves no comment saying it closed.
+criteria), so a refused close leaves no comment saying it closed. When GitHub
+refuses the state change anyway it deletes the comment, so a retry does not say
+it twice; an answer that may hide a landed change (a timeout, a 5xx) keeps it,
+since a repeated reason is better than a close with none.
 
 Machine data in a reason goes in an HTML comment: ticket comments are read as
 email. tests/test_closing_gateway.py fails on any direct state write outside
@@ -21,17 +24,14 @@ required, and the guard test lists every caller that passes it.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict
 
-from . import notify, shadow
+from . import notify, shadow, text
 from .github import GitHubError, ShadowHeld, refuse_incomplete_close
-
-_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def _check_reason(reason: Any) -> None:
-    if not _HTML_COMMENT.sub("", str(reason or "")).strip():
+    if not text.has_reason(reason):
         raise ValueError("a close or reopen needs a plain-English reason for the thread")
 
 
@@ -58,9 +58,26 @@ def _change(gh: Any, repo: str, number: int, path: str, reason: Any,
     _check_reason(reason)
     _check_not_held(gh, path, change)
     refuse_incomplete_close(gh, "PATCH", path, change)
-    if not said:
-        notify.post(gh, repo, number, str(reason), kind)
-    gh.rest("PATCH", path, change)
+    posted = None if said else notify.post(gh, repo, number, str(reason), kind)
+    try:
+        gh.rest("PATCH", path, change)
+    except (GitHubError, ValueError) as err:
+        if isinstance(err, ShadowHeld) or not isinstance(err, GitHubError) \
+                or 400 <= err.status < 500:
+            _take_back(gh, repo, posted)
+        raise
+
+
+def _take_back(gh: Any, repo: str, posted: Any) -> None:
+    """Delete the comment of a state change GitHub refused. Best effort: the
+    refusal is what the caller needs to hear, and at worst a retry repeats it."""
+    ident = posted.data.get("id") if isinstance(getattr(posted, "data", None), dict) else None
+    if ident is None:
+        return
+    try:
+        gh.rest("DELETE", "/repos/%s/issues/comments/%s" % (repo, ident))
+    except GitHubError:
+        pass
 
 
 def close(gh: Any, repo: str, number: int, reason: Any, state_reason: str,

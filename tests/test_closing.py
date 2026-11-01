@@ -92,6 +92,33 @@ class Close(unittest.TestCase):
         self.assertEqual(gh.writes, [])
 
 
+class ARefusedChange(unittest.TestCase):
+    """A retry must not say it twice, and a close must not lose its reason."""
+
+    def run_refused(self, status):
+        gh = FakeGitHub()
+        gh.rest = mock.Mock(side_effect=lambda method, path, body=None: self.answer(
+            gh, method, path, body, status))
+        with self.assertRaises(GitHubError):
+            closing.close(gh, "o/r", 7, "Done.", "not_planned")
+        return gh.writes
+
+    @staticmethod
+    def answer(gh, method, path, body, status):
+        gh.writes.append((method, path, body))
+        if method == "PATCH":
+            raise GitHubError("no", status)
+        return mock.Mock(data={"id": 55})
+
+    def test_a_refusal_takes_the_comment_back(self):
+        self.assertEqual(self.run_refused(403)[-1],
+                         ("DELETE", "/repos/o/r/issues/comments/55", None))
+
+    def test_an_answer_that_may_hide_a_landed_close_keeps_it(self):
+        for status in (0, 502):
+            self.assertEqual(self.run_refused(status)[-1][0], "PATCH")
+
+
 class Reopen(unittest.TestCase):
     def test_the_reason_is_posted_before_the_reopen(self):
         gh = FakeGitHub()

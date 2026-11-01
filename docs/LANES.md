@@ -1352,9 +1352,8 @@ lane-pr-stalled issue: the other repos' issues still update. Closing it rather t
 open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
 The per-violation issues these kinds filed before this close into the
 tracking issue of their kind and their own subject repo as the station meets
-them: closed as not planned with no comment, their note at the foot of the
-body, and a running count in one comment on the tracking issue, edited in
-place (a comment on each would mail everyone watching). The subject comes from
+them: closed as not planned with a comment saying why, and a running count in
+one comment on the tracking issue, edited in place. The subject comes from
 the station's map, else the `subject=` of the issue's marker, else a reference
 in its text, and only one that hashes back to the key counts. The marker names
 a subject only where the breach's public text already does, so a private repo
@@ -1391,7 +1390,7 @@ A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
 loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
-(not a `loom:ticket`), with one note in its body naming how; these closes
+(not a `loom:ticket`), with one comment naming how; these closes
 come before the other clears, read no comments (loom#2022), and walk the
 issue listing rather than the local map, so one filed before the map or gone
 while the station was down settles too (loom#2257). Other cleared issues

@@ -84,6 +84,8 @@ import traceback
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
+from . import text
+
 SWITCH = "LOOM_SHADOW"
 REPOS = "LOOM_SHADOW_REPOS"
 LEDGER = "LOOM_SHADOW_LEDGER"
@@ -561,10 +563,11 @@ def link(repo: str, number: int, kind: str) -> str:
 
 
 def caller() -> str:
-    """The first frame outside this module and bus/github.py: who asked."""
+    """The first frame outside this module, bus/github.py and bus/closing.py:
+    who asked."""
     for frame in reversed(traceback.extract_stack()[:-1]):
         name = os.path.basename(frame.filename)
-        if name in ("shadow.py", "github.py"):
+        if name in ("shadow.py", "github.py", "closing.py"):
             continue
         return "%s:%d %s" % (name, frame.lineno, frame.name)
     return ""
@@ -1021,14 +1024,16 @@ def _says_no_reason(argv: Sequence[str]) -> bool:
     (bus/closing.py holds the same rule for Python, loom#2444). gh posts the
     comment first and stops when that post fails."""
     args = list(argv)
+    if "api" in args and any(re.fullmatch(r"state=(closed|open)", a) for a in args):
+        return True    # no comment can come with it: only bus.brain closes this way
     if not any(pair[0] in ("issue", "pr") and pair[1] in ("close", "reopen")
                for pair in zip(args, args[1:])):
         return False
     for index, arg in enumerate(args):
         if arg.startswith("--comment="):
-            return not arg.partition("=")[2].strip()
+            return not text.has_reason(arg.partition("=")[2])
         if arg in ("--comment", "-c"):
-            return index + 1 >= len(args) or not args[index + 1].strip()
+            return index + 1 >= len(args) or not text.has_reason(args[index + 1])
     return True
 
 
