@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
                      rest_login, unreadable)
-from . import audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -641,6 +641,8 @@ def _unbuilt_criteria_reason(body: str) -> str:
                 if criteria_gate.kind(text) != criteria_gate.LIVE]
     if criteria and all(_NOT_BUILT.search(text) for text in criteria):
         return "blocked: no criterion built"
+    if already_done.uncited(body):
+        return "blocked: a criterion says it is already done and cites no code"
     return ""
 
 
@@ -704,8 +706,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
         if not sha or not _review_check_passed(gh, repo, sha, check):
             return (line.removesuffix("READY")
                     + "blocked: review check has not passed on the head commit")
-    if line.endswith(" - READY") and _unbuilt_criteria_reason(str(pr.get("body") or "")):
-        return line.removesuffix("READY") + "blocked: no criterion built"
+    unbuilt = _unbuilt_criteria_reason(str(pr.get("body") or ""))
+    if line.endswith(" - READY") and unbuilt:
+        return line.removesuffix("READY") + unbuilt
     foreign = _foreign_criteria_reason(str(pr.get("body") or ""), repo)
     if line.endswith(" - READY") and foreign:
         return line.removesuffix("READY") + foreign
@@ -1213,7 +1216,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     waiting: Dict[str, Dict[str, Any]] = {}
     for repo, done, value in per_repo.each(repos, read, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         section, into, waits = value
         found.update(into)
@@ -1226,7 +1229,7 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     tail += [""] + priority_lines(found, now)
-    tail += [""] + waiting_lines(waiting, repos)
+    tail += [""] + waiting_lines(gh, waiting, repos)
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
     tail += ["", "## Lane status", _dated_lane_status(_lane_status(gh, lanes_repo, authors), now)]
@@ -1259,18 +1262,36 @@ def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[s
     return len({int(c.get("number") or 0) for c in children if isinstance(c, dict)} & waiting)
 
 
-def waiting_lines(waiting: Dict[str, Dict[str, Any]], repos: Sequence[str]) -> List[str]:
+def repo_private(gh: GitHub, repo: str) -> Optional[bool]:
+    """Whether `repo` is private; None when that cannot be read."""
+    try:
+        data = gh.rest("GET", "/repos/%s" % repo).data
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        print("could not read whether %s is public: %s" % (repo, err), file=sys.stderr)
+        return None
+    private = data.get("private") if isinstance(data, dict) else None
+    return private if isinstance(private, bool) else None
+
+
+def waiting_lines(gh: GitHub, waiting: Dict[str, Dict[str, Any]],
+                  repos: Sequence[str]) -> List[str]:
     """The "## Waiting on you" section: for each goal, the exact line that goes
     right under "Needs you:" in its report (journal.waiting_line), so the
     report's count comes from data. The repo counts span every repo status
-    read; the share is the goal's own."""
+    read; the share is the goal's own. A goal home that may be public names
+    only public repos (journal.nameable_repos), so with anything waiting each
+    repo's visibility is read."""
     by_repo = {repo: int(waiting[repo]["count"]) for repo in repos if repo in waiting}
+    private = {repo: repo_private(gh, repo) for repo in by_repo} if any(by_repo.values()) else {}
     lines = ["## Waiting on you (paste the line under \"Needs you:\" in each goal's report; "
              "\"Needs you:\" never carries a count)"]
     goals = [(repo, number, share) for repo in repos if repo in waiting
              for number, share in sorted(waiting[repo]["goals"].items())]
     for repo, number, share in goals:
-        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(by_repo, share)))
+        lines.append("- %s#%d: %s" % (repo, number, journal.waiting_line(
+            by_repo, share, journal.nameable_repos(repo, private))))
     return lines if goals else lines + ["- no goals"]
 
 
@@ -1549,36 +1570,33 @@ def _sub_issue_of(issue: Dict[str, Any], repo: str, goal: int) -> bool:
     return str(issue.get("parent_issue_url") or "").endswith("/repos/%s/issues/%d" % (repo, goal))
 
 
-# GitHub search allows five operators: four ORs join five Part of phrases.
-PART_OF_BATCH = 5
-
-
 def part_of_linked(gh: GitHub, repo: str, epics: Sequence[int]
                    ) -> Dict[int, List[Dict[str, Any]]]:
-    """For each epic, the loom:ticket issues, open or closed, whose body has
-    a Part of line naming it: one search per PART_OF_BATCH epics. goal_tree
-    reads only open ones, so a closed ticket linked by its Part of line alone
-    went uncounted (loom#2023: 13 sub-issues and 4 such links read as 16)."""
+    """For each epic, the loom:ticket issues, open or closed, with no parent
+    issue whose body has a Part of line naming it: one search whatever the
+    number of epics, since a ticket with a parent is a sub-issue goal_tree has
+    read. goal_tree reads only open Part of tickets, so a closed ticket linked
+    by its Part of line alone went uncounted (loom#2023: 13 sub-issues and 4
+    such links read as 16). One search per five epics spent more than GitHub's
+    30 searches a minute on 2026-10-31 (loom#2321)."""
     out: Dict[int, List[Dict[str, Any]]] = {int(n): [] for n in epics}
-    numbers = sorted(out)
-    for start in range(0, len(numbers), PART_OF_BATCH):
-        chunk = numbers[start:start + PART_OF_BATCH]
-        phrases = " OR ".join('"%s"' % part_of_line(n) for n in chunk)
-        q = quote("repo:%s is:issue label:loom:ticket in:body %s" % (repo, phrases))
-        url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
-        for _ in range(SEARCH_PAGES):
-            if not url:
-                break
-            resp = gh.rest("GET", url)
-            data = resp.data if isinstance(resp.data, dict) else {}
-            for item in data.get("items") or []:
-                if (not isinstance(item, dict) or "pull_request" in item
-                        or "loom:ticket" not in _labels(item)):
-                    continue
-                for n in chunk:
-                    if _names_goal(item.get("body"), n):
-                        out[n].append(item)
-            url = _next_link(resp.headers.get("link", ""))
+    if not out:
+        return out
+    q = quote('repo:%s is:issue label:loom:ticket in:body "Part of #" no:parent-issue' % repo)
+    url: Optional[str] = "/search/issues?q=%s&per_page=100" % q
+    for _ in range(SEARCH_PAGES):
+        if not url:
+            break
+        resp = gh.rest("GET", url)
+        data = resp.data if isinstance(resp.data, dict) else {}
+        for item in data.get("items") or []:
+            if (not isinstance(item, dict) or "pull_request" in item
+                    or "loom:ticket" not in _labels(item)):
+                continue
+            for n in out:
+                if _names_goal(item.get("body"), n):
+                    out[n].append(item)
+        url = _next_link(resp.headers.get("link", ""))
     return out
 
 
@@ -3757,7 +3775,7 @@ def move(gh: GitHub, repo: str, number: int, state: str,
     if issue.get("state") != "open":
         raise ValueError("cannot move a closed issue")
     owner = owned_elsewhere(issue)
-    if owner is not None and state in ("queued", "briefed", "running"):
+    if owner is not None and state in ("queued", "briefed", "running", "pr", "failed"):
         raise ValueError("#%d is assigned to %s, another operator's; leave it to their Loom"
                          % (number, owner))
     if state == "queued" and lane in REMOTE_LANES:
@@ -3854,6 +3872,9 @@ def merge(gh: GitHub, repo: str, number: int,
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
+        owner = owned_elsewhere(issue, env)
+        if owner is not None:
+            raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
         _refuse_pending_fix(gh, association, env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
@@ -3861,6 +3882,10 @@ def merge(gh: GitHub, repo: str, number: int,
             reason = _unbuilt_criteria_reason(str(pr.get("body") or ""))
             if reason:
                 raise ValueError(reason)
+            unproven = already_done.unproven(str(pr.get("body") or ""),
+                                             already_done.base_reader(gh, repo, pr))
+            if unproven:
+                raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
         reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
         if reason:
             raise ValueError(reason)
@@ -3893,7 +3918,10 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
                           association: Tuple[str, int], issue: Dict[str, Any]) -> None:
     """Move the ticket of the pull request just merged: to loom:queued with a
     note when the diff or the boxes left it unbuilt, else to loom:merged."""
-    reason = _unbuilt_reason(gh, repo, number, issue) or _unbuilt_boxes(pr_body, issue)
+    if owned_elsewhere(issue) is not None:
+        return
+    reason = "; ".join(x for x in (_unbuilt_reason(gh, repo, number, issue),
+                                   _unbuilt_boxes(pr_body, issue)) if x)
     if reason:
         move(gh, association[0], association[1], "queued",
              note=tickets.UNBUILT_NOTE % (number, reason))
@@ -3902,12 +3930,16 @@ def _settle_merged_ticket(gh: GitHub, repo: str, number: int, pr_body: str,
 
 
 def _unbuilt_boxes(pr_body: str, issue: Dict[str, Any]) -> str:
-    """The ticket's code boxes the merged pull request body leaves unbuilt,
-    joined for the requeue note, else "". A partial merge goes back to
-    loom:queued for the rest instead of loom:merged (loom#2026), as the
-    station's own reading of a merged pull request does."""
+    """When the merged pull request body leaves a code box unbuilt, every box
+    it leaves open, joined for the requeue note, else "". A partial merge goes
+    back to loom:queued for the rest instead of loom:merged (loom#2026), as the
+    station's own reading of a merged pull request does, and its note names
+    all that is left (loom#2333)."""
     from . import factory
-    return "; ".join(factory.unbuilt_criteria(str(issue.get("body") or ""), [pr_body]))
+    body = str(issue.get("body") or "")
+    if not factory.unbuilt_criteria(body, [pr_body]):
+        return ""
+    return "; ".join(factory.unticked_criteria(body, [pr_body]))
 
 
 def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -> str:
@@ -5116,6 +5148,7 @@ def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],
         (ticket[0] == repo, "ticket and pull request must be in the same repository"),
         (_ticket_association(repo, pr) == ticket, "pull request is not linked to the ticket"),
         (issue.get("state") == "open" and "loom:ticket" in names, "ticket is not an open loom:ticket"),
+        (owned_elsewhere(issue) is None, "ticket is held by someone outside this Loom"),
         # A failed ticket is one a runaway hold left after its run ended.
         (bool({"loom:briefed", "loom:running", "loom:pr", "loom:failed"} & set(names)),
          "ticket is not loom:briefed, loom:running, loom:pr or loom:failed"),
@@ -5348,6 +5381,8 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         "ask": (needs_human(names), "an ask item is a needs:human issue"),
         "regression": ("pull_request" not in issue, "a regression item is an issue"),
         "brief": ("loom:goal" in names, "a brief item is a loom:goal issue"),
+        "needs-brain": (("loom:briefed" in names and "needs-brain" in names),
+                        "a needs-brain item is a loom:briefed ticket with needs-brain"),
     }
     if stage not in rules:
         raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
@@ -5857,7 +5892,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
     # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
     # A timed-out repo is left out the same way.
     repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
-    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, seconds, now))
+    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, now))
     latest = _latest_marks(goals)
     gone = dict(unread)  # a snapshot: a late read never sees a later change
     check, trusted = review_check_name(env), trusted_authors(env)
@@ -5868,7 +5903,7 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
     for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
         if not done:
-            _say(out, emit, ["", _skip_line(repo, per_repo.timed_out(seconds))])
+            _say(out, emit, ["", _skip_line(repo, per_repo.not_read(seconds, value))])
             continue
         read[repo] = value
         if value["lines"]:
@@ -5878,12 +5913,12 @@ def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
 
 
 def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], seconds: float
-                     ) -> Tuple[List[GoalJournals], Dict[str, str], List[str]]:
+                     ) -> Tuple[List[GoalJournals], Dict[str, str], Dict[str, str]]:
     """Every goal's journals across `repos`, in the order of `repos`, read
     repo by repo under the budget: (goals, unreadable repos with the reason,
-    timed-out repos)."""
+    repos not read in time with the reason)."""
     unread: Dict[str, str] = {}
-    timed: List[str] = []
+    timed: Dict[str, str] = {}
 
     def journals(repo: str) -> Tuple[List[GoalJournals], Dict[str, str]]:
         skipped: Dict[str, str] = {}
@@ -5895,7 +5930,7 @@ def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], s
             by_repo[repo], skipped = value
             unread.update(skipped)
         else:
-            timed.append(repo)
+            timed[repo] = per_repo.not_read(seconds, value)
     return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
 
 
@@ -5912,7 +5947,7 @@ def _latest_marks(goals: Sequence[GoalJournals]
 
 
 def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJournals],
-                 unread: Dict[str, str], timed: Sequence[str], seconds: float,
+                 unread: Dict[str, str], timed: Dict[str, str],
                  now: datetime) -> List[str]:
     """The heading, the freshness line, and the repos left out."""
     head = ["# Resume for %s" % holder, "", trusted_line(authors), "",
@@ -5923,7 +5958,7 @@ def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJourna
         head += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
     if timed:
         head += ["", "## Timed-out repos (read again next tick)"]
-        head += [_skip_line(repo, per_repo.timed_out(seconds)) for repo in timed]
+        head += [_skip_line(repo, reason) for repo, reason in timed.items()]
     return head
 
 
@@ -6219,7 +6254,8 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     """The histories of stuck-state tickets, and the numbers it skipped. Each
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
-    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)),
+    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
+                         and owned_elsewhere(i) is None),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
     read = candidates[:STATUS_HISTORY_MAX]
@@ -6369,6 +6405,29 @@ def _count_move(load: Dict[str, int], issue: Dict[str, Any], lane: str) -> None:
     load[lane] = load.get(lane, 0) + 1
 
 
+def past_move_cap(moves: int) -> bool:
+    """Whether a ticket moved `moves` times with no claim stops moving."""
+    from . import factory  # factory imports this module
+    cap = factory.move_cap()
+    return bool(cap) and moves >= cap
+
+
+def hold_unclaimed(gh: GitHub, repo: str, number: int, names: Sequence[str],
+                   moves: int) -> List[str]:
+    """Stop moving a ticket no lane took: the runaway hold and needs-brain,
+    where every mover stops and the brain sees it. Returns its labels."""
+    from . import factory  # factory imports this module
+    kept = sorted(set(names) | {"needs-brain", RUNAWAY})
+    gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+    notify.post(gh, repo, number,
+                "%s\nRunaway: moved %d times with no lane taking it (the cap is %d). It "
+                "moves no further; the ticket is held for brain review."
+                % (factory.MOVE_CAP_MARKER, moves, factory.move_cap()), notify.RUNAWAY)
+    print("brain: %s#%d held after %d moves with no claim" % (repo, number, moves),
+          file=sys.stderr)
+    return kept
+
+
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
              lanes_repo: str = "quadseven/loom") -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
@@ -6379,6 +6438,9 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     _check_decision_claim(gh, repo, number, notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
+    owner = owned_elsewhere(issue)
+    if owner is not None:
+        raise ValueError("#%d is held by %s; the ladder leaves it alone" % (number, owner))
     if RUNAWAY in names:
         raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
@@ -6405,6 +6467,11 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
+    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                    trusted_authors())
+    if past_move_cap(moves):
+        hold_unclaimed(gh, repo, number, names, moves)
+        return "needs-brain"
     pending_brain_fix = open_pr is not None and _pending_brain_fix(
         gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors())
     finished = (_nothing_to_fix(gh, repo, open_pr)
