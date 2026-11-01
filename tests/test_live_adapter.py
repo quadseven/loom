@@ -141,6 +141,76 @@ class StationAdapterProofTest(tbs.Base):
         self.assertIn("the repo's SQL adapter gave no answer (the adapter exited 2)", text)
         self.assertIn("next check %s" % stamp(self.now + live_proof.RETRY), text)
 
+    def test_prose_live_box_is_sent_to_verify_when_repo_has_adapter(self):
+        body = HEAD + "- [ ] Live: the production levels and cleared runs remain correct\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        self.settings.live_evidence_repos = [REPO]
+        with mock.patch.object(station.Station, "_live_adapter",
+                               return_value=live_adapter.Runner(
+                                   live_adapter.Adapter(None, (), None, {}))):
+            pool, _ = st._verify_pool({})
+            with mock.patch.object(station.brain, "human") as human:
+                self.assertTrue(st._evidence_holds(REPO, self.fake.issues[self.NUMBER]))
+            human.assert_not_called()
+            st._write_verify_brief(REPO, "codex", self.fake.issues[self.NUMBER])
+        self.assertEqual([int(issue["number"]) for _, issue in pool], [self.NUMBER])
+        self.assertNotIn("loom:human", self.fake.names(self.NUMBER))
+        names = os.listdir(self.inbox("codex"))
+        with open(os.path.join(self.inbox("codex"), names[0]), encoding="utf-8") as fh:
+            brief = fh.read()
+        self.assertIn("adapter_step", brief)
+
+    def test_station_runs_a_verify_log_step_and_keeps_its_matching_lines(self):
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+        self.ship(body, hours_ago=2)
+        issue = self.fake.issues[self.NUMBER]
+        line = "%s worker: levels stable and cleared runs complete" % stamp(self.now - HOUR)
+        fake = FakeAdapter([line])
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        sources = live_proof.Sources(source_log=fake.log, sql=fake.sql)
+        answer = {"criterion": "Live: current levels and cleared runs are correct",
+                  "step": "log:worker", "strings": ["levels stable", "cleared runs complete"]}
+        with mock.patch.object(station.Station, "_proof_sources", return_value=sources), \
+                mock.patch.object(station.Station, "_shipped_stamp", return_value=self.shipped_at), \
+                mock.patch.object(station.Station, "_close_proven") as close:
+            st._apply_adapter_verify(REPO, self.NUMBER, answer)
+        close.assert_called_once()
+        outcome = close.call_args.args[2]
+        self.assertTrue(outcome.proven)
+        self.assertIn(line, outcome.evidence[answer["criterion"]])
+        self.assertIn("> " + line, live_proof.close_note(outcome))
+        self.assertEqual([call[0:3] for call in fake.calls], [
+            ("log", "worker", "levels stable"),
+            ("log", "worker", "cleared runs complete")])
+
+    def test_missing_step_and_failed_adapter_read_raise_one_human_ask(self):
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        def add_human_label(*args):
+            self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
+
+        with (mock.patch.object(station.Station, "_issue",
+                                return_value=self.fake.issues[self.NUMBER]),
+              mock.patch.object(station.brain, "human", side_effect=add_human_label) as human):
+            st._adapter_human_ask(REPO, self.NUMBER, "no step was returned", "no safe read was named")
+            st._adapter_human_ask(REPO, self.NUMBER, "no step was returned", "no safe read was named")
+        human.assert_called_once()
+        self.assertIn("no step was returned", human.call_args.args[3])
+
+        self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
+        fake = FakeAdapter(error="adapter exited 2")
+        sources = live_proof.Sources(source_log=fake.log, sql=fake.sql)
+        with (mock.patch.object(station.Station, "_proof_sources", return_value=sources),
+              mock.patch.object(station.Station, "_shipped_stamp", return_value=self.shipped_at),
+              mock.patch.object(station.Station, "_adapter_human_ask") as ask):
+            st._apply_adapter_verify(REPO, self.NUMBER, {
+                "criterion": "Live: current levels and cleared runs are correct",
+                "step": "log:worker", "strings": ["levels stable"]})
+        ask.assert_called_once()
+        self.assertIn("adapter exited 2", ask.call_args.args[3])
+
     def test_a_write_query_is_refused_and_never_reaches_the_adapter(self):
         self.ship(WRITE_SQL_BODY, hours_ago=2)
         fake = FakeAdapter(rows=["ok"])

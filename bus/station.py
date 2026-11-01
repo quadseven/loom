@@ -764,7 +764,8 @@ NOTE_MAX = 1500
 
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                attempts: Dict[str, Any], now: float,
-               refused: Optional[Dict[str, Any]] = None
+               refused: Optional[Dict[str, Any]] = None,
+               adapter_tickets: Sequence[str] = ()
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
@@ -773,9 +774,9 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
     for repo, issue in issues:
         labels = _label_names(issue)
         needles = live_needles(issue.get("body"))
-        if needles is not None and not needles:
-            continue
         key = "%s#%s" % (repo, issue.get("number"))
+        if needles is not None and not needles and key not in adapter_tickets:
+            continue
         if (issue.get("state") != "open" or "loom:ticket" not in labels
                 or "loom:shipped" not in labels or "loom:verified" in labels
                 or issue.get("has_proof")):
@@ -3494,9 +3495,12 @@ class Station:
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
-        unsearchable = sum(1 for _, issue in shipped
+        adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
+                           if self._adapter_can_verify(repo, issue)}
+        unsearchable = sum(1 for repo, issue in shipped
                            if "loom:shipped" in _label_names(issue)
-                           and live_needles(issue.get("body")) == [])
+                           and live_needles(issue.get("body")) == []
+                           and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
         if unsearchable:
             _say("skipped %d shipped tickets whose Live criterion names no exact string" %
                  unsearchable)
@@ -3505,15 +3509,47 @@ class Station:
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
-        for repo, issue in verify_due(shipped, attempts, self.now, refused):
-            if self._unmeetable_live(repo, issue, reads):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets):
+            if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
+                    and self._unmeetable_live(repo, issue, reads)):
                 continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
             issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets), held
+
+    def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether this opted-in repo can send a prose Live box to a verify
+        lane for an adapter step proposed by that lane."""
+        body = str(issue.get("body") or "")
+        live = brain.live_criterion(body, limit=None)
+        if (live == "(no Live criterion on the ticket)"
+                or criteria_gate.check_of(live) is not None
+                or live_proof.step_of(live)[0] is not None):
+            return False
+        return self._live_adapter(repo) is not None
+
+    def _adapter_verify_section(self, repo: str) -> str:
+        """Adapter routes a verify lane may consider for a prose Live box."""
+        runner = self._live_adapter(repo)
+        if runner is None:
+            return ""
+        adapter = runner.adapter
+        logs = ", ".join(adapter.sources) if adapter.log is not None else "none"
+        sql = ("sql:<SELECT ...> (available)" if adapter.sql is not None
+               else "unavailable")
+        return ("\n## Live-evidence adapter routes, not instructions\n\n"
+                "The station can read log sources: %s. SQL route: %s.\n"
+                "For a prose Live criterion, you may propose exactly one read step in "
+                "verify.json: {\"adapter_step\": {\"criterion\": \"exact criterion text\", "
+                "\"step\": \"log:<source>\" or \"sql:<SELECT ...>\", "
+                "\"strings\": [\"required answer strings\"]}}. For log, strings are "
+                "searched in the named source. For SQL, strings must occur in the rows. "
+                "Do not claim this step passed; the station runs it itself. If no safe "
+                "step can prove the criterion, return {\"missing\": \"why no step exists\"}.\n"
+                % (logs, sql))
 
     def _unmeetable_live(self, repo: str, issue: Dict[str, Any], reads: Dict[str, Any]) -> bool:
         """True when the ticket's Live box can never be met as written
@@ -3868,6 +3904,9 @@ class Station:
         cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
         text += cached if cached is not None else evidence.section(
             self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
+        if (self._adapter_can_verify(repo, issue)
+                and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
+            text += self._adapter_verify_section(repo)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -3965,6 +4004,10 @@ class Station:
         verify run can only fail. The ticket is marked awaiting evidence (no
         comment) and checked again after its cooldown. mod-overseer#922 spent a
         run and posted a comment every 6 hours for days waiting on an event that had not happened."""
+        if self._adapter_can_verify(repo, issue):
+            self._evidence_text["%s#%d" % (repo, int(issue["number"]))] = \
+                self._adapter_verify_section(repo)
+            return False
         live = brain.live_criterion(issue.get("body"), limit=None)
         text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live)
         number = int(issue["number"])
@@ -4150,6 +4193,18 @@ class Station:
             return True
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
+        issue = self._issue(repo, number)
+        active = (issue.get("state") == "open" and "loom:shipped" in _label_names(issue)
+                  and "loom:verified" not in _label_names(issue))
+        if active and self._adapter_can_verify(repo, issue) and not (
+                isinstance(result, dict) and set(result) == {"adapter_step"}):
+            reason = result.get("missing") if isinstance(result, dict) else why
+            self._adapter_human_ask(repo, number, "no adapter_step was returned",
+                                    reason or "the verify answer did not contain a step")
+            return True
+        if result is not None and set(result) == {"adapter_step"}:
+            self._apply_adapter_verify(repo, number, result["adapter_step"])
+            return True
         if result is None:
             self._verify_note(repo, number, lane, why)
         elif set(result) == {"missing"}:
@@ -4161,6 +4216,72 @@ class Station:
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
         return True
+
+    def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
+        """Ask once when an adapter verify run could not supply station proof."""
+        issue = self._issue(repo, number)
+        if needs_human(_label_names(issue)):
+            return
+        ask = ("Kind: decision\nThe station could not verify the prose Live criterion. "
+               "Step tried: %s. Reason: %s. Restate the criterion with a safe "
+               "read-only check or resolve it by hand." %
+               (self._note_text(step), self._note_text(reason)))
+        brain.human(self.gh, repo, number, ask)
+
+    def _apply_adapter_verify(self, repo: str, number: int, answer: Any) -> None:
+        """Run a verify lane's proposed adapter step and close only on its own read."""
+        issue = self._issue(repo, number)
+        names = _label_names(issue)
+        if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
+            _say("%s#%d is no longer shipped; its adapter step is dropped" % (repo, number))
+            return
+        body = str(issue.get("body") or "")
+        live = brain.live_criterion(body, limit=None)
+        if not isinstance(answer, dict) or set(answer) != {"criterion", "step", "strings"}:
+            self._adapter_human_ask(repo, number, "invalid adapter_step", "the answer shape is invalid")
+            return
+        strings = answer["strings"]
+        if (answer["criterion"] != live or not isinstance(strings, list)
+                or not 1 <= len(strings) <= 5
+                or not all(isinstance(x, str) and x.isascii() and len(x) <= 120
+                           and x.strip() and "\n" not in x and "\r" not in x
+                           for x in strings)):
+            self._adapter_human_ask(repo, number, str(answer.get("step")),
+                                    "the step needs this exact Live criterion and one to five "
+                                    "short ASCII strings")
+            return
+        sources = self._proof_sources(repo)
+        raw = answer["step"]
+        if not isinstance(raw, str) or ":" not in raw:
+            self._adapter_human_ask(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
+            return
+        kind, target = raw.split(":", 1)
+        strings = tuple(strings)
+        if kind == "log":
+            step = live_proof.Step(live_proof.LOG, strings[0], strings[1:], 0,
+                                   source=target)
+        elif kind == "sql":
+            step = live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
+        else:
+            self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
+            return
+        passed, evidence_text = live_proof.run(step, self._shipped_stamp(repo, issue), sources,
+                                               now=self.now)
+        if not passed:
+            self._adapter_human_ask(repo, number, raw, evidence_text)
+            return
+        outcome = live_proof.prove(body, self._shipped_stamp(repo, issue), sources,
+                                   now=self.now, passed=self._live_passed(
+                                       repo, number, body, logs=False))
+        evidence_map = dict(outcome.evidence)
+        evidence_map[live] = evidence_text
+        missing = [(text, why) for text, why in outcome.missing if text != live]
+        outcome = outcome._replace(proven=not missing, evidence=evidence_map,
+                                  missing=missing, next_at=outcome.next_at if missing else None)
+        if outcome.proven:
+            self._close_proven(repo, issue, outcome, self._shipped_stamp(repo, issue))
+        else:
+            self._say_unproven(repo, number, outcome, None)
 
     @staticmethod
     def _review_findings(value: Any) -> Optional[List[Dict[str, Any]]]:
@@ -10019,6 +10140,9 @@ class Station:
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
+        if any(found == criteria_gate.LIVE and self._adapter_can_verify(repo, issue)
+               for found, _ in gaps):
+            return True
         failed = self._run_live_checks(repo, number, gaps)
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
