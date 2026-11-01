@@ -3587,7 +3587,7 @@ class Tickets(Base):
             self.assertLess(medium.index(lane), medium.index("codex"))
         # On a private repo the public-only ones are skipped.
         self.assertEqual(factory.lanes_of("medium", True)[4:9],
-                         ("free-ollama", "free-gemma", "openrouter", "workersai", "codex"))
+                         ("free-ollama", "free-gemma", "openrouter", "workersai", "opencode-go"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
