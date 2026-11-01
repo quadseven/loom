@@ -951,11 +951,26 @@ fund's holder carried, so the finding vanished while every affected member
 stayed affected, and by a sibling that held refunds back to stay above the
 floor. A read the check needs that fails holds the ticket for the next pass.
 
+A build ticket whose body names no acceptance criteria gets no lane either:
+no criterion could be restated as the check that proves it (the brief carries
+that restatement, under `## Proof checks`), and the runner would only park
+the brief as a work failure. The ticket goes back to `loom:queued` with
+`needs-brain` and a status event, like a health ticket, until its body names
+each criterion as a checkbox under `## Acceptance criteria` (or the shorter
+`## Acceptance` heading). An answer ticket opens no pull request and is
+exempt, as at the runner.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
 
-The station polls lane PRs once per pass. Once checks finish, failed checks
+The station polls lane PRs once per pass. Once checks finish, the diff is
+scanned first for weakened tests (`bus/weakened.py`): an assertion deleted,
+a skip marker added, or an assertion loosened to a weaker form in a test
+file is sent back to the same lane as a fix round naming the lines, before
+any ready mark, since the diff alone proves it and no review round needs
+to run to find it. A file list that cannot be read skips the scan; the
+review remains the backstop. Then failed checks
 and unresolved threads started by `grug-tribe[bot]` are sent back to the same
 lane as a `loom:fix` comment, using the same findings format as
 `python3 -m bus.brain fix`. The ticket returns to `loom:briefed`; the runner

@@ -276,6 +276,16 @@ if [ "${FAKE_AGENT:-commit}" = early-limit ]; then
   for i in 1 2 3 4 5 6; do echo "working on step $i"; done
   exit 1
 fi
+if [ "${FAKE_AGENT:-commit}" = terminal-limit ]; then
+  echo "429: rate limit exceeded"
+  echo "AI_RetryError: retries exhausted"
+  sleep 300
+fi
+if [ "${FAKE_AGENT:-commit}" = retryable-429 ]; then
+  echo "429: rate limit exceeded"
+  echo "fixed" > fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = answer ]; then
   mkdir -p .loom-answers
   echo "Not valid: a.py:2 already guards it." > .loom-answers/PRRT_1.md
@@ -688,9 +698,9 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", cwd=None, **env):
+    def run_lane(self, lane="codex", cwd=None, timeout=60, **env):
         return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
-                              capture_output=True, text=True, timeout=60)
+                              capture_output=True, text=True, timeout=timeout)
 
     def lane_env(self, **env):
         return {
@@ -2120,6 +2130,25 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             '{"type":"tool_use","part":{"state":{"output":"ok"}}}\n'
             '{"type":"error","error":{"message":"429 Too Many Requests: usage limit reached"}}'))
         self.assertIn("[limit]", self.run_log())
+
+    def test_a_fake_agent_that_prints_a_terminal_limit_line_and_sleeps_is_stopped_within_2_minutes_and_the_lane_is_held(self):
+        self.drop_brief()
+        start = time.time()
+        result = self.run_lane(FAKE_AGENT="terminal-limit", timeout=120)
+        elapsed = time.time() - start
+        self.assertLess(elapsed, 120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("limit", beat["reason"])
+
+    def test_a_fake_agent_that_prints_one_retryable_429_and_goes_on_is_not_stopped(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="retryable-429")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        beat = self.beat("codex")
+        self.assertTrue(beat["available"])
 
     def test_a_full_free_pool_is_a_short_limit_not_the_agents_failure(self):
         # The shared free pool answered "has no lane available" 18 times; the
@@ -5999,6 +6028,128 @@ exit %d
 
 
     # The validation contract (.loom/validation.conf).
+
+    def test_a_second_brief_reuses_the_green_base_verdict(self):
+        contract = ("interpreter: loom-test-python\n"
+                    "check: echo base-check-hit\n")
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.write_tool(Path(self._tmp.name) / "pybin" / "loom-test-python",
+                        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        self.contract_repo(contract=contract)
+        self.drop_brief()
+        first = self.run_contract_lane(interpreter=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+
+        self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
+        second = self.run_contract_lane(interpreter=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   "T043-fix-the-thing.validation.jsonl").read_text().splitlines()]
+        baseline = next(r for r in records if r["phase"] == "baseline")
+        self.assertEqual(baseline["detail"], "cached verdict")
+        logs = "\n".join((self.loom / "logs" / "codex" / name).read_text()
+                          for name in ("T042-fix-the-thing.log", "T043-fix-the-thing.log"))
+        self.assertEqual(logs.count("base-check-hit"), 3)  # two first-run checks, final only on second
+
+    def test_the_red_rerun_guard_reads_the_flag_not_the_verdict_file(self):
+        # Elder on PR 2406: the guard read the verdict file a second time, and
+        # a hit overwrote BASELINE_EXIT, so a green written by another lane
+        # after this lane's fresh red could hide a real red base.
+        text = RUNNER.read_text()
+        body = re.search(r"^prepare_validation\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        self.assertEqual(body.count("base_verdict_read"), 1, "read once, into cached_verdict")
+        self.assertIn('[ "$BASELINE_EXIT" -ne 0 ] && [ "$cached_verdict" -eq 0 ]', body)
+
+    def test_the_interpreter_identity_is_the_resolved_line_not_a_second_run(self):
+        # interp is already "path version"; the key must not run it again, or
+        # its error text (which names the working directory) splits the key.
+        text = RUNNER.read_text()
+        line = re.search(r'^\s*interpreter_id=.*$', text, re.M).group(0).strip()
+        tmp = Path(self._tmp.name)
+        calls = tmp / "interp-calls"
+        fake = tmp / "fake-python"
+        fake.write_text('#!/bin/sh\necho call >> "%s"\necho "Python 9.9"\n' % calls)
+        fake.chmod(0o755)
+        script = 'interp="%s Python 9.9"; C_INTERP=python\n%s\nprintf "%%s" "$interpreter_id"\n' % (fake, line)
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=str(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "%s Python 9.9" % fake)
+        self.assertFalse(calls.exists(), "the interpreter was run again for the key")
+
+    def test_base_verdict_key_includes_command_and_interpreter_and_red_expires(self):
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("base_verdict_key", "base_verdict_read", "base_verdict_write"))
+        tmp = Path(self._tmp.name)
+        script = ("BASE_VERDICT_DIR=\"$1\"\nBASE_VERDICT_TTL_GREEN=86400\n"
+                  "BASE_VERDICT_TTL_RED=300\nREPO=example/repo\nC_CHECK=check-one\n"
+                  "key=$(base_verdict_key rev-one python-one)\nbase_verdict_write \"$key\" 1\n"
+                  "now=$(date +%s)\nbase_verdict_read \"$key\" \"$now\" || exit 10\n"
+                  "base_verdict_read \"$key\" $((now + 300)) && exit 11\n"
+                  "C_CHECK=check-two; [ \"$(base_verdict_key rev-one python-one)\" != \"$key\" ] || exit 12\n"
+                  "C_CHECK=check-one; [ \"$(base_verdict_key rev-one python-two)\" != \"$key\" ] || exit 13\n")
+        fakebin = tmp / "fakebin"
+        self.write_tool(fakebin / "sha256sum",
+                        f'#!{sys.executable}\nimport hashlib, sys\n'
+                        'print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest() + "  -")\n')
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(tmp / "verdicts")],
+                                env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_fresh_red_base_verdict_skips_the_second_run_but_still_files(self):
+        # A cached red verdict stands in for both runs of a red base check:
+        # the next brief on the same base revision files the incident
+        # without running the check again (#2355).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        red = ("interpreter: loom-test-python\n"
+               "check: echo red-base-hit; exit 2\n")
+        self.contract_repo(contract=red)
+        self.drop_brief()
+        first = self.run_contract_lane()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.lane_log().count("red-base-hit"), 2)
+        verdicts = list((self.loom / "state" / "base-verdicts").iterdir())
+        self.assertEqual(len(verdicts), 1)
+        self.assertEqual(verdicts[0].read_text().split()[1], "2")
+        verdicts[0].write_text("%d 2\n" % int(time.time()))  # fresh red verdict
+
+        self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
+        second = self.run_contract_lane()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        log = (self.loom / "logs" / "codex" / "T043-fix-the-thing.log").read_text()
+        self.assertEqual(log.count("red-base-hit"), 0)
+        self.assertIn("base check reused cached verdict", log)
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("base check exited 2", log)
+        self.assertTrue((self.inbox / "failed" / "T043-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
+    def test_a_base_verdict_write_prunes_expired_verdicts_and_keeps_fresh_ones(self):
+        text = RUNNER.read_text()
+        funcs = re.search(r"^base_verdict_write\(\) \{[^\n]*\n.*?^\}\n", text, re.S | re.M).group(0)
+        verdicts = Path(self._tmp.name) / "verdicts"
+        verdicts.mkdir()
+        old, fresh = verdicts / "old", verdicts / "fresh"
+        old.write_text("1 0\n")
+        fresh.write_text("%d 0\n" % int(time.time()))
+        two_days_ago = time.time() - 2 * 86400
+        os.utime(old, (two_days_ago, two_days_ago))
+        script = ('BASE_VERDICT_DIR="$1"\nBASE_VERDICT_TTL_GREEN=86400\n'
+                  'base_verdict_write new 0 || exit 10\n')
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(verdicts)],
+                                env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue((verdicts / "new").exists())
+
+        # A sweep that fails does not fail the write.
+        fakebin = Path(self._tmp.name) / "failfind"
+        self.write_tool(fakebin / "find", "#!/bin/sh\nexit 1\n")
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(verdicts)],
+                                env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_resolve_factory_incidents_closes_contract_incident(self):
         function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
