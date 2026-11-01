@@ -484,10 +484,6 @@ class SupersededOrBlocked(unittest.TestCase):
         self.assertTrue(any(n.startswith("lane:") for n in self.names(7)))
         self.assertNotIn("wait:blocked", self.names(7))
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Criteria(unittest.TestCase):
     """A brief is not dispatchable until each acceptance criterion is
     restated as the check that proves it (loom#2162): a ticket with no
@@ -534,3 +530,7 @@ class Criteria(unittest.TestCase):
         # An answer brief opens no pull request; the runner's criteria park
         # never applied to it, and neither does this hold.
         self.assertIsNone(brief_check.criteria_verdict(self.ANSWER))
+
+
+if __name__ == "__main__":
+    unittest.main()
