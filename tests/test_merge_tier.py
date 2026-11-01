@@ -351,6 +351,64 @@ class BrainMerge(unittest.TestCase):
         self.assertEqual(refused, "")
         self.assertTrue(self.merged(fake))
 
+    def behind_revert(self, missed, drop=()):
+        """A proven revert with `missed` {sha: paths} landed on main since it branched."""
+        routes_ = routes(files=BUILD_WORKFLOW, ticket_labels=("loom:revert",),
+                         title="Revert abc1234: Use the shared build socket",
+                         body="## Summary\ngit revert --no-edit abc1234\n", merged_last_hour=9,
+                         patches={BUILD_WORKFLOW[0]: self.INVERSE},
+                         commit_files=[{"filename": BUILD_WORKFLOW[0], "patch": self.FORWARD}])
+        routes_.update({
+            "/repos/%s/compare/main...checked" % REPO: {"behind_by": len(missed)},
+            "/repos/%s/compare/checked...main" % REPO: {
+                "commits": [{"sha": sha} for sha in missed]},
+            **{"/repos/%s/commits/%s" % (REPO, sha): {
+                "files": [{"filename": path} for path in paths]}
+               for sha, paths in missed.items()}})
+        for path in drop:
+            del routes_[path]
+        fake = Route(routes_)
+        try:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=dict(self.ENV))
+        except ValueError as err:
+            return fake, str(err)
+        return fake, ""
+
+    def test_a_revert_lands_behind_when_no_missed_commit_touches_its_files(self):
+        fake, refused = self.behind_revert({"c1": ["docs/a.md"], "c2": ["bus/other.py"]})
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+
+    def test_a_revert_is_refused_when_the_base_landed_the_commit_again(self):
+        # Undone and landed again after the branch: the two-point diff is
+        # empty, so only the commits show it.
+        fake, refused = self.behind_revert(
+            {"undo": BUILD_WORKFLOW, "again": BUILD_WORKFLOW})
+        self.assertIn("behind its base", refused)
+        self.assertIn(BUILD_WORKFLOW[0], refused)
+        self.assertFalse(self.merged(fake))
+
+    def test_a_revert_is_refused_when_the_base_already_reverted_the_commit(self):
+        fake, refused = self.behind_revert({"undo": BUILD_WORKFLOW})
+        self.assertIn("behind its base", refused)
+        self.assertFalse(self.merged(fake))
+
+    def test_a_failed_read_gives_a_revert_no_exemption(self):
+        missing = "/repos/%s/commits/c1" % REPO
+        compare = "/repos/%s/compare/checked...main" % REPO
+        for path in (missing, compare):
+            with self.subTest(path=path):
+                fake, refused = self.behind_revert({"c1": ["docs/a.md"]}, drop=(path,))
+                self.assertIn("could not be checked", refused)
+                self.assertFalse(self.merged(fake))
+
+    def test_a_short_commit_list_gives_a_revert_no_exemption(self):
+        fake = Route({**routes(files=BUILD_WORKFLOW)})
+        gh = GitHub("t", transport=fake)
+        fake.routes["/repos/%s/compare/checked...main" % REPO] = {"commits": [{"sha": "c1"}]}
+        with self.assertRaisesRegex(ValueError, "listed 1 of 3"):
+            brain._missed_paths(gh, REPO, {"base": {"ref": "main"}, "head": {"sha": "checked"}}, 3)
+
     def test_an_unproven_revert_takes_the_normal_gates(self):
         # Security review: the label and the title alone exempted it.
         for kw in ({"ticket_labels": ()},
