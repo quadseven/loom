@@ -832,7 +832,8 @@ branch while another cited commit or a merged pull request is on it),
 `unproven` (no cited commit and no merged pull request is on the default
 branch), `uncited`, or `unknown` (a read failed or was cut short, which is
 never sound). It exits 0 only on `sound`. Only the closer's own comments count
-as citations.
+as citations, and only a merged pull request based in the audited repo or a
+`LOOM_REPOS` repo counts as delivery.
 
 The station runs the same check over closes as completed by anyone but
 itself, every 10 minutes, within a read budget, from the first pass after it

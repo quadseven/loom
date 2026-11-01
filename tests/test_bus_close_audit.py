@@ -131,6 +131,7 @@ class FakeGitHub:
         self.carried = set()
         self.broken = broken
         self.delivered = {}
+        self.foreign = {}
         self.reads = []
         self.writes = []
 
@@ -151,12 +152,19 @@ class FakeGitHub:
     def _get(self, path, ok):
         if self.broken.get("compare") and "/compare/" in path:
             raise GitHubError("no", status=502)
-        if "/compare/" in path:
+        if "/compare/" in path and not any(
+                path.lower().startswith("/repos/%s/" % where) for where, _ in self.foreign):
             sha = path.split("...", 1)[1].split("?")[0]
             if any(sha.startswith(a) for a in self.absent):
                 return Reply({"message": "Not Found"}, 404)
             carried = any(sha.startswith(c) for c in self.carried)
             return Reply({"status": "behind" if carried else "diverged"})
+        for (where, number), pull in self.foreign.items():
+            if path.lower() == "/repos/%s/pulls/%d" % (where, number):
+                return Reply(pull)
+            if "/compare/" in path and path.lower().startswith("/repos/%s/" % where):
+                return Reply({"status": "behind"})
+        path = path.replace("/repos/%s" % REPO.upper(), "/repos/%s" % REPO)
         tail = path.split("/repos/%s" % REPO, 1)[1]
         if tail.startswith("/commits/"):
             sha = tail.split("/")[2]
@@ -227,6 +235,45 @@ class ReadClose(unittest.TestCase):
         self.assertEqual(ca.read_close(gh, REPO, 5).verdict, ca.UNKNOWN)
         self.assertEqual(len([p for p in gh.reads if "/timeline" in p]), ca.TIMELINE_PAGES)
 
+
+    def elsewhere(self, gh, number, where):
+        pull = merged_pull(77, merge="a1a2a3a4" + "3" * 32)
+        pull["base"] = {"repo": {"full_name": where, "default_branch": "main"}, "ref": "main"}
+        gh.foreign[(where.lower(), 77)] = pull
+        gh.timelines.setdefault(number, []).append({
+            "event": "cross-referenced", "source": {"issue": {
+                "number": 77, "repository": {"full_name": where},
+                "pull_request": {"merged_at": pull["merged_at"]}}}})
+
+    def test_a_merged_cross_reference_from_an_untrusted_repo_proves_nothing(self):
+        gh = FakeGitHub()
+        gh.close(5, "On main as %s." % ABSENT_SHA)
+        gh.absent.add(ABSENT_SHA)
+        self.elsewhere(gh, 5, "stranger/anything")
+        report = ca.read_close(gh, REPO, 5)
+        self.assertEqual(report.verdict, ca.UNPROVEN)
+        self.assertEqual(report.deliveries, [])
+
+    def test_a_listed_fleet_repo_counts_whatever_its_case(self):
+        gh = FakeGitHub()
+        gh.close(5, "On main as %s." % ABSENT_SHA)
+        gh.absent.add(ABSENT_SHA)
+        self.elsewhere(gh, 5, "Example-Owner/Other-Repo")
+        report = ca.read_close(gh, REPO.upper(), 5, fleet=["example-owner/other-repo"])
+        self.assertEqual(report.verdict, ca.DIFFERS)
+        self.assertEqual([d.number for d in report.deliveries], [77])
+
+    def test_the_pure_check_ignores_a_pull_from_an_untrusted_repo(self):
+        pull = merged_pull(77)
+        pull["base"] = {"repo": {"full_name": "stranger/anything"}}
+        said = "Done as %s." % HEAD_SHA[:8]
+        report = ca.check(REPO, stamp(NOW), [comment(said)], [pull],
+                          places({MERGE_SHA[:8]: ca.ON, HEAD_SHA[:8]: ca.ABSENT}))
+        self.assertEqual(report.verdict, ca.UNPROVEN)
+
+    def test_the_fleet_comes_from_the_repo_list(self):
+        self.assertEqual(ca.fleet_repos({"LOOM_REPOS": "a/b, c/d e/f"}), ["a/b", "c/d", "e/f"])
+        self.assertEqual(ca.fleet_repos({}), [])
 
     def test_another_authors_hash_is_not_the_closers_citation(self):
         gh = FakeGitHub()

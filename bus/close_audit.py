@@ -25,6 +25,10 @@ budget. A close that is `unproven` gets one comment and is reopened; a ticket
 is reopened once, and a later unproven close of it gets the comment alone.
 Nothing closed before the first pass is read. It makes no AI call.
 
+Only a merged pull request whose base is the audited repo or a repo of this
+fleet (LOOM_REPOS) counts as delivery: anyone can merge a pull request in a repo
+of their own and cross-reference a public ticket.
+
 Only the closer's own comments around the close are read as citing a commit.
 A hash the closer wrote that names another repo in prose reads as absent here;
 the reopen comment says so, and the reopen happens once.
@@ -32,6 +36,7 @@ the reopen comment says so, and the reopen happens once.
 from __future__ import annotations
 
 import calendar
+import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
@@ -132,6 +137,17 @@ def cited_commits(repo: str, closed_at: Any, comments: Sequence[Any]) -> Tuple[L
     return found[:MAX_CITED], len(found) > MAX_CITED
 
 
+def fleet_repos(env: Optional[Mapping[str, str]] = None) -> List[str]:
+    """The repos whose merged pull requests count, besides the audited one."""
+    values = os.environ if env is None else env
+    return str(values.get("LOOM_REPOS") or "").replace(",", " ").split()
+
+
+def trusted(where: str, repo: str, fleet: Sequence[str]) -> bool:
+    """Whether a pull request based in `where` can prove delivery."""
+    return where.lower() in {name.lower() for name in [repo] + list(fleet)}
+
+
 def _pull_repo(repo: str, pull: Mapping[str, Any]) -> str:
     base = pull.get("base") if isinstance(pull.get("base"), dict) else {}
     where = base.get("repo") if isinstance(base.get("repo"), dict) else {}
@@ -164,12 +180,15 @@ def _verdict(citations: Sequence[Citation], deliveries: Sequence[Delivery], erro
 
 
 def check(repo: str, closed_at: Any, comments: Sequence[Any],
-          pulls: Sequence[Mapping[str, Any]], place: Place, error: str = "") -> Report:
+          pulls: Sequence[Mapping[str, Any]], place: Place, error: str = "",
+          fleet: Sequence[str] = ()) -> Report:
     """Judge one close. `pulls` are the ticket's merged pull requests as
     GitHub gives them, each with the cited commits it is known to carry under
-    "cited"; `place(repo, sha)` says where a commit is."""
+    "cited"; `place(repo, sha)` says where a commit is. A pull request based
+    outside the audited repo and `fleet` is left out (`trusted`)."""
     shas, cut = cited_commits(repo, closed_at, comments)
-    deliveries = [_delivery(repo, pull, place) for pull in pulls]
+    deliveries = [_delivery(repo, pull, place) for pull in pulls
+                  if trusted(_pull_repo(repo, pull), repo, fleet)]
     citations = [_citation(repo, sha, deliveries, place) for sha in shas]
     why = error or ("the close cites more than %d commits" % MAX_CITED if cut else "")
     return Report(_verdict(citations, deliveries, why), citations, deliveries, why)
@@ -213,9 +232,10 @@ def _place(gh: Any, repo: str, branch: str, sha: str) -> str:
     return OFF if status in ("ahead", "diverged") else UNSEEN
 
 
-def _merged_pulls(gh: Any, repo: str, number: int) -> Tuple[List[Dict[str, Any]], str]:
+def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str]
+                  ) -> Tuple[List[Dict[str, Any]], str]:
     """(the newest MAX_PULLS merged pull requests a ticket's timeline names,
-    in any repo, why the timeline was not read to its end, or "")."""
+    in a trusted repo, why the timeline was not read to its end, or "")."""
     found: Dict[Tuple[str, int], str] = {}
     full = False
     for page in range(1, TIMELINE_PAGES + 1):
@@ -226,8 +246,8 @@ def _merged_pulls(gh: Any, repo: str, number: int) -> Tuple[List[Dict[str, Any]]
             ref = (event.get("source") or {}).get("issue") or {} if isinstance(event, dict) else {}
             merged = (ref.get("pull_request") or {}).get("merged_at")
             where = str((ref.get("repository") or {}).get("full_name") or "")
-            if event.get("event") == "cross-referenced" and merged and where \
-                    and isinstance(ref.get("number"), int):
+            if event.get("event") == "cross-referenced" and merged \
+                    and trusted(where, repo, fleet) and isinstance(ref.get("number"), int):
                 found[(where, ref["number"])] = str(merged)
         full = len(events) >= PAGE
         if not full:
@@ -284,7 +304,7 @@ def _lookup(gh: Any, repo: str, branch: str, pulls: Sequence[Mapping[str, Any]])
     """`check`'s lookup: this repo against its default branch, and a merge
     commit in another repo against the default branch its pull request names."""
     def place(where: str, sha: str) -> str:
-        if where == repo:
+        if where.lower() == repo.lower():
             return _place(gh, where, branch, sha)
         for pull in pulls:
             if pull.get("merge_commit_sha") == sha:
@@ -295,28 +315,31 @@ def _lookup(gh: Any, repo: str, branch: str, pulls: Sequence[Mapping[str, Any]])
     return place
 
 
-def _read_and_check(gh: Any, repo: str, number: int, issue: Mapping[str, Any]) -> Report:
+def _read_and_check(gh: Any, repo: str, number: int, issue: Mapping[str, Any],
+                    fleet: Sequence[str]) -> Report:
     if issue.get("state") != "closed":
         raise _Unreadable("the ticket is not closed")
     branch = str((gh.rest("GET", "/repos/%s" % repo).data or {}).get("default_branch") or "")
     if not branch:
         raise _Unreadable("the default branch could not be read")
     own, long = _closers_comments(gh, repo, number, issue)
-    pulls, cut = _merged_pulls(gh, repo, number)
+    pulls, cut = _merged_pulls(gh, repo, number, fleet)
     shas = cited_commits(repo, issue.get("closed_at"), own)[0]
     pulls = _with_cited(gh, repo, shas, pulls)
     return check(repo, issue.get("closed_at"), own, pulls, _lookup(gh, repo, branch, pulls),
-                 error=long or cut)
+                 error=long or cut, fleet=fleet)
 
 
 def read_close(gh: Any, repo: str, number: int,
-               issue: Optional[Mapping[str, Any]] = None) -> Report:
+               issue: Optional[Mapping[str, Any]] = None,
+               fleet: Sequence[str] = ()) -> Report:
     """Read a ticket's newest close from GitHub and judge it (`check`). Any
     failed read makes the report unknown. `issue` is the ticket when the
-    caller already read it."""
+    caller already read it; `fleet` lists the other repos whose merged pull
+    requests count."""
     try:
         known = issue or gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-        return _read_and_check(gh, repo, number, known)
+        return _read_and_check(gh, repo, number, known, fleet)
     except RateLimited:
         raise
     except _Unreadable as err:
@@ -353,7 +376,8 @@ class _Pass:
     """One station pass over the closes of its repos."""
 
     def __init__(self, gh: Any, state: Dict[str, Any], now: float, own: Callable[[], str],
-                 say: Callable[[str], None]) -> None:
+                 say: Callable[[str], None], fleet: Sequence[str] = ()) -> None:
+        self.fleet = fleet
         self.gh, self.state, self.now, self.own, self.say = _Counted(gh), state, now, own, say
         self.read = self.refused = self.reopens = self.waiting = 0
         self.seen = state.setdefault("seen", {})
@@ -418,7 +442,7 @@ class _Pass:
             self.seen[key] = self.now
             return
         self.read += 1
-        report = read_close(self.gh, repo, number, full)
+        report = read_close(self.gh, repo, number, full, self.fleet)
         if report.verdict == UNKNOWN:
             self.unknown[key] = int(self.unknown.get(key) or 0) + 1
             self.say("close audit: %s#%d unknown: %s" % (repo, number, report.error or "a lookup "
@@ -474,7 +498,7 @@ def run_pass(gh: Any, repos: Sequence[str], state: Dict[str, Any], now: float,
     if isinstance(last, (int, float)) and 0 <= now - last < EVERY:
         return
     state["last"] = now
-    run = _Pass(gh, state, now, own, say)
+    run = _Pass(gh, state, now, own, say, repos)
     try:
         for repo in repos:
             run.repo(repo)

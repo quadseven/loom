@@ -7224,7 +7224,7 @@ def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_audit_close(gh: GitHub, args: argparse.Namespace) -> int:
     """Print what git holds for a ticket's close (bus/close_audit.py)."""
     repo, number = _ref(args.ticket, "ticket")
-    report = close_audit.read_close(gh, repo, number)
+    report = close_audit.read_close(gh, repo, number, fleet=close_audit.fleet_repos())
     print("\n".join(close_audit.lines(report)))
     return 0 if report.verdict == close_audit.SOUND else 1
 
