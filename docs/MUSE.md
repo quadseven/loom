@@ -276,7 +276,10 @@ Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
 close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
-live regression) and `brief` (a brief named but not written this tick).
+live regression), `brief` (a brief named but not written this tick) and
+`needs-brain` (a decision left open on a `loom:briefed` ticket that carries
+`needs-brain`; the defer changes no label, hold or state, and the `done`
+line for that stage and ticket retires it).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`

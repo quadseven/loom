@@ -2012,7 +2012,8 @@ def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any
 
 
 def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
-              today: Optional[str] = None, standing: bool = False) -> Dict[str, Any]:
+              today: Optional[str] = None, standing: bool = False,
+              labels: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """File an epic under an open goal: the epic label, a done-when, a size
     line and a Part of #goal line, linked as the goal's sub-issue when GitHub
     allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
@@ -2032,13 +2033,15 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if not standing:
         _check_epic_room(gh, repo, goal, goal_issue, today)
     made = gh.rest("POST", "/repos/%s/issues" % repo,
-                   {"title": title, "body": body, "labels": ["epic"]}).data or {}
+                   {"title": title, "body": body,
+                    "labels": ["epic"] + list(labels or [])}).data or {}
     if made.get("id") is not None:
         _link_to_goal(gh, repo, goal, made)
     return made
 
 
-def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
+def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
+                area: Optional[str] = None) -> int:
     """The goal's newest open intake epic with room for `room` more tickets
     (EPIC_TICKET_CAP is the most one holds), opened (within the epic cap) when
     none has room: where triage, rewrites, health intake, validation
@@ -2049,17 +2052,57 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1) -> int:
     if not 1 <= room <= EPIC_TICKET_CAP:
         raise ValueError("%d tickets do not fit one epic (cap %d)" % (room, EPIC_TICKET_CAP))
     _, tree = goal_tree(gh, repo, goal)
+    area_label = "area:" + area if area else None
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
-             and is_intake_epic(found)
+             and ((area_label in _labels(found)) if area_label else
+                  is_intake_epic(found))
              and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
     if roomy:
         return max(roomy)
-    made = file_epic(gh, repo, goal, next_intake_title(gh, repo),
-                     INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP))
+    if area:
+        title = "Epic: " + area
+        body = ("Done when: this area epic holds %d tickets, or every ticket in it is closed; "
+                "the next area epic opens when it fills.\n\nSize: at most %d tickets.\n\n"
+                "Area: %s\n" % (EPIC_TICKET_CAP, EPIC_TICKET_CAP, area))
+    else:
+        title = next_intake_title(gh, repo)
+        body = INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP)
+    made = file_epic(gh, repo, goal, title, body,
+                     labels=[area_label] if area_label else None)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
+
+
+def _area_labels(gh: GitHub, repo: str) -> Dict[str, Dict[str, Any]]:
+    """The repo's `area:` labels by area name. A pass reads this once."""
+    available = gh.paginate("/repos/%s/labels?per_page=100" % repo)
+    return {str(label.get("name") or "")[5:]: label for label in available
+            if isinstance(label, dict) and
+            str(label.get("name") or "").startswith("area:") and
+            str(label.get("name") or "")[5:]}
+
+
+def _ticket_area(areas: Dict[str, Dict[str, Any]], ticket: Dict[str, Any]) -> Optional[str]:
+    """Return the ticket's area label, or infer one from label descriptions."""
+    labels = _labels(ticket)
+    if not areas:
+        return None
+    selected = sorted(name[len("area:"):] for name in labels
+                      if name.startswith("area:") and name[len("area:"):] in areas)
+    if selected:
+        return selected[0]
+    text = (str(ticket.get("title") or "") + " " +
+            str(ticket.get("body") or "")).lower()
+    scores = []
+    for area, label in areas.items():
+        words = set(re.findall(r"[a-z0-9]+", (area + " " +
+                         str(label.get("description") or "")).lower()))
+        score = sum(1 for word in words if len(word) > 2 and
+                    re.search(r"\b" + re.escape(word) + r"\b", text))
+        scores.append((score, area))
+    return sorted(scores, key=lambda pair: (-pair[0], pair[1]))[0][1]
 
 
 def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
@@ -2089,16 +2132,29 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
                                    int(pair[0].get("number") or 0)))
     moved = 0
+    areas = _area_labels(gh, repo)
     epic, held = _intake_with_room(tree)
     for ticket, old in tickets:
-        if epic is None or held >= EPIC_TICKET_CAP:
-            opened = _open_intake_epic(gh, repo, goal)
-            if opened is None:
+        area = _ticket_area(areas, ticket)
+        if area:
+            # Each move changes that area's room, so intake_epic reads it again.
+            if "area:" + area not in _labels(ticket):
+                gh.rest("POST", "/repos/%s/issues/%d/labels" %
+                        (repo, int(ticket["number"])), {"labels": ["area:" + area]})
+            try:
+                target = intake_epic(gh, repo, goal, area=area)
+            except ValueError:
                 break
-            epic, held = opened
-        if _move_to_epic(gh, repo, epic, ticket, old):
+        else:
+            if epic is None or held >= EPIC_TICKET_CAP:
+                opened = _open_intake_epic(gh, repo, goal)
+                if opened is None:
+                    break
+                epic, held = opened
+            target = epic
+        if _move_to_epic(gh, repo, target, ticket, old):
             moved += 1
-            held += 1
+            held += 0 if area else 1
     return (moved, len(tickets) - moved)
 
 
@@ -3243,6 +3299,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     lines: List[str] = []
     done = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
+    areas: Optional[Dict[str, Dict[str, Any]]] = None
     for issue in _oldest_open_issues(gh, repo):
         if done >= limit:
             break
@@ -3258,7 +3315,12 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 continue
             # Decision 0003: a ready issue goes under the goal's intake epic,
             # opened when there is none and again when one fills up.
-            if intake is None or intake[1] >= EPIC_TICKET_CAP:
+            areas = _area_labels(gh, repo) if areas is None else areas
+            area = _ticket_area(areas, issue)
+            if area:
+                found = intake_epic(gh, repo, goal, area=area)
+                intake = (found, 0)
+            elif intake is None or intake[1] >= EPIC_TICKET_CAP:
                 found = intake_epic(gh, repo, goal)
                 intake = (found, len(_epic_tickets(gh, repo, found)))
             if not _link_to_goal(gh, repo, intake[0], issue, under=goal):
@@ -3267,7 +3329,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
                 gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
                         {"body": _with_part_of(str(issue.get("body") or ""), intake[0])})
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                    {"labels": ["loom:ticket", "loom:queued"]})
+                    {"labels": ["loom:ticket", "loom:queued"] +
+                     (["area:" + area] if area and "area:" + area not in _labels(issue) else [])})
             in_flight += 1
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
@@ -5468,6 +5531,8 @@ def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
         "ask": (needs_human(names), "an ask item is a needs:human issue"),
         "regression": ("pull_request" not in issue, "a regression item is an issue"),
         "brief": ("loom:goal" in names, "a brief item is a loom:goal issue"),
+        "needs-brain": (("loom:briefed" in names and "needs-brain" in names),
+                        "a needs-brain item is a loom:briefed ticket with needs-brain"),
     }
     if stage not in rules:
         raise ValueError("unknown stage %s; stages are %s" % (stage, ", ".join(handoff.STAGES)))
