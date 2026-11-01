@@ -276,6 +276,8 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
         "/repos/%s/pulls/8" % REPO: pr,
         "/graphql": {"data": {"repository": {"pullRequest": graph}}},
         "/repos/%s/issues/9/comments" % REPO: [],
+        # The pull request's own comments: no fleet hold on it (loom#2393).
+        "/repos/%s/issues/8/comments" % REPO: [],
         "/repos/%s/issues/9/events" % REPO: [
             {"event": "labeled", "label": {"name": "loom:revert"}, "actor": {"login": labeler}}],
         "/repos/%s/issues/9" % REPO: ticket,
