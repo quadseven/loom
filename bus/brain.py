@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
+from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
@@ -6632,7 +6633,8 @@ def lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]
     five times while the ladder recorded claude-sonnet-5-5."""
     env = os.environ if env is None else env
     for name in dict.fromkeys((lane, re.sub(r"-[0-9]+$", "", lane))):
-        value = str(env.get("LOOM_%s_MODEL" % name.upper().replace("-", "_")) or "").strip()
+        key = "LOOM_%s_MODEL" % name.upper().replace("-", "_")
+        value = str(env.get(key) or "").strip() or runners.tracked_setting(key)
         if value:
             return value
     return None

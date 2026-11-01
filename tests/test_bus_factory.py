@@ -3564,8 +3564,8 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
         # Then the free provider slots: on a private repo only the two allowed
         # private code (infra#5617), then codex.
-        self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
-        self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
+        self.assertEqual(factory.TIERS["easy"][6:12], factory.FREE_POOL)
+        self.assertEqual(factory.TIERS["medium"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
                          ("free-ollama", "free-gemma", "openrouter"))
 
@@ -3590,7 +3590,7 @@ class Tickets(Base):
                          ("free-ollama", "free-gemma", "openrouter", "workersai", "codex"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
-        for lane in ("free-nvidia", "free-kilo", "free-groq"):
+        for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
             self.assertIn(lane, factory.PUBLIC_ONLY)
         for lane in ("free-ollama", "free-gemma"):
             self.assertNotIn(lane, factory.PUBLIC_ONLY)

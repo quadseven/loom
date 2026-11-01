@@ -43,7 +43,10 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # free-gemma Gemma (both allowed private code, /free/<provider>/v1);
          # free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq Groq (public repos
          # only, /free-public/<provider>/v1).
-         "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq"]
+         "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
+         # OpenRouter's free models through the gateway, which holds the key:
+         # a cluster runner slot only, never a Mac lane (loom#2413).
+         "free-openrouter"]
 LANES = LANES + SLOTS
 
 

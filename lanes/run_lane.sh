@@ -355,6 +355,7 @@ lane_setting() {
       free-nvidia) route=/free-public/nvidia-nim/v1 ;;
       free-kilo) route=/free-public/kilo/v1 ;;
       free-groq) route=/free-public/groq/v1 ;;
+      free-openrouter) route=/free-public/openrouter/v1 ;;
     esac
     value="${LOOM_FREE_GATEWAY_URL%/}$route"
   fi
@@ -3081,7 +3082,7 @@ trains_on_prompts() {
   case "$LANE:$MODEL" in zen:*|zai:*|agy:*|copilot:*|opencode-go:opencode/*|opencode-go:*contributor*) return 0 ;; esac
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
-  case "$SLOT" in free-nvidia|free-kilo|free-groq) return 0 ;; esac
+  case "$SLOT" in free-nvidia|free-kilo|free-groq|free-openrouter) return 0 ;; esac
   return 1
 }
 

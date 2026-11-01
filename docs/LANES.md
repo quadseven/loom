@@ -1736,10 +1736,11 @@ again after an hour.
 
 ## free provider slots on the spark-gateway
 
-Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use
 separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
-`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
-`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`free-gemma` uses `/free/gemini/v1`, `free-openrouter`
+`/free-public/openrouter/v1` (a cluster runner slot only), and `free-nvidia`,
+`free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
 holds only that slot for 15 minutes as a limit, so the station can assign the
@@ -2109,6 +2110,11 @@ skips both. The real controls are:
 - The repository setting that requires approval before workflows run for
   any outside collaborator's pull request (managed in the private
   infrastructure code).
+
+`bus/runners.py` TRACKED_SLOTS names slots that run here wherever any runner
+slot does, with the settings the station's plist lacks. They deploy by merge,
+beside the Mac lane they will replace, because a plist changes only through a
+reinstall that replaces every lane. docs/LANE_RUNNERS_PLAN.md holds the plan.
 
 To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
 `opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes

@@ -7133,6 +7133,17 @@ exec /usr/bin/git "$@"
         self.assertIn("[factory]", log)
         self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
 
+    def test_the_openrouter_free_slot_reaches_its_gateway_route_with_no_key(self):
+        # The gateway holds the key and serves only :free models, so the agent
+        # has no key to read (loom#2413). Asked of the runner itself: a free
+        # slot's URL is the gateway's route pinned to its provider.
+        script = ('LOOM_FREE_GATEWAY_URL=http://gw:8080 SLOT=free-openrouter LANE=free; '
+                  'eval "$(sed -n "/^setting_var()/,/^}/p" "$1")"; '
+                  'lane_setting URL')
+        out = subprocess.run(["bash", "-c", script, "_", str(RUNNER)],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "http://gw:8080/free-public/openrouter/v1")
+
     def red_base_contract(self, check):
         return "interpreter: loom-test-python\nsubmodules: yes\ncheck: %s\n" % check
 
