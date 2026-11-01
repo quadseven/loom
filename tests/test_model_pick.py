@@ -235,6 +235,16 @@ class ModelPickTest(unittest.TestCase):
         model_pick.settle(self.home, self.now, MIMO, ["not json"])
         self.assertEqual(model_pick.spent(self.home, self.now, MIMO), before)
 
+    def test_an_unrecorded_spend_stops_paid_models_for_an_hour(self):
+        self.free_models_down()
+        self.later(1)
+        model_pick.usage_dir(self.home).mkdir(parents=True, exist_ok=True)
+        model_pick.unsettled_file(self.home).write_text("%d\n" % self.now)
+        self.assertIsNone(self.pick(private=True).model)
+        self.now += model_pick.PAUSE_UNSETTLED + 1
+        self.free_models_down()
+        self.assertEqual(self.pick(private=True).model, MIMO)
+
     def test_a_free_model_settles_nothing(self):
         model_pick.settle(self.home, self.now, "opencode-go/beam-free",
                           ['{"type":"step_finish","part":{"tokens":{"output":99999}}}'])

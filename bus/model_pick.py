@@ -48,6 +48,7 @@ PAUSE_LIMIT = 900
 PAUSE_GONE = 86400
 PAUSE_FAILED = 1800
 PAUSE_SILENT = 600
+PAUSE_UNSETTLED = 3600
 PAUSE_MOST = 32 * 86400
 RETRY_NOTHING = 900
 
@@ -113,6 +114,11 @@ def pause_file(home: Path) -> Path:
 
 def budget_file(home: Path) -> Path:
     return usage_dir(home) / "go-budget.jsonl"
+
+
+def unsettled_file(home: Path) -> Path:
+    """Written by the runner when a paid run's spend could not be recorded."""
+    return usage_dir(home) / "go-budget.unsettled"
 
 
 def _cache_file(home: Path) -> Path:
@@ -373,7 +379,19 @@ def _period_spent(home: Path, start: float, model: str) -> float:
                for e in _entries(home) if float(e.get("at") or 0) >= start)
 
 
+def _unsettled(home: Path, now: float) -> bool:
+    """A recent failed settlement: the ledger may undercount, so no paid run."""
+    try:
+        return now - float(unsettled_file(home).read_text(encoding="utf-8").strip()) < PAUSE_UNSETTLED
+    except OSError:
+        return False
+    except ValueError:
+        return True
+
+
 def _has_room(home: Path, now: float, model: str, day: int = RENEWAL_DAY) -> bool:
+    if _unsettled(home, now):
+        return False
     limits = GO_PAID[model]
     plan = spent(home, now, model)
     own = spent(home, now, model, only=model)

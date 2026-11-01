@@ -3806,7 +3806,11 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   is_api_lane && archive_transcripts
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
-    model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG" || true
+    # An unknown spend fails closed: the marker stops paid picks for an hour.
+    if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
+      date +%s > "$LOOM_HOME/state/usage/go-budget.unsettled"
+      echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
+    fi
   fi
   if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
