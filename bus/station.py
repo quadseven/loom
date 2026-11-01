@@ -7575,10 +7575,15 @@ class Station:
         model = headers.get("Model", "")
         order = self._retry_order(failed, klass, headers.get("Difficulty"))
         public: Dict[str, bool] = {}
+        # A demoted lane takes no build ticket (bus/scorecard.py): a retry
+        # moved onto one was moved straight off again by the factory, a pass
+        # and a status line each time (loom#2430).
+        demoted = set(self.demoted_lanes())
         first: Optional[List[Dict[str, Any]]] = None
         busy = None
         for cand in dict.fromkeys(order):
-            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
+            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public,
+                                                        demoted):
                 continue
             if self.model_limited(cand, brief_model(cand, headers)) is not None:
                 continue
@@ -7625,12 +7630,12 @@ class Station:
         return order
 
     def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
-                        public: Dict[str, bool]) -> bool:
+                        public: Dict[str, bool], demoted: Iterable[str] = ()) -> bool:
         """Whether lane cand can take a retry: a known, available lane, not
-        the failed lane's provider, whose runner takes the model and, for a
-        public-only lane, a public repo. public caches the repo lookup across
-        candidates."""
-        if cand not in LANES or not self._heartbeat_ok(cand):
+        demoted, not the failed lane's provider, whose runner takes the model
+        and, for a public-only lane, a public repo. public caches the repo
+        lookup across candidates."""
+        if cand not in LANES or cand in demoted or not self._heartbeat_ok(cand):
             return False
         if provider(cand) == provider(failed):
             return False
