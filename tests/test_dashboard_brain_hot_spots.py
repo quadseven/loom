@@ -39,6 +39,45 @@ def outcome(lane, text, at="2030-01-07T10:00:00Z", number=5):
 
 
 class BrainViewTest(unittest.TestCase):
+    def test_brains_page_shows_paused_brain_and_busy_lane_from_fixture(self):
+        data = brain_view.build_brains(
+            {"holder": "muse", "started_at": None, "step": None},
+            [{"created_at": "2030-01-08T10:00:00Z", "body":
+              "<!-- loom:journal v1 -->\nTick 2030-01-08T10:00:00Z, muse\n- Next: review the open work"}],
+            [{"lane": "codex-2", "available": True, "heartbeat": "2030-01-08T11:55:00Z"}],
+            [{"repo": "example-owner/sample", "number": 52, "title": "Sample task", "state": "running",
+              "lane": "codex-2", "html_url": "https://github.com/example-owner/sample/issues/52",
+              "labels": ["claim:codex-2"]}], [],
+            now=NOW)
+        body = brain_view.render_brains(data)
+        self.assertIn("muse", body)
+        self.assertIn("paused", body)
+        self.assertIn("codex-2", body)
+        self.assertIn('href="/t/example-owner/sample/52"', body)
+        self.assertIn("Sample task", body)
+
+    def test_an_idle_lane_says_idle_beside_a_busy_one(self):
+        data = brain_view.build_brains(
+            None, [],
+            [{"lane": "codex-2", "available": True, "heartbeat": "2030-01-08T11:55:00Z"},
+             {"lane": "claude", "available": True, "heartbeat": "2030-01-08T11:55:00Z"}],
+            [{"repo": "example-owner/sample", "number": 52, "title": "Sample task", "state": "running",
+              "lane": "codex-2", "html_url": "https://github.com/example-owner/sample/issues/52",
+              "labels": ["claim:codex-2"]}], [],
+            now=NOW)
+        cards = {c.split("</h3>")[0].rpartition(">")[2]: c
+                 for c in brain_view.render_brains(data).split("<article")[1:]}
+        self.assertIn("/ idle", cards["claude"])
+        self.assertIn("<p>idle</p>", cards["claude"])
+        self.assertIn("/ busy", cards["codex-2"])
+        self.assertNotIn("<p>idle", cards["codex-2"])
+
+    def test_a_brain_holding_the_lock_under_an_alias_shows_running(self):
+        record = {"holder": "mastermind", "started_at": "2030-01-08T11:30:00Z", "step": "merge"}
+        brains = brain_view.build_brains(record, [], [], [], [], now=NOW)["brains"]
+        (card,) = [b for b in brains if b["holder"] == "operator session"]
+        self.assertEqual((card["state"], card["step"]), ("running", "merge"))
+
     def test_current_step_is_marked_and_markers_are_verbatim(self):
         body = brain_view.render_brain(brain_view.build_brain(RECORD, "", [OLDER, JOURNAL]))
         self.assertIn('<li class="tick-step current" aria-current="step"><span class="tick-bar"></span>'
