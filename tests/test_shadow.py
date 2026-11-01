@@ -25,7 +25,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, lock, shadow, station, watch  # noqa: E402
-from bus.github import GitHub, GitHubError, ShadowHeld  # noqa: E402
+from bus.github import GitHub, GitHubError, Response, ShadowHeld  # noqa: E402
 
 import test_bus_brain as tbb  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
@@ -517,7 +517,7 @@ class ReportTest(ShadowCase):
     def run_report(self, *argv):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = shadow.main(["report", *argv])
+            code = shadow.main(["report", "--ledger-only", *argv])
         return code, out.getvalue()
 
     def test_report_lists_would_actions_since_a_time_with_links(self):
@@ -550,6 +550,311 @@ class ReportTest(ShadowCase):
                 redirect_stdout(out):
             shadow.main(["status"])
         self.assertIn("shadow mode on for example-owner/a", out.getvalue())
+
+
+class OutcomeReportTest(ShadowCase):
+    """The report pairs would-actions with GitHub outcomes and operator
+    verdicts, counts damage, and shows the clean decisions since the last
+    damaging one."""
+
+    SHA = "a" * 40
+
+    def _pr(self, number, state="closed", merged=True, head_sha=SHA, merged_by="loom[bot]",
+            title="A change", merge_sha="f" * 40):
+        """A pull request as GitHub answers it."""
+        return {"number": number, "state": state, "merged": merged, "title": title,
+                "merge_commit_sha": merge_sha if merged else None,
+                "head": {"sha": head_sha}, "base": {"sha": "b" * 40},
+                "merged_by": {"login": merged_by} if merged else None}
+
+    def _issue(self, number, state="closed", labels=("loom:ticket",), body=""):
+        return {"number": number, "state": state, "state_reason": "completed",
+                "labels": [{"name": n} for n in labels], "body": body}
+
+    def _make_gh(self, responses, reverts=()):
+        """A fake client: `responses` by path, `reverts` as the search's
+        items. A path with no answer raises as GitHub's 404 does."""
+        class FakeGH:
+            def __init__(self):
+                self.calls = []
+
+            def rest(self, method, path, body=None, etag=None, ok=()):
+                self.calls.append((method, path))
+                if method != "GET":
+                    raise AssertionError("the report writes nothing: %s %s" % (method, path))
+                if path.startswith("/search/issues"):
+                    if reverts is None:
+                        raise GitHubError("GET /search/issues -> 503", 503, "")
+                    return Response(200, {"items": list(reverts), "total_count": len(reverts)}
+                                    if not isinstance(reverts, dict) else reverts)
+                if path not in responses:
+                    raise GitHubError("GET %s -> 404" % path, 404, "")
+                return Response(200, responses[path])
+        return FakeGH()
+
+    def _pulls(self, *prs):
+        return {"/repos/%s/pulls/%d" % (REPO, p["number"]): p for p in prs}
+
+    def _data(self, gh):
+        return shadow._compute_report_data(shadow.read(self.ledger, 0), gh)
+
+    def _one(self, pr, reverts=(), sha=SHA):
+        shadow.record("merge", REPO, pr["number"], "pr", sha=sha, tier="app-code", now=1000)
+        return self._data(self._make_gh(self._pulls(pr), reverts))["merge_pairs"][0]
+
+    def test_merged_as_is_by_the_factory_is_clean(self):
+        pair = self._one(self._pr(8))
+        self.assertEqual(pair["outcome"], shadow.MERGED_AS_IS)
+        self.assertFalse(pair["damaging"])
+
+    def test_merged_as_is_by_a_person_is_clean(self):
+        # In shadow mode a person is the only one who can merge at all.
+        pair = self._one(self._pr(8, merged_by="an-operator"))
+        self.assertEqual(pair["outcome"], shadow.MERGED_AS_IS)
+        self.assertFalse(pair["damaging"])
+
+    def test_merged_after_changes_is_damaging(self):
+        pair = self._one(self._pr(8, head_sha="b" * 40))
+        self.assertEqual(pair["outcome"], shadow.MERGED_AFTER_CHANGES)
+        self.assertTrue(pair["damaging"])
+
+    def test_closed_unmerged_is_damaging(self):
+        pair = self._one(self._pr(8, merged=False))
+        self.assertEqual(pair["outcome"], shadow.CLOSED_UNMERGED)
+        self.assertTrue(pair["damaging"])
+
+    def test_reverted_later_is_damaging_for_each_way_a_revert_names_it(self):
+        for number, hand in ((8, {"title": 'Revert "A change"', "body": ""}),
+                             (9, {"title": "Undo", "body": "git revert --no-edit " + "f" * 40}),
+                             (10, {"title": "Revert #10", "body": ""})):
+            with self.subTest(hand=hand):
+                pair = self._one(self._pr(number, merge_sha="f" * 40, title="A change"),
+                                 reverts=[dict(hand, number=99)])
+                self.assertEqual(pair["outcome"], shadow.REVERTED)
+                self.assertTrue(pair["damaging"])
+                os.remove(self.ledger)
+
+    def test_a_revert_of_another_pull_request_changes_nothing(self):
+        pair = self._one(self._pr(8), reverts=[{"number": 99, "title": 'Revert "Other"',
+                                                "body": ""}])
+        self.assertEqual(pair["outcome"], shadow.MERGED_AS_IS)
+
+    def test_the_repos_reverts_are_read_once(self):
+        shadow.record("merge", REPO, 1, "pr", sha=self.SHA, now=1000)
+        shadow.record("merge", REPO, 2, "pr", sha=self.SHA, now=1001)
+        gh = self._make_gh(self._pulls(self._pr(1), self._pr(2)))
+        self._data(gh)
+        self.assertEqual(len([p for _, p in gh.calls if p.startswith("/search/")]), 1)
+
+    def test_still_open_is_neither_damaging_nor_clean(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=1000)
+        data = self._data(self._make_gh(self._pulls(self._pr(8, state="open", merged=False))))
+        self.assertEqual(data["merge_pairs"][0]["outcome"], shadow.STILL_OPEN)
+        self.assertFalse(data["merge_pairs"][0]["damaging"])
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["pending"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_a_hold_verdict_on_an_open_pull_request_is_damaging(self):
+        shadow.record("operator-verdict", REPO, 8, "pr", label="hold", sha=self.SHA, now=1010)
+        pair = self._one(self._pr(8, state="open", merged=False))
+        self.assertEqual(pair["verdict"], "hold")
+        self.assertTrue(pair["damaging"])
+
+    def test_the_newest_verdict_wins(self):
+        shadow.record("operator-verdict", REPO, 8, "pr", label="hold", sha=self.SHA, now=1010)
+        shadow.record("operator-verdict", REPO, 8, "pr", label="merge", sha=self.SHA, now=1020)
+        pair = self._one(self._pr(8))
+        self.assertEqual(pair["verdict"], "merge")
+        self.assertFalse(pair["damaging"])
+
+    def test_a_pull_request_it_cannot_read_is_unknown_and_counts_as_clean_nowhere(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=1000)
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            data = self._data(self._make_gh({}))
+        self.assertEqual(data["merge_pairs"][0]["outcome"], shadow.UNKNOWN)
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["unknown"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+        self.assertIn("-> 404", err.getvalue())
+
+    def test_a_merge_with_unreadable_reverts_is_unknown(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            pair = self._one(self._pr(8), reverts=None)
+        self.assertEqual(pair["outcome"], shadow.UNKNOWN)
+        self.assertFalse(pair["damaging"])
+
+    def test_a_partial_revert_search_is_unknown(self):
+        for answer in ({"items": [], "incomplete_results": True, "total_count": 0},
+                       {"items": [], "total_count": 101},
+                       {"total_count": 0}):
+            with self.subTest(answer=answer):
+                with mock.patch("sys.stderr", new_callable=io.StringIO):
+                    pair = self._one(self._pr(8), reverts=answer)
+                self.assertEqual(pair["outcome"], shadow.UNKNOWN)
+                os.remove(self.ledger)
+
+    def test_the_revert_search_starts_at_the_earliest_would_merge(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, now=86400 * 2)
+        shadow.record("merge", REPO, 9, "pr", sha=self.SHA, now=86400 * 5)
+        gh = self._make_gh(self._pulls(self._pr(8), self._pr(9)))
+        self._data(gh)
+        search = [p for _, p in gh.calls if p.startswith("/search/")][0]
+        self.assertIn("merged%3A%3E%3D1970-01-03", search)
+
+    def test_a_merge_with_no_recorded_sha_is_unknown_unless_reverted(self):
+        self.assertEqual(self._one(self._pr(8), sha="")["outcome"], shadow.UNKNOWN)
+        os.remove(self.ledger)
+        hand = {"number": 99, "title": 'Revert "A change"', "body": ""}
+        self.assertEqual(self._one(self._pr(8), reverts=[hand], sha="")["outcome"],
+                         shadow.REVERTED)
+
+    def test_a_code_fault_is_not_taken_for_github_being_down(self):
+        class Broken:
+            def rest(self, *args, **kwargs):
+                raise KeyError("a bug, not an outage")
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, now=1000)
+        with self.assertRaises(KeyError):
+            self._data(Broken())
+
+    def test_a_pull_request_answer_with_a_null_head_reads_as_a_new_head(self):
+        pr = self._pr(8)
+        pr["head"] = None
+        self.assertEqual(self._one(pr)["outcome"], shadow.MERGED_AFTER_CHANGES)
+
+    def _close(self, issue, number=3):
+        shadow.record("close", REPO, number, "issue", tier="app-code", now=1000)
+        return self._make_gh({"/repos/%s/issues/%d" % (REPO, number): issue})
+
+    def test_a_would_close_with_an_unticked_box_is_wrong(self):
+        body = "## Acceptance criteria\n- [ ] One\n- [x] Two"
+        pair = self._data(self._close(self._issue(3, body=body)))["close_pairs"][0]
+        self.assertTrue(pair["wrong"])
+
+    def test_a_would_close_with_every_box_ticked_is_right(self):
+        body = "## Acceptance criteria\n- [x] One\n- [x] Two"
+        pair = self._data(self._close(self._issue(3, body=body)))["close_pairs"][0]
+        self.assertFalse(pair["wrong"])
+
+    def test_a_would_close_of_no_ticket_is_right(self):
+        body = "## Acceptance criteria\n- [ ] One"
+        pair = self._data(self._close(self._issue(3, labels=("bug",), body=body)))["close_pairs"][0]
+        self.assertFalse(pair["wrong"])
+
+    def test_an_issue_it_cannot_read_is_unknown_and_not_clean(self):
+        shadow.record("close", REPO, 3, "issue", tier="app-code", now=1000)
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            data = self._data(self._make_gh({}))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["unknown"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_an_open_issue_with_every_box_ticked_is_pending_not_clean(self):
+        body = "## Acceptance criteria\n- [x] One"
+        data = self._data(self._close(self._issue(3, state="open", body=body)))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["pending"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_an_open_issue_with_an_unticked_box_is_already_wrong(self):
+        body = "## Acceptance criteria\n- [ ] One"
+        data = self._data(self._close(self._issue(3, state="open", body=body)))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["wrong_closes"], 1)
+
+    def test_an_issue_with_unreadable_labels_is_unknown(self):
+        found = self._issue(3)
+        del found["labels"]
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            data = self._data(self._close(found))
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["unknown"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
+    def test_counts_are_per_repo_and_tier(self):
+        other = "example-owner/other"
+        shadow.record("merge", REPO, 1, "pr", sha=self.SHA, tier="app-code", now=1000)
+        shadow.record("merge", REPO, 2, "pr", sha=self.SHA, tier="docs", now=1001)
+        shadow.record("merge", REPO, 3, "pr", sha=self.SHA, tier="docs", now=1002)
+        shadow.record("close", REPO, 4, "issue", tier="docs", now=1003)
+        shadow.record("merge", other, 5, "pr", sha=self.SHA, tier="docs", now=1004)
+        responses = self._pulls(self._pr(1), self._pr(2), self._pr(3, head_sha="c" * 40))
+        responses["/repos/%s/issues/4" % REPO] = self._issue(
+            4, body="## Acceptance criteria\n- [ ] One")
+        responses["/repos/%s/pulls/5" % other] = self._pr(5)
+        by_tier = self._data(self._make_gh(responses))["by_repo_tier"]
+        self.assertEqual(sorted(by_tier), sorted([(other, "docs"), (REPO, "app-code"), (REPO, "docs")]))
+        self.assertEqual(by_tier[(REPO, "app-code")]["decisions"], 1)
+        self.assertEqual(by_tier[(REPO, "app-code")]["damaging"], 0)
+        self.assertEqual(by_tier[(REPO, "docs")]["decisions"], 3)
+        self.assertEqual(by_tier[(REPO, "docs")]["damaging"], 1)
+        self.assertEqual(by_tier[(REPO, "docs")]["wrong_closes"], 1)
+        self.assertEqual(by_tier[(other, "docs")]["damaging"], 0)
+
+    def test_the_clean_count_resets_after_a_damaging_would_merge(self):
+        for number in (1, 2, 3, 4):
+            shadow.record("merge", REPO, number, "pr", sha=self.SHA, now=1000 + number)
+        prs = self._pulls(self._pr(1), self._pr(2, head_sha="c" * 40), self._pr(3), self._pr(4))
+        self.assertEqual(self._data(self._make_gh(prs))["clean_by_repo"][REPO], 2)
+
+    def test_the_clean_count_is_per_repo_across_tiers_in_time_order(self):
+        # A damaging merge in one tier, later than a clean close in another.
+        shadow.record("close", REPO, 3, "issue", tier="docs", now=1000)
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=2000)
+        responses = self._pulls(self._pr(8, merged=False))
+        responses["/repos/%s/issues/3" % REPO] = self._issue(3)
+        self.assertEqual(self._data(self._make_gh(responses))["clean_by_repo"][REPO], 0)
+
+    def test_a_wrong_would_close_resets_the_clean_count(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, now=1000)
+        shadow.record("close", REPO, 3, "issue", now=2000)
+        responses = self._pulls(self._pr(8))
+        responses["/repos/%s/issues/3" % REPO] = self._issue(
+            3, body="## Acceptance criteria\n- [ ] One")
+        self.assertEqual(self._data(self._make_gh(responses))["clean_by_repo"][REPO], 0)
+
+    def run_main(self, gh, *argv):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = shadow.main(["report", "--since", "1970-01-01T00:00:01Z", "--ledger", self.ledger,
+                                *argv], gh=gh)
+        return code, out.getvalue()
+
+    def test_the_report_command_prints_outcomes_verdicts_and_counts(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=1000)
+        shadow.record("operator-verdict", REPO, 8, "pr", label="merge", sha=self.SHA, now=1010)
+        shadow.record("merge", REPO, 9, "pr", sha=self.SHA, tier="app-code", now=1020)
+        shadow.record("close", REPO, 3, "issue", tier="app-code", now=1030)
+        responses = self._pulls(self._pr(8), self._pr(9, merged=False))
+        responses["/repos/%s/issues/3" % REPO] = self._issue(
+            3, body="## Acceptance criteria\n- [ ] One")
+        code, text = self.run_main(self._make_gh(responses))
+        self.assertEqual(code, 0)
+        self.assertIn("operator verdict: merge", text)
+        self.assertIn("outcome: merged as is at %s" % self.SHA[:12], text)
+        self.assertIn("outcome: closed unmerged", text)
+        self.assertIn("[DAMAGING]", text)
+        self.assertIn("[WRONG]", text)
+        self.assertIn("%s tier=app-code: decisions=3, damaging=1, wrong-closes=1" % REPO, text)
+        self.assertIn("%s: clean-since-last-damage=0" % REPO, text)
+
+    def test_the_report_names_a_shadow_repo_with_no_decisions(self):
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW_REPOS": "example-owner/quiet"}):
+            _, text = self.run_main(self._make_gh({}))
+        self.assertIn("example-owner/quiet: no decisions", text)
+
+    def test_the_report_speaks_json_with_outcomes(self):
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=1000)
+        _, text = self.run_main(self._make_gh(self._pulls(self._pr(8))), "--json")
+        found = json.loads(text)
+        merge = [e for e in found if e["type"] == "would-merge"][0]
+        self.assertEqual(merge["outcome"], shadow.MERGED_AS_IS)
+        self.assertFalse(merge["damaging"])
+        self.assertEqual([e for e in found if e["type"] == "repo"],
+                         [{"type": "repo", "repo": REPO, "clean_since_last_damage": 1}])
+        summary = [e for e in found if e["type"] == "summary"][0]
+        self.assertEqual((summary["decisions"], summary["damaging"]), (1, 0))
+
+    def test_no_token_is_refused_with_a_reason(self):
+        with mock.patch("bus.github.auth_from_env", side_effect=GitHubError("no GitHub token")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(shadow.main(["report", "--ledger", self.ledger]), 1)
+        self.assertIn("no GitHub token", err.getvalue())
+        self.assertIn("--ledger-only", err.getvalue())
 
 
 class DigestTest(ShadowCase):

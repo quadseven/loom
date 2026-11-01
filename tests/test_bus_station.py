@@ -510,6 +510,12 @@ class Base(unittest.TestCase):
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = FakeGitHub()
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS))
+        # A full runner disk must not pause claims under a test; the disk
+        # tests patch their own figure over this one.
+        roomy = mock.patch.object(station.shutil, "disk_usage",
+                                  return_value=mock.Mock(free=1000 * station.GB))
+        roomy.start()
+        self.addCleanup(roomy.stop)
         self.heartbeat("codex")
 
     def heartbeat(self, lane, available=True, age=0, limited_models=None):

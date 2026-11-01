@@ -51,7 +51,8 @@ class InstallScriptTest(unittest.TestCase):
         # test: an operator's own settings in the environment would trip the
         # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
-                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
+                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO", "LOOM_BRIEF_AUTHORS",
+                             "LOOM_ASK_ANSWERERS", "LOOM_TRUSTED_BRIEFERS")
                 and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
                                        "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
