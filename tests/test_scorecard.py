@@ -254,6 +254,62 @@ class StationStep(unittest.TestCase):
         self.assertIn("| scorecard lane | model |", "\n".join(st._scorecard_lines()))
 
 
+class ZeroDoneDemotion(unittest.TestCase):
+    def test_zero_done_lane_is_demoted_with_probe_briefs(self):
+        """A lane with zero successful brief completions in the window is demoted
+        after LOOM_LANE_ZERO_DONE_HOURS of probe briefs."""
+        state = tempfile.mkdtemp()
+        env = {"LOOM_LANE_DEMOTE_AT": "3", "LOOM_LANE_DEMOTE_DAYS": "7",
+               "LOOM_LANE_ZERO_DONE_HOURS": "24"}
+        later = NOW + 30 * 86400
+        got = card(now=later, env=env, state=state)
+        got.data["records"] = {
+            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 86400 - 3600,
+                                  "review": "clean", "merged": False, "sent_back": 0, "kind": "easy"},
+            "example-owner/r#2": {"lane": "zen", "model": "model-a", "at": later - 86400 - 7200,
+                                  "review": "findings", "merged": False, "sent_back": 0, "kind": "easy"},
+        }
+        got.data["briefs_done"] = {"zen": 0}
+        got.save()
+        quiet(got.demote)
+        self.assertIn("zen", got.demoted())
+        self.assertIn("zero successful", got.demoted()["zen"].lower())
+
+    def test_lane_with_done_briefs_is_not_demoted_for_zero_done(self):
+        """A lane with at least one successful brief completion is not demoted for zero done."""
+        state = tempfile.mkdtemp()
+        env = {"LOOM_LANE_DEMOTE_AT": "3", "LOOM_LANE_DEMOTE_DAYS": "7",
+               "LOOM_LANE_ZERO_DONE_HOURS": "24"}
+        later = NOW + 30 * 86400
+        got = card(now=later, env=env, state=state)
+        got.data["records"] = {
+            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 3600,
+                                  "review": "clean", "merged": True, "sent_back": 0},
+        }
+        got.data["briefs_done"] = {"zen": 1}
+        got.save()
+        quiet(got.demote)
+        self.assertNotIn("zen", got.demoted())
+
+    def test_limit_park_does_not_count_toward_demotion(self):
+        """A limit park (provider at usage limit) does not count as a bad outcome."""
+        state = tempfile.mkdtemp()
+        env = {"LOOM_LANE_DEMOTE_AT": "2"}
+        later = NOW + 30 * 86400
+        got = card(now=later, env=env, state=state)
+        got.data["records"] = {
+            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 3600,
+                                  "review": "clean", "merged": True, "sent_back": 0,
+                                  "limit_park": True},
+            "example-owner/r#2": {"lane": "zen", "model": "model-a", "at": later - 7200,
+                                  "review": "clean", "merged": True, "sent_back": 0,
+                                  "limit_park": True},
+        }
+        got.save()
+        quiet(got.demote)
+        self.assertNotIn("zen", got.demoted())
+
+
 class FailClosed(unittest.TestCase):
     def test_a_scorecard_file_that_cannot_be_read_demotes_every_lane(self):
         from bus import station
