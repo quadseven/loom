@@ -1665,6 +1665,16 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+A fleet hold blocks too (loom#2393): a plain pull request comment from a
+`LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
+commit, whose text opens with `Not merging` or `Hold` (any letter case, after
+optional whitespace or markdown marks such as `**`, `>` or `#`). A later
+comment by the pull request's author lifts it, as does a later trusted comment
+naming the head commit's sha (7 or more hex characters), or a newer push.
+Status prints `held by a fleet comment from LOGIN: <comment link>`, and
+`bus.brain merge` refuses with the same words. Comments that cannot be read
+block as `pull request comments unreadable`. Only the opener counts: no other
+comment text is read as a hold.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST

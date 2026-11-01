@@ -13,6 +13,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CAP = 15
 TARGETS = (
     ("bus/brain.py", "_ready_sensitive"),
+    # PR 2399's review finding (loom#2393).
+    ("bus/brain.py", "fleet_hold"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
 )
