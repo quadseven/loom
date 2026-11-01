@@ -172,7 +172,7 @@ BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIE
 # Shadow mode (bus/shadow.py, docs/BRAIN.md Shadow mode): the rung holds a
 # GitHub token, so its gh is a guard that asks python3 -m bus.shadow gh-guard
 # first and refuses, and records, a merge, an issue close, an approving
-# review, or a merge or ship label while shadow is on. The guard reads the
+# review, or a merge label while shadow is on. The guard reads the
 # switch itself and fails closed, so it is put in front of every rung, in $1
 # (a folder the rung can read). It covers gh only: a rung that sends the
 # request another way (curl) is held by its instructions alone (docs/MUSE.md).
@@ -317,9 +317,9 @@ case "$SHADOW_LINE" in
   "Shadow mode (MUSE.md) "*) ;;
   *) say "could not read the shadow scope; the prompt says shadow for every repo"
      SHADOW_LINE="Shadow mode (MUSE.md) is on for every repo: never merge, \
-close an issue, approve a pull request, or add ready-to-land or loom:shipped \
-by any route (gh, curl, the API); bus.brain merge and bus.brain close run \
-their gates and record what they would do." ;;
+close an issue, approve a pull request, or add ready-to-land by any route \
+(gh, curl, the API); bus.brain merge and bus.brain close run their gates and \
+record what they would do; a move to loom:shipped is a state fact and is sent." ;;
 esac
 
 PROMPT="You are the Loom brain for one tick. Follow $WORK/loom/docs/MUSE.md, \

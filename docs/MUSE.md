@@ -34,9 +34,10 @@ result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
 a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
 the web), in shadow or out of it. In shadow, also never approve a pull
-request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
-Loom does not own, by any route: `bus.brain move` records a ship instead of
-taking it, and the tick's `gh` refuses the rest and records them.
+request or add `ready-to-land` by hand, or write onto a branch Loom does not
+own, by any route: the tick's `gh` refuses the rest and records them. A move
+to `loom:shipped` is a state fact, not a merge or a close, and goes through;
+leave it to each goal's ship rules.
 
 ## What Muse does and leaves
 
