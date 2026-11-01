@@ -305,6 +305,48 @@ class InstallScriptTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("LOOM_TRUSTED_BRIEFERS", result.stderr)
 
+    def installed_setting(self, name):
+        agents = self.home / "Library" / "LaunchAgents"
+        found = [re.search(r"<key>%s</key><string>(.*?)</string>" % name,
+                           (agents / (label + ".plist")).read_text())
+                 for label in ("com.loom.station", "com.loom.brain")]
+        return [match.group(1) if match else "" for match in found]
+
+    def test_ask_answerers_are_written_to_station_and_brain_plists(self):
+        result = self.run_install(LOOM_ASK_ANSWERERS="dana-example app[bot]")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.installed_setting("LOOM_ASK_ANSWERERS"), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_with_a_login_list_unset_keeps_the_installed_list(self):
+        for name in ("LOOM_ASK_ANSWERERS", "LOOM_BRIEF_AUTHORS"):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: "dana-example app[bot]"}).returncode, 0)
+                env = {k: v for k, v in os.environ.items() if k != name}
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.installed_setting(name), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_that_sets_a_login_list_replaces_it_even_with_empty(self):
+        for name in ("LOOM_ASK_ANSWERERS", "LOOM_BRIEF_AUTHORS"):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: "dana-example"}).returncode, 0)
+                self.assertEqual(self.run_install(**{name: "lee-example"}).returncode, 0)
+                self.assertEqual(self.installed_setting(name), ["lee-example"] * 2)
+                self.assertEqual(self.run_install(**{name: ""}).returncode, 0)
+                self.assertEqual(self.installed_setting(name), ["", ""])
+
+    def test_an_unreadable_installed_plist_names_each_unset_login_list(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.loom.station.plist").write_text("not a plist")
+        result = self.run_install(LOOM_TRUSTED_BRIEFERS="", LOOM_BRIEF_AUTHORS="x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_ASK_ANSWERERS", result.stderr)
+        result = self.run_install(LOOM_TRUSTED_BRIEFERS="", LOOM_ASK_ANSWERERS="x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_BRIEF_AUTHORS", result.stderr)
+
     def test_goal_limits_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60",
                                   LOOM_NO_LANE_REROUTE="4")
