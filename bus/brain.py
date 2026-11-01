@@ -5336,7 +5336,8 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
         said = _said_for(comments, number)
         fresh = said is None or not said.startswith(marker)
         comment = "%s\n%s" % (marker, words)
-        _check_written_text(comment)
+        if fresh:
+            _check_written_text(comment)
         if outcome == "closed":
             if unproven and any(not checked for checked, _ in
                                 proof.criteria(str(issue.get("body") or ""))):
