@@ -8,8 +8,9 @@ already done. state() reads one ticket and says which of three it is:
   is not a question, a dashboard answer was posted, a trusted brain wrote a
   line starting "Finished:" or "Done:" or a dated "Operator answer
   YYYY-MM-DD:" line (the date on or after the ask's day), or the body
-  records a Decision. A LOOM_ASK_ANSWERERS login's "Finished:" line or dated
-  line counts too, each with words on the line; nothing else it writes does.
+  records a Decision. A LOOM_ASK_ANSWERERS login's visible "Finished:" line
+  or dated line counts too, each with words on the line and only that line as
+  the answer; nothing else it writes does.
 - WAITING: a wait:* label, or a Blocked on section naming an open issue.
   A person cannot act on it today. It stays on the dashboard.
 - OPEN: anything else. A ticket whose ask time cannot be read stays OPEN: a
@@ -23,7 +24,7 @@ other reader of that list grants more than an answer, and a person login in
 it would make that login's prose an answer. This module is the setting's only
 reader (answerers()), and only the judges of an ask pass the result in. Its
 logins stay out of bus/decision_claim.py, so a listed bot's line is no
-person's record for the claim guard.
+person's record for the claim guard, nor is the label removal that follows it.
 """
 from __future__ import annotations
 
@@ -40,7 +41,9 @@ ANSWERED, WAITING, OPEN = "answered", "waiting", "open"
 # How a trusted brain records the step the ask named as done.
 _FINISHED = re.compile(r"^\s*(?:finished|done)\s*:", re.I | re.M)
 # The one finished form a LOOM_ASK_ANSWERERS login has, with words on the line.
-_ANSWERER_FINISHED = re.compile(r"^[ \t]*finished[ \t]*:[ \t]*\S", re.I | re.M)
+_ANSWERER_FINISHED = re.compile(r"finished[ \t]*:[ \t]*\S", re.I)
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
 # A decision that names a command: someone must still run it.
 _COMMAND = re.compile(r"`[^`\n]+`")
 
@@ -86,25 +89,52 @@ def _records_answer(body: str, since: datetime) -> bool:
                for found in decision_claim.ANSWER_LINE.finditer(body))
 
 
-def _answerer_line(body: str, since: datetime) -> bool:
-    """One of the two lines a LOOM_ASK_ANSWERERS login may answer with. Words
-    must follow on the same line, so a heading over other text is neither."""
-    return bool(_ANSWERER_FINISHED.search(body)) or any(
-        found.group(1) >= since.date().isoformat() and "\n" not in found.group(0).strip()
-        for found in decision_claim.ANSWER_LINE.finditer(body))
+def _visible_lines(body: str) -> List[str]:
+    """The lines a reader sees as prose: none from a Loom marker comment, an
+    HTML comment, a fenced block or an indented block."""
+    if decision_claim.LOOM_MARKER in body:
+        return []
+    fence, kept = "", []
+    for line in _HTML_COMMENT.sub("", body).splitlines():
+        opens = _FENCE.match(line)
+        if fence:
+            if opens and opens.group(1).startswith(fence):
+                fence = ""
+        elif opens:
+            fence = opens.group(1)[:3]
+        elif not line.startswith(("    ", "\t")):
+            kept.append(line.strip())
+    return kept
 
 
-def _answers(comment: Dict[str, Any], people: Iterable[str], trusted: Sequence[str],
-             ops: Sequence[str], since: datetime, listed: Iterable[str]) -> bool:
+def _answerer_line(comment: Dict[str, Any], since: datetime) -> Optional[str]:
+    """The line a LOOM_ASK_ANSWERERS login answers with, or None. A dated line
+    must name a day from the ask's to the comment's own: a later date records
+    nothing yet. Only the line is returned: the rest of the comment is data,
+    and must not reach names_command or the brain as an answer."""
+    posted = decision_claim.when(comment.get("created_at"))
+    for line in _visible_lines(str(comment.get("body") or "")):
+        dated = decision_claim.ANSWER_LINE.match(line)
+        if _ANSWERER_FINISHED.match(line) or (
+                dated and posted is not None
+                and since.date().isoformat() <= dated.group(1) <= posted.date().isoformat()):
+            return line
+    return None
+
+
+def _answer(comment: Dict[str, Any], people: Iterable[str], trusted: Sequence[str],
+            ops: Sequence[str], since: datetime, listed: Iterable[str]) -> Optional[str]:
+    """The text of this comment that answers the ask, or None."""
     body = str(comment.get("body") or "").strip()
+    whole = str(comment.get("body") or "")
     if answer.trusted_answer(comment, trusted, ops):
-        return True
+        return whole
     login = str((comment.get("user") or {}).get("login") or "").lower()
     if decision_claim.person_comment(comment) and login in people:
-        return not body.endswith("?")
+        return None if body.endswith("?") else whole
     if login in {str(t).lower() for t in trusted}:
-        return bool(_FINISHED.search(body)) or _records_answer(body, since)
-    return login in listed and _answerer_line(body, since)
+        return whole if _FINISHED.search(body) or _records_answer(body, since) else None
+    return _answerer_line(comment, since) if login in listed else None
 
 
 def answer_of(issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[Any],
@@ -122,9 +152,11 @@ def answer_of(issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[A
         return ""
     for comment in reversed([c for c in comments if isinstance(c, dict)]):
         stamp = decision_claim.when(comment.get("created_at"))
-        if stamp is not None and stamp > since and _answers(
-                comment, people, trusted, ops, since, listed):
-            return str(comment.get("body") or "")
+        if stamp is None or stamp <= since:
+            continue
+        said = _answer(comment, people, trusted, ops, since, listed)
+        if said is not None:
+            return said
     return None
 
 

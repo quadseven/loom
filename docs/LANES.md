@@ -830,16 +830,19 @@ did not exist.
 
 - Each form starts a line and has words after its colon on that line:
   `Finished: <the step>`, or `Operator answer YYYY-MM-DD: <the answer>` dated
-  on or after the ask's day. The comment must follow the ask. `Done:` and
-  every other comment from these logins leave the ask open, prose from a person
-  login included.
+  from the ask's day to the comment's own day. The comment must follow the
+  ask. A line in a fenced or indented block, in an HTML comment, or in a comment
+  with a Loom marker does not count. `Done:` and every other comment from these
+  logins leave the ask open, prose from a person login included. Only the line
+  is the answer: the rest of the comment reaches neither the `needs-brain`
+  check nor the printed answer.
 - Only the judges of an ask read it: the label pass (`bus/label_pass.py`), the
   station's ask inputs (the digest and the pass) and `python3 -m bus.needs_you`.
 - It grants nothing else. Ownership, proofs, audits, journals, adoption,
   merges, briefing, holds, revert labels, dashboard operators and
   `decision_claim.person_comment` read their own settings, and a listed login
   gains no standing in any of them. A listed bot's line is no person's record
-  for the decision claim guard.
+  for the decision claim guard, nor is the ask label's removal after it.
 - Taking `needs:human` off lifts that hold in `evidence_close.label_hold`, so a
   listed login can clear the way to a close without closing anything itself.
 - The guard runs inside Loom's write commands. `close`, `reply`, `bus journal`

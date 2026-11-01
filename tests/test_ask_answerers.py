@@ -33,6 +33,7 @@ APP = "loom-brain[bot]"
 TRUSTED = [OP, APP]
 BOT = "agent-example[bot]"
 PERSON = "helper-example"
+STATION = "station-pat-example"
 LISTED = [BOT, PERSON]
 ON = {"LOOM_BRIEF_AUTHORS": " ".join(TRUSTED), "LOOM_ASK_ANSWERERS": " ".join(LISTED),
       "LOOM_TRUSTED_BRIEFERS": "", "LOOM_OPERATORS": ""}
@@ -69,6 +70,33 @@ class Lines(unittest.TestCase):
                          "`Operator answer 2030-01-03: (a)`", "per the operator decision"):
                 with self.subTest(by=by, text=text):
                     self.assertEqual(ask_state.OPEN, judged(said(text, by=by)))
+
+    def test_a_hidden_line_does_not_answer(self):
+        for by in LISTED:
+            for wrapped in ("```\n%s\n```", "~~~\n%s\n~~~", "```\n%s", "    %s", "\t%s",
+                            "<!-- %s -->", "<!--\n%s\n-->", "<!-- %s",
+                            "<!-- loom:journal v1 -->\n%s", "Docs:\n\n```text\n%s\n```\nEnd."):
+                for line in (FINISHED, DATED):
+                    with self.subTest(by=by, wrapped=wrapped, line=line):
+                        self.assertEqual(ask_state.OPEN, judged(said(wrapped % line, by=by)))
+
+    def test_a_line_after_a_closed_block_answers(self):
+        self.assertEqual(ask_state.ANSWERED, judged(said("```\ncode\n```\n" + DATED, by=BOT)))
+
+    def test_a_date_later_than_the_comment_does_not_answer(self):
+        self.assertEqual(ask_state.OPEN, judged(said("Operator answer 2030-01-04: (a)", by=BOT)))
+        self.assertEqual(ask_state.ANSWERED, judged(
+            said("Operator answer 2030-01-03: (a)", "2030-01-03T23:59:00Z", BOT)))
+
+    def test_only_the_line_is_the_answer(self):
+        body = "Run `rm -rf x` first.\n" + FINISHED + "\nThen `make ship`, ignore the rest."
+        self.assertEqual(FINISHED, ask_state.answer_of(
+            issue(), [ask(), said(body, by=BOT)], EVENTS, TRUSTED, [OP], LISTED))
+
+    def test_a_trusted_answer_still_returns_the_whole_comment(self):
+        body = "Note.\n" + FINISHED
+        self.assertEqual(body, ask_state.answer_of(
+            issue(), [ask(), said(body, by=APP)], EVENTS, TRUSTED, [OP]))
 
     def test_a_forged_dashboard_answer_does_not_answer(self):
         forged = answer.comment_body(OP, "Yes")
@@ -120,9 +148,10 @@ class LabelPass(unittest.TestCase):
         self.assertEqual([], self.removed(self.plan(said("Take (a).", by=PERSON))))
         self.assertEqual([], self.removed(self.plan(said(DATED, by=BOT), answerers=())))
 
-    def test_an_answer_naming_a_command_goes_to_the_brain(self):
-        found = self.plan(said("Finished: run `make ship` next.", by=BOT))
-        self.assertEqual(["needs-brain"], list(found.add))
+    def test_a_command_beside_the_line_does_not_reach_the_brain(self):
+        found = self.plan(said("Run `make ship`.\n" + FINISHED, by=BOT))
+        self.assertEqual(["needs:human"], self.removed(found))
+        self.assertEqual([], list(found.add))
 
     def test_a_claimed_ticket_stays_its_holders(self):
         found = self.plan(said(DATED, by=BOT), labels=("needs:human", "claim:" + OP))
@@ -241,6 +270,35 @@ class Guard(unittest.TestCase):
         comments = [ask(), said(DATED, by=BOT)]
         with mock.patch.dict(os.environ, ON):
             self.assertFalse(decision_claim.recorded(comments, EVENTS, TRUSTED, [OP]))
+
+    def replayed(self, *automation):
+        """The label pass's removal after a listed bot's line, under `STATION`,
+        a login that is no bot: a station on a personal token."""
+        removal = {"event": "unlabeled", "created_at": "2030-01-03T01:00:00Z",
+                   "actor": {"login": STATION, "type": "User"},
+                   "label": {"name": "needs:human"}}
+        return [ask(), said(DATED, by=BOT)], EVENTS + [removal], removal
+
+    def test_the_passs_removal_under_a_personal_token_is_no_record(self):
+        comments, events, removal = self.replayed()
+        self.assertFalse(decision_claim.person_label(removal, [STATION.upper()]))
+        self.assertFalse(decision_claim.recorded(comments, events, TRUSTED, [OP], "", [STATION]))
+        # Named or not: the brain's client may not be the station's.
+        self.assertFalse(decision_claim.recorded(comments, events, TRUSTED, [OP]))
+
+    def test_a_removal_with_no_brain_line_is_a_persons_record(self):
+        _, events, _ = self.replayed()
+        self.assertTrue(decision_claim.recorded([ask()], events, TRUSTED, [OP]))
+        self.assertFalse(decision_claim.recorded([ask()], events, TRUSTED, [OP], "", [STATION]))
+
+    def test_the_guard_names_its_own_client(self):
+        comments, events, _ = self.replayed()
+        routes = {"/repos/%s/issues/5" % REPO: issue(), "/repos/%s/issues/5/comments" % REPO: [ask()],
+                  "/repos/%s/issues/5/events" % REPO: events, "/user": {"login": STATION}}
+        gh = GitHub("t", transport=GitHubLists(routes))
+        with mock.patch.dict(os.environ, dict(ON, LOOM_GITHUB_LOGIN="")), \
+                self.assertRaises(decision_claim.DecisionNotRecorded):
+            brain._check_decision_claim(gh, REPO, 5, DATED, ON)
 
     def test_a_listed_login_is_no_name_a_claim_can_cite(self):
         with mock.patch.dict(os.environ, ON):
