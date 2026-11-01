@@ -222,6 +222,32 @@ class StationAdapterProofTest(tbs.Base):
             ("log", "worker", "levels stable"),
             ("log", "worker", "cleared runs complete")])
 
+    def test_invalid_adapter_answers_are_rejected_with_a_human_ask(self):
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        live = "Live: current levels and cleared runs are correct"
+        valid = {"criterion": live, "step": "log:worker", "strings": ["levels stable"]}
+        invalid_answers = [
+            (None, "the answer shape is invalid"),
+            ({"criterion": "Live: another check", "step": "log:worker",
+              "strings": ["levels stable"]}, "exact Live criterion"),
+            ({"criterion": live, "step": "log:worker", "strings": []}, "one to five"),
+            ({"criterion": live, "step": "log:worker", "strings": ["caf\u00e9"]}, "ASCII strings"),
+            ({"criterion": live, "step": "log:worker",
+              "strings": ["one", "two", "three", "four", "five", "six"]}, "one to five"),
+            ({"criterion": live, "step": "log:worker", "strings": ["levels\nstable"]},
+             "ASCII strings"),
+            ({**valid, "step": "worker"}, "not log:<source> or sql:<SELECT>"),
+            ({**valid, "step": "shell:worker"}, "step kind is unsupported"),
+        ]
+        for answer, expected_reason in invalid_answers:
+            with self.subTest(answer=answer), mock.patch.object(
+                    st, "_adapter_human_ask") as ask:
+                self.assertIsNone(st._adapter_answer_step(REPO, self.NUMBER, answer, live))
+                ask.assert_called_once()
+                self.assertIn(expected_reason, ask.call_args.args[3])
+
     def test_missing_step_and_failed_adapter_read_raise_one_human_ask(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
         self.ship(body, hours_ago=2)
