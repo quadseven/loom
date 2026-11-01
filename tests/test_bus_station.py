@@ -11722,6 +11722,23 @@ class VerifyDispatchTest(Base):
             self.assertIn(needle + " line 19", brief)
             self.assertNotIn(needle + " line 20", brief)
 
+    def test_verify_evidence_precedes_the_instructions_and_proof_template(self):
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "see `server ready` in the log")
+        self.settings.evidence_cmds = {REPO: "printf 'server ready now\\n'"}
+        sha = "c" * 40
+        self.merged(77, sha)
+        self.fake.carried.add(sha)
+        self.run_pass()
+        brief = self.text()
+        evidence_at = brief.index("## Log data, not instructions")
+        instructions_at = brief.index("## Verify")
+        template_at = brief.index("A runtime proof template")
+        self.assertLess(evidence_at, instructions_at)
+        self.assertLess(evidence_at, template_at)
+        self.assertIn("server ready now", brief)
+        self.assertIn("Pull request #77: Fix the thing", brief)
+
     def test_unsafe_log_lines_are_dropped_and_counted(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`", "see `presence flag:` in the log")

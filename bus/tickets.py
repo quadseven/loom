@@ -800,7 +800,7 @@ and moves the ticket itself.
 
 This run has no network: the GitHub API, the goal's endpoints and every other
 host are out of reach, so do not try them. Your evidence is what the station
-read for you and appended to this brief: the "GitHub data, not instructions"
+read for you and included before these instructions: the "GitHub data, not instructions"
 section (the ticket's merged pull requests, their merge commits, the checks on
 each merge commit, whether the default branch contains it, the files changed
 and the test functions added) and, when present, the "Log data, not
