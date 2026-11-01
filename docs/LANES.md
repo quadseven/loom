@@ -1492,7 +1492,32 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
-- The opencode-go slots run only the models on `bus/tickets.py`
+- Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
+  reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
+  drops what is deprecated or paused, probes each candidate, and takes the first
+  that answers: Go's free models, then Zen's on a public repo, then a paid Go
+  model. A slot's `LOOM_<SLOT>_MODEL` and a brief's `Model:` line do not bind
+  it. `LOOM_MODEL_PICK=off` or a `LOOM_<SLOT>_MODELS` ladder restores the pin.
+- A model that fails is paused for every slot in
+  `state/usage/model-pause.json`: a 429 until its `Retry-After`, a model the
+  provider or CLI no longer serves for a day. `GoUsageLimitError` pauses every
+  paid Go model and `FreeUsageLimitError` every Zen model, because each is one
+  shared limit. With nothing to keep, the brief stays in the inbox and the next
+  pass picks another model, at most 3 times. A slot with every model paused
+  reports unavailable until the first reset.
+- Paid Go runs serve build work only, never a verify, answer or review run,
+  and use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on public
+  repos, Muse Spark 1.3 Contributor). All paid runs stop at 80% of each
+  published 5 hour, weekly and monthly limit, one model at 50%, and spending
+  within the billing period follows the calendar to the renewal (day 28,
+  `LOOM_GO_RENEWAL_DAY`), so the plan lasts the month. Spending is counted in
+  `state/usage/go-budget.jsonl`.
+  Each run holds 500 requests until it settles; output and hidden reasoning
+  past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
+  because of its hidden reasoning. Extra usage stays off.
+- Each run logs `model pick:` and `model report:` lines: the model, why it
+  came to that model, the exit status and whether anything was edited.
+- With the pick off, the opencode-go slots run only the models on `bus/tickets.py`
   `OPENCODE_GO_MODELS`: Go's free models and the paid ones allowed at least
   10,000 requests per 5 hours (Beam Free; MiMo-V2.6-Flash, DeepSeek V4.1
   Flash, Muse Spark 1.3 Contributor). A slot whose model, or any model of its
