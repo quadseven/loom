@@ -576,19 +576,22 @@ class SensitiveResumeTests(unittest.TestCase):
 
         with_fix = [{"user": {"login": "alice-example"},
                      "body": "%s\n%s fix" % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}]
-        gh_fix = GitHub("t", transport=Fake(*merge_takes(), reply(200, with_fix), reply(200, ticket_issue)))
+        gh_fix = GitHub("t", transport=Fake(*merge_takes(), reply(200, with_fix), reply(200, []),
+                                                reply(200, ticket_issue)))
         lines_with = brain._pull_request_lines(gh_fix, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_with, ["### Pull requests", "- #4 PR - blocked: pending brain fix"])
 
         blocked = {"prs": {4: ready_node(checks="FAILURE")}}
-        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix), reply(200, ticket_issue)))
+        gh_blocked = GitHub("t", transport=Fake(reply(200, with_fix), reply(200, []),
+                                                    reply(200, ticket_issue)))
         lines_blocked = brain._pull_request_lines(gh_blocked, REPO, [pr], blocked, bot, authors)
         self.assertEqual(lines_blocked,
                          ["### Pull requests", "- #4 PR - blocked: checks failure, pending brain fix"])
 
         without_fix = [{"user": {"login": "alice-example"},
                         "body": "%s normal fix" % tickets.FIX_MARKER}]
-        gh_without = GitHub("t", transport=Fake(*merge_takes(), reply(200, without_fix), reply(200, ticket_issue)))
+        gh_without = GitHub("t", transport=Fake(*merge_takes(), reply(200, without_fix), reply(200, []),
+                                                    reply(200, ticket_issue)))
         lines_without = brain._pull_request_lines(gh_without, REPO, [pr], data, bot, authors)
         self.assertEqual(lines_without, ["### Pull requests", "- #4 PR - READY"])
 
@@ -1745,7 +1748,8 @@ class SensitiveResumeTests(unittest.TestCase):
                    "user": {"login": "example-brain"}},
             "details": {"headRefName": "feature/lane-work"}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, []),
+                    reply(200, {"merged": True}),
                     reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "example-brain"})
@@ -1884,7 +1888,8 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_merge_goes_ahead_once_no_brain_fix_is_pending(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, {"merged": True}),
+        fake = Fake(pr, query, reply(200, issue), reply(200, []), reply(200, []),
+                    reply(200, {"merged": True}),
                     reply(204), reply(200, []), reply(200, issue), reply(200, {}))
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
@@ -2063,7 +2068,8 @@ class SensitiveResumeTests(unittest.TestCase):
                 reply(200, {"check_runs": runs}))
 
     def _merge_replies_for_adopt(self, changes=None):
-        return self._adopt_replies(changes) + (reply(200, {"merged": True}),
+        # The empty list is the pull request's comments: no fleet hold (loom#2393).
+        return self._adopt_replies(changes) + (reply(200, []), reply(200, {"merged": True}),
                                                reply(204), reply(201, {}))
 
     def test_adopt_merges_a_trusted_green_reviewed_threadless_pr_without_a_ticket(self):
@@ -2071,8 +2077,8 @@ class SensitiveResumeTests(unittest.TestCase):
         result = brain.merge(GitHub("t", transport=fake), REPO, 8, adopt=True, env=self.TRUSTED)
         self.assertEqual(result, {"merged": True, "pull_request": (REPO, 8),
                                   "ticket": None, "head_sha": "head1"})
-        self.assertEqual(fake.calls[3][2], {"merge_method": "squash", "sha": "head1"})
-        self.assertIn("/git/refs/heads/fix/build", fake.calls[4][1])
+        self.assertEqual(fake.calls[4][2], {"merge_method": "squash", "sha": "head1"})
+        self.assertIn("/git/refs/heads/fix/build", fake.calls[5][1])
         # The pull request is told it was adopted, after the branch is deleted.
         self.assertEqual(fake.calls[-1][0], "POST")
         self.assertIn(brain.ADOPT_MARKER, fake.calls[-1][2]["body"])
@@ -2084,7 +2090,7 @@ class SensitiveResumeTests(unittest.TestCase):
         result = brain.merge(GitHub("t", transport=fake), REPO, 8,
                              adopt=True, env=self.TRUSTED)
         self.assertTrue(result["merged"])
-        self.assertEqual(fake.calls[3][2]["sha"], "head1")
+        self.assertEqual(fake.calls[4][2]["sha"], "head1")
 
     def test_adopt_reads_a_valid_review_after_a_null_check_run(self):
         runs = [None, {"name": "Grug - Elder", "status": "completed",
@@ -5918,3 +5924,159 @@ class WaitLabelTests(unittest.TestCase):
                      "wait:after", "wait:window"):
             self.assertIn(name, labels.LABELS)
         self.assertIn("wait:", labels.MANAGED_PREFIXES)
+
+
+class FleetHoldTests(unittest.TestCase):
+    """loom#2393: a trusted fleet login's plain pull request comment that opens
+    "Not merging" or "Hold", made after the last push, stops merge and READY
+    until the author answers, a trusted comment names the head, or a push."""
+
+    SHA = "abc1234def5678abc1234def5678abc1234def56"
+    FLEET = "example-fleet"
+    URL = "https://github.com/%s/pull/8#issuecomment-501" % REPO
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-fleet"}
+
+    def comment(self, login, body, at, ident=501):
+        return {"id": ident, "user": {"login": login}, "body": body, "created_at": at,
+                "html_url": "https://github.com/%s/pull/8#issuecomment-%d" % (REPO, ident)}
+
+    def hold(self, at="2030-01-01T13:00:00Z", login=FLEET,
+             body="Not merging this yet: the label write resets the idle clock."):
+        return self.comment(login, body, at)
+
+    def merge_routes(self, comments, status=200):
+        pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO,
+              "user": {"login": "example-lane[bot]"},
+              "head": {"ref": "loom/9-work", "sha": self.SHA, "repo": {"full_name": REPO}},
+              "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
+                   "headRefOid": self.SHA, "headRepository": {"nameWithOwner": REPO},
+                   "commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:00:00Z",
+                                                     "statusCheckRollup": {"state": "SUCCESS"}}}]},
+                   "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+                   "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
+        issue = {"number": 9, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        return Routed({
+            ("GET", "/pulls/8"): reply(200, pr),
+            ("POST", "/graphql"): reply(200, {"data": {"repository": {"pullRequest": details}}}),
+            ("GET", "/issues/9"): reply(200, issue),
+            ("GET", "/issues/9/comments"): reply(200, []),
+            ("GET", "/issues/8/comments"): reply(status, comments),
+            ("GET", "/pulls/8/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"},
+                                                   {"filename": "tests/test_a.py", "patch": "+x"}]),
+            ("GET", "/search/issues"): reply(200, {"total_count": 0}),
+            ("GET", "/check-runs"): reply(200, {"check_runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]}),
+            ("PUT", "/pulls/8/merge"): reply(200, {"merged": True}),
+        })
+
+    def merge(self, comments, env=None, status=200):
+        transport = self.merge_routes(comments, status)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            try:
+                brain.merge(GitHub("t", transport=transport), REPO, 8, (REPO, 9),
+                            env=self.ENV if env is None else env)
+            except ValueError as err:
+                self.assertFalse(transport.sent("PUT", "/pulls/8/merge"))
+                return str(err)
+        self.assertTrue(transport.sent("PUT", "/pulls/8/merge"))
+        self.assertTrue(transport.sent("GET", "/issues/8/comments"), "the hold was not read")
+        return "merged"
+
+    def test_a_hold_after_the_last_push_refuses_the_merge_and_names_the_comment(self):
+        said = self.merge([self.hold()])
+        self.assertIn("held by a fleet comment from example-fleet", said)
+        self.assertIn(self.URL, said)
+
+    def test_a_markdown_hold_opener_counts(self):
+        for body in ("  **Hold**: the test does not run.", "> hold until the fix lands",
+                     "## NOT MERGING yet"):
+            with self.subTest(body=body):
+                self.assertIn("held by a fleet comment", self.merge([self.hold(body=body)]))
+
+    def test_a_hold_before_the_last_push_does_not_block(self):
+        self.assertEqual(self.merge([self.hold(at="2030-01-01T11:00:00Z")]), "merged")
+
+    def test_a_later_reply_by_the_pull_request_author_lifts_the_hold(self):
+        answer = self.comment("example-lane[bot]", "Fixed the clock reset.",
+                              "2030-01-01T13:30:00Z", 502)
+        self.assertEqual(self.merge([self.hold(), answer]), "merged")
+
+    def test_a_later_trusted_comment_naming_the_head_sha_lifts_the_hold(self):
+        named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
+                             "2030-01-01T13:30:00Z", 502)
+        self.assertEqual(self.merge([self.hold(), named]), "merged")
+        other = self.comment("example-brain", "Still broken at 0123456.",
+                             "2030-01-01T13:30:00Z", 502)
+        self.assertIn("held by a fleet comment", self.merge([self.hold(), other]))
+
+    def test_a_newer_hold_after_a_lift_holds_again(self):
+        answer = self.comment("example-lane[bot]", "Done.", "2030-01-01T13:30:00Z", 502)
+        again = self.comment(self.FLEET, "Hold: still flaps.", "2030-01-01T14:00:00Z", 503)
+        self.assertIn("issuecomment-503", self.merge([self.hold(), answer, again]))
+
+    def test_an_untrusted_login_saying_not_merging_does_not_block(self):
+        self.assertEqual(self.merge([self.hold(login="example-stranger")]), "merged")
+
+    def test_the_trusted_logins_come_from_the_settings(self):
+        self.assertEqual(self.merge([self.hold()], env={"LOOM_BRIEF_AUTHORS": "example-brain"}),
+                         "merged")
+        briefers = {"LOOM_BRIEF_AUTHORS": "example-brain", "LOOM_TRUSTED_BRIEFERS": self.FLEET}
+        self.assertIn("held by a fleet comment", self.merge([self.hold()], env=briefers))
+        self.assertEqual(brain.hold_logins(briefers), ["example-brain", self.FLEET])
+
+    def test_unreadable_comments_refuse_the_merge(self):
+        said = self.merge({"message": "boom"}, status=500)
+        self.assertIn("pull request comments unreadable", said)
+
+    def status_line(self, comments, authors=(FLEET,), status=200, node=None):
+        pr = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": self.SHA},
+              "user": {"login": "example-lane[bot]"}, "labels": [{"name": "class:logic"}]}
+        issue = {"number": 7, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        routes = {
+            ("GET", "/issues/7"): reply(200, issue),
+            ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": True,
+                                             "mergeable_state": "clean"}),
+            ("GET", "/pulls/9/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"},
+                                                   {"filename": "tests/test_a.py", "patch": "+x"}]),
+            ("GET", "/search/issues"): reply(200, {"total_count": 0}),
+            ("GET", "/issues/9/comments"): reply(status, comments),
+        }
+        gh = GitHub("t", transport=Routed(routes))
+        env = {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code", "LOOM_TRUSTED_BRIEFERS": ""}
+        with unittest.mock.patch.dict(os.environ, env):
+            return brain._pull_request_lines(gh, REPO, [pr], {"prs": {9: node or ready_node()}},
+                                             "grug-tribe", list(authors))[1]
+
+    def test_status_does_not_mark_a_held_pull_request_ready_and_says_why(self):
+        # ready_node's head commit is at 12:45; the hold is after it.
+        line = self.status_line([self.hold()])
+        self.assertEqual(line, "- #9 Work - blocked: held by a fleet comment from "
+                               "example-fleet: " + self.URL)
+
+    def test_status_is_ready_once_a_push_or_the_author_lifts_the_hold(self):
+        self.assertEqual(self.status_line([self.hold(at="2030-01-01T12:30:00Z")]),
+                         "- #9 Work - READY")
+        answer = self.comment("example-lane[bot]", "Fixed.", "2030-01-01T13:30:00Z", 502)
+        self.assertEqual(self.status_line([self.hold(), answer]), "- #9 Work - READY")
+        self.assertEqual(self.status_line([self.hold(login="example-stranger")]),
+                         "- #9 Work - READY")
+
+    def test_status_blocks_when_the_comments_are_unreadable(self):
+        self.assertIn("pull request comments unreadable",
+                      self.status_line({"message": "boom"}, status=500))
+
+    def test_status_reads_the_hold_from_its_one_graphql_read(self):
+        node = ready_node()
+        node["comments"] = {"totalCount": 1, "nodes": [
+            {"databaseId": 501, "url": self.URL, "createdAt": "2030-01-01T13:00:00Z",
+             "body": "Not merging this yet.",
+             "author": {"__typename": "Bot", "login": "example-fleet"}}]}
+        # The REST read would 404: status must not make it.
+        line = self.status_line({"message": "Not Found"}, status=404, node=node,
+                                authors=("example-fleet[bot]",))
+        self.assertEqual(line, "- #9 Work - blocked: held by a fleet comment from "
+                               "example-fleet[bot]: " + self.URL)
+        self.assertIn("comments(last:100)", brain.READY_FIELDS)
