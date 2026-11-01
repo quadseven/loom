@@ -76,8 +76,9 @@ def _take_back(gh: Any, repo: str, posted: Any) -> None:
         return
     try:
         gh.rest("DELETE", "/repos/%s/issues/comments/%s" % (repo, ident))
-    except GitHubError:
-        pass
+    except GitHubError as err:
+        print("closing: could not take back comment %s on %s: %s" % (ident, repo, err),
+              flush=True)
 
 
 def close(gh: Any, repo: str, number: int, reason: Any, state_reason: str,
