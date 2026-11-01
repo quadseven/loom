@@ -6030,7 +6030,7 @@ class FleetHoldTests(unittest.TestCase):
         said = self.merge({"message": "boom"}, status=500)
         self.assertIn("pull request comments unreadable", said)
 
-    def status_line(self, comments, authors=(FLEET,), status=200, node=None):
+    def status_line(self, comments, authors=(FLEET,), status=200, node=None, env=None):
         pr = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": self.SHA},
               "user": {"login": "example-lane[bot]"}, "labels": [{"name": "class:logic"}]}
         issue = {"number": 7, "state": "open", "body": "",
@@ -6045,10 +6045,11 @@ class FleetHoldTests(unittest.TestCase):
             ("GET", "/issues/9/comments"): reply(status, comments),
         }
         gh = GitHub("t", transport=Routed(routes))
-        env = {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code", "LOOM_TRUSTED_BRIEFERS": ""}
-        with unittest.mock.patch.dict(os.environ, env):
+        env = {"LOOM_BRIEF_AUTHORS": " ".join(authors)} if env is None else env
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
             return brain._pull_request_lines(gh, REPO, [pr], {"prs": {9: node or ready_node()}},
-                                             "grug-tribe", list(authors))[1]
+                                             "grug-tribe", list(authors),
+                                             hold=brain.hold_logins(env))[1]
 
     def test_status_does_not_mark_a_held_pull_request_ready_and_says_why(self):
         # ready_node's head commit is at 12:45; the hold is after it.
@@ -6080,3 +6081,32 @@ class FleetHoldTests(unittest.TestCase):
         self.assertEqual(line, "- #9 Work - blocked: held by a fleet comment from "
                                "example-fleet[bot]: " + self.URL)
         self.assertIn("comments(last:100)", brain.READY_FIELDS)
+
+    def test_a_trusted_briefer_hold_with_no_brief_authors_blocks_status_and_merge(self):
+        # Review finding on loom#2399: status built its own list, from the
+        # process environment and without LOOM_TRUSTED_BRIEFERS when the
+        # authors were empty, so it could say READY where merge refuses.
+        env = {"LOOM_TRUSTED_BRIEFERS": self.FLEET}
+        self.assertIn("held by a fleet comment", self.merge([self.hold()], env=env))
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "",
+                                                   "LOOM_TRUSTED_BRIEFERS": ""}):
+            line = self.status_line([self.hold()], authors=(), env=env)
+        self.assertIn("held by a fleet comment from example-fleet", line)
+
+    def test_status_passes_the_hold_logins_of_the_env_it_was_given(self):
+        seen = []
+
+        def section(gh, repo, now, bot, authors=None, into=None, check="", waiting=None,
+                    caps=None, hold=None):
+            seen.append(hold)
+            return []
+        env = {"LOOM_BRIEF_AUTHORS": "example-brain", "LOOM_TRUSTED_BRIEFERS": self.FLEET}
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "someone-else",
+                                                   "LOOM_TRUSTED_BRIEFERS": ""}), \
+                unittest.mock.patch.object(brain, "_repo_section", section), \
+                unittest.mock.patch.object(brain, "_lane_status", lambda *a, **k: ""):
+            brain.status(GitHub("t", transport=Routed({})), [REPO], REPO, env=env, now=NOW_2393)
+        self.assertEqual(seen, [["example-brain", self.FLEET]])
+
+
+NOW_2393 = datetime(2030, 1, 1, 14, 0, tzinfo=timezone.utc)
