@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain
 from bus.github import GitHub
+import sub_issue_graphql  # noqa: E402
 
 REPO = "example-owner/example-repo"
 BODY = ("## Why\nwhy: the page query is slow for every visitor.\n## What\nwhat\n"
@@ -33,12 +34,17 @@ class Fake:
     """Replies in order; the reads that resolve open epic #2 under goal #1
     are answered apart and not recorded."""
 
-    def __init__(self, *replies):
+    def __init__(self, *replies, subs=None):
         self.replies = list(replies)
         self.calls = []
+        # Sub-issues status reads in one GraphQL query, by issue number.
+        self.subs = dict(subs or {})
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
+        query = json.loads(body or b"{}").get("query", "") if path == "/graphql" else ""
+        if method == "POST" and sub_issue_graphql.asks(query):
+            return reply(200, sub_issue_graphql.answer(query, lambda n: self.subs.get(n, [])))
         if method == "GET" and path == "/repos/%s/issues/%d" % (REPO, EPIC):
             return reply(200, {"number": EPIC, "state": "open", "labels": [{"name": "epic"}],
                                "body": "Done when: done.\n\nPart of #1\n"})
@@ -111,7 +117,7 @@ class UnprovenLimitTests(unittest.TestCase):
 
 class StatusTests(unittest.TestCase):
     def lines(self, children):
-        gh = GitHub("t", transport=Fake(reply(200, children)))
+        gh = GitHub("t", transport=Fake(subs={1: children}))
         now = datetime(2030, 1, 1, 20, 0, tzinfo=timezone.utc)
         return brain._goal_lines([goal()], {"goals": {1: {}}}, now, None, gh, REPO)
 
