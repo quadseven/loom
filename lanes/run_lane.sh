@@ -2102,7 +2102,10 @@ base_verdict_read() {  # key, now
 }
 base_verdict_write() {  # key, exit
   mkdir -p "$BASE_VERDICT_DIR" || return 1
-  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1"
+  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1" || return 1
+  # Every revision mints a new file; sweep the ones no read can use. A
+  # failed sweep never fails the write.
+  find "$BASE_VERDICT_DIR" -type f -mmin +"$(( BASE_VERDICT_TTL_GREEN / 60 ))" -delete 2>/dev/null || true
 }
 
 # A validation failure the repo did not cause is a factory incident, not a

@@ -109,7 +109,8 @@ unset variables.
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
   Setup still runs for each brief, and the final check on the agent's commit
-  is never cached. Verdicts live under the host's `state/base-verdicts/`.
+  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  each write sweeps the ones older than a day.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the

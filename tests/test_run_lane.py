@@ -6071,6 +6071,61 @@ exit %d
                                 env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_fresh_red_base_verdict_skips_the_second_run_but_still_files(self):
+        # A cached red verdict stands in for both runs of a red base check:
+        # the next brief on the same base revision files the incident
+        # without running the check again (#2355).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        red = ("interpreter: loom-test-python\n"
+               "check: echo red-base-hit; exit 2\n")
+        self.contract_repo(contract=red)
+        self.drop_brief()
+        first = self.run_contract_lane()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.lane_log().count("red-base-hit"), 2)
+        verdicts = list((self.loom / "state" / "base-verdicts").iterdir())
+        self.assertEqual(len(verdicts), 1)
+        self.assertEqual(verdicts[0].read_text().split()[1], "2")
+        verdicts[0].write_text("%d 2\n" % int(time.time()))  # fresh red verdict
+
+        self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
+        second = self.run_contract_lane()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        log = (self.loom / "logs" / "codex" / "T043-fix-the-thing.log").read_text()
+        self.assertEqual(log.count("red-base-hit"), 0)
+        self.assertIn("base check reused cached verdict", log)
+        self.assertIn("failed: [factory]", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertIn("base check exited 2", log)
+        self.assertTrue((self.inbox / "failed" / "T043-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
+    def test_a_base_verdict_write_prunes_expired_verdicts_and_keeps_fresh_ones(self):
+        text = RUNNER.read_text()
+        funcs = re.search(r"^base_verdict_write\(\) \{[^\n]*\n.*?^\}\n", text, re.S | re.M).group(0)
+        verdicts = Path(self._tmp.name) / "verdicts"
+        verdicts.mkdir()
+        old, fresh = verdicts / "old", verdicts / "fresh"
+        old.write_text("1 0\n")
+        fresh.write_text("%d 0\n" % int(time.time()))
+        two_days_ago = time.time() - 2 * 86400
+        os.utime(old, (two_days_ago, two_days_ago))
+        script = ('BASE_VERDICT_DIR="$1"\nBASE_VERDICT_TTL_GREEN=86400\n'
+                  'base_verdict_write new 0 || exit 10\n')
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(verdicts)],
+                                env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue((verdicts / "new").exists())
+
+        # A sweep that fails does not fail the write.
+        fakebin = Path(self._tmp.name) / "failfind"
+        self.write_tool(fakebin / "find", "#!/bin/sh\nexit 1\n")
+        result = subprocess.run(["bash", "-c", funcs + script, "test", str(verdicts)],
+                                env={"PATH": f"{fakebin}:/usr/bin:/bin"}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_resolve_factory_incidents_closes_contract_incident(self):
         function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
                              RUNNER.read_text(), re.S | re.M).group(0)
