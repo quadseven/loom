@@ -99,7 +99,9 @@ def merge_takes(ticket=4):
     return (reply(200, {"number": ticket, "state": "open",
                         "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
             reply(200, {"mergeable": True, "mergeable_state": "clean"}),
-            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]))
+            reply(200, [{"filename": "bus/a.py", "patch": "+x"}]),
+            reply(200, {"total_count": 0}),
+            reply(200, {"total_count": 0}))
 
 
 class BrainTests(unittest.TestCase):
@@ -2673,7 +2675,8 @@ class StatusMergeRefusalTests(unittest.TestCase):
           "labels": [{"name": "class:logic"}]}
 
     def lines(self, state="pr", mergeable=True, mergeable_state="clean",
-              files=("bus/a.py", "tests/test_a.py"), env=None):
+              files=("bus/a.py", "tests/test_a.py"), env=None,
+              search_count=0):
         issue = {"number": 7, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
         routes = {
@@ -2681,6 +2684,7 @@ class StatusMergeRefusalTests(unittest.TestCase):
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
                                              "mergeable_state": mergeable_state}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
+            ("GET", "/search/issues"): reply(200, {"total_count": search_count}),
         }
         gh = GitHub("t", transport=Routed(routes))
         with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
@@ -2701,6 +2705,15 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def test_a_pull_request_merge_would_take_is_ready(self):
         self.assertEqual(self.lines()[1], "- #9 Work - READY")
+
+    def test_a_pull_request_at_the_hourly_cap_blocks(self):
+        env = {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code",
+               "LOOM_AUTO_MERGE_PER_REPO_HOUR": "10",
+               "LOOM_AUTO_MERGE_PER_HOUR": "4"}
+        self.assertEqual(self.lines(env=env, search_count=4)[1],
+                         "- #9 Work - blocked: held by the hourly merge cap: 4 loom/ "
+                         "pull requests merged in the last hour, the cap is 4 "
+                         "(LOOM_AUTO_MERGE_PER_HOUR)")
 
 
 class ModelFlagTests(unittest.TestCase):

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -840,23 +841,27 @@ def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optiona
 
 def _pull_request_lines(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
                         data: Dict[str, Any], bot: str,
-                        authors: Sequence[str] = (), check: str = "Grug - Elder") -> List[str]:
+                        authors: Sequence[str] = (), check: str = "Grug - Elder",
+                        caps: Optional[Dict[str, str]] = None,
+                        now: Optional[datetime] = None) -> List[str]:
     """The pull request lines for status: heading, merge readiness for each
     loom pull request, including a pending brain fix as a blocker."""
+    caps = {} if caps is None else caps
     return ["### Pull requests"] + _read_each(
-        lambda pr: _pull_request_line(gh, repo, pr, data, bot, authors, check), prs)
+        lambda pr: _pull_request_line(gh, repo, pr, data, bot, authors, check, caps, now), prs)
 
 
 def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                        data: Dict[str, Any], bot: str, authors: Sequence[str],
-                       check: str) -> str:
+                       check: str, caps: Optional[Dict[str, str]] = None,
+                       now: Optional[datetime] = None) -> str:
     """Build one status line, including brain and goal-home blockers."""
     node = data["prs"].get(int(pr["number"]))
     line = _status_pr_line(gh, repo, pr, node, bot, check)
     ticket = _safe_ticket_association(repo, pr)
     line = _docs_criterion_override(gh, repo, ticket, line)
     if line.endswith(" - READY"):
-        for blocker in _merge_refusals(gh, repo, pr, ticket):
+        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
             line = _add_blocker(line, blocker)
     line = _pending_fix_blocker(gh, ticket, authors, line)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
@@ -919,11 +924,25 @@ def _goal_rule_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     return line + (" - " + "; ".join("rule: %s" % rule for rule in met_rules) if met_rules else "")
 
 
+def _repo_cap_refusal(gh: GitHub, repo: str, caps: Optional[Dict[str, str]],
+                      now: Optional[datetime]) -> str:
+    """The hourly merge cap refusal for `repo`, cached in `caps` across PRs.
+    Status reads pull requests side by side, so the lock keeps it one read."""
+    if caps is None:
+        return merge_tier.cap_refusal(gh, repo, now=now)
+    with CAPS_LOCK:
+        if repo not in caps:
+            caps[repo] = merge_tier.cap_refusal(gh, repo, now=now)
+        return caps[repo]
+
+
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
-                    ticket: Optional[Tuple[str, int]]) -> List[str]:
+                    ticket: Optional[Tuple[str, int]],
+                    caps: Optional[Dict[str, str]] = None,
+                    now: Optional[datetime] = None) -> List[str]:
     """What bus.brain merge would refuse a READY pull request for, read with
     the functions merge uses (loom#1643): its ticket's state, a conflict,
-    and a risk tier held for the operator."""
+    a risk tier held for the operator, and the hourly merge cap."""
     number = int(pr["number"])
     issue: Dict[str, Any] = {}
     found = []
@@ -947,6 +966,9 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return found + [str(err)]
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
+    refusal = _repo_cap_refusal(gh, repo, caps, now)
+    if refusal:
+        found.append("held by the hourly merge cap: %s" % refusal)
     return found
 
 
@@ -1002,12 +1024,13 @@ def _readable_section(gh: GitHub, repo: str, now: datetime, bot: str,
                       authors: Optional[Sequence[str]] = None,
                       into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                       check: str = "Grug - Elder",
-                      waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
+                      waiting: Optional[Dict[str, Dict[str, Any]]] = None,
+                      caps: Optional[Dict[str, str]] = None) -> List[str]:
     """_repo_section, or one skipped line when GitHub will not show the repo
     (moved, gone or forbidden: github.unreadable), so one moved repo does
     not end the status of every other. Any other GitHubError still ends it."""
     try:
-        return _repo_section(gh, repo, now, bot, authors, into, check, waiting)
+        return _repo_section(gh, repo, now, bot, authors, into, check, waiting, caps)
     except GitHubError as err:
         reason = unreadable(err)
         if reason is None:
@@ -1023,7 +1046,8 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
                   authors: Optional[Sequence[str]] = None,
                   into: Optional[Dict[str, List[Dict[str, Any]]]] = None,
                   check: str = "Grug - Elder",
-                  waiting: Optional[Dict[str, Dict[str, Any]]] = None) -> List[str]:
+                  waiting: Optional[Dict[str, Dict[str, Any]]] = None,
+                  caps: Optional[Dict[str, str]] = None) -> List[str]:
     """The repo's status section; with into, its open tickets are kept
     there under the repo's name for the cross-repo Priorities section. With
     waiting, so are the repo's open needs:human count and, per goal, the share
@@ -1058,7 +1082,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += runaway_lines(tickets) + [""]
     lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
     lines += held_lines(held, tickets)
-    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check)
+    lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps, now)
     lines += [""] + _sensitive_pr_lines(prs)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
@@ -1092,6 +1116,7 @@ def live_criterion(body: Optional[str], limit: Optional[int] = 300) -> str:
 # Concurrent GitHub reads in status: few enough that GitHub's burst limits
 # and dropped connections stay rare (each GET retries on its own).
 READ_WORKERS = 6
+CAPS_LOCK = threading.Lock()
 
 
 def _read_each(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
@@ -1201,13 +1226,15 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     out: List[str] = []
     _say(out, emit, ["# Loom status", "", trusted_line(authors)])
     check = review_check_name(env)
+    caps: Dict[str, str] = {}
 
     def read(repo: str) -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
         # Each read keeps its own tickets and waiting count, so a timed-out
         # read that finishes late changes nothing the run prints.
         into: Dict[str, List[Dict[str, Any]]] = {}
         waits: Dict[str, Dict[str, Any]] = {}
-        return _readable_section(gh, repo, now, bot, authors, into, check, waits), into, waits
+        return (_readable_section(gh, repo, now, bot, authors, into, check, waits, caps),
+                into, waits)
 
     # Each repo's reads are independent, so they run side by side; a section
     # prints as its repo finishes. A status took 68 s here and 152 s from a
