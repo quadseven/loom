@@ -242,6 +242,11 @@ def _projection(used: float, reset: datetime, observed: datetime, minutes: float
     return {"pace": rate, "at_reset": min(100.0, used + rate * left / 3600)}
 
 
+def _no_topup(provider: str) -> bool:
+    values = os.environ.get("LOOM_NO_TOPUP", "").replace(",", " ").split()
+    return provider.lower() in [v.lower() for v in values]
+
+
 def read_window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
     """One reading, judged: its figures, reset, pace and freshness."""
     window = str(row.get("window") or "")
@@ -260,6 +265,9 @@ def read_window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         w.update(_projection(used, reset, observed, minutes))
     if row.get("unit") == "USD" and isinstance(row.get("remaining"), (int, float)):
         w["usd_left"] = float(row["remaining"])
+    if row.get("provider") == "anthropic" and window == "credit" and w["used"] is None and _no_topup("anthropic"):
+        w["used"] = 100.0
+        w["usd_left"] = 0.0
     return w
 
 

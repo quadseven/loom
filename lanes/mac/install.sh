@@ -176,9 +176,10 @@ if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
 fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
-# These login lists are kept nowhere but the installed plists, so a reinstall
-# that leaves one unset keeps the station plist's list instead of silently
-# dropping every login. Setting one, even to empty, replaces the list.
+# These settings (login lists, anthropic budget, no top-up) are kept nowhere
+# but the installed plists, so a reinstall that leaves one unset keeps the
+# station plist's value instead of silently dropping it. Setting one, even to
+# empty, replaces the value.
 keep_installed() {
   local value
   [ -z "${!1+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ] || return 0
@@ -193,6 +194,10 @@ with open(sys.argv[1], "rb") as plist:
 keep_installed LOOM_TRUSTED_BRIEFERS
 keep_installed LOOM_BRIEF_AUTHORS
 keep_installed LOOM_ASK_ANSWERERS
+keep_installed LOOM_ANTHROPIC_BUDGET_USD
+keep_installed LOOM_ANTHROPIC_BUDGET_SINCE
+keep_installed LOOM_ANTHROPIC_BUDGET_EXPIRES
+keep_installed LOOM_NO_TOPUP
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot

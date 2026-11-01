@@ -51,9 +51,9 @@ class InstallScriptTest(unittest.TestCase):
         # test: an operator's own settings in the environment would trip the
         # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
-                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
+                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO", "LOOM_NO_TOPUP")
                 and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
-                                       "LOOM_BRAIN_GITHUB_APP_"))}
+                                       "LOOM_BRAIN_GITHUB_APP_", "LOOM_ANTHROPIC_BUDGET_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
                     HOME=str(self.home),
                     LOOM_HOME=str(self.loom),
@@ -335,6 +335,31 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(self.installed_setting(name), ["lee-example"] * 2)
                 self.assertEqual(self.run_install(**{name: ""}).returncode, 0)
                 self.assertEqual(self.installed_setting(name), ["", ""])
+
+    def test_a_reinstall_with_budget_or_no_topup_unset_keeps_the_installed_values(self):
+        settings = {
+            "LOOM_ANTHROPIC_BUDGET_USD": "0",
+            "LOOM_ANTHROPIC_BUDGET_SINCE": "2026-10-18",
+            "LOOM_ANTHROPIC_BUDGET_EXPIRES": "2026-11-01",
+            "LOOM_NO_TOPUP": "anthropic",
+        }
+        self.assertEqual(self.run_install(**settings).returncode, 0)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, value in settings.items():
+            self.assertEqual(self.installed_setting(name), [value, value])
+
+    def test_a_reinstall_that_sets_budget_or_no_topup_replaces_even_with_empty(self):
+        self.assertEqual(self.run_install(LOOM_ANTHROPIC_BUDGET_USD="100",
+                                          LOOM_NO_TOPUP="anthropic").returncode, 0)
+        self.assertEqual(self.run_install(LOOM_ANTHROPIC_BUDGET_USD="0",
+                                          LOOM_NO_TOPUP="zen").returncode, 0)
+        self.assertEqual(self.installed_setting("LOOM_ANTHROPIC_BUDGET_USD"), ["0", "0"])
+        self.assertEqual(self.installed_setting("LOOM_NO_TOPUP"), ["zen", "zen"])
+        self.assertEqual(self.run_install(LOOM_ANTHROPIC_BUDGET_USD="",
+                                          LOOM_NO_TOPUP="").returncode, 0)
+        self.assertEqual(self.installed_setting("LOOM_ANTHROPIC_BUDGET_USD"), ["", ""])
+        self.assertEqual(self.installed_setting("LOOM_NO_TOPUP"), ["", ""])
 
     def test_an_unreadable_installed_plist_names_each_unset_login_list(self):
         agents = self.home / "Library" / "LaunchAgents"

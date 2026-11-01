@@ -160,6 +160,18 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("LOOM_ANTHROPIC_BUDGET_SINCE", asks)
         self.assertIn("1 of 2 lanes can take work: 1 held at a limit.", body)
 
+    def test_anthropic_credit_reads_used_up_when_no_topup_in_environment(self):
+        rows = [reading("anthropic", ["anthropic"], "credit", source="bus/spend.py",
+                        note="budget is not configured")]
+        with unittest.mock.patch.dict(os.environ, {"LOOM_NO_TOPUP": "anthropic"}):
+            body = usage.render(usage.build(rows, NOW))
+        anthropic = provider_row(body, "anthropic")
+        self.assertIn("100% used", anthropic)
+        self.assertIn("0% left", anthropic)
+        self.assertIn("USD 0.00 left", anthropic)
+        self.assertNotIn("Budget is not configured.", anthropic)
+        self.assertNotIn("no API reads the prepaid balance", section(body, "usage-asks"))
+
     def test_a_snapshot_older_than_two_hours_is_marked_stale_everywhere(self):
         rows = [reading("codex", ["codex"], "weekly", 50, (NOW + timedelta(days=2)).isoformat(),
                         age=timedelta(hours=19)),

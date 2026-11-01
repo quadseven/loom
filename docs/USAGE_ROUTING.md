@@ -50,8 +50,8 @@ Each reading names the machine that collected it (`host`).
   Anthropic API reads the remaining prepaid balance (the Admin API usage and
   cost reports give spend only), so the operator sets the budget to the
   console's balance. Unset, the reading names both settings and the spend
-  recorded; when every anthropic slot reports "out of credit", the credit
-  reads as used up.
+  recorded; when `LOOM_NO_TOPUP` lists anthropic or every anthropic slot
+  reports "out of credit", the credit reads as used up.
 
 `python3 -m bus.usage` collects on the lane machine only: on a machine with
 no lane heartbeat in the last 10 minutes it says so and prints no figures,

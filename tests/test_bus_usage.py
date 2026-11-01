@@ -258,6 +258,18 @@ class UsageTests(unittest.TestCase):
         row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
         self.assertIsNone(row["used_pct"])
 
+    def test_anthropic_credit_reads_used_up_when_no_topup_and_no_budget(self):
+        now = 1_800_000_000
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"],
+                                      {"LOOM_NO_TOPUP": "Anthropic, zen"}, now)[0]
+        self.assertEqual((row["used_pct"], row["remaining"]), (100.0, 0.0))
+        self.assertEqual(row["source"], "LOOM_NO_TOPUP")
+        self.assertIn("LOOM_NO_TOPUP", row["note"])
+        # Unrelated no_topup setting still reports unconfigured budget
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"],
+                                      {"LOOM_NO_TOPUP": "zen"}, now)[0]
+        self.assertIsNone(row["used_pct"])
+
     def test_codex_on_a_machine_without_session_logs_says_so(self):
         rows = usage.codex_records(["codex"], Path(self.home) / "no-sessions", 1000)
         self.assertIsNone(rows[0]["used_pct"])
