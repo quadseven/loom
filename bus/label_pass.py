@@ -135,15 +135,17 @@ def _held_removals(issue: Dict[str, Any], names: List[str]) -> List[Removal]:
 
 def _ask_changes(issue: Dict[str, Any], names: List[str], events: Iterable[Any],
                  comments: Sequence[Any], trusted: Iterable[str], ops: Iterable[str],
-                 blockers: Iterable[int]) -> Plan:
+                 blockers: Iterable[int], answerers: Iterable[str]) -> Plan:
     """What the ask's answer or wait changes on the ticket."""
     events, trusted, ops = list(events or []), list(trusted), list(ops)
-    said = ask_state.answer_of(issue, comments, events, trusted, ops)
+    answerers = list(answerers)
+    said = ask_state.answer_of(issue, comments, events, trusted, ops, answerers)
     if said is not None:
         return Plan([Removal(n, "the answer is in the ticket") for n in names
                      if n in HUMAN_LABELS], "",
                     [NEEDS_BRAIN] if ask_state.names_command(said) else [])
-    if ask_state.state(issue, comments, events, trusted, ops, blockers) == ask_state.WAITING \
+    if ask_state.state(issue, comments, events, trusted, ops, blockers,
+                       answerers) == ask_state.WAITING \
             and not any(n.startswith(WAIT_PREFIX) for n in names):
         return Plan([], "", [WAIT_BLOCKED])
     return Plan([], "", [])
@@ -152,12 +154,12 @@ def _ask_changes(issue: Dict[str, Any], names: List[str], events: Iterable[Any],
 def plan(issue: Dict[str, Any], events: Optional[Iterable[Any]] = None,
          station: Iterable[str] = (), comments: Optional[Sequence[Any]] = None,
          trusted: Iterable[str] = (), ops: Iterable[str] = (),
-         blockers: Iterable[int] = ()) -> Plan:
+         blockers: Iterable[int] = (), answerers: Iterable[str] = ()) -> Plan:
     """The labels to change on `issue` and its health note. `events` (the
     issue's events, oldest first) is read only when needs_events says so;
     pass them then. `comments` are an ask's comments, with who may answer
     and the open issues its Blocked on section names; without them the ask
-    is not judged."""
+    is not judged. `answerers` are the LOOM_ASK_ANSWERERS logins."""
     names = names_of(issue)
     remove = _state_removals(names, events, station)
     gone = {r.label for r in remove}
@@ -169,7 +171,8 @@ def plan(issue: Dict[str, Any], events: Optional[Iterable[Any]] = None,
     add: List[str] = []
     claimed = any(n.startswith(CLAIM_PREFIX) for n in names)
     if needs_human(names) and comments is not None and not claimed:
-        asked = _ask_changes(issue, names, events or [], comments, trusted, ops, blockers)
+        asked = _ask_changes(issue, names, events or [], comments, trusted, ops, blockers,
+                             answerers)
         remove += asked.remove
         add += asked.add
     gone = {r.label for r in remove}

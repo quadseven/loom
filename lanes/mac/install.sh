@@ -2,14 +2,15 @@
 # Install the lanes (and the station) as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
-#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark,
+#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot,
 #     plus the extra slots anthropic-2 to anthropic-8, codex-2, opencode-go-2
 #     opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL) and opencode-go-4
 #     (LOOM_OPENCODE_GO_4_MODEL, Muse Spark Contributor: public repos only)
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
-# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM, optional
+# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM,
+# LOOM_COPILOT_KEY_SSM, optional
 # LOOM_AWS_REGION; zen needs no key); they are written into the local plists
 # only, never into this repo. A lane whose key is missing reports itself
 # unavailable and receives no work. The spark lane needs no key: set
@@ -175,9 +176,26 @@ if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
 fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
+# These login lists are kept nowhere but the installed plists, so a reinstall
+# that leaves one unset keeps the station plist's list instead of silently
+# dropping every login. Setting one, even to empty, replaces the list.
+keep_installed() {
+  local value
+  [ -z "${!1+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ] || return 0
+  value="$(python3 -B -c '
+import plistlib, sys
+with open(sys.argv[1], "rb") as plist:
+    print(plistlib.load(plist).get("EnvironmentVariables", {}).get(sys.argv[2], ""))
+' "$AGENTS/com.loom.station.plist" "$1")" ||
+    { echo "cannot read $1 from $AGENTS/com.loom.station.plist: set it in the environment" >&2; exit 1; }
+  export "$1=$value"
+}
+keep_installed LOOM_TRUSTED_BRIEFERS
+keep_installed LOOM_BRIEF_AUTHORS
+keep_installed LOOM_ASK_ANSWERERS
 
 LANES=("$@")
-[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
+[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
   codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
   free-ollama free-gemma free-nvidia free-kilo free-groq)
@@ -311,10 +329,14 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default empty)
-# names another operator's logins whose loom:ticket briefs it builds without
-# adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
-# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
+# with LOOM_REPOS empty it stays idle. LOOM_BRIEF_AUTHORS defaults to the
+# installed station plist's value, else empty. LOOM_TRUSTED_BRIEFERS (same
+# default) names another operator's logins whose loom:ticket briefs it builds without
+# adopting their claims (docs/LANES.md, Trusted briefers). LOOM_ASK_ANSWERERS
+# (same default) names logins whose two answer lines clear an ask (docs/LANES.md,
+# Ask answerers). It also reads LOOM_STATUS_REPO (default:
+# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_BRAIN_BACKUP_HOLDERS
+# (brain holders each judged on their own journal ticks), LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
@@ -407,6 +429,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
+    <key>LOOM_ASK_ANSWERERS</key><string>$(xml "${LOOM_ASK_ANSWERERS:-}")</string>
     <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
     <key>LOOM_NO_LANE_REROUTE</key><string>$(xml "${LOOM_NO_LANE_REROUTE:-}")</string>
     <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
@@ -429,6 +452,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_CLAIM_REFEREE</key><string>$(xml "${LOOM_CLAIM_REFEREE:-}")</string>
     <key>LOOM_ENGINE_CLAIMS</key><string>$(xml "${LOOM_ENGINE_CLAIMS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
+    <key>LOOM_BRAIN_BACKUP_HOLDERS</key><string>$(xml "${LOOM_BRAIN_BACKUP_HOLDERS:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
@@ -481,7 +505,7 @@ echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bu
 # (default 1800), take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_TRUSTED_BRIEFERS,
+# LOOM_TRUSTED_BRIEFERS, LOOM_ASK_ANSWERERS,
 # LOOM_AWS_REGION, LOOM_BRAIN_*, the rungs' LOOM_CODEX_MODEL,
 # LOOM_SPARK_MODEL and LOOM_SPARK_URL, and LOOM_TRANSCRIPT_URL and
 # LOOM_TRANSCRIPT_TOKEN_SSM (for the handoff packet) from the installing
@@ -495,6 +519,14 @@ if [ "${LOOM_BRAIN:-1}" = 0 ]; then
   rm -f "$PLIST" "$LOOM_HOME/state/brain.json" "$LOOM_HOME/state/brain-ok"
   echo "removed $LABEL (LOOM_BRAIN=0)"
 else
+  # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+  # default, so the brain's plist carries the Fabric key parameter name only
+  # when the opt-in is configured; the station's plist above keeps it always.
+  if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ]; then
+    BRAIN_LOOM_ENV="$(loom_env)"
+  else
+    BRAIN_LOOM_ENV="$(loom_env LOOM_FABRIC_KEY_SSM)"
+  fi
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -515,7 +547,7 @@ else
     <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
-$(loom_env)
+$BRAIN_LOOM_ENV
 $(app_env BRAIN_)
   </dict>
 </dict>

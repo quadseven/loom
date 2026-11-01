@@ -1,10 +1,10 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
-import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional, Sequence, Set,
+                    Tuple, Union)
 
 from . import answer as _answer
 from . import decision_claim as _decision_claim
@@ -251,13 +251,7 @@ def _self_login(gh: GitHub) -> str:
     LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
     installation token, which GET /user refuses), else the token's user (read
     once and kept on the client)."""
-    login = gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", "").strip()
-    if login:
-        return login
-    if getattr(gh, "_journal_login", None) is None:
-        data = gh.rest("GET", "/user").data
-        gh._journal_login = str((data or {}).get("login") or "") if isinstance(data, dict) else ""
-    return gh._journal_login
+    return _decision_claim.client_login(gh)
 
 
 def todays_journal(gh: GitHub, repo: str, issue_number: int,
@@ -364,20 +358,36 @@ _HUMAN_COUNT = re.compile(r"(?:loom|needs):human", re.I)
 _NOTHING = re.compile(r"(?:nothing|none|no one|n/a)\b", re.I)
 
 
-def waiting_line(by_repo: Dict[str, int], share: int = 0) -> str:
+def nameable_repos(home: str, private: Mapping[str, Optional[bool]]) -> Optional[Set[str]]:
+    """The repos a report on `home` may name, for waiting_line. `private` maps
+    a repo to its visibility, None when it could not be read. None (every
+    repo) only on a home known to be private: an unreadable home may be
+    public, so it counts as private for what it shows, as every repo does."""
+    if private.get(home) is True:
+        return None
+    return {repo for repo, hidden in private.items() if hidden is False}
+
+
+def waiting_line(by_repo: Dict[str, int], share: int = 0,
+                 nameable: Optional[Collection[str]] = None) -> str:
     """The report's "Waiting on you:" line: the open needs:human issues by
     repo, how many of them sit under this goal, and where they are listed
     (the daily digest). "Waiting on you: nothing" when there are none. It is
     its own line, apart from "Needs you:", so that "nothing" never sits next
-    to a non-zero count and a moving count never reads as a new ask (loom#1775)."""
+    to a non-zero count and a moving count never reads as a new ask (loom#1775).
+    With `nameable` (nameable_repos), a repo outside it is not named: every such
+    count folds into one "N in private repos" part, and the total stays."""
     counts = [(repo, int(n)) for repo, n in by_repo.items() if int(n) > 0]
     total = sum(n for _, n in counts)
     if total == 0:
         return "Waiting on you: nothing"
     counts.sort(key=lambda item: (-item[1], item[0]))
+    parts = ["%d in %s" % (n, repo) for repo, n in counts if nameable is None or repo in nameable]
+    folded = 0 if nameable is None else sum(n for repo, n in counts if repo not in nameable)
+    if folded:
+        parts.append("%d in private repos" % folded)
     return ("Waiting on you: %d open needs:human (%s; %d of them under this goal), listed in "
-            "the daily digest" % (total, ", ".join("%d in %s" % (n, repo) for repo, n in counts),
-                                  int(share)))
+            "the daily digest" % (total, ", ".join(parts), int(share)))
 
 
 def check_report(text: str) -> None:

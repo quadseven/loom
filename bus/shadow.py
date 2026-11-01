@@ -24,6 +24,11 @@ Held while a repo is in shadow:
   sync): code landed with no pull request is a merge;
 - a branch deletion (DELETE .../git/refs/heads/B) other than Loom's own lock.
 
+One close alone passes: the station's evidence close (bus/evidence_close.py,
+operator ruling of 2026-10-31). The station names the one ticket in code
+(evidence_close()), so no label, no argument and no other process can ask for
+it, and the request is still recorded as acted. Merges stay held.
+
 A request the hold cannot read (a label list, the item's current labels, a
 body of an unknown shape, a read that failed in any way) is held as the
 worst request it could be.
@@ -65,6 +70,8 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -72,7 +79,7 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 SWITCH = "LOOM_SHADOW"
@@ -435,6 +442,27 @@ def close_let_through(issue: Any) -> bool:
     if INVARIANT_LABEL in names:
         return INVARIANT_MARKER in str(issue.get("body") or "")
     return TRIAGE_LABEL in names and WATCH_MARKER in str(issue.get("body") or "")
+
+
+_evidence_ticket: "contextvars.ContextVar[Tuple[str, int]]" = contextvars.ContextVar(
+    "loom_evidence_close", default=("", 0))
+
+
+@contextlib.contextmanager
+def evidence_close(repo: str, number: int) -> Iterator[None]:
+    """Within this block the one close of `repo`#`number` is not held."""
+    token = _evidence_ticket.set((str(repo).lower(), int(number)))
+    try:
+        yield
+    finally:
+        _evidence_ticket.reset(token)
+
+
+def evidence_close_passes(found: Request) -> bool:
+    """Whether `found` is the close evidence_close() names, carrying no merge
+    or ship label."""
+    return (found.action == CLOSE and found.check == "close" and not found.labels
+            and _evidence_ticket.get() == (found.repo.lower(), found.number))
 
 
 def held_after_read(found: Request, item: Any) -> Optional[Tuple[str, List[str]]]:

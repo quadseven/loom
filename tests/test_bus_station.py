@@ -30,7 +30,7 @@ from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
-from bus.github import AppToken, GitHub, GitHubError, TargetReached  # noqa: E402
+from bus.github import AppToken, GitHub, GitHubError, RateLimited, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
@@ -111,15 +111,18 @@ class FakeGitHub:
             "labels": [{"name": "loom:ticket"}] + [{"name": x} for x in labels]}
 
     def add_goal(self, number, journals=(), title="Goal"):
-        """journals: (login, age in seconds) pairs, posted as journal comments."""
+        """journals: (login, age in seconds) pairs, posted as journal comments,
+        or (login, age, holder) for a journal whose Tick line names its holder."""
         goal = {"number": number, "title": title, "state": "open",
                 "labels": [{"name": "loom:goal"}]}
         self.goals.append(goal)
         self.issues[number] = dict(goal)
-        self.comments[number] = [
-            {"body": "<!-- loom:journal v1 -->\nTick", "user": {"login": login},
-             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))}
-            for login, age in journals]
+        self.comments[number] = []
+        for login, age, *holder in journals:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+            tick = "Tick %s, %s" % (stamp, holder[0]) if holder else "Tick"
+            self.comments[number].append({"body": "<!-- loom:journal v1 -->\n" + tick,
+                                          "user": {"login": login}, "created_at": stamp})
 
     def _list_asks(self, headers, label):
         found = [a for a in self.asks if label in [x["name"] for x in a["labels"]]]
@@ -314,7 +317,8 @@ class FakeGitHub:
             return reply(201, {"number": 900})
         if method == "POST" and rest == "issues":
             if (data.get("title") == "Add the repository validation contract"
-                    or data.get("title", "").startswith(("Land or supersede #", "Epic: "))):
+                    or data.get("title", "").startswith(("Land or supersede #", "Epic: ",
+                                                         "Proof due"))):
                 number = max(self.issues.keys(), default=0) + 1
                 made = {"number": number, "id": 1000 + number, "title": data["title"],
                         "body": data["body"], "state": "open",
@@ -341,6 +345,10 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        for label in ("closed-unproven", "loom:proof-due"):
+            if "labels=%s&" % label in query:
+                return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                                   and label in self.names(i["number"])])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -872,6 +880,73 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("Second works", note)
 
+    def stale_pr(self, put="2030-01-05T00:00:00Z", **pull):
+        """Ticket 12 at loom:pr since `put`, with a merge judged long before."""
+        self.merged_with("- [x] First works; test.\n")
+        self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"), created_at=put))
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "lane:codex"}]
+        self.fake.timelines = getattr(self.fake, "timelines", {})
+        self.fake.timelines[12] = list(self.fake.events[12]) + [pull] if pull else list(self.fake.events[12])
+        self.fake.pulls.clear()
+        self.fake.calls.clear()
+        with mock.patch("bus.station.time.time", return_value=4102444800.0):
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+
+    def test_loom_pr_with_no_open_pull_request_clears_on_the_next_pass(self):
+        # loom#2333: the label stayed 4 days with no open pull request.
+        self.stale_pr()
+        self.assertEqual(sorted(self.fake.names(12)), ["loom:queued", "loom:ticket"])
+
+    def test_loom_pr_stays_for_an_open_pull_request_in_another_repo(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "alice-example"},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertIn("loom:pr", self.fake.names(12))
+
+    def test_a_strangers_pull_request_does_not_keep_loom_pr(self):
+        self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                         "source": {"issue": {"state": "open", "pull_request": {},
+                                              "user": {"login": "stranger-example"},
+                                              "body": "Refs %s#12" % REPO}}})
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_fix_round_leaves_a_ticket_claimed_for_outside_work_untouched(self):
+        # loom#2333: the hand-back pass re-briefed a ticket an outside
+        # contributor held and took the hold label off it.
+        self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA, lane="codex")
+        self.fake.issues[12]["labels"].append({"name": "claim:overflow"})
+        before = self.fake.names(12)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.hand_back()
+        st.reconcile_pull_requests()
+        self.assertEqual(self.fake.paths("PUT"), [])
+        self.assertEqual(self.fake.names(12), before)
+
+    def test_the_requeue_note_names_every_open_box_of_any_kind(self):
+        # loom#2333: six boxes were left and the note named one. A box read as
+        # a live check is still open, so the ticket's next reader must see it.
+        criteria = ("## Acceptance criteria\n- [ ] Count the names\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n- [x] Already ticked on the ticket\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [ ] Count the names; not built: no time\n- [x] Build the first\n"
+                         "- [ ] Verify the shape holds; not built: no time\n")
+        self.assertIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in status.expand(self.fake.comments[12], AUTHORS)][0]
+        self.assertIn("Count the names", note)
+        self.assertIn("Verify the shape holds", note)
+        self.assertNotIn("Build the first", note)
+        self.assertNotIn("Already ticked", note)
+
+    def test_only_a_live_box_open_does_not_send_the_ticket_back(self):
+        criteria = ("## Acceptance criteria\n- [ ] Build the first\n"
+                    "- [ ] Verify the shape holds\n")
+        self.fake.add(12, state="pr", body=BODY + "\n" + criteria)
+        self.merged_with("- [x] Build the first\n- [ ] Verify the shape holds\n")
+        self.assertIn("loom:merged", self.fake.names(12))
+
     def test_a_pr_merged_before_the_requeue_does_not_requeue_the_ticket_again(self):
         self.merged_with("- [x] First works; test.\n")
         self.requeued("2030-01-03T00:00:00Z")
@@ -1172,10 +1247,11 @@ class AdoptUntrackedPullRequestTest(Base):
         self.fake.add_goal(30)
 
     def pull(self, number, author="alice-example", head_repo=REPO, ref="fix/stray-files",
-             body="", draft=False, created="2020-01-01T00:00:00Z", title="Tidy the docs"):
+             body="", draft=False, created="2020-01-01T00:00:00Z", title="Tidy the docs",
+             updated=None):
         self.fake.comments.setdefault(number, [])
         pr = {"number": number, "state": "open", "title": title, "user": {"login": author},
-              "body": body, "draft": draft, "created_at": created,
+              "body": body, "draft": draft, "created_at": created, "updated_at": updated or created,
               "head": {"ref": ref, "repo": {"full_name": head_repo}},
               "base": {"ref": "main", "repo": {"full_name": REPO}}}
         self.fake.pulls.append(pr)
@@ -1269,6 +1345,47 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual([c["title"] for c in self.adoptions()],
                          ["Land or supersede #99: Tidy the docs"])
         self.assertEqual(len(self.markers(99)), 1)
+
+    def test_a_session_pull_request_a_day_old_is_not_adopted(self):
+        # #1182's 2 hours adopted pull requests a person or session was still
+        # driving: 85 of 711 ran past 2 hours, 22 past 48 (2026-10-17 to -31).
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        self.pull(99, created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start - 24 * 3600)))
+        self.adopt(now=start)
+        self.assertEqual(self.adoptions(), [])
+        self.assertGreater(station.ADOPT_GRACE, 24 * 3600)
+        self.assertLessEqual(station.ADOPT_GRACE, 72 * 3600)
+
+    def stamp(self, epoch):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+    def test_recent_activity_holds_a_session_pull_request_past_the_grace(self):
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        old = self.stamp(start - 5 * station.ADOPT_GRACE)
+        self.pull(99, created=old, updated=self.stamp(start - 3600))
+        self.adopt(now=start)
+        self.assertEqual(self.adoptions(), [])
+        self.assertEqual(self.fake.comments[99], [])
+        self.adopt(now=start - 3600 + station.ADOPT_GRACE)
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
+
+    def test_a_loom_branch_waits_on_age_alone(self):
+        # The quiet rule is for branches a person or session drives; a lane's
+        # branch with no ticket is orphaned however busy its bots are.
+        start = calendar.timegm((2030, 1, 1, 12, 0, 0))
+        pr = {"created_at": self.stamp(start - station.ADOPT_GRACE),
+              "updated_at": self.stamp(start - 60)}
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=start)
+        self.assertTrue(runner._past_adopt_grace(dict(pr, head={"ref": "loom/12-fix-the-thing"})))
+        self.assertFalse(runner._past_adopt_grace(dict(pr, head={"ref": "fix/stray-files"})))
+
+    def test_a_pull_request_with_no_updated_time_waits_on_age_alone(self):
+        self.pull(99)
+        self.fake.pulls[-1].pop("updated_at")
+        self.adopt()
+        self.assertEqual([c["title"] for c in self.adoptions()],
+                         ["Land or supersede #99: Tidy the docs"])
 
     def test_a_pull_request_merged_since_the_listing_is_not_adopted(self):
         # The open list is read once a pass; eight tickets were filed at or
@@ -3877,7 +3994,7 @@ class StampedReviewFake(ReviewFake):
                                 fixrounds.load_ledger(self.fix_ledger))
 
     def _post_comment(self, data):
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
         self.next_id += 1
         self.new_comments += 1
         self.comments.append({"id": self.next_id, "body": data["body"],
@@ -3888,7 +4005,7 @@ class StampedReviewFake(ReviewFake):
     def _patch_comment(self, comment_id, data):
         comment = next(c for c in self.comments if c.get("id") == comment_id)
         comment["body"] = data["body"]
-        comment["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        comment["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
         return mock.Mock(data=dict(comment))
 
     def _get(self, path):
@@ -3929,13 +4046,26 @@ class FixRoundsInPlaceTest(unittest.TestCase):
 
     def round(self, n, rounds="10"):
         self.lane_pushes(str(n) * 40)
-        with mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": rounds}), \
+        # The round follows its claim on the clock too: _fix_for orders them
+        # by the times the status comment and the rounds comment carry.
+        after_claim = time.time() + 60 * self.claims + 30
+        with mock.patch("time.time", return_value=after_claim), \
+             mock.patch.dict(os.environ, {"LOOM_FIX_ROUNDS": rounds}), \
              mock.patch("bus.brain._failing_checks", return_value=[("lint-%d" % n, "log %d" % n)]), \
              mock.patch("bus.brain._open_threads", return_value=[self.thread("PRRT_%d" % n)]):
             self.station.hand_back()
 
     def fixes(self):
         return [c for c in self.gh.comments if str(c["body"]).startswith(tickets.FIX_MARKER)]
+
+    def assert_refused_or_ended(self, comments):
+        """An edited rounds comment reads as one comment at its first post
+        time. With no claim after that it is refused. A later claim ends it, so
+        a restart is never held by an old comment, and it is not built on."""
+        unclaimed = [c for c in comments if not status.is_status(c.get("body"))]
+        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
+            self.station._fix_for(REPO, unclaimed)
+        self.assertIsNone(self.station._fix_for(REPO, comments))
 
     def test_three_rounds_on_one_pull_request_are_one_comment_listing_all_three(self):
         for n in (1, 2, 3):
@@ -4006,8 +4136,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
             self.round(n)
         self.fixes()[0]["updated_at"] = "2099-01-01T00:00:00Z"
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
-        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
-            self.station._fix_for(REPO, comments)
+        self.assert_refused_or_ended(comments)
         # Read per comment: the edited one is one round, never its rounds.
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
         self.round(3)
@@ -4029,8 +4158,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         comment["updated_at"] = stamp
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 1)
-        with self.assertRaisesRegex(ValueError, "edited after it was posted"):
-            self.station._fix_for(REPO, comments)
+        self.assert_refused_or_ended(comments)
 
     def test_round_counters_never_read_a_strangers_rounds(self):
         self.round(1)
@@ -4304,6 +4432,35 @@ class PassBudgetTest(Base):
         self.run_pass()
         self.assertEqual(self.rotation(), 0)
 
+    def seed_rotation(self, step):
+        self.write(os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE),
+                   json.dumps({"next": step}))
+
+    def test_a_step_a_rate_limit_stops_does_not_start_the_next_pass(self):
+        # loom#2321: on 2026-10-31 check_invariants hit the search limit each
+        # pass, the raise skipped the rotation write, and the next pass began
+        # on it again, so the 39 other steps waited for hours.
+        def limited(_station):
+            raise RateLimited("GET /search/issues -> 403", 403, "", 0)
+
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "check_invariants", limited), \
+                mock.patch.object(station.Station, "release_factory_held", later):
+            self.run_pass()
+            later.assert_not_called()
+            self.assertGreater(self.rotation(), 0)
+            self.run_pass()
+        later.assert_called_once()
+
+    def test_a_step_that_crashes_keeps_its_place_in_the_rotation(self):
+        self.seed_rotation(0)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.Station, "_timed", side_effect=[True, KeyError("x")]):
+            with self.assertRaises(KeyError):
+                st._run_steps()
+        self.assertEqual(self.rotation(), 1)
+
 
 class CorruptStateTest(Base):
     def test_a_corrupt_ledger_stops_the_pass_instead_of_reporting_again(self):
@@ -4328,9 +4485,8 @@ class CorruptStateTest(Base):
         # ones with no state label (loom#1653), the hourly label pass's reads
         # of open issues and of closed ones still at loom:triage (loom#2024),
         # and the hourly read of the repo's roll record declaration (loom#2025),
-        # and the verify-note pass's own build of the verify pool (its
-        # audit-hold read and pool listing, loom#2092).
-        self.assertEqual(self.run_pass().requests, 18)
+        # and the verify-note pass's own pool listing (loom#2092).
+        self.assertEqual(self.run_pass().requests, 17)
 
 
 class TicketsTest(unittest.TestCase):
@@ -5070,6 +5226,102 @@ class FixTest(Base):
         self.assertEqual(self.listing(), [])
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:running", self.fake.names(12))
+
+    def test_a_fix_for_a_merge_already_judged_is_spent_and_does_not_park_the_ticket(self):
+        # loom#2333: the merge sent the ticket back for the rest, the old fix
+        # ask still stood, and every brief parked the ticket at loom:pr.
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, tickets.UNBUILT_NOTE % (99, "Second works."))
+        self.fake.pulls.append({"number": 99, "state": "closed",
+                                "merged_at": "2030-01-02T12:00:00Z",
+                                "merge_commit_sha": "%040x" % 99, "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        # It is a new build now, so the brief check judges it, as any build.
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
+    def restarted_after_a_round(self, pull):
+        """A claimed attempt, a fix round on pull request 99, the pull request
+        ended, then a rung 0 restart back to loom:briefed."""
+        self.fake.add(12, events=[dict(labeled("loom:briefed", "alice-example"),
+                                       created_at="2030-01-02T00:00:00Z"),
+                                  labeled("lane:codex", "bob-example")])
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 0 --> Restarted on rung 0.")
+        self.fake.pulls.append(dict({"number": 99, "state": "closed", "base": {"ref": "main"},
+                                     "head": {"ref": "loom/12-fix-the-thing"}}, **pull))
+
+    def assert_normal_brief(self):
+        brief = self.claimed_brief()
+        self.assertNotIn("Fix-PR:", brief)
+        self.assertNotIn("\n## Fix\n", brief)
+        self.assertIn("\nBranch: loom/12-fix-the-thing-r2\n", brief)
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_rung_0_restart_after_a_merged_pull_request_gets_a_normal_brief(self):
+        self.restarted_after_a_round({"merged_at": "2030-01-01T12:00:00Z",
+                                      "merge_commit_sha": "%040x" % 99})
+        self.fake.issues[12]["labels"].append({"name": "loom:regression"})
+        with mock.patch.object(station, "_say") as say:
+            self.run_pass()
+        self.assert_normal_brief()
+        self.assertNotIn("loom:pr", self.fake.names(12))
+        self.assertFalse([c for c in say.call_args_list
+                          if "merged before its fix round" in str(c)])
+
+    def test_a_rung_0_restart_after_a_closed_pull_request_gets_a_normal_brief(self):
+        self.restarted_after_a_round({"merged_at": None})
+        self.run_pass()
+        self.assert_normal_brief()
+
+    def test_a_fix_after_a_rung_0_restart_still_runs_as_a_fix_round(self):
+        self.fake.add(12)
+        self.comment(12, "<!-- loom:rung 0 --> Restarted on rung 0.")
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def test_a_climb_or_a_strangers_rung_0_does_not_end_a_fix(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY)
+        self.comment(12, "<!-- loom:rung 2 --> Moved up the ladder.")
+        self.comment(12, "<!-- loom:rung 0 --> Restart it.", author="stranger")
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def status_comment(self, claimed_at, author="alice-example"):
+        return {"id": 2, "user": {"login": author}, "created_at": "2030-01-01T00:00:00Z",
+                "updated_at": claimed_at,
+                "body": status.render([(claimed_at, "Claimed for lane codex (body sha256 0123456789ab)")])}
+
+    def fix_comment(self):
+        at = "2030-01-02T00:00:00Z"
+        return {"id": 3, "user": {"login": "alice-example"}, "body": FIX_BODY,
+                "created_at": at, "updated_at": at}
+
+    def fix_of(self, comments):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)._fix_for(REPO, comments)
+
+    def test_a_fix_posted_before_the_status_comment_claim_is_not_current(self):
+        self.assertIsNone(self.fix_of([self.fix_comment(), self.status_comment("2030-01-02T00:00:01Z")]))
+        # The status comment keeps its place in the list and its first post
+        # time, so only the event's own time puts the claim after the fix.
+        self.assertIsNone(self.fix_of([self.status_comment("2030-01-02T00:00:01Z"), self.fix_comment()]))
+
+    def test_a_fix_posted_after_the_status_comment_claim_is_current(self):
+        found = self.fix_of([self.status_comment("2030-01-01T23:59:59Z"), self.fix_comment()])
+        self.assertEqual(found[0].pr, 99)
+
+    def test_a_strangers_status_comment_does_not_end_a_fix(self):
+        found = self.fix_of([self.fix_comment(),
+                             self.status_comment("2030-01-02T00:00:01Z", author="stranger")])
+        self.assertEqual(found[0].pr, 99)
 
     def test_a_fix_for_an_open_pull_request_is_briefed(self):
         self.fake.add(12)
@@ -6388,6 +6640,19 @@ class FactoryIncidentTest(Base):
                                          "Lane muse held: factory incident %s#99" % REPO)])
         self.assertEqual(self.fake.comments[12], [])
         self.incident()
+        self.fake.issues[99] = dict(self.fake.factory_incidents[0])
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_closed_contract_incident_requeues_its_held_ticket(self):
+        self.fake.add(12, lane="muse", body=PLAIN, state="running")
+        self.held_directly(body_events=[("2030-01-01T00:00:00Z",
+                                         "Lane muse held: factory incident %s#99" % REPO)])
+        self.incident()
+        self.fake.factory_incidents[0]["title"] = "Factory incident: %s validation contract" % REPO
+        self.fake.factory_incidents[0]["body"] = (
+            "<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: contract\n" % REPO)
         self.fake.issues[99] = dict(self.fake.factory_incidents[0])
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             station.Station(GitHub("token", transport=self.fake), self.settings).release_factory_held()
@@ -9234,11 +9499,12 @@ class ReportsTest(Base):
             station.REPORT_MARKER)]
         self.assertEqual(len(made), 2)
         body = made[-1]["body"]
-        # 2026-10-25: the headline, one line per heading and the footer.
+        # The headline, one line per heading, the waiting count and the footer.
         lines = [line for line in body.splitlines() if line.strip()]
         self.assertEqual([line.split(":")[0] for line in lines[2:7]],
                          ["Going well", "Not going well", "Still stuck", "Next", "Needs you"])
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(len(lines), 9)
+        self.assertTrue(lines[7].startswith("Waiting on you: "))
         for number, title in ((41, "Merged task"), (42, "Open task"),
                               (43, "Verified task"), (44, "Sent back task"),
                               (45, "Failed task"), (46, "Stuck task"),
@@ -9247,6 +9513,55 @@ class ReportsTest(Base):
         self.assertEqual(body.splitlines()[1], "1 merged, 1 verified, 1 shipped, 1 failed, "
                          "1 stuck, 2 in flight, 1 waiting on you since the last report.")
         brain._check_written_text(body)
+
+    def waiting_line_for(self, home, private, children=()):
+        """The station's line on `home`, with two repos asking and `private`
+        as each repo's visibility (None: unreadable)."""
+        other = "other-owner/other-repo"
+        asks = {REPO: [{"number": n, "state": "open", "labels": [{"name": "needs:human"}]}
+                       for n in (41, 42)],
+                other: [{"number": 51, "state": "open", "labels": [{"name": "needs:human"}]}]}
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        st.s.repos = [REPO, other]
+        with mock.patch.object(brain, "_issues", side_effect=lambda gh, repo: asks[repo]) as read_issues, \
+                mock.patch.object(brain, "repo_private",
+                                  side_effect=lambda gh, repo: private[repo]) as read:
+            line = st._standup_waiting_line(home, list(children))
+            self.assertEqual(st._standup_waiting_line(home, list(children)), line)
+        self.assertEqual(read_issues.call_count, 2)
+        self.assertEqual(read.call_count, 2)
+        return line
+
+    def test_a_data_report_on_a_public_home_folds_private_repos(self):
+        line = self.waiting_line_for(REPO, {REPO: False, "other-owner/other-repo": True},
+                                     [{"number": 41}])
+        self.assertEqual(line, "Waiting on you: 3 open needs:human (2 in %s, 1 in private repos; "
+                         "1 of them under this goal), listed in the daily digest" % REPO)
+
+    def test_a_data_report_on_a_private_home_names_every_repo(self):
+        line = self.waiting_line_for(REPO, {REPO: True, "other-owner/other-repo": True})
+        self.assertIn("(2 in %s, 1 in other-owner/other-repo;" % REPO, line)
+
+    def test_a_data_report_counts_an_unreadable_repo_as_private(self):
+        line = self.waiting_line_for(REPO, {REPO: False, "other-owner/other-repo": None})
+        self.assertIn("(2 in %s, 1 in private repos;" % REPO, line)
+
+    def test_a_data_report_on_an_unreadable_home_names_no_private_repo(self):
+        line = self.waiting_line_for(REPO, {REPO: None, "other-owner/other-repo": False})
+        self.assertIn("(1 in other-owner/other-repo, 2 in private repos;", line)
+
+    def test_a_data_report_without_a_full_count_leaves_the_line_out(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings,
+                             now=time.time())
+        with mock.patch.object(brain, "_issues", side_effect=GitHubError("boom")):
+            self.assertEqual(st._standup_waiting_line(REPO, []), "")
+
+    def test_a_moved_waiting_count_alone_matches_the_last_report(self):
+        body = "%s\nHeadline\nWaiting on you: 3 open needs:human\n\nFooter" % station.REPORT_MARKER
+        moved = body.replace("3 open", "4 open")
+        comments = [{"id": 7, "user": {"login": "me"}, "body": body}]
+        self.assertEqual(station.Station._last_same_report(comments, ["me"], moved), 7)
 
     def test_station_standup_lists_the_tickets_of_the_goals_epics(self):
         self.add_goal()
@@ -9346,7 +9661,7 @@ class ReportsTest(Base):
         self.add_goal()
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
-        quiet = st._overdue_standup_body([], None)
+        quiet = st._overdue_standup_body([], None, waiting=st._standup_waiting_line(REPO, []))
         self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
         self.fake.comments[40][0]["created_at"] = self.ago(
             REPORT_OVERDUE_AGE)
@@ -9371,7 +9686,7 @@ class ReportsTest(Base):
         old = self.ago(quiet_rule.HEARTBEAT_EVERY + 60)
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
-        quiet = st._overdue_standup_body([], None)
+        quiet = st._overdue_standup_body([], None, waiting=st._standup_waiting_line(REPO, []))
         self.comment(40, 5, quiet + "\n" + station.QUIET_STAMP % "2026-01-01T00:00Z")
         self.comment(40, 6, station.REPORT_MARKER + "\nSame as the last report: the backlog is empty.")
         for c in self.fake.comments[40]:
@@ -9815,6 +10130,68 @@ class BrainTest(Base):
         station.Station(gh, self.settings, read_secret=lambda n, r: URL, post=down).run_pass()
         self.go()
         self.assertEqual(len(self.sent), 1)
+
+    # A backup brain is judged on its own journal ticks (loom#2141): a live
+    # primary brain must not hide a backup that stopped.
+    def test_a_fresh_primary_does_not_hide_a_stale_backup(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(outcome="skipped", ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.go(60)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Urgent: the Loom brain lane-machine has posted no journal tick since",
+                      self.sent[0])
+
+    def test_a_backup_with_no_journal_in_the_last_day_is_told(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.add_goal(50, [("alice-example", 600, "muse")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("lane-machine has posted no journal tick in the last day", self.sent[0])
+
+    def test_a_backup_ticking_again_is_told_once(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.fake.add_goal(51, [("alice-example", 0, "lane-machine")])
+        self.go(station.JOURNAL_CHECK + 1)
+        self.go(station.JOURNAL_CHECK + 60)
+        self.go(2 * station.JOURNAL_CHECK + 2)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("The Loom brain lane-machine is ticking again (last journal tick",
+                      self.sent[1])
+
+    def test_a_fresh_backup_is_quiet(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 3 * 3600, "muse"),
+                                ("alice-example", 600, "lane-machine")])
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_no_backup_configured_keeps_a_stale_backup_quiet(self):
+        self.tick(outcome="skipped", ok_age=3 * 3600)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_a_github_read_error_tells_no_backup_fault(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.goal_error = True
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    def test_backup_holders_are_read_from_the_environment(self):
+        settings = station.Settings.from_env({"LOOM_HOME": self.home,
+                                              "LOOM_BRAIN_BACKUP_HOLDERS": "lane-machine, bad<@1>"})
+        self.assertEqual(settings.brain_holders, ["lane-machine"])
+        self.assertEqual(station.Settings.from_env({"LOOM_HOME": self.home}).brain_holders, [])
 
 
 if __name__ == "__main__":
@@ -11889,6 +12266,15 @@ class VerifyNoteTest(Base):
         return [c["body"] for c in self.fake.comments[number]
                 if station.VERIFY_NOTE_MARKER in str(c.get("body") or "")]
 
+    def test_a_live_box_naming_no_exact_string_still_gets_a_note(self):
+        # loom#964: the verify pool skips this ticket, so the note pass must
+        # read its own wider pool or the ticket waits with no record.
+        body = "## Acceptance criteria\n\n- [ ] Live: the page feels right\n"
+        self.assertEqual(station.live_needles(body), [])
+        self.fake.add(7, lane="codex", body=body, state="shipped", events=shipped_at(30))
+        self.station().note_stale_shipped()
+        self.assertEqual(len(self.notes(7)), 1)
+
     def test_every_stale_shipped_ticket_gets_a_note_or_has_an_attempt(self):
         self.station().note_stale_shipped()
         for n in (1, 2, 3):
@@ -12866,7 +13252,11 @@ class OwnershipHelpersTest(unittest.TestCase):
     def test_owned_elsewhere(self):
         self.assertIsNone(tickets.owned_elsewhere({}, AUTHORS))
         self.assertIsNone(tickets.owned_elsewhere(
-            {"assignees": [{"login": "Bob-Example"}, {"login": "carol-example"}]}, AUTHORS))
+            {"assignees": [{"login": "Bob-Example"}]}, AUTHORS))
+        # An outside person beside an operator holds it (loom#2333).
+        self.assertEqual(tickets.owned_elsewhere(
+            {"assignees": [{"login": "Bob-Example"}, {"login": "carol-example"}]}, AUTHORS),
+            "carol-example")
         self.assertEqual(tickets.owned_elsewhere(
             {"assignees": [{"login": "carol-example"}]}, AUTHORS), "carol-example")
         self.assertEqual(tickets.owned_elsewhere(
