@@ -81,7 +81,7 @@ class TargetReached(Exception):
 
 
 class ShadowHeld(GitHubError, ValueError):
-    """A merge, close, ship label or branch deletion shadow mode recorded
+    """A merge, close, merge label or branch deletion shadow mode recorded
     instead of sending (bus/shadow.py). Both a GitHubError and a ValueError,
     so every caller that handles a refused write or a refused gate handles it
     the same way: logged, and tried again (and recorded once) next pass."""
@@ -753,7 +753,7 @@ class GitHub:
                 self.comment_edits = True
 
     def _hold_in_shadow(self, method: str, path: str, body: Any) -> Optional["shadow.Request"]:
-        """Record and refuse a merge, close, ship or merge label, approving
+        """Record and refuse a merge, close, merge label, approving
         review, write onto a branch Loom does not own, or branch deletion in a
         repo in shadow mode (bus/shadow.py). Every Python write to GitHub
         passes through here, whichever caller sent it. An exemption (a signal

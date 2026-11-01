@@ -418,6 +418,8 @@ def brain_routes(body, files, patches):
         "/repos/%s/pulls/8" % BRAIN_REPO: pr,
         "/graphql": {"data": {"repository": {"pullRequest": details}}},
         "/repos/%s/issues/9/comments" % BRAIN_REPO: [],
+        # The pull request's own comments: no fleet hold on it (loom#2393).
+        "/repos/%s/issues/8/comments" % BRAIN_REPO: [],
         "/repos/%s/issues/9" % BRAIN_REPO: ticket,
         "/repos/%s/contents/.github/workflows/sync.yml" % BRAIN_REPO: {
             "content": base64.b64encode(SYNC_WORKFLOW.encode()).decode()},
