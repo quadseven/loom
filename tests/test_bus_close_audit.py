@@ -142,10 +142,11 @@ class FakeGitHub:
         self.comments[number] = [{"created_at": stamp(at - 7), "body": said,
                                   "user": {"login": closed_by}}]
 
-    def link(self, number, pull):
-        self.pulls[pull["number"]] = pull
+    def link(self, number, pull, mentioned=NOW - 7200, refs=True):
+        self.pulls[pull["number"]] = dict(pull, body=(
+            "Refs %s#%d\n" % (REPO, number) if refs else "Unrelated change.\n"))
         self.timelines.setdefault(number, []).append({
-            "event": "cross-referenced", "source": {"issue": {
+            "event": "cross-referenced", "created_at": stamp(mentioned), "source": {"issue": {
                 "number": pull["number"], "repository": {"full_name": REPO},
                 "pull_request": {"merged_at": pull["merged_at"]}}}})
 
@@ -239,9 +240,11 @@ class ReadClose(unittest.TestCase):
     def elsewhere(self, gh, number, where):
         pull = merged_pull(77, merge="a1a2a3a4" + "3" * 32)
         pull["base"] = {"repo": {"full_name": where, "default_branch": "main"}, "ref": "main"}
+        pull["body"] = "Refs %s#%d\n" % (REPO, number)
         gh.foreign[(where.lower(), 77)] = pull
         gh.timelines.setdefault(number, []).append({
-            "event": "cross-referenced", "source": {"issue": {
+            "event": "cross-referenced", "created_at": stamp(NOW - 7200),
+            "source": {"issue": {
                 "number": 77, "repository": {"full_name": where},
                 "pull_request": {"merged_at": pull["merged_at"]}}}})
 
@@ -270,6 +273,41 @@ class ReadClose(unittest.TestCase):
         report = ca.check(REPO, stamp(NOW), [comment(said)], [pull],
                           places({MERGE_SHA[:8]: ca.ON, HEAD_SHA[:8]: ca.ABSENT}))
         self.assertEqual(report.verdict, ca.UNPROVEN)
+
+    def test_a_mention_after_the_merge_proves_nothing(self):
+        gh = FakeGitHub()
+        gh.close(5, "On main as %s." % ABSENT_SHA)
+        gh.absent.add(ABSENT_SHA)
+        gh.carried.add(MERGE_SHA)
+        gh.link(5, merged_pull(7), mentioned=NOW - 60)
+        report = ca.read_close(gh, REPO, 5)
+        self.assertEqual(report.verdict, ca.UNPROVEN)
+        self.assertEqual(report.deliveries, [])
+
+    def test_a_merged_pull_that_only_mentions_the_ticket_proves_nothing(self):
+        gh = FakeGitHub()
+        gh.close(5, "On main as %s." % ABSENT_SHA)
+        gh.absent.add(ABSENT_SHA)
+        gh.carried.add(MERGE_SHA)
+        gh.link(5, merged_pull(7), refs=False)
+        self.assertEqual(ca.read_close(gh, REPO, 5).verdict, ca.UNPROVEN)
+
+    def test_each_real_way_of_naming_a_ticket_counts(self):
+        full, bare = "Refs %s#5 trailing words" % REPO, "Refs #5"
+        for body, head in ((full, "x"), (bare, "x"), ("Closes #5", "x"), ("", "loom/5-a-title")):
+            pull = merged_pull(7, )
+            pull.update(body=body)
+            pull["head"]["ref"] = head
+            self.assertTrue(ca.names_ticket(pull, REPO, REPO, 5, None), (body, head))
+        pull = merged_pull(7)
+        pull.update(body="Refs #55\nSee #5")
+        self.assertFalse(ca.names_ticket(pull, REPO, REPO, 5, None))
+        pull.update(body="Refs #9")
+        self.assertTrue(ca.names_ticket(pull, REPO, REPO, 5, 9))
+        pull.update(body=bare)
+        self.assertFalse(ca.names_ticket(pull, "other/place", REPO, 5, None))
+        pull.update(body="Refs %s#5" % REPO.upper())
+        self.assertTrue(ca.names_ticket(pull, "other/place", REPO, 5, None))
 
     def test_the_fleet_comes_from_the_repo_list(self):
         self.assertEqual(ca.fleet_repos({"LOOM_REPOS": "a/b, c/d e/f"}), ["a/b", "c/d", "e/f"])

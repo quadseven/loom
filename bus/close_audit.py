@@ -25,9 +25,10 @@ budget. A close that is `unproven` gets one comment and is reopened; a ticket
 is reopened once, and a later unproven close of it gets the comment alone.
 Nothing closed before the first pass is read. It makes no AI call.
 
-Only a merged pull request whose base is the audited repo or a repo of this
-fleet (LOOM_REPOS) counts as delivery: anyone can merge a pull request in a repo
-of their own and cross-reference a public ticket.
+A merged pull request counts as delivery only when its base is the audited repo
+or a repo of this fleet (LOOM_REPOS), it names the ticket (`names_ticket`), and
+the cross-reference predates its merge. Anyone can merge a pull request in a
+repo of their own, and anyone can mention a ticket on a merged pull request.
 
 Only the closer's own comments around the close are read as citing a commit.
 A hash the closer wrote that names another repo in prose reads as absent here;
@@ -41,7 +42,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from . import notify, shadow
+from . import notify, shadow, tickets
 from .github import GitHubError, RateLimited
 
 SOUND, DIFFERS, UNPROVEN, UNCITED, UNKNOWN = "sound", "differs", "unproven", "uncited", "unknown"
@@ -148,6 +149,25 @@ def trusted(where: str, repo: str, fleet: Sequence[str]) -> bool:
     return where.lower() in {name.lower() for name in [repo] + list(fleet)}
 
 
+def names_ticket(pull: Mapping[str, Any], where: str, repo: str, number: int,
+                 source: Optional[int]) -> bool:
+    """Whether a pull request based in `where` names ticket `number` of `repo`
+    the way this factory does: a Refs line, a closing keyword, or a lane's
+    loom/<number> branch. `source` is the issue the ticket was rewritten from,
+    which its Refs line may name instead. A bare #N names a ticket of `where`."""
+    same = where.lower() == repo.lower()
+    ref = r"(?:%s)%s#" % (re.escape(repo), "?" if same else "")
+    body = str(pull.get("body") or "")
+    wanted = [n for n in (number, source) if n is not None]
+    if any(re.search(r"^Refs %s%d\b" % (ref, n), body, re.M | re.I) for n in wanted):
+        return True
+    if re.search(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+%s%d\b" % (ref, number),
+                 body, re.I):
+        return True
+    head = pull.get("head") if isinstance(pull.get("head"), dict) else {}
+    return same and bool(re.match(r"loom/%d(?:-|$)" % number, str(head.get("ref") or "")))
+
+
 def _pull_repo(repo: str, pull: Mapping[str, Any]) -> str:
     base = pull.get("base") if isinstance(pull.get("base"), dict) else {}
     where = base.get("repo") if isinstance(base.get("repo"), dict) else {}
@@ -232,10 +252,17 @@ def _place(gh: Any, repo: str, branch: str, sha: str) -> str:
     return OFF if status in ("ahead", "diverged") else UNSEEN
 
 
-def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str]
-                  ) -> Tuple[List[Dict[str, Any]], str]:
-    """(the newest MAX_PULLS merged pull requests a ticket's timeline names,
-    in a trusted repo, why the timeline was not read to its end, or "")."""
+def _before_merge(event: Mapping[str, Any], merged: Any) -> bool:
+    """A cross-reference made after the merge says nothing about what merged."""
+    made, done = epoch(event.get("created_at")), epoch(merged)
+    return made is not None and done is not None and made <= done
+
+
+def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str],
+                  source: Optional[int]) -> Tuple[List[Dict[str, Any]], str]:
+    """(the newest MAX_PULLS merged pull requests that delivered a ticket: in a
+    trusted repo, referenced before the merge and naming the ticket; why the
+    timeline was not read to its end, or "")."""
     found: Dict[Tuple[str, int], str] = {}
     full = False
     for page in range(1, TIMELINE_PAGES + 1):
@@ -247,14 +274,16 @@ def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str]
             merged = (ref.get("pull_request") or {}).get("merged_at")
             where = str((ref.get("repository") or {}).get("full_name") or "")
             if event.get("event") == "cross-referenced" and merged \
-                    and trusted(where, repo, fleet) and isinstance(ref.get("number"), int):
+                    and trusted(where, repo, fleet) and isinstance(ref.get("number"), int) \
+                    and _before_merge(event, merged):
                 found[(where, ref["number"])] = str(merged)
         full = len(events) >= PAGE
         if not full:
             break
     newest = sorted(found, key=lambda key: found[key], reverse=True)[:MAX_PULLS]
-    pulls = [gh.rest("GET", "/repos/%s/pulls/%d" % key).data for key in newest]
-    return ([p for p in pulls if isinstance(p, dict)],
+    pulls = [(key[0], gh.rest("GET", "/repos/%s/pulls/%d" % key).data) for key in newest]
+    return ([p for where, p in pulls
+             if isinstance(p, dict) and names_ticket(p, where, repo, number, source)],
             "the timeline is longer than the audit reads" if full else "")
 
 
@@ -323,7 +352,8 @@ def _read_and_check(gh: Any, repo: str, number: int, issue: Mapping[str, Any],
     if not branch:
         raise _Unreadable("the default branch could not be read")
     own, long = _closers_comments(gh, repo, number, issue)
-    pulls, cut = _merged_pulls(gh, repo, number, fleet)
+    pulls, cut = _merged_pulls(gh, repo, number, fleet,
+                               tickets.rewritten_source(issue.get("body")))
     shas = cited_commits(repo, issue.get("closed_at"), own)[0]
     pulls = _with_cited(gh, repo, shas, pulls)
     return check(repo, issue.get("closed_at"), own, pulls, _lookup(gh, repo, branch, pulls),
