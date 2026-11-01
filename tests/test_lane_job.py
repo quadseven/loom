@@ -38,6 +38,7 @@ slot="$1"; brief="$(ls "$LOOM_HOME/briefs/$slot"/*.md)"; t="$(basename "$brief" 
 mkdir -p "$LOOM_HOME/briefs/$slot/done" "$LOOM_HOME/logs/$slot" "$LOOM_HOME/state/usage"
 mv "$brief" "$LOOM_HOME/briefs/$slot/done/"
 echo "[t] $t done" > "$LOOM_HOME/logs/$slot/$t.log"
+: > "$LOOM_HOME/logs/$slot/$t.agent-ran"
 echo '{"lane": "'"$slot"'", "at": 1, "available": true, "reason": ""}' > "$LOOM_HOME/state/usage/$slot.json"
 """
 
@@ -45,6 +46,15 @@ SIGNED = ("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261025/us-east-2/ssm/aws4_r
           "SignedHeaders=content-type;host;x-amz-date;x-amz-security-token;x-amz-target, "
           "Signature=da23e471ad758ba3397eaaef0812d8d3010bb6f33663eb5e9e329e7a758f04f1")
 
+
+
+def load_job_files(job):
+    """The report's file list, as the job's report step walks it."""
+    spec = importlib.util.spec_from_file_location("lane_job", ROOT / "lanes" / "k8s" / "lane_job.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    meta = json.loads((job / "inputs.json").read_text())
+    return module.report_files(str(job / "home"), meta["slot"], meta["ticket"])
 
 
 class LaneJobTest(unittest.TestCase):
@@ -230,6 +240,36 @@ class LaneJobTest(unittest.TestCase):
                                         "owner.app-7.service.log").read_text())
         self.assertTrue((self.job / "home" / "briefs" / "opencode-go-2" / "done" / "owner.app-7.md").exists())
 
+    def fail_before_the_agent(self):
+        """run_lane.sh parks the brief before any agent starts."""
+        runner = self.root / "lanes" / "run_lane.sh"
+        runner.write_text(FAKE_RUNNER.replace(': > "$LOOM_HOME/logs/$slot/$t.agent-ran"\n', "")
+                          .replace("$t done", "$t failed: [factory] setup failed: a private detail"))
+
+    def test_a_run_whose_agent_did_not_run_fails_the_job(self):
+        self.fail_before_the_agent()
+        self.assertEqual(self.step("prepare").returncode, 0)
+        result = self.step("run")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("::error::the agent did not run (factory)", result.stderr)
+        self.assertNotIn("a private detail", result.stdout + result.stderr)
+
+    def test_a_run_whose_agent_did_not_run_still_seals_its_report(self):
+        self.fail_before_the_agent()
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.step("run")
+        self.assertIn("logs/opencode-go-2/owner.app-7.log", load_job_files(self.job))
+
+    def test_a_run_whose_agent_ran_passes_the_job(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+
+    def test_the_run_records_the_runner_image(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.step("run")
+        image = self.job / "home" / "logs" / "opencode-go-2" / "owner.app-7.image"
+        self.assertRegex(image.read_text().strip(), r"^[0-9a-f]{64}$")
+
     def test_the_report_holds_exactly_this_runs_files(self):
         self.assertEqual(self.step("prepare").returncode, 0)
         self.assertEqual(self.step("run").returncode, 0)
@@ -243,7 +283,8 @@ class LaneJobTest(unittest.TestCase):
         spec.loader.exec_module(job)
         self.assertEqual(job.report_files(str(home), "opencode-go-2", "owner.app-7"), [
             "briefs/opencode-go-2/done/owner.app-7.md",
-            "logs/opencode-go-2/owner.app-7.answered", "logs/opencode-go-2/owner.app-7.log",
+            "logs/opencode-go-2/owner.app-7.answered", "logs/opencode-go-2/owner.app-7.image",
+         "logs/opencode-go-2/owner.app-7.log",
             "logs/opencode-go-2/owner.app-7.service.log", "state/usage/opencode-go-2.json"])
         r = runners.Runners(None, str(self.tmp / "station"), "o/r", [], {}, lambda r: True, print)
         for rel in job.report_files(str(home), "opencode-go-2", "owner.app-7"):

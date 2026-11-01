@@ -29,6 +29,9 @@ Rules:
 - Only the run id the dispatch returned is followed, and a run is believed
   only when it ran the lane workflow on main as a workflow_dispatch the
   station's own App triggered.
+- After BASE_RED_MAX base check failures of one repo at one revision on a
+  slot, the slot takes no more of that repo: its briefs park [transient] so
+  another lane takes them, until the repo's head or the runner image changes.
 
 Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
 stay on this machine. docs/LANES.md, "Lanes on cluster runners".
@@ -88,6 +91,10 @@ MAC_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 WORKFLOW_PATH = ".github/workflows/" + WORKFLOW
 FETCH_TIMEOUT = 120
 OPENSSL_TIMEOUT = 60
+# A runner's base check failures of one repo at one revision before the slot
+# stops taking the repo: one run records two (a red check runs twice).
+BASE_RED_MAX = 2
+BASE_PHASES = ("baseline", "default-baseline")
 # Ledger entries whose brief has left the inbox are dropped after this long.
 KEEP_SECONDS = 7 * 86400
 
@@ -266,12 +273,14 @@ class Runners:
             with open(self.ledger_path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return {"runs": {}, "holds": {}}
+            return {"runs": {}, "holds": {}, "base_red": {}, "images": {}}
         except (OSError, ValueError) as err:
             raise ReportError("cannot read %s: %s" % (self.ledger_path, err)) from None
         if not isinstance(data, dict) or not isinstance(data.get("runs"), dict):
             raise ReportError("%s is not a runner ledger" % self.ledger_path)
         data.setdefault("holds", {})
+        data.setdefault("base_red", {})
+        data.setdefault("images", {})
         return data
 
     def save(self, ledger: Dict[str, Any]) -> None:
@@ -353,6 +362,15 @@ class Runners:
             self._park(slot, ticket, "runner slots take public repos only, and %s is not one"
                        % (repo or "the brief's repo"), "transient")
             return
+        red = self._base_red(ledger, slot, repo)
+        if red:
+            entry["state"] = "refused"
+            self.save(ledger)
+            self._park(slot, ticket, "the base check of %s is red on this runner at %s (%s); "
+                       "another lane takes it" % (repo, red["revision"][:12], red.get("why") or "no reason"),
+                       "transient")
+            return
+        entry["repo"] = repo
         run_id = uuid.uuid4().hex
         mac_key = secrets.token_hex(32)
         inputs = {"slot": slot, "ticket": ticket, "brief": brief, "run_id": run_id,
@@ -404,6 +422,71 @@ class Runners:
             return
         entry["run"] = run
         self.say("dispatched %s to a cluster runner (run id %s)" % (key, run_id))
+
+    # -- a repo whose base check is red on the slot's runner ----------------
+    def _base_red(self, ledger: Dict[str, Any], slot: str, repo: str) -> Optional[Dict[str, Any]]:
+        """The record that stops `repo` on `slot`, or None. A head that moved
+        off the failing revision clears it; a head that cannot be read keeps
+        it, and the next dispatch asks again."""
+        red = (ledger["base_red"].get(slot) or {}).get(repo)
+        if not red or int(red.get("failures") or 0) < BASE_RED_MAX:
+            return None
+        try:
+            head = self.gh.rest("GET", "/repos/%s/commits/HEAD" % repo).data
+        except RateLimited:
+            raise
+        except Exception as err:  # noqa: BLE001 - any failed read keeps the stop
+            self.say("could not read the head of %s: %s" % (repo, err))
+            return red
+        sha = head.get("sha") if isinstance(head, dict) else None
+        if sha and sha != red.get("revision"):
+            del ledger["base_red"][slot][repo]
+            return None
+        return red
+
+    def _note_image(self, ledger: Dict[str, Any], slot: str, files: Dict[str, bytes],
+                    ticket: str) -> None:
+        """A run on a new runner image clears the slot's red repos: the image
+        may be what they failed on."""
+        raw = files.get("logs/%s/%s.image" % (slot, ticket))
+        image = raw.decode("ascii", "replace").strip() if raw else ""
+        if not image:
+            return
+        if ledger["images"].get(slot) not in (None, image):
+            ledger["base_red"].pop(slot, None)
+        ledger["images"][slot] = image
+
+    def _note_base(self, ledger: Dict[str, Any], entry: Dict[str, Any],
+                   files: Dict[str, bytes]) -> None:
+        """Count a report's base check failures for the entry's repo. A green
+        default branch means only a fix round's head was red, and a pass on
+        the base clears the count. SIGTERM (143) says nothing of the repo."""
+        slot, ticket, repo = entry["slot"], entry["ticket"], entry.get("repo")
+        raw = files.get("logs/%s/%s.validation.jsonl" % (slot, ticket))
+        if not repo or raw is None:
+            return
+        rows = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("phase") in BASE_PHASES and row.get("exit") != 143:
+                rows.append(row)
+        reds = [r for r in rows if not r.get("ok")]
+        repos = ledger["base_red"].setdefault(slot, {})
+        if not rows or any(r.get("ok") for r in rows if r["phase"] == "default-baseline"):
+            return
+        if not reds:
+            repos.pop(repo, None)
+            return
+        revision = str(reds[-1].get("revision") or "")
+        count = sum(1 for r in reds if str(r.get("revision") or "") == revision)
+        known = repos.get(repo) or {}
+        if known.get("revision") == revision:
+            count += int(known.get("failures") or 0)
+        repos[repo] = {"revision": revision, "failures": count,
+                       "why": str(reds[-1].get("detail") or "exit %s" % reds[-1].get("exit"))[:200]}
 
     # -- following a run ---------------------------------------------------
     def provenance(self, run: Dict[str, Any]) -> str:
@@ -498,11 +581,14 @@ class Runners:
                        "transient")
             return
         try:
-            beat = self.apply(slot, ticket, self._read_report(entry, artifact))
+            files = self._read_report(entry, artifact)
+            beat = self.apply(slot, ticket, files)
         except ReportError as err:
             self._park(slot, ticket, "could not read the runner's report: %s" % err, "transient")
             return
         self._take_beat(ledger, slot, beat)
+        self._note_image(ledger, slot, files, ticket)
+        self._note_base(ledger, entry, files)
         if os.path.exists(os.path.join(self.inbox(slot), ticket + ".md")):
             why = str((beat or {}).get("reason") or "") or (
                 "the runner run ended %s without finishing the brief" % conclusion)
