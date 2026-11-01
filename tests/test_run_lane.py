@@ -4373,6 +4373,7 @@ echo fixed > fix.txt
         ledger = (self.loom / "state" / "usage" / "go-budget.jsonl").read_text().splitlines()
         self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
 
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_a_slot_with_every_model_paused_takes_nothing_and_says_so(self):
         self.pause_models("zen-free", "opencode/flint-40b-free")
         inbox, result = self.api_lane("zen", **self.pick_env())
