@@ -9,7 +9,10 @@ brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
 for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
-`close`, verified moves and merges refuse every ticket as untrusted. Set `LOOM_GOAL_CAP`
+`close`, verified moves and merges refuse every ticket as untrusted. Set
+`LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
+listed login's answer line as no answer until the label pass clears the ask
+(docs/LANES.md, Ask answerers). Set `LOOM_GOAL_CAP`
 to the station's value too: unset, a Muse tick uses the default cap of 16
 while the station and the lane machine's brain use theirs, and a brief the
 lane machine would file (a factory ticket included) is refused as over the
@@ -274,7 +277,10 @@ Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
 close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
-live regression) and `brief` (a brief named but not written this tick).
+live regression), `brief` (a brief named but not written this tick) and
+`needs-brain` (a decision left open on a `loom:briefed` ticket that carries
+`needs-brain`; the defer changes no label, hold or state, and the `done`
+line for that stage and ticket retires it).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
@@ -508,6 +514,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    done with `Finished:`; other prose leaves the ask open. The dated line
    claims a person's decision, so those commands refuse it when no record
    exists: it is for what the operator said, never for what you expect.
+   Only these two lines count from a `LOOM_ASK_ANSWERERS` login, and each needs
+   words on the line; `Done:` and prose from such a login leave the ask open.
 
    Tell the operator something needs them only from
    `python3 -m bus.needs_you`, run in the same turn (`--repo OWNER/NAME` to

@@ -137,11 +137,12 @@ def _section(said: str, tag: bool, ask: str) -> str:
 
 def judge(repo: str, issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[Any],
           trusted: Sequence[str], ops: Sequence[str], blockers: Sequence[int] = (),
-          timeline: Iterable[Any] = ()) -> Item:
+          timeline: Iterable[Any] = (), answerers: Sequence[str] = ()) -> Item:
     """One item's place, from its whole comment and event history (oldest
-    first) and, for an item that would need you, its timeline."""
+    first) and, for an item that would need you, its timeline. `answerers`
+    are the LOOM_ASK_ANSWERERS logins; the station tag still reads `trusted`."""
     names = _names(issue)
-    said = ask_state.state(issue, comments, events, trusted, ops, blockers)
+    said = ask_state.state(issue, comments, events, trusted, ops, blockers, answerers)
     ask, chosen = written_ask(issue, comments, names)
     section = _section(said, _station_tag(chosen, trusted), ask)
     since = ask_state.asked_at(comments, events)
@@ -154,26 +155,26 @@ def judge(repo: str, issue: Dict[str, Any], comments: Sequence[Any], events: Seq
                 str((chosen or {}).get("html_url") or issue.get("html_url") or ""),
                 brain.comment_login(latest), str(latest.get("created_at") or ""),
                 tuple(n for n in names if n.startswith("claim:")),
-                ask_state.answer_of(issue, comments, events, trusted, ops), merged)
+                ask_state.answer_of(issue, comments, events, trusted, ops, answerers), merged)
 
 
 def read_item(gh: Any, repo: str, issue: Dict[str, Any], trusted: Sequence[str],
-              ops: Sequence[str]) -> Item:
+              ops: Sequence[str], answerers: Sequence[str] = ()) -> Item:
     """One item, read whole. Every list goes through paginate: one page of
     comments is the oldest ones."""
     base = "/repos/%s/issues/%d" % (repo, int(issue["number"]))
     comments = gh.paginate(base + "/comments?per_page=100")
     events = gh.paginate(base + "/events?per_page=100")
     blockers = ask_state.open_blockers(gh.rest, repo, issue)
-    item = judge(repo, issue, comments, events, trusted, ops, blockers)
+    item = judge(repo, issue, comments, events, trusted, ops, blockers, answerers=answerers)
     if item.section != NEEDS_YOU:
         return item
     return judge(repo, issue, comments, events, trusted, ops, blockers,
-                 gh.paginate(base + "/timeline?per_page=100"))
+                 gh.paginate(base + "/timeline?per_page=100"), answerers)
 
 
-def read_repo(gh: Any, repo: str, trusted: Sequence[str],
-              ops: Sequence[str]) -> Tuple[List[Item], List[str]]:
+def read_repo(gh: Any, repo: str, trusted: Sequence[str], ops: Sequence[str],
+              answerers: Sequence[str] = ()) -> Tuple[List[Item], List[str]]:
     """(the repo's items, what could not be read)."""
     try:
         issues = gh.paginate("/repos/%s/issues?state=open&per_page=100" % repo)
@@ -184,7 +185,7 @@ def read_repo(gh: Any, repo: str, trusted: Sequence[str],
         if not isinstance(issue, dict) or not waits_on_person(_names(issue)):
             continue
         try:
-            items.append(read_item(gh, repo, issue, trusted, ops))
+            items.append(read_item(gh, repo, issue, trusted, ops, answerers))
         except (GitHubError, OSError) as err:
             unread.append("%s#%s: %s" % (repo, issue.get("number"), err))
     return items, unread
@@ -232,12 +233,13 @@ def render(items: Sequence[Item], unread: Sequence[str]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
-def run(gh: Any, repos: Sequence[str], trusted: Sequence[str], ops: Sequence[str]) -> Tuple[str, int]:
+def run(gh: Any, repos: Sequence[str], trusted: Sequence[str], ops: Sequence[str],
+        answerers: Sequence[str] = ()) -> Tuple[str, int]:
     """(the report, the exit code)."""
     items: List[Item] = []
     unread: List[str] = []
     for repo in repos:
-        found, missed = read_repo(gh, repo, trusted, ops)
+        found, missed = read_repo(gh, repo, trusted, ops, answerers)
         items += found
         unread += missed
     return render(items, unread), 1 if unread else 0
@@ -258,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh = GitHub(auth_from_env())
     gh.status_in_body = True  # read as the brain reads (bus.brain.main)
     gh.status_authors |= {login.lower() for login in trusted}
-    text, code = run(gh, repos, trusted, answer.operators(trusted=trusted))
+    text, code = run(gh, repos, trusted, answer.operators(trusted=trusted), ask_state.answerers())
     sys.stdout.write(text)
     return code
 

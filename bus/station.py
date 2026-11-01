@@ -959,6 +959,7 @@ class Settings:
                  disk_free_min_gb: float = DISK_FREE_MIN_GB,
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
+                 ask_answerers: Sequence[str] = (),
                  claim_idle_hours: int = 0,
                  brain_holders: Sequence[str] = (),
                  claim_referee: str = "off",
@@ -1053,6 +1054,8 @@ class Settings:
         # briefs this Loom builds (tickets.brief_author_trusted). Ownership,
         # journals, proofs, adoption and merges read authors alone.
         self.briefers = list(briefers)
+        # LOOM_ASK_ANSWERERS (bus/ask_state.py): read by _ask_inputs alone.
+        self.ask_answerers = list(ask_answerers)
         self.owners = owners
         self.status_repo = status_repo
         self.webhook_ssm = webhook_ssm
@@ -1174,6 +1177,7 @@ class Settings:
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
+                   ask_answerers=ask_state.answerers(env),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
                    ship_workflows=_ship_workflows(words("LOOM_SHIP_WORKFLOWS")),
                    ship_path_workflows=words("LOOM_SHIP_PATH_WORKFLOWS"),
@@ -8464,15 +8468,17 @@ class Station:
         return True
 
     def _ask_inputs(self, repo: str, issue: Dict[str, Any]) -> Tuple[
-            List[Any], List[Any], List[str], List[str], List[int]]:
+            List[Any], List[Any], List[str], List[str], List[int], List[str]]:
         """What bus/ask_state.py reads for one ask: its comments, its events,
-        who may answer, and the open issues its Blocked on section names."""
+        who may answer, the open issues its Blocked on section names, and the
+        logins whose two line forms answer it (LOOM_ASK_ANSWERERS)."""
         number = int(issue["number"])
         comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
         events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
         trusted = list(self.s.authors)
         blockers = ask_state.open_blockers(self.gh.rest, repo, issue)
-        return comments, events, trusted, answer.operators(trusted=trusted), blockers
+        return (comments, events, trusted, answer.operators(trusted=trusted), blockers,
+                list(self.s.ask_answerers))
 
     def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
         """A person can act on this ask today: it is not answered in the
@@ -10259,9 +10265,10 @@ class Station:
             ask = (needs_human(_label_names(issue)) and changed < left
                    and str(issue.get("state") or "open") == "open")
             if ask:
-                comments, events, trusted, ops, blockers = self._ask_inputs(repo, issue)
+                comments, events, trusted, ops, blockers, answerers = self._ask_inputs(repo, issue)
                 found = label_pass.plan(issue, events, station_logins, comments=comments,
-                                        trusted=trusted, ops=ops, blockers=blockers)
+                                        trusted=trusted, ops=ops, blockers=blockers,
+                                        answerers=answerers)
             else:
                 events = (self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
                           if label_pass.needs_events(issue) else None)
