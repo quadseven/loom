@@ -1847,8 +1847,8 @@ operator:
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
   issue, an operator-claimed issue, an invariant breach that cleared or was
-  folded into its rolling issue) and a move to `loom:shipped`, except the
-  evidence close (see The evidence close);
+  folded into its rolling issue), except the evidence close (see The
+  evidence close);
 - an issue reopen (an invariant breach seen again, a failed audit's ticket
   or source issue);
 - a label that grants a merge (`ready-to-land`), and any GraphQL label write
@@ -1858,6 +1858,10 @@ operator:
   committed through the contents API, a merge-queue entry, a fork sync):
   code that lands with no pull request is a merge;
 - a branch deletion after a merge.
+
+A move to `loom:shipped` is a state fact, not a merge or a close, so it goes
+through: in a shadow repo a merged ticket whose work deployed still reaches
+`loom:shipped`, and so reaches verify and close. A merge or close stays held.
 
 Closing a pull request without merging it still happens (it can be reopened
 and its branch stays), and so do the closes of Loom's own signal issues that
@@ -1874,8 +1878,9 @@ reads the issue first.
 `bus/github.py` checks every request at its one choke point and refuses a
 held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
 `bus.brain close` and the station's closes check first, so their record names
-the risk tier and the gates that passed. Every merge or ship label in a
-request is checked, and the whole request is held if any one is new. The
+the risk tier and the gates that passed. Every merge label in a request is
+checked, and the whole request is held if any one is new. A `loom:shipped`
+label is let through: it records a state, it does not merge or close. The
 hold fails safe: a request it cannot read (a label list or body of an
 unknown shape, the item's labels unreadable, a read that failed in any way)
 is held as the worst request it could be.
@@ -1883,7 +1888,7 @@ is held as the worst request it could be.
 The brain's model rung holds a GitHub token of its own, so
 `lanes/mac/brain.sh` puts a `gh` in front of it that asks
 `python3 -m bus.shadow gh-guard` first and refuses, and records, a merge, an
-issue close, an approving review or a merge or ship label, with the same
+issue close, an approving review or a merge label, with the same
 switch. It covers `gh` only: a rung that sends the request another way (curl)
 is held by its instructions alone (`docs/MUSE.md`, and the tick's prompt). Each decision is one line of an
 append-only JSONL ledger, `LOOM_SHADOW_LEDGER` or
