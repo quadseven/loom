@@ -40,6 +40,8 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import claim_referee
+from . import close_audit
+from . import decision_claim
 from . import evidence_close
 from . import journal
 from . import fabric
@@ -5209,7 +5211,7 @@ class Station:
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
                      self.clean_labels,
@@ -10975,6 +10977,27 @@ class Station:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now))
         health.Intake(self.gh, state, self.now, stamp, _say).run(sources)
         _write_json(path, state)
+
+    # -- close audit -------------------------------------------------------
+    def audit_closes(self) -> None:
+        """Reopen a close by anyone else whose cited commit is not on the
+        default branch, with no merged pull request (bus/close_audit.py)."""
+        path = os.path.join(self.state, close_audit.STATE_FILE)
+        # Strict: the file keeps which tickets were reopened, and a lost count
+        # is not a zero.
+        try:
+            state = _read_json(path, {})
+        except StateError as err:
+            _say("close audit stopped: %s" % err)
+            return
+        if not isinstance(state, dict):
+            _say("close audit stopped: %s is not an object" % path)
+            return
+        try:
+            close_audit.run_pass(self.gh, self._verify_repos(), state, self.now,
+                                 lambda: decision_claim.client_login(self.gh), _say)
+        finally:
+            _write_json(path, state)
 
     # -- friction intake ---------------------------------------------------
     def intake_friction(self) -> None:
