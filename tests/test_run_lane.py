@@ -6000,6 +6000,30 @@ exit %d
 
     # The validation contract (.loom/validation.conf).
 
+    def test_resolve_factory_incidents_closes_contract_incident(self):
+        function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        script = (function +
+                  'incident_file() { printf "%s/%s-%s" "$INCIDENT_DIR" '
+                  '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
+                  'incident_ticket() { printf "a ticket"; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s\\n" "$*" >> "$CALLS"; }\n'
+                  'mkdir -p "$INCIDENT_DIR"\nprintf "99\\n" > '
+                  '"$INCIDENT_DIR/example_repo-contract"\nresolve_factory_incidents\n')
+        calls = tmp / "calls"
+        calls.touch()
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"INCIDENT_DIR": str(tmp / "incidents"), "REPO": "example/repo",
+                 "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log)},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls.read_text())
+        self.assertFalse((tmp / "incidents" / "example_repo-contract").exists())
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
@@ -6449,6 +6473,37 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_parsing_contract_closes_its_open_incident(self):
+        self.contract_repo()
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.log.read_text()
+        self.assertIn("gh issue close --repo quadseven/loom 99", calls)
+        self.assertIn("Cleared: the check passed on the unmodified base", calls)
+        self.assertFalse(incident.exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_contract_that_still_fails_to_parse_keeps_its_incident_open(self):
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        incident = self.loom / "state" / "incidents" / "example_repo-contract"
+        incident.parent.mkdir(parents=True)
+        incident.write_text("99\n")
+        self.drop_brief()
+
+        result = self.run_contract_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("gh issue close --repo quadseven/loom 99" in call
+                             for call in self.calls()))
+        self.assertEqual(incident.read_text(), "99\n")
 
     def test_a_repeated_factory_incident_updates_the_open_issue(self):
         self.contract_repo(contract=CONTRACT + "python: 3.12\n")

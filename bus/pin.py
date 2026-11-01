@@ -24,6 +24,8 @@ DEFAULT_WATCH = "dashboard/"
 # GitHub's compare lists at most this many files; a full list may hide more.
 COMPARE_FILES_MAX = 300
 PIN_LABEL = "pin-bump"
+# This module opens and updates pin PRs; a reviewer or normal target-repo
+# review automation merges them. The station observes that merge in ship_pins.
 
 
 def targets(value: str) -> list[dict[str, str]]:
@@ -143,6 +145,31 @@ def body(source: str, revision: str, titles: list[str], digest: str = "") -> str
     return result
 
 
+def _checks_running(gh: GitHub, repo: str, active: dict | None) -> bool:
+    head = active.get("head", {}) if active else {}
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        return False
+    data = gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
+    runs = data.get("check_runs", []) if isinstance(data, dict) else []
+    return any(run.get("status") != "completed" for run in runs if isinstance(run, dict))
+
+
+def _pin_commit(gh: GitHub, repo: str, base_sha: str, path: str, text: str,
+                message: str) -> str:
+    base_commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, base_sha)).data
+    blob = gh.rest("POST", "/repos/%s/git/blobs" % repo,
+                   {"content": text, "encoding": "utf-8"}).data
+    tree = gh.rest("POST", "/repos/%s/git/trees" % repo,
+                   {"base_tree": base_commit["tree"]["sha"],
+                    "tree": [{"path": path, "mode": "100644", "type": "blob",
+                              "sha": blob["sha"]}]}).data
+    commit = gh.rest("POST", "/repos/%s/git/commits" % repo,
+                     {"message": message, "tree": tree["sha"],
+                      "parents": [base_sha]}).data
+    return commit["sha"]
+
+
 def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
             get_digest: Callable[[], str], log: Callable[[str], None]) -> None:
     repo, path = spec["repo"], spec["path"]
@@ -160,6 +187,9 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     mergeable_state = active.get("mergeable_state") if active else None
     if current == revision and mergeable_state in (None, "clean"):
         return
+    if _checks_running(gh, repo, active):
+        log("pin: waiting for checks on %s" % repo)
+        return
     watch = spec.get("watch", DEFAULT_WATCH)
     compared = compare(gh, source, old, revision)
     if compared and not touches(compared, watch):
@@ -171,22 +201,19 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
     # its pull request never goes dirty when the default branch moves. The pin
     # file is computed from the default branch's text, not the branch's.
     head = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, quote(base, safe=""))).data
-    if exists:
-        # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
-        # a PATCH to the read path answers 404 (loom#1405).
-        gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="")),
-                {"sha": head["object"]["sha"], "force": True})
-    else:
-        gh.rest("POST", "/repos/%s/git/refs" % repo,
-                {"ref": "refs/heads/" + branch, "sha": head["object"]["sha"]})
-    _, file_sha = content(gh, repo, path, branch)
     updated = replace(replace(old_text, spec["revision_var"], revision),
                       spec["sha256_var"], digest)
     title = "Pin Loom dashboard to %s" % revision[:12]
     plan = body(source, revision, merged_titles(gh, source, old, revision, compared), digest)
-    gh.rest("PUT", "/repos/%s/contents/%s" % (repo, quote(path, safe="/")),
-            {"message": title, "content": base64.b64encode(updated.encode()).decode(),
-             "sha": file_sha, "branch": branch})
+    commit_sha = _pin_commit(gh, repo, head["object"]["sha"], path, updated, title)
+    if exists:
+        # Build the complete commit before moving the ref, so the branch never
+        # briefly equals its base and GitHub cannot close the pull request.
+        gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="")),
+                {"sha": commit_sha, "force": True})
+    else:
+        gh.rest("POST", "/repos/%s/git/refs" % repo,
+                {"ref": "refs/heads/" + branch, "sha": commit_sha})
     if active:
         gh.rest("PATCH", "/repos/%s/pulls/%s" % (repo, active["number"]),
                 {"title": title, "body": plan})

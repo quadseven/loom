@@ -1473,10 +1473,18 @@ def _send_dashboard_view(handler, state, path):
     tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
     status = "stale" if payload["stale"] else "live"
     if path == "/improving":
-        source = payload.get("improving", {})
-        data = views.build_improvements(source.get("journals", []), tickets,
-                                        source.get("metrics_comments", []))
-        body = views.render_improving(data)
+        # The background refresh builds this page's data (loom#2248): a
+        # request renders what it holds and makes no read or join of its
+        # own. Before the first read there is nothing to render, so the
+        # page says what is missing and when it arrives, never false zeros.
+        built = payload.get("improving_built")
+        if built is not None:
+            body = views.render_improving(built)
+        else:
+            when = html.escape(_next_refresh_text(payload.get("next_refresh_at")))
+            body = ('<p class="empty-state">Improving data has not been read yet: the tick journals '
+                    'and the daily metrics are missing; the dashboard reads them in the background '
+                    'and they refresh %s.</p>' % when)
         title, active = "Improving", "improving"
     else:
         body = views.render_lanes(_lane_view_data(payload, tickets, state=state))

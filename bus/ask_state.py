@@ -6,7 +6,9 @@ already done. state() reads one ticket and says which of three it is:
 
 - ANSWERED: after the ask, an operator or trusted person left a comment that
   is not a question, a dashboard answer was posted, a trusted brain wrote a
-  line starting "Finished:" or "Done:", or the body records a Decision.
+  line starting "Finished:" or "Done:" or a dated "Operator answer
+  YYYY-MM-DD:" line (the date on or after the ask's day), or the body
+  records a Decision.
 - WAITING: a wait:* label, or a Blocked on section naming an open issue.
   A person cannot act on it today. It stays on the dashboard.
 - OPEN: anything else. A ticket whose ask time cannot be read stays OPEN: a
@@ -19,9 +21,10 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
-from . import answer, decision_claim
+from . import answer, brief_check, decision_claim
+from .github import GitHubError
 from .labels import HUMAN_LABELS, WAIT_PREFIX
 
 ANSWERED, WAITING, OPEN = "answered", "waiting", "open"
@@ -58,15 +61,23 @@ def asked_at(comments: Sequence[Any], events: Sequence[Any]) -> Optional[datetim
     return max(x for x in (at, asked) if x is not None) if at or asked else None
 
 
+def _records_answer(body: str, since: datetime) -> bool:
+    """A dated "Operator answer" line for this ask: one dated before the
+    ask's day answered an earlier ask."""
+    return any(found.group(1) >= since.date().isoformat()
+               for found in decision_claim.ANSWER_LINE.finditer(body))
+
+
 def _answers(comment: Dict[str, Any], people: Iterable[str], trusted: Sequence[str],
-             ops: Sequence[str]) -> bool:
+             ops: Sequence[str], since: datetime) -> bool:
     body = str(comment.get("body") or "").strip()
     if answer.trusted_answer(comment, trusted, ops):
         return True
     login = str((comment.get("user") or {}).get("login") or "").lower()
     if decision_claim.person_comment(comment) and login in people:
         return not body.endswith("?")
-    return login in {str(t).lower() for t in trusted} and bool(_FINISHED.search(body))
+    return login in {str(t).lower() for t in trusted} and (
+        bool(_FINISHED.search(body)) or _records_answer(body, since))
 
 
 def answer_of(issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[Any],
@@ -82,9 +93,29 @@ def answer_of(issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[A
         return ""
     for comment in reversed([c for c in comments if isinstance(c, dict)]):
         stamp = decision_claim.when(comment.get("created_at"))
-        if stamp is not None and stamp > since and _answers(comment, people, trusted, ops):
+        if stamp is not None and stamp > since and _answers(comment, people, trusted, ops, since):
             return str(comment.get("body") or "")
     return None
+
+
+def open_blockers(rest: Callable[..., Any], repo: str, issue: Dict[str, Any]) -> List[int]:
+    """The open issues the ticket's Blocked on section names. `rest` is a
+    GitHub client's. A number that names no issue here blocks nothing, and
+    any other failed read is the caller's."""
+    number = int(issue["number"])
+    found: List[int] = []
+    for other in brief_check.blocked_on(issue.get("body")):
+        if other == number:
+            continue
+        try:
+            read = rest("GET", "/repos/%s/issues/%d" % (repo, other)).data or {}
+        except GitHubError as err:
+            if err.status not in (404, 410):
+                raise
+            continue
+        if read.get("state") != "closed":
+            found.append(other)
+    return found
 
 
 def state(issue: Dict[str, Any], comments: Sequence[Any], events: Sequence[Any],
