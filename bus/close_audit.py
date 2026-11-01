@@ -258,6 +258,23 @@ def _before_merge(event: Mapping[str, Any], merged: Any) -> bool:
     return made is not None and done is not None and made <= done
 
 
+def _referenced_before_merge(events: Sequence[Any], repo: str,
+                             fleet: Sequence[str]) -> Dict[Tuple[str, int], str]:
+    """(repo, number) -> merge time of each merged pull request in a trusted
+    repo that a cross-reference named before it merged."""
+    found: Dict[Tuple[str, int], str] = {}
+    for event in events:
+        if not isinstance(event, dict) or event.get("event") != "cross-referenced":
+            continue
+        ref = (event.get("source") or {}).get("issue") or {}
+        merged = (ref.get("pull_request") or {}).get("merged_at")
+        where = str((ref.get("repository") or {}).get("full_name") or "")
+        if trusted(where, repo, fleet) and isinstance(ref.get("number"), int) \
+                and _before_merge(event, merged):
+            found[(where, ref["number"])] = str(merged)
+    return found
+
+
 def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str],
                   source: Optional[int]) -> Tuple[List[Dict[str, Any]], str]:
     """(the newest MAX_PULLS merged pull requests that delivered a ticket: in a
@@ -269,14 +286,7 @@ def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str],
         events = gh.rest("GET", "/repos/%s/issues/%d/timeline?per_page=%d&page=%d"
                          % (repo, number, PAGE, page)).data
         events = events if isinstance(events, list) else []
-        for event in events:
-            ref = (event.get("source") or {}).get("issue") or {} if isinstance(event, dict) else {}
-            merged = (ref.get("pull_request") or {}).get("merged_at")
-            where = str((ref.get("repository") or {}).get("full_name") or "")
-            if event.get("event") == "cross-referenced" and merged \
-                    and trusted(where, repo, fleet) and isinstance(ref.get("number"), int) \
-                    and _before_merge(event, merged):
-                found[(where, ref["number"])] = str(merged)
+        found.update(_referenced_before_merge(events, repo, fleet))
         full = len(events) >= PAGE
         if not full:
             break
@@ -287,6 +297,11 @@ def _merged_pulls(gh: Any, repo: str, number: int, fleet: Sequence[str],
             "the timeline is longer than the audit reads" if full else "")
 
 
+def _carries(pull: Mapping[str, Any], sha: str) -> bool:
+    head = str((pull.get("head") or {}).get("sha") or "")
+    return head.startswith(sha) or str(pull.get("merge_commit_sha") or "").startswith(sha)
+
+
 def _with_cited(gh: Any, repo: str, shas: Sequence[str],
                 pulls: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """`pulls`, plus each merged pull request GitHub says a cited commit came
@@ -294,9 +309,7 @@ def _with_cited(gh: Any, repo: str, shas: Sequence[str],
     does not link), each naming the cited commits it carries."""
     found = {int(p.get("number") or 0): dict(p) for p in pulls}
     for sha in shas:
-        if any(str(p.get("merge_commit_sha") or "").startswith(sha)
-               or str((p.get("head") or {}).get("sha") or "").startswith(sha)
-               for p in found.values()):
+        if any(_carries(p, sha) for p in found.values()):
             continue
         listed = gh.rest("GET", "/repos/%s/commits/%s/pulls?per_page=%d" % (repo, sha, MAX_PULLS),
                          ok=(404, 422))
