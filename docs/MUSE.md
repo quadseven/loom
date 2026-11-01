@@ -220,6 +220,9 @@ project goals. Muse, the lane machine's tick and the operator's interactive
 session are peers here: each improves the brain and the factory, through
 tickets and pull requests like any other work.
 
+- Each tick, add a `- Scoreboard:` line to the journal, copied from
+  `python3 -m bus.review_debt line OWNER/NAME#N`, naming the goal home
+  (docs/BRAIN.md, Review and guard debt).
 - Each tick, note in the journal what slowed the factory down, one
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
@@ -259,8 +262,11 @@ steps on each tick:
    branch. Keep a heartbeat current while working with
    `python3 -m bus.lane heartbeat OWNER/NAME#N --lane muse`.
 4. Open the pull request with `python3 -m bus.lane pr OWNER/NAME#N
-   --base BASE`. The command writes the standard Intent section, class label
-   and ticket reference, then moves the ticket to `loom:pr`.
+   --base BASE`. The command writes the standard Intent section with its Risk
+   line, the class and tier labels and the ticket reference, then moves the
+   ticket to `loom:pr`. A `## Risk` section in `.loom/summary.md` supplies the
+   door and blast radius (docs/LANES.md); without one the line reads
+   `door unstated`.
 5. Journal one line on the ticket describing the result.
 
 Claims expire after two hours without a heartbeat. A claim without a pull
@@ -344,7 +350,19 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    with the Rules below and the commit they come from. Open defers of a
    brain no longer ticking (the packet marks them open work for any brain)
    are finished before new work, through `resume` as below.
-   Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   Run `python3 -m bus.brain status $LOOM_REPOS --deadline 1.5`. It reads
+   the repos side by side, the lightest first, prints each repo's section as
+   soon as that repo is read, and logs progress to stderr. The light repos
+   print within seconds, so a deadline leaves only heavy ones unread.
+   `--deadline MINUTES` (default 1.5) stops the reads inside your command
+   timeout (about 115 s): the sections across repos and the lane status
+   take a few seconds more, so the command ends near 100 s. It prints `status skipped OWNER/NAME: deadline` for each repo
+   it did not finish, then the sections across repos from the repos it
+   read, ends with `status partial: not read this run: ...`, and exits 3. A
+   repo that timed out or that GitHub answered with a fault is named in its
+   section and also exits 3. Exit 3 means partial, not failed: a repo it
+   names is not a repo with nothing ready; read it next tick, or run status
+   for the named repos alone. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
@@ -384,8 +402,19 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
-   refuses unless you hold the lock. Each `resume` line it prints is stage
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse
+   --deadline 1.5`. It refuses unless you hold the lock. It prints each
+   repo's goal sections as soon as that repo is read and logs progress to
+   stderr (the repo, the requests so far, and every rate-limit or retry
+   wait), so a killed run keeps what it printed. `--deadline MINUTES`
+   (default 8) stops the reads in time: keep it under your command timeout
+   (1.5 fits a 2-minute one). At the deadline it prints `resume skipped
+   OWNER/NAME: deadline` for each repo it did not finish, then the
+   freshness line and the cross-repo sections from the repos it read, and
+   exits 3. A repo that timed out, or a repo or handoff item GitHub
+   answered with a fault, is named with why (under "Timed-out repos" or
+   "Failed repos", or `read failed` in its goal's section) and also exits 3. Exit 3 means partial, not failed: act on what
+   it printed and read the named repos next tick. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
@@ -450,6 +479,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
    `- Audit: OWNER/NAME#N proof by LANE/MODEL: pass|fail, what was re-read`.
+   An audit line about a merge or a close comes from the output of
+   `python3 -m bus.brain audit-close OWNER/NAME#N`, with the cited hash, the
+   merge commit and whether the default branch has it (docs/BRAIN.md, Close
+   audits); comments alone prove nothing.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
@@ -738,17 +771,17 @@ on hard work):
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
   remotely); then the free lane, one slot per free provider (`free-ollama`,
-  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`) at its pinned
+  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
-  are NVIDIA NIM, Kilo and Groq).
+  are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`); then the other free
+  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
   lanes, openrouter and workersai, or on a public repo zen and zai (the
   operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
   anthropic slot only when every spark, codex and opencode-go slot already

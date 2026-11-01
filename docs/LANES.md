@@ -426,6 +426,10 @@ A new App is easiest made from
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
+A free lane takes work: not at a limit, its heartbeat says available, and not
+down or demoted (bus/scorecard.py). The same test picks every tier move,
+stall move and automatic retry, so no ticket is given a lane only to step
+straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
@@ -1288,12 +1292,17 @@ Each invariant is one function returning breaches with evidence:
 - Goal homes whose body names a roll (the word `roll` or `rolls`) that no
   `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
   every such goal): the station opens no source-pin pull request when their
-  module changes merge (README.md, Roll source pins). The issue says when
+  module changes merge (docs/ROLL_PINS.md). The issue says when
   the setting is empty, which turns the pass off.
 - Tickets still at `loom:merged` 24 hours after a ship rule found their merge
   commit deployed, because the move to `loom:shipped` failed
   (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
   Shipping through a downstream roll).
+- The newest Loom review journal is over 7 days old (`review-overdue`), a
+  guard ticket closed with no merged pull request that changes a test
+  (`guard-no-check`), or a guard ticket unreadable after 5 tries
+  (`guard-unreadable`), one rolling issue each (docs/BRAIN.md, Review and guard
+  debt).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
@@ -1488,7 +1497,32 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
-- The opencode-go slots run only the models on `bus/tickets.py`
+- Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
+  reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
+  drops what is deprecated or paused, probes each candidate, and takes the first
+  that answers: Go's free models, then Zen's on a public repo, then a paid Go
+  model. A slot's `LOOM_<SLOT>_MODEL` and a brief's `Model:` line do not bind
+  it. `LOOM_MODEL_PICK=off` or a `LOOM_<SLOT>_MODELS` ladder restores the pin.
+- A model that fails is paused for every slot in
+  `state/usage/model-pause.json`: a 429 until its `Retry-After`, a model the
+  provider or CLI no longer serves for a day. `GoUsageLimitError` pauses every
+  paid Go model and `FreeUsageLimitError` every Zen model, because each is one
+  shared limit. With nothing to keep, the brief stays in the inbox and the next
+  pass picks another model, at most 3 times. A slot with every model paused
+  reports unavailable until the first reset.
+- Paid Go runs serve build work only, never a verify, answer or review run,
+  and use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on public
+  repos, Muse Spark 1.3 Contributor). All paid runs stop at 80% of each
+  published 5 hour, weekly and monthly limit, one model at 50%, and spending
+  within the billing period follows the calendar to the renewal (day 28,
+  `LOOM_GO_RENEWAL_DAY`), so the plan lasts the month. Spending is counted in
+  `state/usage/go-budget.jsonl`.
+  Each run holds 500 requests until it settles; output and hidden reasoning
+  past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
+  because of its hidden reasoning. Extra usage stays off.
+- Each run logs `model pick:` and `model report:` lines: the model, why it
+  came to that model, the exit status and whether anything was edited.
+- With the pick off, the opencode-go slots run only the models on `bus/tickets.py`
   `OPENCODE_GO_MODELS`: Go's free models and the paid ones allowed at least
   10,000 requests per 5 hours (Beam Free; MiMo-V2.6-Flash, DeepSeek V4.1
   Flash, Muse Spark 1.3 Contributor). A slot whose model, or any model of its
@@ -1707,10 +1741,11 @@ again after an hour.
 
 ## free provider slots on the spark-gateway
 
-Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use
 separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
-`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
-`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`free-gemma` uses `/free/gemini/v1`, `free-openrouter`
+`/free-public/openrouter/v1` (a cluster runner slot only), and `free-nvidia`,
+`free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
 holds only that slot for 15 minutes as a limit, so the station can assign the
@@ -1962,6 +1997,18 @@ which that runner could never clear: the station retries the ticket on
 another lane as a transient ending, and that lane holds it if the base is
 red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
+Each base check row in the validation record names what failed in its
+`detail`: the tests the check reported, a tool the shell could not find
+(`missing make`), else the check's last line. The record travels in the
+sealed report. After two such failures of one repo at one revision on a slot
+the station stops giving that slot the repo: it parks each brief `[transient]`
+without a dispatch, until the repo's head moves or a run reports a new runner
+image (a fingerprint of the image's packages and tools, `<ticket>.image`). One
+run records two failures, because a red check runs twice. A failed `setup:`
+counts too. A check that passed on its second run counts for nothing, and only
+a fix round's default-branch rows count. A day with no report from the slot
+lets one run through, because only a run can show a new image.
+
 The job, step by step (`lanes/k8s/lane_job.py`):
 
 1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
@@ -1977,10 +2024,13 @@ The job, step by step (`lanes/k8s/lane_job.py`):
    that step only, and nothing printed names a parameter or a value.
 4. Runs `lanes/run_lane.sh <slot>` once, with no Actions token and no AWS
    session in its environment. Its output goes into the report, not the log.
+   The step fails when no agent started (`run_lane.sh` writes
+   `<ticket>.agent-ran` first), with only the failure class in the public
+   log, so a green run means an agent ran. The report steps run either way.
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
-   line, the `.answered` and `.verify` files, the transcripts, answers and
-   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   line, the validation record, the `.image` fingerprint, the `.answered`
+   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both
@@ -2066,6 +2116,11 @@ skips both. The real controls are:
   any outside collaborator's pull request (managed in the private
   infrastructure code).
 
+`bus/runners.py` TRACKED_SLOTS names slots that run here wherever any runner
+slot does, with the settings the station's plist lacks. They deploy by merge,
+beside the Mac lane they will replace, because a plist changes only through a
+reinstall that replaces every lane. docs/LANE_RUNNERS_PLAN.md holds the plan.
+
 To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
 `opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes
 that slot's launchd runner and gives the station the slot's settings
@@ -2113,9 +2168,20 @@ class, one line per behavior change, and the counts of files by class:
 ```
 ## Intent
 Class: logic
+Risk: app-code, two-way door, blast radius repo
 - Fix the thing for every user
 Files: 1 logic, 1 tests
 ```
+
+The Risk line (`bus/risk_line.py`) lets review sort by risk from the pull
+request page. The tier is `bus/merge_tier.py`'s, also set as a `tier:<name>`
+label, and only reports: tiers keep deciding what Loom may merge. The lane
+writes the door and blast radius in a `## Risk` section of `.loom/summary.md`
+(`Door: two-way`, `Blast radius: repo`). The runner forces one-way when the
+diff touches a migration, deletes a tracked data file, or the pull request
+lists an operator step. A lane that says nothing reads `door unstated`, never
+two-way. The line and label are set when the pull request opens; a later push
+does not change them.
 
 The behavior lines come from the lane's final summary: the agent writes
 one line per behavior change to `.loom/summary.md` at the top of its

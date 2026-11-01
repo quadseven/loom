@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import calendar
 import copy
+import gzip
 import hashlib
 import http.client
 import json
@@ -30,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -159,6 +161,10 @@ def unreadable(err: GitHubError) -> Optional[str]:
     that is not a rate limit), or a GraphQL NOT_FOUND. None for any other
     failure (5xx, a rate limit, a dropped connection), which must still end
     the command: only these are safe to skip and name."""
+    if isinstance(err, RateLimited):
+        # A refusal the client raises itself while the window is spent
+        # carries a 403 and no body: it is a budget wait, not a missing grant.
+        return None
     body = err.body or ""
     parsed = _json_or_none(body)
     message = str(parsed.get("message") or "") if isinstance(parsed, dict) else ""
@@ -221,14 +227,19 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
                      timeout: float = TIMEOUT) -> Tuple[int, Dict[str, str], bytes]:
     if not url.startswith("https://"):
         raise GitHubError("refusing a non-https URL: %s" % url.split("?")[0])
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    # GitHub's JSON compresses about 6 to 8 times. Uncompressed, one status
+    # of 19 repos moved 70 MB, and from a remote brain whose link carries
+    # about 0.35 MB/s it read no repo inside its deadline (loom#2415).
+    asked = dict(headers)
+    asked.setdefault("Accept-Encoding", "gzip")
+    req = urllib.request.Request(url, data=body, method=method, headers=asked)  # noqa: S310
     try:
         # https only (checked above), never file: or custom schemes.
         with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
-            return resp.status, dict(resp.headers.items()), resp.read()
+            return _decoded(resp.status, dict(resp.headers.items()), resp.read())
     except urllib.error.HTTPError as err:
         try:
-            return err.code, dict(err.headers.items()), err.read()
+            return _decoded(err.code, dict(err.headers.items()), err.read())
         finally:
             err.close()
     except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
@@ -236,6 +247,23 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
         # the middle of a body, which is not an OSError and used to escape
         # every caller's GitHubError handling.
         raise GitHubError("request failed: %r" % err, 0, "") from None
+
+
+def _decoded(status_: int, headers: Dict[str, str], raw: bytes
+             ) -> Tuple[int, Dict[str, str], bytes]:
+    """The answer with a gzip body unpacked and its Content-Encoding and
+    Content-Length dropped, as if it had come uncompressed. A body that does
+    not unpack is a dropped connection (status 0), so a read is tried again."""
+    named = [k for k in headers if k.lower() in ("content-encoding", "content-length")]
+    encoding = next((str(headers[k]).strip().lower() for k in named
+                     if k.lower() == "content-encoding"), "")
+    if encoding != "gzip":
+        return status_, headers, raw
+    try:
+        raw = gzip.decompress(raw)
+    except (OSError, EOFError, zlib.error) as err:
+        raise GitHubError("request failed: a gzip body did not unpack: %r" % err, 0, "") from None
+    return status_, {k: v for k, v in headers.items() if k not in named}, raw
 
 
 def _json_or_none(text: str) -> Any:
@@ -530,6 +558,9 @@ class GitHub:
         # client that does not read the section must not write into it.
         self.status_in_body = False
         self._sleep = sleep
+        # Told each retry wait before it starts (seconds), so a caller can
+        # show that a slow run is waiting and not hung.
+        self.on_wait: Optional[Callable[[float], None]] = None
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
@@ -971,13 +1002,19 @@ class GitHub:
             except GitHubError as err:
                 if err.status != 0 or attempt == len(delays):
                     raise
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             if status in RETRY_STATUSES and attempt < len(delays):
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             return status, raw_headers, raw
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _wait(self, seconds: float) -> None:
+        """Sit out one retry delay, telling `on_wait` first."""
+        if self.on_wait is not None:
+            self.on_wait(seconds)
+        self._sleep(seconds)
 
     def _keep_answer(self, url: str, status: int, data: Any,
                      resp_headers: Dict[str, str]) -> None:

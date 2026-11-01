@@ -40,6 +40,8 @@ from . import brain_memory
 from . import brain_hold
 from . import claimed
 from . import claim_referee
+from . import close_audit
+from . import decision_claim
 from . import evidence_close
 from . import journal
 from . import fabric
@@ -58,6 +60,7 @@ from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import friction_intake
+from . import review_debt
 from . import evidence
 from . import handoff
 from . import health
@@ -5209,14 +5212,14 @@ class Station:
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
-                     self.close_done_tickets, self.settle_orphan_sources,
+                     self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
                      self.clean_labels,
                      self.queue_stateless_tickets,
                      self.note_stale_shipped,
                      self.restate_shipped_live,
-                     self.health_intake, self.intake_friction,
+                     self.health_intake, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -7442,10 +7445,15 @@ class Station:
         model = headers.get("Model", "")
         order = self._retry_order(failed, klass, headers.get("Difficulty"))
         public: Dict[str, bool] = {}
+        # A demoted lane takes no build ticket (bus/scorecard.py): a retry
+        # moved onto one was moved straight off again by the factory, a pass
+        # and a status line each time (loom#2430).
+        demoted = set(self.demoted_lanes())
         first: Optional[List[Dict[str, Any]]] = None
         busy = None
         for cand in dict.fromkeys(order):
-            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public):
+            if cand in skip or not self._retry_eligible(repo, cand, failed, klass, model, public,
+                                                        demoted):
                 continue
             if self.model_limited(cand, brief_model(cand, headers)) is not None:
                 continue
@@ -7492,12 +7500,12 @@ class Station:
         return order
 
     def _retry_eligible(self, repo: str, cand: str, failed: str, klass: str, model: str,
-                        public: Dict[str, bool]) -> bool:
+                        public: Dict[str, bool], demoted: Iterable[str] = ()) -> bool:
         """Whether lane cand can take a retry: a known, available lane, not
-        the failed lane's provider, whose runner takes the model and, for a
-        public-only lane, a public repo. public caches the repo lookup across
-        candidates."""
-        if cand not in LANES or not self._heartbeat_ok(cand):
+        demoted, not the failed lane's provider, whose runner takes the model
+        and, for a public-only lane, a public repo. public caches the repo
+        lookup across candidates."""
+        if cand not in LANES or cand in demoted or not self._heartbeat_ok(cand):
             return False
         if provider(cand) == provider(failed):
             return False
@@ -10971,6 +10979,62 @@ class Station:
         health.Intake(self.gh, state, self.now, stamp, _say).run(sources)
         _write_json(path, state)
 
+    # -- close audit -------------------------------------------------------
+    def audit_closes(self) -> None:
+        """Reopen a close by anyone else whose cited commit is not on the
+        default branch, with no merged pull request (bus/close_audit.py)."""
+        path = os.path.join(self.state, close_audit.STATE_FILE)
+        # Strict: the file keeps which tickets were reopened, and a lost count
+        # is not a zero.
+        try:
+            state = _read_json(path, {})
+        except StateError as err:
+            _say("close audit stopped: %s" % err)
+            return
+        if not isinstance(state, dict):
+            _say("close audit stopped: %s is not an object" % path)
+            return
+        try:
+            close_audit.run_pass(self.gh, self._verify_repos(), state, self.now,
+                                 lambda: decision_claim.client_login(self.gh), _say)
+        finally:
+            _write_json(path, state)
+
+    # -- review debt -------------------------------------------------------
+    def _review_debt_state(self) -> Optional[Dict[str, Any]]:
+        """The kept state, or None when it cannot be read."""
+        try:
+            state = _read_json(os.path.join(self.state, review_debt.STATE_FILE), {})
+        except StateError as err:
+            _say("review debt: %s" % err)
+            return None
+        return state if isinstance(state, dict) else None
+
+    def report_review_debt(self) -> None:
+        """Keep the age of the Loom review and the guards' state, hourly
+        (bus/review_debt.py). The invariants read them from the state."""
+        goal = self._invariant_goal()
+        state = self._review_debt_state()
+        if goal is None or state is None:
+            return
+        try:
+            review_debt.run_pass(self.gh, goal[0], goal[1], state, self.now,
+                                 list(self.s.authors) + review_debt.review_authors(), _say,
+                                 self._verify_repos())
+        finally:
+            _write_json(os.path.join(self.state, review_debt.STATE_FILE), state)
+
+    def _invariant_debt_facts(self, facts: invariants.Facts, kept: Dict[str, Any]) -> None:
+        """Review and guard debt for the invariants. `kept` holds the last
+        good read: a state file that cannot be read must not clear a finding."""
+        state = self._review_debt_state()
+        if state is not None:
+            kept["debt"] = [review_debt.review_at(state), review_debt.no_check(state),
+                            review_debt.unreadable(state)]
+        last = kept.get("debt")
+        if isinstance(last, list) and len(last) == 3:
+            facts.review_at, facts.guards_no_check, facts.guards_unreadable = last
+
     # -- friction intake ---------------------------------------------------
     def intake_friction(self) -> None:
         """File a ticket for a slowdown the tick journals on the invariant
@@ -11288,6 +11352,7 @@ class Station:
                 idle=info["idle"])
             for key, info in gate_held.items()}
         self._invariant_goal_facts(facts)
+        self._invariant_debt_facts(facts, state)
         seen = state.get("brain_seen")
         newest = max([j.at for j in facts.journals or []] + ([seen] if self._num(seen) else []),
                      default=None)

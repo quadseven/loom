@@ -71,6 +71,7 @@ that talks to GitHub about tickets.
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 | `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
 | `class:logic` | A change to behavior; every revert ticket carries it. |
+| `tier:<name>` | The pull request's `bus/merge_tier.py` tier when it opened. It reports and decides nothing. |
 
 A ticket carries exactly one state label. The #35 states are queued,
 briefed, pr, shipped and verified; `merged` keeps merged apart from deployed,
@@ -816,6 +817,53 @@ again. The station then hands that lane no verify run for
 24 hours, and the ticket is due a verify run again. Evidence you cannot read
 from where you run (a lane machine log, from Muse) is not a fail: leave the
 audit to the lane machine's tick and say so in the journal.
+
+### Close audits
+
+An audit of a merge or a close reads what git holds, not what a comment says.
+An audit line comes from this output, never from reading the comments:
+
+    python3 -m bus.brain audit-close OWNER/NAME#N
+
+It finds each commit the comments around the close cite, asks the compare API
+whether the default branch carries it, and names the merged pull request that
+delivered it. It prints the cited hash, the merge commit and the place of
+each, and a verdict: `sound`, `differs` (a cited commit is off the default
+branch while another cited commit or a merged pull request is on it),
+`unproven` (no cited commit and no merged pull request is on the default
+branch), `uncited`, or `unknown` (a read failed or was cut short, which is
+never sound). It exits 0 only on `sound`. Only the closer's own comments count
+as citations. A merged pull request counts as delivery only when it is based
+in the audited repo or a `LOOM_REPOS` repo, names the ticket with a `Refs` line,
+a closing keyword or a `loom/<number>` branch, and was cross-referenced before
+it merged.
+
+The station runs the same check over closes as completed by anyone but
+itself, every 10 minutes, within a read budget, from the first pass after it
+shipped (`bus/close_audit.py`). An `unproven` close gets one comment and is
+reopened. A ticket is reopened once; a later unproven close gets the comment
+alone. A repo in shadow records the reopen instead. Each
+pass logs `close audit: N closes read, M refused, K waiting`. That line is
+what a journal states.
+
+### Review and guard debt
+
+Review is routine, so the station reports when it stops. Once an hour it reads
+the goal home for the newest Loom review journal, a comment whose first line
+starts `Loom review`, and the `loom:factory` tickets with a line starting
+`The guard` (`bus/review_debt.py`). A guard is `open`, `shipped` (a merged pull
+request that names it, lands on the default branch, and adds or changes a test
+file), or closed with no check. A review counts only from a listed login:
+`LOOM_BRIEF_AUTHORS` and `LOOM_REVIEW_AUTHORS`, whose default is the fleet's
+three brains.
+
+A review over 7 days old raises the rolling `review-overdue` invariant, and a
+guard closed with no check raises the rolling `guard-no-check`. A ticket still
+unreadable after 5 tries raises the rolling `guard-unreadable`. All are edited
+in place, and a new review clears the first. A failed read says unknown, never
+healthy. The journal scoreboard's line comes from:
+
+    python3 -m bus.review_debt line OWNER/NAME#N
 
 ## Trust
 
@@ -2160,9 +2208,11 @@ scorecard, aggregated per lane and model.
 A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
 proof audit or a damaging audit verdict. A lane (all its slots) whose bad
 outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
-`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, its
-briefed tickets step aside to other lanes with a status event naming the
-demotion and its counts, and it stays demoted until the operator runs
+`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, the
+factory gives it no queued ticket, tier move or automatic retry (as a lane
+that is down; loom#2430), its briefed tickets step aside to other lanes with
+a status event naming the demotion and its counts, and it stays demoted until
+the operator runs
 `python3 -m bus.scorecard clear <lane>` (`show` prints the table). Clearing
 forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
@@ -2313,8 +2363,12 @@ transfer, 404 or 410, a 403 that is not a rate limit, a GraphQL NOT_FOUND)
 does not end `status` or `resume`: each prints `skipped <repo>: <reason>`,
 in the output and on stderr, and finishes the other repos. `resume` lists
 such repos under "Skipped repos (fix LOOM_REPOS)". Any other GitHub error
-(5xx, a rate limit, a dropped connection) still ends the command, so a
-fault never reads as an empty repo.
+(5xx, a rate limit, a dropped connection) still ends `status`, so a fault
+never reads as an empty repo. `resume` names it instead and goes on
+(loom#1578): a repo GitHub answers with a fault is listed under "Failed
+repos (read again next tick)" with the error, a handoff item that faults is
+named in its goal's section as `skipped OWNER/NAME#N: read failed: ...`, and
+the command exits 3, so neither reads as empty or finished.
 
 `status` and `resume` print as they go (loom#2049): the heading first, then
 each repo's section as soon as that repo's reads finish (in the order the
@@ -2327,7 +2381,16 @@ connection failed, is read once more with a fresh budget, keeping the answers
 the first try finished. A repo that fails again prints `skipped <repo>:
 timed out after ...` or `skipped <repo>: connection failed twice: ...` and is
 left out of the cross-repo sections, and the run goes on with the other
-repos. Within a repo, the
+repos. `resume` writes a line to stderr before each repo (the repo and the
+GitHub requests so far) and before every wait on GitHub (a retry, or a rate
+limit with its length and reset time). It waits out a rate limit only when
+the window resets before its deadline, `--deadline MINUTES` (8 by default);
+otherwise it names the repo as rate limited under "Failed repos". At the
+deadline it stops reading, prints `resume skipped OWNER/NAME: deadline` for
+each repo it did not finish, then the freshness line and the cross-repo
+sections from the repos it read, and exits 3. Since each repo is printed as
+soon as it is read, a handoff finished by a goal in a repo not read yet
+still shows until the item itself reads as finished or closed. Within a repo, the
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.

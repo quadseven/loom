@@ -299,6 +299,7 @@ fi
 if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" > .loom/replies.json; fi
 if [ -n "${FAKE_SUMMARY:-}" ]; then mkdir -p .loom; printf '%s\n' "$FAKE_SUMMARY" > .loom/summary.md; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
+if [ -n "${FAKE_MIGRATION:-}" ]; then mkdir -p migrations; echo 'select 1;' > migrations/0001_add.sql; fi
 if [ "${FAKE_AGENT:-commit}" = probes ]; then
   printf '# test\\n' > .test_write
   mkdir -p bin
@@ -713,6 +714,8 @@ print('leak guard: clean (shape patterns only)')
             "LOOM_LEAK_SCANNER": str(self.scanner),
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
+            # The picked model has its own tests, which turn it on.
+            "LOOM_MODEL_PICK": "off",
             # The free lanes' usage meters (bus/meter.py) read a closed
             # loopback port, never the real provider, unless a test serves one.
             "LOOM_OPENROUTER_METER_URL": "http://127.0.0.1:9/meter",
@@ -816,6 +819,11 @@ print('leak guard: clean (shape patterns only)')
         every run dies at once under set -u and no lane works."""
         env = self.lane_env()
         del env["LOOM_CLONE_BASE"]
+        # The default remote is SSH. A real ssh here reaches out of the test:
+        # on a cluster runner the egress fence drops port 22, the clone hangs
+        # past the timeout below, and this one test failed every base check
+        # of this repo there (loom#2418).
+        self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
         self.drop_brief()
         result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
                                 capture_output=True, text=True, timeout=60)
@@ -1700,6 +1708,26 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(len(create), 1)
         self.assertNotIn("--label", create[0])
         self.assertTrue(any(c.startswith("gh pr edit") and "--add-label class:" in c for c in self.calls()))
+
+    def test_a_migration_gets_a_one_way_risk_line_and_its_tier_label(self):
+        self.drop_brief(text=BRIEF + "\nThe new file is migrations/0001_add.sql.\n")
+        result = self.run_lane(
+            FAKE_MIGRATION="1",
+            FAKE_SUMMARY="Add the column\n\n## Risk\nDoor: two-way\nBlast radius: repo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body.exists(), self.run_log()[-1500:])
+        text = self.body.read_text()
+        self.assertIn("Risk: app-code, one-way door, blast radius repo", text)
+        self.assertLess(text.index("## Intent"), text.index("Risk: "))
+        self.assertLess(text.index("Risk: "), text.index("## Why"))
+        self.assertTrue(any(c.startswith("gh pr edit") and "--add-label tier:app-code" in c
+                            for c in self.calls()), self.calls())
+
+    def test_a_lane_that_says_nothing_about_risk_reads_door_unstated(self):
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(self.body.read_text(), r"Risk: \S+, door unstated, blast radius unstated")
 
     def test_a_failed_pr_create_is_parked_as_transient(self):
         # The agent's work is done and pushed; only the pull request is missing.
@@ -4289,6 +4317,123 @@ exec /usr/bin/git "$@"
         self.assertEqual(len(defaults), 3, defaults)
         for model in defaults:
             self.assertIn(model, tickets.OPENCODE_GO_MODELS)
+
+    # bus/model_pick.py: a Go or Zen slot picks each run's model.
+    FAKE_OPENCODE_PICK = """#!/usr/bin/env bash
+[ "${1:-}" = --version ] && { echo "1.18.4"; exit 0; }
+[ "${1:-}" = models ] && exit 0
+args="$*"
+printf 'opencode %s\\n' "${args//$'\\n'/ }" >> "$TMPDIR/agent.log"
+case "$args" in
+  *"-m BROKEN "*)
+    echo 'Error: ProviderModelNotFoundError: model not found'
+    exit 1 ;;
+esac
+echo '{"type":"step_finish","part":{"tokens":{"output":3}}}'
+echo fixed > fix.txt
+"""
+
+    def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
+                 zen=("flint-40b-free",)):
+        self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
+        lists = {"/go.json": {"data": [{"id": m} for m in go]},
+                 "/zen.json": {"data": [{"id": m} for m in zen]},
+                 "/status.json": {"opencode-go": {"models": {m: {} for m in go}},
+                                  "opencode": {"models": {m: {} for m in zen}}}}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps(lists[self.path]).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = LocalHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:%d" % server.server_port
+        return dict(LOOM_MODEL_PICK="on", LOOM_OPENCODE_GO_KEY_SSM="/k/go", FAKE_SECRET__k_go="fake-go-key",
+                    LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
+                    LOOM_ZEN_MODEL="opencode/flint-40b-free",
+                    LOOM_OPENCODE_GO_PROBE_URL="", LOOM_ZEN_PROBE_URL="",
+                    LOOM_OPENCODE_GO_MODELS_URL=base + "/go.json",
+                    LOOM_ZEN_MODELS_URL=base + "/zen.json",
+                    LOOM_MODELS_STATUS_URL=base + "/status.json")
+
+    def pause_models(self, *keys):
+        (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
+        (self.loom / "state" / "usage" / "model-pause.json").write_text(json.dumps(
+            {key: {"until": time.time() + 3600, "why": "paused by the test"} for key in keys}))
+
+    def runs(self):
+        return [c for c in self.calls() if c.startswith("opencode ")]
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_slot_ignores_its_pin_and_reports_the_free_model_it_picked(self):
+        inbox, result = self.api_lane("opencode-go", extra="Model: opencode-go/mimo-v2.6-flash\n",
+                                      **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/beam-free", self.runs()[-1])
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("model pick: opencode-go/beam-free (free)", log)
+        self.assertRegex(log, r"model report: opencode-go/beam-free \(free\), fallback: .*exit 0, edited")
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_gone_model_is_paused_and_the_brief_runs_on_the_next_free_model(self):
+        env = self.pick_env(broken="opencode-go/beam-free")
+        inbox, first = self.api_lane("opencode-go", **env)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        self.assertTrue(self.beat("opencode-go")["available"])
+        second = self.run_lane("opencode-go", GH_TOKEN="fake-token-not-real", **env)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("opencode-go/beam-free paused for 86400 s", log)
+        self.assertIn("rotation 1 of 3", log)
+        self.assertIn("model pick: opencode-go/iceman-contributor-free (free)", log)
+        self.assertIn("-m opencode-go/iceman-contributor-free", self.runs()[-1])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_paid_run_for_a_private_repo_is_logged_and_settled(self):
+        self.pause_models("opencode-go/beam-free")
+        inbox, result = self.api_lane("opencode-go", FAKE_GH_PRIVATE="true", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/mimo-v2.6-flash", self.runs()[-1])
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("(paid)", log)
+        self.assertIn("no free model works", log)
+        ledger = (self.loom / "state" / "usage" / "go-budget.jsonl").read_text().splitlines()
+        self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_verify_run_waits_rather_than_spend_a_paid_model(self):
+        self.pause_models("opencode-go/beam-free", "opencode-go/iceman-contributor-free", "zen-free")
+        inbox, result = self.api_lane("opencode-go", extra="Deliverable: verify\n", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.runs(), [])
+        self.assertTrue(self.beat("opencode-go")["available"])
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_a_slot_with_every_model_paused_takes_nothing_and_says_so(self):
+        self.pause_models("zen-free", "opencode/flint-40b-free")
+        inbox, result = self.api_lane("zen", **self.pick_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.runs(), [], result.stderr)
+        beat = self.beat("zen")
+        self.assertFalse(beat["available"], beat)
+        self.assertIn("no model can run", beat["reason"])
+        self.assertIn("retry_at", beat)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
 
     def slot_run(self, slot, **env):
         inbox, result = self.api_lane(
@@ -6987,6 +7132,68 @@ exec /usr/bin/git "$@"
         self.assertIn("base check exited 1 on the", log)
         self.assertIn("[factory]", log)
         self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+
+    def test_the_openrouter_free_slot_reaches_its_gateway_route_with_no_key(self):
+        # The gateway holds the key and serves only :free models, so the agent
+        # has no key to read (loom#2413). Asked of the runner itself: a free
+        # slot's URL is the gateway's route pinned to its provider.
+        script = ('LOOM_FREE_GATEWAY_URL=http://gw:8080 SLOT=free-openrouter LANE=free; '
+                  'eval "$(sed -n "/^setting_var()/,/^}/p" "$1")"; '
+                  'lane_setting URL')
+        out = subprocess.run(["bash", "-c", script, "_", str(RUNNER)],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "http://gw:8080/free-public/openrouter/v1")
+
+    def red_base_contract(self, check):
+        return "interpreter: loom-test-python\nsubmodules: yes\ncheck: %s\n" % check
+
+    def test_a_base_failure_on_a_cluster_runner_names_the_failing_tests(self):
+        # Nothing recorded why: 49 base failures on one repo held an empty
+        # detail, and the test output sat unread in a sealed log (loom#2418).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract(
+            "printf 'ERROR: test_one (test_mod.ThingTest.test_one)\\ntext\\n"
+            "FAIL: test_two (test_mod.ThingTest.test_two)\\n'; exit 1"))
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [r for r in self.records() if r["phase"] == "baseline"]
+        self.assertEqual([r["exit"] for r in rows], [1, 1])
+        for row in rows:
+            self.assertIn("test_mod.ThingTest.test_one", row["detail"])
+            self.assertIn("test_mod.ThingTest.test_two", row["detail"])
+        self.assertIn("second run after exit 1", rows[1]["detail"])
+
+    def test_a_base_check_that_cannot_find_its_tool_names_the_tool(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("no-such-tool-here test"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        row = next(r for r in self.records() if r["phase"] == "baseline")
+        self.assertEqual(row["exit"], 127)
+        self.assertIn("missing no-such-tool-here", row["detail"])
+
+    def test_a_red_base_with_no_test_names_records_its_last_line(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("echo the build broke here; exit 2"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        row = next(r for r in self.records() if r["phase"] == "baseline")
+        self.assertIn("the build broke here", row["detail"])
+
+    def test_a_cluster_run_marks_that_its_agent_started(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.agent-ran").exists())
+
+    def test_a_cluster_run_stopped_before_its_agent_leaves_no_mark(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("exit 1"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.agent-ran").exists())
 
     def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')

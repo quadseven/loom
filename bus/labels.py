@@ -43,7 +43,10 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # free-gemma Gemma (both allowed private code, /free/<provider>/v1);
          # free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq Groq (public repos
          # only, /free-public/<provider>/v1).
-         "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq"]
+         "free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
+         # OpenRouter's free models through the gateway, which holds the key:
+         # a cluster runner slot only, never a Mac lane (loom#2413).
+         "free-openrouter"]
 LANES = LANES + SLOTS
 
 
@@ -109,6 +112,11 @@ LABELS: Dict[str, Dict[str, str]] = {
     "class:logic": {"color": "0075ca", "description": "Changes behavior-carrying code"},
     "class:tests": {"color": "0e8a16", "description": "Changes test files only"},
     "class:docs": {"color": "ededed", "description": "Changes docs only"},
+    "tier:docs-tests": {"color": "ededed", "description": "Risk tier: docs and tests only"},
+    "tier:app-code": {"color": "0075ca", "description": "Risk tier: application code"},
+    "tier:deploy-config": {"color": "fbca04", "description": "Risk tier: deploy or dependency config"},
+    "tier:security": {"color": "b60205", "description": "Risk tier: workflows, gates or sensitive paths"},
+    "tier:cross-repo": {"color": "d93f0b", "description": "Risk tier: a pin or another repo"},
     # Why a ticket waits, set where the station or factory decides it waits
     # and cleared at the claim: a label change sends no email, a comment does.
     "wait:gate": {"color": "fef2c0", "description": "Waiting: the unproven-work gate holds its goal"},
@@ -128,7 +136,7 @@ for _lane in LANES:
     LABELS["lane:" + _lane] = {"color": "bfdadc",
                                "description": "Work for the %s lane" % _lane}
 
-MANAGED_PREFIXES = ("loom:", "lane:", "class:", "wait:")
+MANAGED_PREFIXES = ("loom:", "lane:", "class:", "tier:", "wait:")
 WAIT_PREFIX = "wait:"
 # One label asks a person. The old names read as it until a write to the
 # ticket migrates them (bus/label_pass.py, loom#2278).

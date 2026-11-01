@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 import json
 import os
@@ -15,9 +14,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, auth_from_env,
+from . import runners
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -1244,6 +1244,69 @@ READ_WORKERS = 6
 CAPS_LOCK = threading.Lock()
 
 
+# Which pass's reads go on past its deadline, per thread (_SideReads). A
+# thread _side_by_side starts carries its starter's, so the sections across
+# repos read side by side still read once the repo reads are stopped.
+_PASS = threading.local()
+
+
+class _Answer:
+    """One call's answer from a daemon thread: its value or its exception."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.value: Any = None
+        self.error: Optional[BaseException] = None
+
+    def get(self) -> Any:
+        self.done.wait()
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+def _side_by_side(calls: Sequence[Callable[[], Any]], workers: int) -> List[_Answer]:
+    """Start `calls`, `workers` at a time, on daemon threads; each one's
+    _Answer in the order of `calls`.
+
+    Daemon threads, not a ThreadPoolExecutor: Python joins every pool worker
+    at exit, even one started from a daemon thread, so a read still in
+    flight at the deadline held the command's exit for up to its socket
+    timeout. On 2026-11-01 resume at --deadline 1.5 ran past a 100 s tick
+    timeout that way (loom#1578)."""
+    answers = [_Answer() for _ in calls]
+    todo = list(range(len(calls)))
+    lock = threading.Lock()
+    side = getattr(_PASS, "side", None)
+
+    def work() -> None:
+        _PASS.side = side
+        while True:
+            with lock:
+                if not todo:
+                    return
+                n = todo.pop(0)
+            try:
+                answers[n].value = calls[n]()
+            except BaseException as exc:  # handed to the caller's thread
+                answers[n].error = exc
+            answers[n].done.set()
+
+    for _ in range(min(workers, len(calls))):
+        threading.Thread(target=work, name="brain-read", daemon=True).start()
+    return answers
+
+
+def _within(call: Callable[[], Any], seconds: float) -> Tuple[bool, Any]:
+    """(True, call()) when it returns inside `seconds`, (False, None) when it
+    does not: it is left to finish on its daemon thread. Its exception is
+    raised here."""
+    answer = _side_by_side([call], 1)[0]
+    if not answer.done.wait(max(0.0, seconds)):
+        return False, None
+    return True, answer.get()
+
+
 def _read_each(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
     """fn of each item, READ_WORKERS at a time, in the order of `items`; the
     first exception in that order is raised, as a loop would raise it.
@@ -1254,8 +1317,8 @@ def _read_each(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
     items = list(items)
     if len(items) < 2:
         return [fn(x) for x in items]
-    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
-        return list(pool.map(fn, items))
+    answers = _side_by_side([lambda x=x: fn(x) for x in items], READ_WORKERS)
+    return [answer.get() for answer in answers]
 
 
 def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
@@ -1277,8 +1340,7 @@ def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: dateti
                and WAIT_LIVE_EVENT not in _labels(issue)]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
-    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
-        stamps = list(pool.map(lambda issue: _shipped_at(gh, repo, issue), shipped))
+    stamps = _read_each(lambda issue: _shipped_at(gh, repo, issue), shipped)
     due = [(stamp or now, issue) for stamp, issue in zip(stamps, shipped, strict=True)]
     return sorted(due, key=lambda x: (x[0], int(x[1]["number"])))
 
@@ -1326,56 +1388,169 @@ def _dated_lane_status(table: str, now: datetime) -> str:
     return table[:match.end()] + note + table[match.end():]
 
 
+# How long status reads before it stops and names the repos it did not
+# reach (`status --deadline MINUTES`, loom#2415). Muse gives each tick
+# command 2 minutes; status for 19 repos took about 4 minutes from the remote
+# brain, so the tick cut it off at 115 s after two sections, and the repos it
+# never read looked like repos with nothing ready. 1.5 minutes leaves the
+# sections across repos half a minute inside that timeout.
+STATUS_DEADLINE_MINUTES = 1.5
+# The exit code of a status that did not read every repo it was given, as
+# resume's (RESUME_PARTIAL_EXIT): what it printed holds, and it names the
+# rest.
+STATUS_PARTIAL_EXIT = 3
+
+
+def repo_weights(gh: Any, repos: Sequence[str]) -> Dict[str, int]:
+    """How much status has to read in each repo: its open issues and pull
+    requests, counted for every repo in one GraphQL query. Nothing when
+    there is one repo to order, or when GitHub will not answer the query;
+    the repos are then read in the order given, and a repo GitHub will not
+    show is named by its own section read."""
+    order = list(dict.fromkeys(repos))
+    if len(order) < 2:
+        return {}
+    fields = []
+    for n, repo in enumerate(order):
+        owner, _, name = repo.partition("/")
+        fields.append("r%d: repository(owner:%s, name:%s) { issues(states:OPEN) { totalCount } "
+                      "pullRequests(states:OPEN) { totalCount } }" % (n, _gql(owner), _gql(name)))
+    try:
+        # Read past GraphQL's errors: a moved or gone repo answers null and
+        # an error, and the other repos are still weighed.
+        answer = gh.rest("POST", "/graphql", {"query": "query { %s }" % " ".join(fields),
+                                              "variables": {}}).data
+    except GitHubError as err:
+        _progress("status: reading in the order given; the repo sizes were not read: %s"
+                  % _one_line(str(err), 200))
+        return {}
+    data = answer.get("data") if isinstance(answer, dict) else None
+    weights: Dict[str, int] = {}
+    for n, repo in enumerate(order):
+        node = data.get("r%d" % n) if isinstance(data, dict) else None
+        if not isinstance(node, dict):
+            continue
+        weights[repo] = sum(int((node.get(key) or {}).get("totalCount") or 0)
+                            for key in ("issues", "pullRequests"))
+    return weights
+
+
+def lightest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
+    """`repos` with the lightest first; repos of one weight, or not weighed,
+    keep their order. A repo's section prints only once its whole read is
+    in, so the light repos print within seconds and a deadline leaves only
+    heavy ones unread. Heaviest first (loom#2415) put the six heaviest repos
+    on all six workers: on a link that carries about 0.35 MB/s they shared it
+    for the whole deadline, none finished, and the light repos never started,
+    so a tick printed no repo at all."""
+    return sorted(dict.fromkeys(repos), key=lambda repo: weights.get(repo, 0))
+
+
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None,
            emit: Optional[Callable[[str], None]] = None,
-           budget: Optional[float] = None) -> str:
+           budget: Optional[float] = None, deadline: Optional[float] = None,
+           missed: Optional[List[str]] = None) -> str:
     """The status text. With `emit`, each part is handed to it as soon as it
     is known: the heading, then each repo's section as that repo's read
     finishes, then the sections that span every repo (loom#2049). A repo
     whose read runs past the per-repo budget (per_repo.budget) is named as
-    timed out in its section and left out of the cross-repo sections."""
+    timed out in its section and left out of the cross-repo sections.
+
+    Repos are read side by side, the lightest first (fewest open issues
+    and pull requests, lightest_first). At `deadline` minutes (STATUS_DEADLINE_MINUTES when
+    None) it reads no more repos and names each one it did not finish as
+    `status skipped OWNER/NAME: deadline` before the cross-repo sections,
+    which then span only the repos read (loom#2415). A repo GitHub refuses
+    for a rate limit that resets past the deadline, or answers with a fault,
+    is named in its section with what failed, and the others are read. Each
+    repo not read this run is added to `missed`, when given. Progress goes
+    to stderr: a line before each repo, and one before every wait."""
     from . import factory  # factory imports this module
     env = os.environ if env is None else env
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     seconds = per_repo.budget(env, budget)
-    # One pass reads each issue, issue listing, comments and events once,
-    # across every repo and the lane status (loom#2078).
-    gh = issue_reads.once(gh)
+    minutes = STATUS_DEADLINE_MINUTES if deadline is None else float(deadline)
+    if minutes < 0:
+        raise ValueError("the status deadline is zero or more minutes")
+    stop = _clock() + minutes * 60
     # Explicit `authors` are the caller's choice; read from the environment,
     # an empty list is refused, as it would trust no journal (loom#783).
     if authors is None:
         authors = require_trusted_authors(env, "status")
-    out: List[str] = []
-    _say(out, emit, ["# Loom status", "", trusted_line(authors)])
-    check = review_check_name(env)
-    caps: Dict[str, str] = {}
-    # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
-    hold = hold_logins(env)
+    told = hasattr(gh, "on_wait")  # a GitHub client, not a test's stand-in
+    if told:
+        gh.on_wait = lambda wait: _progress("status: waiting %.0fs to retry a GitHub read" % wait)
+    side = _SideReads(gh, "status")
+    try:
+        return _status_pass(gh, list(dict.fromkeys(repos)), lanes_repo, env, now, authors, emit,
+                            seconds, stop, bot, missed if missed is not None else [], side)
+    finally:
+        side.restore()
+        if told:
+            gh.on_wait = None
 
-    def read(repo: str) -> Tuple[List[str], Dict[str, Any], Dict[str, Any]]:
-        # Each read keeps its own tickets and waiting count, so a timed-out
-        # read that finishes late changes nothing the run prints.
-        into: Dict[str, List[Dict[str, Any]]] = {}
-        waits: Dict[str, Dict[str, Any]] = {}
-        return (_readable_section(gh, repo, now, bot, authors, into, check, waits, caps, hold),
-                into, waits)
 
-    # Each repo's reads are independent, so they run side by side; a section
-    # prints as its repo finishes. A status took 68 s here and 152 s from a
-    # remote brain, over a 15-minute tick (2026-10-15).
-    found: Dict[str, List[Dict[str, Any]]] = {}
-    waiting: Dict[str, Dict[str, Any]] = {}
-    for repo, done, value in per_repo.each(repos, read, seconds, READ_WORKERS):
-        if not done:
-            _say(out, emit, ["", "## %s" % repo, "", _skip_line(repo, per_repo.not_read(seconds, value))])
-            continue
-        section, into, waits = value
-        found.update(into)
-        waiting.update(waits)
-        _say(out, emit, section)
+def _status_fault(err: GitHubError) -> str:
+    """Why a status read failed, as one line: a rate limit that resets past
+    the deadline, or GitHub's fault. A dropped connection is raised, so
+    per_repo.each reads the repo again."""
+    if isinstance(err, RateLimited):
+        return "rate limited until %s, past the deadline" % _utc(err.until)
+    if err.status == 0:
+        raise err
+    return "read failed: %s" % _one_line(str(err), 200)
+
+
+def _status_read(reads: Any, repo: str, now: datetime, bot: str, authors: Sequence[str],
+                 check: str, caps: Dict[str, str], hold: Sequence[str], stop: float
+                 ) -> Tuple[Any, ...]:
+    """One repo's status read: ("read", its section, its tickets, its waiting
+    count), or ("missed", why) when GitHub refused it (_status_fault). Each
+    read keeps its own tickets and waiting count, so a timed-out read that
+    finishes late changes nothing the run prints."""
+    _progress("status: reading %s (requests: %d)" % (repo, getattr(reads, "requests", 0)))
+    into: Dict[str, List[Dict[str, Any]]] = {}
+    waits: Dict[str, Dict[str, Any]] = {}
+    try:
+        section = _sit_out_rate_limits(lambda: _readable_section(
+            reads, repo, now, bot, authors, into, check, waits, caps, hold), stop, "status")
+    except GitHubError as err:
+        return ("missed", _status_fault(err))
+    return ("read", section, into, waits)
+
+
+def _status_outcome(repo: str, done: bool, value: Any, seconds: float
+                    ) -> Tuple[str, List[str]]:
+    """What one per_repo.each answer adds: ("late", no lines) past the
+    deadline, ("missed", its skipped section) for a repo not read, or
+    ("read", its section)."""
+    if not done and isinstance(value, per_repo.PastDeadline):
+        return "late", []
+    if not done or value[0] == "missed":
+        why = value[1] if done else per_repo.not_read(seconds, value)
+        return "missed", ["", "## %s" % repo, "", _skip_line(repo, why)]
+    return "read", value[1]
+
+
+def _lane_status_line(reads: Any, lanes_repo: str, authors: Sequence[str], now: datetime,
+                      missed: List[str]) -> str:
+    """The dated lane status, or why it was not read (added to `missed`)."""
+    try:
+        return _dated_lane_status(_lane_status(reads, lanes_repo, authors), now)
+    except GitHubError as err:
+        why = _status_fault(err)
+    missed.append("lane status")
+    return "status skipped the lane status: %s" % why.replace(", past the deadline", "")
+
+
+def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dict[str, Any]]],
+                     waiting: Dict[str, Dict[str, Any]], lanes_repo: str, authors: Sequence[str],
+                     now: datetime, env: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """The sections across repos, from the repos read, and what of them was
+    not read (the lane status, when GitHub refused it)."""
     found = {repo: found[repo] for repo in repos if repo in found}
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
@@ -1383,11 +1558,81 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
     tail += [""] + priority_lines(found, now)
-    tail += [""] + waiting_lines(gh, waiting, repos)
+    tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)
     tail += [""] + validation_gap_lines(env)
-    tail += ["", "## Lane status", _dated_lane_status(_lane_status(gh, lanes_repo, authors), now)]
-    _say(out, emit, tail)
+    unread: List[str] = []
+    tail += ["", "## Lane status", _lane_status_line(reads, lanes_repo, authors, now, unread)]
+    return tail, unread
+
+
+def _status_tail(reads: Any, repos: Sequence[str], found: Dict[str, List[Dict[str, Any]]],
+                 waiting: Dict[str, Dict[str, Any]], lanes_repo: str, authors: Sequence[str],
+                 now: datetime, env: Dict[str, str], missed: List[str], stop: float,
+                 side: Optional[_SideReads] = None) -> List[str]:
+    """The sections across repos, read within _tail_seconds of `stop`, and
+    the partial line when anything was not read: a partial read never reads
+    as complete. Sections still reading past that bound are named skipped,
+    and `side` ends their reads."""
+    done, answer = _within(lambda: _status_sections(reads, repos, found, waiting, lanes_repo,
+                                                    authors, now, env), _tail_seconds(stop))
+    if done:
+        tail, unread = answer
+        missed += unread
+    else:
+        if side is not None:
+            side.end()  # the sections still reading end now, not at the command's exit
+        tail = ["", "status skipped the sections across repos: deadline"]
+        missed.append("sections across repos")
+    if missed:
+        tail += ["", "status partial: not read this run: %s" % " ".join(missed)]
+    return tail
+
+
+def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, str],
+                 now: datetime, authors: Sequence[str],
+                 emit: Optional[Callable[[str], None]], seconds: float, stop: float,
+                 bot: str, missed: List[str], side: Optional[_SideReads] = None) -> str:
+    """status past its arguments. `side` stops the repo reads still running
+    once the deadline has passed, and the cross-repo reads once they run
+    past their own bound (_SideReads)."""
+    # One pass reads each issue, issue listing, comments and events once,
+    # across every repo and the lane status (loom#2078).
+    reads = issue_reads.once(gh)
+    out: List[str] = []
+    _say(out, emit, ["# Loom status", "", trusted_line(authors)])
+    check = review_check_name(env)
+    caps: Dict[str, str] = {}
+    # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
+    hold = hold_logins(env)
+    # The lightest repos are read first, so a deadline leaves only heavy
+    # ones (lightest_first). A status took 68 s here and 152 s from a remote
+    # brain, over a 15-minute tick (2026-10-15), and about 4 minutes for 19
+    # repos inside a 2-minute command (loom#2415).
+    order = lightest_first(repos, repo_weights(reads, repos))
+    found: Dict[str, List[Dict[str, Any]]] = {}
+    waiting: Dict[str, Dict[str, Any]] = {}
+    late: List[str] = []
+    for repo, done, value in per_repo.each(
+            order, lambda r: _status_read(reads, r, now, bot, authors, check, caps, hold, stop),
+            seconds, READ_WORKERS, clock=lambda: _clock(), until=stop):
+        kind, lines = _status_outcome(repo, done, value, seconds)
+        if kind == "late":
+            late.append(repo)
+            continue
+        if kind == "missed":
+            missed.append(repo)
+        else:
+            found.update(value[2])
+            waiting.update(value[3])
+        _say(out, emit, lines)
+    if late:
+        if side is not None:
+            side.stop()  # the reads still running end now, not at the command's exit
+        missed += late
+        _say(out, emit, [""] + ["status skipped %s: deadline" % repo for repo in late])
+    _say(out, emit, _status_tail(reads, repos, found, waiting, lanes_repo, authors, now, env,
+                                 missed, stop, side))
     return "\n".join(out)
 
 
@@ -5877,23 +6122,43 @@ def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str],
 
 
 def _item_revisions(gh: GitHub, items: Sequence[handoff.Mark],
-                    skipped: Dict[str, str]
+                    skipped: Dict[str, str],
+                    faults: Optional[Dict[Tuple[str, int], str]] = None
                     ) -> Tuple[Dict[Tuple[str, int], Optional[str]], Dict[Tuple[str, int], str]]:
     """Each handoff item's revision (item_revision), and apart from those the
     items GitHub will not show, with the reason: an item in a skipped repo,
-    or one whose read answers moved or forbidden."""
+    or one whose read answers moved or forbidden.
+
+    Any other GitHubError ends the read, unless `faults` is given (resume,
+    loom#1578): then an item GitHub answers with a fault is left out with
+    "read failed: <the error>" as its reason, and recorded in `faults` too,
+    so the caller names it and reports the run as partial. A rate limit or
+    a dropped connection is still raised: the caller waits it out or reads
+    the repo again."""
     current: Dict[Tuple[str, int], Optional[str]] = {}
     gone: Dict[Tuple[str, int], str] = {}
     for item in dict.fromkeys(m.item for m in items):
         if item[0] in skipped:
             gone[item] = skipped[item[0]]
     wanted = [item for item in dict.fromkeys(m.item for m in items) if item not in gone]
-    for item, (revision, reason) in zip(wanted, _read_each(
-            lambda item: _revision_or_reason(gh, item), wanted), strict=True):
+
+    def read(item: Tuple[str, int]) -> Tuple[Optional[str], Optional[str], bool]:
+        try:
+            return _revision_or_reason(gh, item) + (False,)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            if faults is None or err.status == 0:
+                raise
+            return None, "read failed: %s" % _one_line(str(err), 200), True
+
+    for item, (revision, reason, fault) in zip(wanted, _read_each(read, wanted), strict=True):
         if reason is None:
             current[item] = revision
         else:
             gone[item] = reason
+            if fault and faults is not None:
+                faults[item] = reason
     return current, gone
 
 
@@ -5926,11 +6191,12 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                        found: List[Dict[str, Any]],
     latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None,
                        skipped: Sequence[str] = (),
-                       unread: Optional[Dict[str, str]] = None) -> List[str]:
+                       unread: Optional[Dict[str, str]] = None,
+                       faults: Optional[Dict[Tuple[str, int], str]] = None) -> List[str]:
     found_marks = handoff.marks(found)
     items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
     latest = latest or {_mark_key(m): m for m in found_marks}
-    current, gone = _item_revisions(gh, items, unread or {})
+    current, gone = _item_revisions(gh, items, unread or {}, faults)
     items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
@@ -6086,109 +6352,316 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     return out if ready else out + ["- none"]
 
 
+# How long resume reads before it stops and names the repos it did not reach
+# (`resume --deadline MINUTES`, loom#1578). Before it, resume on the remote
+# brain ran silent past the tick's command timeout and was killed with
+# nothing printed but its first line.
+RESUME_DEADLINE_MINUTES = 8.0
+# The exit code of a resume that did not read every repo it was given: the
+# lines it printed hold, and the repos it names are read again next tick.
+RESUME_PARTIAL_EXIT = 3
+
+
+def _progress(text: str) -> None:
+    """One resume or status progress line on stderr, at once, so a slow run
+    reads as slow and not hung (loom#1578, loom#2415). One write per line: repos are read side
+    by side, and two lines must not run together."""
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+class _ResumePass:
+    """What the repos read side by side in one resume share: the newest mark
+    of each handoff across the goals read so far, and the repos GitHub will
+    not show. Each is read and written under one lock."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
+        self.unread: Dict[str, str] = {}
+
+    def note(self, goals: Sequence[GoalJournals]
+             ) -> Tuple[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark], Dict[str, str]]:
+        """Keep `goals`' marks; the newest marks and the unreadable repos so far."""
+        with self.lock:
+            for _, _, found, _ in goals:
+                for mark in handoff.marks(found):
+                    key = _mark_key(mark)
+                    if key not in self.latest or mark.at >= self.latest[key].at:
+                        self.latest[key] = mark
+            return dict(self.latest), dict(self.unread)
+
+    def gone(self, repo: str, reason: str) -> None:
+        with self.lock:
+            self.unread[repo] = reason
+
+
+class _ReadsStopped(Exception):
+    """A read refused because resume or status reached its deadline (_SideReads)."""
+
+
+class _SideReads:
+    """`gh`'s transport, wrapped so that after stop() a request from any
+    thread outside this pass's own is refused with _ReadsStopped: the repo
+    reads still running at the deadline end at their next request instead
+    of holding the command's exit. The pass's own threads are the one that
+    made it and those _side_by_side starts from it (_PASS): the sections
+    across repos, read after the deadline, go on. end() refuses those too,
+    once the sections ran past their own bound. restore() puts the
+    transport back, unless the reads were stopped: a stopped pass's reads
+    must stay stopped."""
+
+    def __init__(self, gh: Any, who: str = "resume") -> None:
+        self.gh = gh
+        self.who = who
+        self.transport = getattr(gh, "transport", None)
+        self.stopped = threading.Event()
+        self.ended = threading.Event()
+        self.outer = getattr(_PASS, "side", None)
+        _PASS.side = self
+        if self.transport is not None:
+            gh.transport = self.send
+
+    def send(self, method: str, url: str, headers: Dict[str, str],
+             payload: Optional[bytes]) -> Any:
+        if self.ended.is_set() or (self.stopped.is_set()
+                                   and getattr(_PASS, "side", None) is not self):
+            raise _ReadsStopped("%s reached its deadline: %s %s not sent" % (self.who, method, url))
+        return self.transport(method, url, headers, payload)  # type: ignore[misc]
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+    def end(self) -> None:
+        self.stopped.set()
+        self.ended.set()
+
+    def restore(self) -> None:
+        _PASS.side = self.outer
+        if self.transport is not None and not self.stopped.is_set():
+            self.gh.transport = self.transport
+
+
+# How long past its deadline resume or status may read the sections that span
+# every repo, when the repo reads used up the deadline. Past it the sections
+# are named as skipped, so the command returns within the deadline and this
+# (loom#1578: at --deadline 1.5 a resume ran past a 100 s tick timeout).
+PAST_DEADLINE_SECONDS = 5.0
+
+
+def _tail_seconds(stop: float) -> float:
+    """The time the sections across repos may take: what is left of the
+    deadline (`stop`, a _clock reading), and PAST_DEADLINE_SECONDS."""
+    return max(0.0, stop - _clock()) + PAST_DEADLINE_SECONDS
+
+
+def _sit_out_rate_limits(read: Callable[[], Any], stop: float, who: str = "resume") -> Any:
+    """read(), again after a rate-limit refusal when the window resets before
+    `stop` (a _clock reading), logging the wait before it starts as `who`.
+    A refusal whose reset comes past `stop` is raised."""
+    while True:
+        try:
+            return read()
+        except RateLimited as err:
+            wait = max(0.0, err.until - time.time())
+            if _clock() + wait >= stop:
+                raise
+            _progress("%s: waiting %.0fs for the GitHub rate limit (resets %s)"
+                      % (who, wait, _utc(err.until)))
+            _sleep(wait)
+
+
+def _resume_one(gh: GitHub, repo: str, authors: Sequence[str], shared: _ResumePass,
+                now: datetime, check: str, trusted: Sequence[str], stop: float
+                ) -> Tuple[Any, ...]:
+    """One repo's whole resume read, so its goals print as soon as it is done:
+    ("read", its goals, its parts, the handoff items GitHub answered with a
+    fault, each named in its goal's section), ("unread", why) when GitHub will not show
+    the repo (github.unreadable), or ("missed", why) when this run could not
+    read it: a rate limit that resets past the deadline, or GitHub answering
+    with a fault. A dropped connection is raised, so per_repo.each reads the
+    repo once more; anything that is not a GitHubError is raised too."""
+    def read() -> Tuple[Any, ...]:
+        # The sensitive pull requests come first: a repo GitHub will not
+        # show there is named once and its goals are never read.
+        try:
+            ready = _ready_sensitive_in(gh, repo, now, check)
+            skipped: Dict[str, str] = {}
+            mine = _goal_journals(gh, [repo], authors, skipped)
+        except GitHubError as err:
+            reason = unreadable(err)
+            if reason is None:
+                raise
+            return ("unread", reason)
+        if repo in skipped:
+            return ("unread", skipped[repo])
+        # A handoff finished by a goal in a repo not read yet still shows
+        # until the item itself reads as finished or closed.
+        latest, gone = shared.note(mine)
+        faults: Dict[Tuple[str, int], str] = {}
+        return ("read", mine, _resume_repo(gh, repo, mine, latest, gone, now, check, trusted,
+                                           sensitive=ready, faults=faults), faults)
+
+    try:
+        return _sit_out_rate_limits(read, stop)
+    except RateLimited as err:
+        return ("missed", "rate limited until %s, past the deadline" % _utc(err.until))
+    except GitHubError as err:
+        if err.status == 0:
+            raise
+        return ("missed", "read failed: %s" % _one_line(str(err), 200))
+
+
 def resume(gh: GitHub, repos: Sequence[str], holder: str, lock_repo: str,
            now: Optional[datetime] = None, env: Optional[Dict[str, str]] = None,
            emit: Optional[Callable[[str], None]] = None,
-           budget: Optional[float] = None) -> str:
+           budget: Optional[float] = None, deadline: Optional[float] = None,
+           missed: Optional[List[str]] = None) -> str:
     """What the lock holder may finish for other brains: the live resume items
     on every goal, with each goal's stage owners, and whether broad GitHub
     work is open to it under the freshness rule (handoff.QUIET). Refuses
     unless `holder` holds the lock, so only the lock holder acts on it.
 
-    With `emit`, each part is handed to it as soon as it is known (loom#2049):
-    the heading once every repo's goal journals are read, then each repo's
-    goal items as that repo's reads finish, then the sections that span every
-    repo. A repo whose read runs past the per-repo budget is named as timed
-    out and left out of every later section."""
+    With `emit`, each part is handed to it as soon as it is known (loom#2049,
+    loom#1578): the heading at once, then each repo's goal items as that
+    repo's reads finish, then the freshness line, the repos left out and the
+    sections that span every repo. Progress goes to stderr: a line before
+    each repo, and one before every wait on GitHub.
+
+    A repo whose read runs past the per-repo budget is named as timed out; a
+    repo GitHub answers with a fault, or refuses for a rate limit that
+    resets past the deadline, is named as failed with what failed, and a
+    handoff item GitHub answers with a fault is named in its goal's section
+    the same way while the goal's other items are read. At
+    `deadline` minutes (RESUME_DEADLINE_MINUTES when None) it reads no more
+    and names each repo it did not finish as `resume skipped OWNER/NAME:
+    deadline`. Each repo and handoff item not read this run is added to
+    `missed`, when given.
+    A moved or forbidden repo is named under the skipped repos (loom#800)."""
     now = now or datetime.now(timezone.utc)
     authors = require_trusted_authors(env, "resume")
     seconds = per_repo.budget(env, budget)
+    minutes = RESUME_DEADLINE_MINUTES if deadline is None else float(deadline)
+    if minutes < 0:
+        raise ValueError("the resume deadline is zero or more minutes")
+    stop = _clock() + minutes * 60
     _lock_holder(gh, lock_repo, holder, now)
-    # Resume is read-only past the lock check: one pass reads each issue,
-    # issue listing, comments and events once (loom#2078).
-    gh = issue_reads.once(gh)
+    told = hasattr(gh, "on_wait")  # a GitHub client, not a test's stand-in
+    if told:
+        gh.on_wait = lambda wait: _progress("resume: waiting %.0fs to retry a GitHub read" % wait)
+    side = _SideReads(gh)
+    try:
+        return _resume_pass(gh, list(dict.fromkeys(repos)), holder, authors, now, env, emit,
+                            seconds, stop, missed if missed is not None else [], side.stop,
+                            side.end)
+    finally:
+        side.restore()
+        if told:
+            gh.on_wait = None
+
+
+def _resume_pass(gh: GitHub, repos: List[str], holder: str, authors: Sequence[str],
+                 now: datetime, env: Optional[Dict[str, str]],
+                 emit: Optional[Callable[[str], None]], seconds: float, stop: float,
+                 missed: List[str], halt: Callable[[], None] = lambda: None,
+                 end: Callable[[], None] = lambda: None) -> str:
+    """resume past the lock check, read-only: one pass reads each issue,
+    issue listing, comments and events once (loom#2078). `halt` stops the
+    repo reads still running once the deadline has passed, and `end` every
+    read once the sections across repos run past their bound (_SideReads,
+    _tail_seconds)."""
+    reads = issue_reads.once(gh)
     out: List[str] = []
-    goals, unread, timed = _resume_journals(gh, repos, authors, seconds)
-    # A moved or forbidden repo is named once and left out of every later
-    # section, so one stale LOOM_REPOS entry does not end the run (loom#800).
-    # A timed-out repo is left out the same way.
-    repos = [r for r in dict.fromkeys(repos) if r not in unread and r not in timed]
-    _say(out, emit, _resume_head(holder, authors, goals, unread, timed, now))
-    latest = _latest_marks(goals)
-    gone = dict(unread)  # a snapshot: a late read never sees a later change
     check, trusted = review_check_name(env), trusted_authors(env)
+    shared = _ResumePass()
+    _say(out, emit, ["# Resume for %s" % holder, "", trusted_line(authors)])
+    goals: List[GoalJournals] = []
     read: Dict[str, Dict[str, Any]] = {}
+    timed: Dict[str, str] = {}
+    failed: Dict[str, str] = {}
+    late: List[str] = []
+    faulted: List[str] = []
 
-    def gather(repo: str) -> Dict[str, Any]:
-        return _resume_repo(gh, repo, goals, latest, gone, now, check, trusted)
+    def gather(repo: str) -> Tuple[Any, ...]:
+        _progress("resume: reading %s (requests: %d)" % (repo, getattr(gh, "requests", 0)))
+        return _resume_one(reads, repo, authors, shared, now, check, trusted, stop)
 
-    for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS):
+    for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS,
+                                           clock=lambda: _clock(), until=stop):
         if not done:
-            _say(out, emit, ["", _skip_line(repo, per_repo.not_read(seconds, value))])
-            continue
-        read[repo] = value
-        if value["lines"]:
-            _say(out, emit, value["lines"])
-    _say(out, emit, _resume_tail(gh, [r for r in repos if r in read], read, now, env))
+            if isinstance(value, per_repo.PastDeadline):
+                late.append(repo)
+            else:
+                timed[repo] = per_repo.not_read(seconds, value)
+        elif value[0] == "unread":
+            shared.gone(repo, value[1])
+        elif value[0] == "missed":
+            failed[repo] = value[1]
+        else:
+            goals += value[1]
+            read[repo] = value[2]
+            faulted += [handoff.item_ref(item) for item in sorted(value[3])]
+            if value[2]["lines"]:
+                _say(out, emit, value[2]["lines"])
+    if late:
+        halt()  # the reads still running end now, not at the command's exit
+        _say(out, emit, [""] + ["resume skipped %s: deadline" % repo for repo in late])
+    missed += [r for r in repos if r in timed or r in failed] + late + faulted
+    kept = [r for r in repos if r in read]
+    head = _resume_head(holder, goals, shared.unread, timed, failed, now)
+    done, answer = _within(lambda: _resume_tail_or_why(reads, kept, read, now, env),
+                           _tail_seconds(stop))
+    tail, why = answer if done else ([], "deadline")
+    if why is not None:
+        if not done:
+            end()  # the sections still reading end now, not at the command's exit
+        tail = ["", "resume skipped the sections across repos: %s" % why]
+        missed.append("sections across repos")
+    _say(out, emit, head + tail)
     return "\n".join(out)
 
 
-def _resume_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str], seconds: float
-                     ) -> Tuple[List[GoalJournals], Dict[str, str], Dict[str, str]]:
-    """Every goal's journals across `repos`, in the order of `repos`, read
-    repo by repo under the budget: (goals, unreadable repos with the reason,
-    repos not read in time with the reason)."""
-    unread: Dict[str, str] = {}
-    timed: Dict[str, str] = {}
-
-    def journals(repo: str) -> Tuple[List[GoalJournals], Dict[str, str]]:
-        skipped: Dict[str, str] = {}
-        return _goal_journals(gh, [repo], authors, skipped), skipped
-
-    by_repo: Dict[str, List[GoalJournals]] = {}
-    for repo, done, value in per_repo.each(repos, journals, seconds, READ_WORKERS):
-        if done:
-            by_repo[repo], skipped = value
-            unread.update(skipped)
-        else:
-            timed[repo] = per_repo.not_read(seconds, value)
-    return [g for repo in dict.fromkeys(repos) for g in by_repo.get(repo, [])], unread, timed
+def _resume_tail_or_why(gh: GitHub, repos: Sequence[str], read: Dict[str, Dict[str, Any]],
+                        now: datetime, env: Optional[Dict[str, str]]
+                        ) -> Tuple[List[str], Optional[str]]:
+    """(_resume_tail, None), or (no lines, why it was not read): a rate limit
+    or a fault from GitHub. A dropped connection is raised."""
+    try:
+        return _resume_tail(gh, repos, read, now, env), None
+    except RateLimited as err:
+        return [], "rate limited until %s" % _utc(err.until)
+    except GitHubError as err:
+        if err.status == 0:
+            raise
+        return [], "read failed: %s" % _one_line(str(err), 200)
 
 
-def _latest_marks(goals: Sequence[GoalJournals]
-                  ) -> Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]:
-    """The newest mark of each handoff across every goal's journals."""
-    latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark] = {}
-    for _, _, found, _ in goals:
-        for mark in handoff.marks(found):
-            key = (mark.stage, mark.item, mark.key if mark.stage == "brief" else "")
-            if key not in latest or mark.at >= latest[key].at:
-                latest[key] = mark
-    return latest
-
-
-def _resume_head(holder: str, authors: Sequence[str], goals: Sequence[GoalJournals],
-                 unread: Dict[str, str], timed: Dict[str, str],
-                 now: datetime) -> List[str]:
-    """The heading, the freshness line, and the repos left out."""
-    head = ["# Resume for %s" % holder, "", trusted_line(authors), "",
-            _freshness_line(handoff.peer_journals(
-                [j for _, _, found, _ in goals for j in found], holder, now))]
-    if unread:
-        head += ["", "## Skipped repos (fix LOOM_REPOS)"]
-        head += [_skip_line(repo, reason) for repo, reason in sorted(unread.items())]
-    if timed:
-        head += ["", "## Timed-out repos (read again next tick)"]
-        head += [_skip_line(repo, reason) for repo, reason in timed.items()]
+def _resume_head(holder: str, goals: Sequence[GoalJournals], unread: Dict[str, str],
+                 timed: Dict[str, str], failed: Dict[str, str], now: datetime) -> List[str]:
+    """The freshness line, from the goals read, and the repos left out."""
+    head = ["", _freshness_line(handoff.peer_journals(
+        [j for _, _, found, _ in goals for j in found], holder, now))]
+    for title, left in (("Skipped repos (fix LOOM_REPOS)", unread),
+                        ("Timed-out repos (read again next tick)", timed),
+                        ("Failed repos (read again next tick)", failed)):
+        if left:
+            head += ["", "## " + title]
+            head += [_skip_line(repo, reason) for repo, reason in sorted(left.items())]
     return head
 
 
 def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
                  latest: Dict[Tuple[str, Tuple[str, int], str], handoff.Mark],
                  gone: Dict[str, str], now: datetime, check: str,
-                 trusted: Sequence[str]) -> Dict[str, Any]:
+                 trusted: Sequence[str],
+                 sensitive: Optional[List[Dict[str, Any]]] = None,
+                 faults: Optional[Dict[Tuple[str, int], str]] = None) -> Dict[str, Any]:
     """One repo's resume reads: its goals' resume lines, printed as the repo
-    finishes, and its share of each cross-repo section."""
+    finishes, and its share of each cross-repo section. `sensitive`, when
+    given, is the repo's ready sensitive pull requests already read by
+    resume; the part reads them itself otherwise. `faults`, when given,
+    collects the handoff items GitHub answered with a fault
+    (_item_revisions)."""
     mine = [g for g in goals if g[0] == repo]
 
     def goal_lines() -> List[str]:
@@ -6198,7 +6671,7 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
             _issues(gh, repo)
         lines: List[str] = []
         for r, issue, found, skipped in mine:
-            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone)
+            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone, faults)
         return lines
 
     # The five parts read different things, so they run side by side: one
@@ -6207,13 +6680,12 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
     # and the first exception in this order is raised, as a loop would.
     parts: List[Tuple[str, Callable[[], Any]]] = [
         ("lines", goal_lines),
-        ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check)),
+        ("sensitive", lambda: _ready_sensitive_in(gh, repo, now, check) if sensitive is None else sensitive),
         ("epics", lambda: _finished_epic_lines(gh, [(r, i) for r, i, _, _ in mine])),
         ("verify", lambda: _verify_due_in(gh, repo, now)),
         ("audit", lambda: audit.due(gh, [repo], trusted, now.timestamp()))]
-    with ThreadPoolExecutor(max_workers=len(parts)) as pool:
-        futures = [(key, pool.submit(part)) for key, part in parts]
-        return {key: future.result() for key, future in futures}
+    answers = _side_by_side([part for _, part in parts], len(parts))
+    return {key: answer.get() for (key, _), answer in zip(parts, answers, strict=True)}
 
 
 def _resume_tail(gh: GitHub, repos: Sequence[str], read: Dict[str, Dict[str, Any]],
@@ -6283,7 +6755,8 @@ def lane_model(lane: str, env: Optional[Dict[str, str]] = None) -> Optional[str]
     five times while the ladder recorded claude-sonnet-5-5."""
     env = os.environ if env is None else env
     for name in dict.fromkeys((lane, re.sub(r"-[0-9]+$", "", lane))):
-        value = str(env.get("LOOM_%s_MODEL" % name.upper().replace("-", "_")) or "").strip()
+        key = "LOOM_%s_MODEL" % name.upper().replace("-", "_")
+        value = str(env.get(key) or "").strip() or runners.tracked_setting(key)
         if value:
             return value
     return None
@@ -6757,7 +7230,7 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom"); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
+    s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom"); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
@@ -6768,12 +7241,13 @@ def parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
+    ac = sub.add_parser("audit-close", help="the facts a close audit line carries: cited hash, merge commit, on the default branch or not; exit 0 only when sound"); ac.add_argument("ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
-    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET)
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
     st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
     sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
@@ -6803,10 +7277,17 @@ def _flushed(part: str) -> None:
     print(part, flush=True)
 
 
-def _cmd_status(gh: GitHub, args: argparse.Namespace) -> None:
+def _cmd_status(gh: GitHub, args: argparse.Namespace) -> int:
+    """Exit STATUS_PARTIAL_EXIT when a repo was not read this run, after
+    naming it on stdout and on stderr (loom#2415)."""
     _print_clock(gh, _repo(args.lanes_repo))
+    missed: List[str] = []
     status(gh, [_repo(x) for x in args.repos], _repo(args.lanes_repo),
-           emit=_flushed, budget=args.repo_budget)
+           emit=_flushed, budget=args.repo_budget, deadline=args.deadline, missed=missed)
+    if not missed:
+        return 0
+    print("status partial: not read this run: %s" % " ".join(missed), file=sys.stderr)
+    return STATUS_PARTIAL_EXIT
 
 
 def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
@@ -6865,6 +7346,14 @@ def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     print(audit_proof(gh, repo, number, args.result, args.note))
+
+
+def _cmd_audit_close(gh: GitHub, args: argparse.Namespace) -> int:
+    """Print what git holds for a ticket's close (bus/close_audit.py)."""
+    repo, number = _ref(args.ticket, "ticket")
+    report = close_audit.read_close(gh, repo, number, fleet=close_audit.fleet_repos())
+    print("\n".join(close_audit.lines(report)))
+    return 0 if report.verdict == close_audit.SOUND else 1
 
 
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
@@ -6940,15 +7429,23 @@ def _cmd_done(gh: GitHub, args: argparse.Namespace) -> None:
                               key=args.resolves))
 
 
-def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> None:
+def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
+    """Exit RESUME_PARTIAL_EXIT when a repo was not read this run, after
+    naming it on stdout and on stderr (loom#1578)."""
     _print_clock(gh, _repo(args.lock_repo))
+    missed: List[str] = []
     resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
-           emit=_flushed, budget=args.repo_budget)
+           emit=_flushed, budget=args.repo_budget, deadline=args.deadline, missed=missed)
+    if not missed:
+        return 0
+    print("resume partial: not read this run: %s" % " ".join(missed), file=sys.stderr)
+    return RESUME_PARTIAL_EXIT
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize, "live": _cmd_live,
-            "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
+            "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
+            "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,
@@ -6967,8 +7464,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
-        COMMANDS[args.command](gh, args)
-        return 0
+        code = COMMANDS[args.command](gh, args)
+        return code if isinstance(code, int) else 0
     except (ValueError, OSError, GitHubError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1 if isinstance(exc, ValueError) else 2

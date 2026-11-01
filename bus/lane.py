@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, hunt_plan, notify, pr_repair, tickets
+from . import brain, change_class, hunt_plan, notify, pr_repair, risk_line, tickets
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -518,7 +518,7 @@ def _what(body: str) -> str:
 
 
 def pr_body(repo: str, issue: Dict[str, Any], kind: str, counts: Dict[str, int],
-            lane: str = "muse") -> str:
+            lane: str = "muse", risk_text: str = "") -> str:
     """The pull request body every lane writes (lanes/run_lane.sh pr_body,
     rendered by bus/pr_repair.py): the Intent section, Why, Summary,
     Acceptance criteria, Size, Out of scope, the Loom footer and a Refs line.
@@ -530,12 +530,21 @@ def pr_body(repo: str, issue: Dict[str, Any], kind: str, counts: Dict[str, int],
     body = pr_repair._render_generated(brief, lane, model, tickets.ticket_name(repo, number))
     intent = change_class.render_intent(kind, change_class.behavior_lines(
         "", _what(str(issue.get("body") or ""))), counts)
-    body = change_class.with_intent(body, intent)
+    body = change_class.with_intent(body, risk_line.with_risk(intent, risk_text))
     found = hunt_plan.problems(body)
     if found:
         raise ValueError("the pull request body would fail the review bot's plan checks: "
                          + "; ".join(found) + " (fix the ticket's brief sections)")
     return body
+
+
+def _lane_summary() -> str:
+    """The lane's .loom/summary.md at the top of the tree, or "" without one."""
+    try:
+        with open(change_class.SUMMARY_FILE, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return ""
 
 
 def open_pr(gh: GitHub, repo: str, number: int, base: str,
@@ -555,14 +564,18 @@ def open_pr(gh: GitHub, repo: str, number: int, base: str,
         import base64
         patterns = change_class.parse_patterns(base64.b64decode(patterns_data["content"]).decode("utf-8"))
     kind = change_class.classify(files, patterns)
-    body = pr_body(repo, issue, kind, change_class.count_by_class(files, patterns))
+    raw = _git("-c", "core.quotePath=false", "diff", "--raw", "-M", "%s...HEAD" % base)
+    risk = risk_line.compute(repo, risk_line.entries(raw), _lane_summary(),
+                             str(issue.get("body") or ""), kind == "sensitive")
+    body = pr_body(repo, issue, kind, change_class.count_by_class(files, patterns),
+                   risk_text=risk_line.line(risk))
     made = gh.rest("POST", "/repos/%s/pulls" % repo, {
         "title": title or str(issue.get("title") or ""), "head": branch,
         "base": base, "body": body}).data
     if not isinstance(made, dict) or "number" not in made:
         raise ValueError("GitHub did not return the created pull request")
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, made["number"]),
-            {"labels": ["class:" + kind]})
+            {"labels": ["class:" + kind, risk_line.label(risk)]})
     labels = [x for x in _names(issue) if x not in ("loom:running", "loom:queued")]
     labels.append("loom:pr")
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})

@@ -361,8 +361,10 @@ SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # never a Spark. Operator 2026-10-19: make every free provider a lane, spend
 # its allowance and wait out each reset. free-ollama Ollama Cloud and free-gemma
 # Gemma may take private repos; free-nvidia NVIDIA NIM, free-kilo Kilo and free-groq
-# Groq may train on prompts, so they are public only (PUBLIC_ONLY).
-FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq")
+# Groq may train on prompts, so they are public only (PUBLIC_ONLY), as does
+# free-openrouter, OpenRouter's free models on a cluster runner.
+FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
+             "free-openrouter")
 TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priorities: Muse and agy first on public repos, so their
     # allowances are spent before the rest (2026-10-14); then the Sparks,
@@ -458,7 +460,8 @@ FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
 # free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
-PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq")
+PUBLIC_ONLY = ("zen", "zai", "agy", "copilot", "opencode-go-4", "muse", "free-nvidia", "free-kilo", "free-groq",
+               "free-openrouter")
 # A rung whose least-loaded lane already holds this many briefed or running
 # tickets is passed over for the next one (docs/MUSE.md: "a higher rung rather
 # than a wait behind a busy lane that is up"). Only lanes that are up and serve
@@ -1046,7 +1049,8 @@ def known_models(env: Optional[Dict[str, str]] = None) -> set:
     env = os.environ if env is None else env
     found = {model for _, model in CLIMB} | set(HARD_MODELS.values())
     found |= {model for _, model, _ in EQUIVALENTS.values()}
-    for key, value in env.items():
+    settings = {**{k: v for s in runners.TRACKED_SLOTS.values() for k, v in s.items()}, **env}
+    for key, value in settings.items():
         if re.fullmatch(r"LOOM_[A-Z0-9_]+_MODELS?", key) and key != "LOOM_BRAIN_MODEL":
             for model in str(value).split():
                 found |= {model} | {"%s-%s" % (model, e) for e in ("low", "medium", "high")}
@@ -1872,9 +1876,16 @@ class Factory:
             self._private[repo] = not isinstance(data, dict) or data.get("private") is not False
         return self._private[repo]
 
-    def _up(self, lane: str) -> bool:
-        """A lane that is up and not at a limit."""
-        return lane not in self.limited and (self.available is None or lane in self.available)
+    def _takes_work(self, lane: str) -> bool:
+        """Whether the lane may be given a ticket now: not at a limit, its
+        heartbeat says available, and not down (self.down, which holds the
+        demoted lanes too). Every lane choice reads this one test: a queued
+        ticket's lane, a tier move, a stall move, a rung or model lane. It
+        once left out self.down, so a demoted lane with a fresh heartbeat was
+        given queued tickets and the same pass's step-aside moved each
+        straight off again (loom#2430)."""
+        return (lane not in self.limited and lane not in self.down
+                and (self.available is None or lane in self.available))
 
     def _serves(self, lane: str, model: str) -> bool:
         """Whether the lane can run this model now: no limit on it there and
@@ -1883,9 +1894,9 @@ class Factory:
                 and not bench.is_benched(self.benched, lane, model))
 
     def _free(self, lane: str) -> bool:
-        """A lane that is up, not at a limit, and holds no briefed or
+        """A lane that takes work (_takes_work) and holds no briefed or
         running ticket."""
-        return self._up(lane) and self.load.get(lane, 0) == 0
+        return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
     def _tier_move(self, repo: str, issue: Dict[str, Any],
                    old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
@@ -1900,7 +1911,7 @@ class Factory:
                if x != old and (allow_remote or x not in REMOTE_LANES)
                and (x != "agy" or agy_ok)]
         lane = next((x for x in own if self._free(x)), None)
-        if lane is not None or any(self._up(x) for x in own):
+        if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
         if not all(self._out_hours(x) for x in whole):
@@ -2146,10 +2157,10 @@ class Factory:
         return lanes
 
     def _up_lanes(self, repo: str) -> Dict[int, Tuple[str, ...]]:
-        """Each CLIMB rung's lanes that may serve it now for this repo: up,
-        not at a limit, and with no limit on the rung's model there."""
+        """Each CLIMB rung's lanes that may serve it now for this repo: they
+        take work (_takes_work) and hold no limit on the rung's model there."""
         return {n: tuple(lane for lane in self._rung_lanes(repo, n)
-                         if self._up(lane) and self._serves(lane, CLIMB[n - 1][1]))
+                         if self._takes_work(lane) and self._serves(lane, CLIMB[n - 1][1]))
                 for n in range(1, len(CLIMB) + 1)}
 
     def _move_capped(self, repo: str, issue: Dict[str, Any],
@@ -4106,7 +4117,7 @@ class Factory:
         its rung, or of its difficulty tier. Never up the ladder."""
         old = _lane(issue)
         pool = self._rung_lanes(repo, rung) if rung else tier_lanes(issue, self._is_private(repo))
-        return [x for x in pool if x != old and self._up(x)
+        return [x for x in pool if x != old and self._takes_work(x)
                 and (not rung or self._serves(x, CLIMB[rung - 1][1]))
                 and (x != "agy" or agy_takes_header(issue))]
 
@@ -4137,7 +4148,7 @@ class Factory:
             return
         lane = pick_lane(lanes, self.load)
         waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
-        if self._up(old) and there and there >= waiting - 1:
+        if self._takes_work(old) and there and there >= waiting - 1:
             # A move to a lane with as long a wait only restarts the stall
             # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
             # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
@@ -4360,7 +4371,7 @@ class Factory:
                 continue
             if (_state(issue) in ("briefed", "running")
                     or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
-                        and self._up(_lane(issue)))):
+                        and self._takes_work(_lane(issue)))):
                 self.load[_lane(issue)] = self.load.get(_lane(issue), 0) + 1
 
     def _queued_model_lane(self, repo: str, model: str, busy_ok: bool = False) -> Optional[str]:
@@ -4368,7 +4379,7 @@ class Factory:
         first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
         return next((candidate for candidate in model_lanes(model)
-                     if (self._up(candidate) and self._serves(candidate, model)
+                     if (self._takes_work(candidate) and self._serves(candidate, model)
                          if busy_ok else self._free(candidate))
                      and (not needs_public_repo(candidate, model)
                           or not self._is_private(repo))), None)
@@ -4382,7 +4393,7 @@ class Factory:
             return None
         from .station import model_lanes
         lanes, equivalent, why = EQUIVALENTS[model]
-        if any(self._up(x) for x in model_lanes(model) if x not in lanes):
+        if any(self._takes_work(x) for x in model_lanes(model) if x not in lanes):
             return None
         lane = next((x for x in lanes if self._free(x)), None)
         return (lane, equivalent, why) if lane is not None else None
@@ -4414,7 +4425,7 @@ class Factory:
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))
         assigned = _lane(issue)
-        if assigned in REMOTE_LANES and not self._is_private(repo) and self._up(assigned):
+        if assigned in REMOTE_LANES and not self._is_private(repo) and self._takes_work(assigned):
             # A live remote assignment stays queued for its pull worker.
             self._waiting(repo, issue["number"], "remote lane %s has not pulled it" % assigned)
             return "%s waits for remote lane %s to pull it" % (ref, assigned)
@@ -4882,7 +4893,7 @@ class Factory:
         free = next((x for x in lanes if self._free(x)), None)
         if free is not None:
             return free
-        up = [x for x in lanes if self._up(x)]
+        up = [x for x in lanes if self._takes_work(x)]
         return pick_lane(up, self.load) if up else None
 
     # -- the pass --------------------------------------------------------

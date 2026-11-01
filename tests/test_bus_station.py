@@ -5823,6 +5823,30 @@ class RetryTest(Base):
         self.run_pass()
         self.assertIn("lane:anthropic", self.fake.names(12))
 
+    def test_a_retry_never_moves_a_ticket_onto_a_demoted_lane(self):
+        # loom#2430: a demoted lane with a fresh heartbeat passed
+        # _retry_eligible, so a retry moved a ticket onto a lane that takes
+        # no build ticket, and the factory moved it straight off again.
+        self.heartbeat("anthropic")
+        self.heartbeat("opencode-go")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        with mock.patch.object(station.Station, "demoted_lanes",
+                               return_value={"anthropic": "3 bad outcomes in 7 days"}):
+            self.run_pass()
+        self.assertNotIn("lane:anthropic", self.fake.names(12))
+        self.assertIn("lane:opencode-go", self.fake.names(12))
+        self.assertIn("moved from lane codex to lane opencode-go.", self.bodies()[-2])
+        self.assertFalse([b for b in self.bodies() if "is demoted" in b])
+
+    def test_a_retry_with_only_a_demoted_lane_left_is_not_retried_there(self):
+        self.heartbeat("anthropic")
+        self.failed(reason="[limit] agent exited 1: provider limit reached")
+        with mock.patch.object(station.Station, "demoted_lanes",
+                               return_value={"anthropic": "3 bad outcomes in 7 days"}):
+            self.run_pass()
+        self.assertNotIn("lane:anthropic", self.fake.names(12))
+        self.assertFalse([b for b in self.bodies() if b.startswith("Automatic retry")])
+
     def test_an_unavailable_lane_is_skipped(self):
         self.heartbeat("codex-2", available=False)
         self.heartbeat("anthropic", age=3600)
