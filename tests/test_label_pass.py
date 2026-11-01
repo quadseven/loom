@@ -54,7 +54,8 @@ class Plan(unittest.TestCase):
             [labeled("loom:answered", "loom-app[bot]"), labeled("loom:queued", "loom-app[bot]"),
              labeled("loom:answered", "a-person")],
             STATION)
-        self.assertEqual(["loom:answered"], removed(found))
+        self.assertEqual(["loom:answered", "loom:human"], removed(found))
+        self.assertEqual(["needs:human"], found.add)
 
     def test_without_a_station_event_the_newest_by_anyone_stays_then_the_furthest(self):
         both = issue(1, ("loom:pr", "loom:merged"))
@@ -71,7 +72,7 @@ class Plan(unittest.TestCase):
         for holder in ("loom:human", "needs:example-op"):
             with self.subTest(holder=holder):
                 found = label_pass.plan(issue(1, ("needs-brain", holder)))
-                self.assertEqual(["needs-brain"], removed(found))
+                self.assertIn("needs-brain", removed(found))
         self.assertEqual([], removed(label_pass.plan(issue(1, ("needs-brain", "needs-operator")))))
 
     def test_triage_goes_once_the_issue_is_a_ticket_or_closed(self):
@@ -148,7 +149,9 @@ class Step(unittest.TestCase):
         said = self.run_step(shadow_on=False)
         self.assertEqual([("DELETE", "issues/1/labels/loom:queued"),
                           ("DELETE", "issues/1/labels/lane:codex"),
+                          ("POST", "issues/2/labels"),
                           ("DELETE", "issues/2/labels/needs-brain"),
+                          ("DELETE", "issues/2/labels/loom:human"),
                           ("DELETE", "issues/5/labels/loom:triage")], self.fake.writes)
         notes = [line for line in said if line.startswith("health note")]
         self.assertEqual(["health note %s#4: body says Part of #12 but the sub-issue "
@@ -169,10 +172,10 @@ class Step(unittest.TestCase):
         self.run_step(shadow_on=True)
         self.assertEqual([], self.fake.writes)
         entries = shadow.read(os.path.join(self.tmp, "ledger.jsonl"))
-        self.assertEqual([(1, "loom:queued"), (1, "lane:codex"), (2, "needs-brain"),
-                          (5, "loom:triage")],
+        self.assertEqual([(1, "loom:queued"), (1, "lane:codex"), (2, "needs:human"),
+                          (2, "needs-brain"), (2, "loom:human"), (5, "loom:triage")],
                          [(e["number"], e["label"]) for e in entries])
-        self.assertEqual({shadow.UNLABEL}, {e["action"] for e in entries})
+        self.assertEqual({shadow.UNLABEL, shadow.LABEL}, {e["action"] for e in entries})
         self.assertIn("label removal", " ".join(shadow.digest_lines(
             0, time.time(), os.path.join(self.tmp, "ledger.jsonl"), {"LOOM_SHADOW": "1"})))
 

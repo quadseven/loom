@@ -249,6 +249,22 @@ def test_render_brief_removes_control_characters_from_finding_summary():
     assert "\x00" not in head and "\x1b" not in head
 
 
+class FixBriefRepliesTest(unittest.TestCase):
+    def test_a_fix_brief_requires_a_reply_entry_for_every_listed_review_thread(self):
+        """A fix round must answer each thread it lists, not optionally."""
+        fix = Fix(108, "loom/108-test",
+                  "### Thread PRRT_one (comment 1) at a.py:1\n    bot: rename\n\n"
+                  "### Thread PRRT_two (comment 2) at b.py:2\n    bot: guard\n")
+        issue = {"number": 108, "title": "T", "body": "Why\n"}
+        text = render_brief("quadseven/loom", issue, "codex", 1, fix)
+        self.assertNotIn("You may also write .loom/replies.json", text)
+        self.assertIn(tickets.REPLIES_NOTE, text)
+        self.assertIn("every review thread listed below", tickets.REPLIES_NOTE)
+        self.assertIn('"resolve": true', tickets.REPLIES_NOTE)
+        self.assertIn("a concrete reason", tickets.REPLIES_NOTE)
+        self.assertLess(text.index(tickets.REPLIES_NOTE), text.index("### Thread PRRT_one"))
+
+
 class AfterLineTest(unittest.TestCase):
     """The After: line: what it accepts, and when it still holds."""
 

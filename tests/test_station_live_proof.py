@@ -156,7 +156,7 @@ class StationLiveProofTest(tbs.Base):
         self.close_pass(log)
         self.assertEqual(log.reads, [])
         self.assertNotIn("Live proof missing:", self.status_text())
-        self.assertIn("loom:human", self.fake.names(self.NUMBER))
+        self.assertIn("needs:human", self.fake.names(self.NUMBER))
 
 
 class EvidenceDropsVerifyNotesTest(unittest.TestCase):

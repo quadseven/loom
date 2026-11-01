@@ -299,7 +299,7 @@ class StationClaim(unittest.TestCase):
         asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
         self.assertEqual(len(asks), 1)
         self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
-        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["loom:human"]}),
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs:human"]}),
                       fake.writes)
 
     def test_a_health_ticket_with_no_cause_goes_to_the_brain(self):
@@ -350,7 +350,7 @@ class FactoryQueue(unittest.TestCase):
         worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
         worker.assign_queued()
         self.assertEqual(worker.waits["%s#7" % self.repo], "health ticket names no cause")
-        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (loom:human)")
+        self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (needs:human)")
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
         self.assertNotIn("%s#9" % self.repo, worker.waits)
 

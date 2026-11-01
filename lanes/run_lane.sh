@@ -89,7 +89,7 @@ LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check
 # The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
 # ticket repos the lane clones. Override it on a machine without network.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE}quadseven/infra-public"
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}quadseven/infra-public"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
@@ -310,6 +310,33 @@ mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
+# A check that hashes a file needs a sha256sum this machine can execute. The
+# lane plist puts the Intel Homebrew bin directory ahead of everything but the
+# arm64 one, and an x86_64 coreutils link there never runs on an arm64 host
+# without Rosetta (#2317). The macOS system binary sits in /sbin, on no lane's
+# PATH, so its directory goes in just before the one that holds the broken
+# tool: it can shadow only that directory and those after it.
+tool_runs() { printf '' | "$1" > /dev/null 2>&1; }
+runnable_sha256sum_on_path() {
+  local found dir holder tail
+  found="$(command -v sha256sum)"
+  [ -n "$found" ] && tool_runs "$found" && return 0
+  for dir in ${LOOM_SHA256SUM_DIRS:-/sbin /usr/bin /bin}; do
+    [ -x "$dir/sha256sum" ] && tool_runs "$dir/sha256sum" || continue
+    if [ -n "$found" ]; then
+      holder="$(dirname "$found")"
+      case "$PATH" in
+        "$holder":*) PATH="$dir:$PATH" ;;
+        *) tail="${PATH#*:"$holder":}"; PATH="${PATH%%:"$holder":*}:$dir:$holder:$tail" ;;
+      esac
+    else
+      PATH="$PATH:$dir"
+    fi
+    return 0
+  done
+}
+runnable_sha256sum_on_path
+
 field() { grep -m1 "^$1:" "$2" | cut -d' ' -f2-; }
 
 # LOOM_<LANE>_<SUFFIX>, e.g. opencode-go + MODEL -> LOOM_OPENCODE_GO_MODEL.
@@ -390,7 +417,7 @@ utc() { date -u -r "$1" +%FT%TZ 2>/dev/null || date -u -d "@$1" +%FT%TZ; }
 
 # Body of one "## <name>" section of the brief, blank lines dropped.
 section() {
-  awk -v h="## $1" '$0 == h {on=1; next} /^#+ / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
+  awk -v h="## $1" '$0 == h {on=1; next} /^##? / {on=0} on' "$2" | sed '/^[[:space:]]*$/d'
 }
 
 # The acceptance criteria of $1, blank lines dropped: its "## Acceptance
@@ -423,7 +450,7 @@ BUGS_SECTION="Bugs discovered"
 # What section, or the reason a run changed nothing (no_change_reason). The
 # file itself is never committed.
 summary_note() {
-  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
+  printf '\n\n## Intent summary\nWhen you finish, write one line per behavior change to %s at the top of the tree (plain text, one change per line). The runner reads it for the pull request Intent section and never commits it. Also include a ## Acceptance criteria section containing the ticket criteria as checkboxes: tick each criterion the change builds; leave every live check (a Live line, or anything seen on a running system, a host, a network or over time) and every operator action unticked, since only the station'"'"'s verifier ticks those; and for an unbuilt criterion append \"; not built: <reason>\". A reason saying the work is already there must cite the code on the base branch as <path>:<line> or <path>::<symbol>, or the pull request goes back. The runner puts that checklist in the pull request body. Also include a ## %s section: each step a person must take before this change can merge and deploy (a data migration, a cutover, a VM or disk resize, scaling a workload down), one per line, or the single word none. Loom never merges a pull request that lists a step: its ticket goes to the operator. If you found a bug outside this ticket, add a ## %s section, one bug per line, each citing its issue as #N (this repo) or OWNER/NAME#N; file the issue first if none exists. The station looks each issue up and leaves out any line whose issue does not exist, is a pull request, or is closed and was not filed in the last two days. If there is no behavior change, leave the file out, unless you change nothing because the work is already done or no longer applies: then write that reason there (for example \"nothing to change: the finding no longer holds\"), and it is recorded on the ticket as the answer.\n' "$SUMMARY_FILE" "$OPERATOR_SECTION" "$BUGS_SECTION"
 }
 
 # How the agent is told to work, after its brief. On 2026-10-14, 27 of 95
@@ -862,6 +889,33 @@ post_replies() {
   rm -f "$REPLIES_FILE"
 }
 
+# The review threads a fix brief lists (the "### Thread PRRT_..." lines of its
+# ## Fix section) that this round left without an answer: no entry in its
+# replies file and no file kept from .loom-answers. Prints them ", "-joined,
+# or nothing. The brief requires an answer for every one (bus/tickets.py
+# REPLIES_NOTE); an unanswered thread holds the merge gate, so the round says
+# which ones it left.
+unanswered_threads() {
+  python3 - "$BRIEF" "${REPLIES_FILE:-}" "$INBOX/answers/$TICKET" <<'PY' 2>> "$LOG"
+import json, os, re, sys
+brief, replies, answers = sys.argv[1:]
+with open(brief, encoding="utf-8", errors="replace") as stream:
+    parts = stream.read().rsplit("\n## Fix\n", 1)
+listed = (re.findall(r"^### Thread (PRRT_[A-Za-z0-9_-]{1,100}) ", parts[1], re.M)
+          if len(parts) > 1 else [])
+answered = set()
+if replies and os.path.isfile(replies):
+    try:
+        with open(replies, encoding="utf-8") as stream:
+            answered |= {entry["thread"] for entry in json.load(stream)}
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        print("the replies file could not be read: %s" % error, file=sys.stderr)
+if os.path.isdir(answers):
+    answered |= {name[:-3] for name in os.listdir(answers) if name.endswith(".md")}
+print(", ".join(dict.fromkeys(t for t in listed if t not in answered)))
+PY
+}
+
 # Reconcile the generated title/body sections of an existing PR with the
 # approved ticket revision in the brief, preserving reviewer-authored text
 # outside those sections. Scope changes are logged with old/new body hashes.
@@ -1141,7 +1195,8 @@ park() {
 # startup files, ~/.gemini config, MCP servers). Other lanes get no rules here.
 # antigravity-oauth-token is agy's sign-in when it cannot reach the keychain
 # (the sandbox denies /usr/bin/security): wiped, every run asked for a browser
-# login (2026-10-22 to 10-24, #1620).
+# login (2026-10-22 to 10-24, #1620). The sandbox profile lets only agy's own
+# binary read it (agy_token_rules in lanes/agent_sandbox.sh, #1623).
 AGY_STATE_KEEP=(settings.json bin builtin installation_id jetski_state.pbtxt updater last_check.timestamp log cli.log crashes cache antigravity-oauth-token)
 AGY_CACHE_KEEP=(onboarding.json default_project_id.txt)
 # agy keeps its sign-in in its file store, Library/Application Support/
@@ -1684,7 +1739,7 @@ ask_sign_in() {
   file_ask "$title" "$body" "Sign-in failed again"
 }
 
-# File a needs-operator ask titled $1 with body $2, or, with one already open,
+# File a needs:human ask titled $1 with body $2, or, with one already open,
 # keep one comment on it with a running count headed $3, never one per failure.
 file_ask() {
   local title="$1" body="$2" headline="$3" number existing
@@ -1696,10 +1751,10 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs-operator --body "$body" 2>>"$LOG" ||
+             --label needs:human --body "$body" 2>>"$LOG" ||
            gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
   number="${number##*/}"
-  case "$number" in ''|*[!0-9]*) echo "needs-operator ask filing failed" >> "$LOG" ;; esac
+  case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
 }
 
@@ -1785,6 +1840,7 @@ import json
 import sys
 
 text = tool = False
+events_processed = False
 for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
     try:
         event = json.loads(line)
@@ -1792,6 +1848,7 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         continue
     if not isinstance(event, dict):
         continue
+    events_processed = True
     kind = event.get("type")
     part = event.get("part") if isinstance(event.get("part"), dict) else {}
     if kind == "step_start":
@@ -1800,6 +1857,8 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
         text = True
     elif kind in ("tool_use", "tool") or part.get("type") == "tool":
         tool = True
+if not events_processed:
+    sys.exit(1)
 sys.exit(0 if text and not tool else 1)
 PY
 }
@@ -2030,7 +2089,7 @@ record() {
 # failing line or command, and the exit code.
 FACTORY_REPO=quadseven/loom
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
-# The marker on the body of the needs-operator ask an expired key files.
+# The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
 # The markers on the one comment that counts repeats on an open ask or incident.
 KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"
@@ -2048,11 +2107,11 @@ open_issue() {
 # checks had passed again for hours (2026-10-19).
 INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
-# Close this repo's environment and base-check incidents once the check has
-# passed on the unmodified base; the station then releases their tickets.
+# Close this repo's environment, contract and base-check incidents once the
+# check has passed on the unmodified base; the station then releases tickets.
 resolve_factory_incidents() {
   local kind file number
-  for kind in environment base-check; do
+  for kind in environment contract base-check; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
@@ -2322,7 +2381,7 @@ exclude_untracked() {
 # Only a red default branch check is a base-check factory incident. Returns
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
-  local rc interp="" subs="" changed what baseline_rev
+  local rc interp="" subs="" changed what baseline_rev tool=""
   SETUP_REASON=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
@@ -2330,6 +2389,11 @@ prepare_validation() {
   if ! sandbox_ready; then
     SETUP_REASON="$SANDBOX_WHY"
     note_factory_incident environment "$SANDBOX_WHY" SETUP_REASON
+  elif ! tool="$(command -v sha256sum)" || ! tool_runs "$tool"; then
+    # The host's fault, whatever the repo: a check that hashes a file would
+    # read as a red default branch and file a base-check incident.
+    SETUP_REASON="lane host fault: sha256sum${tool:+ at $tool} cannot run"
+    note_factory_incident environment "sha256sum: ${tool:-not on PATH}" SETUP_REASON
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
@@ -3971,6 +4035,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
   fi
   if [ -n "$FIX_PR" ]; then
+    UNANSWERED="$(unanswered_threads)"
     post_replies
     ITEMS="$(fix_items "$BRIEF")"
     if [ "$COMMITTED" -eq 1 ]; then
@@ -3998,6 +4063,12 @@ $LIVE_NOTES"
       COMMENT="$COMMENT
 
 Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+    fi
+    if [ -n "$UNANSWERED" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: review threads left without a reply: $UNANSWERED" >> "$LOG"
+      COMMENT="$COMMENT
+
+Review threads this round left without a reply: $UNANSWERED"
     fi
     # One comment per pull request, edited each round; the push and the body
     # edit are already on the pull request's timeline.

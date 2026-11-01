@@ -116,6 +116,23 @@ class OutageWindowTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "last good observation and the first"):
                     text.check(written)
 
+    def test_an_issue_reference_ending_in_503_is_not_an_outage(self):
+        self.assertEqual(text.undated_outage(
+            "31 other self-attributed deaths since 2026-09-19 15:49 UTC under "
+            "drivers #503 does not touch"), "")
+
+    def test_a_pull_request_or_cross_repo_reference_is_not_an_outage(self):
+        self.assertEqual(text.undated_outage("PR 503 since 09:00Z"), "")
+        cross_repo = "see example-owner/example-repo#503 since 09:00Z"  # leak-guard-allow
+        self.assertEqual(text.undated_outage(cross_repo), "")
+
+    def test_real_outage_text_is_still_refused(self):
+        for written in (
+                "the API returned 503 since 09:00Z",
+                "down since 04:28Z"):
+            with self.subTest(written=written):
+                self.assertNotEqual(text.undated_outage(written), "")
+
     def test_an_outage_with_its_window_or_a_plain_observation_passes(self):
         text.check("Unreachable: last good read 04:28Z (0 stuck), first failing read "
                    "09:02Z; it went down between them.")

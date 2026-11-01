@@ -33,10 +33,27 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
 CLAIM_PREFIX = "claim:"
+# Outside work under the Overflow ledger. A person's claim, not an engine's: it
+# never expires, nothing removes it, and every path that briefs, escalates or
+# moves a ticket skips it (tickets.owned_elsewhere). Here, not in bus/labels.py,
+# because that module imports the GitHub client, which imports bus/tickets.py.
+OVERFLOW_CLAIM = "claim:overflow"
 IDLE_HOURS = 24
 EVERY = 3600
 PER_RUN = 20
 STATE_FILE = "stale-claims.json"
+
+
+def outside_hold(issue: Dict[str, Any]) -> Optional[str]:
+    """The label that keeps this Loom off an issue offered to outside work:
+    claim:overflow, or an `overflow:` price with no `overflow paid:` label yet."""
+    names = [str(x.get("name") if isinstance(x, dict) else x or "").lower()
+             for x in issue.get("labels") or []]
+    if OVERFLOW_CLAIM in names:
+        return OVERFLOW_CLAIM
+    if any(n.startswith("overflow paid:") for n in names):
+        return None
+    return next((n for n in names if n.startswith("overflow:")), None)
 
 
 def idle_hours(raw: str) -> int:
@@ -112,7 +129,10 @@ def claimers(issue: Dict[str, Any], ours: Iterable[str],
     other operator who owns the issue: a `claim:<login>` label not ours, or an
     assignment to one of `operators` (LOOM_TRUSTED_BRIEFERS) or to a login a
     claim label names. Empty when the issue is also assigned to anyone else:
-    a person this Loom knows nothing of owns it, and it is never released."""
+    a person this Loom knows nothing of owns it, and it is never released.
+    Empty under outside_hold too: no claim on a held issue is released."""
+    if outside_hold(issue):
+        return {}
     mine = {x.lower() for x in ours}
     known = {x.lower() for x in operators}
     found: Dict[str, str] = {}
@@ -144,8 +164,13 @@ def without_own_claim(names: Iterable[str], ours: Iterable[str]) -> list:
 
 def own_claims(issue: Dict[str, Any], ours: Iterable[str]) -> Dict[str, str]:
     """{login: the claim label naming it} for each claim:<login> label on the
-    issue naming one of `ours` (this Loom's own logins)."""
+    issue naming one of `ours` (this Loom's own logins). Empty on outside
+    work: the lapse step takes nothing off a ticket someone outside holds."""
     mine = {x.lower() for x in ours}
+    if outside_hold(issue) or any(
+            login and login not in mine and not login.endswith("[bot]")
+            for login in (_login(x) for x in issue.get("assignees") or [])):
+        return {}
     found: Dict[str, str] = {}
     for label in issue.get("labels") or []:
         name = str(label.get("name") or "") if isinstance(label, dict) else ""

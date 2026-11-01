@@ -251,7 +251,7 @@ def _int_or(value: Any, default: int = 0) -> int:
 # fills. A pass below the budget floor reads none of them and carries every
 # source an earlier pass read; source_read_at says when each was read.
 VIEW_SOURCES = {
-    "improving": ("improving", "floor_context"),
+    "improving": ("improving", "improving_built", "floor_context"),
     "lanes": ("lanes",),
     "pull_requests": ("pull_requests", "footer_models", "footer_runs"),
     "brain_step": ("brain_step", "brain_step_error"),
@@ -292,6 +292,7 @@ class TicketStore:
                           "stale": False, "ready": False,
                           "ticket_refreshed_at": None, "next_refresh_at": None, "stale_reason": "",
                           "improving": {"journals": [], "metrics_comments": []},
+                          "improving_built": None,
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
                           "goal_context": {},
                           "goal_context_error": "the dashboard has not read its sources yet"}
@@ -409,14 +410,16 @@ class TicketStore:
     def _read_operator_repo(self, repo):
         try:
             asks = self.gh.paginate("/repos/%s/issues?labels=needs-operator&state=open" % quote(repo, safe="/"))
+            asks += self.gh.paginate("/repos/%s/issues?labels=needs%%3Ahuman&state=open" % quote(repo, safe="/"))
             humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
         except (GitHubError, OSError, ValueError) as exc:
             return repo, [], 0, "%s operator items: %s" % (repo, self._error_reason(exc))
         humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row]
-        found = [_operator_item(repo, issue, "needs_operator")
-                 for issue in asks if isinstance(issue, dict) and "pull_request" not in issue]
-        # A loom:human issue waits on the operator too (loom#1777): its ask is
-        # the loom:human comment, read with the needs-operator asks.
+        unique = {issue.get("number"): issue for issue in asks
+                  if isinstance(issue, dict) and "pull_request" not in issue}
+        found = [_operator_item(repo, issue, "needs_operator") for issue in unique.values()]
+        # A needs:human issue waits on the operator too (loom#1777): its ask is
+        # the needs:human comment, read with the needs-operator asks.
         listed = {item["number"] for item in found}
         found += [_operator_item(repo, issue, "loom_human") for issue in humans
                   if issue.get("number") not in listed]
@@ -470,6 +473,7 @@ class TicketStore:
                  if self._reset_at else "when GitHub's request limit resets")
         skipped = "GitHub's request budget ran low; these details refresh %s" % reset
         data.update({"improving": {"journals": [], "metrics_comments": []},
+                     "improving_built": None,
                      "lanes": [], "pull_requests": [],
                      "brain_step": None, "brain_step_error": skipped,
                      "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
@@ -500,6 +504,12 @@ class TicketStore:
         configured = set(self.repos) | {repo for repo, _ in homes}
         titles, parents = self._goal_info(rows, configured)
         epics = self._assign_epics(rows)
+        # A goal home whose issue does not exist is no goal: a ticket
+        # naming it (or naming an epic under it) names nothing (loom#2166).
+        cache = self.__dict__.get("_goal_info_cache") or {}
+        for row in rows:
+            if row.get("goal") and (cache.get(row["goal"]) or {}).get("is_missing"):
+                row["goal"] = None
         # Reports on the goal homes read in full above count too: a goal home
         # in LOOM_IMPROVEMENT_HOMES keeps its report even if its repo's
         # comment feed failed this pass.
@@ -547,6 +557,18 @@ class TicketStore:
             prs.extend(found)
             errors.extend(repo_errors)
         data["improving"] = {"journals": journals, "metrics_comments": metric_comments}
+        # The Improving page's join of journals to tickets is the slow work
+        # the page timed out on (loom#2248): build it here, once a pass, so
+        # a page request only renders what the refresh already holds, as
+        # the other pages do. A failed build keeps no build and says why;
+        # the page then shows its not-read message, never a per-request join.
+        rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
+        try:
+            data["improving_built"] = views.build_improvements(journals, rows, metric_comments)
+        except Exception as exc:  # noqa: BLE001 - background thread, see _read_latest_runs
+            LOG.warning("improving build failed: %s", exc)
+            data["improving_built"] = None
+            errors.append("improving build: " + (self._error_reason(exc) or type(exc).__name__))
         data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
         data["pull_requests"] = prs
@@ -761,7 +783,9 @@ class TicketStore:
         name and every parent above them. A goal home is read again after
         GOAL_INFO_TTL (a parent line can be added at any time; a conditional
         read of an unchanged issue costs no request budget); an unreadable
-        one stays None and is read again next pass.
+        one stays None and is read again next pass. A home whose issue
+        does not exist (a 404 read) is no goal at all: it is in neither
+        map, and tickets naming it name nothing (loom#2166).
 
         A parent counts only in a repo the dashboard is configured for
         (`configured`: LOOM_REPOS and the goal-home repos), and only when it is
@@ -782,8 +806,16 @@ class TicketStore:
                 if goal not in seen and goal not in level and len(seen) + len(level) < GOAL_INFO_MAX:
                     level.append(goal)
             seen.update(level)
-            stale = [goal for goal in level if not (cache.get(goal) or {}).get("title")
-                     or now - cache[goal].get("read_at", 0) >= GOAL_INFO_TTL]
+            stale = []
+            for goal in level:
+                cached = cache.get(goal) or {}
+                # A home read as missing (its issue is a 404) stays missing
+                # until the TTL, like any other read (loom#2166); a home
+                # with no title otherwise is read again every pass.
+                if not cached.get("title") and not cached.get("is_missing"):
+                    stale.append(goal)
+                elif now - cached.get("read_at", 0) >= GOAL_INFO_TTL:
+                    stale.append(goal)
             with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
                 read = list(pool.map(lambda goal: self._read_goal_home(goal, cache.get(goal), now, configured),
                                      stale))
@@ -799,12 +831,14 @@ class TicketStore:
         def accepted(parent):
             if not parent or parent.partition("#")[0] not in configured:
                 return None
+            if (cache.get(parent) or {}).get("is_missing"):
+                return None
             return parent if parent in named or (cache.get(parent) or {}).get("is_goal") else None
 
-        titles = {goal: entry.get("title") for goal, entry in cache.items()}
+        titles = {goal: entry.get("title") for goal, entry in cache.items() if not entry.get("is_missing")}
         # An epic is not a smaller goal: it never rolls up as one.
         parents = {goal: None if entry.get("is_epic") else accepted(entry.get("parent"))
-                   for goal, entry in cache.items()}
+                   for goal, entry in cache.items() if not entry.get("is_missing")}
         return titles, parents
 
     def _assign_epics(self, rows) -> Dict[str, Dict[str, Any]]:
@@ -819,16 +853,28 @@ class TicketStore:
             entry = cache.get(named) if named else None
             if not entry or not entry.get("is_epic"):
                 continue
-            row["epic"], row["goal"] = named, entry.get("epic_goal")
+            epic_goal = entry.get("epic_goal")
+            if epic_goal and (cache.get(epic_goal) or {}).get("is_missing"):
+                epic_goal = None  # the epic's goal home does not exist (loom#2166)
+            row["epic"], row["goal"] = named, epic_goal
             epics[named] = {"title": entry.get("title"), "open": entry.get("open", True),
-                            "goal": entry.get("epic_goal")}
+                            "goal": epic_goal}
         return epics
 
     def _read_goal_home(self, goal, entry, now, configured):
         repo, _, number = goal.partition("#")
         try:
             issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (quote(repo, safe="/"), int(number))).data
-        except (GitHubError, OSError, ValueError):
+        except GitHubError as exc:
+            if exc.status == 404:
+                # The issue does not exist, so there is no goal home here,
+                # whatever an earlier read cached: a definitive answer,
+                # not a transient failure (loom#2166).
+                return {"title": None, "parent": None, "is_goal": False, "is_epic": False,
+                        "epic_goal": None, "open": False, "is_missing": True, "read_at": now}
+            # Keep what an earlier read found; try again next pass.
+            return dict(entry or {}, read_at=0)
+        except (OSError, ValueError):
             # Keep what an earlier read found; try again next pass.
             return dict(entry or {}, read_at=0)
         if not isinstance(issue, dict):
@@ -1193,6 +1239,7 @@ class TicketStore:
                 "next_refresh_at": snapshot.get("next_refresh_at"),
                 "stale_reason": snapshot.get("stale_reason", "GitHub could not refresh ticket data"),
                 "improving": snapshot.get("improving", {}),
+                "improving_built": snapshot.get("improving_built"),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),
@@ -1218,7 +1265,7 @@ class TicketStore:
 
 
 def _operator_item(repo: str, issue: Dict[str, Any], queue: str) -> Dict[str, Any]:
-    """A needs-operator or loom:human issue as the Needs-you page reads it."""
+    """A needs-operator or needs:human issue as the Needs-you page reads it."""
     return {"repo": repo, "number": issue.get("number"), "title": issue.get("title", ""),
             "html_url": issue.get("html_url"),
             "ask": (issue.get("body") or issue.get("title", "")) if queue == "needs_operator" else "",
