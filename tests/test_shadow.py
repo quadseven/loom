@@ -285,6 +285,16 @@ class ChokePointTest(ShadowCase):
         self.assertEqual([(e["action"], e["label"]) for e in self.entries()],
                          [("label", "ready-to-land")])
 
+    def test_every_new_merge_label_is_recorded(self):
+        fake = Recorder({"/repos/%s/issues/33" % REPO: issue(33, ("loom:ticket",))})
+        with mock.patch.dict(shadow.MERGE_LABELS, {"another-label": ()}):
+            with self.assertRaises(ShadowHeld):
+                GitHub("t", transport=fake).rest(
+                    "POST", "/repos/%s/issues/33/labels" % REPO,
+                    {"labels": ["ready-to-land", "another-label"]})
+            self.assertEqual(sorted(e["label"] for e in self.entries()),
+                             ["another-label", "ready-to-land"])
+
     def test_a_held_merge_label_is_recorded_beside_a_shipped_one(self):
         fake = Recorder({"/repos/%s/issues/33" % REPO: issue(33, ("loom:ticket",))})
         with self.assertRaises(ShadowHeld):
