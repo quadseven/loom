@@ -26,6 +26,7 @@ from bus import factory, scorecard  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from dashboard import views  # noqa: E402
 from test_bus_factory import Base as FactoryBase, iso as factory_iso  # noqa: E402
+from test_bus_factory import NOW as FACTORY_NOW, REPO as FACTORY_REPO  # noqa: E402
 
 AUDIT_AT = scorecard._ts(scorecard.AUDIT_AT)
 NOW = AUDIT_AT + 86400
@@ -293,6 +294,56 @@ class FactoryStepAside(FactoryBase):
         self.assertNotEqual(self.lane(7), "spark-2")
         self.assertIn("lane spark-2 is demoted (%s; the operator clears it)" % why,
                       self.gh.comments[7][-1]["body"])
+
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n"):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        self.gh.issues[number]["created_at"] = factory_iso(0)
+
+    def notes(self, number):
+        return "\n".join(str(c.get("body") or "") for c in self.gh.comments[number])
+
+    def test_a_demoted_lane_with_a_fresh_heartbeat_is_never_given_a_queued_ticket(self):
+        # loom#2430: _up read only limited and available, so a demoted lane
+        # with a fresh heartbeat took a queued ticket, and the same pass's
+        # step-aside moved it straight back ("The station gave this queued
+        # ticket lane X" then "Not a failure (lane X is demoted ...)").
+        self.queued(7)
+        first = factory.TIERS["medium"][0]
+        why = "3 bad outcomes in 7 days (1 reverts, 2 failed deploys)"
+        worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
+                                 available=list(factory.TIERS["medium"]),
+                                 demoted={first: why})
+        with mock.patch("bus.factory._say"):
+            worker.assign_queued()
+            worker.run()
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertNotEqual(self.lane(7), first)
+        self.assertIn("The station gave this queued ticket lane %s" % self.lane(7), self.notes(7))
+        self.assertNotIn("is demoted", self.notes(7))
+
+    def test_a_queued_ticket_whose_only_up_lane_is_demoted_waits(self):
+        self.queued(7)
+        first = factory.TIERS["medium"][0]
+        worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
+                                 available=[first], demoted={first: "bad work"})
+        with mock.patch("bus.factory._say"):
+            worker.assign_queued()
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertNotIn("lane:" + first, [x["name"] for x in self.gh.issues[7]["labels"]])
+
+    def test_a_step_aside_never_moves_a_ticket_onto_a_demoted_lane(self):
+        # The tier move off a limited lane skipped only limited and
+        # unavailable lanes: it picked the demoted one, which bounced it on.
+        self.gh.ticket(7, "briefed", lane="codex", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": factory_iso(60)}]
+        first = factory.TIERS["medium"][0]
+        with mock.patch("bus.factory._say"):
+            self.go(limited=["codex"], demoted={first: "bad work"},
+                    available=list(factory.TIERS["medium"]))
+        self.assertNotIn(self.lane(7), (first, "codex"))
+        self.assertNotIn("is demoted", self.notes(7))
 
 
 if __name__ == "__main__":
