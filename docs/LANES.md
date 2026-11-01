@@ -819,6 +819,38 @@ The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like
 `LOOM_BRIEF_AUTHORS`.
 
+### Ask answerers
+
+`LOOM_ASK_ANSWERERS` (space separated GitHub logins, an App as `<slug>[bot]`,
+default empty) names logins that may answer an ask with two line forms, without
+any other trust. A reinstall that leaves it unset keeps the list in the
+installed station plist, and `LOOM_BRIEF_AUTHORS` is kept the same way; set
+either, even to empty, to replace it. Unset, asks are judged as if the setting
+did not exist.
+
+- Each form starts a line and has words after its colon on that line:
+  `Finished: <the step>`, or `Operator answer YYYY-MM-DD: <the answer>` dated
+  on or after the ask's day. The comment must follow the ask. `Done:` and
+  every other comment from these logins leave the ask open, prose from a person
+  login included.
+- Only the judges of an ask read it: the label pass (`bus/label_pass.py`), the
+  station's ask inputs (the digest and the pass) and `python3 -m bus.needs_you`.
+- It grants nothing else. Ownership, proofs, audits, journals, adoption,
+  merges, briefing, holds, revert labels, dashboard operators and
+  `decision_claim.person_comment` read their own settings, and a listed login
+  gains no standing in any of them. A listed bot's line is no person's record
+  for the decision claim guard.
+- Taking `needs:human` off lifts that hold in `evidence_close.label_hold`, so a
+  listed login can clear the way to a close without closing anything itself.
+- The guard runs inside Loom's write commands. `close`, `reply`, `bus journal`
+  and the rest still refuse the dated line with no person's record, but a
+  listed login that posts with its own GitHub client passes no guard. List only
+  a login whose writer records what the operator said and nothing else.
+
+The installer writes the setting into the station plist and the brain plist,
+and the brain passes it to a sandboxed rung. Muse sets the same value
+(docs/MUSE.md).
+
 ### Verify runs
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take
