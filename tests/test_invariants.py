@@ -952,24 +952,20 @@ class FilerTest(unittest.TestCase):
         self.assertEqual(len([i for i in self.gh.issues.values()
                               if i.get("title") == brain.REPAIRS_TITLE]), 1)
 
-    def test_a_refused_sub_issue_link_rolls_over_to_a_batch_epic_and_is_logged(self):
-        """loom#2023: GitHub answered 422 for the repairs epic at its
-        sub-issue limit, and the issue kept only a Part of line naming it."""
+    def test_a_full_repairs_epic_files_into_an_existing_batch(self):
+        """A repairs epic at GitHub's sub-issue ceiling selects a batch."""
         self.gh.issues[GOAL] = {"number": GOAL, "id": 9000 + GOAL, "state": "open",
                                 "title": "Goal", "labels": [{"name": "loom:goal"}], "body": ""}
         repairs = dict(epic(50), title=brain.REPAIRS_TITLE)
         batch = dict(epic(60), title="Epic: factory repairs the brain finds by hand, batch 2")
         self.gh.subs[(REPO, GOAL)] = [repairs, batch]
-        self.gh.subs[(REPO, 50)] = [ticket(n, state="closed") for n in range(200, 299)]
+        self.gh.subs[(REPO, 50)] = [ticket(n, state="closed") for n in range(200, 300)]
         self.gh.subs[(REPO, 60)] = [ticket(7)]
-        self.gh.refuse_subs.add(50)
         self.file(self.breach())
         (filed,) = [i for i in self.gh.issues.values() if "loom:invariant" in i.get("labels", [])]
         self.assertTrue(filed["body"].rstrip().endswith("Part of #60"), filed["body"])
         self.assertNotIn("Part of #50", filed["body"])
         self.assertIn(filed["number"], [c["number"] for c in self.gh.subs[(REPO, 60)]])
-        self.assertTrue(any("HTTP 422" in line and "#50" in line for line in self.said),
-                        self.said)
         # The next filing this pass goes straight to the batch.
         self.file(invariants.Breach("goal-full", "x/y#2", "Another", ("line",), T0))
         later = [i for i in self.gh.issues.values() if i.get("title") == "Another"][0]
@@ -1816,15 +1812,13 @@ class StandingEpicTest(unittest.TestCase):
         self.assertEqual(invariants.epic_over_cap(f), [])
         self.assertEqual(invariants.goal_epics_over_cap(f), [])
 
-    def test_any_open_epic_at_the_sub_issue_limit_is_flagged_standing_or_not(self):
+    def test_the_sub_issue_limit_is_handled_by_rollover_not_an_invariant(self):
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
-        repairs = invariants.EpicShape(Ref("%s#50" % REPO, "#50"), True, 100, (), True, 100)
-        batch = invariants.EpicShape(Ref("%s#51" % REPO, "#51"), True, 100, (), False, 100)
+        repairs = invariants.EpicShape(Ref("%s#50" % REPO, "#50"), True, 0, (), True, 100)
+        batch = invariants.EpicShape(Ref("%s#51" % REPO, "#51"), True, 0, (), False, 100)
         done = invariants.EpicShape(Ref("%s#52" % REPO, "#52"), False, 15, (), True, 100)
         f = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (repairs, batch, done), ())])
-        found = invariants.epic_over_cap(f)
-        self.assertEqual([b.subject for b in found], ["%s#50" % REPO, "%s#51" % REPO])
-        self.assertIn("100 sub-issues", found[0].title)
+        self.assertEqual(invariants.epic_over_cap(f), [])
 
 
     def test_a_closed_epic_is_not_over_the_ticket_cap(self):

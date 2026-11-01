@@ -708,30 +708,18 @@ def ticket_outside_epic(f: Facts) -> List[Breach]:
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
-    """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
-    the issues whose Part of line names it, each once), or any epic, the
-    standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
-    refuses its next link (loom#2023). A closed epic is finished work whose
-    closed tickets can never leave it, so it is never over a cap (loom#2140)."""
+    """An open non-standing epic holding more than EPIC_TICKETS tickets.
+
+    GitHub's sub-issue ceiling is handled at filing time by moving new work
+    into a repairs batch epic, so reaching that ceiling is expected state.
+    A closed epic is finished work whose tickets can never leave it, so it is
+    never over a cap (loom#2140)."""
     if f.shapes is None:
         return []
     out = []
     for shape in f.shapes:
         for epic in shape.epics:
-            if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
-                out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
-                    "Epic %s holds %d sub-issues (GitHub's limit %d)"
-                    % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
-                    ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
-                     "past %d, so new work goes into a next epic" % (
-                         epic.epic.label, shape.goal.label, epic.sub_issues,
-                         SUB_ISSUE_LIMIT),),
-                    f.now,
-                    line="Epic %s of goal home %s: %d sub-issues (GitHub's limit %d)" % (
-                        epic.epic.label, shape.goal.label, epic.sub_issues, SUB_ISSUE_LIMIT),
-                    where=_where(epic.epic)))
-            elif epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
+            if epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
                     "epic-over-cap", epic.epic.key,
                     "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
