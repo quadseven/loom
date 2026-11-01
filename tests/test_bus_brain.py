@@ -3664,6 +3664,8 @@ class Routes:
         return answer
 
     def _read(self, path):
+        if path.startswith("/repos/%s/labels" % REPO):
+            return reply(200, [])
         if path == "/repos/%s/issues/1" % REPO:
             return reply(200, goal())
         if "/issues/1/sub_issues" in path:
@@ -5327,6 +5329,18 @@ class MoveFromGoalTests(unittest.TestCase):
         self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
+    def test_triage_files_a_ready_area_issue_under_its_area_epic(self):
+        routes = Routes([item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
+        areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
+        with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
+                unittest.mock.patch.object(brain, "intake_epic", return_value=70) as epic:
+            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+        read.assert_called_once()
+        self.assertEqual(epic.call_args_list,
+                         [unittest.mock.call(unittest.mock.ANY, REPO, 1, area="stability")] * 2)
+        self.assertEqual([c[1] for c in self.sub_issue_posts(routes.calls)],
+                         ["/repos/%s/issues/70/sub_issues" % REPO] * 2)
+
     def test_triage_does_not_take_an_issue_out_of_another_parent(self):
         other = "https://api.github.com/repos/%s/issues/77" % REPO
         routes = Routes([item(5, parent_issue_url=other), item(6)])
@@ -5434,6 +5448,7 @@ class OutsideEpicRepo:
         self.issues = {1: goal()}
         self.subs = {1: []}
         self.epics = []
+        self.labels = []
         self.open_tickets = []
         self.calls = []
 
@@ -5452,6 +5467,8 @@ class OutsideEpicRepo:
             return reply(200, self.open_tickets)
         if path.startswith("/repos/%s/issues?labels=epic&state=all" % REPO):
             return reply(200, self.epics)
+        if path.startswith("/repos/%s/labels" % REPO):
+            return reply(200, self.labels)
         if path.startswith("/repos/%s/issues?labels=epic&state=open" % REPO):
             return reply(200, [e for e in self.epics if e.get("state", "open") == "open"])
         if path == "/repos/%s/issues/1" % REPO:
@@ -5459,6 +5476,13 @@ class OutsideEpicRepo:
         raise AssertionError("unexpected read %s" % path)
 
     def _write(self, path, payload):
+        found = re.fullmatch(r"/repos/%s/issues/(\d+)/labels" % re.escape(REPO), path)
+        if found:
+            issue = self.issues[int(found.group(1))]
+            existing = {label["name"] for label in issue.get("labels", [])}
+            issue["labels"].extend({"name": label} for label in payload["labels"]
+                                   if label not in existing)
+            return reply(200, issue["labels"])
         if path.endswith("/sub_issues"):
             parent = int(path.split("/issues/")[1].split("/")[0])
             child = payload["sub_issue_id"] - 1000
@@ -5566,6 +5590,54 @@ class MoveOutsideEpicTests(unittest.TestCase):
         fake = self.repo(tickets=[self.ticket(10)], epics=[(60, 1)])
         self.move(fake)
         self.assertEqual(fake.issues[10]["body"], "## Why\nwhy\n\nPart of #60\n")
+
+    def test_area_ticket_moves_under_its_area_epic(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, 1)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        fake.issues[60]["title"] = "Epic: stability"
+        self.assertEqual(self.move(fake), (1, 0))
+        self.assertEqual(fake.subs[60][-1], 10)
+
+    def test_a_repo_with_no_areas_reads_the_goal_tree_once(self):
+        fake = self.repo(tickets=[self.ticket(10), self.ticket(11)], epics=[(60, 1)])
+        with unittest.mock.patch.object(brain, "goal_tree", wraps=brain.goal_tree) as tree:
+            self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(tree.call_count, 1)
+
+    def test_a_pass_reads_the_repo_labels_once(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability")),
+                                  self.ticket(11, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, 1)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(sum(1 for c in fake.calls if "/labels?per_page" in c[1]), 1)
+
+    def test_full_area_epics_open_a_labeled_epic_for_that_area(self):
+        fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability"))],
+                         epics=[(60, brain.EPIC_TICKET_CAP)])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        fake.issues[60]["labels"].append({"name": "area:stability"})
+        fake.issues[60]["title"] = "Epic: stability"
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        made = fake.subs[1][-1]
+        self.assertEqual(fake.issues[made]["title"], "Epic: stability")
+        self.assertIn({"name": "area:stability"}, fake.issues[made]["labels"])
+        self.assertEqual(fake.subs[made], [10])
+        self.assertIn({"name": "area:stability"}, fake.issues[10]["labels"])
+
+    def test_missing_area_is_inferred_from_label_descriptions(self):
+        ticket = self.ticket(10, labels=("loom:ticket",))
+        ticket["title"] = "Stability alert is stuck"
+        fake = self.repo(tickets=[ticket])
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        self.assertEqual(self.move(fake), (1, 0))
+        made = fake.subs[1][-1]
+        self.assertEqual(fake.issues[made]["title"], "Epic: stability")
+        self.assertIn({"name": "area:stability"}, fake.issues[made]["labels"])
 
     def epic_under_goal(self, fake, number, state="open", tickets=()):
         """A (non-intake) epic of goal #1 holding the given tickets as its
