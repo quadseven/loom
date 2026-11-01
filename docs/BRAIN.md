@@ -1924,7 +1924,22 @@ head. Each report digest adds what was held since the last one, and
     python3 -m bus.shadow report --since 24h      # or 7d, or an ISO date or UTC time
     python3 -m bus.shadow status                  # which repos are in shadow
 
-lists each would-action with its link, for the operator's review.
+lists each would-action with its link, for the operator's review, read
+only. Each would-merge is paired with its operator verdict and its outcome on
+GitHub: merged as is at the recorded head, merged after changes, closed
+unmerged, reverted later, or still open. Each would-close is paired with its
+issue, and every other ledger line is listed after them. A would-merge is
+damaging when the operator did not merge it as is or it was later reverted,
+and a would-close is wrong when its ticket has an unticked acceptance box.
+The report counts
+decisions, damaging would-merges and wrong would-closes per repo and risk
+tier, then the clean decisions each repo has since its last damaging one,
+within the `--since` window. A still-open pull request or issue (`pending`)
+and an outcome the report could not establish (`unknown`: a failed read, a
+partial revert search, or a merge with no head to compare) are neither damage
+nor clean, except that an operator's Hold is damage on either until the pull
+request merges as is.
+`--ledger-only` lists the ledger's lines with no GitHub read.
 
 The switch fails closed. `LOOM_SHADOW` turns shadow off only when it reads
 `0` (or `false`, `off`, `no`); unset, empty, any other value, or a value that

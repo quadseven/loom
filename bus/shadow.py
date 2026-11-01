@@ -63,7 +63,7 @@ last ACTED_KEEP lines past ACTED_MAX; the station sends both files' newest
 lines to the dashboard's /chain page. A failed write never stops a request.
 
     python3 -m bus.shadow report [--since 24h|7d|2026-10-22[T10:00:00Z]]
-                                 [--repo OWNER/NAME] [--json]
+                                 [--repo OWNER/NAME] [--json] [--ledger-only]
     python3 -m bus.shadow status
     python3 -m bus.shadow prompt        # the brain tick's Shadow mode sentence
     python3 -m bus.shadow gh-guard [--lane] CWD GH-ARGS...   # exit 1: held
@@ -82,7 +82,7 @@ import sys
 import time
 import traceback
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 SWITCH = "LOOM_SHADOW"
 REPOS = "LOOM_SHADOW_REPOS"
@@ -737,14 +737,25 @@ def _entry_lines(e: Mapping[str, Any]) -> List[str]:
     reason and caller."""
     if e.get("action") == VERDICT:
         return _verdict_lines(e)
+    return [_action_line(e)] + _detail_lines(e)
+
+
+def _action_line(e: Mapping[str, Any], mark: str = "") -> str:
+    """One would-action's line, with [mark] on the end when it is set."""
     what = str(e.get("action") or "")
     if e.get("label"):
         what += " " + str(e["label"])
     ref = "%s#%s" % (e.get("repo") or "?", e.get("number") or "?")
     extra = (["tier=%s" % e["tier"]] if e.get("tier") else []) + \
         (["sha=%s" % str(e["sha"])[:12]] if e.get("sha") else [])
-    lines = ["%s  would %-16s %-28s %s  %s" % (
-        e.get("time"), what, ref, " ".join(extra), e.get("url") or "")]
+    line = "%s  would %-16s %-28s %s  %s" % (
+        e.get("time"), what, ref, " ".join(extra), e.get("url") or "")
+    return "%s  [%s]" % (line, mark) if mark else line
+
+
+def _detail_lines(e: Mapping[str, Any]) -> List[str]:
+    """A would-action's gates, reason and caller."""
+    lines = []
     if e.get("gates"):
         lines.append("    gates passed: %s" % ", ".join(str(g) for g in e["gates"]))
     for key, name in (("reason", "reason"), ("source", "from")):
@@ -774,6 +785,385 @@ def _tally_lines(entries: Sequence[Mapping[str, Any]]) -> List[str]:
     return ["By repo, tier and action:"] + [
         "    %s tier=%s %s: %d" % (repo, tier, action, n)
         for (repo, tier, action), n in sorted(tally.items())]
+
+
+# -- the outcome report ------------------------------------------------------
+# GitHub reads only: nothing here moves a repo out of shadow.
+
+# What finally happened to a would-merge's pull request. UNKNOWN is a read
+# that failed: on its own it counts as neither damage nor a clean decision. An
+# operator's Hold on it is still damage (is_damaging_would_merge).
+MERGED_AS_IS = "merged as is"
+MERGED_AFTER_CHANGES = "merged after changes"
+CLOSED_UNMERGED = "closed unmerged"
+REVERTED = "reverted later"
+STILL_OPEN = "still open"
+UNKNOWN = "unknown"
+DAMAGING_OUTCOMES = (MERGED_AFTER_CHANGES, CLOSED_UNMERGED, REVERTED)
+# How one decision bears on the repo's clean count.
+CLEAN, DAMAGING, PENDING = "clean", "damaging", "pending"
+
+
+class PROutcome(NamedTuple):
+    """A pull request as GitHub has it now."""
+    number: int
+    title: str
+    state: str              # "open", "closed"
+    merged: bool
+    merged_at: Optional[str]
+    head_sha: str
+    merge_commit_sha: str
+
+
+class IssueOutcome(NamedTuple):
+    """An issue as GitHub has it now."""
+    state: str              # "open", "closed"
+    closed_at: Optional[str]
+    state_reason: str       # "completed", "not_planned"
+    labels: Tuple[str, ...]
+    body: str
+
+
+def _read_page(gh: Any, path: str) -> Optional[Any]:
+    """GET one object's Response; None, said on stderr, when GitHub refuses or
+    fails. Only GitHub's own failure is caught: a fault in this code raises."""
+    from .github import GitHubError
+    try:
+        resp = gh.rest("GET", path)
+    except GitHubError as err:
+        print("shadow: could not read %s: %s" % (path, err), file=sys.stderr)
+        return None
+    if not isinstance(resp.data, dict):
+        print("shadow: %s did not answer with an object" % path, file=sys.stderr)
+        return None
+    return resp
+
+
+def _read_json(gh: Any, path: str) -> Optional[Dict[str, Any]]:
+    """GET one object, or None as _read_page says."""
+    resp = _read_page(gh, path)
+    return None if resp is None else resp.data
+
+
+def _fetch_pr(gh: Any, repo: str, number: int) -> Optional[PROutcome]:
+    """The pull request now, or None when it cannot be read."""
+    data = _read_json(gh, "/repos/%s/pulls/%d" % (repo, number))
+    if data is None:
+        return None
+    return PROutcome(number, str(data.get("title") or ""), str(data.get("state") or "open"),
+                     bool(data.get("merged")), data.get("merged_at"),
+                     str((data.get("head") or {}).get("sha") or ""),
+                     str(data.get("merge_commit_sha") or ""))
+
+
+def _fetch_issue(gh: Any, repo: str, number: int) -> Optional[IssueOutcome]:
+    """The issue now, or None when it cannot be read."""
+    data = _read_json(gh, "/repos/%s/issues/%d" % (repo, number))
+    if data is None:
+        return None
+    labels = labels_of(data)
+    if labels is None:
+        print("shadow: %s#%d has no readable labels" % (repo, number), file=sys.stderr)
+        return None
+    return IssueOutcome(str(data.get("state") or "open"), data.get("closed_at"),
+                        str(data.get("state_reason") or "completed"), tuple(labels),
+                        str(data.get("body") or ""))
+
+
+def _fetch_reverts(gh: Any, repo: str, first: str) -> Optional[List[Dict[str, Any]]]:
+    """The repo's revert pull requests merged on or after the day `first`
+    (the earliest would-merge's: nothing older can undo one), or None when
+    they cannot all be read: a partial list would pass a reverted merge as
+    clean."""
+    from . import revert
+    from .github import _next_link
+    query = "repo:%s is:pr is:merged revert in:title,body merged:>=%s" % (repo, first)
+    url: Optional[str] = "/search/issues?q=%s&per_page=100" % quote(query, safe="")
+    items: List[Any] = []
+    total = 0
+    while url:
+        resp = _read_page(gh, url)
+        if resp is None:
+            return None
+        page = resp.data.get("items")
+        if not isinstance(page, list) or resp.data.get("incomplete_results"):
+            return _partial_search(repo)
+        items += page
+        total = int(resp.data.get("total_count") or 0)
+        url = _next_link(resp.headers.get("link", ""))
+    if total > len(items):
+        return _partial_search(repo)
+    return [p for p in items if revert.looks_like_revert(p)]
+
+
+def _partial_search(repo: str) -> None:
+    """Say the revert search came back short: its merges read as UNKNOWN."""
+    print("shadow: the revert search for %s came back partial" % repo, file=sys.stderr)
+
+
+def _verdict_for(verdicts: Sequence[Mapping[str, Any]], repo: str, number: int) -> Optional[str]:
+    """The newest operator-verdict on a pull request (merge or hold), or None.
+    The ledger is in time order, and a later answer replaces an earlier one."""
+    for e in reversed(verdicts):
+        if str(e.get("repo") or "").lower() == repo.lower() and int(e.get("number") or 0) == number:
+            return str(e.get("label") or "").lower()
+    return None
+
+
+def merge_outcome(would_merge: Mapping[str, Any], pr: Optional[PROutcome],
+                  reverts: Optional[Sequence[Mapping[str, Any]]]) -> str:
+    """What finally happened to the would-merge's pull request."""
+    from . import revert
+    if pr is None:
+        return UNKNOWN
+    if not pr.merged:
+        return STILL_OPEN if pr.state == "open" else CLOSED_UNMERGED
+    if reverts is None:
+        return UNKNOWN
+    if any(revert.undoes(dict(r), pr._asdict()) for r in reverts):
+        return REVERTED
+    sha = str(would_merge.get("sha") or "")
+    if not sha or not pr.head_sha:
+        return UNKNOWN  # no head to compare
+    return MERGED_AS_IS if pr.head_sha == sha else MERGED_AFTER_CHANGES
+
+
+def is_damaging_would_merge(outcome: str, verdict: Optional[str]) -> bool:
+    """The operator did not merge it as is, or it was later reverted. A Hold
+    says the operator did not, so it is damage on any outcome, UNKNOWN too,
+    until the pull request does merge as is."""
+    return outcome in DAMAGING_OUTCOMES or (verdict == "hold" and outcome != MERGED_AS_IS)
+
+
+def is_wrong_would_close(issue: Optional[IssueOutcome]) -> bool:
+    """A would-close of a ticket with an unticked acceptance box."""
+    from . import proof
+    if issue is None or not set(issue.labels) & set(WORK_LABELS):
+        return False
+    return any(not checked for checked, _ in proof.criteria(issue.body))
+
+
+def _merge_bearing(outcome: str, damaging: bool) -> str:
+    if damaging:
+        return DAMAGING
+    if outcome == MERGED_AS_IS:
+        return CLEAN
+    return UNKNOWN if outcome == UNKNOWN else PENDING
+
+
+def _close_bearing(issue: Optional[IssueOutcome]) -> str:
+    """A would-close that is not wrong: clean only once the issue has closed."""
+    if issue is None:
+        return UNKNOWN
+    return PENDING if issue.state == "open" else CLEAN
+
+
+def _pair_merge_outcomes(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[Dict[str, Any]]:
+    """Each would-merge with its pull request's outcome and operator verdict."""
+    verdicts = [e for e in entries if e.get("action") == VERDICT]
+    would_merges = [e for e in entries if e.get("action") == MERGE]
+    first = min((str(e.get("time") or "")[:10] for e in would_merges), default="")
+    # A pull request held at several heads is several lines and one read.
+    prs: Dict[Tuple[str, int], Optional[PROutcome]] = {}
+    reverts: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+    pairs = []
+    for wm in would_merges:
+        repo = str(wm.get("repo") or "")
+        number = int(wm.get("number") or 0)
+        if (repo, number) not in prs:
+            prs[repo, number] = _fetch_pr(gh, repo, number) if repo and number else None
+        pr = prs[repo, number]
+        if repo not in reverts:
+            reverts[repo] = _fetch_reverts(gh, repo, first) if repo else None
+        verdict = _verdict_for(verdicts, repo, number)
+        outcome = merge_outcome(wm, pr, reverts[repo])
+        damaging = is_damaging_would_merge(outcome, verdict)
+        pairs.append({"would_merge": wm, "pr_outcome": pr, "outcome": outcome, "verdict": verdict,
+                      "damaging": damaging, "bearing": _merge_bearing(outcome, damaging)})
+    return pairs
+
+
+def _pair_close_outcomes(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[Dict[str, Any]]:
+    """Each would-close with its issue's outcome."""
+    pairs = []
+    for wc in (e for e in entries if e.get("action") == CLOSE):
+        repo = str(wc.get("repo") or "")
+        number = int(wc.get("number") or 0)
+        issue = _fetch_issue(gh, repo, number) if repo and number else None
+        wrong = is_wrong_would_close(issue)
+        bearing = DAMAGING if wrong else _close_bearing(issue)
+        pairs.append({"would_close": wc, "issue_outcome": issue, "wrong": wrong,
+                      "bearing": bearing})
+    return pairs
+
+
+def _compute_repo_tier_counts(
+    merge_pairs: Sequence[Dict[str, Any]], close_pairs: Sequence[Dict[str, Any]]
+) -> Dict[Tuple[str, str], Dict[str, int]]:
+    """Decisions and damage per repo and risk tier."""
+    by_repo_tier: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for pairs, entry, damage in ((merge_pairs, "would_merge", "damaging"),
+                                 (close_pairs, "would_close", "wrong_closes")):
+        for pair in pairs:
+            e = pair[entry]
+            counts = by_repo_tier.setdefault(
+                (str(e.get("repo") or "?"), str(e.get("tier") or "-")),
+                {"decisions": 0, "damaging": 0, "wrong_closes": 0, "pending": 0, "unknown": 0})
+            counts["decisions"] += 1
+            if pair["bearing"] == DAMAGING:
+                counts[damage] += 1
+            elif pair["bearing"] != CLEAN:
+                counts[pair["bearing"]] += 1
+    return by_repo_tier
+
+
+def _count_since_damage(merge_pairs: Sequence[Dict[str, Any]],
+                   close_pairs: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Clean decisions per repo, across its tiers, since its last damaging one."""
+    decided = [(p["would_merge"], p["bearing"]) for p in merge_pairs]
+    decided += [(p["would_close"], p["bearing"]) for p in close_pairs]
+    clean: Dict[str, int] = {}
+    for entry, bearing in sorted(decided, key=lambda d: str(d[0].get("time") or "")):
+        repo = str(entry.get("repo") or "?")
+        if bearing == DAMAGING:
+            clean[repo] = 0
+        else:
+            clean[repo] = clean.get(repo, 0) + (1 if bearing == CLEAN else 0)
+    return clean
+
+
+def _other_entries(entries: Sequence[Mapping[str, Any]],
+                   merge_pairs: Sequence[Dict[str, Any]]) -> List[Mapping[str, Any]]:
+    """The ledger lines with no outcome to read: every would-action but a
+    merge or close, and each operator verdict no would-merge here carries."""
+    paired = {(str(p["would_merge"].get("repo") or "").lower(),
+               int(p["would_merge"].get("number") or 0)) for p in merge_pairs}
+    return [e for e in entries if e.get("action") not in (MERGE, CLOSE)
+            and not (e.get("action") == VERDICT
+                     and (str(e.get("repo") or "").lower(), int(e.get("number") or 0)) in paired)]
+
+
+def _compute_report_data(entries: Sequence[Mapping[str, Any]], gh: Any) -> Dict[str, Any]:
+    """Pair the would-actions with their outcomes and count the damage."""
+    merge_pairs = _pair_merge_outcomes(entries, gh)
+    close_pairs = _pair_close_outcomes(entries, gh)
+    return {"merge_pairs": merge_pairs, "close_pairs": close_pairs,
+            "others": _other_entries(entries, merge_pairs),
+            "by_repo_tier": _compute_repo_tier_counts(merge_pairs, close_pairs),
+            "clean_by_repo": _count_since_damage(merge_pairs, close_pairs)}
+
+
+def _format_merge_outcome(outcome: str, pr: Optional[PROutcome]) -> str:
+    if outcome == MERGED_AS_IS and pr is not None:
+        return "outcome: merged as is at %s" % pr.head_sha[:12]
+    return "outcome: %s" % outcome
+
+
+def _format_issue_outcome(issue: Optional[IssueOutcome]) -> str:
+    if issue is None:
+        return "outcome: %s" % UNKNOWN
+    if issue.state == "open":
+        return "outcome: %s" % STILL_OPEN
+    return "outcome: closed (%s)" % issue.state_reason
+
+
+def _format_merge_pairs(merge_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    lines = ["Would-merges (%d):" % len(merge_pairs)]
+    for pair in merge_pairs:
+        wm = pair["would_merge"]
+        lines.append("  " + _action_line(wm, "DAMAGING" if pair["damaging"] else ""))
+        if pair["verdict"]:
+            lines.append("    operator verdict: %s" % pair["verdict"])
+        lines.append("    %s" % _format_merge_outcome(pair["outcome"], pair["pr_outcome"]))
+        lines += _detail_lines(wm)
+    return lines + [""]
+
+
+def _format_close_pairs(close_pairs: Sequence[Dict[str, Any]]) -> List[str]:
+    lines = ["Would-closes (%d):" % len(close_pairs)]
+    for pair in close_pairs:
+        wc = pair["would_close"]
+        lines.append("  " + _action_line(wc, "WRONG" if pair["wrong"] else ""))
+        lines.append("    %s" % _format_issue_outcome(pair["issue_outcome"]))
+        lines += _detail_lines(wc)
+    return lines + [""]
+
+
+def _format_others(others: Sequence[Mapping[str, Any]]) -> List[str]:
+    lines = ["Other ledger lines (%d):" % len(others)]
+    for e in others:
+        lines += ["  " + line for line in _entry_lines(e)]
+    return lines + [""]
+
+
+def _format_repo_tier_summary(by_repo_tier: Mapping[Tuple[str, str], Mapping[str, int]],
+                              clean_by_repo: Mapping[str, int],
+                              shadow_repos: Sequence[str]) -> List[str]:
+    """The counts per repo and tier, then each repo's clean count, then each
+    repo in shadow the window holds no decision for."""
+    lines = ["By repo and tier:"]
+    for (repo, tier), counts in sorted(by_repo_tier.items()):
+        parts = ["decisions=%d" % counts["decisions"], "damaging=%d" % counts["damaging"],
+                 "wrong-closes=%d" % counts["wrong_closes"]]
+        parts += ["%s=%d" % (key, counts[key]) for key in ("pending", "unknown") if counts[key]]
+        lines.append("  %s tier=%s: %s" % (repo, tier, ", ".join(parts)))
+    lines += ["", "By repo:"]
+    lines += ["  %s: clean-since-last-damage=%d" % (repo, n)
+              for repo, n in sorted(clean_by_repo.items())]
+    seen = {repo.lower() for repo in clean_by_repo}
+    lines += ["  %s: no decisions" % repo for repo in sorted(shadow_repos)
+              if repo.lower() not in seen]
+    return lines
+
+
+def outcome_report_lines(entries: Sequence[Mapping[str, Any]], gh: Any, since: float, path: str,
+                         shadow_repos: Sequence[str] = ()) -> List[str]:
+    """The report: each would-action with its outcome, then the counts."""
+    data = _compute_report_data(entries, gh)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since))
+    lines = ["Shadow report since %s (%s)" % (stamp, path), ""]
+    if data["merge_pairs"]:
+        lines += _format_merge_pairs(data["merge_pairs"])
+    if data["close_pairs"]:
+        lines += _format_close_pairs(data["close_pairs"])
+    if data["others"]:
+        lines += _format_others(data["others"])
+    return lines + _format_repo_tier_summary(data["by_repo_tier"], data["clean_by_repo"],
+                                             shadow_repos)
+
+
+_JSON_KEYS = ("time", "repo", "number", "tier", "sha", "gates", "reason", "url")
+
+
+def _merge_json(pair: Mapping[str, Any]) -> Dict[str, Any]:
+    wm = pair["would_merge"]
+    pr = pair["pr_outcome"]
+    return dict({k: wm.get(k) for k in _JSON_KEYS}, type="would-merge", verdict=pair["verdict"],
+                outcome=pair["outcome"], damaging=pair["damaging"],
+                pr_head_sha=pr.head_sha if pr else None,
+                pr_merged_at=pr.merged_at if pr else None)
+
+
+def _close_json(pair: Mapping[str, Any]) -> Dict[str, Any]:
+    wc = pair["would_close"]
+    issue = pair["issue_outcome"]
+    return dict({k: wc.get(k) for k in _JSON_KEYS}, type="would-close",
+                wrong=pair["wrong"], issue_state=issue.state if issue else None,
+                issue_closed_at=issue.closed_at if issue else None,
+                issue_state_reason=issue.state_reason if issue else None)
+
+
+def outcome_report_json(entries: Sequence[Mapping[str, Any]], gh: Any) -> List[Dict[str, Any]]:
+    """The report as data: one object per decision, per tier and per repo."""
+    data = _compute_report_data(entries, gh)
+    out = [_merge_json(pair) for pair in data["merge_pairs"]]
+    out += [_close_json(pair) for pair in data["close_pairs"]]
+    out += [dict(e, type="other") for e in data["others"]]
+    out += [dict(counts, type="summary", repo=repo, tier=tier)
+            for (repo, tier), counts in sorted(data["by_repo_tier"].items())]
+    out += [{"type": "repo", "repo": repo, "clean_since_last_damage": n}
+            for repo, n in sorted(data["clean_by_repo"].items())]
+    return out
 
 
 # -- the brain rung's gh ------------------------------------------------------
@@ -1043,7 +1433,26 @@ def gh_guard(cwd: str, argv: Sequence[str], source: str = "brain rung gh",
     return 1
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def _outcome_report(args: argparse.Namespace, entries: Sequence[Mapping[str, Any]], since: float,
+                    path: str, gh: Any) -> int:
+    """Print the report for the ledger lines; 1 when no client can be made."""
+    from .github import GitHub, GitHubError, auth_from_env
+    if gh is None:
+        try:
+            gh = GitHub(auth_from_env())
+        except GitHubError as err:
+            print("shadow: the report reads GitHub: %s (--ledger-only reads no outcomes)" % err,
+                  file=sys.stderr)
+            return 1
+    if args.json:
+        print(json.dumps(outcome_report_json(entries, gh), indent=2, sort_keys=True))
+        return 0
+    repos = [args.repo] if args.repo else sorted(scope()[1] or ())
+    print("\n".join(outcome_report_lines(entries, gh, since, path, repos)))
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None, gh: Any = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["gh-guard"]:
         # Before argparse: gh's own flags are not this command's.
@@ -1056,11 +1465,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return gh_guard(argv[1], argv[2:])
     parser = argparse.ArgumentParser(prog="python3 -m bus.shadow")
     sub = parser.add_subparsers(dest="command", required=True)
-    rep = sub.add_parser("report", help="list the would-actions since a time, with links")
+    rep = sub.add_parser("report", help="pair the would-actions since a time with their "
+                                        "outcomes and count the damage per repo and tier")
     rep.add_argument("--since", default="24h")
     rep.add_argument("--repo", default="")
     rep.add_argument("--ledger", default="")
     rep.add_argument("--json", action="store_true")
+    rep.add_argument("--ledger-only", action="store_true",
+                     help="only list the ledger's lines, with no GitHub read")
     sub.add_parser("status", help="say which repos are in shadow and where the ledger is")
     sub.add_parser("prompt", help="print the brain tick prompt's Shadow mode sentence")
     args = parser.parse_args(argv)
@@ -1079,11 +1491,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     path = args.ledger or ledger_path()
     entries = read(path, since, args.repo)
-    if args.json:
-        print(json.dumps(entries, indent=2, sort_keys=True))
-    else:
-        print("\n".join(report_lines(entries, since, path)))
-    return 0
+    if args.ledger_only:
+        print(json.dumps(entries, indent=2, sort_keys=True) if args.json
+              else "\n".join(report_lines(entries, since, path)))
+        return 0
+    return _outcome_report(args, entries, since, path, gh)
 
 
 if __name__ == "__main__":
