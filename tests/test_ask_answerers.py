@@ -291,6 +291,20 @@ class Guard(unittest.TestCase):
         self.assertTrue(decision_claim.recorded([ask()], events, TRUSTED, [OP]))
         self.assertFalse(decision_claim.recorded([ask()], events, TRUSTED, [OP], "", [STATION]))
 
+    def test_a_hollow_line_does_not_erase_a_persons_removal(self):
+        _, events, _ = self.replayed()
+        for text in ("Finished:", "Done: yes.", "Operator answer 2030-01-03:", "Take (a)."):
+            with self.subTest(text):
+                comments = [ask(), said(text, by=BOT)]
+                self.assertTrue(decision_claim.recorded(comments, events, TRUSTED, [OP]))
+
+    def test_a_trusted_bots_bare_line_clears_so_its_removal_is_no_record(self):
+        _, events, _ = self.replayed()
+        for text in ("Finished:", "Done: yes."):
+            with self.subTest(text):
+                comments = [ask(), said(text, by=APP)]
+                self.assertFalse(decision_claim.recorded(comments, events, TRUSTED, [OP]))
+
     def test_the_guard_names_its_own_client(self):
         comments, events, _ = self.replayed()
         routes = {"/repos/%s/issues/5" % REPO: issue(), "/repos/%s/issues/5/comments" % REPO: [ask()],

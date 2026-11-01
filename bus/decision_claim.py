@@ -37,9 +37,10 @@ _NAME = r"([A-Za-z][\w-]*)"
 # "Operator answer 2026-10-31: (a)". The date is the group; words after the
 # colon are required, so "Operator answer: none yet" is no record of one.
 ANSWER_LINE = re.compile(r"^\s*operator answer\s+(\d{4}-\d{2}-\d{2})\s*:\s*\S", re.I | re.M)
-# A line that clears an ask from a brain's comment (bus/ask_state.py).
-_BRAIN_LINE = re.compile(r"^\s*(?:finished\s*:|done\s*:|operator answer\s+\d{4}-\d{2}-\d{2}\s*:)",
-                         re.I | re.M)
+# The undated lines that clear an ask (bus/ask_state.py): a trusted bot's may be
+# bare, and a bot not trusted here clears one only with words on the line.
+_TRUSTED_LINE = re.compile(r"^\s*(?:finished|done)\s*:", re.I | re.M)
+_WORDED_LINE = re.compile(r"^[ \t]*finished[ \t]*:[ \t]*\S", re.I | re.M)
 
 # Every phrasing that claims a person decided. A match that captures a name
 # is a claim only when that name is one of claim's `names`.
@@ -212,8 +213,21 @@ def latest_ask(comments: Sequence[Any]) -> Optional[datetime]:
     return max(asks) if asks else None
 
 
+def _clears_ask(comment: Dict[str, Any], trusted: Iterable[str]) -> bool:
+    """A bot's comment holds a line the label pass could clear an ask on, so
+    a hollow line does not erase a person's later removal."""
+    who = comment.get("user") or comment.get("author")
+    if not is_bot(who):
+        return False
+    body = str(comment.get("body") or "")
+    if ANSWER_LINE.search(body):
+        return True
+    listed = {str(t).lower() for t in trusted}
+    return bool((_TRUSTED_LINE if _login(who)[0].lower() in listed else _WORDED_LINE).search(body))
+
+
 def _after_brain_line(event: Dict[str, Any], comments: Sequence[Any],
-                      since: Optional[datetime]) -> bool:
+                      since: Optional[datetime], trusted: Iterable[str]) -> bool:
     """The ask label came off after a bot's answer line: the label pass did
     that, so the removal repeats the line and records no person. A personal
     token the reader cannot name is told apart this way."""
@@ -222,8 +236,7 @@ def _after_brain_line(event: Dict[str, Any], comments: Sequence[Any],
         stamp = when(comment.get("created_at")) if isinstance(comment, dict) else None
         if (stamp is not None and at is not None and stamp <= at
                 and (since is None or stamp > since)
-                and is_bot(comment.get("user") or comment.get("author"))
-                and _BRAIN_LINE.search(str(comment.get("body") or ""))):
+                and _clears_ask(comment, trusted)):
             return True
     return False
 
@@ -248,7 +261,7 @@ def recorded(comments: Sequence[Any], events: Sequence[Any],
     return (any(after(c) and (person_comment(c) or answer.trusted_answer(c, trusted, ops))
                 for c in comments if isinstance(c, dict))
             or any(after(e) and person_label(e, automation)
-                   and not (_ask_removal(e) and _after_brain_line(e, comments, since))
+                   and not (_ask_removal(e) and _after_brain_line(e, comments, since, trusted))
                    for e in events if isinstance(e, dict)))
 
 
