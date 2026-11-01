@@ -3517,8 +3517,8 @@ class Tickets(Base):
         # private code (infra#5617), then codex.
         self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
         self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
-        self.assertEqual(factory.lanes_of("medium", True)[4:7],
-                         ("free-ollama", "free-gemma", "openrouter"))
+        self.assertEqual(factory.lanes_of("medium", True)[4:6],
+                         ("free-ollama", "free-gemma"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
         # A runner's inputs and logs live in the public repo's Actions, so the
@@ -3537,8 +3537,8 @@ class Tickets(Base):
         for lane in ("openrouter", "workersai", "zen", "zai"):
             self.assertLess(medium.index(lane), medium.index("codex"))
         # On a private repo the public-only ones are skipped.
-        self.assertEqual(factory.lanes_of("medium", True)[4:9],
-                         ("free-ollama", "free-gemma", "openrouter", "workersai", "codex"))
+        self.assertEqual(factory.lanes_of("medium", True)[4:6],
+                         ("free-ollama", "free-gemma"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq"):
@@ -3550,6 +3550,31 @@ class Tickets(Base):
         # Never on hard work, and never counted as a Spark.
         self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
         self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))
+
+    def test_factory_and_station_agree_on_public_only_for_private_repos(self):
+        # Every lane the factory assigns to a private repo must pass the
+        # station's needs_public_repo check (i.e., needs_public_repo returns False).
+        # This test fails on main because factory.public_only omits FREE_LANES.
+        for difficulty in ("easy", "medium", "hard"):
+            lanes = factory.lanes_of(difficulty, True)
+            for lane in lanes:
+                # Use a generic model that doesn't trigger the opencode-go special case.
+                model = "some-model"
+                self.assertFalse(
+                    station.needs_public_repo(lane, model),
+                    "factory assigns %s to private %s repo but station.needs_public_repo says it needs public" % (lane, difficulty)
+                )
+
+    def test_free_gemma_and_free_ollama_stay_private_capable(self):
+        # free-gemma and free-ollama must remain usable for private repos when
+        # not sent to cluster runners (provider() maps them to "free", not in FREE_LANES).
+        for lane in ("free-gemma", "free-ollama"):
+            self.assertFalse(factory.public_only(lane))
+            self.assertFalse(station.needs_public_repo(lane, "some-model"))
+        # But when a cluster runner slot is set, they become public-only.
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            self.assertTrue(factory.public_only("free-gemma"))
+            self.assertTrue(station.needs_public_repo("free-gemma", "some-model"))
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
@@ -3570,6 +3595,7 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "agy")
 
     def test_a_lane_without_an_available_heartbeat_is_not_free(self):
+        self.gh.private = False
         self.limited_easy(available=["openrouter"])
         self.assertEqual(self.lane(7), "openrouter")
 

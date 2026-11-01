@@ -174,13 +174,14 @@ import json
 import os
 import re
 import time
+import fnmatch
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
-from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
+from .labels import FREE_LANES, HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
 from .tickets import FIX_MARKER, PRIORITIES, priority_of
 
@@ -1608,11 +1609,44 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
+def lane_needs_public_repo(lane: str, model: str = "") -> bool:
+    """Shared predicate: whether a lane (or slot) requires a public repository.
+
+    This is the single source of truth for both the factory (lane assignment)
+    and the station (dispatch gate). It covers:
+    - Lanes in PUBLIC_ONLY (explicitly public-only slots)
+    - Cluster runner slots (LOOM_RUNNER_SLOTS)
+    - Providers in FREE_LANES (openrouter, zen, zai, workersai)
+    - Remote lanes (REMOTE_LANES keys, currently muse)
+    - agy provider
+    - opencode-go with a model matching *muse-spark*contributor*
+    """
+    if lane in PUBLIC_ONLY:
+        return True
+    if lane in runners.runner_slots():
+        return True
+    prov = runners.provider(lane)
+    if prov in FREE_LANES:
+        return True
+    if prov in REMOTE_LANES:
+        return True
+    if prov == "agy":
+        return True
+    if prov == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*"):
+        return True
+    return False
+
+
 def public_only(lane: str) -> bool:
     """Whether the lane takes public repos only: PUBLIC_ONLY, or a slot sent to
     cluster runners (LOOM_RUNNER_SLOTS), whose inputs and logs live in this
-    public repository's Actions, so the dispatch refuses a private repo."""
-    return lane in PUBLIC_ONLY or lane in runners.runner_slots()
+    public repository's Actions, so the dispatch refuses a private repo.
+
+    This is a compatibility wrapper for callers that don't have a model.
+    It uses the shared predicate with an empty model (which never matches the
+    opencode-go special case).
+    """
+    return lane_needs_public_repo(lane, "")
 
 
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:

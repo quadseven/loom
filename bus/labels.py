@@ -60,8 +60,12 @@ def base_lane(slot: str) -> str:
 # slots: tickets the lane may hold at once; Muse runs four scheduled lane
 # tasks (operator, 2026-10-25).
 REMOTE_LANES = {"muse": {"tiers": ("easy", "medium"), "scope": "public", "slots": 4,
-                         "beat_max": 2 * 3600}}
+                          "beat_max": 2 * 3600}}
 LANES += list(REMOTE_LANES)
+
+# Free lanes whose providers train on prompts or are otherwise public-only.
+# Provider names (after provider() mapping), not slot names.
+FREE_LANES = ["openrouter", "zen", "zai", "workersai"]
 
 # The model ladder for repeatedly stuck work is bus/factory.py LADDER, and
 # the rungs a stuck ticket climbs are its CLIMB (docs/MUSE.md).
