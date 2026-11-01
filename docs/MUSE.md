@@ -471,6 +471,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
    `- Audit: OWNER/NAME#N proof by LANE/MODEL: pass|fail, what was re-read`.
+   An audit line about a merge or a close comes from the output of
+   `python3 -m bus.brain audit-close OWNER/NAME#N`, with the cited hash, the
+   merge commit and whether the default branch has it (docs/BRAIN.md, Close
+   audits); comments alone prove nothing.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
