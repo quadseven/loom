@@ -2127,25 +2127,28 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
                                    int(pair[0].get("number") or 0)))
     moved = 0
     areas = _area_labels(gh, repo)
+    epic, held = _intake_with_room(tree)
     for ticket, old in tickets:
         area = _ticket_area(areas, ticket)
         if area:
+            # Each move changes that area's room, so intake_epic reads it again.
             if "area:" + area not in _labels(ticket):
                 gh.rest("POST", "/repos/%s/issues/%d/labels" %
                         (repo, int(ticket["number"])), {"labels": ["area:" + area]})
             try:
-                epic = intake_epic(gh, repo, goal, area=area)
+                target = intake_epic(gh, repo, goal, area=area)
             except ValueError:
                 break
         else:
-            epic, held = _intake_with_room(goal_tree(gh, repo, goal)[1])
             if epic is None or held >= EPIC_TICKET_CAP:
                 opened = _open_intake_epic(gh, repo, goal)
                 if opened is None:
                     break
                 epic, held = opened
-        if _move_to_epic(gh, repo, epic, ticket, old):
+            target = epic
+        if _move_to_epic(gh, repo, target, ticket, old):
             moved += 1
+            held += 0 if area else 1
     return (moved, len(tickets) - moved)
 
 

@@ -5600,6 +5600,12 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(self.move(fake), (1, 0))
         self.assertEqual(fake.subs[60][-1], 10)
 
+    def test_a_repo_with_no_areas_reads_the_goal_tree_once(self):
+        fake = self.repo(tickets=[self.ticket(10), self.ticket(11)], epics=[(60, 1)])
+        with unittest.mock.patch.object(brain, "goal_tree", wraps=brain.goal_tree) as tree:
+            self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(tree.call_count, 1)
+
     def test_a_pass_reads_the_repo_labels_once(self):
         fake = self.repo(tickets=[self.ticket(10, labels=("loom:ticket", "area:stability")),
                                   self.ticket(11, labels=("loom:ticket", "area:stability"))],
