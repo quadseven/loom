@@ -545,9 +545,9 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
-    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS), so a pin to
-    # a low-allowance Go model is never routed to an opencode-go lane.
-    "opencode-go": list(tickets.OPENCODE_GO_MODELS),
+    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS) and free models,
+    # so a pin to a low-allowance Go model is never routed to an opencode-go lane.
+    "opencode-go": list(tickets.OPENCODE_GO_MODELS) + ["opencode-go/*-free"],
     "zen": ["opencode/*-free"],
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
@@ -14123,6 +14123,9 @@ class Station:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
+        self._tend_usage()
+
+    def _tend_usage(self) -> None:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
@@ -14130,9 +14133,28 @@ class Station:
         except OSError as err:
             _say("could not write usage limits: %s" % err)
         try:
+            self._refresh_model_catalogue()
+        except Exception as err:
+            _say("model catalogue refresh failed: %s" % err)
+        try:
             self.post_chain()
         except OSError as err:
             _say("could not send the command chain snapshot: %s" % err)
+
+    def _refresh_model_catalogue(self) -> None:
+        from . import catalogue
+        cat_file = catalogue.catalogue_file(self.s.home)
+        now = self.now
+        try:
+            mtime = cat_file.stat().st_mtime
+            if now - mtime < catalogue.DISCOVERY_INTERVAL:
+                return
+        except OSError:
+            pass
+        url = os.environ.get("LOOM_OPENCODE_GO_MODELS_URL", catalogue.OPENCODE_GO_MODELS_URL)
+        discovered = catalogue.discover_models(url=url)
+        if discovered:
+            catalogue.save_catalogue(discovered, cat_file)
 
     def tend_runners(self) -> None:
         """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster

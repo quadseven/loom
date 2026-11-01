@@ -55,12 +55,21 @@ OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
 
 def allowed_model(model: str) -> str:
     """The model a lane may run for `model`: the stand-in of a
-    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS,
-    else `model` itself."""
+    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS
+    or the discovered catalogue, else `model` itself."""
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
-    if model.startswith("opencode-go/") and model not in OPENCODE_GO_MODELS:
+    if model.startswith("opencode-go/"):
+        if model in OPENCODE_GO_MODELS:
+            return model
+        try:
+            from . import catalogue
+            cat = catalogue.load_catalogue()
+            if model in cat:
+                return model
+        except (ImportError, OSError, ValueError):
+            return OPENCODE_GO_STAND_IN
         return OPENCODE_GO_STAND_IN
     return model
 
@@ -1238,6 +1247,9 @@ def after_holds(repo: str, headers: Dict[str, str],
 if __name__ == "__main__":
     import sys
     if sys.argv[1:] == ["opencode-go-models"]:
-        print("\n".join(OPENCODE_GO_MODELS))
+        from . import catalogue
+        models = set(OPENCODE_GO_MODELS)
+        models.update(m.id for m in catalogue.load_catalogue().values())
+        print("\n".join(sorted(models)))
     else:
         sys.exit("usage: python3 -m bus.tickets opencode-go-models")
