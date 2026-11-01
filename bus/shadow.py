@@ -16,13 +16,20 @@ Held while a repo is in shadow:
   held. Closing or reopening a pull request is let through: it can be
   undone, its branch stays, and the factory closes superseded lane pull
   requests so lanes do not work twice;
-- a label that grants a merge or marks a ticket shipped
-  (MERGE_LABELS), and a GraphQL label write, whose label ids it cannot read;
+- a label that grants a merge (MERGE_LABELS), and a GraphQL label write,
+  whose label ids it cannot read. A move to loom:shipped is a state fact, not
+  a merge or a close, so it goes through and the ticket can be verified and
+  closed later;
 - an approving pull request review (REST or GraphQL);
 - a write straight onto a branch Loom does not own (a ref moved, a file
   committed or deleted through the contents API, a merge-queue entry, a fork
   sync): code landed with no pull request is a merge;
 - a branch deletion (DELETE .../git/refs/heads/B) other than Loom's own lock.
+
+One close alone passes: the station's evidence close (bus/evidence_close.py,
+operator ruling of 2026-10-31). The station names the one ticket in code
+(evidence_close()), so no label, no argument and no other process can ask for
+it, and the request is still recorded as acted. Merges stay held.
 
 A request the hold cannot read (a label list, the item's current labels, a
 body of an unknown shape, a read that failed in any way) is held as the
@@ -65,6 +72,8 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -72,7 +81,7 @@ import subprocess
 import sys
 import time
 import traceback
-from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 SWITCH = "LOOM_SHADOW"
@@ -96,12 +105,11 @@ VERDICT = "operator-verdict"
 # none, so the operator reads what the pass would clean before it does.
 UNLABEL = "unlabel"
 
-# Labels whose addition grants a merge or ships a ticket, each with the labels
-# that mean the ticket is already past it (a verified ticket moved back to
-# shipped by a failed audit is not a new ship).
+# Labels whose addition grants a merge, each with the labels that mean the
+# ticket is already past it. loom:shipped is deliberately not here: it is a
+# state fact, so shadow sends it (loom#2350).
 MERGE_LABELS: Dict[str, Tuple[str, ...]] = {
     "ready-to-land": (),
-    "loom:shipped": ("loom:verified",),
 }
 # A close of an issue with one of these is a decision about work: held.
 WORK_LABELS = ("loom:ticket", "loom:goal", "loom:backlog", "loom:rewritten")
@@ -161,7 +169,7 @@ class Request(NamedTuple):
     kind: str          # "pr", "issue" or "branch"
     detail: str        # the labels added, the branch deleted, or the mutation
     check: str         # "" (always held), "close" or "label": github.py reads the item
-    labels: Tuple[str, ...] = ()   # every merge or ship label the request adds
+    labels: Tuple[str, ...] = ()   # every merge label the request adds
 
 
 def _env(env: Optional[Mapping[str, str]]) -> Mapping[str, str]:
@@ -209,9 +217,9 @@ def describe(env: Optional[Mapping[str, str]] = None) -> str:
 # The brain tick's own words for "in shadow" (lanes/mac/brain.sh). The
 # fallback the wrapper uses when `prompt` cannot run is this same sentence.
 _HELD_WORDS = ("never merge, close an issue, approve a pull request, or add "
-               "ready-to-land or loom:shipped by any route (gh, curl, the API); "
-               "bus.brain merge and bus.brain close run their gates and record "
-               "what they would do")
+               "ready-to-land by any route (gh, curl, the API); bus.brain merge and "
+               "bus.brain close run their gates and record what they would do; a move "
+               "to loom:shipped is a state fact and is sent")
 
 
 def prompt_line(env: Optional[Mapping[str, str]] = None) -> str:
@@ -285,7 +293,7 @@ def _branch_merge(path: str, body: Any) -> Optional[Request]:
 
 def _issue_edit(path: str, body: Any) -> Optional[Request]:
     """A close, or a label write, through PATCH .../issues/N. A close that may
-    go (a signal issue, a pull request) still holds a merge or ship label
+    go (a signal issue, a pull request) still holds a merge label
     added in the same request, so the close carries them."""
     found = _ISSUE_PATH.match(path)
     if not found or not isinstance(body, dict):
@@ -382,7 +390,7 @@ def _graphql_request(body: Any) -> Optional[Request]:
 
 
 def _label_request(repo: str, number: int, labels: Any) -> Optional[Request]:
-    """The label write as a held Request when it adds any merge or ship label,
+    """The label write as a held Request when it adds any merge label,
     naming every one of them; github.py then holds it if any is new. A label
     list of a shape this cannot read is held as it stands (fails closed)."""
     names = []
@@ -437,10 +445,31 @@ def close_let_through(issue: Any) -> bool:
     return TRIAGE_LABEL in names and WATCH_MARKER in str(issue.get("body") or "")
 
 
+_evidence_ticket: "contextvars.ContextVar[Tuple[str, int]]" = contextvars.ContextVar(
+    "loom_evidence_close", default=("", 0))
+
+
+@contextlib.contextmanager
+def evidence_close(repo: str, number: int) -> Iterator[None]:
+    """Within this block the one close of `repo`#`number` is not held."""
+    token = _evidence_ticket.set((str(repo).lower(), int(number)))
+    try:
+        yield
+    finally:
+        _evidence_ticket.reset(token)
+
+
+def evidence_close_passes(found: Request) -> bool:
+    """Whether `found` is the close evidence_close() names, carrying no merge
+    or merge label."""
+    return (found.action == CLOSE and found.check == "close" and not found.labels
+            and _evidence_ticket.get() == (found.repo.lower(), found.number))
+
+
 def held_after_read(found: Request, item: Any) -> Optional[Tuple[str, List[str]]]:
     """Whether `found` is still held once its item is read (None when the
     read failed or was not needed): None when it may go, else the action to
-    record and the new merge or ship labels it adds. A close that may go is
+    record and the new merge labels it adds. A close that may go is
     decided by the labels it carries; every label the item does not already
     have is new, all of them when its labels cannot be read."""
     action = found.action

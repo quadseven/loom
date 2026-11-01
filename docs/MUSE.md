@@ -9,7 +9,10 @@ brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
 for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
-`close`, verified moves and merges refuse every ticket as untrusted. Set `LOOM_GOAL_CAP`
+`close`, verified moves and merges refuse every ticket as untrusted. Set
+`LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
+listed login's answer line as no answer until the label pass clears the ask
+(docs/LANES.md, Ask answerers). Set `LOOM_GOAL_CAP`
 to the station's value too: unset, a Muse tick uses the default cap of 16
 while the station and the lane machine's brain use theirs, and a brief the
 lane machine would file (a factory ticket included) is refused as over the
@@ -31,9 +34,10 @@ result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
 a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
 the web), in shadow or out of it. In shadow, also never approve a pull
-request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
-Loom does not own, by any route: `bus.brain move` records a ship instead of
-taking it, and the tick's `gh` refuses the rest and records them.
+request or add `ready-to-land` by hand, or write onto a branch Loom does not
+own, by any route: the tick's `gh` refuses the rest and records them. A move
+to `loom:shipped` is a state fact, not a merge or a close, and goes through;
+leave it to each goal's ship rules.
 
 ## What Muse does and leaves
 
@@ -68,6 +72,13 @@ To read a file in a repo (a test, a script, a doc) without the web tool:
 
 A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
 one loom test file and stopped until the operator answered.
+
+Every list read paginates: issue comments, events, timelines and labels. A
+GitHub list returns the oldest 30 by default, so the last item of one read is
+not the newest. Follow the `Link` header to its end with `per_page=100`, or
+use a Loom command, which pages for you (`gh api --paginate` does too). A
+ticket with 36 comments read this way ended 18 days before its newest comment
+and hid the operator's own answers (loom#2387).
 
 ## Operate, do not report
 
@@ -266,7 +277,10 @@ Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
 close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
-live regression) and `brief` (a brief named but not written this tick).
+live regression), `brief` (a brief named but not written this tick) and
+`needs-brain` (a decision left open on a `loom:briefed` ticket that carries
+`needs-brain`; the defer changes no label, hold or state, and the `done`
+line for that stage and ticket retires it).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
@@ -495,6 +509,25 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    operator or trusted login) when no such record exists
    (bus/decision_claim.py, loom#2089). A ruling cited from a repo doc
    ("per the operator ruling in docs/MUSE.md") is not refused.
+   Record an answer the operator gave outside the ticket with a line
+   starting `Operator answer YYYY-MM-DD:` and the answer, or a step that is
+   done with `Finished:`; other prose leaves the ask open. The dated line
+   claims a person's decision, so those commands refuse it when no record
+   exists: it is for what the operator said, never for what you expect.
+   Only these two lines count from a `LOOM_ASK_ANSWERERS` login, and each needs
+   words on the line; `Done:` and prose from such a login leave the ask open.
+
+   Tell the operator something needs them only from
+   `python3 -m bus.needs_you`, run in the same turn (`--repo OWNER/NAME` to
+   narrow it). A needs-you item never comes from a `needs:human` count, from
+   a list carried over from an earlier tick, or from a comment read that did
+   not page to the end. Quote the ask verbatim as the command prints it, with
+   its time and the latest comment. Only its "Needs you" section needs a
+   person. "Check first" means a pull request naming the ticket merged after
+   the ask: read it, then record the answer on the ticket, or treat it as
+   needs you. A station verification tag is not a question to a person: the
+   brain or the verify pass takes it. If the command exits 1 its report is
+   incomplete: say so, and never report nothing from it.
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,
@@ -646,13 +679,17 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
      is empty. Read the previous report to fill this in.
    - `Next:` one line, what the brain will do before the next report.
    - Needs you: only what only the operator can do for THIS goal, or
-     "nothing new for this goal". Never a count: this line is what `journal`
+     "nothing new for this goal", from the "Needs you" section of
+     `python3 -m bus.needs_you` run this tick (step 6). Never a count: this line is what `journal`
      compares to tell a new ask from an unchanged one.
    - Waiting on you: the next line, always. Copy it from the "## Waiting on
      you" section of `status`, which fills it from data: "Waiting on you: 28
      open needs:human (25 in OWNER/NAME, 3 in OWNER/OTHER; 4 of them under
      this goal), listed in the daily digest", or "Waiting on you: nothing"
      when none is open. The daily digest lists them, so do not list them here.
+     On a goal home that is not known to be private, the line names only
+     public repos and folds the rest into "N in private repos"; a repo whose
+     visibility cannot be read counts as private. Copy it as printed.
      "nothing" never sits beside a count on one line (the operator read
      "Needs you: nothing. needs:human: 28 in OWNER/NAME." as both, 2026-10-25).
    Write sentences, not ticket lists: name a ticket only where the operator

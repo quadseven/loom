@@ -215,8 +215,7 @@ def _journal_build(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any],
     if not found:
         return
     marker = MARKER + head_sha + " -->"
-    comments = gh.rest("GET", "/repos/%s/issues/%s/comments?per_page=100" %
-                       (goal_repo, number)).data or []
+    comments = gh.paginate("/repos/%s/issues/%s/comments" % (goal_repo, number))
     if any(marker in str(comment.get("body") or "") for comment in comments):
         return
     body = ("<!-- loom:journal v1 -->\n%s\nSource-pin pull request %s for module revision `%s` started build run %s."

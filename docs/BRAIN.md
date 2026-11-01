@@ -54,6 +54,8 @@ that talks to GitHub about tickets.
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
+| `closed-unproven` | The station closed the ticket on merged code with its Live box unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
+| `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
@@ -410,7 +412,11 @@ and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
-for a later run. Any other issue gets `loom:triage`, and the station's log
+for a later run. In a repo with `area:` labels, ready tickets go under the
+open epic carrying their area label. When no area label matches the issue,
+triage selects the area whose label name or description shares the most words
+with the title and body, adds that label, and uses that area's epic. Any other
+issue gets `loom:triage`, and the station's log
 line names what is missing. Triage writes labels and sub-issue links
 only, and posts no comment: it never closes or retitles an issue, and edits nothing but the one
 line below, because an automated pass over old issues over-calls work as
@@ -473,19 +479,24 @@ to the newest open factory repairs batch epic (an epic whose title starts
 than 15 tickets; when none has room, "Epic: factory repairs for this goal,
 next batch" opens even when the goal is at its open epic cap. The filer
 logs each rollover, and the filed issue's `Part of` line names the batch
-epic. `epic-over-cap` counts an epic's tickets as its sub-issues and every
-loom:ticket issue, open or closed, whose `Part of` line names it, each once,
-and flags any open epic, the standing one too, that holds 100 sub-issues.
+epic. `epic-over-cap` counts an epic's open tickets, its sub-issues and every
+loom:ticket issue whose `Part of` line names it, each once, the same count
+intake uses for room. It also flags any open epic, the standing one too, that
+holds 100 sub-issues, closed ones included, which is GitHub's limit.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
-rewrites and health intake find, batch N"): the newest open one, by issue
-number, holding fewer than 15 open tickets. One is opened by `bus.brain
-onboard`, and again whenever no open intake epic has room. Each new one takes
-a batch number one past the highest any open epic of the repo carries, so no
-two open intake epics share a title (intake epics opened before this carry the
-title without a batch and are still found). The `epic-title-shared` invariant
-reports two or more open epics of one repo with the same title.
+rewrites and health intake find, batch N") in repos without `area:` labels:
+the newest open one, by issue number, holding fewer than 15 open tickets. One
+is opened by `bus.brain onboard`, and again whenever no open intake epic has
+room. Each new one takes a batch number one past the highest any open epic of
+the repo carries, so no two open intake epics share a title (intake epics opened
+before this carry the title without a batch and are still found). The
+`epic-title-shared` invariant reports two or more open epics of one repo with
+the same title. In a repo with `area:` labels, triage and the outside-epic move
+use the ticket's area epic instead. A new area epic is titled `Epic: <area>` and
+carries the matching `area:<area>` label when no open epic in that area has
+room.
 
 Every other path that files a ticket under a goal does the same
 (`brain.placement_epic`): the parts of a split pull request and the follow-up
@@ -503,7 +514,9 @@ tickets that were placed before this, or by hand.
 The station moves the tickets that break this rule itself, at most every hour
 (`Station.move_outside_tickets`, `brain.move_outside_tickets`): for each goal
 home, the tickets that are the goal's own sub-issues and sit under no epic
-move, oldest first, into an open intake epic of that goal with room. The
+move, oldest first, into an open intake epic of that goal with room. In a repo
+with `area:` labels, each moves into an epic for its area; a missing area is
+inferred from label names and descriptions. The
 epic's sub-issue link replaces the goal as the parent and the ticket's `Part
 of` line names the epic. When no intake epic has room and the goal is under
 its open epic cap, a new intake epic opens the way triage opens one; otherwise
@@ -1019,10 +1032,15 @@ request's branch, gets a `Fix-PR: <number>` header and ends with a `## Fix`
 section holding the comment. A fix comment edited after it was posted is
 refused, as an untrusted ticket is. The runner then checks out that branch,
 pushes the agent's work onto it (fast-forward only, never forced) and
-comments on the pull request; it never opens a second one. The sandboxed agent
-can write `.loom/replies.json` with thread ids, reply text and a resolve
-boolean. The runner posts valid entries after a successful push and resolves
-those marked true; missing or invalid files produce no replies. An entry
+comments on the pull request; it never opens a second one. The brief requires
+the sandboxed agent to answer every review thread it lists: one entry per
+thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
+true when the round fixed it, false with a concrete reason when it declines),
+or an answer file in `.loom-answers/`. The runner posts valid entries after a
+successful push and resolves those marked true; missing or invalid files
+produce no replies. A listed thread left with neither is named in the log and
+in the round comment on the pull request ("Review threads this round left
+without a reply"). An entry
 whose thread is not on the round's own pull request, or whose text
 `bus/text.py` refuses, is skipped and logged. A fix brief
 whose pull request is no longer open is parked as failed (a merged one is
@@ -1389,7 +1407,9 @@ its own, and none posts a comment.
 The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
 comment after the ask by an operator or trusted person that is not a
 question, a dashboard answer, a trusted brain's line starting `Finished:` or
-`Done:`, or a `## Decision (<login>, <date>)` heading in the body. An answer
+`Done:` or a dated `Operator answer YYYY-MM-DD:` line (dated on or after the
+ask's day), a `LOOM_ASK_ANSWERERS` login's `Finished:` or dated line (docs/LANES.md,
+Ask answerers), or a `## Decision (<login>, <date>)` heading in the body. An answer
 that names a command in backticks adds `needs-brain`, so the brain sees who
 can run it. An ask whose Blocked on section names an open issue gets
 `wait:blocked`. The digest skips answered and waiting asks at once, even
@@ -1631,6 +1651,16 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+A fleet hold blocks too (loom#2393): a plain pull request comment from a
+`LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
+commit, whose text opens with `Not merging` or `Hold` (any letter case, after
+optional whitespace or markdown marks such as `**`, `>` or `#`). A later
+comment by the pull request's author lifts it, as does a later trusted comment
+naming the head commit's sha (7 or more hex characters), or a newer push.
+Status prints `held by a fleet comment from LOGIN: <comment link>`, and
+`bus.brain merge` refuses with the same words. Comments that cannot be read
+block as `pull request comments unreadable`. Only the opener counts: no other
+comment text is read as a hold.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:running, not loom:pr`), a REST
@@ -1644,12 +1674,28 @@ merge` refuses with the same reason (loom#1711). Send a brain fix asking the
 lane to untick it and end it `; not built: belongs in <repo>`, so the station
 files the follow-up in that repo; a criterion already ending that way passes.
 
+A ticket at `loom:pr` with no open pull request linking it goes back to
+`loom:queued` on the next pass, once the label is 10 minutes old, unless a
+trusted author's pull request in another repo still names it, or one merged
+after the ticket's last brief and outside the closed page the station reads.
+A ticket moved `LOOM_UNCLAIMED_MOVE_CAP`
+times (default 6, 0 is off) with no lane claiming it stops moving: it takes
+`needs-brain` and `loom:runaway` with one comment (loom#2333).
+
+A `; not built:` reason that says the work is already there must cite code on
+the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,
+`<path>::<symbol>`, or `` `<path>` `<symbol>` ``. Status prints
+`blocked: a criterion says it is already done and cites no code`, `bus.brain
+merge` refuses, and the factory sends the pull request back when a citation is
+missing or the base cannot back it (bus/already_done.py, loom#2333).
+
 Status also prints a "Waiting on the brain" section: every open lane pull
 request whose ticket carries `needs-brain`, oldest first, with its ticket,
 its age in hours and its merge-ready line. The factory sets `needs-brain`
 when a ticket runs out of fix rounds as well as for a sensitive change, and a
 logic pull request with failing checks appeared in no other section, so it
-waited until the `lane-pr-stalled` invariant filed it (loom#1411). The brain
+waited until the `lane-pr-stalled` invariant listed it (loom#1411; since
+loom#2099 a line of that invariant's one tracking issue per repo, docs/LANES.md). The brain
 takes these first: merge it, or send it back with `bus.brain fix`.
 
 ### Landing lock
@@ -1812,7 +1858,8 @@ operator:
   Muse, the deploy-watch revert path, the roll pin);
 - an issue close (a done or verified ticket, an epic, a rewritten source
   issue, an operator-claimed issue, an invariant breach that cleared or was
-  folded into its rolling issue) and a move to `loom:shipped`;
+  folded into its rolling issue), except the evidence close (see The
+  evidence close);
 - an issue reopen (an invariant breach seen again, a failed audit's ticket
   or source issue);
 - a label that grants a merge (`ready-to-land`), and any GraphQL label write
@@ -1822,6 +1869,10 @@ operator:
   committed through the contents API, a merge-queue entry, a fork sync):
   code that lands with no pull request is a merge;
 - a branch deletion after a merge.
+
+A move to `loom:shipped` is a state fact, not a merge or a close, so it goes
+through: in a shadow repo a merged ticket whose work deployed still reaches
+`loom:shipped`, and so reaches verify and close. A merge or close stays held.
 
 Closing a pull request without merging it still happens (it can be reopened
 and its branch stays), and so do the closes of Loom's own signal issues that
@@ -1838,8 +1889,9 @@ reads the issue first.
 `bus/github.py` checks every request at its one choke point and refuses a
 held one with `ShadowHeld`, whichever code sent it; `bus.brain merge`,
 `bus.brain close` and the station's closes check first, so their record names
-the risk tier and the gates that passed. Every merge or ship label in a
-request is checked, and the whole request is held if any one is new. The
+the risk tier and the gates that passed. Every merge label in a request is
+checked, and the whole request is held if any one is new. A `loom:shipped`
+label is let through: it records a state, it does not merge or close. The
 hold fails safe: a request it cannot read (a label list or body of an
 unknown shape, the item's labels unreadable, a read that failed in any way)
 is held as the worst request it could be.
@@ -1847,7 +1899,7 @@ is held as the worst request it could be.
 The brain's model rung holds a GitHub token of its own, so
 `lanes/mac/brain.sh` puts a `gh` in front of it that asks
 `python3 -m bus.shadow gh-guard` first and refuses, and records, a merge, an
-issue close, an approving review or a merge or ship label, with the same
+issue close, an approving review or a merge label, with the same
 switch. It covers `gh` only: a rung that sends the request another way (curl)
 is held by its instructions alone (`docs/MUSE.md`, and the tick's prompt). Each decision is one line of an
 append-only JSONL ledger, `LOOM_SHADOW_LEDGER` or
@@ -1988,6 +2040,49 @@ before it runs. Loom bounds what it asks and keeps; the routes behind the
 adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
+
+### The evidence close
+
+By the operator's ruling of 2026-10-31 (loom#2325), one close revises the
+rule above, for one kind of ticket. The station closes a `loom:shipped`
+ticket with its one Live box unproven when all of these hold:
+
+- that Live box is the ticket's only unticked box;
+- it has no regression, urgent, runaway, `needs-brain` or `loom:audit-failed`
+  label, no open ask, no `wait:` label, and never closed this way before;
+- every linked pull request is merged, green on its merge commit (a neutral
+  review check counts, and at least one check succeeded), and on the default
+  branch;
+- every pull request's tier is below deploy-config;
+- each symbol a pull request added is still defined on the default branch,
+  and each one it removed is still gone, read from the file itself;
+- Loom has no check of its own for the box (a station proof, a runnable check
+  or a time window), and the box is known to be meetable
+  (`bus/unmeetable.py`).
+
+A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
+refused ticket goes to the usual done close and is read again after 6 hours.
+Checks still running leave the ticket for a later pass with no ask.
+
+The close carries `closed-unproven` and `force-close`, and is the one close
+that passes through shadow. The station names the ticket in code, so no label
+or `gh` call can ask for it. Merges stay held. The box is first written into
+the repo's one rolling Proof due issue, edited in place, so nothing closes
+unlisted. The close makes no AI call.
+
+At most 3 closes and 6 tickets read a pass, and 10 closes a day. Each pass
+that reads one logs its counts and these bounds in one `evidence close:` line.
+Clearing a stock in bulk is not this close's job.
+
+Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+reopened tickets, and a reopen stays counted after the ticket closes again.
+Above the limit this close stops, says so in the log and in each Proof due
+issue, and the usual done close takes over. A first reopen in fewer than 20
+closes stops it too. The count is a floor: it sees only reopens someone made.
+
+    python3 -m bus.evidence_close status
+    python3 -m bus.evidence_close pause
+    python3 -m bus.evidence_close resume    # closes before now stop counting
 
 ## Post-merge watch
 
@@ -2213,9 +2308,12 @@ repos finish), then the sections that span every repo (Runaway tickets,
 Priorities, Waiting on you and the rest for `status`; Sensitive pull
 requests, Finished epics, Verify due and Lane proof audit for `resume`).
 Each repo's reads have a budget, `--repo-budget SECONDS` or
-`LOOM_REPO_BUDGET`, 120 seconds by default; a repo past it prints
-`skipped <repo>: timed out after ...` and is left out of the cross-repo
-sections, and the run goes on with the other repos. Within a repo, the
+`LOOM_REPO_BUDGET`, 120 seconds by default. A repo past it, or one whose
+connection failed, is read once more with a fresh budget, keeping the answers
+the first try finished. A repo that fails again prints `skipped <repo>:
+timed out after ...` or `skipped <repo>: connection failed twice: ...` and is
+left out of the cross-repo sections, and the run goes on with the other
+repos. Within a repo, the
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.
@@ -2238,8 +2336,13 @@ per-repo backlog goal never gets one: its status is one line in the
 station's twice-daily Discord digest, and `journal` refuses a report there. The report ends with two lines: "Needs you:" (only what only
 the operator can do for this goal, or "nothing new for this goal"; it alone
 decides new comment or edit in place) and "Waiting on you:" (the count of
-open `needs:human` issues by repo and this goal's share, or "nothing"). `status`
-prints each goal's "Waiting on you:" line under "## Waiting on you"; `journal`
+open `needs:human` issues by repo and this goal's share, or "nothing"). A goal
+home known to be private names every repo; any other home names only public
+repos and folds the rest into one "N in private repos" part, and a repo whose
+visibility cannot be read counts as private. `status`
+prints each goal's "Waiting on you:" line under "## Waiting on you", the
+station's data-only report carries the same line (left out when a repo cannot
+be counted, and a count that moved alone edits the last report); `journal`
 refuses a report that puts the count on the "Needs you:" line or says
 "nothing" beside a count (loom#1775).
 

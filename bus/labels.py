@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
+from .stale_claims import OVERFLOW_CLAIM
 
 # The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
 # NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
@@ -14,7 +15,7 @@ from .github import GitHub
 HANDOFF = "handoff:claude"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
-         "zai", "workersai", "agy", "spark"]
+         "zai", "workersai", "agy", "spark", "copilot"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.
@@ -67,6 +68,7 @@ LANES += list(REMOTE_LANES)
 # the rungs a stuck ticket climbs are its CLIMB (docs/MUSE.md).
 # name -> (6-hex color, short ASCII description)
 LABELS: Dict[str, Dict[str, str]] = {
+    OVERFLOW_CLAIM: {"color": "5319e7", "description": "An outside contributor holds this; Loom leaves it alone"},
     "loom:goal": {"color": "5319e7", "description": "The goal's home issue"},
     "loom:backlog": {"color": "5319e7", "description": "The goal home that holds the repo's whole backlog"},
     "loom:ticket": {"color": "0e8a16", "description": "A ticket issue"},
@@ -99,6 +101,8 @@ LABELS: Dict[str, Dict[str, str]] = {
     "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},
     "needs-brain": {"color": "d876e3", "description": "Stuck past the model ladder; the brain must review or ask"},
     "loom:urgent": {"color": "e11d21", "description": "With needs:human: forward now"},
+    "closed-unproven": {"color": "fbca04", "description": "Closed on merged code with its Live box unproven; a reopen counts against this close"},
+    "loom:proof-due": {"color": "fbca04", "description": "Rolling list of Live boxes of tickets closed unproven"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
     "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},
