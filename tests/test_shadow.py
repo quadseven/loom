@@ -1,5 +1,5 @@
 """Shadow mode (bus/shadow.py, loom#1515): Loom runs as usual, but every
-merge, issue close, ship or merge label and branch deletion is recorded in a
+merge, issue close, merge label and branch deletion is recorded in a
 ledger instead of sent, until the operator takes a repo out of shadow.
 
 Loom was paused after its Apps merged damaging lane pull requests unattended.
@@ -165,10 +165,10 @@ class ChokePointTest(ShadowCase):
          shadow.CLOSE),
         ("PATCH", "/repos/%s/issues/9" % REPO, {"state": "closed", "state_reason": "not_planned"},
          shadow.CLOSE),
-        ("POST", "/repos/%s/issues/9/labels" % REPO, {"labels": ["loom:shipped"]}, shadow.LABEL),
+        ("POST", "/repos/%s/issues/9/labels" % REPO, {"labels": ["ready-to-land"]}, shadow.LABEL),
         ("PUT", "/repos/%s/issues/9/labels" % REPO, {"labels": ["loom:ticket", "ready-to-land"]},
          shadow.LABEL),
-        ("PATCH", "/repos/%s/issues/9" % REPO, {"labels": ["loom:shipped"]}, shadow.LABEL),
+        ("PATCH", "/repos/%s/issues/9" % REPO, {"labels": ["ready-to-land"]}, shadow.LABEL),
         ("PATCH", "/repos/%s/issues/9" % REPO, {"state": "open"}, shadow.REOPEN),
         ("POST", "/graphql", {"query": "mutation { reopenIssue(input:{issueId:\"x\"}) { issue { id } } }"},
          shadow.REOPEN),
@@ -202,6 +202,24 @@ class ChokePointTest(ShadowCase):
         actions = {e["action"] for e in self.entries()}
         self.assertEqual(actions, set(shadow.ACTIONS))
 
+    def test_a_shipped_label_is_a_state_fact_and_goes_through(self):
+        # loom#2350: a move to loom:shipped must reach GitHub in shadow, or a
+        # deployed ticket can never be verified and closed.
+        gh, fake = self.gh()
+        for method, path in (
+                ("POST", "/repos/%s/issues/9/labels" % REPO),
+                ("PUT", "/repos/%s/issues/9/labels" % REPO),
+                ("PATCH", "/repos/%s/issues/9" % REPO)):
+            gh.rest(method, path, {"labels": ["loom:shipped"]})
+        self.assertEqual([m for m, _, _ in fake.sent], ["POST", "PUT", "PATCH"])
+        self.assertEqual(self.entries(), [])
+
+    def test_a_shipped_label_needs_no_read_of_the_item(self):
+        gh, fake = self.gh(fail_reads=True)
+        gh.rest("POST", "/repos/%s/issues/9/labels" % REPO, {"labels": ["loom:shipped"]})
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(self.entries(), [])
+
     def test_a_held_action_reads_as_a_refused_write_and_a_refused_gate(self):
         # Callers catch one or the other: either keeps a station pass going.
         gh, _ = self.gh()
@@ -213,7 +231,7 @@ class ChokePointTest(ShadowCase):
     def test_an_item_that_cannot_be_read_holds_the_close_and_the_label(self):
         gh, fake = self.gh(fail_reads=True)
         for body, path in (({"state": "closed"}, "/repos/%s/issues/9" % REPO),
-                           ({"labels": ["loom:shipped"]}, "/repos/%s/issues/9/labels" % REPO)):
+                           ({"labels": ["ready-to-land"]}, "/repos/%s/issues/9/labels" % REPO)):
             with self.subTest(body=body):
                 with self.assertRaises(ShadowHeld):
                     gh.rest("PATCH" if "state" in body else "POST", path, body)
@@ -243,20 +261,18 @@ class ChokePointTest(ShadowCase):
                          ["/repos/%s/issues/%d" % (REPO, n) for n in (20, 22, 25)])
         self.assertEqual(sorted(e["number"] for e in self.entries()), [21, 23, 24])
 
-    def test_a_label_already_on_or_already_past_is_no_new_grant(self):
-        items = {"/repos/%s/issues/30" % REPO: issue(30, ("loom:ticket", "loom:shipped")),
-                 "/repos/%s/issues/31" % REPO: issue(31, ("loom:ticket", "loom:verified"))}
+    def test_a_merge_label_already_on_is_no_new_grant(self):
+        items = {"/repos/%s/issues/30" % REPO: issue(30, ("loom:ticket", "ready-to-land"))}
         fake = Recorder(items)
         gh = GitHub("t", transport=fake)
-        gh.rest("PUT", "/repos/%s/issues/30/labels" % REPO, {"labels": ["loom:shipped", "x"]})
-        # A failed audit moves a verified ticket back to shipped: not a ship.
-        gh.rest("PUT", "/repos/%s/issues/31/labels" % REPO, {"labels": ["loom:shipped"]})
+        gh.rest("PUT", "/repos/%s/issues/30/labels" % REPO, {"labels": ["ready-to-land", "x"]})
         gh.rest("POST", "/repos/%s/issues/30/labels" % REPO, {"labels": ["loom:merged"]})
-        self.assertEqual(len(fake.sent), 3)
+        self.assertEqual(len(fake.sent), 2)
+        self.assertEqual(self.entries(), [])
 
     def test_a_new_merge_label_after_one_already_on_is_still_held(self):
-        # Security review: only the first merge or ship label was checked, so
-        # one already on, listed first, let a new one through.
+        # Security review: only the first merge label was checked, so one
+        # already on, listed first, let a new one through.
         items = {"/repos/%s/issues/32" % REPO: issue(32, ("loom:ticket", "loom:shipped"))}
         for method, body in (("POST", {"labels": ["loom:shipped", "ready-to-land"]}),
                              ("PUT", {"labels": [{"name": "loom:shipped"}, "Ready-To-Land"]})):
@@ -269,13 +285,12 @@ class ChokePointTest(ShadowCase):
         self.assertEqual([(e["action"], e["label"]) for e in self.entries()],
                          [("label", "ready-to-land")])
 
-    def test_every_new_merge_label_is_recorded(self):
+    def test_a_held_merge_label_is_recorded_beside_a_shipped_one(self):
         fake = Recorder({"/repos/%s/issues/33" % REPO: issue(33, ("loom:ticket",))})
         with self.assertRaises(ShadowHeld):
             GitHub("t", transport=fake).rest("POST", "/repos/%s/issues/33/labels" % REPO,
                                              {"labels": ["ready-to-land", "loom:shipped"]})
-        self.assertEqual(sorted(e["label"] for e in self.entries()),
-                         ["loom:shipped", "ready-to-land"])
+        self.assertEqual([e["label"] for e in self.entries()], ["ready-to-land"])
 
     def test_a_label_list_it_cannot_read_is_held(self):
         for body in ({"labels": "ready-to-land"}, {"labels": [["ready-to-land"]]},
@@ -427,6 +442,43 @@ class CallSiteTest(ShadowCase):
                          ("close", 1, "station live proof"))
 
 
+class ShipLabelTest(ShadowCase):
+    """loom#2350: a move to loom:shipped is a state fact, not a merge or a
+    close, so shadow sends it even though merges and closes stay held."""
+
+    def ship_case(self):
+        case = tbs.ShipRuleTest("test_a_ship_on_merge_repo_ships_its_merged_tickets")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        return case
+
+    def test_a_deployed_ticket_in_a_shadow_repo_moves_to_shipped(self):
+        case = self.ship_case()
+        case.settings.ship_on_merge = [REPO]
+        case.merged(12, 99)
+        case.ship()
+        self.assertIn("loom:shipped", case.fake.names(12))
+        self.assertNotIn("loom:merged", case.fake.names(12))
+        self.assertEqual(self.entries(), [])
+
+    def test_a_label_shadow_still_holds_is_logged_once_and_not_as_a_failure(self):
+        case = self.ship_case()
+        pr = {"number": 99, "merge_commit_sha": "a" * 40}
+        runner = station.Station(GitHub("token", transport=case.transport), case.settings)
+
+        def held(*args, **kwargs):
+            entry = shadow.record("label", REPO, 12, "issue", label="ready-to-land")
+            raise ShadowHeld("shadow mode: would add ready-to-land to %s#12" % REPO, entry)
+
+        with mock.patch("bus.brain.move", side_effect=held), \
+                mock.patch.object(station, "_say") as say:
+            runner._ship_one(REPO, 12, pr, "test", "merge")
+            runner._ship_one(REPO, 12, pr, "test", "merge")
+        lines = [str(c.args[0]) for c in say.call_args_list]
+        self.assertEqual(len([line for line in lines if "shadow mode holds shipping" in line]), 1)
+        self.assertFalse(any("could not ship" in line for line in lines))
+
+
 class LedgerTest(ShadowCase):
     def test_the_same_action_is_written_once_and_a_new_head_again(self):
         for sha in ("a" * 40, "a" * 40, "b" * 40):
@@ -494,7 +546,7 @@ class DigestTest(ShadowCase):
     def test_the_digest_counts_what_was_held_and_names_the_review_command(self):
         shadow.record("merge", REPO, 8, "pr", sha="c" * 40, now=1000)
         shadow.record("close", REPO, 9, "issue", now=1100)
-        shadow.record("label", REPO, 9, "issue", label="loom:shipped", now=1200)
+        shadow.record("label", REPO, 9, "issue", label="ready-to-land", now=1200)
         lines = shadow.digest_lines(900, 2000, self.ledger)
         self.assertEqual(len(lines), 2)
         self.assertIn("Shadow mode (every repo): Loom would have done 1 merge, 1 close, "
@@ -522,7 +574,7 @@ class DigestTest(ShadowCase):
 
 
 class HoldFailsSafeTest(ShadowCase):
-    """Security review of the label hold (loom#1515): every merge or ship
+    """Security review of the label hold (loom#1515): every merge
     label in a request is read, and anything the hold cannot read holds the
     whole request."""
 
@@ -565,19 +617,28 @@ class HoldFailsSafeTest(ShadowCase):
     def test_a_close_that_may_go_still_holds_a_new_merge_label_in_the_same_request(self):
         items = {"/repos/%s/issues/43" % REPO: issue(43, pr=True),
                  "/repos/%s/issues/44" % REPO: issue(44, ("loom:factory",))}
-        for number, label in ((43, "ready-to-land"), (44, "loom:shipped")):
+        for number in (43, 44):
             with self.subTest(number=number):
                 fake = Recorder(items)
-                with self.assertRaisesRegex(ShadowHeld, "would add %s" % label):
+                with self.assertRaisesRegex(ShadowHeld, "would add ready-to-land"):
                     GitHub("t", transport=fake).rest(
                         "PATCH", "/repos/%s/issues/%d" % (REPO, number),
-                        {"state": "closed", "labels": ["loom:triage", label]})
+                        {"state": "closed", "labels": ["loom:triage", "ready-to-land"]})
                 self.assertEqual(fake.sent, [])
-        # With no merge or ship label in it, the same close goes through.
+        # With no merge label in it, the same close goes through.
         fake = Recorder(items)
         GitHub("t", transport=fake).rest("PATCH", "/repos/%s/issues/43" % REPO,
                                          {"state": "closed", "labels": ["loom:closed-unmerged"]})
         self.assertEqual(len(fake.sent), 1)
+
+    def test_a_shipped_label_in_a_close_that_may_go_does_not_hold_it(self):
+        items = {"/repos/%s/issues/43" % REPO: issue(43, pr=True)}
+        fake = Recorder(items)
+        GitHub("t", transport=fake).rest(
+            "PATCH", "/repos/%s/issues/43" % REPO,
+            {"state": "closed", "labels": ["loom:triage", "loom:shipped"]})
+        self.assertEqual(len(fake.sent), 1)
+        self.assertEqual(self.entries(), [])
 
     def test_a_triage_issue_closes_only_when_it_is_a_watch_signature(self):
         # loom:triage is on every issue not yet a ticket, a person's too: it
@@ -707,7 +768,6 @@ class GhGuardTest(ShadowCase):
         ["pr", "review", "5", "-R", REPO, "--approve"],
         ["pr", "review", "5", "-a", "-R", REPO],
         ["issue", "edit", "5", "-R", REPO, "--add-label", "ready-to-land"],
-        ["pr", "edit", "5", "-R", REPO, "--add-label=loom:merged,Loom:Shipped"],
         ["api", "-X", "PUT", "repos/%s/pulls/5/merge" % REPO],
         ["api", "--method=PATCH", "/repos/%s/issues/5" % REPO, "-f", "state=closed"],
         ["api", "repos/%s/issues/5/labels" % REPO, "-f", "labels[]=ready-to-land"],
@@ -722,6 +782,8 @@ class GhGuardTest(ShadowCase):
         ["pr", "close", "5", "-R", REPO],
         ["issue", "comment", "5", "-R", REPO, "--body", "ready-to-land soon"],
         ["issue", "edit", "5", "-R", REPO, "--add-label", "loom:answered"],
+        ["issue", "edit", "5", "-R", REPO, "--add-label", "loom:shipped"],
+        ["pr", "edit", "5", "-R", REPO, "--add-label=loom:merged,Loom:Shipped"],
         ["pr", "review", "5", "-R", REPO, "--comment", "-b", "x"],
         ["api", "repos/%s/pulls/5/merge" % REPO],
         ["api", "repos/%s/issues/5/comments" % REPO, "-f", "body=state=closed"],
