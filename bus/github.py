@@ -1078,6 +1078,33 @@ class GitHub:
                 continue
         return removed
 
+    # A whole list kept beside the conditional answers, for a reader that
+    # knows from elsewhere whether it changed (bus.needs_you: a ticket's
+    # comments and events, checked against the issue's updated_at in the
+    # listing, loom#2394). GitHub's ETags differ per token on a private repo,
+    # so a run with a token of its own gets no 304 from the last run's ETags;
+    # updated_at is the same for every reader. The key is the list's URL with
+    # a fragment no request sends, so it never answers that URL's 304.
+    def _whole_key(self, path: str) -> str:
+        return self._url(path) + "#whole"
+
+    def recall(self, path: str, validator: str) -> Optional[List[Any]]:
+        """The list kept for `path` under this validator, or None. A hit
+        counts as a use, so prune_cache keeps it."""
+        if not self.cache_dir or not validator:
+            return None
+        key = self._whole_key(path)
+        entry = self._cached(key)
+        if entry is None or entry.get("etag") != validator or not isinstance(entry.get("data"), list):
+            return None
+        self._touch(key)
+        return list(entry["data"])
+
+    def remember(self, path: str, validator: str, items: List[Any]) -> None:
+        """Keep the whole list read for `path` under `validator`."""
+        if self.cache_dir and validator:
+            self._keep(self._whole_key(path), {"etag": validator, "data": list(items)})
+
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"

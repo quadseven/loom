@@ -3,10 +3,12 @@ of comments (loom#2387)."""
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -319,7 +321,9 @@ class Budget(unittest.TestCase):
         slow = lambda: release.wait(5) and []  # noqa: E731
         fake = GitHubLists({"/repos/%s/issues" % SLOW: slow})
         out = io.StringIO()
-        env = {"LOOM_BRIEF_AUTHORS": OP, "LOOM_REPOS": SLOW}
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        env = {"LOOM_BRIEF_AUTHORS": OP, "LOOM_REPOS": SLOW, "LOOM_HOME": home.name}
         with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), \
                 mock.patch.object(needs_you, "auth_from_env", return_value="t"), \
                 mock.patch.object(needs_you, "_short_transport", fake, create=True):
@@ -403,6 +407,153 @@ class Requests(unittest.TestCase):
         text, code = needs_you.run(gh, [REPO], TRUSTED, [OP])
         self.assertEqual((0, "Needs you: 3"), (code, text.split("\n")[0]))
 
+
+
+class ETags(GitHubLists):
+    """GitHubLists that answers an If-None-Match naming the answer it would
+    send with a 304, as GitHub does for one token. `token_bound` answers
+    every read whole instead: on a private repo the last run's ETags were
+    another token's."""
+
+    def __init__(self, routes, token_bound=False):
+        super().__init__(routes)
+        self.token_bound = token_bound
+        self.answers = []
+
+    def __call__(self, method, url, headers, body):
+        status, head, raw = super().__call__(method, url, headers, body)
+        tag = '"%s"' % hashlib.sha256(raw + head.get("link", "").encode()).hexdigest()
+        if not self.token_bound and headers.get("If-None-Match") == tag:
+            self.answers.append((url, 304))
+            return 304, dict(head, etag=tag), b""
+        self.answers.append((url, status))
+        return status, dict(head, etag=tag), raw
+
+
+class KeptBetweenRuns(unittest.TestCase):
+    """A second run within the cache's life reads only what changed
+    (loom#2394): Muse's ticks left the heaviest repo unread at the deadline
+    because every run read every asking ticket's comments and events again."""
+
+    def setUp(self):
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
+        items = [dict(issue(n), updated_at="2030-01-02T00:00:00Z") for n in (3, 4)]
+        self.routes = dict(routes_of(items[0], [ask()]), **routes_of(items[1], [ask()]))
+        self.routes["/repos/%s/issues" % REPO] = items
+
+    def main(self, fake, *argv):
+        out = io.StringIO()
+        env = {"LOOM_BRIEF_AUTHORS": OP, "LOOM_REPOS": REPO, "LOOM_HOME": self.home}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), \
+                mock.patch.object(needs_you, "auth_from_env", return_value="t"), \
+                mock.patch.object(needs_you, "_short_transport", fake, create=True):
+            code = needs_you.main(list(argv))
+        return out.getvalue(), code
+
+    @staticmethod
+    def kinds(fake):
+        return sorted(urlsplit(u).path.rsplit("/", 1)[-1] for u in fake.reads)
+
+    def test_an_unchanged_ticket_is_not_read_again(self):
+        first = ETags(self.routes)
+        text, code = self.main(first)
+        self.assertEqual((0, "Needs you: 2"), (code, text.split("\n")[0]))
+        self.assertEqual(["comments", "comments", "events", "events", "issues",
+                          "timeline", "timeline"], self.kinds(first))
+        again = ETags(self.routes)
+        self.assertEqual((text, 0), self.main(again))
+        # The listing and each timeline are asked with the ETag kept last run
+        # and answered 304; the comments and events are not asked at all.
+        self.assertEqual(["issues", "timeline", "timeline"], self.kinds(again))
+        self.assertEqual([304, 304, 304], [status for _, status in again.answers])
+
+    def test_with_another_token_an_unchanged_ticket_is_still_not_read(self):
+        self.main(ETags(self.routes))
+        again = ETags(self.routes, token_bound=True)
+        text, code = self.main(again)
+        self.assertEqual((0, "Needs you: 2"), (code, text.split("\n")[0]))
+        self.assertEqual(["issues", "timeline", "timeline"], self.kinds(again))
+
+    def test_a_ticket_that_changed_is_read_again(self):
+        self.main(ETags(self.routes))
+        base = "/repos/%s/issues/3" % REPO
+        self.routes[base + "/comments"] = [ask(), said("Still thinking.", ident=2)]
+        self.routes["/repos/%s/issues" % REPO][0]["updated_at"] = "2030-01-03T00:00:00Z"
+        again = ETags(self.routes)
+        text, _ = self.main(again)
+        read = [urlsplit(u).path for u in again.reads]
+        self.assertIn(base + "/comments", read)
+        self.assertIn(base + "/events", read)
+        self.assertNotIn("/repos/%s/issues/4/comments" % REPO, read)
+        self.assertIn("latest comment: %s at 2030-01-03T00:00:00Z" % OP, text)
+
+    def test_a_ticket_with_no_updated_at_is_read_every_run(self):
+        for item in self.routes["/repos/%s/issues" % REPO]:
+            del item["updated_at"]
+        self.main(ETags(self.routes))
+        again = ETags(self.routes)
+        self.main(again)
+        self.assertEqual(2, self.kinds(again).count("comments"))
+
+    def test_an_answer_unused_for_a_day_is_removed(self):
+        folder = needs_you.cache_dir({"LOOM_HOME": self.home})
+        os.makedirs(folder)
+        stale = os.path.join(folder, "old.json")
+        with open(stale, "w") as fh:
+            fh.write("{}")
+        os.utime(stale, (time.time() - 2 * 86400,) * 2)
+        self.main(ETags(self.routes))
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.listdir(folder))
+
+    def test_workers_is_a_setting(self):
+        seen = {}
+
+        def run(*args, **kwargs):
+            seen.update(kwargs)
+            return "Needs you: nothing\n", 0
+        with mock.patch.object(needs_you, "run", run):
+            self.main(ETags({}), "--workers", "24")
+        self.assertEqual(24, seen["workers"])
+        with mock.patch.object(needs_you, "run", run):
+            self.main(ETags({}))
+        self.assertEqual(needs_you.WORKERS, seen["workers"])
+
+
+class Order(unittest.TestCase):
+    """The heaviest repo's tickets are read first (loom#2394): its items
+    were found last and trailed past the deadline."""
+
+    def test_the_repo_with_most_open_issues_has_its_tickets_read_first(self):
+        light, heavy = "example-owner/light", "example-owner/heavy"
+        routes = {"/repos/%s/issues" % light: [issue(1)],
+                  "/repos/%s/issues" % heavy: [issue(n) for n in (7, 8)] + [
+                      issue(n, labels=("loom:ticket",)) for n in range(10, 160)]}
+        for repo, numbers in ((light, (1,)), (heavy, (7, 8))):
+            for n in numbers:
+                base = "/repos/%s/issues/%d" % (repo, n)
+                routes.update({base + "/comments": [ask()], base + "/events": [added()],
+                               base + "/timeline": []})
+        fake = GitHubLists(routes)
+        text, code = needs_you.run(GitHub("t", transport=fake), [light, heavy], TRUSTED, [OP],
+                                   workers=1)
+        self.assertEqual(0, code)
+        firsts = [urlsplit(u).path for u in fake.reads if u.split("?")[0].endswith("/comments")]
+        self.assertEqual(["/repos/%s/issues/%d/comments" % (heavy, 7),
+                          "/repos/%s/issues/%d/comments" % (heavy, 8),
+                          "/repos/%s/issues/%d/comments" % (light, 1)], firsts)
+
+    def test_drain_starts_the_heaviest_task_first_and_keeps_order_within_a_weight(self):
+        ran = []
+
+        def task(name):
+            return lambda: ran.append(name) or []
+        late = needs_you.drain([("a", task("a"), 1), ("b", task("b"), 5), ("c", task("c")),
+                                ("d", task("d"), 5), ("e", task("e"), needs_you.FIRST)], 1, 5)
+        self.assertEqual([], late)
+        self.assertEqual(["e", "b", "d", "a", "c"], ran)
 
 
 class Pages(unittest.TestCase):
