@@ -1396,7 +1396,8 @@ its own, and none posts a comment.
 The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
 comment after the ask by an operator or trusted person that is not a
 question, a dashboard answer, a trusted brain's line starting `Finished:` or
-`Done:`, or a `## Decision (<login>, <date>)` heading in the body. An answer
+`Done:` or a dated `Operator answer YYYY-MM-DD:` line (dated on or after the
+ask's day), or a `## Decision (<login>, <date>)` heading in the body. An answer
 that names a command in backticks adds `needs-brain`, so the brain sees who
 can run it. An ask whose Blocked on section names an open issue gets
 `wait:blocked`. The digest skips answered and waiting asks at once, even

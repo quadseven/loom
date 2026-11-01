@@ -8411,11 +8411,7 @@ class Station:
         comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
         events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
         trusted = list(self.s.authors)
-        blockers = []
-        for other in brief_check.blocked_on(issue.get("body")):
-            if other != number and (self.gh.rest(
-                    "GET", "/repos/%s/issues/%d" % (repo, other)).data or {}).get("state") != "closed":
-                blockers.append(other)
+        blockers = ask_state.open_blockers(self.gh.rest, repo, issue)
         return comments, events, trusted, answer.operators(trusted=trusted), blockers
 
     def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
