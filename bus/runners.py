@@ -340,43 +340,42 @@ class Runners:
                 return     # held, as its heartbeat says: the brief waits
             self._dispatch(ledger, slot, ticket)
 
+    def _refuse(self, ledger: Dict[str, Any], entry: Dict[str, Any], reason: str,
+                kind: str = "transient") -> None:
+        """Record that this brief is not sent, then park it."""
+        entry["state"] = "refused"
+        self.save(ledger)
+        self._park(entry["slot"], entry["ticket"], reason, kind)
+
     def _dispatch(self, ledger: Dict[str, Any], slot: str, ticket: str) -> None:
         key = "%s/%s" % (slot, ticket)
         path = os.path.join(self.inbox(slot), ticket + ".md")
         entry: Dict[str, Any] = {"slot": slot, "ticket": ticket, "at": self.now}
         ledger["runs"][key] = entry
         if not TICKET_RE.fullmatch(ticket):
-            entry["state"] = "refused"
-            self.save(ledger)
-            self._park(slot, ticket, "ticket name must be letters, digits, dot, underscore or dash", "work")
+            self._refuse(ledger, entry, "ticket name must be letters, digits, dot, underscore or dash", "work")
             return
         try:
             with open(path, encoding="utf-8") as fh:
                 brief = fh.read()
         except (OSError, UnicodeDecodeError) as err:
-            entry["state"] = "refused"
-            self.save(ledger)
-            self._park(slot, ticket, "could not read the brief for a runner dispatch: %s"
-                       % type(err).__name__, "transient")
+            self._refuse(ledger, entry, "could not read the brief for a runner dispatch: %s"
+                         % type(err).__name__)
             return
         repo = brief_field(brief, "Repo")
         if not repo or not self.public(repo):
-            entry["state"] = "refused"
-            self.save(ledger)
-            self._park(slot, ticket, "runner slots take public repos only, and %s is not one"
-                       % (repo or "the brief's repo"), "transient")
+            self._refuse(ledger, entry, "runner slots take public repos only, and %s is not one"
+                         % (repo or "the brief's repo"))
             return
         base = brief_field(brief, "Base")
         red = self._base_red(ledger, slot, repo, base)
         if red:
-            entry["state"] = "refused"
-            self.save(ledger)
             # The check's own words stay in the station log: a park's reason
             # can reach a ticket, and this text comes from a run log.
             self.say("%s/%s not dispatched: %s is red there: %s"
                      % (slot, ticket, repo, red.get("why") or "no reason"))
-            self._park(slot, ticket, "the base check of %s is red on this runner at %s; "
-                       "another lane takes it" % (repo, red["revision"][:12]), "transient")
+            self._refuse(ledger, entry, "the base check of %s is red on this runner at %s; "
+                         "another lane takes it" % (repo, red["revision"][:12]))
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
@@ -386,11 +385,8 @@ class Runners:
                   "report_key": self.public_key(), "report_mac_key": mac_key}
         size = input_size(inputs)
         if size > INPUT_LIMIT:
-            entry["state"] = "refused"
-            self.save(ledger)
-            self._park(slot, ticket, "the brief is too large to dispatch to a runner "
-                       "(%d of %d input characters); a local lane takes it" % (size, INPUT_LIMIT),
-                       "transient")
+            self._refuse(ledger, entry, "the brief is too large to dispatch to a runner "
+                         "(%d of %d input characters); a local lane takes it" % (size, INPUT_LIMIT))
             return
         entry.update({"state": "dispatched", "run_id": run_id, "mac": mac_key})
         # Recorded before the request: a request that lands but whose answer
@@ -408,10 +404,7 @@ class Runners:
         except Exception as err:  # noqa: BLE001 - any failed request
             status = getattr(err, "status", 0) or 0
             if 400 <= status < 500:
-                entry["state"] = "refused"
-                self.save(ledger)
-                self._park(slot, ticket, "GitHub refused the runner dispatch (HTTP %d)" % status,
-                           "transient")
+                self._refuse(ledger, entry, "GitHub refused the runner dispatch (HTTP %d)" % status)
                 return
             # No answer or a server error: the run may exist, but with no run
             # id it cannot be followed. Parked, never sent again; a run that
@@ -474,6 +467,19 @@ class Runners:
             ledger["base_red"].pop(slot, None)
         ledger["images"][slot] = {"id": image, "at": self.now}
 
+    @staticmethod
+    def _base_rows(raw: bytes, phases: Tuple[str, ...]) -> List[Dict[str, Any]]:
+        """The validation record's rows of these phases, less any a SIGTERM ended."""
+        rows = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get("phase") in phases and row.get("exit") != 143:
+                rows.append(row)
+        return rows
+
     def _note_base(self, ledger: Dict[str, Any], entry: Dict[str, Any],
                    files: Dict[str, bytes]) -> None:
         """Count a report's base failures for the entry's repo. A run's last
@@ -484,15 +490,7 @@ class Runners:
         raw = files.get("logs/%s/%s.validation.jsonl" % (slot, ticket))
         if not repo or raw is None:
             return
-        phases = ("default-baseline",) if entry.get("fix") else BASE_PHASES
-        rows = []
-        for line in raw.decode("utf-8", "replace").splitlines():
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(row, dict) and row.get("phase") in phases and row.get("exit") != 143:
-                rows.append(row)
+        rows = self._base_rows(raw, ("default-baseline",) if entry.get("fix") else BASE_PHASES)
         if not rows:
             return
         repos = ledger["base_red"].setdefault(slot, {})
