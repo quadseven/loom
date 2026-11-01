@@ -47,11 +47,13 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.write_text("%s\n" % pid)
 
     def run_install(self, *lanes, **env):
-        # The watched repos, status repo and App settings come only from the
-        # test: an operator's own settings in the environment would trip the
-        # owner check or the App check.
+        # The watched repos, status repo, login lists and App settings come
+        # only from the test: an operator's own settings in the environment
+        # would trip the owner check or the App check, or fill a list a test
+        # leaves unset.
         full = {k: v for k, v in os.environ.items()
-                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
+                if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO", "LOOM_BRIEF_AUTHORS",
+                             "LOOM_ASK_ANSWERERS", "LOOM_TRUSTED_BRIEFERS")
                 and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
                                        "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,

@@ -333,6 +333,13 @@ class SensitiveResumeTests(unittest.TestCase):
         tier = unittest.mock.patch.object(brain, "_refuse_risk_tier")
         tier.start()
         self.addCleanup(tier.stop)
+        # A host's own login lists turn on the fleet hold read, which the
+        # scripted replies here do not carry.
+        logins = unittest.mock.patch.dict(os.environ)
+        logins.start()
+        self.addCleanup(logins.stop)
+        os.environ.pop("LOOM_BRIEF_AUTHORS", None)
+        os.environ.pop("LOOM_TRUSTED_BRIEFERS", None)
 
     def make_gh(self, entries):
         prs = []

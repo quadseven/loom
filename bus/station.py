@@ -11132,9 +11132,10 @@ class Station:
             for epic in shape.epics:
                 if epic.epic.key == subject and not epic.open:
                     return "epic %s is closed" % epic.epic.label
-                if epic.epic.key == subject and epic.tickets <= invariants.EPIC_TICKETS:
-                    return "epic %s holds %d tickets, within the cap of %d" % (
-                        epic.epic.label, epic.tickets, invariants.EPIC_TICKETS)
+                if (epic.epic.key == subject
+                        and len(epic.open_tickets) <= invariants.EPIC_TICKETS):
+                    return "epic %s holds %d open tickets, within the cap of %d" % (
+                        epic.epic.label, len(epic.open_tickets), invariants.EPIC_TICKETS)
         return None
 
     def _invariant_goal(self) -> Optional[Tuple[str, int]]:

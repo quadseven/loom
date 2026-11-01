@@ -182,12 +182,13 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # pass, before any other clear, whatever labels it carries (loom#2022: five
 # lane-pr-stalled issues stayed open up to a day after their pull requests
 # merged or closed, and an operator closed them by hand).
-SETTLES = ("lane-pr-stalled", "epic-over-cap")
+EPIC_OVER_CAP = "epic-over-cap"
+SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
 # Invariants that restate state the pull request, the epic or the dashboard
 # already shows: one tracking issue per (kind, subject repo), its list edited
 # in place, instead of one issue per violation (loom#2099). The settle path
 # above now only closes per-violation issues filed before this.
-ROLLED = ("lane-pr-stalled", "plan-check-failed", "epic-over-cap", "epic-title-shared")
+ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared")
 ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
 ROLL_TITLE = "Invariant: %s in %s"
 ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
@@ -234,7 +235,7 @@ ROLL_HINTS = {
         "OWNER/NAME#N --file FIX.md`"]),
     "plan-check-failed": "Each pull request here is held by its plan check; fix the rows its "
                          "check-run summary marks failing.",
-    "epic-over-cap": "Each epic here holds more than its cap; new work goes into a next epic.",
+    EPIC_OVER_CAP: "Each epic here holds more than its cap; new work goes into a next epic.",
     "epic-title-shared": "The epics on each line share one title; give each a distinct title, "
                          "and move the tickets of the older ones under one.",
 }
@@ -708,11 +709,12 @@ def ticket_outside_epic(f: Facts) -> List[Breach]:
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
-    """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
-    the issues whose Part of line names it, each once), or any epic, the
-    standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
-    refuses its next link (loom#2023). A closed epic is finished work whose
-    closed tickets can never leave it, so it is never over a cap (loom#2140)."""
+    """An open epic holding more than EPIC_TICKETS open tickets (its
+    sub-issues and the issues whose Part of line names it, each once), or any
+    epic, the standing repairs epic too, holding GitHub's limit of sub-issues:
+    GitHub refuses its next link (loom#2023). A closed epic is finished work
+    whose closed tickets can never leave it, so it is never over a cap
+    (loom#2140)."""
     if f.shapes is None:
         return []
     out = []
@@ -720,7 +722,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
         for epic in shape.epics:
             if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
+                    EPIC_OVER_CAP, epic.epic.key,
                     "Epic %s holds %d sub-issues (GitHub's limit %d)"
                     % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
                     ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
@@ -731,17 +733,18 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                     line="Epic %s of goal home %s: %d sub-issues (GitHub's limit %d)" % (
                         epic.epic.label, shape.goal.label, epic.sub_issues, SUB_ISSUE_LIMIT),
                     where=_where(epic.epic)))
-            elif epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
+            elif epic.open and len(epic.open_tickets) > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
-                    "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
-                                                           EPIC_TICKETS),
-                    ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
+                    EPIC_OVER_CAP, epic.epic.key,
+                    "Epic %s holds %d open tickets (cap %d)"
+                    % (epic.epic.label, len(epic.open_tickets), EPIC_TICKETS),
+                    ("Epic %s of goal home %s holds %d open tickets; an epic holds at most %d, "
                      "and more work goes into a next epic" % (
-                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
+                         epic.epic.label, shape.goal.label, len(epic.open_tickets),
+                         EPIC_TICKETS),),
                     f.now,
-                    line="Epic %s of goal home %s: %d tickets (cap %d)" % (
-                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),
+                    line="Epic %s of goal home %s: %d open tickets (cap %d)" % (
+                        epic.epic.label, shape.goal.label, len(epic.open_tickets), EPIC_TICKETS),
                     where=_where(epic.epic)))
     return out
 
@@ -1182,7 +1185,7 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
 # The Facts field each ROLLED kind reads: a pass that could not read it says
 # nothing about that kind, so its tracking issue is left as it is.
 ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
-                "epic-over-cap": "shapes", "epic-title-shared": "shapes"}
+                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes"}
 
 
 def read_kinds(facts: Facts) -> Tuple[str, ...]:

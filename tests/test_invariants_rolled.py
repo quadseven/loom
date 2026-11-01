@@ -161,9 +161,10 @@ class RolledKindTest(unittest.TestCase):
         self.assertEqual(len(self.gh.writes), writes)
 
     def test_other_kinds_and_repos_stay_separate(self):
+        held = tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 116))
         epics = invariants.epic_over_cap(Facts(T0, shapes=[invariants.GoalShape(
             Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL), 6,
-            (invariants.EpicShape(Ref("%s#40" % REPO, "#40"), True, 16, ()),), ())]))
+            (invariants.EpicShape(Ref("%s#40" % REPO, "#40"), True, 16, held),), ())]))
         lane = invariants.Breach("lane-no-success", "zen", "Lane zen: 5 runs in 24 hours and "
                                  "none done", ("x",), T0)
         self.file(self.stalled([self.pull(201), self.pull(202), self.pull(301, self.PUBLIC),
@@ -188,19 +189,20 @@ class RolledKindTest(unittest.TestCase):
 
     def test_an_epic_line_keeps_when_it_was_first_seen(self):
         def shape(tickets, now):
+            held = tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 100 + tickets))
             return invariants.epic_over_cap(Facts(now, shapes=[invariants.GoalShape(
                 Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL), 6,
-                (invariants.EpicShape(Ref("%s#40" % REPO, "#40"), True, tickets, ()),), ())]))
+                (invariants.EpicShape(Ref("%s#40" % REPO, "#40"), True, tickets, held),), ())]))
         self.file(shape(16, T0))
         writes = len(self.gh.writes)
         self.file(shape(16, T0 + 3600), now=T0 + 3600)
         self.assertEqual(len(self.gh.writes), writes)
         (issue,) = self.gh.issues.values()
-        self.assertIn("16 tickets (cap 15) (since %s)" % stamp(T0), issue["body"])
+        self.assertIn("16 open tickets (cap 15) (since %s)" % stamp(T0), issue["body"])
         # Gone and back: it starts again.
         self.file([], now=T0 + 4000)
         self.file(shape(17, T0 + 5000), now=T0 + 5000)
-        self.assertIn("17 tickets (cap 15) (since %s)" % stamp(T0 + 5000), issue["body"])
+        self.assertIn("17 open tickets (cap 15) (since %s)" % stamp(T0 + 5000), issue["body"])
 
     def legacy(self, number, invariant="lane-pr-stalled", labels=None, subject=None):
         key = invariants.Breach(invariant, subject or "%s#%d" % (REPO, number), "t", (), T0).key

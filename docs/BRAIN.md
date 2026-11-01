@@ -479,9 +479,10 @@ to the newest open factory repairs batch epic (an epic whose title starts
 than 15 tickets; when none has room, "Epic: factory repairs for this goal,
 next batch" opens even when the goal is at its open epic cap. The filer
 logs each rollover, and the filed issue's `Part of` line names the batch
-epic. `epic-over-cap` counts an epic's tickets as its sub-issues and every
-loom:ticket issue, open or closed, whose `Part of` line names it, each once,
-and flags any open epic, the standing one too, that holds 100 sub-issues.
+epic. `epic-over-cap` counts an epic's open tickets, its sub-issues and every
+loom:ticket issue whose `Part of` line names it, each once, the same count
+intake uses for room. It also flags any open epic, the standing one too, that
+holds 100 sub-issues, closed ones included, which is GitHub's limit.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,
