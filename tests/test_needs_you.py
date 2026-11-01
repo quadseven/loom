@@ -7,6 +7,8 @@ import io
 import json
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -76,6 +78,8 @@ class GitHubLists:
         parts = urlsplit(url)
         path, query = parts.path, parse_qs(parts.query)
         data = self.routes[path]
+        if callable(data) and not isinstance(data, type):
+            data = data()
         if isinstance(data, Exception):
             raise data
         if not isinstance(data, list):
@@ -84,7 +88,9 @@ class GitHubLists:
         rows = data[(page - 1) * size:page * size]
         link = ""
         if page * size < len(data):
-            link = '<%s%s?per_page=%d&page=%d>; rel="next"' % (API, path, size, page + 1)
+            last = (len(data) + size - 1) // size
+            link = ", ".join('<%s%s?per_page=%d&page=%d>; rel="%s"' % (API, path, size, at, rel)
+                             for at, rel in ((page + 1, "next"), (last, "last")))
         return 200, {"link": link} if link else {}, json.dumps(rows).encode()
 
 
@@ -263,6 +269,139 @@ class Failures(unittest.TestCase):
     def test_the_ask_time_is_the_labels_when_no_comment_holds_it(self):
         found = judge([], issue(body="## Ask\nPick one.\n"))
         self.assertEqual(ASKED, found.asked_at)
+
+
+
+SLOW, QUICK = "example-owner/slow", "example-owner/quick"
+
+
+class Budget(unittest.TestCase):
+    """The command finishes inside a Muse tick (loom#2394): Muse gave it 120,
+    100 and then 45 seconds and got no output at all, because every repo and
+    every ticket was read one after another and the report printed last."""
+
+    def two_repos(self, slow_repo):
+        quick = issue(5)
+        base = "/repos/%s/issues/5" % QUICK
+        routes = {"/repos/%s/issues" % QUICK: [quick],
+                  base + "/comments": [ask()], base + "/events": [added()], base + "/timeline": [],
+                  "/repos/%s/issues" % SLOW: slow_repo}
+        return routes
+
+    def test_a_repo_that_hangs_is_named_and_the_rest_is_printed(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        fake = GitHubLists(self.two_repos(lambda: release.wait(5) and []))
+        started = time.monotonic()
+        with mock.patch.object(needs_you, "DEADLINE", 0.5, create=True):
+            text, code = needs_you.run(GitHub("t", transport=fake, sleep=lambda _: None),
+                                       [SLOW, QUICK], TRUSTED, [OP])
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(1, code)
+        self.assertIn("Needs you: 1", text)
+        self.assertIn("- %s#5: open" % QUICK, text)
+        self.assertIn("Unread, so this report is incomplete: 1", text)
+        self.assertIn("- %s: not read within the 0.5s deadline" % SLOW, text)
+        self.assertNotIn("nothing", text)
+
+    def test_a_repo_that_fails_is_named_and_the_rest_is_printed(self):
+        fake = GitHubLists(self.two_repos(GitHubError("request failed: RemoteDisconnected", 0, "")))
+        text, code = needs_you.run(GitHub("t", transport=fake, sleep=lambda _: None),
+                                   [SLOW, QUICK], TRUSTED, [OP])
+        self.assertEqual(1, code)
+        self.assertIn("- %s#5: open" % QUICK, text)
+        self.assertIn("- %s: request failed: RemoteDisconnected" % SLOW, text)
+
+    def test_the_deadline_prints_the_report_from_the_command(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        slow = lambda: release.wait(5) and []  # noqa: E731
+        fake = GitHubLists({"/repos/%s/issues" % SLOW: slow})
+        out = io.StringIO()
+        env = {"LOOM_BRIEF_AUTHORS": OP, "LOOM_REPOS": SLOW}
+        with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), \
+                mock.patch.object(needs_you, "auth_from_env", return_value="t"), \
+                mock.patch.object(needs_you, "_short_transport", fake, create=True):
+            self.assertEqual(1, needs_you.main(["--deadline", "0.3"]))
+        self.assertIn("- %s: not read within the 0.3s deadline" % SLOW, out.getvalue())
+
+
+class Requests(unittest.TestCase):
+    """What one run reads, pinned so it does not grow back."""
+
+    def busy_repo(self):
+        asks = [issue(n, labels=("needs:human",)) for n in (3, 4)] + \
+            [issue(6, labels=("needs:someone", "needs:human"))]
+        others = [issue(n, labels=("loom:ticket",)) for n in range(10, 260)]
+        routes = {"/repos/%s/issues" % REPO: asks + others}
+        for item in asks:
+            base = "/repos/%s/issues/%d" % (REPO, item["number"])
+            routes.update({base + "/comments": [ask()], base + "/events": [added()],
+                           base + "/timeline": []})
+        return routes
+
+    def test_each_page_and_each_asking_ticket_is_read_once(self):
+        fake = GitHubLists(self.busy_repo())
+        gh = GitHub("t", transport=fake)
+        # As main reads: a first comments page also reads its issue's body,
+        # which the listing already holds.
+        gh.status_in_body = True
+        gh.status_authors |= {OP}
+        text, code = needs_you.run(gh, [REPO], TRUSTED, [OP])
+        self.assertEqual(0, code)
+        self.assertIn("Needs you: 3", text)
+        paths = sorted("%s?page=%s" % (urlsplit(u).path,
+                                       parse_qs(urlsplit(u).query).get("page", ["1"])[0])
+                       for u in fake.reads)
+        want = ["/repos/%s/issues?page=%d" % (REPO, n) for n in (1, 2, 3)]
+        for n in (3, 4, 6):
+            want += ["/repos/%s/issues/%d/%s?page=1" % (REPO, n, kind)
+                     for kind in ("comments", "events", "timeline")]
+        self.assertEqual(sorted(want), paths)
+
+    def test_the_pages_of_a_busy_repo_are_read_in_parallel(self):
+        gate = threading.Barrier(2, timeout=2)
+        routes = self.busy_repo()
+        rows = routes["/repos/%s/issues" % REPO]
+        seen = []
+
+        def listing():
+            seen.append(1)
+            if len(seen) > 1:  # pages 2 and 3 meet, or one waits alone
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    return GitHubError("read alone: the pages were read one at a time", 500, "")
+            return rows
+        routes["/repos/%s/issues" % REPO] = listing
+        gh = GitHub("t", transport=GitHubLists(routes))
+        text, code = needs_you.run(gh, [REPO], TRUSTED, [OP])
+        self.assertEqual((0, "Needs you: 3"), (code, text.split("\n")[0]))
+
+    def test_a_blocker_named_by_many_asks_is_read_once(self):
+        routes = self.busy_repo()
+        for n in (3, 4):
+            routes["/repos/%s/issues" % REPO][[3, 4].index(n)]["body"] = "## Blocked on\n\n- #999\n"
+        routes["/repos/%s/issues/999" % REPO] = {"number": 999, "state": "open"}
+        fake = GitHubLists(routes)
+        needs_you.run(GitHub("t", transport=fake), [REPO], TRUSTED, [OP])
+        self.assertEqual(1, sum(urlsplit(u).path.endswith("/issues/999") for u in fake.reads))
+
+    def test_tickets_are_read_in_parallel(self):
+        gate = threading.Barrier(3, timeout=2)
+        routes = self.busy_repo()
+        for n in (3, 4, 6):
+            def comments():
+                try:
+                    gate.wait()
+                except threading.BrokenBarrierError:
+                    return GitHubError("read alone: the tickets were read one at a time", 500, "")
+                return [ask()]
+            routes["/repos/%s/issues/%d/comments" % (REPO, n)] = comments
+        gh = GitHub("t", transport=GitHubLists(routes))
+        text, code = needs_you.run(gh, [REPO], TRUSTED, [OP])
+        self.assertEqual((0, "Needs you: 3"), (code, text.split("\n")[0]))
 
 
 if __name__ == "__main__":
