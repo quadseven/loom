@@ -1567,6 +1567,67 @@ class InvariantTest(unittest.TestCase):
                     Facts(T0, lane_pulls=[self.pull(T0 - 25 * 3600, **shape)])), [])
 
 
+
+class ReviewDebtTest(unittest.TestCase):
+    def setUp(self):
+        self.gh, self.state, self.said = FakeGH(), {}, []
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_filer(self, facts, now):
+        found = invariants.check(facts, self.said.append)
+        invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append).run(found)
+
+    def mine(self):
+        return [i for i in self.gh.issues.values() if "review-overdue" in i.get("body", "")]
+
+    def comments(self):
+        return [w for w in self.gh.writes if w[0] == "POST" and w[1].endswith("/comments")]
+
+    def test_no_review_in_eight_days_raises_one_finding_and_a_second_pass_adds_no_comment(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        self.assertEqual(len(self.mine()), 1)
+        self.assertEqual(self.mine()[0]["state"], "open")
+        self.assertIn("8 days", self.mine()[0]["title"])
+        before = len(self.comments())
+        self.run_filer(Facts(T0 + 300, review_at=T0 - 8 * DAY_S), T0 + 300)
+        self.assertEqual(len(self.mine()), 1)
+        self.assertEqual(len(self.comments()), before)
+
+    def test_seven_days_is_on_time_and_not_read_is_no_finding(self):
+        self.assertEqual(invariants.review_overdue(Facts(T0, review_at=T0 - 7 * DAY_S)), [])
+        self.assertEqual(invariants.review_overdue(Facts(T0)), [])
+
+    def test_a_new_review_clears_the_finding(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        later = T0 + invariants.CLEAR_AFTER + 300
+        self.run_filer(Facts(later, review_at=later - 60), later)
+        self.assertEqual(self.mine()[0]["state"], "closed")
+
+    def test_a_second_lapse_reports_again(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        later = T0 + invariants.CLEAR_AFTER + 300
+        self.run_filer(Facts(later, review_at=later - 60), later)
+        again = later + 8 * DAY_S
+        self.run_filer(Facts(again, review_at=later - 60), again)
+        self.assertEqual(self.mine()[0]["state"], "open")
+
+    def test_a_guard_that_stays_unreadable_is_its_own_finding(self):
+        (found,) = invariants.guard_unreadable(Facts(T0, guards_unreadable=[3]))
+        self.assertEqual(found.invariant, "guard-unreadable")
+        self.assertTrue(found.rolling)
+        self.assertEqual(invariants.guard_unreadable(Facts(T0, guards_unreadable=[])), [])
+        self.assertEqual(invariants.guard_unreadable(Facts(T0)), [])
+
+    def test_a_guard_closed_with_no_check_is_one_rolling_finding(self):
+        (found,) = invariants.guard_no_check(Facts(T0, guards_no_check=[3, 4]))
+        self.assertTrue(found.rolling)
+        self.assertIn("#3", " ".join(found.evidence))
+        self.assertEqual(invariants.guard_no_check(Facts(T0, guards_no_check=[])), [])
+        self.assertEqual(invariants.guard_no_check(Facts(T0)), [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

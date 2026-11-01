@@ -54,6 +54,7 @@ from . import brain
 from . import journal
 from . import naming
 from . import notify
+from . import review_debt
 from . import shadow
 from . import text as _text
 from . import watch
@@ -148,6 +149,9 @@ TICKETS_SUBJECT = "every ticket"
 # The one subject of the rolling roll-pin-off breach: each goal home that
 # ships by roll with no roll ship document is a line in one issue.
 ROLL_SUBJECT = "every roll goal"
+REVIEW_SUBJECT = "the Loom review duty"
+GUARD_SUBJECT = "every guard ticket"
+GUARD_UNREAD_SUBJECT = "every unreadable guard ticket"
 # The one subject of the rolling merged-not-shipped breach: each ticket still
 # at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule found its commit
 # deployed is a line in one issue (loom#2025).
@@ -414,6 +418,11 @@ class Facts:
     # pass (one repo's open pull requests answered an error): their tracking
     # issues are left as they are.
     unread: Optional[Dict[str, Tuple[str, ...]]] = None
+    # The newest Loom review journal the station knows of, and the guard
+    # tickets closed with no check (bus/review_debt.py).
+    review_at: Optional[float] = None
+    guards_no_check: Optional[List[int]] = None
+    guards_unreadable: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1024,47 @@ def roll_pin_off(f: Facts) -> List[Breach]:
                    f.now, rolling=True)]
 
 
+def review_overdue(f: Facts) -> List[Breach]:
+    """The Loom review duty has no journal entry for over a week. The age is
+    in whole days, so the issue is rewritten at most once a day."""
+    if f.review_at is None or f.now - f.review_at <= review_debt.OVERDUE:
+        return []
+    days = int((f.now - f.review_at) // DAY)
+    return [Breach("review-overdue", REVIEW_SUBJECT,
+                   "No Loom review journal for %d days" % days,
+                   ("The goal asks for a routine Loom review; this goal home holds no entry "
+                    "since %s" % utc(f.review_at),
+                    "Run the review as a journal entry whose first line starts "
+                    "\"Loom review\"; the next station pass clears this"),
+                   # When it became overdue: a closed issue reopens only for a
+                   # breach after its close, and the review itself came before.
+                   f.review_at + review_debt.OVERDUE, rolling=True)]
+
+
+def guard_no_check(f: Facts) -> List[Breach]:
+    """Guard tickets closed with no merged pull request that changed a test."""
+    if not f.guards_no_check:
+        return []
+    return [Breach("guard-no-check", GUARD_SUBJECT,
+                   "%d guard tickets closed with no check" % len(f.guards_no_check),
+                   ("Closed with no merged pull request that names them and changes a test "
+                    "file: %s" % ", ".join("#%d" % n for n in f.guards_no_check),
+                    "Reopen each one and ship its test"),
+                   f.now, rolling=True)]
+
+
+def guard_unreadable(f: Facts) -> List[Breach]:
+    """Guard tickets whose pull requests stayed unreadable, try after try."""
+    if not f.guards_unreadable:
+        return []
+    return [Breach("guard-unreadable", GUARD_UNREAD_SUBJECT,
+                   "%d guard tickets cannot be read" % len(f.guards_unreadable),
+                   ("Not read after %d tries: %s" % (review_debt.GUARD_TRIES, ", ".join(
+                       "#%d" % n for n in f.guards_unreadable)),
+                    "Their state is unknown, so the guard count says unknown"),
+                   f.now, rolling=True)]
+
+
 def merged_not_shipped(f: Facts) -> List[Breach]:
     """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
     found their merge commit deployed: the move to loom:shipped failed, and
@@ -1104,7 +1154,8 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
-    untrusted_labeler, roll_pin_off, merged_not_shipped)
+    untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
+    guard_unreadable)
 
 
 def check(facts: Facts, say: Say,

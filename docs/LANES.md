@@ -1298,6 +1298,11 @@ Each invariant is one function returning breaches with evidence:
   commit deployed, because the move to `loom:shipped` failed
   (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
   Shipping through a downstream roll).
+- The newest Loom review journal is over 7 days old (`review-overdue`), a
+  guard ticket closed with no merged pull request that changes a test
+  (`guard-no-check`), or a guard ticket unreadable after 5 tries
+  (`guard-unreadable`), one rolling issue each (docs/BRAIN.md, Review and guard
+  debt).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
