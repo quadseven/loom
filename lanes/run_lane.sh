@@ -2467,8 +2467,9 @@ prepare_validation() {
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   baseline_rev="$(safe_git rev-parse HEAD)"
-  interpreter_id="${C_INTERP:-none}"
-  [ -z "$interp" ] || interpreter_id="$interp $($interp --version 2>&1 | head -1)"
+  # interp already holds "path version" (set above), so it is the identity as
+  # it stands; running it again would hand its own output to the key.
+  interpreter_id="${interp:-${C_INTERP:-none}}"
   verdict_key="$(base_verdict_key "$baseline_rev" "$interpreter_id")"
   now="$(date +%s)"
   if base_verdict_read "$verdict_key" "$now"; then

@@ -6051,6 +6051,22 @@ exit %d
                           for name in ("T042-fix-the-thing.log", "T043-fix-the-thing.log"))
         self.assertEqual(logs.count("base-check-hit"), 3)  # two first-run checks, final only on second
 
+    def test_the_interpreter_identity_is_the_resolved_line_not_a_second_run(self):
+        # interp is already "path version"; the key must not run it again, or
+        # its error text (which names the working directory) splits the key.
+        text = RUNNER.read_text()
+        line = re.search(r'^\s*interpreter_id=.*$', text, re.M).group(0).strip()
+        tmp = Path(self._tmp.name)
+        calls = tmp / "interp-calls"
+        fake = tmp / "fake-python"
+        fake.write_text('#!/bin/sh\necho call >> "%s"\necho "Python 9.9"\n' % calls)
+        fake.chmod(0o755)
+        script = 'interp="%s Python 9.9"; C_INTERP=python\n%s\nprintf "%%s" "$interpreter_id"\n' % (fake, line)
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=str(tmp))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "%s Python 9.9" % fake)
+        self.assertFalse(calls.exists(), "the interpreter was run again for the key")
+
     def test_base_verdict_key_includes_command_and_interpreter_and_red_expires(self):
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{[^\n]*\n.*?^\}\n" % name, text, re.S | re.M).group(0)
