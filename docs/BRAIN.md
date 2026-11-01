@@ -817,6 +817,31 @@ again. The station then hands that lane no verify run for
 from where you run (a lane machine log, from Muse) is not a fail: leave the
 audit to the lane machine's tick and say so in the journal.
 
+### Close audits
+
+An audit of a merge or a close reads what git holds, not what a comment says.
+An audit line comes from this output, never from reading the comments:
+
+    python3 -m bus.brain audit-close OWNER/NAME#N
+
+It finds each commit the comments around the close cite, asks the compare API
+whether the default branch carries it, and names the merged pull request that
+delivered it. It prints the cited hash, the merge commit and the place of
+each, and a verdict: `sound`, `differs` (a cited commit is off the default
+branch while another cited commit or a merged pull request is on it),
+`unproven` (no cited commit and no merged pull request is on the default
+branch), `uncited`, or `unknown` (a read failed or was cut short, which is
+never sound). It exits 0 only on `sound`. Only the closer's own comments count
+as citations.
+
+The station runs the same check over closes as completed by anyone but
+itself, every 10 minutes, within a read budget, from the first pass after it
+shipped (`bus/close_audit.py`). An `unproven` close gets one comment and is
+reopened. A ticket is reopened once; a later unproven close gets the comment
+alone. A repo in shadow records the reopen instead. Each
+pass logs `close audit: N closes read, M refused, K waiting`. That line is
+what a journal states.
+
 ## Trust
 
 Briefs become agent prompts, and the runner pushes with the operator's
