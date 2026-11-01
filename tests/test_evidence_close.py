@@ -299,7 +299,7 @@ class Shadow(Case):
                 gh.rest("PUT", "/repos/%s/pulls/101/merge" % REPO, {})
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/1" % REPO,
-                        {"state": "closed", "labels": ["loom:shipped"]})
+                        {"state": "closed", "labels": ["ready-to-land"]})
             self.assertEqual(self.fake.issues[1]["state"], "open")
             # The named ticket's plain close is the one request that passes.
             self.fake.issues[1]["labels"].append({"name": "force-close"})
