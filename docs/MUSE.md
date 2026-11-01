@@ -34,9 +34,10 @@ result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
 a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
 the web), in shadow or out of it. In shadow, also never approve a pull
-request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
-Loom does not own, by any route: `bus.brain move` records a ship instead of
-taking it, and the tick's `gh` refuses the rest and records them.
+request or add `ready-to-land` by hand, or write onto a branch Loom does not
+own, by any route: the tick's `gh` refuses the rest and records them. A move
+to `loom:shipped` is a state fact, not a merge or a close, and goes through;
+leave it to each goal's ship rules.
 
 ## What Muse does and leaves
 
@@ -276,7 +277,10 @@ Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
 close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
-live regression) and `brief` (a brief named but not written this tick).
+live regression), `brief` (a brief named but not written this tick) and
+`needs-brain` (a decision left open on a `loom:briefed` ticket that carries
+`needs-brain`; the defer changes no label, hold or state, and the `done`
+line for that stage and ticket retires it).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
@@ -523,7 +527,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    the ask: read it, then record the answer on the ticket, or treat it as
    needs you. A station verification tag is not a question to a person: the
    brain or the verify pass takes it. If the command exits 1 its report is
-   incomplete: say so, and never report nothing from it.
+   incomplete: say so, and never report nothing from it. It prints within
+   40 seconds (`--deadline SECONDS`); a repo or ticket not read by then is
+   listed as unread, and it exits 1.
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,

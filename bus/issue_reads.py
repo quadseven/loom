@@ -110,6 +110,12 @@ class IssueReads:
             return GitHub.paginate(self, path)  # type: ignore[arg-type]
         return self._gh.paginate(path)
 
+    def keep_listed(self, repo: str, items: List[Any]) -> None:
+        """Answer each item's single read from a listing of the repo's
+        issues read without this client (bus.needs_you reads the pages on
+        its own threads, loom#2394)."""
+        self._keep_listed("/repos/%s/issues?per_page=100" % repo, items)
+
     def _keep_listed(self, key: str, items: List[Any]) -> None:
         """Answer each listed issue's single read from the listing. Only for
         GitHub itself, whose listing and single read return the same issue

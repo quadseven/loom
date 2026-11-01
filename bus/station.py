@@ -86,11 +86,12 @@ from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
 from . import watch
+from . import weakened
 from . import labels
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
-from .github import (GitHub, GitHubError, RateLimited, TargetReached, _OPENER,
-                     _next_link, read_ssm, rest_login, unreadable)
+from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
+                     _OPENER, _next_link, read_ssm, rest_login, unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -2010,6 +2011,11 @@ READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b
 # A ticket marked ready before the status event kept a ready-head comment of
 # its own; it is still read.
 OLD_READY_RE = re.compile(r"<!-- loom:ready-head ([0-9a-f]+) -->")
+# The station's own pre-check of a lane pull request's diff (bus/weakened.py):
+# a head that weakens its tests is sent back under this name, as if a check
+# by that name had failed with the weakened lines as its output, and the
+# ready mark above is withheld.
+WEAKENED_CHECK = "weakened-test pre-check"
 
 
 def _unindexed_entries(tree: List[Any]) -> List[Dict[str, Any]]:
@@ -4712,6 +4718,15 @@ class Station:
                     found.reason, "A lane gets it once its body names the cause on a "
                     "`Cause:` line: why the affected are affected, not what the health read "
                     "counts."))
+            elif found.kind == brief_check.CRITERIA:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once its body names each acceptance "
+                    "criterion as a checkbox under `## Acceptance criteria`, stated as "
+                    "an observable result: the brief restates each one as the check "
+                    "that proves it."))
             else:
                 brain.human(self.gh, repo, number, brief_check.ask(found))
         except ValueError as err:
@@ -5842,6 +5857,13 @@ class Station:
             brain.move(self.gh, repo, number, "shipped", note=note)
         except RateLimited:
             raise
+        except ShadowHeld as err:
+            # A label shadow still holds is a hold, not a failed ship: say it
+            # once per ticket, when the ledger first records it (loom#2350).
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            self._deployed_seen(key, True)
+            return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
             self._deployed_seen(key, True)
@@ -6645,6 +6667,19 @@ class Station:
         # DIRTY after hand merges moved main. Its conflict brief is the
         # factory's (Factory._send_back), so no round is sent from here.
         conflict = detail.get("mergeable") is False
+        # A diff that weakens its own tests is bounced before the review
+        # round (bus/weakened.py, loom#2162): the miss is knowable from the
+        # diff alone, so the lane hears it at once, naming the lines,
+        # instead of after a full Elder round-trip. It rides the fix-round
+        # machinery as a failed check of the station's own.
+        weakened_lines = self._weakened_tests(repo, pr_number)
+        if weakened_lines:
+            self._remove_ready_if_present(repo, number, names)
+            self._post_fix_or_escalate(repo, number, pr_number, lane, detail, sha,
+                                       comments, names,
+                                       [(WEAKENED_CHECK, "\n".join(weakened_lines))],
+                                       [], rounds, flaky)
+            return
         if not failed and not threads and not degraded and not conflict:
             # A lane pull request is ready only on its goal home's trunk (or
             # the repo's default branch when the goal home names no trunk).
@@ -6790,6 +6825,32 @@ class Station:
             _say("validation gap: could not judge %s#%d: %s" % (repo, pr_number, err))
             return ""
         return ci_gap.fix_notes(filed)
+
+    def _weakened_tests(self, repo: str, pr_number: int) -> List[str]:
+        """The weakened-test lines in a lane pull request's diff
+        (bus/weakened.py), read from the files GitHub lists for it, page
+        by page while a page comes back full. A read that fails names
+        none: the evaluation goes as it did before the pre-check, and the
+        review remains the backstop."""
+        try:
+            entries = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100"
+                                   % (repo, pr_number)).data
+            page = 2
+            while isinstance(entries, list) and len(entries) % 100 == 0 and entries \
+                    and page <= 10:
+                more = self.gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100&page=%d"
+                                    % (repo, pr_number, page)).data
+                if not isinstance(more, list) or not more:
+                    break
+                entries = entries + more
+                page += 1
+        except (GitHubError, ValueError, TypeError, AssertionError) as err:
+            _say("weakened-test pre-check: could not read %s#%d files (%s)"
+                 % (repo, pr_number, err))
+            return []
+        if not isinstance(entries, list):
+            return []
+        return weakened.find([e for e in entries if isinstance(e, dict)])
 
     def _ready_head(self, comments: List[Any]) -> Optional[str]:
         """The head the newest ready mark of ours names. A mark is an event in
