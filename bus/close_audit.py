@@ -61,12 +61,12 @@ PAGE = 100
 STATE_FILE = "close-audit.json"
 EVERY = 600
 LOOKBACK = 2 * 24 * 3600
-READS_PER_PASS = 60
+READS_PER_PASS = 80
 # The most one ticket can read, so a pass never starts what it cannot finish:
-# 3 first reads, the timeline, a pull request and its merge commit each, and
-# each cited commit's place and pull requests, with room for the client's own
-# read of status events.
-TICKET_READS = 3 + TIMELINE_PAGES + 2 * MAX_PULLS + 2 * MAX_CITED + 2
+# 3 first reads, the timeline, each linked pull request and its merge commit,
+# and for each cited commit its pull requests, one more merge commit and its
+# place, with room for the client's own read of status events.
+TICKET_READS = 3 + TIMELINE_PAGES + 2 * MAX_PULLS + 3 * MAX_CITED + 2
 REOPENS_PER_PASS = 2
 # A close that reads unknown this many times is left, and logged.
 UNKNOWN_TRIES = 3
@@ -317,6 +317,7 @@ def _with_cited(gh: Any, repo: str, shas: Sequence[str],
             if isinstance(pull, dict) and pull.get("merged_at"):
                 have = found.setdefault(int(pull.get("number") or 0), dict(pull))
                 have["cited"] = list(have.get("cited") or []) + [sha]
+                break     # one pull request per cited commit keeps the reads bounded
     return list(found.values())
 
 

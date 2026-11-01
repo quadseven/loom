@@ -150,39 +150,51 @@ class FakeGitHub:
                 "number": pull["number"], "repository": {"full_name": REPO},
                 "pull_request": {"merged_at": pull["merged_at"]}}}})
 
-    def _get(self, path, ok):
-        if self.broken.get("compare") and "/compare/" in path:
+    def _compare(self, path, ok):
+        if self.broken.get("compare"):
             raise GitHubError("no", status=502)
-        if "/compare/" in path and not any(
-                path.lower().startswith("/repos/%s/" % where) for where, _ in self.foreign):
-            sha = path.split("...", 1)[1].split("?")[0]
-            if any(sha.startswith(a) for a in self.absent):
-                return Reply({"message": "Not Found"}, 404)
-            carried = any(sha.startswith(c) for c in self.carried)
-            return Reply({"status": "behind" if carried else "diverged"})
+        sha = path.split("...", 1)[1].split("?")[0]
+        if any(sha.startswith(a) for a in self.absent):
+            if 404 not in ok:
+                raise GitHubError("Not Found", status=404)
+            return Reply({"message": "Not Found"}, 404)
+        carried = any(sha.startswith(c) for c in self.carried)
+        return Reply({"status": "behind" if carried else "diverged"})
+
+    def _foreign(self, path):
         for (where, number), pull in self.foreign.items():
             if path.lower() == "/repos/%s/pulls/%d" % (where, number):
                 return Reply(pull)
             if "/compare/" in path and path.lower().startswith("/repos/%s/" % where):
                 return Reply({"status": "behind"})
-        path = path.replace("/repos/%s" % REPO.upper(), "/repos/%s" % REPO)
-        tail = path.split("/repos/%s" % REPO, 1)[1]
-        if tail.startswith("/commits/"):
-            sha = tail.split("/")[2]
-            return Reply(self.delivered.get(sha, []))
-        if tail == "":
-            return Reply({"default_branch": "main"})
-        if tail.startswith("/issues?"):
-            return Reply(sorted(self.issues.values(), key=lambda i: -i["number"]))
-        parts = tail.split("?")[0].strip("/").split("/")
+        return None
+
+    def _issue(self, parts, tail):
         number = int(parts[1])
-        if parts[0] == "pulls":
-            return Reply(self.pulls[number])
         if len(parts) == 2:
             return Reply(self.issues[number])
         if parts[2] == "comments":
             return Reply(self.comments.get(number, []))
         return Reply(self.timelines.get(number, []) if "page=1" in tail else [])
+
+    def _get(self, path, ok):
+        answer = self._foreign(path)
+        if answer is not None:
+            return answer
+        if "/compare/" in path:
+            return self._compare(path, ok)
+        path = path.replace("/repos/%s" % REPO.upper(), "/repos/%s" % REPO)
+        tail = path.split("/repos/%s" % REPO, 1)[1]
+        if tail == "":
+            return Reply({"default_branch": "main"})
+        if tail.startswith("/issues?"):
+            return Reply(sorted(self.issues.values(), key=lambda i: -i["number"]))
+        if tail.startswith("/commits/"):
+            return Reply(self.delivered.get(tail.split("/")[2].split("?")[0], []))
+        parts = tail.split("?")[0].strip("/").split("/")
+        if parts[0] == "pulls":
+            return Reply(self.pulls[int(parts[1])])
+        return self._issue(parts, tail)
 
     def rest(self, method, path, body=None, ok=()):
         if method == "GET":
@@ -460,10 +472,14 @@ class RunPass(unittest.TestCase):
 
     def test_the_most_a_ticket_can_read_is_inside_its_reservation(self):
         gh = FakeGitHub()
-        said = " ".join("%07xa" % n for n in range(ca.MAX_CITED))
-        gh.close(1, said)
+        shas = ["%07xa" % n for n in range(ca.MAX_CITED)]
+        gh.close(1, " ".join(shas))
         for number in range(ca.MAX_PULLS + 1):
             gh.link(1, merged_pull(100 + number, head="e" * 40, merge="f%039d" % number))
+        for offset, sha in enumerate(shas):
+            gh.delivered[sha] = [merged_pull(200 + 10 * offset + n, head="b" * 40,
+                                             merge="c%039d" % (10 * offset + n))
+                                 for n in range(ca.MAX_PULLS)]
         original = gh._get
 
         def get(path, ok):
