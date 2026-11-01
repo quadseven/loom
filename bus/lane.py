@@ -171,6 +171,8 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
         for issue in found:
             if not isinstance(issue, dict) or "pull_request" in issue:
                 continue
+            if brain.owned_elsewhere(issue) is not None:
+                continue  # its holder's now: no move, and no slot counted
             # The newest claim comment is this claim: an earlier claim of the
             # ticket, handed back since, must not age the one held now.
             held = _claims(_comments(gh, repo, int(issue["number"])), lane)
@@ -217,6 +219,8 @@ def _takes(item: Any, lane: str) -> bool:
         return False
     names = _names(item)
     if "loom:queued" not in names or "lane:" + lane not in names:
+        return False
+    if brain.owned_elsewhere(item) is not None:
         return False
     try:
         headers = tickets.parse(item.get("body"))[0]

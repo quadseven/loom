@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import claim_referee
 from . import evidence_close
+from . import journal
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -54,7 +55,7 @@ from . import stale_claims
 from . import ask_state
 from . import brief_check
 from . import label_pass
-from .labels import HUMAN_LABELS, NEEDS_HUMAN, needs_human
+from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import friction_intake
 from . import evidence
@@ -243,6 +244,7 @@ REPORT_MARKER = "<!-- loom:report v1 -->"
 # The last line of a quiet standup the station edits in place, and of a
 # standup that repeats an earlier one word for word.
 QUIET_STAMP = quiet_rule.HEARTBEAT_STAMP
+WAITING_PREFIX = "Waiting on you:"
 SAME_STAMP = "Unchanged as of %s; this report is edited in place until something changes."
 # Reports come at the reading times (brain.REPORT_TIMES), so the goal homes are read at most this often,
 # and only for comments since the last read (with an overlap; the ledger of
@@ -375,6 +377,8 @@ SUPPRESS_EMBEDS = 1 << 2
 # the brain has stopped, and the operator is told once.
 BRAIN_STALE = 2 * 3600
 BRAIN_OUTCOMES = ("ok", "skipped", "failed")
+# A brain holder as a journal's Tick line names it (bus/journal.py).
+BRAIN_HOLDER_RE = re.compile(r"[A-Za-z0-9._-]+")
 # Every brain, on any machine, posts a journal on the goal homes; the station
 # reads GitHub at most this often, and looks back this far.
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
@@ -956,6 +960,7 @@ class Settings:
                  settle_claimed: str = "off",
                  settle_claimed_max: int = claimed.PER_RUN,
                  claim_idle_hours: int = 0,
+                 brain_holders: Sequence[str] = (),
                  claim_referee: str = "off",
                  engine_claims: Sequence[str] = claim_referee.ENGINE_CLAIMS,
                  agy_workdir: str = "",
@@ -1051,6 +1056,11 @@ class Settings:
         self.owners = owners
         self.status_repo = status_repo
         self.webhook_ssm = webhook_ssm
+        # LOOM_BRAIN_BACKUP_HOLDERS: brain holders (the name on a journal's
+        # Tick line, such as a backup brain's) each judged on its own journal
+        # ticks, so a live brain elsewhere does not hide one that stopped
+        # (Station.watch_brain_holders, loom#2141). Empty is off.
+        self.brain_holders = list(brain_holders)
         self.mention = mention
         self.digest_hour = digest_hour
         self.region = region
@@ -1176,6 +1186,8 @@ class Settings:
                    settle_claimed=claimed.mode(env.get("LOOM_SETTLE_CLAIMED", "")),
                    settle_claimed_max=claimed.per_run(env.get("LOOM_SETTLE_CLAIMED_MAX", "")),
                    claim_idle_hours=stale_claims.idle_hours(env.get("LOOM_CLAIM_IDLE_HOURS", "")),
+                   brain_holders=[h for h in words("LOOM_BRAIN_BACKUP_HOLDERS")
+                                  if BRAIN_HOLDER_RE.fullmatch(h)],
                    claim_referee=claim_referee.mode(env.get("LOOM_CLAIM_REFEREE", "")),
                    engine_claims=claim_referee.engines(env.get("LOOM_ENGINE_CLAIMS", "")),
                    agy_workdir=_agy_workdir(env),
@@ -2095,6 +2107,9 @@ class Station:
         # Whether each repo is public, and the repo invariant breaches are
         # filed in: what a public issue may name (_invariant_ref).
         self._publics: Dict[str, bool] = {}
+        # Read once a pass, when a data-only report first needs them.
+        self._waiting_asks: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        self._repo_privacy: Dict[str, Optional[bool]] = {}
         self._invariant_repo = ""
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
@@ -2461,7 +2476,8 @@ class Station:
         if owner is None:
             return False
         self._note_owned("%s#%s" % (repo, issue.get("number")),
-                         "assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+                         ("assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
+                         if ":" not in owner else "held by %s for outside work" % owner)
         return True
 
     def _goal_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -2555,7 +2571,7 @@ class Station:
         except ValueError as err:
             self._refuse(repo, issue, str(err))
             return False
-        fix, fix_comment_id = fix_source if fix_source else (None, None)
+        fix, fix_comment_id = self._live_fix(repo, number, fix_source)
         if self._held_before_claim(repo, issue, fix, comments):
             return False
 
@@ -3680,10 +3696,8 @@ class Station:
         """One missing-evidence note on every shipped ticket older than
         VERIFY_NOTE_AFTER that no verify attempt has ever reached
         (loom#2092), until the pass's step budget defers the rest to the
-        next run. The pool is the reserved lane's own (_verify_pool with
-        queued_holds=False): a ticket in it with an attempt on the ledger
-        has been reached and is spared, and a ticket the pool leaves to the
-        brain (proof refused too often) has attempts by construction. At
+        next run. The pool is _note_pool: a ticket with an attempt on the
+        ledger has been reached and is spared. At
         most once per VERIFY_NOTE_EVERY; a GitHub failure listing the pool
         is logged and the run is not stamped, so the next pass retries."""
         path = os.path.join(self.state, VERIFY_NOTE_FILE)
@@ -3696,7 +3710,7 @@ class Station:
         attempts = _read_json(os.path.join(self.state, VERIFY_FILE), {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, _held = self._verify_pool(attempts, queued_holds=False)
+            pool = self._note_pool(attempts, ledger)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -3708,12 +3722,12 @@ class Station:
                 if self._deferred():
                     deferred = True
                     break
-                number = int(issue["number"])
-                if "%s#%d" % (repo, number) in attempts:
+                if self._proven(repo, int(issue["number"])):
                     continue
-                shipped_at = float(issue.get("shipped_at", 0) or 0)
+                shipped_at = self._shipped_stamp(repo, issue)
                 if not shipped_at or self.now - shipped_at < VERIFY_NOTE_AFTER:
                     continue
+                issue["shipped_at"] = shipped_at
                 self._note_one_shipped(repo, issue, ledger)
         finally:
             # A run the step budget cut short is not stamped: the cadence
@@ -3723,6 +3737,32 @@ class Station:
             if not deferred:
                 ledger["_at"] = self.now
             _write_json(path, ledger)
+
+    def _note_pool(self, attempts: Dict[str, Any], ledger: Dict[str, Any]
+                   ) -> List[Tuple[str, Dict[str, Any]]]:
+        """The open shipped tickets a note pass reads: every one with no
+        attempt and no fresh note, by cheap filters only. It is wider than
+        _verify_pool on purpose (loom#964): a Live box that names no exact
+        string or cannot be met gets no verify lane, so on 2026-10-31 thirteen
+        such tickets waited with no note at all."""
+        pool = []
+        asked = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
+        asked = asked if isinstance(asked, dict) else {}
+        for repo in self._verify_repos():
+            for issue in self._tickets_open(repo):
+                key = "%s#%d" % (repo, int(issue["number"]))
+                # A box flagged unmeetable already carries its restate ask.
+                if (asked.get(key) or {}).get("reasons"):
+                    continue
+                seen = ledger.get(key)
+                written = seen.get("at") if isinstance(seen, dict) else None
+                labels = _label_names(issue)
+                if ("loom:shipped" not in labels or "loom:verified" in labels or key in attempts
+                        or (isinstance(written, (int, float))
+                            and 0 <= self.now - float(written) < VERIFY_NOTE_REFRESH)):
+                    continue
+                pool.append((repo, issue))
+        return pool
 
     def _note_one_shipped(self, repo: str, issue: Dict[str, Any],
                           ledger: Dict[str, Any]) -> None:
@@ -4618,6 +4658,15 @@ class Station:
              % (repo, number, int(pr["number"])))
         return True
 
+    def _live_fix(self, repo: str, number: int, found: Optional[Tuple[tickets.Fix, Any]]
+                  ) -> Tuple[Optional[tickets.Fix], Any]:
+        """The fix ask and its comment id, or nothing. An ask for a merged pull
+        request the station already judged is spent: the ticket went back for
+        the rest, and the ask parked it at loom:pr on every brief (loom#2333)."""
+        if found is None or found[0].pr in tickets.judged_pulls(self._status_texts(repo, number)):
+            return None, None
+        return found
+
     def _held_before_claim(self, repo: str, issue: Dict[str, Any], fix: Any,
                            comments: List[Any]) -> bool:
         """A fix round its pull request blocks, or a new build the brief
@@ -4818,10 +4867,12 @@ class Station:
         if left:
             # Routine: the ticket goes back for the rest, and a comment would
             # email the operator on each such merge.
+            every = factory.unticked_criteria(str(ticket.get("body") or ""),
+                                              [str(p.get("body") or "") for p in (pr, *landed)])
             self._routine(repo, number, tickets.UNBUILT_NOTE
-                          % (int(pr["number"]), "; ".join(left)))
+                          % (int(pr["number"]), "; ".join(every)))
             _say("%s#%d: merged pull request #%d left %d criteria unbuilt, requeued"
-                 % (repo, number, int(pr["number"]), len(left)))
+                 % (repo, number, int(pr["number"]), len(every)))
 
     @staticmethod
     def _unbuilt_criteria(ticket: dict, merged: Sequence[dict]) -> List[str]:
@@ -4841,7 +4892,8 @@ class Station:
                    "loom:failed")
         for issue in open_tickets:
             if (not isinstance(issue, dict) or "pull_request" in issue
-                    or not set(_label_names(issue)).intersection(waiting)):
+                    or not set(_label_names(issue)).intersection(waiting)
+                    or self._owned_elsewhere(repo, issue)):
                 continue
             number = self._adopted_pull_number(issue)
             if number is None:
@@ -4926,6 +4978,8 @@ class Station:
             labels = _label_names(ticket)
             if not set(labels).intersection(("loom:queued", "loom:briefed")):
                 continue
+            if self._owned_elsewhere(repo, ticket):
+                continue
             if not _linked_pr(ticket, repo, pr):
                 continue
             if "loom:briefed" in labels and self._fix_round_for(repo, ticket, int(pr["number"])):
@@ -4995,6 +5049,34 @@ class Station:
                         # Check if it moved to merged
                         if "loom:merged" in _label_names(ticket):
                             _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
+        for number, ticket in tickets_by_number.items():
+            self._clear_pull_gone(repo, number, ticket, open_prs)
+
+    def _clear_pull_gone(self, repo: str, number: int, ticket: Dict[str, Any],
+                         open_prs: List[Dict[str, Any]]) -> None:
+        """A ticket cannot hold loom:pr with no open pull request: it goes
+        back to the queue for a lane (loom#2333). Reconcile, above, has moved
+        every ticket whose pull request closed in the window it reads."""
+        names = _label_names(ticket)
+        allowed = {a.lower() for a in self.s.authors}
+        if ("loom:pr" not in names
+                or any(_covers_pr(ticket, repo, p) for p in open_prs
+                       if tickets._login(p.get("user")) in allowed)
+                or self._adopted_pull_number(ticket) is not None
+                or self._owned_elsewhere(repo, ticket)):
+            return
+        timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        if not tickets.pull_gone(timeline, repo, number, self.now, self.s.authors):
+            return
+        states = {"loom:" + state for state in brain.STATES}
+        kept = self._drop_claim(n for n in names if n not in states
+                                and not n.startswith(("lane:", WAIT)))
+        kept.append("loom:queued")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        ticket["labels"] = [{"name": name} for name in kept]
+        self._routine(repo, number, "No open pull request carries this ticket, so it left "
+                      "loom:pr and is back at loom:queued.")
+        _say("%s#%d: loom:pr with no open pull request, requeued" % (repo, number))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
@@ -6236,7 +6318,9 @@ class Station:
         """Return completed lane PRs with failed checks or bot findings."""
         rounds = _fix_round_limit()
         for repo in self.scan_repos():
-            issues = self._pr_tickets(repo)
+            # A fix round from here took a hold off a ticket an outside
+            # contributor had just been given (loom#2333).
+            issues = [i for i in self._pr_tickets(repo) if not self._owned_elsewhere(repo, i)]
             if not issues:
                 continue
             prs = self._open_pulls(repo)
@@ -8380,11 +8464,7 @@ class Station:
         comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
         events = self._paginate("/repos/%s/issues/%d/events?per_page=100" % (repo, number))
         trusted = list(self.s.authors)
-        blockers = []
-        for other in brief_check.blocked_on(issue.get("body")):
-            if other != number and (self.gh.rest(
-                    "GET", "/repos/%s/issues/%d" % (repo, other)).data or {}).get("state") != "closed":
-                blockers.append(other)
+        blockers = ask_state.open_blockers(self.gh.rest, repo, issue)
         return comments, events, trusted, answer.operators(trusted=trusted), blockers
 
     def _ask_open(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -9424,9 +9504,33 @@ class Station:
             _say("evidence close paused: %s; python3 -m bus.evidence_close resume restarts it"
                  % run.paused)
             self._say_paused(state, run.paused)
+            self._ask_about_stop(state, run.paused)
         else:
             state.pop("paused_said", None)
+            state.pop("stop_asked", None)
         return run
+
+    def _ask_about_stop(self, state: Dict[str, Any], why: str) -> None:
+        """One needs:human ask when the reopen guardrail stops this close, on
+        a repo's Proof due issue: the log and that issue's body reach nobody.
+        Its rate text changes as reopens count, so the ask is per stop, not
+        per text; a resume ends the stop. An operator's own pause asks nothing."""
+        if state.get("stop_asked") or why == evidence_close.OPERATOR_PAUSED:
+            return
+        repos = sorted({str(c.get("repo")) for c in evidence_close.closes(state)})
+        if not repos:
+            return
+        try:
+            brain.human(self.gh, repos[0], self._proof_due_issue(repos[0]),
+                        evidence_close.stop_ask(why))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not ask about the evidence close stop: %s" % err)
+            return
+        except ValueError as err:
+            _say("evidence close stop: no new ask: %s" % err)
+        state["stop_asked"] = True
 
     def _say_paused(self, state: Dict[str, Any], why: str) -> None:
         """Write the pause into each repo's Proof due issue, once."""
@@ -10318,6 +10422,7 @@ class Station:
             "/repos/%s/labels" % repo) if isinstance(label, dict)]
         queries = ["labels=%s" % quote(name, safe=":") for name in names
                    if name.lower().startswith(stale_claims.CLAIM_PREFIX)
+                   and name.lower() != OVERFLOW_CLAIM
                    and name[len(stale_claims.CLAIM_PREFIX):].strip().lower() not in ours]
         queries += ["assignee=%s" % quote(login) for login in self.s.briefers
                     if login.lower() not in ours]
@@ -11655,16 +11760,17 @@ class Station:
         named = self._open_breaches(repo, number)
         breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
+        waiting = self._standup_waiting_line(repo, children)
         body = self._overdue_standup_body(children, self._epoch(str(ledger.get("report") or "")),
                                           breaches, gate_hold=hold,
-                                          finished=brain.finished_epics(tree))
+                                          finished=brain.finished_epics(tree), waiting=waiting)
         brain._check_written_text(body)
         if hold is None and self._quiet_standup(repo, comments, children, named, body,
                                                 authors, now):
             state[key + " quiet"] = self.now
             return
         quiet = hold is None and body == self._overdue_standup_body(
-            [], None, None if breaches is None else [])
+            [], None, None if breaches is None else [], waiting=waiting)
         previous = self._last_same_report(comments, authors, body)
         if previous is not None:
             # Every new comment emails the goal's author; a report that says
@@ -11676,6 +11782,39 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _open_asks(self) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        """Each repo's open needs:human issues, read as `status` reads them so
+        the two counts agree; None when a repo could not be read."""
+        if self._waiting_asks is not None:
+            return self._waiting_asks
+        found: Dict[str, List[Dict[str, Any]]] = {}
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                found[repo] = brain.open_human(brain._issues(self.gh, repo))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not count what waits in %s: %s" % (repo, err))
+                return None
+        self._waiting_asks = found
+        return found
+
+    def _standup_waiting_line(self, home: str, children: List[Any]) -> str:
+        """The report's "Waiting on you:" line, naming only what the goal home
+        may show (journal.nameable_repos); "" when the count is partial."""
+        asks = self._open_asks()
+        if asks is None:
+            return ""
+        counts = {repo: len(issues) for repo, issues in asks.items() if issues}
+        for repo in set(counts) | {home}:
+            if repo not in self._repo_privacy:
+                self._repo_privacy[repo] = brain.repo_private(self.gh, repo)
+        private = {repo: self._repo_privacy[repo] for repo in set(counts) | {home}}
+        return journal.waiting_line(counts, brain.goal_human_share(children, asks.get(home, [])),
+                                    journal.nameable_repos(home, private))
 
     @staticmethod
     def _report_due(at: float) -> float:
@@ -11714,8 +11853,12 @@ class Station:
     def _last_same_report(comments: List[Any], authors: List[str], body: str) -> Optional[int]:
         """The id of the goal's latest report by `authors` that says `body`
         (its stamp line aside), else None. Reports in between do not matter:
-        the brain's reports on the same goal never match the station's."""
-        stamps = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP))
+        the brain's reports on the same goal never match the station's. The
+        "Waiting on you:" line is left out too: a moving count is not news
+        (loom#1775), so it edits the last report instead of emailing a new one."""
+        skipped = tuple(stamp.split("%")[0] for stamp in (QUIET_STAMP, SAME_STAMP)) + (
+            WAITING_PREFIX,)
+        said = "\n".join(line for line in body.splitlines() if not line.startswith(skipped))
         for comment in reversed(comments):
             if not isinstance(comment, dict) or not isinstance(comment.get("id"), int) \
                     or tickets._login(comment.get("user")).lower() not in authors:
@@ -11723,8 +11866,8 @@ class Station:
             text = str(comment.get("body") or "")
             if not text.startswith(REPORT_MARKER):
                 continue
-            kept = [line for line in text.splitlines() if not line.startswith(stamps)]
-            if "\n".join(kept) == body:
+            kept = [line for line in text.splitlines() if not line.startswith(skipped)]
+            if "\n".join(kept) == said:
                 return comment["id"]
         return None
 
@@ -11753,7 +11896,8 @@ class Station:
     def _overdue_standup_body(self, children: List[Any], since: Optional[float] = None,
                               breaches: Optional[List[Dict[str, Any]]] = None,
                               gate_hold: Optional[Dict[str, Any]] = None,
-                              finished: Optional[List[Dict[str, Any]]] = None) -> str:
+                              finished: Optional[List[Dict[str, Any]]] = None,
+                              waiting: str = "") -> str:
         groups = self._standup_ticket_groups(children, since)
         rows = self._standup_rows
         summary = self._standup_summary(groups)
@@ -11765,9 +11909,9 @@ class Station:
                       "%d lanes idle." % (gate_hold["goal"], gate_hold["count"],
                                           gate_hold["limit"], len(gate_hold["tickets"]),
                                           gate_hold["idle"]))
-        # Headline, at most five lines and the footer (2026-10-25, "info
-        # overload"): one line per heading, as journal.REPORT_LINES_MAX holds
-        # a brain's report to.
+        # Headline, at most five lines, the waiting count and the footer
+        # (2026-10-25, "info overload"): one line per heading, as
+        # journal.REPORT_LINES_MAX holds a brain's report to.
         return "\n".join([
             REPORT_MARKER, first,
             "Going well: Merged: %s. Verified: %s. Shipped: %s." %
@@ -11780,7 +11924,8 @@ class Station:
             (rows(groups["in_flight"]), rows(groups["queued"]), rows(groups["needs_difficulty"]))
             + (" Epics with every ticket closed (check the done-when, then close): %s."
                % rows(finished) if finished else ""),
-            "Needs you: Open asks: %s." % rows(groups["asks"]), "",
+            "Needs you: Open asks: %s." % rows(groups["asks"]),
+            *([waiting] if waiting else []), "",
             STANDUP_FOOTER])
 
     def _standup_summary(self, groups: Dict[str, List[Dict[str, Any]]], station: Optional["Station"] = None) -> str:
@@ -12072,13 +12217,25 @@ class Station:
         except (ValueError, TypeError):
             return None
 
-    def _newest_journal(self) -> Optional[Dict[str, Any]]:
+    def _newest_journal(self) -> Tuple[Optional[Dict[str, Any]], Dict[str, float]]:
         """The newest journal comment from an allowed login on any open
         loom:goal issue in LOOM_REPOS, as {"at", "goal"}, or None when there is
-        none in the last day. Raises GitHubError when GitHub cannot be read."""
+        none in the last day; and the newest journal tick of each holder its
+        Tick line names. Raises GitHubError when GitHub cannot be read."""
+        best: Optional[Dict[str, Any]] = None
+        holders: Dict[str, float] = {}
+        for at, goal, holder in self._goal_journals():
+            if best is None or at > best["at"]:
+                best = {"at": at, "goal": goal}
+            if holder and at > holders.get(holder, 0):
+                holders[holder] = at
+        return best, holders
+
+    def _goal_journals(self) -> Iterator[Tuple[float, str, str]]:
+        """(posted at, goal, holder) for each journal tick of the last day
+        from an allowed login on an open loom:goal issue in LOOM_REPOS."""
         since = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                               time.gmtime(self.now - JOURNAL_LOOKBACK))
-        best: Optional[Dict[str, Any]] = None
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
@@ -12097,30 +12254,30 @@ class Station:
                     # since= filters on the last edit, so an old journal
                     # edited today still comes back: check when it was posted.
                     if (login in self.s.authors and body.startswith(JOURNAL_MARKER)
-                            and at is not None and self.now - at <= JOURNAL_LOOKBACK
-                            and (best is None or at > best["at"])):
-                        best = {"at": at, "goal": "%s#%d" % (repo, number)}
-        return best
+                            and at is not None and self.now - at <= JOURNAL_LOOKBACK):
+                        yield at, "%s#%d" % (repo, number), handoff.journal_holder(c)
 
-    def _journal(self) -> Tuple[bool, Optional[Dict[str, Any]]]:
-        """(read ok, newest journal), re-read at most every JOURNAL_CHECK
-        seconds and kept in the station state between reads."""
+    def _journal(self) -> Tuple[bool, Optional[Dict[str, Any]], Dict[str, float]]:
+        """(read ok, newest journal, newest tick per holder), re-read at most
+        every JOURNAL_CHECK seconds and kept in the station state between
+        reads. A cache from before holders were kept is read again."""
         path = os.path.join(self.state, "brain-journal.json")
         cache = _read_json(path, {}, strict=False)
         checked = cache.get("checked") if isinstance(cache, dict) else None
         if (isinstance(checked, (int, float)) and not isinstance(checked, bool)
-                and 0 <= self.now - checked < JOURNAL_CHECK):
+                and 0 <= self.now - checked < JOURNAL_CHECK
+                and isinstance(cache.get("holders"), dict)):
             journal = cache.get("journal")
-            return True, journal if isinstance(journal, dict) else None
+            return True, journal if isinstance(journal, dict) else None, cache["holders"]
         try:
-            journal = self._newest_journal()
+            journal, holders = self._newest_journal()
         except RateLimited:
             raise
         except GitHubError as err:
             _say("brain journal read failed: %s" % err)
-            return False, None
-        _write_json(path, {"checked": self.now, "journal": journal})
-        return True, journal
+            return False, None, {}
+        _write_json(path, {"checked": self.now, "journal": journal, "holders": holders})
+        return True, journal, holders
 
     def _brain_state(self, ok_at: Optional[float]
                      ) -> Optional[Tuple[bool, Optional[Dict[str, Any]]]]:
@@ -12128,7 +12285,7 @@ class Station:
         journal is read only when the local tick files say stale."""
         if self._brain_fresh(ok_at):
             return True, None
-        read, journal = self._journal()
+        read, journal, _ = self._journal()
         if not read:
             return None
         return bool(journal and self.now - journal["at"] <= BRAIN_STALE), journal
@@ -12146,9 +12303,12 @@ class Station:
     def watch_brain(self) -> None:
         """Tell the operator once when the brain stops ticking, and once when
         it is back. The brain is fresh when the lane machine's own tick files
-        say so or a journal on any goal is at most BRAIN_STALE old."""
+        say so or a journal on any goal is at most BRAIN_STALE old. Each
+        holder in LOOM_BRAIN_BACKUP_HOLDERS is also judged on its own
+        (watch_brain_holders)."""
         if not self.s.webhook_ssm:
             return
+        self.watch_brain_holders()
         brain = self._brain()
         if brain is None:
             return
@@ -12167,6 +12327,46 @@ class Station:
         url = self._webhook()
         if url is not None:
             self._tell_brain(url, path, fresh, last, ok_at, journal)
+
+    def watch_brain_holders(self) -> None:
+        """Tell the operator once when a holder in LOOM_BRAIN_BACKUP_HOLDERS
+        has posted no journal tick for BRAIN_STALE, and once when it ticks
+        again. Each holder keeps its own alert state, so a live brain elsewhere
+        does not hide a backup that stopped (loom#2141). A GitHub read error
+        makes no decision."""
+        if not self.s.brain_holders:
+            return
+        read, _, holders = self._journal()
+        if not read:
+            return
+        path = os.path.join(self.state, "brain-holders-alert.json")
+        alerts = _read_json(path, {}, strict=False)
+        alerts = alerts if isinstance(alerts, dict) else {}
+        url: Optional[str] = None
+        for holder in self.s.brain_holders:
+            at = holders.get(holder)
+            at = at if self._num(at) else None
+            fresh = at is not None and self.now - at <= BRAIN_STALE
+            told = alerts.get(holder)
+            if fresh != (isinstance(told, dict) and told.get("sent") is True):
+                continue
+            url = url or self._webhook()
+            if url is None or not self._send(url, self._holder_text(holder, fresh, at)):
+                return
+            if fresh:
+                alerts.pop(holder, None)
+            else:
+                alerts[holder] = {"sent": True, "at": self.now}
+            _write_json(path, alerts)
+
+    def _holder_text(self, holder: str, fresh: bool, at: Optional[float]) -> str:
+        if fresh:
+            return ("The Loom brain %s is ticking again (last journal tick %s)."
+                    % (holder, self._utc(at or self.now)))
+        since = "since " + self._utc(at) if at is not None else "in the last day"
+        return ("Urgent: the Loom brain %s has posted no journal tick %s, over %d hours, "
+                "though another brain may still be ticking. Its log is brain.log on the "
+                "machine it runs on." % (holder, since, BRAIN_STALE // 3600))
 
     # -- talking to the brain --------------------------------------------
     @staticmethod

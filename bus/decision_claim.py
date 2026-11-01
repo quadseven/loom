@@ -32,6 +32,10 @@ _ACT = r"(?:decided|ruled|signed off|approved|chose|confirmed|agreed|answered|ok
 # decided" or "Dependabot decided" claims nothing about this factory.
 _NAMED_ACT = r"(?:decided|ruled|signed off|okayed|OK'd)"
 _NAME = r"([A-Za-z][\w-]*)"
+# How a brain records an answer the operator gave outside the ticket:
+# "Operator answer 2026-10-31: (a)". The date is the group; words after the
+# colon are required, so "Operator answer: none yet" is no record of one.
+ANSWER_LINE = re.compile(r"^\s*operator answer\s+(\d{4}-\d{2}-\d{2})\s*:\s*\S", re.I | re.M)
 
 # Every phrasing that claims a person decided. A match that captures a name
 # is a claim only when that name is one of claim's `names`.
@@ -48,6 +52,8 @@ CLAIM_PATTERNS: Tuple[re.Pattern, ...] = tuple(re.compile(p, re.I) for p in (
     r"\b(?:per|following|according to|pursuant to) %s's %s" % (_NAME, _NOUN),
     # "NAME decided", "NAME has ruled"
     r"\b%s (?:has |had )?(?:already )?%s\b" % (_NAME, _NAMED_ACT),
+    # A dated record line (ANSWER_LINE), which clears an ask in bus/ask_state.py.
+    r"(?m)^\s*operator answer\s+\d{4}-\d{2}-\d{2}\s*:",
 ))
 
 # A loom marker comment is Loom's own record, even under a person's login:

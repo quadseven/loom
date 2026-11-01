@@ -172,6 +172,31 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
 
+    def test_the_brain_plist_omits_the_fabric_key_without_the_opt_in(self):
+        # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and
+        # off by default, so its plist must not carry the key parameter name
+        # at all; the station's plist keeps it exactly as before.
+        env = {k: v for k, v in os.environ.items() if k != "LOOM_BRAIN_FABRIC_ASK"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertNotIn("LOOM_FABRIC_KEY_SSM", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
+    def test_the_brain_plist_gets_the_fabric_key_with_the_opt_in(self):
+        result = self.run_install(LOOM_FABRIC_KEY_SSM="/example/fabric/key",
+                                  LOOM_BRAIN_FABRIC_ASK="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        brain = (agents / "com.loom.brain.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", brain)
+        self.assertIn("<key>LOOM_BRAIN_FABRIC_ASK</key><string>1</string>", brain)
+        station = (agents / "com.loom.station.plist").read_text()
+        self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
+
     def test_roll_ship_documents_are_written_to_station_plist(self):
         documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
         result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)
@@ -251,6 +276,34 @@ class InstallScriptTest(unittest.TestCase):
         entry = "<key>LOOM_TRUSTED_BRIEFERS</key><string>dana-example</string>"
         self.assertIn(entry, (agents / "com.loom.station.plist").read_text())
         self.assertIn(entry, (agents / "com.loom.brain.plist").read_text())
+
+    def trusted_briefers_entries(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        found = [re.search(r"<key>LOOM_TRUSTED_BRIEFERS</key><string>(.*?)</string>",
+                           (agents / (label + ".plist")).read_text())
+                 for label in ("com.loom.station", "com.loom.brain")]
+        return [match.group(1) if match else "" for match in found]
+
+    def test_a_reinstall_with_the_setting_unset_keeps_the_installed_briefers(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example app[bot]").returncode, 0)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="lee-example").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["lee-example"] * 2)
+        self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="").returncode, 0)
+        self.assertEqual(self.trusted_briefers_entries(), ["", ""])
+
+    def test_an_unreadable_installed_plist_stops_a_reinstall_that_names_no_briefers(self):
+        agents = self.home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        (agents / "com.loom.station.plist").write_text("not a plist")
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("LOOM_TRUSTED_BRIEFERS", result.stderr)
 
     def test_goal_limits_are_written_to_station_and_brain_plists(self):
         result = self.run_install(LOOM_GOAL_CAP="28", LOOM_UNVERIFIED_LIMIT="60",
