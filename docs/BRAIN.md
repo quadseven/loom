@@ -2323,8 +2323,12 @@ transfer, 404 or 410, a 403 that is not a rate limit, a GraphQL NOT_FOUND)
 does not end `status` or `resume`: each prints `skipped <repo>: <reason>`,
 in the output and on stderr, and finishes the other repos. `resume` lists
 such repos under "Skipped repos (fix LOOM_REPOS)". Any other GitHub error
-(5xx, a rate limit, a dropped connection) still ends the command, so a
-fault never reads as an empty repo.
+(5xx, a rate limit, a dropped connection) still ends `status`, so a fault
+never reads as an empty repo. `resume` names it instead and goes on
+(loom#1578): a repo GitHub answers with a fault is listed under "Failed
+repos (read again next tick)" with the error, a handoff item that faults is
+named in its goal's section as `skipped OWNER/NAME#N: read failed: ...`, and
+the command exits 3, so neither reads as empty or finished.
 
 `status` and `resume` print as they go (loom#2049): the heading first, then
 each repo's section as soon as that repo's reads finish (in the order the
@@ -2337,7 +2341,16 @@ connection failed, is read once more with a fresh budget, keeping the answers
 the first try finished. A repo that fails again prints `skipped <repo>:
 timed out after ...` or `skipped <repo>: connection failed twice: ...` and is
 left out of the cross-repo sections, and the run goes on with the other
-repos. Within a repo, the
+repos. `resume` writes a line to stderr before each repo (the repo and the
+GitHub requests so far) and before every wait on GitHub (a retry, or a rate
+limit with its length and reset time). It waits out a rate limit only when
+the window resets before its deadline, `--deadline MINUTES` (8 by default);
+otherwise it names the repo as rate limited under "Failed repos". At the
+deadline it stops reading, prints `resume skipped OWNER/NAME: deadline` for
+each repo it did not finish, then the freshness line and the cross-repo
+sections from the repos it read, and exits 3. Since each repo is printed as
+soon as it is read, a handoff finished by a goal in a repo not read yet
+still shows until the item itself reads as finished or closed. Within a repo, the
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.

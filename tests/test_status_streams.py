@@ -231,6 +231,28 @@ class SecondTryTest(unittest.TestCase):
         self.assertEqual((True, "answer"), got[FAST])
         self.assertIn("connection failed twice", per_repo.not_read(5, down))
 
+    def test_at_the_deadline_every_repo_not_read_is_handed_back_in_order(self) -> None:
+        def read(repo):
+            if repo != FAST:
+                self.stuck.wait()
+            return "answer"
+        started = time.monotonic()
+        got = list(per_repo.each([HANG, FAST, "example-owner/third"], read, 30, workers=4,
+                                 until=time.monotonic() + 0.2))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual([(FAST, True, "answer")], got[:1])
+        self.assertEqual([HANG, "example-owner/third"], [repo for repo, _, _ in got[1:]])
+        for _, done, err in got[1:]:
+            self.assertFalse(done)
+            self.assertIsInstance(err, per_repo.PastDeadline)
+            self.assertEqual("deadline", per_repo.not_read(30, err))
+
+    def test_a_deadline_already_past_reads_nothing(self) -> None:
+        got = list(per_repo.each([FAST], lambda repo: self.calls.append(repo), 5, workers=2,
+                                 until=time.monotonic() - 1))
+        self.assertEqual([], self.calls)
+        self.assertEqual([FAST], [repo for repo, done, _ in got if not done])
+
     def test_a_refusal_still_ends_the_run(self) -> None:
         def read(repo):
             self.calls.append(repo)

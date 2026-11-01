@@ -384,8 +384,19 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
-   refuses unless you hold the lock. Each `resume` line it prints is stage
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse
+   --deadline 1.5`. It refuses unless you hold the lock. It prints each
+   repo's goal sections as soon as that repo is read and logs progress to
+   stderr (the repo, the requests so far, and every rate-limit or retry
+   wait), so a killed run keeps what it printed. `--deadline MINUTES`
+   (default 8) stops the reads in time: keep it under your command timeout
+   (1.5 fits a 2-minute one). At the deadline it prints `resume skipped
+   OWNER/NAME: deadline` for each repo it did not finish, then the
+   freshness line and the cross-repo sections from the repos it read, and
+   exits 3. A repo that timed out, or a repo or handoff item GitHub
+   answered with a fault, is named with why (under "Timed-out repos" or
+   "Failed repos", or `read failed` in its goal's section) and also exits 3. Exit 3 means partial, not failed: act on what
+   it printed and read the named repos next tick. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
