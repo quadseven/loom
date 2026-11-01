@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .github import GitHub, Response
 
@@ -109,6 +109,16 @@ class IssueReads:
             # client's rest, so a comments page reads its issue once.
             return GitHub.paginate(self, path)  # type: ignore[arg-type]
         return self._gh.paginate(path)
+
+    def recall(self, path: str, validator: str) -> Optional[List[Any]]:
+        """GitHub.recall, for GitHub itself; a stand-in keeps nothing."""
+        if isinstance(self._gh, GitHub):
+            return self._gh.recall(_with_per_page(path), validator)
+        return None
+
+    def remember(self, path: str, validator: str, items: List[Any]) -> None:
+        if isinstance(self._gh, GitHub):
+            self._gh.remember(_with_per_page(path), validator, items)
 
     def keep_listed(self, repo: str, items: List[Any]) -> None:
         """Answer each item's single read from a listing of the repo's
