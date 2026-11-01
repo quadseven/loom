@@ -818,6 +818,11 @@ print('leak guard: clean (shape patterns only)')
         every run dies at once under set -u and no lane works."""
         env = self.lane_env()
         del env["LOOM_CLONE_BASE"]
+        # The default remote is SSH. A real ssh here reaches out of the test:
+        # on a cluster runner the egress fence drops port 22, the clone hangs
+        # past the timeout below, and this one test failed every base check
+        # of this repo there (loom#2418).
+        self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
         self.drop_brief()
         result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
                                 capture_output=True, text=True, timeout=60)
@@ -7106,6 +7111,57 @@ exec /usr/bin/git "$@"
         self.assertIn("base check exited 1 on the", log)
         self.assertIn("[factory]", log)
         self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+
+    def red_base_contract(self, check):
+        return "interpreter: loom-test-python\nsubmodules: yes\ncheck: %s\n" % check
+
+    def test_a_base_failure_on_a_cluster_runner_names_the_failing_tests(self):
+        # Nothing recorded why: 49 base failures on one repo held an empty
+        # detail, and the test output sat unread in a sealed log (loom#2418).
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract(
+            "printf 'ERROR: test_one (test_mod.ThingTest.test_one)\\ntext\\n"
+            "FAIL: test_two (test_mod.ThingTest.test_two)\\n'; exit 1"))
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [r for r in self.records() if r["phase"] == "baseline"]
+        self.assertEqual([r["exit"] for r in rows], [1, 1])
+        for row in rows:
+            self.assertIn("test_mod.ThingTest.test_one", row["detail"])
+            self.assertIn("test_mod.ThingTest.test_two", row["detail"])
+        self.assertIn("second run after exit 1", rows[1]["detail"])
+
+    def test_a_base_check_that_cannot_find_its_tool_names_the_tool(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("no-such-tool-here test"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        row = next(r for r in self.records() if r["phase"] == "baseline")
+        self.assertEqual(row["exit"], 127)
+        self.assertIn("missing no-such-tool-here", row["detail"])
+
+    def test_a_red_base_with_no_test_names_records_its_last_line(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("echo the build broke here; exit 2"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        row = next(r for r in self.records() if r["phase"] == "baseline")
+        self.assertIn("the build broke here", row["detail"])
+
+    def test_a_cluster_run_marks_that_its_agent_started(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertTrue((self.loom / "logs" / "codex" / "T042-fix-the-thing.agent-ran").exists())
+
+    def test_a_cluster_run_stopped_before_its_agent_leaves_no_mark(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(self.red_base_contract("exit 1"))
+        self.drop_brief()
+        self.run_contract_lane(LOOM_CLUSTER_RUNNER="1")
+        self.assertFalse((self.loom / "logs" / "codex" / "T042-fix-the-thing.agent-ran").exists())
 
     def test_a_red_default_branch_on_a_fix_round_files_a_base_check_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')

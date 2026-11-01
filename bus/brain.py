@@ -17,7 +17,7 @@ from urllib.parse import quote
 
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -1373,12 +1373,15 @@ def repo_weights(gh: Any, repos: Sequence[str]) -> Dict[str, int]:
     return weights
 
 
-def heaviest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
-    """`repos` with the heaviest first; repos of one weight, or not weighed,
-    keep their order, so the largest reads start first and the light ones
-    are what a deadline leaves behind (as bus.needs_you orders its reads,
-    loom#2409)."""
-    return sorted(dict.fromkeys(repos), key=lambda repo: -weights.get(repo, 0))
+def lightest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
+    """`repos` with the lightest first; repos of one weight, or not weighed,
+    keep their order. A repo's section prints only once its whole read is
+    in, so the light repos print within seconds and a deadline leaves only
+    heavy ones unread. Heaviest first (loom#2415) put the six heaviest repos
+    on all six workers: on a link that carries about 0.35 MB/s they shared it
+    for the whole deadline, none finished, and the light repos never started,
+    so a tick printed no repo at all."""
+    return sorted(dict.fromkeys(repos), key=lambda repo: weights.get(repo, 0))
 
 
 def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
@@ -1393,8 +1396,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     whose read runs past the per-repo budget (per_repo.budget) is named as
     timed out in its section and left out of the cross-repo sections.
 
-    Repos are read side by side, the heaviest first (most open issues and
-    pull requests). At `deadline` minutes (STATUS_DEADLINE_MINUTES when
+    Repos are read side by side, the lightest first (fewest open issues
+    and pull requests, lightest_first). At `deadline` minutes (STATUS_DEADLINE_MINUTES when
     None) it reads no more repos and names each one it did not finish as
     `status skipped OWNER/NAME: deadline` before the cross-repo sections,
     which then span only the repos read (loom#2415). A repo GitHub refuses
@@ -1517,11 +1520,11 @@ def _status_pass(gh: GitHub, repos: List[str], lanes_repo: str, env: Dict[str, s
     caps: Dict[str, str] = {}
     # The fleet hold logins merge reads (hold_logins), from this env (loom#2393).
     hold = hold_logins(env)
-    # The heaviest repos are read first, so a deadline leaves the light
-    # ones. A status took 68 s here and 152 s from a remote brain, over a
-    # 15-minute tick (2026-10-15), and about 4 minutes for 19 repos inside a
-    # 2-minute command (loom#2415).
-    order = heaviest_first(repos, repo_weights(reads, repos))
+    # The lightest repos are read first, so a deadline leaves only heavy
+    # ones (lightest_first). A status took 68 s here and 152 s from a remote
+    # brain, over a 15-minute tick (2026-10-15), and about 4 minutes for 19
+    # repos inside a 2-minute command (loom#2415).
+    order = lightest_first(repos, repo_weights(reads, repos))
     found: Dict[str, List[Dict[str, Any]]] = {}
     waiting: Dict[str, Dict[str, Any]] = {}
     late: List[str] = []
@@ -7114,6 +7117,7 @@ def parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
+    ac = sub.add_parser("audit-close", help="the facts a close audit line carries: cited hash, merge commit, on the default branch or not; exit 0 only when sound"); ac.add_argument("ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
     df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
@@ -7220,6 +7224,14 @@ def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
     print(audit_proof(gh, repo, number, args.result, args.note))
 
 
+def _cmd_audit_close(gh: GitHub, args: argparse.Namespace) -> int:
+    """Print what git holds for a ticket's close (bus/close_audit.py)."""
+    repo, number = _ref(args.ticket, "ticket")
+    report = close_audit.read_close(gh, repo, number, fleet=close_audit.fleet_repos())
+    print("\n".join(close_audit.lines(report)))
+    return 0 if report.verdict == close_audit.SOUND else 1
+
+
 def _cmd_close(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     said = close(gh, repo, number, args.reason, args.note)
@@ -7308,7 +7320,8 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize, "live": _cmd_live,
-            "close": _cmd_close, "audit": _cmd_audit, "merge": _cmd_merge, "reply": _cmd_reply,
+            "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
+            "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
             "onboard": _cmd_onboard, "escalate": _cmd_escalate, "epic": _cmd_epic,

@@ -1,10 +1,13 @@
-"""bus.brain status reads the heaviest repo first, prints each repo as it is
+"""bus.brain status reads the lightest repo first, prints each repo as it is
 read, and stops at a deadline inside a Muse tick (loom#2415).
 
 On 2026-11-01 Muse's tick cut status off at 115 s with a partial read: two
-repo sections printed, 17 not read, and nothing said which. These tests run
-status over a fake GitHub of three repos, at the transport, so the request
-count and the order of the reads are the real client's."""
+repo sections printed, 17 not read, and nothing said which. Then, reading
+the heaviest repo first, a tick at --deadline 1.5 printed no repo at all:
+the six heaviest repos held all six workers and shared a slow link for the
+whole deadline, and the light repos never started. These tests run status
+over a fake GitHub, at the transport, so the request count and the order of
+the reads are the real client's."""
 from __future__ import annotations
 
 import io
@@ -34,6 +37,12 @@ ENV = {"LOOM_BRIEF_AUTHORS": "allowed-bot"}
 AUTHORS = ["allowed-bot"]
 # Open issues per repo: the heavy repo has the most to read.
 SIZES = {HEAVY: 5, LIGHT: 1, SLOW: 2}
+# A fleet as Muse reads it: more heavy repos than status has workers, and
+# light repos that take a moment each.
+BIG = ["example-owner/big-%d" % n for n in range(brain.READ_WORKERS + 1)]
+SMALL = ["example-owner/small-%d" % n for n in range(4)]
+SIZES.update({repo: 8 for repo in BIG})
+SIZES.update({repo: 1 for repo in SMALL})
 REPO = re.compile(r"^/repos/([^/]+/[^/]+)/")
 
 
@@ -172,9 +181,9 @@ class StatusDeadlineTest(unittest.TestCase):
         return brain.status(GitHub("t", transport=fake), repos, LANES, env=ENV, now=NOW,
                             authors=AUTHORS, emit=self.parts.append, **kwargs)
 
-    def test_the_heaviest_repo_prints_before_the_light_ones_are_read(self) -> None:
-        # One reader at a time, the heavy repo given last: its section is
-        # read and printed before any light repo's section read starts.
+    def test_the_lightest_repo_prints_before_the_heavy_ones_are_read(self) -> None:
+        # One reader at a time, the light repo given first: it is read and
+        # printed first, and the heavy repo last.
         fake = self.fake()
         printed_at: dict = {}
 
@@ -184,16 +193,59 @@ class StatusDeadlineTest(unittest.TestCase):
                 if "## %s" % repo in part:
                     printed_at[repo] = len(fake.order)
         with mock.patch.object(brain, "READ_WORKERS", 1):
-            brain.status(GitHub("t", transport=fake), [LIGHT, SLOW, HEAVY], LANES, env=ENV,
+            brain.status(GitHub("t", transport=fake), [HEAVY, SLOW, LIGHT], LANES, env=ENV,
                          now=NOW, authors=AUTHORS, emit=emit, deadline=1)
-        self.assertEqual([HEAVY, SLOW, LIGHT], sorted(printed_at, key=printed_at.get))
-        # One query weighs every repo; then the heavy repo's whole section
+        self.assertEqual([LIGHT, SLOW, HEAVY], sorted(printed_at, key=printed_at.get))
+        # One query weighs every repo; then the light repo's whole section
         # is read before the first request of another repo's section.
         self.assertEqual("", fake.order[0])
         sections = [repo for repo in fake.order[1:] if repo]
-        self.assertEqual(HEAVY, sections[0])
-        first_other = sections.index(next(r for r in sections if r != HEAVY))
-        self.assertEqual(sections.count(HEAVY), first_other)
+        self.assertEqual(LIGHT, sections[0])
+        first_other = sections.index(next(r for r in sections if r != LIGHT))
+        self.assertEqual(sections.count(LIGHT), first_other)
+
+    def test_a_slow_heavy_repo_leaves_the_fast_ones_printed_before_the_deadline(self) -> None:
+        # One reader, the slow repo the heaviest and given first: its reads
+        # hang, and every fast repo's section must still print before the
+        # deadline, with only the slow repo named unread. Read heaviest
+        # first, the slow repo held the reader and nothing printed.
+        fake = self.fake(hold=(HEAVY,))
+        missed: list = []
+        printed: dict = {}
+        started = time.monotonic()
+
+        def emit(part: str) -> None:
+            self.parts.append(part)
+            for repo in SIZES:
+                if "## %s\n" % repo in part + "\n":
+                    printed[repo] = time.monotonic() - started
+        with mock.patch.object(brain, "READ_WORKERS", 1):
+            text = brain.status(GitHub("t", transport=fake), [HEAVY, SLOW, LIGHT], LANES,
+                                env=ENV, now=NOW, authors=AUTHORS, emit=emit,
+                                deadline=1 / 60, missed=missed)
+        self.assertEqual([HEAVY], missed)
+        self.assertEqual({LIGHT, SLOW}, set(printed))
+        self.assertTrue(all(at < 1 for at in printed.values()), printed)
+        self.assertIn("status skipped %s: deadline" % HEAVY, text)
+        self.assertEqual("status partial: not read this run: %s" % HEAVY, text.splitlines()[-1])
+
+    def test_more_heavy_repos_than_workers_still_print_every_light_repo(self) -> None:
+        # The live shape (2026-11-01): more heavy repos than workers, each
+        # too slow to finish by the deadline. Every light repo prints and
+        # only the heavy ones are named unread.
+        fake = self.fake(hold=tuple(BIG))
+        missed: list = []
+        text = self.status(fake, BIG + SMALL, deadline=1 / 60, missed=missed)
+        for repo in SMALL:
+            self.assertIn("## %s\n" % repo, text)
+        for repo in BIG:
+            self.assertIn("status skipped %s: deadline" % repo, text)
+        self.assertEqual(sorted(BIG), sorted(missed))
+        # Each light repo's section is read once, in a pinned number of
+        # requests: a change here is a change in what status reads.
+        small = sum(n for (m, p), n in fake.calls.items()
+                    if any(p.startswith("/repos/%s/" % r) for r in SMALL))
+        self.assertEqual(PINNED_SMALL_REQUESTS, small)
 
     def test_the_first_repo_prints_before_the_last_is_read(self) -> None:
         # The slow repo's section reads answer only once another repo's
@@ -304,9 +356,9 @@ class StatusDeadlineTest(unittest.TestCase):
         self.assertTrue(all(fake.calls[("GET", p)] == 1 for p in listings))
         self.assertEqual(PINNED_REQUESTS, sum(fake.calls.values()))
 
-    def test_heaviest_first_keeps_the_given_order_among_equals(self) -> None:
-        self.assertEqual([HEAVY, LIGHT, SLOW],
-                         brain.heaviest_first([LIGHT, SLOW, HEAVY, LIGHT],
+    def test_lightest_first_keeps_the_given_order_among_equals(self) -> None:
+        self.assertEqual([LIGHT, SLOW, HEAVY],
+                         brain.lightest_first([HEAVY, LIGHT, SLOW, LIGHT],
                                               {HEAVY: 9, LIGHT: 1, SLOW: 1}))
 
     def test_repos_are_read_in_the_order_given_when_their_sizes_cannot_be_read(self) -> None:
@@ -315,7 +367,7 @@ class StatusDeadlineTest(unittest.TestCase):
                 raise GitHubError("POST /graphql -> 502", 502, "")
         self.assertEqual({}, brain.repo_weights(Refused(), [LIGHT, HEAVY]))
         self.assertEqual({}, brain.repo_weights(Refused(), [LIGHT]))
-        self.assertEqual([LIGHT, HEAVY], brain.heaviest_first([LIGHT, HEAVY], {}))
+        self.assertEqual([HEAVY, LIGHT], brain.lightest_first([HEAVY, LIGHT], {}))
 
     def test_a_repo_github_will_not_show_does_not_stop_the_others_being_weighed(self) -> None:
         class Partial:
@@ -329,6 +381,8 @@ class StatusDeadlineTest(unittest.TestCase):
 
 # The requests status sends for the three fake repos and the lane status.
 PINNED_REQUESTS = 60
+# The requests the four light repos' sections send, beside the heavy ones.
+PINNED_SMALL_REQUESTS = 36
 
 
 if __name__ == "__main__":

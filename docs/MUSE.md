@@ -345,10 +345,12 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    brain no longer ticking (the packet marks them open work for any brain)
    are finished before new work, through `resume` as below.
    Run `python3 -m bus.brain status $LOOM_REPOS --deadline 1.5`. It reads
-   the repos side by side, the heaviest first, prints each repo's section as
-   soon as that repo is read, and logs progress to stderr. `--deadline
-   MINUTES` (default 1.5) stops the reads inside your 2-minute command
-   timeout: it prints `status skipped OWNER/NAME: deadline` for each repo
+   the repos side by side, the lightest first, prints each repo's section as
+   soon as that repo is read, and logs progress to stderr. The light repos
+   print within seconds, so a deadline leaves only heavy ones unread.
+   `--deadline MINUTES` (default 1.5) stops the reads inside your command
+   timeout (about 115 s): the sections across repos and the lane status
+   take a few seconds more, so the command ends near 100 s. It prints `status skipped OWNER/NAME: deadline` for each repo
    it did not finish, then the sections across repos from the repos it
    read, ends with `status partial: not read this run: ...`, and exits 3. A
    repo that timed out or that GitHub answered with a fault is named in its
@@ -471,6 +473,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
    `- Audit: OWNER/NAME#N proof by LANE/MODEL: pass|fail, what was re-read`.
+   An audit line about a merge or a close comes from the output of
+   `python3 -m bus.brain audit-close OWNER/NAME#N`, with the cited hash, the
+   merge commit and whether the default branch has it (docs/BRAIN.md, Close
+   audits); comments alone prove nothing.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each

@@ -325,6 +325,63 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(GitHubError):
                 urllib_transport("GET", url, {}, None)
 
+    def test_the_default_transport_asks_for_gzip_and_unpacks_it(self):
+        # Uncompressed, a 19-repo status moved 70 MB: from a remote brain on
+        # a link of about 0.35 MB/s it read no repo by its deadline
+        # (loom#2415). GitHub's JSON packs 6 to 8 times smaller.
+        import gzip
+        from unittest import mock
+        from bus import github as gh_mod
+        body = json.dumps([{"number": n, "body": "x" * 200} for n in range(50)]).encode()
+        packed = gzip.compress(body)
+        sent = []
+
+        class Answer:
+            status = 200
+            headers = {"Content-Encoding": "gzip", "Content-Length": str(len(packed)),
+                       "ETag": '"v1"'}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return packed
+
+        def opened(req, timeout=None):
+            sent.append(req)
+            return Answer()
+        with mock.patch.object(gh_mod._OPENER, "open", side_effect=opened):
+            status_, headers, raw = gh_mod.urllib_transport(
+                "GET", "https://api.github.com/x", {"Accept": "application/json"}, None)
+        self.assertEqual("gzip", sent[0].get_header("Accept-encoding"))
+        self.assertLess(len(packed) * 5, len(body))
+        self.assertEqual((200, body), (status_, raw))
+        self.assertEqual({"ETag": '"v1"'}, headers)
+
+    def test_a_gzip_error_answer_is_unpacked_and_a_broken_one_is_a_dropped_read(self):
+        import gzip
+        import urllib.error
+        from email.message import Message
+        from unittest import mock
+        from bus import github as gh_mod
+
+        def refused(body):
+            headers = Message()
+            headers["Content-Encoding"] = "gzip"
+            return urllib.error.HTTPError("https://api.github.com/x", 422, "Unprocessable",
+                                          headers, io.BytesIO(body))
+        with mock.patch.object(gh_mod._OPENER, "open",
+                               side_effect=refused(gzip.compress(b'{"message": "no"}'))):
+            status_, _, raw = gh_mod.urllib_transport("GET", "https://api.github.com/x", {}, None)
+        self.assertEqual((422, b'{"message": "no"}'), (status_, raw))
+        with mock.patch.object(gh_mod._OPENER, "open", side_effect=refused(b"not gzip")):
+            with self.assertRaises(GitHubError) as caught:
+                gh_mod.urllib_transport("GET", "https://api.github.com/x", {}, None)
+        self.assertEqual(0, caught.exception.status)
+
     def test_the_default_transport_never_follows_a_redirect(self):
         from bus.github import _NoRedirect
         self.assertIsNone(_NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://elsewhere.example/x"))
