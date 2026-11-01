@@ -2160,9 +2160,11 @@ scorecard, aggregated per lane and model.
 A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
 proof audit or a damaging audit verdict. A lane (all its slots) whose bad
 outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
-`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, its
-briefed tickets step aside to other lanes with a status event naming the
-demotion and its counts, and it stays demoted until the operator runs
+`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, the
+factory gives it no queued ticket, tier move or automatic retry (as a lane
+that is down; loom#2430), its briefed tickets step aside to other lanes with
+a status event naming the demotion and its counts, and it stays demoted until
+the operator runs
 `python3 -m bus.scorecard clear <lane>` (`show` prints the table). Clearing
 forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
