@@ -916,7 +916,13 @@ the ticket's Live criterion and judges each criterion against those two
 sections, then
 writes `verify.json`: a proof record (`bus/proof.py`),
 `{"missing": "<the evidence that does not exist yet>"}` or, for a ticket sent
-ahead of a build, the `unmet` answer described below. The runner copies it
+ahead of a build, the `unmet` answer described below. For a prose Live box in
+an opted-in repo with a live-evidence adapter, the brief lists its log sources
+and SQL route. The lane may suggest one `adapter_step` with the exact criterion,
+`log:<source>` or `sql:<SELECT ...>`, and the strings the station must find.
+The station runs that step through the adapter itself; the lane's statement
+that it passed is never proof. The station asks a person once when the lane
+returns no step or the station read fails. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, refuses it when it passes a live or operator criterion the
