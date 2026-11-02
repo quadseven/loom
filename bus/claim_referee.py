@@ -48,7 +48,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from .stale_claims import CLAIM_PREFIX, _login, _made_by, _stamp, loom_managed, running
+from .stale_claims import CLAIM_PREFIX, OVERFLOW_CLAIM, outside_hold, _login, _made_by, _stamp, loom_managed, running
 
 ENGINE_CLAIMS = ("claim:claude-code", "claim:muse", "claim:dot", "claim:ccqw")
 IDLE = 2 * 3600
@@ -97,7 +97,8 @@ def mode(raw: str) -> str:
 
 def engines(raw: str) -> Tuple[str, ...]:
     """LOOM_ENGINE_CLAIMS: the claim:* words, lowercased; else ENGINE_CLAIMS."""
-    found = tuple(w.lower() for w in (raw or "").split() if w.lower().startswith(CLAIM_PREFIX))
+    found = tuple(w.lower() for w in (raw or "").split()
+                  if w.lower().startswith(CLAIM_PREFIX) and w.lower() != OVERFLOW_CLAIM)
     return found or ENGINE_CLAIMS
 
 
@@ -232,6 +233,8 @@ def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
     IDLE seconds, and no stated wait or open pull request holds it. Only the claimer and `trusted`
     count, never `station`. A claim whose putting-on the timeline does not
     show leaves the issue for a later pass, however many claims it has."""
+    if outside_hold(issue):
+        return []
     events = [e for e in timeline if isinstance(e, dict)]
     claims = engine_claims(issue, engine_labels)
     put: Dict[str, PutOn] = {}

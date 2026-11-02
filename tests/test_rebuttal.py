@@ -11,11 +11,12 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from bus import brain, rebuttal  # noqa: E402
+from bus import brain, rebuttal, text  # noqa: E402
 from bus.github import GitHub, RateLimited  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
+NUMBER = 8
 HEAD = "f" * 40
 # The loom#1948 shape: a dead function next to the sibling its caller uses.
 STATION = ("def _markings(s):\n    return []\n\n\n"
@@ -113,10 +114,16 @@ class Transport:
     def __init__(self, files=None, ancestors=(), unresolve_status=200):
         self.files, self.ancestors, self.calls = files or {}, set(ancestors), []
         self.unresolve_status = unresolve_status
+        self.comments = []
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
         self.calls.append((method, path, json.loads(body) if body else None))
+        if path.split("?")[0] == "/repos/%s/issues/%d/comments" % (REPO, NUMBER):
+            if method == "POST":
+                self.comments.append({"id": len(self.comments) + 1, "body": json.loads(body)["body"]})
+                return reply(201, self.comments[-1])
+            return reply(200, list(self.comments))
         m = re.match(r"/repos/%s/contents/(.+)\?ref=%s$" % (REPO, HEAD), path)
         if m:
             text = self.files.get(m.group(1))
@@ -155,7 +162,7 @@ class BrainMergeGate(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def gate(self, transport, data):
-        brain._refuse_unheld_answers(GitHub("t", transport=transport), REPO, data, ENV)
+        brain._refuse_unheld_answers(GitHub("t", transport=transport), REPO, NUMBER, data, ENV)
 
     def test_a_thread_resolved_on_a_false_caller_claim_refuses_and_reopens(self):
         transport = Transport({"bus/s.py": STATION})
@@ -170,6 +177,37 @@ class BrainMergeGate(unittest.TestCase):
         transport = Transport({"bus/s.py": CALLED})
         self.gate(transport, details("`_markings` is called by `_hand_back`."))
         self.assertFalse([c for c in transport.calls if c[1] == "/graphql"])
+        self.assertEqual(transport.comments, [])
+
+    def test_a_refusal_posts_one_marker_comment_per_thread_and_head(self):
+        # loom#2179: a refusal leaves a countable record on the pull request,
+        # once per thread and head however many ticks refuse it.
+        transport = Transport({"bus/s.py": STATION})
+        answer = "`_markings` is called by `_hand_back`."
+        for _ in range(2):
+            with self.assertRaises(ValueError) as raised:
+                self.gate(transport, details(answer))
+        self.assertEqual(len(transport.comments), 1)
+        body = transport.comments[0]["body"]
+        marker = "<!-- loom:rebuttal-refused v1 thread=PRRT_1 head=%s -->" % HEAD
+        self.assertIn(marker, body)
+        self.assertIn("PRRT_1", body)
+        self.assertIn("> " + answer, body)
+        self.assertIn("`_hand_back`", body)
+        why = "`_hand_back` does not call `_markings` on the head"
+        self.assertIn(why, body)
+        # The journal prints the merge refusal: it carries the same reason
+        # and the marker's thread and head, so the two counts agree.
+        self.assertIn(why, str(raised.exception))
+        self.assertIn("rebuttal-refused thread=PRRT_1 head=%s" % HEAD, str(raised.exception))
+
+    def test_a_new_head_posts_its_own_marker(self):
+        transport = Transport({"bus/s.py": STATION})
+        transport.comments.append({"id": 1, "body": "<!-- loom:rebuttal-refused v1 "
+                                   "thread=PRRT_1 head=%s -->" % ("e" * 40)})
+        with self.assertRaises(ValueError):
+            self.gate(transport, details("`_markings` is called by `_hand_back`."))
+        self.assertEqual(len(transport.comments), 2)
 
     def test_fixed_in_counts_only_for_a_commit_on_the_head_history(self):
         self.gate(Transport(ancestors={"abc1234"}), details("Fixed in abc1234"))
@@ -186,7 +224,44 @@ class BrainMergeGate(unittest.TestCase):
         gh = GitHub("t", transport=Transport())
         with mock.patch.object(gh, "rest", side_effect=RateLimited("limited", 403, "", 0)):
             with self.assertRaises(RateLimited):
-                brain._refuse_unheld_answers(gh, REPO, details("`_markings` is called by `_x`."), ENV)
+                brain._refuse_unheld_answers(gh, REPO, NUMBER, details("`_markings` is called by `_x`."),
+                                             ENV)
+
+    # loom#2285 (on another repo): the station redacts any 32-character
+    # word from the posted answer, so a long test name the answer cites is
+    # gone from the quote and the quote alone "cites no file, line or symbol".
+    TEST_NAME = "test_a_resolved_verified_answer_does_not_block_the_merge"
+
+    def redacted_reply(self, head):
+        raw = "`%s` covers it." % self.TEST_NAME
+        said = text.SECRET_RE.sub("<redacted>", raw)
+        self.assertNotIn(self.TEST_NAME, said)
+        return said + "\n" + rebuttal.held_marker(head)
+
+    def test_an_answer_citing_a_test_name_passes_after_redaction(self):
+        transport = Transport()
+        data = details(self.redacted_reply(HEAD))
+        self.assertEqual(brain._refuse_unheld_answers(GitHub("t", transport=transport),
+                                                      REPO, NUMBER, data, ENV), {"PRRT_1"})
+        self.assertEqual(transport.calls, [])
+
+    def test_a_held_mark_for_another_head_is_checked_again_on_this_one(self):
+        with self.assertRaisesRegex(ValueError, "cites no file, line or symbol"):
+            self.gate(Transport(), details(self.redacted_reply("e" * 40)))
+
+    def test_a_held_mark_inside_the_lane_quote_is_not_the_stations(self):
+        # The lane writes the quoted lines; only the station's own line counts.
+        forged = "nothing to see\n" + rebuttal.held_marker(HEAD)
+        with self.assertRaisesRegex(ValueError, "cites no file, line or symbol"):
+            self.gate(Transport(), details(forged.replace("\n", "\n> ")))
+
+    def test_the_quote_leaves_out_the_held_mark(self):
+        body = ("Lane codex answered this finding instead of changing the code:\n\n> Fine.\n"
+                + rebuttal.held_marker(HEAD))
+        self.assertEqual(rebuttal.quoted(body), "Fine.")
+        self.assertTrue(rebuttal.marked_held(body, HEAD))
+        self.assertFalse(rebuttal.marked_held(body, "e" * 40))
+        self.assertFalse(rebuttal.marked_held(body, ""))
 
     def test_merge_runs_the_gate_before_it_merges(self):
         with mock.patch.object(brain, "_refuse_unheld_answers",

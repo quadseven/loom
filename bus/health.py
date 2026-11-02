@@ -65,7 +65,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
-from . import brain, criteria_gate, naming, notify, proof, shadow, text, tickets
+from . import brain, closing, criteria_gate, naming, notify, proof, shadow, text, tickets
 from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
@@ -1162,10 +1162,8 @@ class Intake:
         names = [str(x.get("name") or "") for x in issue.get("labels") or [] if isinstance(x, dict)]
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
                      {"body": proof.tick(body)})
-        self._comment(source.repo, issue, settle_comment(absent, checked, hours, how),
-                      notify.CLOSED)
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number),
-                     {"state": "closed", "state_reason": "completed"})
+        closing.close(self.gh, source.repo, number, settle_comment(absent, checked, hours, how),
+                      "completed")
         kept = brain.closing_labels(names, brain.trusted_authors())
         if kept != names:
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (source.repo, number),

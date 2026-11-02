@@ -34,8 +34,9 @@ if [ "$2" = bus.brain_memory ]; then
   exit "${FAKE_PACKET_EXIT:-0}"
 fi
 if [ "$2" = bus.fabric ]; then
+  printf 'fabric env LOOM_FABRIC_KEY_SSM=%s\\n' "${LOOM_FABRIC_KEY_SSM:-absent}" >> "$FAKE_LOG"
   printf '%s\\n' "${FAKE_FABRIC:-}"
-  exit 0
+  exit "${FAKE_FABRIC_EXIT:-0}"
 fi
 if [ "$3 $4" = "app token" ]; then
   # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
@@ -63,6 +64,7 @@ exit 0
 # $FAKE_<NAME>_OUT, then exits $FAKE_<NAME>_EXIT (default 0).
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%(name)s %%s\\n' "$*" >> "$FAKE_LOG"
+printf 'env-%(name)s LOOM_FABRIC_KEY_SSM=%%s\\n' "${LOOM_FABRIC_KEY_SSM:-absent}" >> "$FAKE_LOG"
 printf 'cwd %%s\\n' "$PWD" >> "$FAKE_LOG"
 printf 'gh-path-%(name)s %%s\\n' "$(command -v gh)" >> "$FAKE_LOG"
 [ -z "${FAKE_%(var)s_OUT:-}" ] || printf '%%s\\n' "$FAKE_%(var)s_OUT"
@@ -145,6 +147,9 @@ class BrainTickTest(unittest.TestCase):
             "LOOM_REPOS": "example/project",
             "LOOM_STATUS_REPO": "example/loom",
             "FAKE_LOG": str(self.log),
+            # No other brain's slot bounds these ticks; the slot tests below
+            # set their own (loom#2469).
+            "LOOM_BRAIN_YIELD_AT": "",
         }
         # The claude lane's runner says it has usage, as on the lane machine.
         self.usage("claude", True)
@@ -210,8 +215,29 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("Read this handoff packet before anything else.", claude[0])
         self.assertIn("## Open commitments (1)", "\n".join(calls))
 
+    def test_fabric_is_not_asked_without_the_opt_in(self):
+        # The Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+        # default: a tick with only the key set makes no bus.fabric call,
+        # the answer never reaches the prompt, and the tick still runs.
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+        self.assertNotIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        # loom#2203: with the ask off, the configuration still never
+        # reaches the brain child.
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        self.log.unlink()
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="",
+                               FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertEqual(0, run.returncode)
+        self.assertFalse(any("bus.fabric" in c for c in calls), calls)
+
     def test_fabric_is_asked_by_the_wrapper_before_the_agent(self):
         _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
                              FAKE_FABRIC="Earlier decision: a fix was merged.")
         fabric_call = next(i for i, call in enumerate(calls)
                            if "bus.fabric ask" in call)
@@ -219,7 +245,90 @@ class BrainTickTest(unittest.TestCase):
                        if call.startswith("claude ")]
         self.assertLess(fabric_call, agent_calls[0][0])
         self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
-        self.assertNotIn("LOOM_FABRIC_KEY_SSM", "\n".join(calls))
+        # The configuration's name is part of no agent call's arguments.
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c
+                             for c in calls if c.startswith("claude ")))
+
+    def test_fabric_configuration_reaches_the_responder_but_not_the_child(self):
+        # loom#2203: the wrapper's trusted Fabric request runs with the
+        # configuration in its own environment; the agent child must never
+        # see it, while the answer still reaches the prompt.
+        _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+        # The dummy configuration value itself is in no agent call's
+        # arguments or prompt (the ticket's test plan, literally).
+        agent_lines = [c for c in calls
+                       if c.startswith(("claude ", "codex ", "opencode "))]
+        self.assertTrue(agent_lines)
+        for line in agent_lines:
+            self.assertNotIn("/example/fabric-key", line)
+        # Unconfigured: no Fabric request is made and the child still runs
+        # with the variable absent.
+        self.log.unlink()
+        _, calls = self.tick()
+        self.assertFalse(any("bus.fabric" in c for c in calls))
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+
+    def test_fabric_configuration_does_not_reach_the_codex_child(self):
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_BRAIN_LADDER="codex",
+                             LOOM_CODEX_MODEL="gpt-test-high",
+                             LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertIn("env-codex LOOM_FABRIC_KEY_SSM=absent", calls)
+
+    def test_fabric_configuration_does_not_reach_the_spark_child(self):
+        self.usage("spark", True)
+        _, calls = self.tick(LOOM_BRAIN_LADDER="spark",
+                             LOOM_SPARK_MODEL="spark/coder",
+                             LOOM_SPARK_URL="http://spark.invalid:8000/v1",
+                             LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
+                             FAKE_FABRIC="Earlier decision: a fix was merged.")
+        self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
+        self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c
+                             for c in calls if c.startswith("opencode setting ")),
+                         calls)
+        # The spark child did run, with its recorded environment present,
+        # and the Fabric answer reached its prompt.
+        settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
+        opencode = [c for c in calls if c.startswith("opencode run ")]
+        self.assertEqual(1, len(opencode))
+        self.assertIn("Earlier decision: a fix was merged.", "\n".join(calls))
+
+    def test_a_failed_fabric_request_still_hides_the_configuration(self):
+        # The responder failing must fail closed: no configuration in the
+        # child environment, no Fabric context in the prompt, tick runs on.
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="1",
+                               FAKE_FABRIC="untrusted partial answer",
+                               FAKE_FABRIC_EXIT="1")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(1, len(claude))
+        self.assertNotIn("untrusted partial answer", claude[0])
+        self.assertIn("could not read Fabric context",
+                      (self.home / "logs" / "brain.log").read_text())
+        # The production shape of an unavailable responder (bus/fabric.py
+        # answers a refusal or an unreachable service with an empty string
+        # and exit 0) fails just as safely: no Fabric section in the prompt.
+        self.log.unlink()
+        run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="1",
+                               FAKE_FABRIC="")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
+        claude = [c for c in calls if c.startswith("claude ")]
+        self.assertEqual(1, len(claude))
+        self.assertNotIn("Fabric workspace context", claude[0])
 
     def test_no_dashboard_or_a_failed_read_runs_the_tick_without_the_packet(self):
         _, calls = self.tick()
@@ -251,7 +360,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual(0, run.returncode)
         self.assertIn("-m bus lock", calls[0])
         self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
-                         "--lock-repo example/loom", calls[1])
+                         "--lock-repo example/loom --tick-minutes 40", calls[1])
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
@@ -369,7 +478,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("tick start (lane codex, model gpt-test-high, scope all)", log)
         self.assertEqual("python3 -m bus unlock example/loom --holder lane-machine", calls[-1])
 
-    def test_a_stale_heartbeat_has_no_usage(self):
+    def test_a_stale_heartbeat_goes_after_a_fresh_one(self):
         # A runner that stopped writes no heartbeat; its old one does not count.
         self.usage("claude", True, age=3600)
         self.usage("codex", True)
@@ -390,11 +499,47 @@ class BrainTickTest(unittest.TestCase):
 
     def test_a_dead_runners_lock_does_not_keep_an_aged_heartbeat(self):
         self.usage("claude", True, age=1800)
+        self.usage("codex", True)
         lock = self.home / "run" / "claude.lock"
         lock.mkdir(parents=True)
         (lock / "pid").write_text("999999\n")
-        _, calls = self.tick()
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_stale_heartbeats_read_as_fuel_unknown_and_the_tick_still_runs(self):
+        # From 15:34Z on 2026-10-28 a crashing lane runner wrote no heartbeat
+        # for 28 hours, and each hourly tick stood down though nothing said
+        # the lanes had no usage.
+        self.usage("claude", True, age=99846)
+        self.usage("codex", True, age=99350)
+        run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        self.assertEqual(1, sum(1 for c in calls if " -m bus lock " in c))
+        last, ok = self.beat()
+        self.assertEqual(("ok", "claude"), (last["outcome"], last["lane"]))
+        self.assertTrue(ok)
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn("fuel unknown for lane claude (usage heartbeat is", log)
+
+    def test_a_missing_heartbeat_reads_as_fuel_unknown(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        _, calls = self.tick()
+        self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+
+    def test_a_rung_with_known_usage_goes_before_one_with_unknown_fuel(self):
+        (self.home / "state" / "usage" / "claude.json").unlink()
+        self.usage("codex", True)
+        _, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
+        self.assertEqual([], self.agent_calls(calls, "claude"))
+        self.assertEqual(1, len(self.agent_calls(calls, "codex")))
+
+    def test_a_heartbeat_that_says_unavailable_still_stands_the_rung_down(self):
+        self.usage("claude", False, "limit: out of credit", age=99846)
+        run, calls = self.tick()
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], calls)
 
     def test_a_limit_failure_moves_the_tick_to_the_next_rung_once(self):
         for lane in ("codex", "spark"):
@@ -438,6 +583,7 @@ class BrainTickTest(unittest.TestCase):
 
     def test_no_rung_with_usage_skips_with_a_reason_and_runs_nothing(self):
         self.usage("claude", False, "limit: out of credit")
+        self.usage("codex", False, "limit: out of quota")
         self.usage("spark", True)
         run, calls = self.tick(LOOM_CODEX_MODEL="gpt-test-high")
         self.assertEqual(0, run.returncode)
@@ -448,7 +594,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertNotIn("started", last)
         self.assertIn("no brain lane has usage", last["reason"])
         self.assertIn("claude: unavailable (limit: out of credit)", last["reason"])
-        self.assertIn("codex: no usage heartbeat", last["reason"])
+        self.assertIn("codex: unavailable (limit: out of quota)", last["reason"])
         self.assertIn("spark: LOOM_SPARK_URL is not set", last["reason"])
         # Not a good tick: the station's brain-stopped check sees it go stale.
         self.assertFalse(ok)
@@ -537,8 +683,10 @@ class BrainTickTest(unittest.TestCase):
         # other LOOM_* variable, keys and SSM names included.
         _, calls = self.spark_tick(LOOM_FOO_TOKEN="foo-secret-value",
                                    LOOM_OPENCODE_GO_KEY_SSM="/example/key",
-                                   LOOM_BRIEF_AUTHORS="example-author")
+                                   LOOM_BRIEF_AUTHORS="example-author",
+                                   LOOM_ASK_ANSWERERS="example-answerer")
         settings = [c for c in calls if c.startswith("opencode setting ")]
+        self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
         self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
@@ -711,6 +859,84 @@ class BrainTickTest(unittest.TestCase):
         claude = [c for c in calls if c.startswith("claude ")][0]
         self.assertIn("--model claude-sonnet-5-5", claude)
         self.assertIn("stop within 15 minutes; you are cut off at 20", claude)
+
+
+
+# 2026-11-01T20:00:00Z, the top of an hour; Muse's slots are :10 and :40.
+HOUR = 1793563200
+MUSE_SLOTS = (10, 40)
+
+
+class BrainSlotTest(unittest.TestCase):
+    """loom#2469: the lane machine's tick never holds the lock over the start
+    of a Muse tick. From 2026-11-01 to 02 its drifting 30-minute ticks held
+    the lock 16 to 29 minutes from 19:52Z, 00:39Z and 02:04Z, over Muse's
+    20:10Z, 00:40Z and 02:10Z starts."""
+
+    _tick_setup = BrainTickTest.setUp
+    usage = BrainTickTest.usage
+    tick = BrainTickTest.tick
+    beat = BrainTickTest.beat
+
+    def setUp(self):
+        self._tick_setup()
+        del self.env["LOOM_BRAIN_YIELD_AT"]
+
+    def lock_minutes(self, calls):
+        locks = [c for c in calls if " -m bus lock " in c]
+        return int(locks[-1].split("--minutes ", 1)[1].split()[0]) if locks else None
+
+    def next_slot(self, second):
+        return min(m * 60 + (3600 if m * 60 <= second else 0) for m in MUSE_SLOTS)
+
+    def test_no_hold_spans_a_muse_tick_start_from_any_start_minute(self):
+        for minute in range(60):
+            for second in (minute * 60, minute * 60 + 59):
+                with self.subTest(start="%02d:%02d" % divmod(second, 60)):
+                    if self.log.exists():
+                        self.log.unlink()
+                    _, calls = self.tick(FAKE_LOCK="1", LOOM_BRAIN_NOW=str(HOUR + second))
+                    held = self.lock_minutes(calls)
+                    if held is None:
+                        # Yielded whole: under 6 minutes to the next slot.
+                        self.assertLess(self.next_slot(second) - second, 8 * 60)
+                        continue
+                    self.assertLessEqual(second + held * 60, self.next_slot(second))
+
+    def test_a_tick_at_25_past_runs_until_2_minutes_before_40(self):
+        _, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR + 25 * 60))
+        self.assertEqual(15, self.lock_minutes(calls))
+        self.assertIn("--tick-minutes 13", [c for c in calls if "step lock" in c][0])
+        claude = [c for c in calls if c.startswith("claude ")][0]
+        self.assertIn("stop within 8 minutes; you are cut off at 13", claude)
+        self.assertIn("tick bounded to 13 minutes", (self.home / "logs" / "brain.log").read_text())
+
+    def test_the_drifted_1952_tick_no_longer_spans_2010(self):
+        # 19:52Z on 2026-11-01 took the lock with a 45-minute expiry.
+        _, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR - 8 * 60))
+        self.assertEqual(18, self.lock_minutes(calls))
+
+    def test_a_start_just_before_a_slot_yields_the_whole_tick(self):
+        run, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR + 39 * 60 + 7))
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], [c for c in calls if " -m bus lock " in c])
+        self.assertIn("tick skipped: another brain's tick starts in 0 minutes",
+                      (self.home / "logs" / "brain.log").read_text())
+        last, ok = self.beat()
+        self.assertEqual("skipped", last["outcome"])
+        self.assertTrue(ok)
+
+    def test_far_from_a_slot_the_tick_keeps_its_full_length(self):
+        _, calls = self.tick(LOOM_BRAIN_YIELD_AT="30", LOOM_BRAIN_NOW=str(HOUR + 31 * 60))
+        self.assertEqual(45, self.lock_minutes(calls))
+        self.assertIn("--tick-minutes 40", [c for c in calls if "step lock" in c][0])
+
+    def test_a_bad_slot_list_never_takes_the_lock(self):
+        for bad in ("60", "ten", "5,35"):
+            with self.subTest(bad=bad):
+                run, calls = self.tick(LOOM_BRAIN_YIELD_AT=bad)
+                self.assertEqual(1, run.returncode)
+                self.assertEqual([], calls)
 
 
 if __name__ == "__main__":

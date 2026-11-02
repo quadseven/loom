@@ -21,6 +21,12 @@ on one. It returns "" when the answer holds on the head, else why not:
   finding's first backticked symbol.
 - A dead-code finding is answered only by a call of its symbol on the head.
 
+The station checks the lane's own text, before it redacts the posted
+reply: redaction removes any 32-character word, a long test name included.
+When the answer holds, the reply carries `held_marker(head)`, and the
+brain's merge gate takes that mark for the same head instead of checking the
+redacted quote again (loom#2285).
+
 The reads go through two callables, so the rules are tested without GitHub:
 `read(path)` returns a file's text on the head or None, and
 `ancestor(sha)` says whether sha is the head or one of its ancestors.
@@ -36,6 +42,10 @@ from urllib.parse import quote
 Read = Callable[[str], Optional[str]]
 Ancestor = Callable[[str], bool]
 
+# The station's mark on a reply whose answer held on that head: the head's
+# first 12 hex digits (a full sha reads as a credential to the redaction).
+HELD_RE = re.compile(r"<!-- loom:answer-held ([0-9a-f]{12}) -->")
+HELD_DIGITS = 12
 FIXED_RE = re.compile(r"^\s*Fixed in `?([0-9a-fA-F]{7,40})`?", re.I)
 # A repo file path: a known source or text extension (so `mod.NAME` reads as
 # a symbol, not a file), optional :line or :start-end.
@@ -136,6 +146,17 @@ def _cited(answer: str, thread_path: str) -> List[Tuple[str, int, int]]:
     return cited
 
 
+def citations(answer: str, thread_path: str = "") -> List[str]:
+    """What the answer cites for the head to show, as a refusal comment names
+    it: each file (with its line or lines) and each backticked symbol."""
+    out = []
+    for path, start, end in _cited((answer or "").strip(), thread_path):
+        out.append(path if not start else "%s:%d" % (path, start) if start == end
+                   else "%s:%d-%d" % (path, start, end))
+    out += ["`%s`" % s for s in _symbols(answer)]
+    return list(dict.fromkeys(out))
+
+
 def _files_refusal(cited: List[Tuple[str, int, int]], head: _Head) -> str:
     for path, start, end in cited:
         text = head.text(path)
@@ -228,10 +249,25 @@ def _call_refusal(subject: str, target: str, head: _Head, where: List[str]) -> s
     return "`%s` is not defined in %s on the head" % (target, ", ".join(where) or "any cited file")
 
 
+def held_marker(head: str) -> str:
+    """The mark the station puts on a reply whose answer held on `head`."""
+    return "<!-- loom:answer-held %s -->" % head[:HELD_DIGITS].lower()
+
+
+def marked_held(reply: str, head: str) -> bool:
+    """Whether the reply carries the station's held mark for this head, on a
+    line of its own: the lane's words are all quoted ("> "), so a mark the
+    lane wrote is never the station's."""
+    if len(head) < HELD_DIGITS:
+        return False
+    return held_marker(head) in [line.strip() for line in (reply or "").split("\n")[1:]
+                                 if not line.startswith(">")]
+
+
 def quoted(reply: str) -> str:
     """The lane's own words from the station's reply: the quoted lines after
-    its first line, with the quote marks taken off."""
-    lines = (reply or "").split("\n")[1:]
+    its first line, with the quote marks and the held mark taken off."""
+    lines = HELD_RE.sub("", reply or "").split("\n")[1:]
     return "\n".join(x[1:].lstrip() if x.startswith(">") else x for x in lines).strip()
 
 
@@ -298,3 +334,12 @@ def check_on_head(gh: Any, repo: str, head: str, answer: str, thread_path: str =
     read, ancestor = head_reader(gh, repo, head)
     return refusal(answer, read, ancestor, thread_path, finding)
 
+
+def reply_refusal(gh: Any, repo: str, head: str, reply: str, thread_path: str = "",
+                  finding: str = "") -> str:
+    """For a posted station reply: "" when the station marked its answer held
+    on this head (it checked the lane's unredacted text), else check_on_head
+    on the quoted words."""
+    if marked_held(reply, head):
+        return ""
+    return check_on_head(gh, repo, head, quoted(reply), thread_path, finding)

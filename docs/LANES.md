@@ -35,6 +35,14 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing to a private repository, the lane runner runs the same scanner
+with `--personal-data`, which refuses only real mail and street addresses. The
+household values are deny-list terms, and no marker waives them. The scanner's
+`--diff` reads each commit's patch and message too, since a value added and then
+removed passes a net diff and still goes up in history. The pull
+request body on a private repo is scanned before the push. Repaired PR text,
+review replies and ticket answers pass the personal data scan before they post.
+
 Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
@@ -86,6 +94,16 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+After the repo check passes, the runner also checks each changed Python test
+against the exact base commit's code in the check sandbox. It copies each
+changed test file into a temporary base tree, then runs each changed test by
+name: a `unittest.TestCase` method through unittest, a module-level
+`test_*` function through pytest when the tree has it, else by calling it.
+A test that passes on base, one that times out, or a module-level test that
+takes fixtures with no pytest to run it, blocks validation and names the
+test for the lane to fix. The archive and test run have bounded
+timeouts, and paths are validated before any file is written.
+
 The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
@@ -105,6 +123,12 @@ unset variables.
   check is recorded but does not stop the run (a ticket may exist to fix
   it). What setup leaves untracked goes into `.git/info/exclude`, so it is
   never committed.
+- On a host, a base check verdict is reused by repo, base revision, check
+  command and interpreter identity. Green verdicts last 24 hours; red
+  verdicts last five minutes and still follow the base-check incident path.
+  Setup still runs for each brief, and the final check on the agent's commit
+  is never cached. Verdicts live under the host's `state/base-verdicts/`;
+  each write sweeps the ones older than a day.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
@@ -219,7 +243,15 @@ comment) carry `live-cluster check could not run: <reason>`.
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
-`lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
+`lanes/mac/brain.sh` at `LOOM_BRAIN_AT` minutes past each hour (default
+`25 55`), or every `LOOM_BRAIN_INTERVAL` seconds (default 1800) with
+`LOOM_BRAIN_AT` empty. Those starts sit between Muse's :10 and :40 ticks, and
+the tick's lock expires by the next minute in `LOOM_BRAIN_YIELD_AT` (default
+`10 40`, Muse's starts; empty for no bound), with its agent cut off 2 minutes
+before that, so no lane machine hold spans a Muse tick's start (loom#2469).
+A tick with under 6 minutes left before that start skips. The bounded length
+goes on the tick record (`bus.brain step lock --tick-minutes`), so the tick
+clock and its budget read it. A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
 `$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
@@ -229,8 +261,9 @@ failure. It logs to
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
 rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
-0002): both brains take every stage under the one lock, and the defer and
-done markers keep them from repeating each other's work.
+0002): every brain that takes a tick takes every stage under the one lock
+(docs/BRAIN.md, Shared brain duty), and the defer and done markers keep them
+from repeating each other's work.
 Its prompt tells the brain to brief only under an open epic
 (`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
 epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
@@ -271,7 +304,9 @@ there runs or steers the next tick.
 Each tick writes `$LOOM_HOME/state/brain.json` (how it ended, and the
 holder, lane and model that ran) and touches
 `$LOOM_HOME/state/brain-ok` when it ended well, a skip for a held lock
-included. When no rung has usage, the tick takes no lock and runs no CLI: it
+included. A rung with no heartbeat, or an old one, has unknown fuel: it runs
+after the rungs with known usage, and its log line says so. When every rung
+says it has no usage or cannot run, the tick takes no lock and runs no CLI: it
 records `skipped` with each rung's reason and leaves `brain-ok` alone, so
 the brain-stopped check below reports it with that reason. The station adds a `brain` row to the lane status. The brain also
 runs on Muse, so the station reads GitHub too: while no local tick has ended
@@ -282,6 +317,16 @@ local tick or a journal is at most 2 hours old. Only when both are older does
 the station send one urgent Discord message, naming the newest journal's time
 and goal, then one more when the brain is back. A GitHub read error never
 counts as stale; that pass makes no decision.
+
+A live brain hides a stopped one in that check, since any fresh journal
+counts. `LOOM_BRAIN_BACKUP_HOLDERS` (holder names, as a journal's
+`Tick <time>, <holder>` line gives them, such as `lane-machine`; empty is off)
+judges each named holder on its own journal ticks from the same read: when a
+holder's newest tick is over 2 hours old, or it has none in the last day, the
+station sends one urgent Discord message naming it, then one more when it
+ticks again. Each holder keeps its own alert state in
+`state/station/brain-holders-alert.json`, apart from the brain-stopped alert
+above (loom#2141).
 
 ## The station
 
@@ -408,6 +453,10 @@ A new App is easiest made from
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
+A free lane takes work: not at a limit, its heartbeat says available, and not
+down or demoted (bus/scorecard.py). The same test picks every tier move,
+stall move and automatic retry, so no ticket is given a lane only to step
+straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
@@ -456,7 +505,8 @@ operator is brought up to date with its base while it waits, and still never
 merges on the factory's say-so. Failed tickets and briefed tickets no lane
 claimed for 2 hours climb too. After a push the factory waits for the review
 to run on the new head before judging it. A `<!-- loom:rung 0 -->` comment
-starts a ticket's ladder again. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
+starts a ticket's ladder again and ends any fix round posted before it, so
+the restart runs as a normal attempt on a fresh branch. The ladder (claude `claude-sonnet-5-5`, then codex `gpt-6-luna`, then
 `claude-opus-5-5`), each
 climb recorded as a `<!-- loom:rung N -->` comment.
 A climb takes the lowest rung the ticket has not run on since its ladder
@@ -489,10 +539,18 @@ file, or the answer cites files and lines
 the head has and, when it names backticked symbols, at least one of them is
 there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing
-checkable stays open. Any other answered thread stays open, and the factory
+checkable stays open. The check reads the lane's own text before
+redaction, which drops any 32-character word such as a long test name; a
+reply whose answer held carries a `loom:answer-held` mark for that head
+(loom#2285). Any other answered thread stays open, and the factory
 reads it as a finding that survived. The brain's merge re-checks every bot
-thread resolved on a lane answer the same way, and reopens it and refuses
-the merge when the answer does not hold.
+thread resolved on a lane answer the same way (a held mark for the same
+head stands for the check), and reopens it and refuses the merge when the
+answer does not hold. The refusal posts one comment on
+the pull request per thread and head, marked
+`<!-- loom:rebuttal-refused v1 thread=<id> head=<sha> -->`, that quotes the
+answer, lists what it cites and says what the head showed; the refusal the
+journal prints carries the same reason, thread and head (loom#2179).
 An answered thread that survives and leaves its ticket with no lane up for
 its next rung does not wait with nothing to move it: the factory asks the
 review bot to judge the answer instead, commenting `/grug improve` on the
@@ -536,9 +594,11 @@ ticket climbs, and past the last rung it is left `loom:failed` for the brain. It
 open lane pull request is closed then, or on any later pass, as is one whose
 open ticket was rewritten as a newer ticket, each with one comment naming the
 ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
-keeps the default branch green: a ready pull request that is behind its base
-is brought up to date first (GitHub's update-branch) and lands only after its
-checks and review pass again on the new head; each repo lands at most one a
+keeps the default branch green: a ready pull request behind its base lands as
+it stands when GitHub reports it mergeable and no rule on the base requires
+up-to-date branches; any other is brought up to date first (GitHub's
+update-branch) and lands only after its checks and review pass again on the
+new head; each repo lands at most one a
 pass, `loom:urgent` and `loom:regression` tickets first, then by their
 ticket's `Priority:`, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
@@ -675,6 +735,14 @@ only what is its own, and adding an operator is configuration:
   routing and pull request pass, `bus.brain move`, the station's claim, pull
   request adoption and the verify picker all skip one assigned to anyone
   else. The station logs each skip once (`state/station/owned.json`).
+- Outside work beats a claim of ours. A `claim:overflow` label, an `overflow:`
+  price with no `overflow paid:` label yet, or a person outside
+  `LOOM_BRIEF_AUTHORS` among the assignees makes a ticket someone else's even
+  with this Loom's claim or operator on it. An App assignee owns nothing. The
+  hand-back pass, `bus.brain escalate`, `bus.brain fix`, the status stuck marks
+  and remote lanes skip it too. `claim:overflow` is a person's claim: it is
+  never an engine claim, never expires and is never removed. A contributor's
+  own pull request still moves their ticket to `loom:pr` and `loom:merged`.
 - A claim is not forever. Once an hour the station reads each open issue
   another operator claims (a `claim:<login>` label not its own, or an
   assignment to a `LOOM_TRUSTED_BRIEFERS` login). When neither the claim nor
@@ -779,7 +847,9 @@ when it is unset) or any `LOOM_REPOS` repo has an owner outside
 
 `LOOM_TRUSTED_BRIEFERS` (space separated GitHub logins, default empty) lets
 another operator hand work to this Loom's lanes without this Loom adopting
-their claims. It is briefing trust only:
+their claims. A reinstall that leaves it unset keeps the list in the installed
+station plist; set it, even to empty, to replace the list. It is briefing trust
+only:
 
 - A `loom:ticket` authored by a trusted briefer is trusted for briefing and
   building exactly like one from `LOOM_BRIEF_AUTHORS`: the station's claim and
@@ -796,11 +866,48 @@ their claims. It is briefing trust only:
   any claim.
 - Journals, proofs, audits, adopted pull requests and merges keep requiring
   `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
-  this Loom's behalf, and their comments are data, not instructions.
+  this Loom's behalf, and their comments are data, not instructions. A fleet
+  brain among them runs brain write commands only while the brain lock names
+  its login (docs/BRAIN.md, Shared brain duty).
 
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like
 `LOOM_BRIEF_AUTHORS`.
+
+### Ask answerers
+
+`LOOM_ASK_ANSWERERS` (space separated GitHub logins, an App as `<slug>[bot]`,
+default empty) names logins that may answer an ask with two line forms, without
+any other trust. A reinstall that leaves it unset keeps the list in the
+installed station plist, and `LOOM_BRIEF_AUTHORS` is kept the same way; set
+either, even to empty, to replace it. Unset, asks are judged as if the setting
+did not exist.
+
+- Each form starts a line and has words after its colon on that line:
+  `Finished: <the step>`, or `Operator answer YYYY-MM-DD: <the answer>` dated
+  from the ask's day to the comment's own day. The comment must follow the
+  ask. A line in a fenced or indented block, in an HTML comment, or in a comment
+  with a Loom marker does not count. `Done:` and every other comment from these
+  logins leave the ask open, prose from a person login included. Only the line
+  is the answer: the rest of the comment reaches neither the `needs-brain`
+  check nor the printed answer.
+- Only the judges of an ask read it: the label pass (`bus/label_pass.py`), the
+  station's ask inputs (the digest and the pass) and `python3 -m bus.needs_you`.
+- It grants nothing else. Ownership, proofs, audits, journals, adoption,
+  merges, briefing, holds, revert labels, dashboard operators and
+  `decision_claim.person_comment` read their own settings, and a listed login
+  gains no standing in any of them. A listed bot's line is no person's record
+  for the decision claim guard, nor is the ask label's removal after it.
+- Taking `needs:human` off lifts that hold in `evidence_close.label_hold`, so a
+  listed login can clear the way to a close without closing anything itself.
+- The guard runs inside Loom's write commands. `close`, `reply`, `bus journal`
+  and the rest still refuse the dated line with no person's record, but a
+  listed login that posts with its own GitHub client passes no guard. List only
+  a login whose writer records what the operator said and nothing else.
+
+The installer writes the setting into the station plist and the brain plist,
+and the brain passes it to a sandboxed rung. Muse sets the same value
+(docs/MUSE.md).
 
 ### Verify runs
 
@@ -854,7 +961,13 @@ the ticket's Live criterion and judges each criterion against those two
 sections, then
 writes `verify.json`: a proof record (`bus/proof.py`),
 `{"missing": "<the evidence that does not exist yet>"}` or, for a ticket sent
-ahead of a build, the `unmet` answer described below. The runner copies it
+ahead of a build, the `unmet` answer described below. For a prose Live box in
+an opted-in repo with a live-evidence adapter, the brief lists its log sources
+and SQL route. The lane may suggest one `adapter_step` with the exact criterion,
+`log:<source>` or `sql:<SELECT ...>`, and the strings the station must find.
+The station runs that step through the adapter itself; the lane's statement
+that it passed is never proof. The station asks a person once when the lane
+returns no step or the station read fails. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, refuses it when it passes a live or operator criterion the
@@ -1217,7 +1330,7 @@ Each invariant is one function returning breaches with evidence:
   `Epic cap: N until DATE` exception), and a closed epic that still holds
   open tickets. These replaced the goal home sub-issue count check.
 - An open lane pull request whose plan check failed more than 30 minutes ago.
-- An open lane pull request nothing drives for over 6 hours (the time a lane
+- An open lane pull request nothing drives for over 24 hours (the time a lane
   has to open one): no open `loom:ticket` carries it, its ticket is past the
   last rung of the model ladder (`loom:failed`), its ticket is marked
   `needs-brain`, or it holds unresolved review threads from the review bot
@@ -1230,12 +1343,17 @@ Each invariant is one function returning breaches with evidence:
 - Goal homes whose body names a roll (the word `roll` or `rolls`) that no
   `LOOM_ROLL_SHIP_DOCS` entry names (`roll-pin-off`, one rolling issue for
   every such goal): the station opens no source-pin pull request when their
-  module changes merge (README.md, Roll source pins). The issue says when
+  module changes merge (docs/ROLL_PINS.md). The issue says when
   the setting is empty, which turns the pass off.
 - Tickets still at `loom:merged` 24 hours after a ship rule found their merge
   commit deployed, because the move to `loom:shipped` failed
   (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
   Shipping through a downstream roll).
+- The newest Loom review journal is over 7 days old (`review-overdue`), a
+  guard ticket closed with no merged pull request that changes a test
+  (`guard-no-check`), or a guard ticket unreadable after 5 tries
+  (`guard-unreadable`), one rolling issue each (docs/BRAIN.md, Review and guard
+  debt).
 
 The failing-streak, lane-held and silent-lane invariants are one rolling
 issue each, a line per lane, rewritten in place while the list changes, as
@@ -1251,7 +1369,55 @@ hold that comes and goes never closes and reopens an issue (each reopen mailed
 the people watching it). The lanes it listed move into a "Hold log" in the body
 (a line per hold, newest first, the last 20).
 
-Each breach files one issue labelled `loom:triage` and `loom:invariant` under
+Four kinds file no issue per violation at all (loom#2099): `lane-pr-stalled`,
+`plan-check-failed`, `epic-over-cap` and `epic-title-shared`
+(`invariants.ROLLED`). Each restates state the pull request, the epic or
+`python3 -m bus.brain status` already shows, and filing one ticket per
+violation was most of 185 invariant issues in 7 days (109 stalled lane pull
+requests, 36 over-cap epics, 13 failed plan checks), every one closing itself
+later. Instead each kind has one tracking
+issue per subject repo, titled `Invariant: <kind> in <repo>` (a private repo
+named in words with a short hash), labelled `loom:invariant` only (not
+`loom:triage`, so the rewriter never turns the list into a ticket and freezes
+it). Its body lists every current violation, a line each with its link and
+when it started (`since <time>`: a lane pull request's open time, a plan
+check's completion, else when the station first saw it, kept in
+`invariants.json` under `seen`), and a "Last checked" line. The station
+rewrites the body only when the list changes: an unchanged list, or only a
+newer check time, writes nothing. When a kind's list empties, the next pass
+rewrites it to "Current violations: none." with a "Clear since" time; once it
+has said none for 6 hours (`CLEAR_AFTER`) the issue closes as not planned
+with one cleared note, which a later clear edits in place rather than posting
+again; a violation that returns reopens that same issue (the one "Broken
+again" note, edited in place), so the kind keeps one stable issue number. A
+pass that could not read a kind's facts (the lane pull requests, the plan
+checks, the goal shapes) leaves its tracking issue as it is, and so does a
+pass that could not read one repo's open pull requests for that repo's
+lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
+open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+When a trusted lane pull request has been open past the six-hour limit, its
+ticket is still at `loom:pr`, and trusted review threads remain without a
+pending fix round, the station queues `bus.brain fix` on the ticket and returns
+it to its lane. Tickets awaiting brain review or past the model ladder remain
+on their existing path.
+The per-violation issues these kinds filed before this close into the
+tracking issue of their kind and their own subject repo as the station meets
+them: closed as not planned with a comment saying why, and a running count in
+one comment on the tracking issue, edited in place. The subject comes from
+the station's map, else the `subject=` of the issue's marker, else a reference
+in its text, and only one that hashes back to the key counts. The marker names
+a subject only where the breach's public text already does, so a private repo
+never reaches it. One whose repo cannot be told (a private repo the title
+names in words) closes with a note naming no tracking issue, and one with a
+known repo and no open tracking issue waits out `CLEAR_AFTER` first. At most
+`FOLD_MAX` (2) old issues close a pass, each logged, so the migration cannot
+spend the GitHub budget.
+One rewritten into a `loom:ticket` is work the factory carries and is never
+folded, nor is one asking an operator (`needs:<login>`); every other kind,
+`lane-no-success` with its per-lane keys for the dead-lane release included,
+files as below.
+
+Each other breach files one issue labelled `loom:triage` and `loom:invariant` under
 the standing repairs epic (docs/BRAIN.md, Filing under an epic; the goal home
 itself when that epic cannot be read) of the invariant goal home
 (`LOOM_INVARIANT_GOAL`; empty means
@@ -1270,11 +1436,14 @@ ticket gets one separate invariant issue that refs the ticket (loom#1223
 flipped 18 times in a day before this). Issues and pull requests in a private repo are named in words, and
 failure reasons have repos, paths and credentials replaced. One pass files
 or reopens at most 5, and below the GitHub budget floor files nothing.
-A `lane-pr-stalled` or `epic-over-cap` issue whose subject settled for good
+A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
+loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
-(not a `loom:ticket`), with one note naming how; these closes come before
-the other clears and read no comments (loom#2022). Other cleared issues
+(not a `loom:ticket`), with one comment naming how; these closes
+come before the other clears, read no comments (loom#2022), and walk the
+issue listing rather than the local map, so one filed before the map or gone
+while the station was down settles too (loom#2257). Other cleared issues
 close once the breach has been gone 6 hours.
 `python3 -m bus.brain status` lists the open ones under "Invariants broken"
 for the brain's report, and the station's own standup on that goal home
@@ -1338,8 +1507,12 @@ cannot query the viewer or any other local service.
 - `copilot` reads its token from `LOOM_COPILOT_KEY_SSM` and exports it only as
   `COPILOT_GITHUB_TOKEN`. It invokes one `copilot -p` prompt with
   `--allow-all-tools`; the run output, including any CLI usage details, is
-  retained in the lane log. Monthly usage-limit messages hold the lane until
-  the next UTC month begins.
+  retained in the lane log. Monthly usage-limit messages, and the Free plan's
+  "exceeded your ... allowance" and "you have no quota" answers, hold the lane
+  instead of failing the ticket until the next UTC month begins. Those two
+  answers count only on this lane and only in the last lines of its run. `lanes/mac/install.sh` installs it with
+  the default lanes; set `LOOM_COPILOT_KEY_SSM` when installing, or the lane
+  reports itself unavailable.
 - Model choice on the priced Anthropic routes follows
   docs/USAGE_ROUTING.md ("October 2026 price changes"): high-volume
   subtasks pin `claude-haiku-5-5`; cache-heavy work stays on
@@ -1379,7 +1552,45 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
-- The opencode-go slots run only the models on `bus/tickets.py`
+- Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
+  reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
+  drops what is deprecated or paused, probes each candidate, and takes the first
+  that answers: Go's free models, then Zen's on a public repo, then a paid Go
+  model. A slot's `LOOM_<SLOT>_MODEL` and a brief's `Model:` line do not bind
+  it. `LOOM_MODEL_PICK=off` or a `LOOM_<SLOT>_MODELS` ladder restores the pin.
+- A model that fails is paused for every slot in
+  `state/usage/model-pause.json`: a 429 until its `Retry-After`, a model the
+  provider or CLI no longer serves for a day. `GoUsageLimitError` pauses every
+  paid Go model and `FreeUsageLimitError` every Zen model, because each is one
+  shared limit. With nothing to keep, the brief stays in the inbox and the next
+  pass picks another model, at most 3 times. A slot with every model paused
+  reports unavailable until the first reset.
+- Paid Go runs serve build work only, never a verify, answer or review run. A
+  medium or hard ticket starts on `GO_STRONG` (GPT 6 Luna, then Claude Haiku
+  5.5), then free models without Beam Free, which takes easy tickets only. An
+  easy ticket runs free models, then MiMo-V2.6-Flash and, on public repos,
+  Muse Spark 1.3 Contributor. A ticket with no model left goes back as a limit,
+  never as a failure.
+- The plan guard reads `https://opencode.ai/zen/go/v1/usage` before a paid
+  run; the figures count every caller of the key. Paid runs stop at 60% rolling,
+  80% weekly and 90% monthly, and the weekly and monthly figures must stay under
+  that stop times the part of the window gone, plus 5 points. Usage that cannot
+  be read stops paid runs and free models carry on. One model may spend 50% of
+  its own published limit in any window, counted in
+  `state/usage/go-budget.jsonl`.
+- A failed review on a Go or Zen slot demotes the model
+  (`model:<id>` in the scorecard), not the slots: the picker skips it and the
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
+  proof audits and records with no model still demote the lane. Each brief for
+  these slots carries a `Demoted-Models:` line, so a runner without the
+  scorecard file skips them too. An unreadable scorecard, or neither source,
+  stops paid models and free models carry on.
+  Each run holds up to 500 requests until it settles; output and hidden reasoning
+  past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
+  because of its hidden reasoning. Extra usage stays off.
+- Each run logs `model pick:` and `model report:` lines: the model, why it
+  came to that model, the exit status and whether anything was edited.
+- With the pick off, the opencode-go slots run only the models on `bus/tickets.py`
   `OPENCODE_GO_MODELS`: Go's free models and the paid ones allowed at least
   10,000 requests per 5 hours (Beam Free; MiMo-V2.6-Flash, DeepSeek V4.1
   Flash, Muse Spark 1.3 Contributor). A slot whose model, or any model of its
@@ -1598,10 +1809,11 @@ again after an hour.
 
 ## free provider slots on the spark-gateway
 
-Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The five free slots use
+Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use
 separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
-`free-gemma` uses `/free/gemini/v1`, and `free-nvidia`, `free-kilo` and
-`free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
+`free-gemma` uses `/free/gemini/v1`, `free-openrouter`
+`/free-public/openrouter/v1` (a cluster runner slot only), and `free-nvidia`,
+`free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
 holds only that slot for 15 minutes as a limit, so the station can assign the
@@ -1853,6 +2065,18 @@ which that runner could never clear: the station retries the ticket on
 another lane as a transient ending, and that lane holds it if the base is
 red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
+Each base check row in the validation record names what failed in its
+`detail`: the tests the check reported, a tool the shell could not find
+(`missing make`), else the check's last line. The record travels in the
+sealed report. After two such failures of one repo at one revision on a slot
+the station stops giving that slot the repo: it parks each brief `[transient]`
+without a dispatch, until the repo's head moves or a run reports a new runner
+image (a fingerprint of the image's packages and tools, `<ticket>.image`). One
+run records two failures, because a red check runs twice. A failed `setup:`
+counts too. A check that passed on its second run counts for nothing, and only
+a fix round's default-branch rows count. A day with no report from the slot
+lets one run through, because only a run can show a new image.
+
 The job, step by step (`lanes/k8s/lane_job.py`):
 
 1. Reads the dispatch inputs (slot, ticket key, brief, run id, the slot's
@@ -1868,10 +2092,13 @@ The job, step by step (`lanes/k8s/lane_job.py`):
    that step only, and nothing printed names a parameter or a value.
 4. Runs `lanes/run_lane.sh <slot>` once, with no Actions token and no AWS
    session in its environment. Its output goes into the report, not the log.
+   The step fails when no agent started (`run_lane.sh` writes
+   `<ticket>.agent-ran` first), with only the failure class in the public
+   log, so a green run means an agent ran. The report steps run either way.
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
-   line, the `.answered` and `.verify` files, the transcripts, answers and
-   the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   line, the validation record, the `.image` fingerprint, the `.answered`
+   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both
@@ -1957,6 +2184,11 @@ skips both. The real controls are:
   any outside collaborator's pull request (managed in the private
   infrastructure code).
 
+`bus/runners.py` TRACKED_SLOTS names slots that run here wherever any runner
+slot does, with the settings the station's plist lacks. They deploy by merge,
+beside the Mac lane they will replace, because a plist changes only through a
+reinstall that replaces every lane. docs/LANE_RUNNERS_PLAN.md holds the plan.
+
 To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
 `opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes
 that slot's launchd runner and gives the station the slot's settings
@@ -2004,9 +2236,20 @@ class, one line per behavior change, and the counts of files by class:
 ```
 ## Intent
 Class: logic
+Risk: app-code, two-way door, blast radius repo
 - Fix the thing for every user
 Files: 1 logic, 1 tests
 ```
+
+The Risk line (`bus/risk_line.py`) lets review sort by risk from the pull
+request page. The tier is `bus/merge_tier.py`'s, also set as a `tier:<name>`
+label, and only reports: tiers keep deciding what Loom may merge. The lane
+writes the door and blast radius in a `## Risk` section of `.loom/summary.md`
+(`Door: two-way`, `Blast radius: repo`). The runner forces one-way when the
+diff touches a migration, deletes a tracked data file, or the pull request
+lists an operator step. A lane that says nothing reads `door unstated`, never
+two-way. The line and label are set when the pull request opens; a later push
+does not change them.
 
 The behavior lines come from the lane's final summary: the agent writes
 one line per behavior change to `.loom/summary.md` at the top of its
