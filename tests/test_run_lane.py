@@ -288,6 +288,13 @@ if [ "${FAKE_AGENT:-commit}" = terminal-limit ]; then
   echo "AI_RetryError: retries exhausted"
   sleep 300
 fi
+if [ "${FAKE_AGENT:-commit}" = bare-429-then-retry-error ]; then
+  echo "upstream returned 429, retrying in 1s"
+  echo "AI_RetryError: connection reset by peer"
+  sleep 3
+  echo "fixed" > fix.txt
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = retryable-429 ]; then
   echo "429: rate limit exceeded"
   echo "fixed" > fix.txt
@@ -2278,6 +2285,34 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
         beat = self.beat("codex")
         self.assertTrue(beat["available"])
+
+    def test_a_bare_429_then_an_unrelated_retry_error_neither_stops_the_agent_nor_holds_the_provider(self):
+        # loom#2401: a retryable 429 armed the kill, so a later AI_RetryError
+        # from a different fault was read as a limit.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="bare-429-then-retry-error")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+        self.assertTrue(self.beat("codex")["available"])
+        self.assertFalse((self.loom / "run" / "codex.lock" / "watchdog-limit").exists())
+
+    def watchdog_tails(self):
+        """Pids of tail readers on this test's lane logs."""
+        ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        logs = str(self.loom / "logs")
+        rows = [line.strip().split(None, 1) for line in ps.splitlines() if line.strip()]
+        return [int(row[0]) for row in rows
+                if len(row) == 2 and row[1].startswith("tail ") and logs in row[1]]
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_no_watchdog_tail_outlives_the_agent(self):
+        # loom#2401: the watchdog's tail -f reader was never stopped by the
+        # watchdog itself, so one could be left per run.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="terminal-limit", timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        time.sleep(0.5)
+        self.assertEqual(self.watchdog_tails(), [])
 
     def test_a_full_free_pool_is_a_short_limit_not_the_agents_failure(self):
         # The shared free pool answered "has no lane available" 18 times; the
@@ -6446,7 +6481,59 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(left.exists())
 
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_a_watchdog_orphaned_by_a_killed_runner_is_stopped_by_the_next_pass(self):
+        # loom#2401: only the agent's group was recorded in the lock, so the
+        # watchdog and its tail -f reader outlived a killed runner.
+        self.drop_brief()
+        agent_pid = Path(self._tmp.name) / "agent.pid"
+        second = Path(self._tmp.name) / "second-run"
+        self.write_tool(self.bin / "real-codex", FAKE_AGENT)
+        self.write_tool(self.bin / "codex",
+                        "#!/bin/bash\n"
+                        f"if [ -e '{second}' ]; then exec \"{self.bin / 'real-codex'}\" \"$@\"; fi\n"
+                        f"echo $$ > '{agent_pid}'\n"
+                        "exec sleep 30\n")
+        lock = self.loom / "run" / "codex.lock"
+        runner = subprocess.Popen(["bash", str(RUNNER), "codex"], env=self.lane_env(),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        left = []
+        try:
+            for _ in range(100):
+                if agent_pid.exists() and agent_pid.read_text().strip() and self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            watchdog_group = int((lock / "watchdog_pgid").read_text())
+            os.killpg(runner.pid, signal.SIGKILL)
+            runner.wait(timeout=5)
+            time.sleep(0.3)
+            left = self.watchdog_tails()
+            self.assertNotEqual(left, [])  # the reader outlived its runner
+            os.killpg(watchdog_group, 0)
+            second.write_text("")
+            result = self.run_lane()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for _ in range(30):
+                if not self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(self.watchdog_tails(), [])
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(watchdog_group, 0)
+            self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+        finally:
+            orphans = list(left)
+            if agent_pid.exists() and agent_pid.read_text().strip():
+                orphans.append(int(agent_pid.read_text()))
+            for pid in orphans:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
+        # A lock written before watchdog_pgid existed still recovers.
         self.drop_brief()
         lock = self.loom / "run" / "codex.lock"
         lock.mkdir(parents=True)
