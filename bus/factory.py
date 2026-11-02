@@ -3082,9 +3082,9 @@ class Factory:
             self._send_back(repo, full, issue, comments,
                             "code changed without a test", no_test=True)
         elif sensitive:
-            # The brain merges it, and its merge gate refuses a pull request
-            # behind its base, so keep it current while it waits (2026-10-27:
-            # green sensitive pull requests sat 4 to 66 commits behind).
+            # The brain merges it, and a strict base refuses a pull request
+            # behind it, so keep it current while it waits (2026-10-27: green
+            # sensitive pull requests sat 4 to 66 commits behind).
             self._keep_current(repo, number, full)
         elif (self._operator_holds(repo, number, full, issue, comments)
               or self._risk_holds(repo, number, full, issue, comments)):
@@ -3718,8 +3718,8 @@ class Factory:
               issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
         """Merge a ready pull request, one a repo a pass. One behind its base
         merges as it stands when _may_land_behind says so; any other behind
-        one is brought up to date instead. A pull request that cannot be
-        brought up to date cleanly goes back for a fix round, as a conflict
+        one, or one whose merge is refused, is brought up to date instead.
+        A pull request that cannot be brought up to date cleanly goes back for a fix round, as a conflict
         does. The one brought up to date takes the repo's landing lock; while
         another holds it, this does neither."""
         if repo in self.landed:
@@ -3727,7 +3727,8 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             return  # another pull request holds the repo's landing lock
-        if self._behind(repo, full) and not self._may_land_behind(repo, full):
+        behind = bool(self._behind(repo, full))
+        if behind and not self._may_land_behind(repo, full):
             if repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
@@ -3737,28 +3738,62 @@ class Factory:
             self.landed.add(repo)
             if held == number:
                 self._unlock(repo, number)
+        elif behind and repo not in self.updated:
+            # GitHub knows a rule the reads did not show; update as for a strict base.
+            self._update_to_land(repo, number, full, issue, comments, held)
 
     def _may_land_behind(self, repo: str, full: Dict[str, Any]) -> bool:
-        """The merge gate's rule for a behind pull request (claude-stuff
-        scripts/pr-merge-gated.sh, loom#2482): it merges when GitHub says it
-        merges cleanly and no rule on the base requires up-to-date branches.
-        A check rule that does not state its policy, or rules that cannot be
-        read, count as requiring it."""
-        if full.get("mergeable") is not True:
-            return False
-        base = str((full.get("base") or {}).get("ref") or "")
+        """The fleet merge gate's rule for a behind pull request (loom#2482):
+        it merges when GitHub says it merges cleanly and nothing on the base
+        requires up-to-date branches."""
+        return full.get("mergeable") is True and not self._base_is_strict(
+            repo, str((full.get("base") or {}).get("ref") or ""))
+
+    def _base_is_strict(self, repo: str, base: str) -> bool:
+        """Whether a ruleset or classic protection on the base requires
+        up-to-date branches. A check rule that does not state its policy, or
+        either answer that cannot be read or is not the shape GitHub
+        documents, counts as requiring it."""
+        branch = quote(base, safe="")
         try:
-            rules = self.gh.paginate("/repos/%s/rules/branches/%s"
-                                     % (repo, quote(base, safe="")))
+            return (self._rules_are_strict(repo, branch)
+                    or self._classic_is_strict(repo, branch))
         except GitHubError as err:
-            _say("could not read the rules on %s %s, so it counts as strict: %s"
+            _say("could not read the protection on %s %s, so it counts as strict: %s"
                  % (repo, base, err))
-            return False
-        return not any(
-            rule.get("type") == "required_status_checks"
-            and (rule.get("parameters") or {}).get("strict_required_status_checks_policy")
-            is not False
+            return True
+
+    def _rules_are_strict(self, repo: str, branch: str) -> bool:
+        rules = self.gh.rest("GET", "/repos/%s/rules/branches/%s?per_page=100"
+                             % (repo, branch)).data
+        # A full page may hide a strict rule on the next one.
+        if not isinstance(rules, list) or len(rules) >= 100:
+            return True
+        return any(
+            not isinstance(rule, dict)
+            or (rule.get("type") == "required_status_checks"
+                and (rule.get("parameters") or {}).get("strict_required_status_checks_policy")
+                is not False)
             for rule in rules)
+
+    def _classic_is_strict(self, repo: str, branch: str) -> bool:
+        """Classic protection is off the rules endpoint. Its detail needs
+        administration read, which an App may lack, so the branch's summary,
+        readable with metadata alone, says first whether there is any."""
+        summary = self.gh.rest("GET", "/repos/%s/branches/%s" % (repo, branch)).data
+        if not isinstance(summary, dict) or not isinstance(summary.get("protection"), dict):
+            return True
+        if summary["protection"].get("enabled") is False:
+            return False
+        found = self.gh.rest("GET", "/repos/%s/branches/%s/protection" % (repo, branch),
+                             ok=(404,))
+        if found.status == 404:
+            return False
+        if not isinstance(found.data, dict):
+            return True
+        checks = found.data.get("required_status_checks")
+        return checks is not None and (not isinstance(checks, dict)
+                                       or checks.get("strict") is not False)
 
     def _update_to_land(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: List[Dict[str, Any]],

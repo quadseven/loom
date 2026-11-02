@@ -1672,6 +1672,20 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(fake.calls[5][2], {"merge_method": "squash", "sha": "checked"})
         self.assertTrue(result["merged"])
 
+    def test_merge_takes_a_behind_pull_request_github_says_merges_cleanly(self):
+        # The factory's behind landing (loom#2482) depends on this: merge has
+        # no behind rule of its own, and GitHub refuses a strict base itself.
+        pr, query = self._merge_replies({"pr": {"mergeable_state": "behind"},
+                                         "details": {"mergeStateStatus": "BEHIND"}})
+        issue = {"state": "open", "body": "Part of #1\n",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, self.CPP_GOAL),
+                    reply(200, [{"filename": "src/change.cpp"}, {"filename": "t/TestChange.cpp"}]),
+                    reply(200, {"merged": True}), reply(204), reply(200, []),
+                    reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+
     def test_status_shows_goal_home_merge_constraint(self):
         ticket_issue = {"number": 4, "state": "open",
                         "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
