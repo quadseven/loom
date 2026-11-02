@@ -225,6 +225,9 @@ class BrainTickTest(unittest.TestCase):
         self.assertFalse(any("bus.fabric" in c for c in calls), calls)
         self.assertNotIn("Earlier decision: a fix was merged.", "\n".join(calls))
         self.assertEqual(1, len(self.agent_calls(calls, "claude")))
+        # loom#2203: with the ask off, the configuration still never
+        # reaches the brain child.
+        self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
         self.log.unlink()
         run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
                                LOOM_BRAIN_FABRIC_ASK="",
@@ -251,6 +254,7 @@ class BrainTickTest(unittest.TestCase):
         # configuration in its own environment; the agent child must never
         # see it, while the answer still reaches the prompt.
         _, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
                              FAKE_FABRIC="Earlier decision: a fix was merged.")
         self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
         self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
@@ -274,6 +278,7 @@ class BrainTickTest(unittest.TestCase):
         _, calls = self.tick(LOOM_BRAIN_LADDER="codex",
                              LOOM_CODEX_MODEL="gpt-test-high",
                              LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
                              FAKE_FABRIC="Earlier decision: a fix was merged.")
         self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
         self.assertIn("env-codex LOOM_FABRIC_KEY_SSM=absent", calls)
@@ -284,6 +289,7 @@ class BrainTickTest(unittest.TestCase):
                              LOOM_SPARK_MODEL="spark/coder",
                              LOOM_SPARK_URL="http://spark.invalid:8000/v1",
                              LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                             LOOM_BRAIN_FABRIC_ASK="1",
                              FAKE_FABRIC="Earlier decision: a fix was merged.")
         self.assertIn("fabric env LOOM_FABRIC_KEY_SSM=/example/fabric-key", calls)
         self.assertFalse(any("LOOM_FABRIC_KEY_SSM" in c
@@ -301,6 +307,7 @@ class BrainTickTest(unittest.TestCase):
         # The responder failing must fail closed: no configuration in the
         # child environment, no Fabric context in the prompt, tick runs on.
         run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="1",
                                FAKE_FABRIC="untrusted partial answer",
                                FAKE_FABRIC_EXIT="1")
         self.assertEqual(0, run.returncode)
@@ -315,6 +322,7 @@ class BrainTickTest(unittest.TestCase):
         # and exit 0) fails just as safely: no Fabric section in the prompt.
         self.log.unlink()
         run, calls = self.tick(LOOM_FABRIC_KEY_SSM="/example/fabric-key",
+                               LOOM_BRAIN_FABRIC_ASK="1",
                                FAKE_FABRIC="")
         self.assertEqual(0, run.returncode)
         self.assertIn("env-claude LOOM_FABRIC_KEY_SSM=absent", calls)
