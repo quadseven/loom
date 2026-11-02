@@ -8500,9 +8500,10 @@ class Station:
             saved = {}
         if isinstance(saved.get("at"), (int, float)) and self.now - saved["at"] < 3600:
             cached = saved.get("items")
+            if not isinstance(cached, list):
+                return []
             return [(str(row[0]), row[1]) for row in cached
-                    if isinstance(row, list) and len(row) == 2 and isinstance(row[1], dict)] \
-                if isinstance(cached, list) else []
+                    if isinstance(row, list) and len(row) == 2 and isinstance(row[1], dict)]
         found: List[Tuple[str, Dict[str, Any]]] = []
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):

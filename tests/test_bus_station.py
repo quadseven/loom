@@ -8925,6 +8925,20 @@ class AsksTest(Base):
                     and "label:grug:idle" in path]
         self.assertEqual(len(searches), 1)
 
+    def test_idle_scan_fresh_cache_without_an_items_list_reads_as_empty(self):
+        path = os.path.join(self.settings.home, "state", "station", "idle_pulls.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.fake.search_items = [{"number": 77, "title": "Fresh", "body": "",
+                                   "updated_at": "2030-05-03T12:00:00Z",
+                                   "labels": [{"name": "grug:idle"}],
+                                   "pull_request": {"url": "unused"}}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        for items in (None, {"bad": 1}, "text"):
+            with open(path, "w") as fh:
+                json.dump({"at": NOON - 60, "items": items}, fh)
+            self.assertEqual(st._idle_pull_requests(), [])
+        self.assertFalse(any(p.startswith("/search/issues?") for p in self.fake.paths("GET")))
+
     def test_idle_lane_pull_holds_ticket_and_posts_no_comment(self):
         self.fake.search_items = [{"number": 77, "title": "Lane change", "body": "",
                                    "updated_at": "2030-05-03T12:00:00Z",
