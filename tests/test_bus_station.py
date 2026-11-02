@@ -74,6 +74,9 @@ class FakeGitHub:
         self.comments = {}
         self.editors = {}
         self.pulls = []
+        self.search_items = []
+        # Pull requests read as issues: number -> the live issue object.
+        self.pull_issues = {}
         self.calls = []
         self.version = 1
         self.lanes_issues = []
@@ -214,6 +217,13 @@ class FakeGitHub:
         if method == "GET" and parts.path == "/search/issues":
             # The epic shape's Part of search (loom#2023): no issue here is
             # linked to an epic by its Part of line alone.
+            if "label:grug:idle" in parts.query:
+                pages = getattr(self, "search_pages", None)
+                if pages is not None:
+                    page = int((re.search(r"(?:^|&)page=(\d+)", parts.query) or [0, 1])[1])
+                    return reply(200, {"total_count": sum(len(p) for p in pages),
+                                       "items": pages[page - 1] if page <= len(pages) else []})
+                return reply(200, {"items": self.search_items})
             return reply(200, {"items": []})
         if method == "GET" and parts.path == "/repos/%s" % REPO:
             return reply(200, {"full_name": REPO, "private": self.private,
@@ -467,6 +477,8 @@ class FakeGitHub:
         if sub == "sub_issues":
             return reply(200, self.sub_issues.get(n, []))
         found = {None: self.issues, "events": self.events, "comments": self.comments}
+        if sub is None and n not in self.issues and n in self.pull_issues:
+            return reply(200, self.pull_issues[n])
         if sub in found:
             if sub is None and n not in found[sub]:
                 return reply(404, {"message": "Not Found"})
@@ -8894,6 +8906,7 @@ class AsksTest(Base):
             self.read.append((name, region))
             return URL
         gh = GitHub("token", transport=self.fake)
+        gh.status_in_body = True
         station.Station(gh, self.settings, now=now, read_secret=secret, post=post,
                         urgency_client=urgency_client).run_pass()
 
@@ -8930,9 +8943,99 @@ class AsksTest(Base):
         self.assertEqual(scores["%s#5" % REPO]["route"], urgency.URGENT)
         self.assertEqual(scores["%s#5" % REPO]["today_route"], urgency.DIGEST)
         self.assertEqual(scores["%s#6" % REPO]["route"], urgency.STATUS)
-        # The next pass asks nothing again for the same revisions.
         self.go(NOON + 60, urgency_client=client)
         self.assertEqual(len(asked), 2)
+
+    def test_idle_operator_pull_is_in_one_digest_and_drops_when_label_is_removed(self):
+        self.fake.search_items = [{"number": 77, "title": "Review update", "body": "",
+                                   "updated_at": "2030-05-03T12:00:00Z",
+                                   "labels": [{"name": "grug:idle"}],
+                                   "pull_request": {"url": "unused"}}]
+        self.fake.pulls = [{"number": 77, "body": "", "head": {"ref": "operator/topic"}}]
+        self.fake.pull_issues[77] = self.fake.search_items[0]
+        self.fake.add_ask(5)
+        self.go()
+        content = self.sent[-1][1]["content"]
+        self.assertEqual(content.count("example-owner/example-repo #77"), 1)
+        self.assertIn("idle 2 days; merge, close, or brief it as a ticket", content)
+        self.fake.search_items[0]["labels"] = []
+        self.go(NOON + 24 * 3600)
+        self.assertFalse(any("#77" in payload["content"] for _, payload in self.sent[1:]))
+
+    def test_idle_label_removed_inside_the_cache_hour_drops_the_line_at_once(self):
+        item = {"number": 77, "title": "Review update", "body": "", "state": "open",
+                "updated_at": "2030-05-03T12:00:00Z",
+                "labels": [{"name": "grug:idle"}], "pull_request": {"url": "unused"}}
+        self.fake.search_items = [dict(item)]
+        self.fake.pulls = [{"number": 77, "body": "", "head": {"ref": "operator/topic"}}]
+        self.fake.pull_issues[77] = dict(item)
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=NOON)
+        self.assertEqual(len(st._idle_pull_lines()), 1)
+        # The search result is cached for the hour; the live pull request
+        # has lost its label, so the line goes at once.
+        self.fake.pull_issues[77]["labels"] = []
+        later = station.Station(gh, self.settings, now=NOON + 60)
+        self.assertEqual(later._idle_pull_lines(), [])
+        # A closed pull request drops out the same way.
+        self.fake.pull_issues[77].update(labels=[{"name": "grug:idle"}], state="closed")
+        self.assertEqual(later._idle_pull_lines(), [])
+        searches = [path for method, path in self.fake.calls
+                    if method == "GET" and "label:grug:idle" in path]
+        self.assertEqual(len(searches), 1)
+
+    def test_idle_scan_follows_search_pages_past_the_first(self):
+        def item(n):
+            return {"number": n, "title": "Pull %d" % n, "body": "", "state": "open",
+                    "updated_at": "2030-05-03T12:00:00Z",
+                    "labels": [{"name": "grug:idle"}], "pull_request": {"url": "unused"}}
+        self.fake.search_pages = [[item(70), item(71)], [item(72)]]
+        self.fake.pulls = [{"number": n, "body": "", "head": {"ref": "operator/topic"}}
+                           for n in (70, 71, 72)]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        with mock.patch.object(station, "IDLE_SEARCH_PER_PAGE", 2):
+            found = st._idle_pull_requests()
+        self.assertEqual([issue["number"] for _, issue in found], [70, 71, 72])
+        searches = [path for method, path in self.fake.calls
+                    if method == "GET" and "label:grug:idle" in path]
+        self.assertEqual(len(searches), 2)
+        self.assertIn("per_page=2&page=2", searches[1])
+
+    def test_idle_scan_searches_at_most_once_per_repo_per_hour(self):
+        self.fake.add_ask(5)
+        self.go()
+        self.go(NOON + 60)
+        searches = [path for method, path in self.fake.calls
+                    if method == "GET" and path.startswith("/search/issues?")
+                    and "label:grug:idle" in path]
+        self.assertEqual(len(searches), 1)
+
+    def test_idle_scan_fresh_cache_without_an_items_list_reads_as_empty(self):
+        path = os.path.join(self.settings.home, "state", "station", "idle_pulls.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.fake.search_items = [{"number": 77, "title": "Fresh", "body": "",
+                                   "updated_at": "2030-05-03T12:00:00Z",
+                                   "labels": [{"name": "grug:idle"}],
+                                   "pull_request": {"url": "unused"}}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        for items in (None, {"bad": 1}, "text"):
+            with open(path, "w") as fh:
+                json.dump({"at": NOON - 60, "items": items}, fh)
+            self.assertEqual(st._idle_pull_requests(), [])
+        self.assertFalse(any(p.startswith("/search/issues?") for p in self.fake.paths("GET")))
+
+    def test_idle_lane_pull_holds_ticket_and_posts_no_comment(self):
+        self.fake.search_items = [{"number": 77, "title": "Lane change", "body": "",
+                                   "updated_at": "2030-05-03T12:00:00Z",
+                                   "labels": [{"name": "grug:idle"}],
+                                   "pull_request": {"url": "unused"}}]
+        self.fake.pulls = [{"number": 77, "body": "", "head": {"ref": "loom/12-change"}}]
+        self.fake.add(12, state="pr")
+        self.go()
+        self.assertIn("wait:stuck", self.fake.names(12))
+        self.assertFalse(any(method == "POST" and "/comments" in path
+                             for method, path in self.fake.calls))
+        self.assertIn("Idle review label", self.fake.issues[12]["body"])
 
     def test_act_forwards_by_the_score_and_ranks_the_digest(self):
         self.settings.urgency = urgency.Config(mode=urgency.ACT)
