@@ -24,6 +24,29 @@ class BaseTestResults(NamedTuple):
     passed_on_base: List[str]
     failed_on_base: List[str]
     timed_out: List[str]
+    # Changed tests the gate could not run on base (a module-level test that
+    # takes fixtures where pytest is absent): the gate fails closed on them.
+    not_run: List[str]
+
+
+# Runs one module-level test function: through pytest when the tree has it,
+# else by calling it (awaiting a coroutine). Exit NOT_RUN when neither works.
+NOT_RUN = 99
+NOT_RUN_CODES = frozenset((4, 5, NOT_RUN))  # pytest usage error, no tests collected
+_FUNCTION_RUNNER = """
+import asyncio, importlib, importlib.util, inspect, sys
+module, name = sys.argv[1], sys.argv[2]
+if importlib.util.find_spec("pytest") is not None:
+    import pytest
+    raise SystemExit(int(pytest.main(["-q", "-p", "no:cacheprovider",
+                                      module.replace(".", "/") + ".py::" + name])))
+func = getattr(importlib.import_module(module), name)
+if inspect.signature(func).parameters:
+    raise SystemExit(%d)
+result = func()
+if inspect.iscoroutine(result):
+    asyncio.run(result)
+""" % NOT_RUN
 
 
 def is_test_path(path: str) -> bool:
@@ -189,12 +212,29 @@ def safe_test_path(path: str) -> str:
     return str(posix)
 
 
-def _test_names(path: str, source: str) -> List[str]:
+def _module_name(path: str) -> str:
     module = path[:-3].replace("/", ".") if path.endswith(".py") else ""
     if not module or any(not part.isidentifier() for part in module.split(".")):
+        return ""
+    return module
+
+
+def _top_level_names(path: str, source: str) -> List[str]:
+    """Module-level test functions (pytest style), as module.function."""
+    module = _module_name(path)
+    if not module:
+        return []
+    return sorted({"%s.%s" % (module, node.name) for node in ast.parse(source).body
+                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name.startswith("test")})
+
+
+def _test_names(path: str, source: str) -> List[str]:
+    module = _module_name(path)
+    if not module:
         return []
     tree = ast.parse(source)
-    names = []
+    names = _top_level_names(path, source)
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
             continue
@@ -273,6 +313,9 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
     passed: List[str] = []
     failed: List[str] = []
     timed_out: List[str] = []
+    not_run: List[str] = []
+    top_level = {name for path, source in changed_tests.items()
+                 for name in _top_level_names(path, source)}
     with tempfile.TemporaryDirectory(prefix="loom-base-tests-") as scratch:
         checkout = os.path.join(scratch, "checkout")
         shutil.copytree(base_tree, checkout,
@@ -284,16 +327,23 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                                      if test_patches is not None else _test_names(path, source))})
         deadline = time.monotonic() + timeout
         for index, name in enumerate(names):
+            if name in top_level:
+                module, _, function = name.rpartition(".")
+                command = [sys.executable, "-B", "-c", _FUNCTION_RUNNER, module, function]
+            else:
+                command = [sys.executable, "-B", "-m", "unittest", name]
             try:
-                run = subprocess.run([sys.executable, "-B", "-m", "unittest", name],
-                                     cwd=checkout, capture_output=True, text=True,
+                run = subprocess.run(command, cwd=checkout, capture_output=True, text=True,
                                      timeout=max(0.01, deadline - time.monotonic()),
                                      check=False)
             except subprocess.TimeoutExpired:
                 timed_out.extend(names[index:])
                 break
-            (failed if run.returncode else passed).append(name)
-    return BaseTestResults(passed, failed, timed_out)
+            if name in top_level and run.returncode in NOT_RUN_CODES:
+                not_run.append(name)
+            else:
+                (failed if run.returncode else passed).append(name)
+    return BaseTestResults(passed, failed, timed_out, not_run)
 
 
 def _git(tree: str, *args: str, timeout: int = 30) -> bytes:
@@ -358,7 +408,7 @@ def git_base_test_results(tree: str, base: str, head: str,
                              "--unified=0", base_sha, head_sha, "--", path).decode(
                                  "utf-8", "replace")
     if not changed_tests:
-        return BaseTestResults([], [], [])
+        return BaseTestResults([], [], [], [])
     with tempfile.TemporaryDirectory(prefix="loom-vacuous-base-") as scratch:
         checkout = os.path.join(scratch, "base")
         os.mkdir(checkout)
@@ -380,7 +430,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("base-pass: " + name)
     for name in result.timed_out:
         print("base-timeout: " + name)
-    return 1 if result.passed_on_base or result.timed_out else 0
+    for name in result.not_run:
+        print("base-unrunnable: " + name)
+    return 1 if result.passed_on_base or result.timed_out or result.not_run else 0
 
 
 if __name__ == "__main__":

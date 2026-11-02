@@ -1,8 +1,10 @@
+import io
 import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from bus import vacuous
 
@@ -58,6 +60,37 @@ class VacuousTests(unittest.TestCase):
                       " def test_passes(self): self.assertEqual(app.VALUE, 1)\n")
             result = vacuous.base_test_results(root, {"tests/test_case.py": source}, timeout=5)
             self.assertEqual(result.passed_on_base, ["tests.test_case.TestThing.test_passes"])
+
+    def test_a_module_level_test_function_that_passes_on_base_is_named(self):
+        # Elder on PR 2362: a pytest-style top-level test was never run, so a
+        # vacuous one left the lane READY.
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "app.py"), "w") as stream:
+                stream.write("VALUE = 1\n")
+            source = ("import app\n"
+                      "def test_passes():\n assert app.VALUE == 1\n"
+                      "def test_fails():\n assert app.VALUE == 2\n"
+                      "async def test_async_passes():\n assert app.VALUE == 1\n")
+            result = vacuous.base_test_results(root, {"tests/test_top.py": source}, timeout=20)
+            self.assertEqual(result.passed_on_base, ["tests.test_top.test_async_passes",
+                                                     "tests.test_top.test_passes"])
+            self.assertEqual(result.failed_on_base, ["tests.test_top.test_fails"])
+
+    def test_a_module_level_test_with_fixtures_is_never_a_silent_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = "def test_needs(no_such_fixture):\n assert True\n"
+            result = vacuous.base_test_results(root, {"tests/test_fix.py": source}, timeout=20)
+            self.assertEqual(result.passed_on_base, [])
+            # Without pytest the gate cannot run it and fails closed; with
+            # pytest the missing fixture is an error, which is not a pass.
+            self.assertEqual(result.not_run + result.failed_on_base, ["tests.test_fix.test_needs"])
+
+    def test_the_cli_fails_on_a_test_it_could_not_run(self):
+        results = vacuous.BaseTestResults([], [], [], ["tests.test_fix.test_needs"])
+        with mock.patch.object(vacuous, "git_base_test_results", return_value=results), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(vacuous.main(["tree", "base", "head"]), 1)
+        self.assertIn("base-unrunnable: tests.test_fix.test_needs", out.getvalue())
 
     def test_git_base_check_copies_new_test_file_and_reports_each_test(self):
         with tempfile.TemporaryDirectory() as root:

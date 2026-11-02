@@ -2725,6 +2725,7 @@ final_base_tests() {
   names="$(tail -c +$((log_offset + 1)) "$LOG" \
     | sed -n -e 's/^base-pass: /passes on base: /p' \
              -e 's/^base-timeout: /timed out on base: /p' \
+             -e 's/^base-unrunnable: /could not run on base: /p' \
     | head -5 | tr '\n' ';')"
   record base-tests "$command" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
   case "$rc" in
