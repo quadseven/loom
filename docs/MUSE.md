@@ -337,9 +337,15 @@ this tick"; a step with no note shows nothing there. Each step call records
 when that step started and when the previous one ended, and prints the
 tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
-1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
-   Stop if the lock is held. The lock outlives the 25-minute tick, so no
-   other brain takes it mid-tick.
+1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30 --wait 5`.
+   Read its exit code and its one line, not an earlier one. Exit 0 means you
+   hold the lock: the line starts `lock acquired: yours`, or `lock acquired:
+   already yours` when you had taken it earlier this tick (a re-attempt is
+   yours, never a peer's, so go on). Exit 1 means a peer holds it after the
+   5-minute wait: the line starts `lock held by <holder>` and says how long
+   it has held it and when it expires. Stop then, and quote that line in the
+   stand-down so it names the holder and its age. The lock outlives the
+   25-minute tick, so no other brain takes it mid-tick.
    Then run `python3 -m bus.brain step lock --holder muse`.
 2. First run `python3 -m bus.brain step status --holder muse`. The first read
    of every tick is the handoff packet: the comment marked
