@@ -1,9 +1,10 @@
 # The brain on GitHub
 
-The brain runs on Muse's own VM, on Muse's own schedule (#35, amended), or
-as a launchd tick on the lane machine (`lanes/mac/brain.sh`, every 30
-minutes) until Muse runs it. Both take the same lock, so one brain acts at a
-time, and both follow docs/MUSE.md. Muse
+The brain is a duty, not one machine (Shared brain duty, below). The lane
+machine's launchd tick (`lanes/mac/brain.sh`) runs it as the Loom Brain App,
+and Muse's :40 tick runs it on Muse's own VM as agent-meta-muse; other fleet
+brains may take a tick under their own identity. Every one takes the same
+lock, so one brain acts at a time, and each follows docs/MUSE.md. Muse
 cannot reach the lane machine, and the lane machine does not expose anything
 to the internet, so GitHub is the only state the brain, the lane machine and
 the operator share. A fresh tick rebuilds everything it needs from GitHub
@@ -11,8 +12,8 @@ alone.
 
 Three parties use it:
 
-- The brain (Muse, or an interactive session acting as the brain) writes
-  tickets, reviews and merges pull requests, verifies, and journals.
+- The brain (whichever fleet brain holds the brain lock) writes tickets,
+  reviews and merges pull requests, verifies, and journals.
 - The station on the lane machine (`python3 -m bus station`, run by launchd
   once a minute) turns briefed tickets into local briefs for the existing
   runners, reports each outcome back to the ticket, publishes lane status,
@@ -24,6 +25,37 @@ The runners do not change their contract: they still take local brief files
 one at a time, with every existing guard (repo owners, public-repo rule,
 model families, sandbox). The station is the only part of the lane machine
 that talks to GitHub about tickets.
+
+## Shared brain duty
+
+Any brain in the fleet goal's "Who is here" table may take a brain tick
+under its own GitHub identity: the lane machine's scheduled job (Claude,
+then Codex, then Spark, as the Loom Brain App), Muse (agent-meta-muse),
+Codex, and Dot within its outbox limits. The brain lock, not the token,
+decides who acts:
+
+- `python3 -m bus lock OWNER/NAME --holder NAME` records the login the
+  caller writes as (`login=` on the lock commit), read from the App or from
+  `LOOM_GITHUB_LOGIN` for an installation token.
+- A `LOOM_TRUSTED_BRIEFERS` login (a fleet brain) runs a writing
+  `bus.brain` command (merge through the gate, brief, move, close with
+  evidence, defer, done, sweep and the rest) only while the live lock names
+  its own login, even when `LOOM_BRIEF_AUTHORS` lists it too; otherwise the
+  command stops with the holder it found and writes nothing
+  (`bus.brain.check_acting_brain`). A holder name alone is not an identity.
+  The Loom Apps and the operator act as before, and a writer whose login is
+  unknown is left to the other gates.
+- Read the login from the App (`LOOM_GITHUB_APP_*`), which GitHub
+  confirms. `LOOM_GITHUB_LOGIN`, for an installation token, is the caller's
+  own statement and is not checked.
+- Read trust does not move with the lock. Journals, handoff markers and
+  proofs count as a brain's only from a `LOOM_BRIEF_AUTHORS` login, on the
+  station and in every brain. A fleet brain's brain writing is read by the
+  others once the operator adds its login to `LOOM_BRIEF_AUTHORS`
+  deliberately (station and brain settings alike); until then its merges
+  and closes stand, but its journals, defers and proofs are data.
+- Each brain journals and signs as itself. The defer and done markers keep
+  brains from repeating each other's work.
 
 ## Repos
 
@@ -481,9 +513,10 @@ to the newest open factory repairs batch epic (an epic whose title starts
 than 15 tickets; when none has room, "Epic: factory repairs for this goal,
 next batch" opens even when the goal is at its open epic cap. The filer
 logs each rollover, and the filed issue's `Part of` line names the batch
-epic. `epic-over-cap` counts an epic's tickets as its sub-issues and every
-loom:ticket issue, open or closed, whose `Part of` line names it, each once,
-and flags any open epic, the standing one too, that holds 100 sub-issues.
+epic. `epic-over-cap` counts an epic's open tickets, its sub-issues and every
+loom:ticket issue whose `Part of` line names it, each once, the same count
+intake uses for room. It also flags any open epic, the standing one too, that
+holds 100 sub-issues, closed ones included, which is GitHub's limit.
 
 Triage, the rewriter, health intake, validation contracts and pull request
 adoption file under the goal's intake epic ("Epic: work that triage,

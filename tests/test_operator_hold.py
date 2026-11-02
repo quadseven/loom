@@ -525,7 +525,7 @@ class BrainMerge(unittest.TestCase):
                   "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True},
                   "/search/issues": {"total_count": 0}}
         lines = brain._pull_request_lines(GitHub("t", transport=Route(routes)), BRAIN_REPO, [pr],
-                                          {"prs": {8: node}}, "grug-tribe")
+                                          {"prs": {8: node}}, "grug-tribe", hold=())
         self.assertIn("blocked: held for the operator", lines[1])
 
 
