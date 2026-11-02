@@ -2525,7 +2525,8 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
 
 def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
-                area: Optional[str] = None) -> int:
+                area: Optional[str] = None,
+                exclude: Sequence[int] = ()) -> int:
     """The goal's newest open intake epic with room for `room` more tickets
     (EPIC_TICKET_CAP is the most one holds), opened (within the epic cap) when
     none has room: where triage, rewrites, health intake, validation
@@ -2539,6 +2540,7 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
     area_label = "area:" + area if area else None
     roomy = [int(found["number"]) for found, held in tree
              if found.get("state", "open") == "open"
+             and int(found["number"]) not in exclude
              and ((area_label in _labels(found)) if area_label else
                   is_intake_epic(found))
              and _open_count(held) + room <= EPIC_TICKET_CAP]  # goal_tree already read its tickets
@@ -2604,42 +2606,71 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     epic once its sub-issues are closed, but a ticket that names the epic by
     its Part of line stays open under it) moves the same way, and its Part of
     line then names the new epic; the closed epic stays closed (loom#1925).
-    A ticket that also sits under an open epic stays there. Returns (moved,
-    left)."""
+    A ticket that also sits under an open epic stays there.
+
+    An open epic that holds more than EPIC_TICKET_CAP tickets has its excess
+    open tickets moved to the goal's next intake epic (the epic retains its
+    first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left)."""
     loose, tree = goal_tree(gh, repo, goal)
-    tickets = [(t, goal) for t in _outside_tickets(loose, goal)]
-    seen = {int(t.get("number") or 0) for t, _ in tickets}
-    tickets += [(t, old) for t, old in _closed_epic_tickets(tree)
-                if int(t.get("number") or 0) not in seen]
+    tickets = _tickets_to_move(loose, tree, goal)
     if not tickets:
         return (0, 0)
-    tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
-                                   int(pair[0].get("number") or 0)))
     moved = 0
     areas = _area_labels(gh, repo)
     epic, held = _intake_with_room(tree)
     for ticket, old in tickets:
-        area = _ticket_area(areas, ticket)
-        if area:
-            # Each move changes that area's room, so intake_epic reads it again.
-            if "area:" + area not in _labels(ticket):
-                gh.rest("POST", "/repos/%s/issues/%d/labels" %
-                        (repo, int(ticket["number"])), {"labels": ["area:" + area]})
-            try:
-                target = intake_epic(gh, repo, goal, area=area)
-            except ValueError:
-                break
-        else:
-            if epic is None or held >= EPIC_TICKET_CAP:
-                opened = _open_intake_epic(gh, repo, goal)
-                if opened is None:
-                    break
-                epic, held = opened
-            target = epic
+        target, (epic, held) = _move_target(
+            gh, repo, goal, ticket, old, areas, (epic, held))
+        if target is None:
+            break
         if _move_to_epic(gh, repo, target, ticket, old):
             moved += 1
-            held += 0 if area else 1
+            if target == epic:
+                held += 1
     return (moved, len(tickets) - moved)
+
+
+def _tickets_to_move(loose: List[Dict[str, Any]],
+                     tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+                     goal: int) -> List[Tuple[Dict[str, Any], int]]:
+    """Open tickets to place into open epics: tickets outside epics, tickets
+    under closed epics, and excess tickets of epics holding more than
+    EPIC_TICKET_CAP tickets."""
+    tickets = [(t, goal) for t in _outside_tickets(loose, goal)]
+    seen = {int(t.get("number") or 0) for t, _ in tickets}
+    for t, old in _closed_epic_tickets(tree) + _over_capacity_epic_tickets(tree):
+        n = int(t.get("number") or 0)
+        if n not in seen:
+            tickets.append((t, old))
+            seen.add(n)
+    tickets.sort(key=lambda pair: (str(pair[0].get("created_at") or ""),
+                                   int(pair[0].get("number") or 0)))
+    return tickets
+
+
+def _move_target(gh: GitHub, repo: str, goal: int, ticket: Dict[str, Any],
+                 old: int, areas: Dict[str, Dict[str, Any]],
+                 state: Tuple[Optional[int], int]
+                 ) -> Tuple[Optional[int], Tuple[Optional[int], int]]:
+    """Determine the target epic for a ticket moving into an epic.
+    Returns (target, (epic, held)) or (None, state) when no epic can accept it."""
+    epic, held = state
+    area = _ticket_area(areas, ticket)
+    if area:
+        if "area:" + area not in _labels(ticket):
+            gh.rest("POST", "/repos/%s/issues/%d/labels" %
+                    (repo, int(ticket["number"])), {"labels": ["area:" + area]})
+        try:
+            target = intake_epic(gh, repo, goal, area=area, exclude=(old,))
+        except ValueError:
+            return None, state
+        return target, state
+    if epic is None or held >= EPIC_TICKET_CAP or epic == old:
+        opened = _open_intake_epic(gh, repo, goal, exclude=(old,))
+        if opened is None:
+            return None, state
+        epic, held = opened
+    return epic, (epic, held)
 
 
 def _outside_tickets(loose: List[Dict[str, Any]], goal: int) -> List[Dict[str, Any]]:
@@ -2697,6 +2728,31 @@ def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
     return out
 
 
+def _over_capacity_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
+                               ) -> List[Tuple[Dict[str, Any], int]]:
+    """(ticket, its epic) for each excess open ticket of an open epic that
+    holds more than EPIC_TICKET_CAP tickets. The epic retains its first
+    EPIC_TICKET_CAP tickets, and excess open tickets move to the next epic."""
+    out: List[Tuple[Dict[str, Any], int]] = []
+    seen = set()
+    for epic, held in tree:
+        if epic.get("state", "open") != "open" or standing_epic(epic):
+            continue
+        if len(held) <= EPIC_TICKET_CAP:
+            continue
+        number = int(epic.get("number") or 0)
+        excess = len(held) - EPIC_TICKET_CAP
+        movable = [t for t in held if _movable_ticket(t)]
+        if not movable:
+            continue
+        for issue in movable[-excess:]:
+            n = int(issue.get("number") or 0)
+            if n and n not in seen:
+                out.append((issue, number))
+                seen.add(n)
+    return out
+
+
 def _open_count(tickets: List[Dict[str, Any]]) -> int:
     """How many of an intake epic's tickets are still open: its room. Counting
     closed ones too made a mostly closed intake epic read as full, so a new one
@@ -2705,23 +2761,25 @@ def _open_count(tickets: List[Dict[str, Any]]) -> int:
     return sum(1 for t in tickets if t.get("state", "open") != "closed")
 
 
-def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
-                      ) -> Tuple[Optional[int], int]:
+def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+                      exclude: Sequence[int] = ()) -> Tuple[Optional[int], int]:
     """The goal's newest open intake epic that has room, and the tickets it
     holds; (None, 0) when no intake epic has room."""
     roomy = [(int(epic["number"]), _open_count(held)) for epic, held in tree
              if epic.get("state", "open") == "open"
+             and int(epic.get("number") or 0) not in exclude
              and is_intake_epic(epic)
              and _open_count(held) < EPIC_TICKET_CAP]
     return max(roomy) if roomy else (None, 0)
 
 
-def _open_intake_epic(gh: GitHub, repo: str, goal: int) -> Optional[Tuple[int, int]]:
+def _open_intake_epic(gh: GitHub, repo: str, goal: int,
+                      exclude: Sequence[int] = ()) -> Optional[Tuple[int, int]]:
     """The goal's newest open intake epic with room, opened when none has
     room and the goal is under its open epic cap, and the tickets it holds;
     (None, 0) when the goal is at its cap and no intake epic has room."""
     try:
-        number = intake_epic(gh, repo, goal)
+        number = intake_epic(gh, repo, goal, exclude=exclude)
     except ValueError as err:
         print("goal #%d: no intake epic has room and none may open (%s)" % (goal, err),
               file=sys.stderr)
@@ -2788,7 +2846,7 @@ def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
             if standing or repairs_batch(issue):
                 # A full repairs epic: the repair goes to a batch with room.
                 return repairs_epic(gh, repo, parent, room, full=(number,))
-            return intake_epic(gh, repo, parent, room)
+            return intake_epic(gh, repo, parent, room, exclude=(number,))
         if "loom:goal" in _labels(issue):
             return intake_epic(gh, repo, number, room)
         parent = _issue_goal(issue)
