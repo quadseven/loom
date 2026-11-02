@@ -11275,6 +11275,7 @@ class Station:
         goal = self._invariant_goal()
         self._invariant_repo = goal[0] if goal else ""
         facts = self._invariant_facts(state)
+        self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
@@ -11296,6 +11297,45 @@ class Station:
                              settled=lambda inv, subject: self._invariant_settled(
                                  facts, inv, subject)).run(breaches)
         invariants.save(path, state)
+
+    def _unstick_lane_pulls(self, facts: invariants.Facts) -> None:
+        """Queue a brain fix round for each stale lane pull request blocked by
+        trusted review threads, then mark it queued in this pass's facts."""
+        if facts.lane_pulls is None:
+            return
+        for index, pull in enumerate(facts.lane_pulls):
+            if (self.now - pull.at <= invariants.PR_STALLED or not pull.drives
+                    or not pull.threads or pull.fix_pending or pull.ticket is None
+                    or "loom:pr" not in pull.labels
+                    or "needs-brain" in pull.labels or "loom:failed" in pull.labels):
+                continue
+            repo, number = self._invariant_ref_parts(pull.pr.key)
+            ticket = self._invariant_ref_parts(pull.ticket.key)
+            if repo is None or ticket is None:
+                continue
+            lane = next((label[5:] for label in pull.labels if label.startswith("lane:")), None)
+            if lane in REMOTE_LANES:
+                continue
+            try:
+                queued = brain.fix(self.gh, repo, number, ticket, factory.FIX_NOTES,
+                                   lane=lane, authors=self.s.authors)
+            except RateLimited:
+                raise
+            except (GitHubError, ValueError) as err:
+                _say("invariants: could not queue a fix round for stalled pull request %s: %s"
+                     % (pull.pr.label, err))
+                continue
+            if queued:
+                facts.lane_pulls[index] = pull._replace(fix_pending=True)
+                _say("invariants: queued a fix round for stalled pull request %s" % pull.pr.label)
+
+    @staticmethod
+    def _invariant_ref_parts(ref: str) -> Optional[Tuple[str, int]]:
+        """The repository and issue number from an invariant ref."""
+        match = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", ref)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2))
 
     def _invariant_settled(self, facts: invariants.Facts, invariant: str,
                            subject: str) -> Optional[str]:

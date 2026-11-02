@@ -1358,6 +1358,11 @@ checks, the goal shapes) leaves its tracking issue as it is, and so does a
 pass that could not read one repo's open pull requests for that repo's
 lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
 open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+When a trusted lane pull request has been open past the six-hour limit, its
+ticket is still at `loom:pr`, and trusted review threads remain without a
+pending fix round, the station queues `bus.brain fix` on the ticket and returns
+it to its lane. Tickets awaiting brain review or past the model ladder remain
+on their existing path.
 The per-violation issues these kinds filed before this close into the
 tracking issue of their kind and their own subject repo as the station meets
 them: closed as not planned with no comment, their note at the foot of the
