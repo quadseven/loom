@@ -38,7 +38,7 @@ MAX_ACTIONS = 10
 MAX_CLAIMS = 5
 CLAIM_LABEL = "claim:muse"
 CLAIM_COLOR = "5319E7"
-CLAIM_DESCRIPTION = "Claimed by the Muse sweep for this tick; released before the tick ends"
+CLAIM_DESCRIPTION = "Claimed by Muse: a sweep releases it before the tick ends, a build when its PR merges"
 # Issues the sweep never closes or rewrites, beside every hold label.
 NEVER_LABELS = ("loom:goal",)
 # What each close action records as GitHub's state_reason.
@@ -294,6 +294,15 @@ class _Claims:
             self.labelled.add(act.repo)
         held.append((act.repo, act.number))
         claim(self.gh, act.repo, act.number)
+        # Muse's builder posts its marker, then adds this same label. One
+        # that landed since the read above is the builder's ticket: leave
+        # the issue and its label alone (bus/muse_build.py).
+        from . import muse_build
+        if muse_build.holds_build_claim(self.gh, act.repo, act.number):
+            held.remove((act.repo, act.number))
+            result.skipped += 1
+            result.lines.append("skipped %s#%d: claimed by the Muse builder" % (act.repo, act.number))
+            return None
         return issue
 
 
@@ -330,11 +339,15 @@ def release_all(gh: Any, held: Sequence[Tuple[str, int]]) -> None:
 def release_leftovers(gh: Any, repos: Sequence[str], result: Result) -> None:
     """Release every open claim:muse in `repos`. Only the lock holder
     sweeps, so a claim found at the start is a dead tick's, never a live
-    one's: without this a crashed tick's claims would hold issues forever."""
+    one's: without this a crashed tick's claims would hold issues forever.
+    A claim Muse's builder holds (bus/muse_build.py, its newest build marker
+    a claim) is live build work, not a sweep's, and stays."""
+    from . import muse_build
     found = []
     for repo in repos:
         path = "/repos/%s/issues?state=open&labels=%s" % (repo, urllib.parse.quote(CLAIM_LABEL, safe=""))
-        found += [(repo, int(i["number"])) for i in gh.paginate(path) if "pull_request" not in i]
+        found += [(repo, int(i["number"])) for i in gh.paginate(path) if "pull_request" not in i
+                  and not muse_build.holds_build_claim(gh, repo, int(i["number"]))]
     release_all(gh, found)
     result.lines += ["released %s#%d: a claim left by an earlier tick" % x for x in found]
 
