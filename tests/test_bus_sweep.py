@@ -349,6 +349,32 @@ class SkipTest(unittest.TestCase):
         self.assertIn("released quadseven/loom#1: a claim left by an earlier tick", result.lines)
         self.assertEqual(result.closed, 1)
 
+    def test_a_build_claim_that_lands_as_the_sweep_claims_is_left_to_the_builder(self):
+        # Muse's builder (bus/muse_build.py) posts its marker, then adds the
+        # same claim:muse label. If that lands between the sweep's read and
+        # its claim, the sweep must not act on the issue or release the label.
+        from bus import muse_build
+
+        class Racing(FakeGH):
+            def paginate(self, path):
+                if path.startswith("/repos/%s/issues/1/comments" % REPO) and self.raced:
+                    return [{"body": muse_build.CLAIM_MARKER + "\nClaimed.",
+                             "user": {"login": muse_build.LOGIN}}]
+                return FakeGH.paginate(self, path)
+
+            def rest(self, method, path, body=None, ok=(), **kw):
+                if method == "POST" and path.endswith("/issues/1/labels"):
+                    self.raced = True
+                return FakeGH.rest(self, method, path, body, ok, **kw)
+
+        record, clock = at_triage()
+        gh = Racing({1: issue(1)})
+        gh.raced = False
+        result = sweep.run(gh, [close(1)], record, brain.TICK_STEPS, no_rewrite, clock=clock)
+        self.assertEqual(gh.issues[1]["state"], "open")
+        self.assertIn("claim:muse", [x["name"] for x in gh.issues[1]["labels"]])
+        self.assertEqual((result.closed, result.skipped), (0, 1))
+
     def test_a_dead_ticks_claim_is_released_even_when_the_sweep_is_refused(self):
         gh = FakeGH({1: issue(1, "claim:muse")})
         sweep.run(gh, [], {"step": "journal", "started_at": stamp(START)}, brain.TICK_STEPS,
