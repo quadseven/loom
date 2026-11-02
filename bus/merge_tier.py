@@ -415,8 +415,10 @@ def blocking_findings(threads: Sequence[Mapping[str, Any]], committed: str,
     comment is the review bot's. `held` names the resolved threads the
     station marked held for the head (bus/brain.py _station_held); it never
     exempts a high, critical or bad-work finding, so every finding returned
-    here blocks whether held or not (loom#2519). A missing time cannot show
-    a fix followed."""
+    here blocks whether held or not (loom#2519). `held` is therefore unused
+    here; it stays in the signature until the plumbing through
+    brain._refuse_risk_tier is removed. A missing time cannot show a fix
+    followed."""
     out = []
     for thread in threads:
         comments = (thread.get("comments") or {}).get("nodes") or []
