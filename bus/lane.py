@@ -443,14 +443,16 @@ def _push_commit(gh: GitHub, repo: str, local_sha: str, local_parent: str,
     return str(commit["sha"])
 
 
-def push_branch(gh: GitHub, repo: str, number: int) -> str:
+def push_branch(gh: GitHub, repo: str, number: int, branch: Optional[str] = None) -> str:
     """Push the current branch through the git-database API and return the
     remote HEAD SHA. The lane has no git HTTPS credential, so `git push`
     cannot work; the API accepts the same token the GitHub client carries.
-    The current branch must be the ticket's branch. Idempotent: pushing an
-    up-to-date branch changes nothing."""
-    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
-    branch = tickets.branch_for(number, str(issue.get("title") or ""))
+    The current branch must be the ticket's branch, or `branch` when given
+    (Muse's muse/<n>-<slug> build branch, bus/muse_build.py). Idempotent:
+    pushing an up-to-date branch changes nothing."""
+    if branch is None:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        branch = tickets.branch_for(number, str(issue.get("title") or ""))
     current = _git("branch", "--show-current")
     if current != branch:
         raise ValueError("current branch %r does not match the ticket branch %r"
