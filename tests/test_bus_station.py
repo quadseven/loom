@@ -7866,6 +7866,12 @@ class AnswerTest(Base):
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
         self.assertTrue(rebuttal.marked_held(body, "f" * 40))
 
+    def test_the_redaction_leaves_ordinary_answer_text_unchanged(self):
+        plain = "The guard on a.py:2 returns first | see `f` and lines 2-3."
+        self.assertEqual(station._redacted_answer(plain), plain)
+        self.assertEqual(station._redacted_answer("token ghp_" + "a1B2c3D4e5F6g7H8i9J0 at /tmp/x"),
+                         "token <redacted> at <path>")
+
     def test_an_answer_that_does_not_hold_carries_no_held_mark(self):
         self.thread()
         self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
