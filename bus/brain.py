@@ -264,7 +264,8 @@ def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
 # check rollup, the reviews, and each review thread's state and first comment.
 READY_FIELDS = (
     "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
-    " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
+    " reviews(last:100) { nodes { author { __typename login }"
+    " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     # The pull request's own comments, for a fleet hold (loom#2393).
@@ -620,13 +621,16 @@ _VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
 def _person_blockers(node: Dict[str, Any]) -> List[str]:
     """One blocker per person (any author that is not a Bot) whose newest
     verdict review on the pull request is CHANGES_REQUESTED. Bots keep their
-    own rule (_review_blocker); the review bot dismisses or re-reviews its own."""
+    own rule (_review_blocker); the review bot dismisses or re-reviews its own.
+    A review from someone who cannot push to the repository never counts, as
+    in GitHub's reviewDecision; a payload without that field still counts."""
     newest: Dict[str, Dict[str, Any]] = {}
     for r in (node.get("reviews") or {}).get("nodes") or []:
         author = r.get("author") or {}
         login = str(author.get("login") or "")
         stamp = str(r.get("submittedAt") or "")
         if (author.get("__typename") == "Bot" or not login or not stamp
+                or r.get("authorCanPushToRepository") is False
                 or r.get("state") not in _VERDICT_STATES):
             continue
         seen = newest.get(login.lower())
@@ -4534,7 +4538,8 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
-             ' reviews(last:100) { nodes { author { __typename login } state submittedAt } } '
+             ' reviews(last:100) { nodes { author { __typename login }'
+             ' authorCanPushToRepository state submittedAt } } '
              ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } }'
