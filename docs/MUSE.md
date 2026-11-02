@@ -86,7 +86,7 @@ A goal's product watch reads its product's own API, for WoW the stuck list
 and the health findings. Read them with the helper, not a hand-built URL:
 
     python3 -m bus.product_read stuck
-    python3 -m bus.product_read stuck --param guild=cave
+    python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
     python3 -m bus.product_read health
 
 It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the

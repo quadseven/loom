@@ -48,8 +48,8 @@ class StuckUrlTest(unittest.TestCase):
         self.assertEqual(pr.read_url(DEV_BASE + "/", "health"), DEV_BASE + "/api/v2/health")
 
     def test_a_query_param_is_encoded(self):
-        self.assertEqual(pr.read_url(DEV_BASE, "stuck", [("guild", "cave")]),
-                         DEV_BASE + "/api/v2/stuck?guild=cave")
+        self.assertEqual(pr.read_url(DEV_BASE, "stuck", [("team", "north")]),
+                         DEV_BASE + "/api/v2/stuck?team=north")
 
     def test_the_dashboard_host_is_refused_as_a_base(self):
         env = {"LOOM_PRODUCT_URL": "https://loom.example.test/dev", "LOOM_TRANSCRIPT_URL": DASHBOARD}
@@ -154,8 +154,8 @@ class ReadTest(unittest.TestCase):
 
     def test_a_param_reaches_the_url(self):
         seen = []
-        run(["stuck", "--param", "guild=bonkers"], self.ENV, answering(200, b"{}", seen=seen))
-        self.assertEqual(seen, [DEV_BASE + "/api/v2/stuck?guild=bonkers"])
+        run(["stuck", "--param", "team=south"], self.ENV, answering(200, b"{}", seen=seen))
+        self.assertEqual(seen, [DEV_BASE + "/api/v2/stuck?team=south"])
 
 
 class RedirectTest(unittest.TestCase):
