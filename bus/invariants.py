@@ -1265,6 +1265,17 @@ def _busy_ticket(labels: Sequence[str]) -> bool:
     return any(n.startswith(("claim:", "needs:")) or n in BUSY_LABELS for n in labels)
 
 
+def _clears(labels: Sequence[str]) -> bool:
+    """Whether the clear step closes a report with these labels once its
+    breach is gone: a triage or rewritten one, or one left with
+    loom:invariant alone (its triage label came off, no ticket was made of
+    it) that nothing holds (loom#2526: such reports of every kind but the
+    SETTLES ones had no close path, and stayed open for weeks)."""
+    if "loom:triage" in labels or "loom:rewritten" in labels:
+        return True
+    return TICKET_LABEL not in labels and not _busy_ticket(labels)
+
+
 def is_rolled(b: Breach) -> bool:
     return b.rolling and b.invariant in ROLLED
 
@@ -1942,18 +1953,12 @@ class Filer:
                   if isinstance(x, dict)]
         if self._rolls.get(key) == number and TICKET_LABEL not in labels:
             return self._clear_roll(key, number, issue)
-        triaged = "loom:triage" in labels or "loom:rewritten" in labels
-        ticket = TICKET_LABEL in labels
-        # A report left with loom:invariant alone (its triage label came off,
-        # no ticket was made of it) clears like a triage one unless something
-        # holds it (loom#2526: such reports of every kind but the SETTLES
-        # ones had no close path, and stayed open for weeks).
-        bare = not triaged and not ticket and not _busy_ticket(labels)
-        if self._old_rolled(key) and (triaged or ticket or bare):
+        clears = _clears(labels)
+        if self._old_rolled(key) and (clears or TICKET_LABEL in labels):
             # A rewrite into a ticket drops loom:triage; the ticket still
             # restates its kind (loom#2506).
             return self._fold_old_rolled(key, number, issue, labels, current)
-        if not (triaged or bare):
+        if not clears:
             return True
         comments = self._comments(number)
         into = self._rolled_into(key, current)
