@@ -2,7 +2,10 @@
 
 Creating a ref that exists fails with 422, so only one holder wins. The
 message is `holder=<name> expires=<UTC> acquired=<UTC>`, with ` run=<id>` when
-the caller named its run. Every attempt answers with the holder record, so a
+the caller named its run, and ` login=<login>` when it named the GitHub
+login it writes as: a fleet brain acts as the brain only while the lock
+names its own login (docs/BRAIN.md, Shared brain duty). Every attempt
+answers with the holder record, so a
 brain can tell its own lock from a peer's (loom#2275): a re-attempt that finds
 the caller's own live lock is acquired, and a peer's lock is told with its
 holder and how long it has held it.
@@ -20,6 +23,8 @@ from .github import GitHub
 
 LOCK_BRANCH = "loom-lock/brain"
 HOLDER_RE = re.compile(r"[A-Za-z0-9._-]+")
+# A GitHub login as LOOM_BRIEF_AUTHORS writes it: an App reads "<slug>[bot]".
+LOGIN_RE = re.compile(r"[A-Za-z0-9._-]+(?:\[bot\])?")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Seconds between tries while `attempt_waiting` waits out a peer's lock.
 WAIT_STEP = 60
@@ -33,6 +38,11 @@ def _check_holder(holder: str) -> None:
 def _check_run(run: str) -> None:
     if not isinstance(run, str) or (run and not HOLDER_RE.fullmatch(run)):
         raise ValueError("run may only use letters, digits, '.', '_' and '-'")
+
+
+def _check_login(login: str) -> None:
+    if not isinstance(login, str) or (login and not LOGIN_RE.fullmatch(login)):
+        raise ValueError("login is a GitHub login such as name or app-slug[bot]")
 
 
 def _utc(now: Optional[datetime]) -> datetime:
@@ -68,6 +78,8 @@ class Holder:
     run: str = ""
     # The tick step the holder last recorded, or "" when none.
     step: str = ""
+    # The GitHub login the holder took the lock as, or "" when it named none.
+    login: str = ""
 
     def is_caller(self, holder: str, run: str = "") -> bool:
         """Whether this is the caller's own lock: the same brain, and the same
@@ -107,7 +119,8 @@ def _holder_from(message: str) -> Holder:
                   acquired=(_parse_time(_field(r"(?:^|\s)acquired=(\S+)", first))
                             or _parse_time(started if isinstance(started, str) else None)),
                   run=_field(r"(?:^|\s)run=(\S+)", first) or "",
-                  step=step if isinstance(step, str) and HOLDER_RE.fullmatch(step) else "")
+                  step=step if isinstance(step, str) and HOLDER_RE.fullmatch(step) else "",
+                  login=_field(r"(?:^|\s)login=(\S+)", first) or "")
 
 
 def read_holder(gh: GitHub, repo: str) -> Optional[Holder]:
@@ -178,13 +191,14 @@ def _create_ref(gh: GitHub, repo: str, sha: str) -> bool:
 
 
 def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
-            now: Optional[datetime] = None, run: str = "") -> Attempt:
+            now: Optional[datetime] = None, run: str = "", login: str = "") -> Attempt:
     """Try once to take the lock. A live lock that is the caller's own (same
     holder, and same run when `run` is given) is acquired, not held: a
     re-attempt after a lost or misread answer must not stand the brain down
     against itself."""
     _check_holder(holder)
     _check_run(run)
+    _check_login(login)
     now = _utc(now)
     main = gh.rest("GET", "/repos/%s/git/ref/heads/main" % repo)
     base = main.data["object"]["sha"]
@@ -194,7 +208,9 @@ def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
         holder, expires.strftime(TIME_FORMAT), now.strftime(TIME_FORMAT))
     if run:
         message += " run=%s" % run
-    mine = Holder(holder, expires, now, run)
+    if login:
+        message += " login=%s" % login
+    mine = Holder(holder, expires, now, run, login=login)
     commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
         "message": message,
         "tree": tree,
@@ -220,7 +236,7 @@ def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
 
 
 def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,
-                    wait: int = 0, run: str = "",
+                    wait: int = 0, run: str = "", login: str = "",
                     clock: Optional[Callable[[], datetime]] = None,
                     sleep: Callable[[float], None] = time.sleep,
                     step: int = WAIT_STEP) -> Attempt:
@@ -232,7 +248,7 @@ def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,
     deadline = start + timedelta(minutes=max(0, wait))
     while True:
         now = _utc(clock())
-        result = attempt(gh, repo, holder, minutes, now, run)
+        result = attempt(gh, repo, holder, minutes, now, run, login)
         if result.acquired or now + timedelta(seconds=step) > deadline:
             waited = int((now - start).total_seconds() // 60)
             return Attempt(result.acquired, result.holder, holder, result.already, waited)
