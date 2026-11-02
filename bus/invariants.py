@@ -1751,16 +1751,20 @@ class Filer:
         """Close the open issue of each gone SETTLES breach whose subject
         settled for good, its note as a comment. Walks the listing,
         not the local map, so a breach filed before the map or gone while the
-        station was down settles too. run() calls it before filing anything,
-        so the pass's writes go here first (loom#2451: filing spent them every
-        pass that could write, and four issues about closed epics stayed open
-        for days), and it reads no comments (a deferred comment read stopped
-        the whole clear)."""
+        station was down settles too, oldest issue first. run() calls it
+        before filing anything, so the pass's writes go here first
+        (loom#2451: filing spent them every pass that could write, and four
+        issues about closed epics stayed open for days), and it reads no
+        comments (a deferred comment read stopped the whole clear)."""
         listing = self._listing()
         for key in list(self.subjects):
             if listing.get(key) is None or listing[key] in self._listed_closed:
                 self.subjects.pop(key, None)
-        for key, number in listing.items():
+        # Oldest first. GitHub lists the newest first, and at FOLD_MAX closes
+        # a pass the oldest issues waited behind every newer settled one
+        # (loom#2451: three reports about epics closed for five days sat
+        # behind about 25 newer ones at two closes a writable pass).
+        for key, number in sorted(listing.items(), key=lambda item: item[1]):
             if self.writes + FOLD_WRITES > WRITES_MAX or self.folds >= FOLD_MAX:
                 return
             invariant = key.split("/", 1)[0]

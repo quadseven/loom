@@ -1020,6 +1020,26 @@ class SettleBeforeFilingTest(StationBase):
         self.assertEqual(filed["state"], "open")
         self.assertFalse(any("closed settled" in line for line in self.said), self.said)
 
+    def test_the_oldest_settled_report_closes_before_newer_ones(self):
+        """The live shape after the fix above deployed: GitHub lists the
+        newest issue first, and newer settled reports outnumbered FOLD_MAX,
+        so each writable pass closed two of them and the oldest reports,
+        about epics closed for days, never came up."""
+        newer = (200, 201, 202)
+        facts = self.far_epics("closed", (35,) + newer)
+        # Inserted newest first: the fake lists in insertion order.
+        later = [self.report(97 - i, n) for i, n in enumerate(newer)]
+        old = self.report(90, 35)
+        listed = [i["number"] for i in self.gh.paginate(
+            "/repos/%s/issues?labels=loom:invariant&state=all" % REPO) if i["number"] != GOAL]
+        self.assertEqual(listed, [97, 96, 95, 90])
+        self.run_filer(facts, self.others("a"))
+        self.assertEqual(old["state"], "closed", self.said)
+        self.assertIn("epic issue 35 of %s is closed" % OTHER,
+                      "".join(c["body"] for c in self.gh.comments[(REPO, 90)]))
+        # FOLD_MAX closes a pass: the oldest newer one goes with it.
+        self.assertEqual([r["state"] for r in later], ["open", "open", "closed"])
+
 
 class FilerTest(unittest.TestCase):
     def setUp(self):
