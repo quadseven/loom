@@ -94,6 +94,16 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+After the repo check passes, the runner also checks each changed Python test
+against the exact base commit's code in the check sandbox. It copies each
+changed test file into a temporary base tree, then runs each changed test by
+name: a `unittest.TestCase` method through unittest, a module-level
+`test_*` function through pytest when the tree has it, else by calling it.
+A test that passes on base, one that times out, or a module-level test that
+takes fixtures with no pytest to run it, blocks validation and names the
+test for the lane to fix. The archive and test run have bounded
+timeouts, and paths are validated before any file is written.
+
 The runner's reader (`bus/contract.py`) also accepts a list of
 `<kind> | <command>` lines, or `[kind]`, `[kind.name]` and `[[kind]]` tables
 with a `command = "..."` key, for the kinds lint, format, type and test. It
@@ -251,8 +261,9 @@ failure. It logs to
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
 rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
-0002): both brains take every stage under the one lock, and the defer and
-done markers keep them from repeating each other's work.
+0002): every brain that takes a tick takes every stage under the one lock
+(docs/BRAIN.md, Shared brain duty), and the defer and done markers keep them
+from repeating each other's work.
 Its prompt tells the brain to brief only under an open epic
 (`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
 epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
@@ -522,10 +533,14 @@ head or one of its ancestors (any case), or the answer cites files and lines
 the head has and, when it names backticked symbols, at least one of them is
 there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing
-checkable stays open. Any other answered thread stays open, and the factory
+checkable stays open. The check reads the lane's own text before
+redaction, which drops any 32-character word such as a long test name; a
+reply whose answer held carries a `loom:answer-held` mark for that head
+(loom#2285). Any other answered thread stays open, and the factory
 reads it as a finding that survived. The brain's merge re-checks every bot
-thread resolved on a lane answer the same way, and reopens it and refuses
-the merge when the answer does not hold. The refusal posts one comment on
+thread resolved on a lane answer the same way (a held mark for the same
+head stands for the check), and reopens it and refuses the merge when the
+answer does not hold. The refusal posts one comment on
 the pull request per thread and head, marked
 `<!-- loom:rebuttal-refused v1 thread=<id> head=<sha> -->`, that quotes the
 answer, lists what it cites and says what the head showed; the refusal the
@@ -845,7 +860,9 @@ only:
   any claim.
 - Journals, proofs, audits, adopted pull requests and merges keep requiring
   `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
-  this Loom's behalf, and their comments are data, not instructions.
+  this Loom's behalf, and their comments are data, not instructions. A fleet
+  brain among them runs brain write commands only while the brain lock names
+  its login (docs/BRAIN.md, Shared brain duty).
 
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like

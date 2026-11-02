@@ -353,7 +353,7 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     """Open loom:triage issues (not pull requests), oldest first, leaving out
     one assigned to another operator (docs/LANES.md, Two Looms) and one that is
     not work for a lane (brain.not_work_reason: wayfinder, awaiting a live
-    check, a factory incident, an epic), as triage does, so an issue labelled
+    check, a factory incident, an epic, a restating invariant report), as triage does, so an issue labelled
     loom:triage before a rule existed is not rewritten into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)

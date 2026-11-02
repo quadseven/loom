@@ -28,8 +28,11 @@ empties says "none"; after CLEAR_AFTER of none the issue closes with one
 cleared note (edited, not reposted, on a later clear), and a violation that
 returns reopens the same issue. A repo whose facts could not be read keeps
 its issue as it is. Older per-violation issues of those kinds close with a
-comment saying why, FOLD_MAX a pass and never one rewritten into a ticket; a
-running count on the tracking issue of their repo is edited in place.
+comment saying why, FOLD_MAX a pass, a ticket a rewrite made of one and a
+report left with loom:invariant alone too unless something has it in hand
+(loom#2506, loom#2526); a running count on the tracking
+issue of their repo is edited in place. The rewriter takes no such issue
+(brain.not_work_reason).
 Adding an invariant is one function in INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
@@ -57,6 +60,7 @@ from . import notify
 from . import review_debt
 from . import shadow
 from . import text as _text
+from . import tickets
 from . import watch
 from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
@@ -186,12 +190,13 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # pass, before filing or any other clear, whatever labels it carries
 # (loom#2022: five lane-pr-stalled issues stayed open up to a day after their
 # pull requests merged or closed, and an operator closed them by hand).
-SETTLES = ("lane-pr-stalled", "epic-over-cap")
+EPIC_OVER_CAP = "epic-over-cap"
+SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
 # Invariants that restate state the pull request, the epic or the dashboard
 # already shows: one tracking issue per (kind, subject repo), its list edited
 # in place, instead of one issue per violation (loom#2099). The settle path
 # above now only closes per-violation issues filed before this.
-ROLLED = ("lane-pr-stalled", "plan-check-failed", "epic-over-cap", "epic-title-shared")
+ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared")
 ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
 ROLL_TITLE = "Invariant: %s in %s"
 ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
@@ -215,6 +220,12 @@ ROLL_CHECKED = "Last checked: %s (checked every station pass; this issue is edit
 # A tracking issue is a list, not work: it carries loom:invariant only, so the
 # rewriter never turns it into a ticket and freezes the list.
 ROLL_LABELS = [LABEL]
+# A ticket a rewrite made of an older issue of a ROLLED kind (loom#2506) is
+# still settled like that issue unless something has it in hand: a lane at
+# one of these states, an operator's claim (the station claims a running
+# ticket), an ask, or a merged pull request whose own path closes it.
+BUSY_TICKET_STATES = ("running", "pr", "ready") + tickets.MERGED_STATES
+BUSY_LABELS = ("loom:human", "awaiting-live-check")
 # Per pass, at most this many older per-violation issues close into a tracking
 # issue, within WRITES_MAX. Each says why in a comment first (bus/closing.py),
 # and this cap bounds those mails. FOLD_SUMMARY on the tracking issue counts
@@ -240,7 +251,7 @@ ROLL_HINTS = {
         "OWNER/NAME#N --file FIX.md`"]),
     "plan-check-failed": "Each pull request here is held by its plan check; fix the rows its "
                          "check-run summary marks failing.",
-    "epic-over-cap": "Each epic here holds more than its cap; new work goes into a next epic.",
+    EPIC_OVER_CAP: "Each epic here holds more than its cap; new work goes into a next epic.",
     "epic-title-shared": "The epics on each line share one title; give each a distinct title, "
                          "and move the tickets of the older ones under one.",
 }
@@ -719,11 +730,12 @@ def ticket_outside_epic(f: Facts) -> List[Breach]:
 
 
 def epic_over_cap(f: Facts) -> List[Breach]:
-    """An epic holding more than EPIC_TICKETS tickets (its sub-issues and
-    the issues whose Part of line names it, each once), or any epic, the
-    standing repairs epic too, holding GitHub's limit of sub-issues: GitHub
-    refuses its next link (loom#2023). A closed epic is finished work whose
-    closed tickets can never leave it, so it is never over a cap (loom#2140)."""
+    """An open epic holding more than EPIC_TICKETS open tickets (its
+    sub-issues and the issues whose Part of line names it, each once), or any
+    epic, the standing repairs epic too, holding GitHub's limit of sub-issues:
+    GitHub refuses its next link (loom#2023). A closed epic is finished work
+    whose closed tickets can never leave it, so it is never over a cap
+    (loom#2140)."""
     if f.shapes is None:
         return []
     out = []
@@ -731,7 +743,7 @@ def epic_over_cap(f: Facts) -> List[Breach]:
         for epic in shape.epics:
             if epic.open and epic.sub_issues >= SUB_ISSUE_LIMIT:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
+                    EPIC_OVER_CAP, epic.epic.key,
                     "Epic %s holds %d sub-issues (GitHub's limit %d)"
                     % (epic.epic.label, epic.sub_issues, SUB_ISSUE_LIMIT),
                     ("Epic %s of goal home %s holds %d sub-issues; GitHub refuses a sub-issue "
@@ -742,17 +754,18 @@ def epic_over_cap(f: Facts) -> List[Breach]:
                     line="Epic %s of goal home %s: %d sub-issues (GitHub's limit %d)" % (
                         epic.epic.label, shape.goal.label, epic.sub_issues, SUB_ISSUE_LIMIT),
                     where=_where(epic.epic)))
-            elif epic.open and epic.tickets > EPIC_TICKETS and not epic.standing:
+            elif epic.open and len(epic.open_tickets) > EPIC_TICKETS and not epic.standing:
                 out.append(Breach(
-                    "epic-over-cap", epic.epic.key,
-                    "Epic %s holds %d tickets (cap %d)" % (epic.epic.label, epic.tickets,
-                                                           EPIC_TICKETS),
-                    ("Epic %s of goal home %s holds %d tickets; an epic holds at most %d, "
+                    EPIC_OVER_CAP, epic.epic.key,
+                    "Epic %s holds %d open tickets (cap %d)"
+                    % (epic.epic.label, len(epic.open_tickets), EPIC_TICKETS),
+                    ("Epic %s of goal home %s holds %d open tickets; an epic holds at most %d, "
                      "and more work goes into a next epic" % (
-                         epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),),
+                         epic.epic.label, shape.goal.label, len(epic.open_tickets),
+                         EPIC_TICKETS),),
                     f.now,
-                    line="Epic %s of goal home %s: %d tickets (cap %d)" % (
-                        epic.epic.label, shape.goal.label, epic.tickets, EPIC_TICKETS),
+                    line="Epic %s of goal home %s: %d open tickets (cap %d)" % (
+                        epic.epic.label, shape.goal.label, len(epic.open_tickets), EPIC_TICKETS),
                     where=_where(epic.epic)))
     return out
 
@@ -1235,12 +1248,32 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
 # The Facts field each ROLLED kind reads: a pass that could not read it says
 # nothing about that kind, so its tracking issue is left as it is.
 ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
-                "epic-over-cap": "shapes", "epic-title-shared": "shapes"}
+                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes"}
 
 
 def read_kinds(facts: Facts) -> Tuple[str, ...]:
     """The ROLLED kinds whose facts this pass read."""
     return tuple(kind for kind in ROLLED if getattr(facts, ROLLED_FACTS[kind]) is not None)
+
+
+def _busy_ticket(labels: Sequence[str]) -> bool:
+    """Whether a ticket's or a report's labels show something has it in
+    hand: a lane at a BUSY_TICKET_STATES state, a claim:<login>, an ask
+    (needs:<login>) or a BUSY_LABELS label."""
+    if tickets.ticket_state({"labels": [{"name": n} for n in labels]}) in BUSY_TICKET_STATES:
+        return True
+    return any(n.startswith(("claim:", "needs:")) or n in BUSY_LABELS for n in labels)
+
+
+def _clears(labels: Sequence[str]) -> bool:
+    """Whether the clear step closes a report with these labels once its
+    breach is gone: a triage or rewritten one, or one left with
+    loom:invariant alone (its triage label came off, no ticket was made of
+    it) that nothing holds (loom#2526: such reports of every kind but the
+    SETTLES ones had no close path, and stayed open for weeks)."""
+    if "loom:triage" in labels or "loom:rewritten" in labels:
+        return True
+    return TICKET_LABEL not in labels and not _busy_ticket(labels)
 
 
 def is_rolled(b: Breach) -> bool:
@@ -1321,6 +1354,9 @@ class Filer:
         # Issue numbers the listing found carrying loom:ticket: a ticket is
         # the work, no longer the breach's own issue.
         self._ticketed: set = set()
+        # Of those, the tickets something has in hand (_busy_ticket): no
+        # settle or fold closes them.
+        self._busy: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
 
@@ -1372,9 +1408,12 @@ class Filer:
         if ROLL_MARKER in str(issue.get("body") or ""):
             self._rolls.setdefault(key, number)
         self._texts.setdefault(key, "%s\n%s" % (issue.get("title") or "", issue.get("body") or ""))
-        ticket = TICKET_LABEL in self._label_names(issue)
+        names = self._label_names(issue)
+        ticket = TICKET_LABEL in names
         if ticket:
             self._ticketed.add(number)
+            if _busy_ticket(names):
+                self._busy.add(number)
         if issue.get("state") == "closed":
             self._listed_closed.add(number)
         return ticket
@@ -1796,8 +1835,11 @@ class Filer:
             if (key in current or invariant not in SETTLES or key in self._rolls
                     or number in self._listed_closed):
                 continue
-            if number in self._ticketed:
-                # Rewritten into work: the ticket path closes it.
+            if number in self._busy:
+                # Rewritten into work something has in hand: its own path
+                # closes it. An idle one settles like the issue it was
+                # (loom#2506: five whose pull requests had closed held goal
+                # slots at loom:failed).
                 self.subjects.pop(key, None)
                 continue
             subject = self._subject_of(key)
@@ -1901,8 +1943,9 @@ class Filer:
     def _clear_one(self, key: str, number: int, current: Dict[str, Breach]) -> bool:
         """Settle one open issue whose breach is gone this pass: a tracking
         issue lists none or closes, an older issue folds into its rolling
-        one, a standing one says clear, any other closes once quiet. False
-        when the pass has no writes left."""
+        one, a standing one says clear, any other closes once quiet. A ticket
+        and a held report keep their own path. False when the pass has no
+        writes left."""
         issue = self._issue(number)
         if issue is None or issue.get("state") != "open":
             return True
@@ -1910,10 +1953,13 @@ class Filer:
                   if isinstance(x, dict)]
         if self._rolls.get(key) == number and TICKET_LABEL not in labels:
             return self._clear_roll(key, number, issue)
-        if "loom:triage" not in labels and "loom:rewritten" not in labels:
-            return True
-        if self._old_rolled(key):
+        clears = _clears(labels)
+        if self._old_rolled(key) and (clears or TICKET_LABEL in labels):
+            # A rewrite into a ticket drops loom:triage; the ticket still
+            # restates its kind (loom#2506).
             return self._fold_old_rolled(key, number, issue, labels, current)
+        if not clears:
+            return True
         comments = self._comments(number)
         into = self._rolled_into(key, current)
         if into is not None and into != number:
@@ -1950,11 +1996,14 @@ class Filer:
                          current: Dict[str, Breach]) -> bool:
         """Close one older issue of a ROLLED kind, whatever its subject does
         now: its kind files no such issue, and a live subject is a line of the
-        tracking issue. A ticket is work and a needs:<login> ask waits for its
-        answer, so neither folds, and a kind this pass did not read says
-        nothing. False when the pass has no writes left."""
+        tracking issue. A ticket something has in hand (_busy_ticket) and a
+        needs:<login> ask that waits for its answer do not fold, and a kind
+        this pass did not read says nothing. A ticket nothing has in hand
+        folds: its only remedy is a GitHub operation no lane can make
+        (loom#2506). False when the pass has no writes left."""
         invariant = key.split("/", 1)[0]
-        if (any(n.startswith("needs:") for n in labels) or TICKET_LABEL in labels
+        if (any(n.startswith("needs:") for n in labels)
+                or (TICKET_LABEL in labels and _busy_ticket(labels))
                 or invariant not in self.read):
             return True
         if self.writes + FOLD_WRITES > WRITES_MAX:
@@ -2001,7 +2050,8 @@ class Filer:
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
-        """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
+        """Close an open report (triage, rewritten, or loom:invariant alone and
+        not held) whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
         breaches = [_epoch(issue.get("created_at"))] + self._broken_times(comments)

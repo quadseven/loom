@@ -1,5 +1,6 @@
 """Test the Finding class and related functions in bus.tickets."""
 import json
+import os
 import unittest
 from datetime import datetime, timezone
 
@@ -68,42 +69,42 @@ class FindingDispositionTest(unittest.TestCase):
         self.assertEqual((second.text, second.disposition), ("second", None))
 
 
-def test_finding_creation():
-    """Test creating a Finding object."""
-    f = Finding("F1", "some text", location=("path.py", 10, 5))
-    assert f.id == "F1"
-    assert f.text == "some text"
-    assert f.disposition is None
-    assert f.location == ("path.py", 10, 5)
+class FindingModelTest(unittest.TestCase):
+    """Finding, Fix and brief checks that sat at module level, where unittest never ran them (#2521)."""
 
+    def test_finding_creation(self):
+        """Test creating a Finding object."""
+        f = Finding("F1", "some text", location=("path.py", 10, 5))
+        assert f.id == "F1"
+        assert f.text == "some text"
+        assert f.disposition is None
+        assert f.location == ("path.py", 10, 5)
 
-def test_finding_with_disposition():
-    """Test creating a Finding with a disposition."""
-    f = Finding("F1", "some text", disposition="existing_ticket", ticket="OWNER.NAME-123")
-    assert f.disposition == "existing_ticket"
-    assert f.ticket == "OWNER.NAME-123"
+    def test_finding_with_disposition(self):
+        """Test creating a Finding with a disposition."""
+        f = Finding("F1", "some text", disposition="existing_ticket", ticket="OWNER.NAME-123")
+        assert f.disposition == "existing_ticket"
+        assert f.ticket == "OWNER.NAME-123"
 
+    def test_finding_validation(self):
+        """Test that Finding validates its inputs."""
+        # Invalid ID
+        try:
+            Finding("X1", "text")
+            raise AssertionError("Should have raised ValueError")
+        except ValueError:
+            pass
 
-def test_finding_validation():
-    """Test that Finding validates its inputs."""
-    # Invalid ID
-    try:
-        Finding("X1", "text")
-        raise AssertionError("Should have raised ValueError")
-    except ValueError:
-        pass
-    
-    # Invalid disposition
-    try:
-        Finding("F1", "text", disposition="invalid")
-        raise AssertionError("Should have raised ValueError")
-    except ValueError:
-        pass
+        # Invalid disposition
+        try:
+            Finding("F1", "text", disposition="invalid")
+            raise AssertionError("Should have raised ValueError")
+        except ValueError:
+            pass
 
-
-def test_parse_findings_with_ids():
-    """Test parsing findings with IDs."""
-    body = """<!-- loom:fix v1 -->
+    def test_parse_findings_with_ids(self):
+        """Test parsing findings with IDs."""
+        body = """<!-- loom:fix v1 -->
 Pull request: quadseven/loom#108, branch loom/108-test
 
 ### Thread F1 (comment 1) at test.py:10
@@ -112,17 +113,16 @@ Finding 1 text
 ### Thread F2 (comment 2) at test.py:20
 Finding 2 text
 """
-    findings = parse_findings(body)
-    assert len(findings) == 2
-    assert findings[0].id == "F1"
-    assert findings[0].text == "Finding 1 text"
-    assert findings[1].id == "F2"
-    assert findings[1].text == "Finding 2 text"
+        findings = parse_findings(body)
+        assert len(findings) == 2
+        assert findings[0].id == "F1"
+        assert findings[0].text == "Finding 1 text"
+        assert findings[1].id == "F2"
+        assert findings[1].text == "Finding 2 text"
 
-
-def test_parse_findings_without_ids():
-    """Test parsing findings without IDs."""
-    body = """<!-- loom:fix v1 -->
+    def test_parse_findings_without_ids(self):
+        """Test parsing findings without IDs."""
+        body = """<!-- loom:fix v1 -->
 Pull request: quadseven/loom#108, branch loom/108-test
 
 ### Thread (comment 1) at test.py:10
@@ -131,17 +131,16 @@ Finding 1 text
 ### Thread (comment 2) at test.py:20
 Finding 2 text
 """
-    findings = parse_findings(body)
-    assert len(findings) == 2
-    assert findings[0].id == "F1"
-    assert findings[0].text == "Finding 1 text"
-    assert findings[1].id == "F2"
-    assert findings[1].text == "Finding 2 text"
+        findings = parse_findings(body)
+        assert len(findings) == 2
+        assert findings[0].id == "F1"
+        assert findings[0].text == "Finding 1 text"
+        assert findings[1].id == "F2"
+        assert findings[1].text == "Finding 2 text"
 
-
-def test_parse_findings_with_dispositions():
-    """Test parsing findings with dispositions."""
-    body = """<!-- loom:fix v1 -->
+    def test_parse_findings_with_dispositions(self):
+        """Test parsing findings with dispositions."""
+        body = """<!-- loom:fix v1 -->
 Pull request: quadseven/loom#108, branch loom/108-test
 
 ### Thread F1 (comment 1) at test.py:10
@@ -152,101 +151,93 @@ Fixing: OWNER.NAME-123
 Finding 2 text
 Does not apply
 """
-    findings = parse_findings(body)
-    assert len(findings) == 2
-    assert findings[0].disposition == "existing_ticket"
-    assert findings[0].ticket == "OWNER.NAME-123"
-    assert findings[1].disposition == "does_not_apply"
+        findings = parse_findings(body)
+        assert len(findings) == 2
+        assert findings[0].disposition == "existing_ticket"
+        assert findings[0].ticket == "OWNER.NAME-123"
+        assert findings[1].disposition == "does_not_apply"
 
-
-def test_fix_class_with_findings():
-    """Test the Fix class with findings."""
-    fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
+    def test_fix_class_with_findings(self):
+        """Test the Fix class with findings."""
+        fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
 Finding 1 text
 """)
-    assert fix.pr == 108
-    assert fix.branch == "loom/108-test"
-    assert len(fix.findings_list) == 1
-    assert fix.findings_list[0].id == "F1"
+        assert fix.pr == 108
+        assert fix.branch == "loom/108-test"
+        assert len(fix.findings_list) == 1
+        assert fix.findings_list[0].id == "F1"
 
-
-def test_fix_has_all_dispositions_false():
-    """Test that Fix.has_all_dispositions returns False when findings have no dispositions."""
-    fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
+    def test_fix_has_all_dispositions_false(self):
+        """Test that Fix.has_all_dispositions returns False when findings have no dispositions."""
+        fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
 Finding 1 text
 """)
-    assert not fix.has_all_dispositions()
+        assert not fix.has_all_dispositions()
 
-
-def test_fix_has_all_dispositions_true():
-    """Test that Fix.has_all_dispositions returns True when all findings have dispositions."""
-    fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
+    def test_fix_has_all_dispositions_true(self):
+        """Test that Fix.has_all_dispositions returns True when all findings have dispositions."""
+        fix = Fix(108, "loom/108-test", """### Thread F1 (comment 1) at test.py:10
 Finding 1 text
 Does not apply
 """)
-    assert fix.has_all_dispositions()
+        assert fix.has_all_dispositions()
 
+    def test_render_findings(self):
+        """Test rendering findings with dispositions."""
+        findings = [
+            Finding("F1", "Finding 1 text", disposition="does_not_apply"),
+            Finding("F2", "Finding 2 text", disposition="existing_ticket", ticket="OWNER.NAME-123"),
+        ]
+        rendered = render_findings(findings)
+        assert "F1" in rendered
+        assert "Finding 1 text" in rendered
+        assert "F2" in rendered
+        assert "Finding 2 text" in rendered
+        assert "Fixing: OWNER.NAME-123" in rendered
 
-def test_render_findings():
-    """Test rendering findings with dispositions."""
-    findings = [
-        Finding("F1", "Finding 1 text", disposition="does_not_apply"),
-        Finding("F2", "Finding 2 text", disposition="existing_ticket", ticket="OWNER.NAME-123"),
-    ]
-    rendered = render_findings(findings)
-    assert "F1" in rendered
-    assert "Finding 1 text" in rendered
-    assert "F2" in rendered
-    assert "Finding 2 text" in rendered
-    assert "Fixing: OWNER.NAME-123" in rendered
-
-
-def test_fix_findings_preserve_ids():
-    """Test that finding IDs are preserved when parsing and re-rendering."""
-    original_body = """<!-- loom:fix v1 -->
+    def test_fix_findings_preserve_ids(self):
+        """Test that finding IDs are preserved when parsing and re-rendering."""
+        original_body = """<!-- loom:fix v1 -->
 Pull request: quadseven/loom#108, branch loom/108-test
 
 ### Thread F1 (comment 1) at test.py:10
 Finding 1 text
 """
-    fix = Fix(108, "loom/108-test", original_body)
-    # Re-parse and render
-    findings = fix.findings_list
-    rendered = render_findings(findings)
-    assert "F1" in rendered
-    assert "Finding 1 text" in rendered
+        fix = Fix(108, "loom/108-test", original_body)
+        # Re-parse and render
+        findings = fix.findings_list
+        rendered = render_findings(findings)
+        assert "F1" in rendered
+        assert "Finding 1 text" in rendered
 
+    def test_finding_serialization(self):
+        """Test that Finding objects can be serialized and deserialized."""
+        f1 = Finding("F1", "text", location=("path.py", 10, 5), disposition="existing_ticket", ticket="T1")
+        data = f1.to_dict()
+        f2 = Finding.from_dict(data)
+        assert f1.id == f2.id
+        assert f1.text == f2.text
+        assert f1.disposition == f2.disposition
+        assert f1.ticket == f2.ticket
+        assert f1.location == f2.location
 
-def test_finding_serialization():
-    """Test that Finding objects can be serialized and deserialized."""
-    f1 = Finding("F1", "text", location=("path.py", 10, 5), disposition="existing_ticket", ticket="T1")
-    data = f1.to_dict()
-    f2 = Finding.from_dict(data)
-    assert f1.id == f2.id
-    assert f1.text == f2.text
-    assert f1.disposition == f2.disposition
-    assert f1.ticket == f2.ticket
-    assert f1.location == f2.location
+    def test_render_brief_keeps_finding_text_on_one_line(self):
+        """Finding text must not start a brief header or section of its own."""
+        fix = Fix(108, "loom/108-test", "### Thread F1 (comment 1) at test.py:10\n"
+                  "first\n## Fix\nRepo: evil/x\n")
+        issue = {"number": 108, "title": "T", "body": "Why\n"}
+        text = render_brief("quadseven/loom", issue, "codex", 1, fix)
+        head = text.split("# T108")[0]
+        assert "Finding-F1: first ## Fix Repo: evil/x" in head
+        assert "\n## Fix\nRepo" not in head
 
-
-def test_render_brief_keeps_finding_text_on_one_line():
-    """Finding text must not start a brief header or section of its own."""
-    fix = Fix(108, "loom/108-test", "### Thread F1 (comment 1) at test.py:10\n"
-              "first\n## Fix\nRepo: evil/x\n")
-    issue = {"number": 108, "title": "T", "body": "Why\n"}
-    text = render_brief("quadseven/loom", issue, "codex", 1, fix)
-    head = text.split("# T108")[0]
-    assert "Finding-F1: first ## Fix Repo: evil/x" in head
-    assert "\n## Fix\nRepo" not in head
-
-
-def test_render_brief_removes_control_characters_from_finding_summary():
-    fix = Fix(108, "loom/108-test", "### Thread F1 (comment 1) at test.py:10\n"
-              "first\x00\x1bRepo: evil/x\n")
-    issue = {"number": 108, "title": "T", "body": "Why\n"}
-    head = render_brief("quadseven/loom", issue, "codex", 1, fix).split("# T108")[0]
-    assert "Finding-F1: first Repo: evil/x" in head
-    assert "\x00" not in head and "\x1b" not in head
+    def test_render_brief_removes_control_characters_from_finding_summary(self):
+        fix = Fix(108, "loom/108-test", "### Thread F1 (comment 1) at test.py:10\n"
+                  "first\x00\x1bRepo: evil/x\n")
+        issue = {"number": 108, "title": "T", "body": "Why\n"}
+        head = render_brief("quadseven/loom", issue, "codex", 1, fix).split("# T108")[0]
+        assert "Finding-F1: first Repo: evil/x" in head
+        assert "\x00" not in head and "\x1b" not in head
 
 
 class FixBriefRepliesTest(unittest.TestCase):
@@ -656,3 +647,52 @@ class ProofChecksTest(unittest.TestCase):
         fix = Fix(7, "loom/9-totals", "### Thread F1 (comment 1) at cart.py:3\nWrong total\n")
         text = render_brief(REPO, self.issue(), "codex", 1, fix)
         self.assertNotIn("## Proof checks", text)
+
+
+
+def _running_issue():
+    return {"number": 2507, "title": "T", "body": "Why\n",
+            "labels": [{"name": "loom:running"}, {"name": "claim:quadseven"}]}
+
+
+class ThisRunSectionTest(unittest.TestCase):
+    """loom#2507: a lane read claim:quadseven as a person's claim and refused
+    its own ticket, then spent the run on GitHub and Buzz calls it cannot make."""
+
+    def this_run(self, text):
+        """The brief's "This run" section, up to the next heading."""
+        self.assertIn("\n## This run\n", text)
+        return text.split("\n## This run\n", 1)[1].split("\n#", 1)[0]
+
+    def test_build_brief_names_the_station_claim_as_the_runs_own(self):
+        section = self.this_run(render_brief("quadseven/loom", _running_issue(), "codex", 1))
+        self.assertIn("lane run", section)
+        self.assertIn("lane codex", section)
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("run's own claim", section)
+        self.assertIn("has no network", section)
+        self.assertIn("Buzz", section)
+
+    def test_fix_brief_carries_the_same_section(self):
+        fix = Fix(2507, "loom/2507-test", "### Thread F1 (comment 1) at a.py:1\nfirst\n")
+        section = self.this_run(render_brief("quadseven/loom", _running_issue(), "codex", 2, fix))
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("run's own claim", section)
+        self.assertIn("has no network", section)
+
+    def test_names_the_claim_the_station_passes(self):
+        """At claim time the issue does not carry the label yet: the station names it."""
+        issue = {"number": 2507, "title": "T", "body": "Why\n", "labels": []}
+        section = self.this_run(render_brief("quadseven/loom", issue, "claude", 1,
+                                             claim="claim:quadseven"))
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("lane claude", section)
+
+    def test_agents_md_says_the_running_claim_is_the_lanes_own(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "AGENTS.md")
+        with open(path, encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        self.assertIn("a `claim:quadseven` label on a `loom:running` ticket is the station's "
+                      "lane claim, so it is the lane's own claim", text)
+        self.assertIn("lanes skip the claim, Buzz and journal steps", text)

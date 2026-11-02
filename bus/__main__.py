@@ -122,8 +122,12 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         # The line names the holder, says whether the lock is the caller's
         # own and how long it has been held (loom#2275); exit 0 whenever the
         # caller holds the lock, its own earlier lock included.
+        # The lock names the login the caller writes as, so a fleet brain
+        # (LOOM_TRUSTED_BRIEFERS) may act as the brain while it holds it
+        # (docs/BRAIN.md, Shared brain duty).
         result = lock.attempt_waiting(gh, args.repo, args.holder, args.minutes,
-                                      wait=args.wait, run=args.run)
+                                      wait=args.wait, run=args.run,
+                                      login=brain.writer_login(gh))
         print(result.line())
         return 0 if result.acquired else 1
     if args.command == "unlock":

@@ -278,6 +278,17 @@ class RewriteIssueTest(Base):
         self.fake.add_triage(7)
         self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
 
+    def test_a_restating_invariant_report_is_not_a_candidate(self):
+        # loom#2506: per-violation reports of a ROLLED kind were rewritten
+        # into lane tickets whose only remedy is a GitHub operation a
+        # sandboxed lane cannot make. A kind outside ROLLED still is one.
+        for number, key in ((8, "lane-pr-stalled/20d83e430f73"),
+                            (7, "roll-pin-off/2cfc73ee59d8")):
+            self.fake.add_triage(number)
+            self.fake.triage[number]["labels"].append({"name": "loom:invariant"})
+            self.fake.triage[number]["body"] = "<!-- loom:invariant v1 key=%s -->\nBroken." % key
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_an_operator_claimed_or_goal_named_issue_is_skipped_with_one_reason(self):
         # loom#2143: the live goal issue carried loom:triage and the
         # operator's claim label; the rewrite turned it into a lane ticket.

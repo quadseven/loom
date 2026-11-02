@@ -3838,7 +3838,22 @@ def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
         return "factory incident"
     if _is_epic(issue):
         return "epic"
+    if restating_invariant(issue):
+        # Its only remedy is a GitHub operation a sandboxed lane cannot make,
+        # and the filer settles it once it clears (loom#2506).
+        return "restating invariant report"
     return None
+
+
+def restating_invariant(issue: Dict[str, Any]) -> bool:
+    """Whether the issue is a loom:invariant report of a kind that restates
+    state the pull request, the epic or the dashboard already shows
+    (invariants.ROLLED), by the kind in its marker key."""
+    from . import invariants  # invariants imports this module
+    if invariants.LABEL not in _labels(issue):
+        return False
+    m = invariants.MARKER_RE.search(str(issue.get("body") or ""))
+    return m is not None and m.group(1).split("/", 1)[0] in invariants.ROLLED
 
 
 # A live goal or a goal journal is read by every session, so no pass may
@@ -4535,12 +4550,16 @@ def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
 
 
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    # The newest 20 commits, with their parent counts: a review finding is
+    # fixed only by a later commit that is not a base merge
+    # (merge_tier.fix_committed, loom#2285).
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
              ' reviews(last:100) { nodes { author { __typename login }'
              ' authorCanPushToRepository state submittedAt } } '
-             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+             ' commits(last:20) { nodes { commit { committedDate parents { totalCount }'
+             ' statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } }'
              ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
@@ -4584,7 +4603,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
-        _refuse_unheld_answers(gh, repo, number, details, env)
+        held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -4609,7 +4628,8 @@ def merge(gh: GitHub, repo: str, number: int,
         if reason:
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
-        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
+        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict,
+                                 held)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -4907,7 +4927,8 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]],
-                      verdict: Optional[Callable[[], Optional[answer.Answer]]] = None) -> str:
+                      verdict: Optional[Callable[[], Optional[answer.Answer]]] = None,
+                      held: Container[str] = ()) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -4940,8 +4961,8 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         or factory.DEFAULT_REVIEW_BOT
     blocking = merge_tier.blocking_findings(
         merge_tier.review_threads(gh, repo, number),
-        str(_head_commit(details).get("committedDate") or ""),
-        lambda c: by_bot(dict(c), bot), env)
+        merge_tier.fix_committed((details.get("commits") or {}).get("nodes") or []),
+        lambda c: by_bot(dict(c), bot), env, held)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
     capped = merge_tier.cap_refusal(gh, repo, env)
@@ -5056,16 +5077,21 @@ def _first(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
     return nodes[index] or {}
 
 
+def _answered(thread: Dict[str, Any], bot: str, trusted: set) -> bool:
+    """A resolved bot thread whose newest comment is a lane's answer."""
+    from . import factory  # factory imports this module
+    return bool(thread.get("isResolved") and by_bot(_first(thread, "comments", 0), bot)
+                and factory.lane_answered(_first(thread, "latest", -1), trusted))
+
+
 def _unheld_answer(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
                    bot: str, trusted: set) -> str:
     """Why a resolved bot thread whose newest comment is a lane's answer was
     resolved on an answer that does not hold on the head, else ""."""
-    from . import factory  # factory imports this module
-    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
-    if not (thread.get("isResolved") and by_bot(root, bot)
-            and factory.lane_answered(latest, trusted)):
+    if not _answered(thread, bot, trusted):
         return ""
-    return rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
+    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
+    return rebuttal.reply_refusal(gh, repo, head, str(latest.get("body") or ""),
                                   str(thread.get("path") or ""), str(root.get("body") or ""))
 
 
@@ -5124,17 +5150,21 @@ def _record_rebuttal_refusal(gh: GitHub, repo: str, number: int,
 
 
 def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
-                           env: Optional[Dict[str, str]] = None) -> None:
+                           env: Optional[Dict[str, str]] = None) -> Set[str]:
     """Refuse the merge when a review bot thread was resolved on a lane's
     answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
     thread is reopened, so the factory reads it as a finding that survived
     and moves it on, and the next merge sees it unresolved. The refusal
     leaves a marker comment on the pull request, and the error the journal
-    prints carries the same reason, thread and head (loom#2179)."""
+    prints carries the same reason, thread and head (loom#2179). Returns the
+    ids of the resolved threads whose answer held: such a finding needs no
+    fix commit to stop holding the merge (merge_tier.blocking_findings,
+    loom#2285)."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
     head = str(details.get("headRefOid") or "")
+    held: Set[str] = set()
     for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
         why = _unheld_answer(gh, repo, head, thread, bot, trusted)
         if why:
@@ -5143,6 +5173,9 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
             raise ValueError("review thread %s was resolved on a lane answer that does not "
                              "hold on the head: %s (rebuttal-refused thread=%s head=%s)"
                              % (thread.get("id"), why, thread.get("id"), head))
+        if thread.get("id") and _answered(thread, bot, trusted):
+            held.add(str(thread["id"]))
+    return held
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
@@ -5379,9 +5412,51 @@ def trusted_line(authors: Sequence[str]) -> str:
 def trusted_briefers(env: Optional[Dict[str, str]] = None) -> List[str]:
     """LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
     briefs this Loom builds like its own (tickets.brief_author_trusted). They
-    own nothing here, and their journals, proofs and merges are not trusted."""
+    own nothing here, and their journals, proofs and merges are not trusted
+    unless LOOM_BRIEF_AUTHORS lists them too. A fleet brain among them runs
+    brain write commands only while it holds the brain lock
+    (check_acting_brain)."""
     raw = (os.environ if env is None else env).get("LOOM_TRUSTED_BRIEFERS", "")
     return raw.replace(",", " ").split()
+
+
+def writer_login(gh: Any, env: Optional[Dict[str, str]] = None) -> str:
+    """The login this client writes as, without a GitHub read beyond GET
+    /app: the App's bot login, else LOOM_GITHUB_LOGIN; "" when neither says."""
+    try:
+        login = gh.app_login() if hasattr(gh, "app_login") else None
+    except GitHubError:
+        login = None
+    return login or (os.environ if env is None else env).get("LOOM_GITHUB_LOGIN", "").strip()
+
+
+# Brain commands outside the lock check: reads, and `step`, whose tick
+# record only the lock's holder may write (tick_step checks it).
+READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step")
+
+
+def check_acting_brain(gh: Any, lock_repo: str, env: Optional[Dict[str, str]] = None,
+                       now: Optional[datetime] = None) -> None:
+    """Refuse a brain write by a fleet brain that does not hold the lock.
+    The lock, not the token, decides who acts (docs/BRAIN.md, Shared brain
+    duty): a LOOM_TRUSTED_BRIEFERS login (a fleet brain) acts only while the
+    live brain lock names its own login, even when LOOM_BRIEF_AUTHORS lists it
+    too. Any other writer (the Loom Apps, the operator), or one whose login is
+    unknown, is left to the gates as before. Read trust does not move: what a
+    fleet brain writes counts as a brain's only once the operator lists its
+    login in LOOM_BRIEF_AUTHORS."""
+    login = writer_login(gh, env).lower()
+    if not login or login not in {b.lower() for b in trusted_briefers(env)}:
+        return
+    holder = lock.read_holder(gh, lock_repo)
+    now = now or datetime.now(timezone.utc)
+    if holder is not None and holder.live(now) and holder.login.lower() == login:
+        return
+    held = ("the lock is held by %s as %s" % (holder.name, holder.login or "no login")
+            if holder is not None and holder.live(now) else "nobody holds the lock")
+    raise ValueError("%s acts as the brain only while it holds the brain lock in %s under "
+                     "its own login (python3 -m bus lock %s --holder NAME); %s"
+                     % (login, lock_repo, lock_repo, held))
 
 
 def owned_elsewhere(issue: Dict[str, Any],
@@ -7858,6 +7933,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
+        if args.command not in READ_COMMANDS:
+            check_acting_brain(gh, getattr(args, "lock_repo", None)
+                               or os.environ.get("LOOM_STATUS_REPO") or "quadseven/loom")
         code = COMMANDS[args.command](gh, args)
         return code if isinstance(code, int) else 0
     except (ValueError, OSError, GitHubError) as exc:

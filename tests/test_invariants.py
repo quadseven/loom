@@ -647,8 +647,8 @@ class StationTest(StationBase):
                                     "1 open tickets sit under no epic across 1 goal homes"),
             "epic-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40)],
-                (REPO, 40): [ticket(n, state="closed") for n in range(50, 66)]}),
-                "Epic #40 of goal home #30: 16 tickets (cap 15)"),
+                (REPO, 40): [ticket(n) for n in range(50, 66)]}),
+                "Epic #40 of goal home #30: 16 open tickets (cap 15)"),
             "goal-epics-over-cap": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
                 "has 7 open epics (cap 6)"),
@@ -686,7 +686,7 @@ class StationTest(StationBase):
 
     def test_epic_over_cap_counts_sub_issues_and_part_of_links_once(self):
         """loom#2023: 13 sub-issues plus 4 issues linked only by a Part of
-        line (one of them closed) are 17 tickets, not 16."""
+        line (one of them closed) are 16 open tickets, none counted twice."""
         part_of = lambda n, state="open": dict(ticket(n, state), body="Why.\n\nPart of #40\n")  # noqa: E731
         subs = [ticket(n) for n in range(50, 63)]
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
@@ -698,7 +698,7 @@ class StationTest(StationBase):
                                 part_of(73, "closed"), part_of(50)]
         self.run_at(T0)
         (filed,) = self.gh.filed()
-        self.assertIn("Epic #40 of goal home #30: 17 tickets (cap 15)", filed["body"])
+        self.assertIn("Epic #40 of goal home #30: 16 open tickets (cap 15)", filed["body"])
 
     def test_a_goal_makes_one_part_of_search_however_many_epics_it_holds(self):
         """loom#2321: one search per five epics, about 35 a check, spent
@@ -867,10 +867,10 @@ class SettledSubjectTest(StationBase):
         back at the cap, the line goes, and the empty list closes once it
         has been clear for CLEAR_AFTER."""
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
-        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 66)]
+        self.gh.subs[(REPO, 40)] = [ticket(n) for n in range(50, 66)]
         self.run_at(T0)
         (filed,) = self.breaches()
-        self.assertIn("Epic #40 of goal home #30: 16 tickets (cap 15)", filed["body"])
+        self.assertIn("Epic #40 of goal home #30: 16 open tickets (cap 15)", filed["body"])
         self.gh.subs[(REPO, 40)] = self.gh.subs[(REPO, 40)][:15]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertIn(invariants.ROLL_NONE, filed["body"])
@@ -883,11 +883,12 @@ class SettledSubjectTest(StationBase):
     def test_an_epic_back_at_its_cap_closes_its_issue(self):
         filed = self.legacy("epic-over-cap", "%s#40" % REPO)
         self.gh.subs[(REPO, GOAL)] = [epic(40)]
-        self.gh.subs[(REPO, 40)] = [ticket(n, state="closed") for n in range(50, 65)]
+        self.gh.subs[(REPO, 40)] = [ticket(n) for n in range(50, 65)]
+        self.gh.tickets[REPO] = self.gh.subs[(REPO, 40)]
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
         (note,) = self.notes(filed)
-        self.assertIn("epic #40 holds 15 tickets, within the cap of 15", note)
+        self.assertIn("epic #40 holds 15 open tickets, within the cap of 15", note)
 
     def test_a_closed_epic_holding_many_tickets_files_nothing(self):
         self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
@@ -958,13 +959,14 @@ class SettleBeforeFilingTest(StationBase):
         self.station = station.Station(self.gh, self.settings, now=T0)
         self.station._invariant_repo = REPO
 
-    def far_epics(self, state, numbers=(35,)):
+    def far_epics(self, state, numbers=(35,), tickets="closed"):
         """Epics of the other repo, under its goal home, each holding 22
-        closed tickets; the facts carry the shape the station builds."""
+        tickets in state `tickets`; the facts carry the shape the station
+        builds."""
         self.gh.subs[(OTHER, self.HOME)] = [
             dict(epic(n, state=state), body="Part of #%d" % self.HOME) for n in numbers]
         for n in numbers:
-            self.gh.subs[(OTHER, n)] = [ticket(100 + i, state="closed") for i in range(22)]
+            self.gh.subs[(OTHER, n)] = [ticket(100 + i, state=tickets) for i in range(22)]
         self.gh.tickets[OTHER] = []
         facts = Facts(T0)
         facts.shapes = [self.station._goal_shape(OTHER, {
@@ -1014,7 +1016,9 @@ class SettleBeforeFilingTest(StationBase):
         self.assertEqual([r["state"] for r in reports], ["closed"] * len(far), self.said)
 
     def test_an_open_epic_of_another_repo_keeps_its_report_open(self):
-        facts = self.far_epics("open")
+        # Only open tickets count toward the cap, so the epic stays over it
+        # with 22 open ones.
+        facts = self.far_epics("open", tickets="open")
         filed = self.report(90, 35)
         self.run_filer(facts, self.others("a"))
         self.assertEqual(filed["state"], "open")
@@ -1523,7 +1527,9 @@ class InvariantTest(unittest.TestCase):
             self.assertEqual(check(f), [])
             self.assertEqual(check(Facts(T0)), [])  # not read: nothing found
         bad = invariants.GoalShape(self.goal, 1, (
-            invariants.EpicShape(e40, True, 16, ()),
+            invariants.EpicShape(e40, True, 16,
+                                 tuple(Ref("%s#%d" % (REPO, n), "#%d" % n)
+                                       for n in range(100, 116))),
             invariants.EpicShape(Ref("%s#41" % REPO, "#41"), True, 1, ()),
             invariants.EpicShape(Ref("%s#42" % REPO, "#42"), False, 2, (t7,))), (t7,))
         f = Facts(T0, shapes=[bad])
@@ -2010,13 +2016,43 @@ class StandingEpicTest(unittest.TestCase):
         self.assertEqual([b.subject for b in found], ["%s#50" % REPO, "%s#51" % REPO])
         self.assertIn("100 sub-issues", found[0].title)
 
+    def test_closed_tickets_do_not_put_an_open_epic_over_the_ticket_cap(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#40" % REPO, "#40"), True, 19,
+            tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 113)))
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        self.assertEqual(invariants.epic_over_cap(facts), [])
+
+    def test_sixteen_open_tickets_put_an_epic_over_the_ticket_cap(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#40" % REPO, "#40"), True, 16,
+            tuple(Ref("%s#%d" % (REPO, n), "#%d" % n) for n in range(100, 116)))
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        (breach,) = invariants.epic_over_cap(facts)
+        self.assertIn("16 open tickets (cap 15)", breach.title)
+
+    def test_closed_sub_issues_still_count_toward_github_limit(self):
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        epic = invariants.EpicShape(
+            Ref("%s#50" % REPO, "#50"), True, 100, (), False, 100)
+        facts = Facts(T0, shapes=[invariants.GoalShape(goal, 6, (epic,), ())])
+
+        (breach,) = invariants.epic_over_cap(facts)
+        self.assertIn("100 sub-issues", breach.title)
+
 
     def test_a_closed_epic_is_not_over_the_ticket_cap(self):
         """loom#2140: a finished epic keeps its closed tickets, so it can
         never drop under the cap; only an open epic is flagged."""
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
         mk = lambda n, open_, tickets: invariants.EpicShape(  # noqa: E731
-            Ref("%s#%d" % (REPO, n), "#%d" % n), open_, tickets, ())
+            Ref("%s#%d" % (REPO, n), "#%d" % n), open_, tickets,
+            tuple(Ref("%s#%d" % (REPO, n * 100 + i), "#%d" % (n * 100 + i))
+                  for i in range(tickets)) if open_ else ())
         f = Facts(T0, shapes=[invariants.GoalShape(
             goal, 6, (mk(60, False, 16), mk(61, False, 40), mk(62, True, 16)), ())])
         self.assertEqual([b.subject for b in invariants.epic_over_cap(f)], ["%s#62" % REPO])
