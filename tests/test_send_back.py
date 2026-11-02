@@ -51,6 +51,11 @@ class CountsTest(unittest.TestCase):
         self.assertFalse(send_back.not_fallen({"acceptance-criterion-unmet": 9,
                                                "weakened-test": 1, "intent-mismatch": 6}))
 
+    def test_a_rule_missing_from_the_counts_reads_as_none(self):
+        self.assertTrue(send_back.not_fallen({"weakened-test": 18}))
+        self.assertFalse(send_back.not_fallen({}))
+        self.assertIn("intent-mismatch: 0 (was 13)", send_back.report({}))
+
     def test_the_clock_starts_at_the_merge_of_2170(self):
         self.assertEqual(send_back.LANDED_AT, "2026-11-01T09:08:45Z")
 
@@ -116,7 +121,16 @@ class StationStepTest(unittest.TestCase):
         with mock.patch.object(station.shadow, "record_held") as held:
             self.run_step()
         self.assertEqual((self.posted, self.patched), ([], []))
-        self.assertEqual(held.call_args[0][:3], (station.shadow.REOPEN, send_back.REPO, 2162))
+        held.assert_called_once_with(station.shadow.REOPEN, send_back.REPO, 2162, "issue",
+                                     source="seven-day send-back comparison",
+                                     reason="send-back counts have not fallen")
+
+    def test_counts_add_up_across_the_served_repos(self):
+        self.repos = [send_back.REPO, "example-owner/sample"]
+        self.findings = [finding("weakened-test")] * 9
+        self.run_step()
+        self.assertIn("weakened-test: 18 (was 18)", self.posted[0][2])
+        self.assertEqual(self.patched[0][2], {"state": "open"})
 
     def test_a_station_not_serving_the_home_repo_never_runs_it(self):
         self.repos = ["example-owner/sample"]

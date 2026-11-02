@@ -50,14 +50,15 @@ def counts(comments: Iterable[Mapping[str, Any]], bot: str, now: datetime) -> Di
 
 
 def not_fallen(found: Mapping[str, int]) -> bool:
-    """Whether any rule has not fallen below its count at filing."""
-    return any(found[rule] >= FILED_COUNTS[rule] for rule in RULES)
+    """Whether any rule has not fallen below its count at filing. A rule the
+    mapping lacks reads as no findings."""
+    return any(found.get(rule, 0) >= FILED_COUNTS[rule] for rule in RULES)
 
 
 def report(found: Mapping[str, int]) -> str:
     """The result comment: each rule, now against filing, the verdict and the
     marker."""
-    lines = ", ".join("%s: %d (was %d)" % (rule, found[rule], FILED_COUNTS[rule])
+    lines = ", ".join("%s: %d (was %d)" % (rule, found.get(rule, 0), FILED_COUNTS[rule])
                       for rule in RULES)
     verdict = ("At least one has not fallen, so this ticket reopens." if not_fallen(found)
                else "All three fell.")

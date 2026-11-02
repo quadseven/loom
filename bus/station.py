@@ -14396,12 +14396,16 @@ class Station:
         if not landed_at or self.now < landed_at + send_back.WAIT:
             _write_json(path, {"checked_at": self.now})
             return
-        comments: List[Any] = []
+        # One repo's trailing week at a time, counted and dropped, so only the
+        # three totals are held across repos.
+        found = {rule: 0 for rule in send_back.RULES}
         for source in self.s.repos:
-            comments.extend(self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
-                                           % (source, send_back.since(self.now))))
-        found = send_back.counts(comments, self.s.review_bot,
-                                 datetime.fromtimestamp(self.now, timezone.utc))
+            week = self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
+                                  % (source, send_back.since(self.now)))
+            for rule, n in send_back.counts(week, self.s.review_bot,
+                                            datetime.fromtimestamp(self.now,
+                                                                   timezone.utc)).items():
+                found[rule] += n
         _say("send-back comparison for #%d: %s" % (send_back.TICKET, found))
         reopen = send_back.not_fallen(found)
         if shadow.active(repo):
