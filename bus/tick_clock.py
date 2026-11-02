@@ -25,6 +25,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 TICK_MINUTES = 25
 BUDGET_MINUTES = 20
+# A tick its wrapper bounded below TICK_MINUTES records its own length in
+# the tick record's "tick_minutes" (loom#2469: the lane machine's tick ends
+# before Muse's next slot). Its budget keeps the same 5 minutes for the
+# journal and unlock: a 13-minute tick may defer on budget from minute 8.
+MIN_TICK_MINUTES = 5
 
 # A note that defers work because the tick's time ran out. Any "budget"
 # next to a defer word counts ("deferred: budget", "budget spent, skipping
@@ -62,6 +67,24 @@ def stamp(value: Any) -> Optional[datetime]:
         return None
 
 
+def valid_tick_minutes(value: Any) -> bool:
+    """Whether `value` is a tick length the record may carry: a whole
+    number from MIN_TICK_MINUTES up to, not including, TICK_MINUTES."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and MIN_TICK_MINUTES <= value < TICK_MINUTES)
+
+
+def tick_minutes(record: Dict[str, Any]) -> int:
+    """The tick's length: the record's bounded length, else TICK_MINUTES."""
+    value = record.get("tick_minutes")
+    return value if valid_tick_minutes(value) else TICK_MINUTES
+
+
+def budget_minutes(record: Dict[str, Any]) -> int:
+    """Minutes into the tick from which a step may be deferred on budget."""
+    return max(tick_minutes(record) - (TICK_MINUTES - BUDGET_MINUTES), 0)
+
+
 def minutes_used(record: Dict[str, Any], now: datetime) -> Optional[float]:
     """Minutes since the tick's lock step, or None with no start recorded."""
     started = stamp(record.get("started_at"))
@@ -75,16 +98,17 @@ def elapsed_line(record: Dict[str, Any], now: datetime) -> str:
     rounded down, so a printed 20 is always a real 20 the budget guard
     agrees with."""
     used = minutes_used(record, now)
+    tick, budget = tick_minutes(record), budget_minutes(record)
     if used is None:
         return ("elapsed unknown of %d minutes: no tick start recorded "
-                "(run python3 -m bus.brain step lock first)" % TICK_MINUTES)
+                "(run python3 -m bus.brain step lock first)" % tick)
     used = max(used, 0.0)
-    left = max(int(TICK_MINUTES * 60 - used * 60), 0)
-    line = "elapsed %d of %d minutes (%d seconds left)" % (int(used), TICK_MINUTES, left)
-    if used >= TICK_MINUTES:
+    left = max(int(tick * 60 - used * 60), 0)
+    line = "elapsed %d of %d minutes (%d seconds left)" % (int(used), tick, left)
+    if used >= tick:
         return line + ": the tick is over, journal and unlock now"
-    if used >= BUDGET_MINUTES:
-        return line + ": past %d, a step may be deferred on budget" % BUDGET_MINUTES
+    if used >= budget:
+        return line + ": past %d, a step may be deferred on budget" % budget
     return line
 
 
@@ -92,13 +116,14 @@ def budget_status(record: Dict[str, Any], now: datetime) -> str:
     """`bus.brain step-budget`: the elapsed line and whether a deferral on
     budget is allowed now."""
     used = minutes_used(record, now)
-    if used is not None and used >= BUDGET_MINUTES:
+    budget = budget_minutes(record)
+    if used is not None and used >= budget:
         verdict = "budget: spent, a step may be deferred on budget"
     elif used is None:
         verdict = "budget: unknown, no deferral on budget without a tick start"
     else:
         verdict = ("budget: open, do the step; a deferral on budget is refused until "
-                   "%d minutes" % BUDGET_MINUTES)
+                   "%d minutes" % budget)
     return "%s\n%s" % (elapsed_line(record, now), verdict)
 
 
@@ -120,11 +145,12 @@ def budget_refusal(record: Dict[str, Any], note: Optional[str], now: datetime) -
     if not claims_budget(note):
         return None
     used = minutes_used(record, now)
-    if used is not None and used >= BUDGET_MINUTES:
+    budget = budget_minutes(record)
+    if used is not None and used >= budget:
         return None
     return ("refused: the note defers on budget, but %s; a step may be deferred on budget "
             "only at %d minutes or more, so do the step (python3 -m bus.brain step-budget "
-            "reads the clock)" % (elapsed_line(record, now), BUDGET_MINUTES))
+            "reads the clock)" % (elapsed_line(record, now), budget))
 
 
 def with_elapsed(note: str, record: Dict[str, Any], now: datetime) -> str:
@@ -132,7 +158,7 @@ def with_elapsed(note: str, record: Dict[str, Any], now: datetime) -> str:
     used = minutes_used(record, now)
     if used is None or "[elapsed " in note:
         return note
-    return "%s [elapsed %d of %d minutes]" % (note, int(used), TICK_MINUTES)
+    return "%s [elapsed %d of %d minutes]" % (note, int(used), tick_minutes(record))
 
 
 def durations(record: Dict[str, Any], now: datetime) -> List[Tuple[str, int, bool]]:
