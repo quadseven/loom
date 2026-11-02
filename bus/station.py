@@ -1740,17 +1740,6 @@ def _open_on(node: Dict[str, Any], repo: str, pr: int) -> bool:
             and where.get("number") == pr)
 
 
-def _bot_minor(comment: Dict[str, Any], bot: str) -> bool:
-    """The review bot's own finding (its app, not a person with its login)
-    whose severity, the first field of its first line, is medium or low."""
-    author = comment.get("author") or {}
-    if author.get("__typename") != "Bot" or str(author.get("login") or "").lower() != bot.lower():
-        return False
-    severity = str(comment.get("body") or "").split("\n", 1)[0].split("|", 1)[0].lower()
-    return bool(re.search(r"\b(medium|low)\b", severity)) and not re.search(
-        r"\b(critical|high)\b", severity)
-
-
 def _read_json(path: str, default: Any, strict: bool = True) -> Any:
     """The file's JSON, or `default` when it does not exist. A file that
     exists but cannot be read raises StateError when strict: the ledgers of
@@ -8072,7 +8061,7 @@ class Station:
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
         # The check reads the lane's own text: redaction drops any long word,
         # a test name the answer cites included (loom#2285).
-        settled = (strong and _bot_minor(root, self.s.review_bot)
+        settled = (strong and factory._bot_minor(root, self.s.review_bot)
                    and self._answer_holds(repo, pr, lane, thread_id, node, raw))
         head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
         if settled:

@@ -1115,8 +1115,8 @@ An auto tier still merges only when it is clean:
 - no high or critical review-bot finding, and no finding from a bad-work rule
   at any severity, is open, or was resolved with no commit after it. A
   commit that merges the base (two parents) proves no fix and does not
-  count, and a thread resolved on a lane answer that held on the head
-  (bus/rebuttal.py) needs no commit (loom#2285). The
+  count. A lane answer, even one the station marked held for the head, never
+  stands in for that commit on such a finding (loom#2519). The
   bad-work rules are the review bot's `intent-mismatch`, `unmet-criterion`,
   `dead-code` and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
   `LOOM_ELDER_BLOCKING_RULES`, and any finding whose category is `bad-work`.

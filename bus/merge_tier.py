@@ -412,15 +412,13 @@ def blocking_findings(threads: Sequence[Mapping[str, Any]], committed: str,
     after it (deferred, or resolved by hand without a fix). `threads` are
     every review thread (review_threads), `committed` the date of the newest
     commit that can be a fix (fix_committed), and `by_bot` says whether a
-    comment is the review bot's. `held` names the resolved threads whose lane
-    answer was checked on the head and held (bus/rebuttal.py): an answered
-    false finding needs no commit (loom#2285). A missing time cannot show a
-    fix followed."""
+    comment is the review bot's. `held` names the resolved threads the
+    station marked held for the head (bus/brain.py _station_held); it never
+    exempts a high, critical or bad-work finding, so every finding returned
+    here blocks whether held or not (loom#2519). A missing time cannot show
+    a fix followed."""
     out = []
     for thread in threads:
-        tid = str(thread.get("id") or "")
-        if tid and thread.get("isResolved") and tid in held:
-            continue
         comments = (thread.get("comments") or {}).get("nodes") or []
         root = (comments[0] if comments else None) or {}
         body = str(root.get("body") or "")
