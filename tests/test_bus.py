@@ -444,11 +444,17 @@ class LabelTests(unittest.TestCase):
         self.assertIn("loom:factory", created)
 
 
+def take(gh, holder, minutes=15, now=None, run=""):
+    """(whether the caller holds the lock after one attempt, the holder's name)."""
+    got = lock.attempt(gh, REPO, holder, minutes, now, run)
+    return got.acquired, got.holder.name
+
+
 class LockTests(unittest.TestCase):
     def test_acquire_free(self):
         g = FakeGit()
         gh = GitHub("tok", api="https://api.github.com", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertEqual(g.lock_message(),
                          "holder=tick-1 expires=" + stamp(NOW + timedelta(minutes=15))
                          + " acquired=" + stamp(NOW))
@@ -457,7 +463,7 @@ class LockTests(unittest.TestCase):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW + timedelta(minutes=5)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (False, "other"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (False, "other"))
         self.assertIn("holder=other", g.lock_message())
         self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
@@ -467,7 +473,7 @@ class LockTests(unittest.TestCase):
         g = FakeGit()
         g.seed_lock("tick-1", stamp(NOW + timedelta(minutes=5)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
         self.assertEqual("held", g.refs["heads/loom-lock/brain"])
         self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
@@ -529,6 +535,27 @@ class LockTests(unittest.TestCase):
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="old").already)
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW).already)
 
+    def test_a_takeover_lost_after_the_stale_delete_is_held_not_yours(self):
+        # Another taker re-creates the lock between the stale-lock delete and
+        # the caller's second create: the caller never held it, even when
+        # the winner carries the caller's own holder name.
+        for winner in ("lane-machine", "muse"):
+            g = FakeGit()
+            g.seed_lock("old", stamp(NOW - timedelta(minutes=1)))
+            real = g.__call__
+
+            def racing(method, url, headers, body, g=g, real=real, winner=winner):
+                answer = real(method, url, headers, body)
+                if method == "DELETE":
+                    g.seed_lock(winner, stamp(NOW + timedelta(minutes=30)))
+                return answer
+
+            held = lock.attempt(GitHub("tok", transport=racing), REPO, "muse", 30, NOW)
+            self.assertFalse(held.acquired, winner)
+            self.assertFalse(held.already, winner)
+            self.assertEqual(winner, held.holder.name)
+            self.assertTrue(held.line(NOW).startswith("lock held by %s" % winner))
+
     def test_a_bounded_wait_takes_the_lock_once_the_peer_lets_go(self):
         g = FakeGit()
         g.seed_lock("lane-machine", stamp(NOW + timedelta(minutes=2, seconds=30)))
@@ -565,14 +592,14 @@ class LockTests(unittest.TestCase):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW - timedelta(minutes=1)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
         self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     def test_release_by_holder_and_wrong_holder(self):
         g = FakeGit()
         gh = GitHub("tok", transport=g)
-        lock.acquire(gh, REPO, "tick-1", 15, NOW)
+        take(gh, "tick-1", 15, NOW)
         self.assertFalse(lock.release(gh, REPO, "tick-2"))
         self.assertIn("heads/loom-lock/brain", g.refs)
         self.assertTrue(lock.release(gh, REPO, "tick-1"))
@@ -590,7 +617,7 @@ class LockTests(unittest.TestCase):
         gh = GitHub("tok", transport=FakeGit())
         for bad in ("", "a b", "a=b", "a\nb", "x/y"):
             with self.assertRaises(ValueError):
-                lock.acquire(gh, REPO, bad)
+                lock.attempt(gh, REPO, bad)
             with self.assertRaises(ValueError):
                 lock.release(gh, REPO, bad)
         self.assertEqual(gh.requests, 0)

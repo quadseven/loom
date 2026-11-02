@@ -213,9 +213,9 @@ def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
                 ok=(404, 422))
     if _create_ref(gh, repo, sha):
         return Attempt(True, mine, holder)
+    # A second failed create means another taker won the gap after the
+    # stale-lock delete: whoever it names, the caller never held this lock.
     current = read_holder(gh, repo)
-    if current is not None and current.live(now) and current.is_caller(holder, run):
-        return Attempt(True, current, holder, already=True)
     return Attempt(False, current or Holder("", None, None), holder)
 
 
@@ -239,20 +239,13 @@ def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,
         sleep(step)
 
 
-def acquire(gh: GitHub, repo: str, holder: str, minutes: int = 15,
-            now: Optional[datetime] = None, run: str = "") -> Tuple[bool, str]:
-    """(whether the caller holds the lock now, the holder's name)."""
-    result = attempt(gh, repo, holder, minutes, now, run)
-    return result.acquired, result.holder.name
-
-
 def release(gh: GitHub, repo: str, holder: str) -> bool:
     _check_holder(holder)
     current = _read_lock(gh, repo)
     if current is None or current[0] != holder or current[1] is None or current[1] <= datetime.now(timezone.utc):
         return False
     # Keep the lock ref as the durable last-tick record. Expire it now so the
-    # next holder can replace it immediately through acquire's stale-lock path.
+    # next holder can replace it immediately through attempt's stale-lock path.
     ref_path = "/repos/%s/git/ref/heads/%s" % (repo, LOCK_BRANCH)
     ref = gh.rest("GET", ref_path)
     sha = ref.data["object"]["sha"]
