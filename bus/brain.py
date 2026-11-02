@@ -177,24 +177,28 @@ def _graphql_status(gh: GitHub, repo: str, prs: List[Dict[str, Any]],
     pr_ids = [int(x["number"]) for x in prs]
     goal_ids = [int(x["number"]) for x in goals]
     # A single query fetches every PR's merge-ready data (READY_FIELDS), plus
-    # comments on the goal issues for journal timestamps, plus RULING_FIELDS
-    # for the pull requests of tickets past the last rung. When the repo has
-    # goals, it also fetches the default branch and the last 10 merged PRs so
-    # status can warn when work is landing on an undeclared trunk.
+    # RULING_FIELDS for the pull requests of tickets past the last rung. When
+    # the repo has goals, it also fetches the default branch and the last 10
+    # merged PRs so status can warn when work is landing on an undeclared
+    # trunk. Each goal's comments are read through REST beside it
+    # (_goal_comment_node): GraphQL answers are never compressed, and the goal
+    # comments were about 80% of this query's bytes (loom#2464).
     # GitHub GraphQL does not support a dynamic issue-number list as a top-level
     # node argument. Build aliases from the numbers while retaining one request.
     owner, name = repo.split("/", 1)
-    fields = _status_pr_fields(pr_ids, ruling) + _status_goal_fields(goal_ids)
+    fields = _status_pr_fields(pr_ids, ruling)
     if goal_ids:
         fields += _status_trunk_fields()
     if not fields:
         return {"prs": {}, "goals": {}, "trunk": None, "merged": []}
     q = "query { repository(owner:%s, name:%s) { %s } }" % (
         _gql(owner), _gql(name), " ".join(fields))
-    result = gh.graphql(q) or {}
+    reads: List[Callable[[], Any]] = [lambda: gh.graphql(q) or {}]
+    reads += [lambda g=g: _goal_comment_node(gh, repo, g) for g in goals]
+    result, *nodes = _read_each(lambda read: read(), reads)
     repo_data = result.get("repository") or {}
     return {"prs": {n: repo_data.get("p%d" % n) for n in pr_ids},
-            "goals": {n: repo_data.get("g%d" % n) for n in goal_ids},
+            "goals": dict(zip(goal_ids, nodes, strict=True)),
             **_status_trunk_data(repo_data)}
 
 
@@ -204,14 +208,40 @@ def _status_pr_fields(pr_ids: Sequence[int], ruling: Sequence[int]) -> List[str]
         n, n, READY_FIELDS, RULING_FIELDS if n in ruling else "") for n in pr_ids]
 
 
-def _status_goal_fields(goal_ids: Sequence[int]) -> List[str]:
-    """GraphQL aliases for the latest comments on each goal issue."""
-    # __typename: GraphQL names the Loom App "<slug>" without "[bot]", and
-    # only a Bot author gains the suffix that LOOM_BRIEF_AUTHORS carries.
-    # updatedAt: a quiet goal's heartbeat edits its last report (bus/quiet.py).
-    return ["g%d: issue(number:%d) { comments(last:100) { nodes { body createdAt updatedAt"
-            " author { __typename login } } } }" % (n, n)
-            for n in goal_ids]
+# How many of a goal's newest comments status reads: its journals, reports
+# and a quiet goal's heartbeat edit are all among them.
+GOAL_COMMENTS = 100
+
+
+def _goal_comment_node(gh: GitHub, repo: str, goal: Dict[str, Any]) -> Dict[str, Any]:
+    """A goal's last GOAL_COMMENTS comments, read through gzipped REST from
+    the pages its listed comment count points at (GitHub.last_comments), in
+    the shape the GraphQL `comments(last:100)` node had: `nodes` of body,
+    createdAt, updatedAt and author { __typename login } (loom#2464).
+
+    __typename: GraphQL names the Loom App "<slug>" without "[bot]", and
+    only a Bot author gains the suffix that LOOM_BRIEF_AUTHORS carries
+    (rest_login). updatedAt: a quiet goal's heartbeat edits its last report
+    (bus/quiet.py)."""
+    count = goal.get("comments")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        return {"comments": {"nodes": []}}
+    found = gh.last_comments(repo, int(goal["number"]), count, GOAL_COMMENTS)
+    return {"comments": {"nodes": [_rest_comment_node(c) for c in found if isinstance(c, dict)]}}
+
+
+def _rest_comment_node(comment: Dict[str, Any]) -> Dict[str, Any]:
+    """One REST issue comment in the GraphQL node spelling status reads."""
+    user = comment.get("user")
+    author: Optional[Dict[str, str]] = None
+    if isinstance(user, dict):
+        kind = str(user.get("type") or "User")
+        login = str(user.get("login") or "")
+        if kind == "Bot" and login.lower().endswith("[bot]"):
+            login = login[:-len("[bot]")]
+        author = {"__typename": kind, "login": login}
+    return {"body": comment.get("body"), "createdAt": comment.get("created_at"),
+            "updatedAt": comment.get("updated_at"), "author": author}
 
 
 def _status_trunk_fields() -> List[str]:

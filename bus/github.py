@@ -1235,6 +1235,37 @@ class GitHub:
             items.extend(self.paginate(nxt))
         return items
 
+    def last_comments(self, repo: str, number: int, count: int, keep: int = 100) -> List[Any]:
+        """The last `keep` comments on issue `number`, oldest first, exactly as
+        GitHub stores them: no status, fix-round or body events (rest() adds
+        those), the same comments a GraphQL `comments(last:keep)` returns.
+
+        `count` is the issue listing's comment count. It picks a page size
+        whose pages hold the last `keep` (_comment_pages): one or two pages,
+        not the whole list, and none at all for an issue with no comments. A
+        comment added since the listing is followed through the last page's
+        next link; one deleted since is made up from the page before. REST
+        answers arrive gzipped, which GraphQL's never do (loom#2464)."""
+        if count <= 0 or keep <= 0:
+            return []
+        size, first, last = _comment_pages(count, keep)
+        base = "/repos/%s/issues/%d/comments?per_page=%d" % (repo, number, size)
+        items: List[Any] = []
+        nxt: Optional[str] = None
+        for page in range(first, last + 1):
+            resp = self._rest("GET", "%s&page=%d" % (base, page))
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while nxt:
+            resp = self._rest("GET", nxt)
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while len(items) < keep and first > 1:
+            first -= 1
+            resp = self._rest("GET", "%s&page=%d" % (base, first))
+            items[:0] = resp.data if isinstance(resp.data, list) else []
+        return items[-keep:]
+
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",
                          {"query": query, "variables": variables or {}})
@@ -1242,6 +1273,28 @@ class GitHub:
         if data.get("errors"):
             raise GitHubError("graphql errors", resp.status, json.dumps(data["errors"]))
         return data.get("data")
+
+
+# GitHub's largest page of comments.
+COMMENT_PAGE = 100
+
+
+def _comment_pages(count: int, keep: int) -> Tuple[int, int, int]:
+    """(page size, first page, last page) that read the last `keep` of
+    `count` comments in as few requests as GitHub's page sizes allow, then
+    with the fewest comments before them: 192 comments read as two pages of
+    92 (pages 2 and 3, comments 92 to 191), not two of 100 that also carry
+    comments 0 to 91. Up to COMMENT_PAGE comments are one page."""
+    if count <= COMMENT_PAGE:
+        return COMMENT_PAGE, 1, 1
+    skip = max(0, count - keep)
+
+    def cost(size: int) -> Tuple[int, int, int]:
+        pages = (count - 1) // size - skip // size + 1
+        return pages, skip % size, -size
+
+    size = min(range(COMMENT_PAGE, 0, -1), key=cost)
+    return size, skip // size + 1, (count - 1) // size + 1
 
 
 def _per_page(url: str) -> int:
