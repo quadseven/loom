@@ -2446,7 +2446,8 @@ check_default_branch() {
   # round has not merged (2026-10-20). A checkout that still fails is the
   # runner's fault, not the ticket's: a factory incident, so the round
   # spends no ladder attempt and never counts toward the runaway hold.
-  if ! { timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+  if ! { rm -rf "$default_tree" >> "$LOG" 2>&1 &&
+         timeout "$NET_TIMEOUT" git -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            clone -q --local --no-checkout "$branch_tree" "$default_tree" >> "$LOG" 2>&1 &&
          timeout "$NET_TIMEOUT" git -C "$default_tree" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
            fetch -q --update-shallow "$branch_tree" "+refs/remotes/origin/$FIX_DEFAULT:refs/remotes/origin/$FIX_DEFAULT" >> "$LOG" 2>&1 &&
