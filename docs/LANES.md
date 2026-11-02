@@ -35,6 +35,14 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing to a private repository, the lane runner runs the same scanner
+with `--personal-data`, which refuses only real mail and street addresses. The
+household values are deny-list terms, and no marker waives them. The scanner's
+`--diff` reads each commit's patch and message too, since a value added and then
+removed passes a net diff and still goes up in history. The pull
+request body on a private repo is scanned before the push. Repaired PR text,
+review replies and ticket answers pass the personal data scan before they post.
+
 Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products

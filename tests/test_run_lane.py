@@ -244,6 +244,13 @@ if [ "${FAKE_AGENT:-commit}" = answer-file ]; then
   printf '%s' "${FAKE_ANSWER_TEXT:-The cause is the configured retry limit.}" > .loom/answer.md
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = add-then-remove ]; then
+  echo "pat.synthetic@corp.invalid" > fix.txt
+  git add fix.txt && git commit -qm "add"
+  echo "fixed" > fix.txt
+  git add fix.txt && git commit -qm "remove"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = private-ip ]; then
   echo "fixed" > fix.txt
   printf 'contact %s\\n' "$(printf 'MTAuMjMuNC41' | base64 -d)" >> fix.txt
@@ -659,6 +666,23 @@ if '--deny-list-ssm' in args and os.environ.get('FAKE_SCANNER_READS_DENY'):
         sys.exit(2)
     with open(os.environ['FAKE_LOG'] + '.deny', 'a', encoding='utf-8') as fh:
         fh.write(got.stdout)
+# --personal-data checks real addresses only, not a private repo's hosts.
+if '--personal-data' in args:
+    if os.environ.get('FAKE_PERSONAL_HIT'):
+        print(f'BLOCKED: private identifier found\\n  {value}:1 [personal-deny-list] <redacted, 9 chars>', file=sys.stderr)
+        sys.exit(1)
+    if mode == '--diff':
+        seen = subprocess.run(['git', 'log', '-p', '--format=%B', value], capture_output=True,
+                              text=True, check=True).stdout
+    elif mode == '--text-file':
+        seen = open(value, encoding='utf-8').read()
+    else:
+        seen = ''
+    if 'pat.synthetic@corp.invalid' in seen:
+        print(f'BLOCKED: private identifier found\\n  {value}:1 [personal-deny-list] <redacted, 9 chars>', file=sys.stderr)
+        sys.exit(1)
+    print('leak guard: clean (personal data)')
+    sys.exit(0)
 # The real scanner's private-issue-ref rule: an issue reference to any repo
 # but the ones named with --allow-repo-ref may name a private repo.
 allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
@@ -667,6 +691,10 @@ allowed = [args[i + 1] for i, a in enumerate(args) if a == '--allow-repo-ref']
 forms = set(allowed) | {a.split('/', 1)[1] for a in allowed if '/' in a}
 exempt = r'(?!(?:%s)#)' % '|'.join(map(re.escape, sorted(forms))) if forms else ''
 ref = re.compile(r'(?<![\\w/-])' + exempt + r'(?:[a-z0-9][a-z0-9._-]*/)?[a-z][a-z0-9_]*(?:-[a-z0-9]+)*[a-z0-9]#\\d+\\b', re.I)
+if mode == '--diff' and 'pat.synthetic@corp.invalid' in subprocess.run(
+        ['git', 'log', '-p', '--format=%B', value], capture_output=True, text=True).stdout:
+    print(f'BLOCKED: private identifier found\\n  {value}:1 [personal-deny-list] <redacted, 9 chars>', file=sys.stderr)
+    sys.exit(1)
 if mode == '--diff':
     text = subprocess.run(['git', 'diff', '-U0', value], capture_output=True,
                           text=True, check=True).stdout
@@ -1233,13 +1261,68 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("\n## Operator steps before merge\nnone stated\n\n---\n",
                       self.body.read_text())
 
-    def test_private_repo_does_not_run_leak_scan_and_pushes(self):
+    def test_private_repo_runs_only_the_personal_data_scan_and_pushes(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="private-ip", FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.pushed_files(), ["fix.txt"])
-        self.assertNotIn("leak guard", self.run_log())
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        for call in calls:
+            self.assertIn(" --personal-data", call)
+            self.assertTrue(call.endswith(self.DENY), call)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_real_address_in_a_private_repo_pushes_nothing(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_GH_PRIVATE="true", FAKE_PERSONAL_HIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("personal data scan failed", self.failure_line())
+
+    def assert_nothing_pushed(self):
+        heads = subprocess.run(["git", "ls-remote", "--heads", str(self.remote)],
+                               capture_output=True, text=True, check=True).stdout
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_value_added_then_removed_in_a_private_repo_pushes_nothing(self):
+        # The net diff is clean; the first commit still goes up in history.
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="add-then-remove", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_nothing_pushed()
+        self.assertIn("personal data scan failed", self.failure_line())
+
+    def test_a_value_added_then_removed_in_a_public_repo_pushes_nothing(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="add-then-remove")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_nothing_pushed()
+
+    def test_a_real_address_in_a_private_pr_body_pushes_nothing(self):
+        self.drop_brief(text=BRIEF.replace("Make the thing work.",
+                                           "Make the thing work for pat.synthetic@corp.invalid."))
+        result = self.run_lane(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_nothing_pushed()
+        self.assertIn("PR body personal data scan failed", self.failure_line())
+
+    def test_a_private_repo_with_no_readable_list_pushes_nothing(self):
+        self.drop_brief()
+        result = self.run_lane(FAKE_GH_PRIVATE="true", FAKE_DENY_UNREADABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue(self.failure_line().startswith("[transient] personal data scan could not run"))
+
+    def test_the_work_note_names_the_personal_data_rule(self):
+        self.drop_brief()
+        self.run_lane()
+        prompt = "\n".join(self.calls())
+        self.assertIn("real person's mail or street address", prompt)
 
     def test_files_the_brief_names_commit_and_push_normally(self):
         self.drop_brief(text=BRIEF.replace(
@@ -1973,6 +2056,12 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("the comment on #7 failed",
                       (self.loom / "logs" / "codex" / (name + ".log")).read_text())
 
+    def test_a_review_reply_with_a_real_address_is_not_posted(self):
+        self.fix_brief()
+        replies = '[{"thread":"PRRT_fake","reply":"Mail pat.synthetic@corp.invalid.","resolve":true}]'
+        self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in self.calls()))
+
     def test_fix_runner_posts_and_resolves_agent_thread_replies_after_push(self):
         self.fix_brief()
         replies = ('[{"thread":"PRRT_fake","reply":"Addressed","resolve":true},'
@@ -2680,7 +2769,7 @@ exec /usr/bin/git "$@"
         self.assertIn("fix.txt", files)
         self.assertFalse([f for f in files if f.startswith(".loom-answers")])
 
-    def test_a_fix_brief_repairs_stale_pr_text_without_a_code_commit(self):
+    def stale_text_round(self, **env):
         # The branch already has one commit and an open PR. The ticket body
         # was corrected after the PR was opened, so the generated PR sections
         # are stale. The agent makes no code change: only the PR text is
@@ -2731,9 +2820,20 @@ exec /usr/bin/git "$@"
             FAKE_GH_PR_BODY=str(pr_body_file),
             FAKE_PR_TITLE=str(new_title_file),
             FAKE_PR_BODY=str(new_body_file),
+            **env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)  # no code commit
+        return name, new_body_file
+
+    def test_repaired_pr_text_with_a_real_address_is_not_written(self):
+        name, new_body_file = self.stale_text_round(FAKE_PERSONAL_HIT="1")
+        self.assertFalse(new_body_file.exists())
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("PR text repair refused", log)
+
+    def test_a_fix_brief_repairs_stale_pr_text_without_a_code_commit(self):
+        name, new_body_file = self.stale_text_round()
         calls = self.calls()
         log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
         self.assertFalse(any(c.startswith("gh pr create") for c in calls))
@@ -3545,7 +3645,13 @@ exec /usr/bin/git "$@"
         self.assertFalse([c for c in self.calls() if c.startswith("aws ")], self.calls())
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
 
+    def copy_deny_list(self):
+        deny = self.home / ".ssm" / "infra" / "leak-scan"
+        deny.mkdir(parents=True)
+        (deny / "deny-list").write_text("secret-product-name\n")
+
     def test_a_pod_lane_pushes_to_a_private_repo(self):
+        self.copy_deny_list()
         inbox, result = self.pod_lane(FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
@@ -3557,6 +3663,7 @@ exec /usr/bin/git "$@"
         # repo: a pod pushes nothing public (see the test above).
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
+        self.copy_deny_list()
         record = Path(self._tmp.name) / "bwrap.calls"
         # Each call: its options up to --, the command and its first argument,
         # and the key it was handed, one a line, then a blank line.
