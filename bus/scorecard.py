@@ -149,10 +149,6 @@ def zero_done_threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return int(raw) if raw.isdigit() and int(raw) > 0 else DEFAULT_ZERO_DONE
 
 
-def zero_done_hours(env: Optional[Mapping[str, str]] = None) -> int:
-    return _setting(os.environ if env is None else env, "LOOM_LANE_ZERO_DONE_HOURS", 24) * 3600
-
-
 def footer(body: Any) -> Optional[Tuple[str, str]]:
     """(lane, model) of the newest run the pull request's footer names."""
     found = FOOTER_RE.findall(str(body or ""))
@@ -181,6 +177,53 @@ def review_outcome(threads: Sequence[Mapping[str, Any]],
     if any(merge_tier.bad_work(body, env) for body in found):
         return BAD_WORK
     return FINDINGS if found else CLEAN
+
+
+def _is_limit_log(log_file: str) -> bool:
+    """Whether a failed brief's log shows it failed due to usage limit."""
+    if not os.path.isfile(log_file):
+        return False
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
+            return bool(re.search(r"\bfailed: \[(limit)\]", fh.read()))
+    except OSError:
+        return False
+
+
+def _scan_lane_dir(dir_path: str, since: float) -> List[Tuple[str, float]]:
+    """(ticket, mtime) for each .md brief file updated since `since`."""
+    if not os.path.isdir(dir_path):
+        return []
+    try:
+        entries = os.listdir(dir_path)
+    except OSError:
+        return []
+    out = []
+    for name in entries:
+        if not name.endswith(".md"):
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(dir_path, name))
+        except OSError:
+            continue
+        if mtime >= since:
+            out.append((name[:-3], mtime))
+    return out
+
+
+def _scan_lane_briefs(briefs_dir: str, logs_dir: str, lane: str,
+                      since: float) -> List[Tuple[str, bool, bool, float]]:
+    """Each (ticket, done, limit, mtime) for a lane's finished briefs."""
+    lane_path = os.path.join(briefs_dir, lane)
+    if not os.path.isdir(lane_path):
+        return []
+    out = []
+    for kind in ("done", "failed"):
+        for ticket, mtime in _scan_lane_dir(os.path.join(lane_path, kind), since):
+            log_file = os.path.join(logs_dir, lane, ticket + ".log")
+            is_limit = (kind == "failed") and _is_limit_log(log_file)
+            out.append((ticket, kind == "done", is_limit, mtime))
+    return out
 
 
 def _lane_pull(pr: Dict[str, Any], allowed: set, since: float) -> bool:
@@ -445,38 +488,8 @@ class Scorecard:
         except OSError:
             return
         for lane in lanes:
-            lane_path = os.path.join(briefs_dir, lane)
-            if not os.path.isdir(lane_path):
-                continue
-            for kind in ("done", "failed"):
-                sub = os.path.join(lane_path, kind)
-                if not os.path.isdir(sub):
-                    continue
-                try:
-                    entries = os.listdir(sub)
-                except OSError:
-                    continue
-                for name in entries:
-                    if not name.endswith(".md"):
-                        continue
-                    ticket = name[:-3]
-                    file_path = os.path.join(sub, name)
-                    try:
-                        mtime = os.path.getmtime(file_path)
-                    except OSError:
-                        continue
-                    if mtime < since:
-                        continue
-                    is_limit = False
-                    if kind == "failed":
-                        log_file = os.path.join(logs_dir, lane, ticket + ".log")
-                        if os.path.isfile(log_file):
-                            try:
-                                with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
-                                    is_limit = bool(re.search(r"\bfailed: \[(limit)\]", fh.read()))
-                            except OSError:
-                                pass
-                    self.record_brief(lane, ticket, done=(kind == "done"), limit=is_limit, at=mtime)
+            for ticket, done, limit, mtime in _scan_lane_briefs(briefs_dir, logs_dir, lane, since):
+                self.record_brief(lane, ticket, done=done, limit=limit, at=mtime)
 
     def brief_counts(self, lane: str) -> Tuple[int, int, int]:
         """(total_non_limit, done, limit_count) for the lane since the window
