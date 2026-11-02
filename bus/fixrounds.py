@@ -180,6 +180,12 @@ def findings_path(home: str) -> str:
     return os.path.join(home, "state", "fix-findings.json")
 
 
+def pending_finding(thread: str, path: str, revision: str) -> Dict[str, Any]:
+    """A finding no round has picked up yet: thread `thread` citing `path`,
+    raised against pull request head `revision`."""
+    return {"id": thread, "path": path, "revision": revision, "state": "pending"}
+
+
 def finding_key(thread: str, revision: str) -> str:
     return "%s@%s" % (thread, revision)
 

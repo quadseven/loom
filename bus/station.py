@@ -8129,9 +8129,9 @@ class Station:
         """The finding at the answer's revision, picked up; None when that
         revision is not the pull request's head."""
         known = fixrounds.load_findings(fixrounds.findings_path(self.s.home))
-        finding = known.get(fixrounds.finding_key(thread_id, revision)) or {
-            "id": thread_id, "path": str(node.get("path") or ""), "revision": revision,
-            "state": "pending"}
+        finding = (known.get(fixrounds.finding_key(thread_id, revision))
+                   or fixrounds.pending_finding(thread_id, str(node.get("path") or ""),
+                                                revision))
         picked = fixrounds.transition_finding(finding, "picked_up", revision, current)
         if picked is not None:
             self._keep_finding(picked)

@@ -862,9 +862,13 @@ PY
   rm -f "$source"
 }
 
-# Whether this round's commits changed file $1.
+# Whether this round's commits changed file $1; a thread with no file never
+# counts as changed.
 round_changed() {
-  safe_git diff --name-only "$BASE..HEAD" 2>> "$LOG" | grep -Fxq -- "$1"
+  local changed
+  [ -n "$1" ] || return 1
+  changed="$(safe_git diff --name-only "$BASE..HEAD" 2>> "$LOG")" || return 1
+  grep -Fxq -- "$1" <<< "$changed"
 }
 
 # The reply text reaches gh as a -f field value (a GraphQL variable), never
