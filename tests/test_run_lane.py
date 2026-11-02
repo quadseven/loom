@@ -1869,10 +1869,11 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     FIX_BRANCH = "loom/42-fix-the-thing"
 
-    def fix_brief(self, with_head=False, check="lint"):
+    def fix_brief(self, with_head=False, check="lint", resume=None):
         """A station fix brief for PR 7, whose branch is already on the remote
         with the lane's first commit. `with_head`: the brief names that commit
-        as the head its checks failed on, as the station's does."""
+        as the head its checks failed on, as the station's does. `resume`: the
+        kept -timedout- branch the station names in the brief, if any."""
         work = Path(self._tmp.name) / "pr-work"
         git("clone", "-q", str(self.remote), str(work))
         git("checkout", "-q", "-b", self.FIX_BRANCH, cwd=work)
@@ -1891,8 +1892,19 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n%s"
             % (self.FIX_BRANCH, check, marker)))
         name = tickets.ticket_name("example/repo", 42, 2)
-        self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 2, fix))
+        self.drop_brief(name + ".md", tickets.render_brief("example/repo", issue, "codex", 2, fix,
+                                                           resume=resume))
         return name, self.remote_head(self.FIX_BRANCH)
+
+    def keep_edits(self, side, start, text, name="earlier.txt"):
+        """Push SIDE, one commit on START that writes NAME, as a timed-out run keeps its edits."""
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, start, cwd=work)
+        (work / name).write_text(text)
+        git("add", name, cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
 
     def remote_head(self, branch):
         return subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", branch],
@@ -2944,6 +2956,45 @@ cat > /dev/null
         self.assertEqual(len(self.parents(after)), 2)
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_merges_the_kept_branch_of_its_timed_out_attempt_before_the_agent(self):
+        # The station names the kept branch in a fix round's brief too; the
+        # runner merges it as it does for a first build (2026-11-02).
+        side = self.FIX_BRANCH + "-timedout-1792595837"
+        self.keep_edits(side, "origin/main", "from the timed-out round\n")
+        name, _ = self.fix_brief(resume=side)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent-saw-earlier", self.calls())
+        self.assertIn("merged the earlier attempt's branch %s" % side, self.run_log(name + ".log"))
+
+    def test_a_kept_branch_that_conflicts_is_left_out_and_logged_and_the_fix_round_still_runs(self):
+        side = self.FIX_BRANCH + "-timedout-1792595838"
+        self.keep_edits(side, "origin/main", "the timed-out round's first.txt\n", name="first.txt")
+        name, _ = self.fix_brief(resume=side)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not merge the earlier attempt's branch %s" % side, self.run_log(name + ".log"))
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        # The failed merge was aborted: the branch keeps its own first.txt.
+        self.assertEqual(self.remote_file(self.remote_head(self.FIX_BRANCH), "first.txt"), "first try\n")
+
+    def test_a_kept_branch_is_not_merged_over_a_default_branch_merge_that_conflicts(self):
+        # The default branch merge is still pending when the kept branch would
+        # merge; a second merge would abort it and the agent would never see
+        # the conflict.
+        side = self.FIX_BRANCH + "-timedout-1792595839"
+        self.keep_edits(side, "origin/main", "from the timed-out round\n")
+        name, _ = self.fix_brief(resume=side)
+        self.advance_main("first.txt", "main's version\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "printf 'both kept\\n' > first.txt\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent saw conflicts", self.calls())
+        self.assertIn("could not merge the earlier attempt's branch %s" % side, self.run_log(name + ".log"))
 
     def test_a_fix_round_that_merges_main_scans_only_what_the_pull_request_adds(self):
         # The default branch may carry text the public repo scan flags in a
