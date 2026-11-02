@@ -28,8 +28,9 @@ empties says "none"; after CLEAR_AFTER of none the issue closes with one
 cleared note (edited, not reposted, on a later clear), and a violation that
 returns reopens the same issue. A repo whose facts could not be read keeps
 its issue as it is. Older per-violation issues of those kinds close with a
-comment saying why, FOLD_MAX a pass, a ticket a rewrite made of one too
-unless something has it in hand (loom#2506); a running count on the tracking
+comment saying why, FOLD_MAX a pass, a ticket a rewrite made of one and a
+report left with loom:invariant alone too unless something has it in hand
+(loom#2506, loom#2526); a running count on the tracking
 issue of their repo is edited in place. The rewriter takes no such issue
 (brain.not_work_reason).
 Adding an invariant is one function in INVARIANTS plus a test.
@@ -1256,12 +1257,23 @@ def read_kinds(facts: Facts) -> Tuple[str, ...]:
 
 
 def _busy_ticket(labels: Sequence[str]) -> bool:
-    """Whether a ticket's labels show something has it in hand: a lane at a
-    BUSY_TICKET_STATES state, a claim:<login>, an ask (needs:<login>) or a
-    BUSY_LABELS label."""
+    """Whether a ticket's or a report's labels show something has it in
+    hand: a lane at a BUSY_TICKET_STATES state, a claim:<login>, an ask
+    (needs:<login>) or a BUSY_LABELS label."""
     if tickets.ticket_state({"labels": [{"name": n} for n in labels]}) in BUSY_TICKET_STATES:
         return True
     return any(n.startswith(("claim:", "needs:")) or n in BUSY_LABELS for n in labels)
+
+
+def _clears(labels: Sequence[str]) -> bool:
+    """Whether the clear step closes a report with these labels once its
+    breach is gone: a triage or rewritten one, or one left with
+    loom:invariant alone (its triage label came off, no ticket was made of
+    it) that nothing holds (loom#2526: such reports of every kind but the
+    SETTLES ones had no close path, and stayed open for weeks)."""
+    if "loom:triage" in labels or "loom:rewritten" in labels:
+        return True
+    return TICKET_LABEL not in labels and not _busy_ticket(labels)
 
 
 def is_rolled(b: Breach) -> bool:
@@ -1931,8 +1943,9 @@ class Filer:
     def _clear_one(self, key: str, number: int, current: Dict[str, Breach]) -> bool:
         """Settle one open issue whose breach is gone this pass: a tracking
         issue lists none or closes, an older issue folds into its rolling
-        one, a standing one says clear, any other closes once quiet. False
-        when the pass has no writes left."""
+        one, a standing one says clear, any other closes once quiet. A ticket
+        and a held report keep their own path. False when the pass has no
+        writes left."""
         issue = self._issue(number)
         if issue is None or issue.get("state") != "open":
             return True
@@ -1940,12 +1953,12 @@ class Filer:
                   if isinstance(x, dict)]
         if self._rolls.get(key) == number and TICKET_LABEL not in labels:
             return self._clear_roll(key, number, issue)
-        triaged = "loom:triage" in labels or "loom:rewritten" in labels
-        if self._old_rolled(key) and (triaged or TICKET_LABEL in labels):
+        clears = _clears(labels)
+        if self._old_rolled(key) and (clears or TICKET_LABEL in labels):
             # A rewrite into a ticket drops loom:triage; the ticket still
             # restates its kind (loom#2506).
             return self._fold_old_rolled(key, number, issue, labels, current)
-        if not triaged:
+        if not clears:
             return True
         comments = self._comments(number)
         into = self._rolled_into(key, current)
@@ -2037,7 +2050,8 @@ class Filer:
 
     def _close_quiet(self, number: int, issue: Dict[str, Any], labels: List[str],
                      comments: List[Dict[str, Any]]) -> bool:
-        """Close an open triage or rewritten issue whose breach has been gone CLEAR_AFTER,
+        """Close an open report (triage, rewritten, or loom:invariant alone and
+        not held) whose breach has been gone CLEAR_AFTER,
         or mark it loom:recurring when it broke 3 times in RECURRING_AFTER.
         False when the pass has no writes left for it."""
         breaches = [_epoch(issue.get("created_at"))] + self._broken_times(comments)
