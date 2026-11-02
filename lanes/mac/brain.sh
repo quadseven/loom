@@ -44,6 +44,9 @@ LADDER="${LOOM_BRAIN_LADDER:-claude codex spark}"
 # The lane and model that ran the tick; set when a rung starts.
 RUNG="" MODEL=""
 HOLDER="${LOOM_BRAIN_HOLDER:-lane-machine}"
+# This tick's run id on the lock (loom#2275): a lock left under the same
+# holder by an earlier tick reads as another run, not as this one's own.
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 MINUTES="${LOOM_BRAIN_MINUTES:-40}"
 SCOPE="${LOOM_BRAIN_SCOPE:-all}"
 # How long a tick waits for a lock another brain holds before it skips. A
@@ -239,7 +242,7 @@ bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 # still releases it below before anyone else could take it.
 [[ "$WAIT" =~ ^[0-9]+$ && "$WAIT_STEP" =~ ^[0-9]+$ ]] || { say "LOOM_BRAIN_WAIT and LOOM_BRAIN_WAIT_STEP must be whole numbers"; exit 1; }
 deadline=$(( $(date +%s) + WAIT * 60 ))
-until bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" >> "$LOG" 2>&1; do
+until bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" --run "$RUN_ID" >> "$LOG" 2>&1; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     beat skipped 0
     exit 0

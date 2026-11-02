@@ -3416,7 +3416,7 @@ exec /usr/bin/git "$@"
         self.assertNotIn("[limit]", log)
         self.assertIn("[transient]", log)
 
-    def api_lane(self, lane, extra="", **env):
+    def api_lane(self, lane, extra="", difficulty="medium", brief_header="Demoted-Models: none", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
         planted = self.home / ".ssh" / "id_planted"
@@ -3436,7 +3436,8 @@ exec /usr/bin/git "$@"
         self.addCleanup(self.local_service.close)
         port = self.local_service.getsockname()[1]
         (inbox / "T042-fix-the-thing.md").write_text(
-            BRIEF.replace("Lane: codex", f"Lane: {lane}") + f"\nPROBE_PORT={port}\n{extra}")
+            BRIEF.replace("Lane: codex", f"Lane: {lane}").replace("Difficulty: medium", f"Difficulty: {difficulty}\n{brief_header}")
+            + f"\nPROBE_PORT={port}\n{extra}")
         result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
@@ -4334,12 +4335,16 @@ echo fixed > fix.txt
 """
 
     def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
-                 zen=("flint-40b-free",)):
+                 zen=("flint-40b-free",), usage=1):
         self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
         lists = {"/go.json": {"data": [{"id": m} for m in go]},
                  "/zen.json": {"data": [{"id": m} for m in zen]},
                  "/status.json": {"opencode-go": {"models": {m: {} for m in go}},
-                                  "opencode": {"models": {m: {} for m in zen}}}}
+                                  "opencode": {"models": {m: {} for m in zen}}},
+                 "/usage": {"usage": {name: {"status": "ok", "percent": usage, "resetsAt": reset}
+                                      for name, reset in (("rolling", "2099-01-01T00:00:00Z"),
+                                                          ("weekly", "2099-01-02T00:00:00Z"),
+                                                          ("monthly", "2099-01-03T00:00:00Z"))}}}
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -4361,9 +4366,19 @@ echo fixed > fix.txt
                     LOOM_OPENCODE_GO_MODEL="opencode-go/mimo-v2.6-flash",
                     LOOM_ZEN_MODEL="opencode/flint-40b-free",
                     LOOM_OPENCODE_GO_PROBE_URL="", LOOM_ZEN_PROBE_URL="",
+                    LOOM_OPENCODE_GO_USAGE_URL=base + "/usage",
                     LOOM_OPENCODE_GO_MODELS_URL=base + "/go.json",
                     LOOM_ZEN_MODELS_URL=base + "/zen.json",
                     LOOM_MODELS_STATUS_URL=base + "/status.json")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_runner_without_the_scorecard_skips_models_named_in_the_brief(self):
+        (self.loom / "briefs" / "opencode-go").mkdir(parents=True, exist_ok=True)
+        inbox, result = self.api_lane("opencode-go", extra="", difficulty="medium",
+                                      brief_header="Demoted-Models: opencode-go/gpt-6-luna",
+                                      **self.pick_env(go=self.STRONG_LISTED + ("claude-haiku-5-5",)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/claude-haiku-5-5", self.runs()[-1])
 
     def pause_models(self, *keys):
         (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
@@ -4375,7 +4390,7 @@ echo fixed > fix.txt
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_slot_ignores_its_pin_and_reports_the_free_model_it_picked(self):
-        inbox, result = self.api_lane("opencode-go", extra="Model: opencode-go/mimo-v2.6-flash\n",
+        inbox, result = self.api_lane("opencode-go", extra="Model: opencode-go/mimo-v2.6-flash\n", difficulty="easy",
                                       **self.pick_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-m opencode-go/beam-free", self.runs()[-1])
@@ -4387,7 +4402,7 @@ echo fixed > fix.txt
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_gone_model_is_paused_and_the_brief_runs_on_the_next_free_model(self):
         env = self.pick_env(broken="opencode-go/beam-free")
-        inbox, first = self.api_lane("opencode-go", **env)
+        inbox, first = self.api_lane("opencode-go", difficulty="easy", **env)
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
         self.assertFalse((inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -4404,7 +4419,8 @@ echo fixed > fix.txt
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_paid_run_for_a_private_repo_is_logged_and_settled(self):
         self.pause_models("opencode-go/beam-free")
-        inbox, result = self.api_lane("opencode-go", FAKE_GH_PRIVATE="true", **self.pick_env())
+        inbox, result = self.api_lane("opencode-go", difficulty="easy", FAKE_GH_PRIVATE="true",
+                                      **self.pick_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-m opencode-go/mimo-v2.6-flash", self.runs()[-1])
         log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
@@ -4413,7 +4429,26 @@ echo fixed > fix.txt
         ledger = (self.loom / "state" / "usage" / "go-budget.jsonl").read_text().splitlines()
         self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    STRONG_LISTED = ("beam-free", "iceman-contributor-free", "gpt-6-luna", "mimo-v2.6-flash")
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_medium_ticket_runs_the_strong_tier(self):
+        inbox, result = self.api_lane("opencode-go",
+                                      **self.pick_env(go=self.STRONG_LISTED))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/gpt-6-luna", self.runs()[-1])
+        log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
+        self.assertIn("(paid)", log)
+        self.assertIn("strong tier", log)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_near_the_limit_a_hard_ticket_falls_back_to_free_and_still_runs(self):
+        inbox, result = self.api_lane("opencode-go", difficulty="hard",
+                                      **self.pick_env(go=self.STRONG_LISTED, usage=95))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-m opencode-go/iceman-contributor-free", self.runs()[-1])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_verify_run_waits_rather_than_spend_a_paid_model(self):
         self.pause_models("opencode-go/beam-free", "opencode-go/iceman-contributor-free", "zen-free")

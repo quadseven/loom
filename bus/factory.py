@@ -384,12 +384,13 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # waited a median 18.5 hours for codex while these sat idle; a ticket a
     # free model fails still climbs the model ladder.
     "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
-              + ("codex", "codex-2", "opencode-go", "opencode-go-2",
-                 "opencode-go-3", "opencode-go-4") + ANTHROPIC,
+              + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                 "codex", "codex-2") + ANTHROPIC,
     # agy takes hard work on public repos (agy stays public only); since
     # 2026-10-21 it runs its gemini-3.8-flash default there, as codex runs
     # gpt-6-luna (tickets.FORBIDDEN_MODELS).
-    "hard": SPARKS + ANTHROPIC + ("claude", "agy", "codex", "codex-2"),
+    "hard": SPARKS + ANTHROPIC + ("claude", "agy", "opencode-go", "opencode-go-2",
+                                  "opencode-go-3", "opencode-go-4", "codex", "codex-2"),
 }
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
 # own-hardware (the Sparks), free (a free provider's allowance), subscription

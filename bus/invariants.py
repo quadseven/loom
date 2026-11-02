@@ -183,9 +183,9 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # closed, an epic back at its cap. The filer keeps each breach's subject in
 # its local state and, once the breach is gone, asks the caller's settled()
 # whether the subject itself settled; one that did closes its issue on that
-# pass, before any other clear, whatever labels it carries (loom#2022: five
-# lane-pr-stalled issues stayed open up to a day after their pull requests
-# merged or closed, and an operator closed them by hand).
+# pass, before filing or any other clear, whatever labels it carries
+# (loom#2022: five lane-pr-stalled issues stayed open up to a day after their
+# pull requests merged or closed, and an operator closed them by hand).
 SETTLES = ("lane-pr-stalled", "epic-over-cap")
 # Invariants that restate state the pull request, the epic or the dashboard
 # already shows: one tracking issue per (kind, subject repo), its list edited
@@ -1306,6 +1306,9 @@ class Filer:
         self._texts: Dict[str, str] = {}
         # Tracking issue -> older issues closed into it this pass.
         self._folded: Dict[int, int] = {}
+        # (key, number) of each older issue settled this pass, not yet
+        # counted against its tracking issue.
+        self._unrolled: List[Tuple[str, int]] = []
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
         self._listed_closed: set = set()
@@ -1751,9 +1754,11 @@ class Filer:
         """Close the open issue of each gone SETTLES breach whose subject
         settled for good, its note at the foot of the body. Walks the listing,
         not the local map, so a breach filed before the map or gone while the
-        station was down settles too. Runs before the other clears, so a pass
-        short of writes still spends them here first, and reads no comments
-        (a deferred comment read stopped the whole clear)."""
+        station was down settles too. run() calls it before filing anything,
+        so the pass's writes go here first (loom#2451: filing spent them every
+        pass that could write, and four issues about closed epics stayed open
+        for days), and it reads no comments (a deferred comment read stopped
+        the whole clear)."""
         listing = self._listing()
         for key in list(self.subjects):
             if listing.get(key) is None or listing[key] in self._listed_closed:
@@ -1818,14 +1823,19 @@ class Filer:
         self.writes += 1
         self.folds += 1
         self._listed_closed.add(number)
-        into = self._rolled_into(key, current)
-        if into is not None and into != number:
-            self._folded[into] = self._folded.get(into, 0) + 1
+        # Counted against its tracking issue once filing has found which
+        # are open: the settle step closes before filing runs.
+        self._unrolled.append((key, number))
         return True
 
-    def _summarize_folds(self) -> None:
+    def _summarize_folds(self, current: Dict[str, Breach]) -> None:
         """One comment per tracking issue counts the older issues closed into
         it, edited in place as the count grows."""
+        for key, closed in self._unrolled:
+            into = self._rolled_into(key, current)
+            if into is not None and into != closed:
+                self._folded[into] = self._folded.get(into, 0) + 1
+        self._unrolled = []
         for number, count in self._folded.items():
             mine = [c for c in self._comments(number) if FOLD_MARKER in str(c.get("body", ""))]
             m = FOLD_COUNT_RE.search(str(mine[-1].get("body", ""))) if mine else None
@@ -1846,7 +1856,7 @@ class Filer:
         try:
             self._clear_gone(current)
         finally:
-            self._summarize_folds()
+            self._summarize_folds(current)
 
     def _clear_gone(self, current: Dict[str, Breach]) -> None:
         for key, number in self._listing().items():
@@ -2072,29 +2082,25 @@ class Filer:
         for b in current.values():
             if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
-        if self.write:
-            # Before the filing below can spend the pass's writes: settling
-            # costs at most FOLD_MAX closes, so the older issues drain even
-            # while other invariants file something every pass (loom#2408).
-            self._settle_first(current)
-        for b in current.values():
-            if not self.write or self.writes >= WRITES_MAX:
-                return
-            try:
-                self._one(b)
-            except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
-                self.say("invariants: could not file %s (%s): %s" % (b.invariant, b.title, err))
-        if self.write and self.writes < WRITES_MAX:
-            try:
-                self._clear_stale(current)
-            except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
-                self.say("invariants: could not close cleared issues: %s" % err)
-
-    def _settle_first(self, current: Dict[str, Breach]) -> None:
+        if not self.write:
+            return
+        # Settle first: it closes at most FOLD_MAX issues a pass, and filing
+        # below can spend every write (loom#2451).
         try:
             self._settle(current)
         except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
             self.say("invariants: could not close settled issues: %s" % err)
+        for b in current.values():
+            if self.writes >= WRITES_MAX:
+                break
+            try:
+                self._one(b)
+            except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+                self.say("invariants: could not file %s (%s): %s" % (b.invariant, b.title, err))
+        try:
+            self._clear_stale(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close cleared issues: %s" % err)
 
 
 def load(path: str, say: Say) -> Dict[str, Any]:

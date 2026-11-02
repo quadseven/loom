@@ -56,6 +56,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `closed-unproven` | The station closed the ticket on merged code with its Live box unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
 | `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
+| `loom:mutation` | The one rolling report of the weekly spot mutation run (`bus/mutation_run.py`). Never a ticket; a survivor to fix gets its own. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
@@ -1505,13 +1506,21 @@ issue moves to `needs:human`, it is listed with the asks.
 One tick at a time, under a lock: a branch `loom-lock/brain` in this repo,
 created through the API. Creating a ref that exists fails, so only one
 holder wins. The ref points at a commit whose message is
-`holder=<name> expires=<UTC time>`. A tick that finds the lock held and
-unexpired exits; one that finds it expired deletes it and tries once to
-create it. The tick deletes it when done. The lock lasts `--minutes`
-(default 15); Muse takes 30 for its 25-minute tick.
+`holder=<name> expires=<UTC time> acquired=<UTC time>`, with `run=<id>` when
+the caller passed `--run`. A tick that finds the lock held and unexpired by a
+peer exits; one that finds it expired deletes it and tries once to create
+it. A live lock that is the caller's own (the same holder, and the same run
+when `--run` is given) is acquired, not held: a re-attempt after a lost or
+misread answer never stands a brain down against itself (loom#2275). The
+tick expires it when done. The lock lasts `--minutes`
+(default 15); Muse takes 30 for its 25-minute tick. `--wait N` tries again
+each minute for up to N minutes while a peer holds it.
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
-<owner/name> --holder <name>` do this (exit 0 on success, 1 when held by
-someone else).
+<owner/name> --holder <name>` do this (exit 0 when the caller holds the lock,
+1 when a peer does). The lock line always names the holder: `lock acquired:
+yours ...`, `lock acquired: already yours ..., held 4m since <time>`, or
+`lock held by <holder> (not yours: you are <caller>), held 12m since <time>,
+at step <step>, expires <time>`.
 
 Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review `needs-brain` tickets in full
@@ -2102,6 +2111,16 @@ before it runs. Loom bounds what it asks and keeps; the routes behind the
 adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
+
+When an opted-in repo has a prose Live box with no runnable check, the
+station hands a shipped ticket to a verify lane before asking a person. The
+brief lists that adapter's log sources and whether its SQL route is available.
+The lane may return one `adapter_step`: `log:<source>` with required strings,
+or `sql:<SELECT ...>` with strings that must occur in the rows. The station
+validates and runs the step through the repo adapter itself; lane prose never
+counts as evidence. A missing step or a failed station read raises one
+`loom:human` ask naming the attempted step and reason. Repos without an opted-in
+adapter keep the existing ask path.
 
 ### The evidence close
 

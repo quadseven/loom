@@ -724,6 +724,12 @@ class States(unittest.TestCase):
         runs = [run("green"), run("red", name=factory.DEFAULT_REVIEW_CHECK, run_id=2)]
         self.assertEqual(revert.commit_state(runs, 0, factory.DEFAULT_REVIEW_CHECK), "green")
 
+    def test_a_weekly_report_on_a_commit_is_not_that_commits_failure(self):
+        runs = [{"id": 1, "name": "unittest", "status": "completed", "conclusion": "success"},
+                {"id": 2, "name": revert.REPORT_CHECKS[0], "status": "completed",
+                 "conclusion": "failure"}]
+        self.assertEqual(revert.commit_state(runs, 0), "green")
+
 
 if __name__ == "__main__":
     unittest.main()

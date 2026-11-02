@@ -1845,10 +1845,15 @@ pick_refused() {
 # 0 with MODEL set for this run; the key goes to the picker on stdin. A run
 # reaches here with the slot's pin in MODEL, which it replaces.
 pick_run_model() {
-  local out paid_ok=true
-  # Paid models run on build work only: a verify, answer or review run waits.
-  [ -z "$DELIVERABLE" ] || paid_ok=false
-  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$paid_ok" 2>> "$LOG")"; then
+  local out tier=none
+  # Paid models run on build work only: a verify, answer or review run stays
+  # on free models. An easy ticket runs free first, and any other the strong
+  # tier first. A ticket with no Difficulty: line counts as medium.
+  if [ -z "$DELIVERABLE" ]; then
+    tier=strong
+    [ "$(field Difficulty "$BRIEF" || true)" = easy ] && tier=easy
+  fi
+  if ! out="$(printf '%s\n' "$API_KEY" | model_pick pick "$LANE" "$SLOT" "$REPO_PRIVATE" "$tier" "$(field Demoted-Models "$BRIEF" || true)" 2>> "$LOG")"; then
     pick_refused "$out"
     return 1
   fi

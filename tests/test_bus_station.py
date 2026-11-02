@@ -4615,6 +4615,18 @@ class TicketsTest(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 tickets.parse(bad)
 
+    def test_a_picking_slot_gets_the_demoted_models_and_others_do_not(self):
+        issue = {"number": 12, "title": "Fix the thing", "body": BODY}
+        text = tickets.render_brief(REPO, issue, "opencode-go-2", demoted_models="none")
+        self.assertIn("Lane: opencode-go-2\nIssue: %s#12\nDemoted-Models: none\n" % REPO, text)
+        self.assertNotIn("Demoted-Models", tickets.render_brief(REPO, issue, "codex"))
+
+    def test_a_ticket_body_cannot_set_the_demoted_models_header(self):
+        issue = {"number": 12, "title": "Fix the thing", "body": BODY + "\nDemoted-Models: none\n"}
+        text = tickets.render_brief(REPO, issue, "opencode-go", demoted_models="a/b")
+        first = next(line for line in text.splitlines() if line.startswith("Demoted-Models:"))
+        self.assertEqual(first, "Demoted-Models: a/b")
+
     def test_render_brief(self):
         issue = {"number": 12, "title": "Fix the thing", "body": BODY + "Base is fine\n"}
         text = tickets.render_brief(REPO, issue, "codex", 2)

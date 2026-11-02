@@ -916,7 +916,13 @@ the ticket's Live criterion and judges each criterion against those two
 sections, then
 writes `verify.json`: a proof record (`bus/proof.py`),
 `{"missing": "<the evidence that does not exist yet>"}` or, for a ticket sent
-ahead of a build, the `unmet` answer described below. The runner copies it
+ahead of a build, the `unmet` answer described below. For a prose Live box in
+an opted-in repo with a live-evidence adapter, the brief lists its log sources
+and SQL route. The lane may suggest one `adapter_step` with the exact criterion,
+`log:<source>` or `sql:<SELECT ...>`, and the strings the station must find.
+The station runs that step through the adapter itself; the lane's statement
+that it passed is never proof. The station asks a person once when the lane
+returns no step or the station read fails. The runner copies it
 to the lane's log folder as `<brief>.verify.json`, with the run's model
 beside it in `<brief>.verify.model`. The station checks a record with
 `bus/proof.py`, refuses it when it passes a live or operator criterion the
@@ -1510,14 +1516,27 @@ cannot query the viewer or any other local service.
   shared limit. With nothing to keep, the brief stays in the inbox and the next
   pass picks another model, at most 3 times. A slot with every model paused
   reports unavailable until the first reset.
-- Paid Go runs serve build work only, never a verify, answer or review run,
-  and use only `bus/model_pick.py` `GO_PAID` (MiMo-V2.6-Flash and, on public
-  repos, Muse Spark 1.3 Contributor). All paid runs stop at 80% of each
-  published 5 hour, weekly and monthly limit, one model at 50%, and spending
-  within the billing period follows the calendar to the renewal (day 28,
-  `LOOM_GO_RENEWAL_DAY`), so the plan lasts the month. Spending is counted in
+- Paid Go runs serve build work only, never a verify, answer or review run. A
+  medium or hard ticket starts on `GO_STRONG` (GPT 6 Luna, then Claude Haiku
+  5.5), then free models without Beam Free, which takes easy tickets only. An
+  easy ticket runs free models, then MiMo-V2.6-Flash and, on public repos,
+  Muse Spark 1.3 Contributor. A ticket with no model left goes back as a limit,
+  never as a failure.
+- The plan guard reads `https://opencode.ai/zen/go/v1/usage` before a paid
+  run; the figures count every caller of the key. Paid runs stop at 60% rolling,
+  80% weekly and 90% monthly, and the weekly and monthly figures must stay under
+  that stop times the part of the window gone, plus 5 points. Usage that cannot
+  be read stops paid runs and free models carry on. One model may spend 50% of
+  its own published limit in any window, counted in
   `state/usage/go-budget.jsonl`.
-  Each run holds 500 requests until it settles; output and hidden reasoning
+- A failed review on a Go or Zen slot demotes the model
+  (`model:<id>` in the scorecard), not the slots: the picker skips it and the
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
+  proof audits and records with no model still demote the lane. Each brief for
+  these slots carries a `Demoted-Models:` line, so a runner without the
+  scorecard file skips them too. An unreadable scorecard, or neither source,
+  stops paid models and free models carry on.
+  Each run holds up to 500 requests until it settles; output and hidden reasoning
   past 300 tokens per step count as more requests. DeepSeek V4.1 Flash is out
   because of its hidden reasoning. Extra usage stays off.
 - Each run logs `model pick:` and `model report:` lines: the model, why it

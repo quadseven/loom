@@ -382,7 +382,9 @@ class StatusDeadlineTest(unittest.TestCase):
 # The requests status sends for the three fake repos and the lane status.
 PINNED_REQUESTS = 60
 # The requests the four light repos' sections send, beside the heavy ones.
-PINNED_SMALL_REQUESTS = 36
+# Each goal's sub-issues are a GraphQL query, not a REST list, so the
+# light repos send 4 REST requests fewer than before loom#2461.
+PINNED_SMALL_REQUESTS = 32
 
 
 if __name__ == "__main__":

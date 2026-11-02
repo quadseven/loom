@@ -108,6 +108,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:proof-due": {"color": "fbca04", "description": "Rolling list of Live boxes of tickets closed unproven"},
     "loom:regression": {"color": "b60205", "description": "Fixes a measured regression of a shipped ticket"},
     "loom:revert": {"color": "b60205", "description": "Reverts the merge that turned the default branch red"},
+    "loom:mutation": {"color": "d4c5f9", "description": "The rolling report of the weekly spot mutation run"},
     "class:sensitive": {"color": "b60205", "description": "Touches a sensitive path; needs extra scrutiny"},
     "class:logic": {"color": "0075ca", "description": "Changes behavior-carrying code"},
     "class:tests": {"color": "0e8a16", "description": "Changes test files only"},

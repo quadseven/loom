@@ -452,7 +452,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
-            loose, tree = goal_tree(gh, repo, int(issue["number"]))
+            loose, tree = goal_tree(gh, repo, int(issue["number"]), light=True)
             if shares is not None:
                 shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree), issues)
             held, waiting = _count_unproven(_flatten(loose, tree))
@@ -2034,11 +2034,14 @@ def _epic_label(issue: Dict[str, Any]) -> bool:
     return "epic" in [name.lower() for name in _labels(issue)]
 
 
-def _direct_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+def _direct_children(gh: GitHub, repo: str, goal: int,
+                     light: bool = False) -> List[Dict[str, Any]]:
     """Sub-issues of the goal, then, once the goal holds GitHub's limit of
     sub-issues (the only way a ticket gets a Part of line instead), the Part
-    of #goal tickets not already listed. Below the limit it costs no search."""
-    children = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal)))
+    of #goal tickets not already listed. Below the limit it costs no search.
+    With `light`, the sub-issues are read as _sub_issue_tickets reads them."""
+    children = (_sub_issue_tickets(gh, repo, [goal])[goal] if light else
+                list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100" % (repo, goal))))
     if len(children) < SUB_ISSUE_LIMIT:
         return children
     seen = {int(c.get("number") or 0) for c in children if isinstance(c, dict)}
@@ -2065,15 +2068,19 @@ def _goal_epics(gh: GitHub, repo: str, goal: int,
     return epics
 
 
-def goal_tree(gh: GitHub, repo: str, goal: int
+def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
     """(the goal's direct children that are not epics, [(epic, its tickets)]).
 
     One walk for every reader (decision 0003): goal, then its epics, then each
     epic's tickets, its sub-issues plus open loom:ticket issues whose Part of
     line names the epic. While tickets move under epics, the goal's own
-    tickets (sub-issues and Part of #goal tickets) still count."""
-    direct = _direct_children(gh, repo, goal)
+    tickets (sub-issues and Part of #goal tickets) still count.
+
+    With `light` (status), each sub-issue carries only SUB_ISSUE_FIELDS, read
+    EPIC_STATES issues to a GraphQL query (_sub_issue_tickets), not one REST
+    list per issue with every body (loom#2461)."""
+    direct = _direct_children(gh, repo, goal, light)
     epics = _goal_epics(gh, repo, goal, direct)
     epic_numbers = {int(e.get("number") or 0) for e in epics}
     loose = [c for c in direct if isinstance(c, dict)
@@ -2084,8 +2091,12 @@ def goal_tree(gh: GitHub, repo: str, goal: int
         "/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
         if isinstance(i, dict) and "pull_request" not in i]
     tree = []
-    subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                               % (repo, int(epic.get("number") or 0))), epics)
+    if light:
+        found = _sub_issue_tickets(gh, repo, [int(e.get("number") or 0) for e in epics])
+        subs = [found[int(e.get("number") or 0)] for e in epics]
+    else:
+        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                                   % (repo, int(epic.get("number") or 0))), epics)
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
     return loose, tree
@@ -2147,6 +2158,56 @@ def _sub_issue_states(gh: GitHub, repo: str, numbers: Sequence[int]
                 out[n] = [{"number": x.get("number"), "state": str(x.get("state") or "").lower()}
                           for x in nodes]
     return out
+
+
+# What status reads of each sub-issue (_sub_issue_tickets): the number, title,
+# state and label names, and the times bus/quiet.py compares. The REST list
+# carries every body too: on 2026-11-01 a status of three heavy repos read
+# 103 sub-issue lists, 2.2 MB gzipped (15.7 MB unpacked), the largest part of
+# its read (loom#2461).
+SUB_ISSUE_FIELDS = ("number title state createdAt closedAt updatedAt"
+                    " labels(first:100) { nodes { name } }")
+
+
+def _sub_issue_tickets(gh: GitHub, repo: str, numbers: Sequence[int]
+                       ) -> Dict[int, List[Dict[str, Any]]]:
+    """Each issue's sub-issues in sub-issue order, in GitHub's REST spelling
+    (number, title, lower-case state, created_at, closed_at, updated_at,
+    labels as [{"name"}]) but only SUB_ISSUE_FIELDS of it, read EPIC_STATES
+    issues to a GraphQL query. An issue with more sub-issues than one page
+    holds is read through REST, whole, as goal_tree reads it."""
+    owner, name = repo.split("/", 1)
+    numbers = list(dict.fromkeys(int(n) for n in numbers))
+    chunks = [numbers[i:i + EPIC_STATES] for i in range(0, len(numbers), EPIC_STATES)]
+
+    def read(chunk: List[int]) -> Dict[str, Any]:
+        fields = " ".join("e%d: issue(number:%d) { subIssues(first:100) { totalCount "
+                          "nodes { %s } } }" % (n, n, SUB_ISSUE_FIELDS) for n in chunk)
+        data = gh.graphql("query { repository(owner:%s,name:%s) { %s } }"
+                          % (_gql(owner), _gql(name), fields)) or {}
+        return data.get("repository") or {}
+
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for chunk, found in zip(chunks, _read_each(read, chunks), strict=True):
+        for n in chunk:
+            subs = (found.get("e%d" % n) or {}).get("subIssues") or {}
+            nodes = [x for x in subs.get("nodes") or [] if isinstance(x, dict)]
+            if int(subs.get("totalCount") or 0) > len(nodes):
+                out[n] = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                          % (repo, n)))
+            else:
+                out[n] = [_rest_issue(x) for x in nodes]
+    return out
+
+
+def _rest_issue(node: Dict[str, Any]) -> Dict[str, Any]:
+    """A GraphQL issue node of SUB_ISSUE_FIELDS in GitHub's REST spelling."""
+    labels = ((node.get("labels") or {}).get("nodes")) or []
+    return {"number": node.get("number"), "title": node.get("title"),
+            "state": str(node.get("state") or "").lower(),
+            "created_at": node.get("createdAt"), "closed_at": node.get("closedAt"),
+            "updated_at": node.get("updatedAt"),
+            "labels": [{"name": x.get("name")} for x in labels if isinstance(x, dict)]}
 
 
 def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
