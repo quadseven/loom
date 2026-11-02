@@ -6907,7 +6907,8 @@ exit %d
         self.assertIn("Never edit files inside a submodule", self.log.read_text())
         records = self.records()
         self.assertEqual([(r["phase"], r["exit"], r["ok"]) for r in records],
-                         [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True), ("final", 0, True)])
+                         [("prepare", 0, True), ("setup", 0, True), ("baseline", 0, True),
+                          ("base-tests", 0, True), ("final", 0, True)])
         self.assertIn(pinned, records[0]["detail"])
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         head = subprocess.run(["git", "--git-dir", str(self.remote), "rev-parse", "loom/T042-fix-the-thing"],

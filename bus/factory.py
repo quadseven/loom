@@ -182,7 +182,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -1972,6 +1972,13 @@ class Factory:
                 break
         return paths
 
+    def _vacuous_findings(self, repo: str, number: int,
+                          full: Dict[str, Any], issue: Dict[str, Any]) -> List[str]:
+        """Check changed Python sources for vacuous lookup and fixture edits."""
+        sha = str((full.get("head") or {}).get("sha") or "")
+        return vacuous.pull_findings(self.gh, repo, number, sha,
+                                     str(issue.get("body") or ""))
+
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
         ticket that ask for tests?"""
@@ -2309,7 +2316,7 @@ class Factory:
                    open_threads: Sequence[str] = (), checks_failing: bool = False,
                    no_test: bool = False, unticked: Sequence[str] = (),
                    ticked: Sequence[str] = (), conflict_only: bool = False,
-                   unproven: Sequence[str] = ()) -> None:
+                   unproven: Sequence[str] = (), finding: str = "") -> None:
         number = int(issue["number"])
         held = SEND_BACK_HOLDS & set(_labels(issue))
         if held:
@@ -2333,6 +2340,8 @@ class Factory:
                 and not self._climb_or_stop(repo, pr, issue, comments, why)):
             return
         notes = TEST_NOTES if no_test else FIX_NOTES
+        if finding:
+            notes += "\n\nFactory finding: " + finding
         if unticked:
             try:
                 # Criteria are ticket text: one the written-text check refuses
@@ -2679,6 +2688,12 @@ class Factory:
         details = brain._pr_graphql(self.gh, repo, number)
         runs = self._runs.get(sha, [])
         faults = pr_faults(details, full, runs)
+        vacuity = self._vacuous_findings(repo, number, full, issue)
+        if vacuity:
+            finding = "; ".join(vacuity)
+            self._send_back(repo, full, issue, comments,
+                            "vacuous-test gate: " + finding, finding=finding)
+            return
         # Medium and low findings never send a pull request back on their own
         # (2026-10-14: 64% of 361 fix rounds were review threads, most of them
         # medium; "high-complexity" alone was 220 of ~1000 findings). They go
