@@ -5364,10 +5364,9 @@ def require_trusted_authors(env: Optional[Dict[str, str]], command: str) -> List
     """trusted_authors, or a ValueError naming the setting when it is empty:
     status and resume read only trusted journals, so with nobody trusted they
     would report no handoffs and every stage open instead of failing."""
-    authors = trusted_authors(env)
-    if not authors:
+    if not trusted_authors(env):
         raise ValueError(_NO_TRUST % command)
-    return authors
+    return brain_writers(env)
 
 
 def trusted_line(authors: Sequence[str]) -> str:
@@ -5379,9 +5378,57 @@ def trusted_line(authors: Sequence[str]) -> str:
 def trusted_briefers(env: Optional[Dict[str, str]] = None) -> List[str]:
     """LOOM_TRUSTED_BRIEFERS: another operator's logins whose loom:ticket
     briefs this Loom builds like its own (tickets.brief_author_trusted). They
-    own nothing here, and their journals, proofs and merges are not trusted."""
+    own nothing here. A fleet brain among them may act as the brain while it
+    holds the brain lock (check_acting_brain), and its journals, markers and
+    proofs are then read as a brain's (brain_writers)."""
     raw = (os.environ if env is None else env).get("LOOM_TRUSTED_BRIEFERS", "")
     return raw.replace(",", " ").split()
+
+
+def brain_writers(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The logins whose brain writing is read as a brain's: journals, handoff
+    markers and proofs. LOOM_BRIEF_AUTHORS, then LOOM_TRUSTED_BRIEFERS: brain
+    duty is shared (docs/BRAIN.md, Shared brain duty), and a fleet brain in
+    the briefers list writes as a brain only while it holds the brain lock
+    (check_acting_brain), so what it wrote counts like the Loom Brain App's."""
+    return list(dict.fromkeys(trusted_authors(env) + trusted_briefers(env)))
+
+
+def writer_login(gh: Any, env: Optional[Dict[str, str]] = None) -> str:
+    """The login this client writes as, without a GitHub read beyond GET
+    /app: the App's bot login, else LOOM_GITHUB_LOGIN; "" when neither says."""
+    try:
+        login = gh.app_login() if hasattr(gh, "app_login") else None
+    except GitHubError:
+        login = None
+    return login or (os.environ if env is None else env).get("LOOM_GITHUB_LOGIN", "").strip()
+
+
+# Brain commands that read and change nothing: they need no lock.
+READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step")
+
+
+def check_acting_brain(gh: Any, lock_repo: str, env: Optional[Dict[str, str]] = None,
+                       now: Optional[datetime] = None) -> None:
+    """Refuse a brain write by a fleet brain that does not hold the lock.
+    The lock, not the token, decides who acts (docs/BRAIN.md, Shared brain
+    duty): a LOOM_BRIEF_AUTHORS login acts as before; a LOOM_TRUSTED_BRIEFERS
+    login acts only while the live brain lock names its own login. Any other
+    writer, or one whose login is unknown, is left to the gates as before."""
+    login = writer_login(gh, env).lower()
+    if not login or login in {a.lower() for a in trusted_authors(env)}:
+        return
+    if login not in {b.lower() for b in trusted_briefers(env)}:
+        return
+    holder = lock.read_holder(gh, lock_repo)
+    now = now or datetime.now(timezone.utc)
+    if holder is not None and holder.live(now) and holder.login.lower() == login:
+        return
+    held = ("the lock is held by %s as %s" % (holder.name, holder.login or "no login")
+            if holder is not None and holder.live(now) else "nobody holds the lock")
+    raise ValueError("%s acts as the brain only while it holds the brain lock in %s under "
+                     "its own login (python3 -m bus lock %s --holder NAME); %s"
+                     % (login, lock_repo, lock_repo, held))
 
 
 def owned_elsewhere(issue: Dict[str, Any],
@@ -5397,13 +5444,14 @@ def owned_elsewhere(issue: Dict[str, Any],
 def _check_proven(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                   env: Optional[Dict[str, str]]) -> str:
     """A completed closure needs every criterion checked and a proof comment,
-    from a LOOM_BRIEF_AUTHORS login, made against the criteria as they are now.
+    from a brain writer (brain_writers), made against the criteria as they are now.
     Returns that proof comment's link ("" when GitHub gave none)."""
     body = str(issue.get("body") or "")
     proof.check_criteria(body)
-    authors = trusted_authors(env)
-    if not authors:
+    if not trusted_authors(env):
         raise ValueError("LOOM_BRIEF_AUTHORS is empty, so no proof comment can be trusted")
+    # A fleet brain's proof counts: it wrote it holding the brain lock.
+    authors = brain_writers(env)
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     found = [(proof.read(str(c.get("body") or "")), str(c.get("html_url") or ""))
              for c in comments if (c.get("user") or {}).get("login") in authors]
@@ -7858,6 +7906,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
+        if args.command not in READ_COMMANDS:
+            check_acting_brain(gh, getattr(args, "lock_repo", None)
+                               or os.environ.get("LOOM_STATUS_REPO") or "quadseven/loom")
         code = COMMANDS[args.command](gh, args)
         return code if isinstance(code, int) else 0
     except (ValueError, OSError, GitHubError) as exc:

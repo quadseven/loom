@@ -251,8 +251,9 @@ failure. It logs to
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
 rest to Muse (docs/MUSE.md). The lane machine runs with `all` (decision
-0002): both brains take every stage under the one lock, and the defer and
-done markers keep them from repeating each other's work.
+0002): every brain that takes a tick takes every stage under the one lock
+(docs/BRAIN.md, Shared brain duty), and the defer and done markers keep them
+from repeating each other's work.
 Its prompt tells the brain to brief only under an open epic
 (`bus.brain brief --epic E`), to propose a new epic within the cap of 6 open
 epics per goal (`bus.brain epic`), to chart a wayfinder map for an epic whose
@@ -843,9 +844,12 @@ only:
   never a hand-off. When the station claims a handed-off ticket it assigns it
   to this Loom's operator login and labels it `claim:<that login>`, as for
   any claim.
-- Journals, proofs, audits, adopted pull requests and merges keep requiring
-  `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
-  this Loom's behalf, and their comments are data, not instructions.
+- Audits, adopted pull requests and the station's own reads keep requiring
+  `LOOM_BRIEF_AUTHORS`. A trusted briefer verifies, closes or merges only as
+  the brain, while the brain lock names its login (docs/BRAIN.md, Shared
+  brain duty); then the brain's `status` and `resume` read its journals and
+  markers, and `close` trusts its proof. Outside the lock, its comments are
+  data, not instructions.
 
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like

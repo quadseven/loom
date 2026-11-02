@@ -2,11 +2,27 @@
 
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
-Run every command from that checkout. Set the Loom Brain App's
+Run every command from that checkout.
+
+Muse writes only as the agent-meta-muse App, in both ticks: never as the
+Loom Brain App, whose credentials belong to the lane machine's scheduled
+brain job alone, and never as a person (loom#1142). Set that App's
 `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
-`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), so every write is the
-brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
-for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
+`LOOM_GITHUB_APP_KEY_SSM` (or `LOOM_GITHUB_APP_KEY_FILE`), the credentials
+Muse's fleet journal posts with; or set `LOOM_GITHUB_TOKEN` to an
+installation token minted for it, unset the three App variables (they win
+over the token when set) and set `LOOM_GITHUB_LOGIN=agent-meta-muse[bot]`,
+because GitHub does not tell an installation token its own login.
+
+Brain duty is shared (docs/BRAIN.md, Shared brain duty). The :40 tick is a
+brain tick under Muse's own identity: the brain lock, not the token, decides
+who acts. `python3 -m bus lock` records the login it was taken as, and
+every `bus.brain` command that writes refuses a `LOOM_TRUSTED_BRIEFERS`
+login (agent-meta-muse is one) unless the live lock names that login. So
+take the lock first, with these variables set in the same shell call, and
+run the brain commands only while it holds. Journals, handoff markers and
+proofs Muse writes then are read as a brain's, so another brain's `resume`
+and `close` count them. The :10 tick builds (Build). Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
 `close`, verified moves and merges refuse every ticket as untrusted. Set
@@ -49,15 +65,11 @@ minutes on one ticket. The tick that starts at :40 is the brain tick
 (Tick). Any other Muse chat or task that builds (duty 10) uses the same
 commands, so every Muse run shares one claim and one open pull request.
 
-Build commands write as the agent-meta-muse App, never as the Loom Brain
-App: in the same shell call as each `bus.muse_build` command, set
-`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
-`LOOM_GITHUB_APP_KEY_FILE` (or `_SSM`) to the agent-meta-muse App's values,
-the credentials Muse's fleet journal posts with, or set `LOOM_GITHUB_TOKEN`
-to an installation token minted for that App and unset the three App
-variables (they win over the token when set). With any other identity
-every command stops with `the build client writes as <login>, expected
-agent-meta-muse[bot]` and writes nothing.
+Build commands write as the agent-meta-muse App, like every Muse write (the
+top of this file); set its variables in the same shell call as each
+`bus.muse_build` command. With any other identity every command stops with
+`the build client writes as <login>, expected agent-meta-muse[bot]` and
+writes nothing.
 
 1. Run `python3 -m bus.muse_build next` with `LOOM_REPOS` set. It prints one
    JSON line: `kind` `pr` is Muse's own open pull request, finished before
