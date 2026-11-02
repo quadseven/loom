@@ -225,7 +225,15 @@ comment) carry `live-cluster check could not run: <reason>`.
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
-`lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
+`lanes/mac/brain.sh` at `LOOM_BRAIN_AT` minutes past each hour (default
+`25 55`), or every `LOOM_BRAIN_INTERVAL` seconds (default 1800) with
+`LOOM_BRAIN_AT` empty. Those starts sit between Muse's :10 and :40 ticks, and
+the tick's lock expires by the next minute in `LOOM_BRAIN_YIELD_AT` (default
+`10 40`, Muse's starts; empty for no bound), with its agent cut off 2 minutes
+before that, so no lane machine hold spans a Muse tick's start (loom#2469).
+A tick with under 6 minutes left before that start skips. The bounded length
+goes on the tick record (`bus.brain step lock --tick-minutes`), so the tick
+clock and its budget read it. A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
 `$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of

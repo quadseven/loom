@@ -140,6 +140,40 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.station_interval(), "180")
 
+    def brain_plist(self):
+        return (self.home / "Library" / "LaunchAgents" / "com.loom.brain.plist").read_text()
+
+    def test_the_brain_ticks_at_25_and_55_between_muses_slots(self):
+        # loom#2469: a 30-minute StartInterval drifted onto Muse's :10 and :40.
+        env = {k: v for k, v in os.environ.items() if k != "LOOM_BRAIN_AT"}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plist = self.brain_plist()
+        self.assertNotIn("<key>StartInterval</key>", plist)
+        minutes = re.findall(r"<dict><key>Minute</key><integer>(\d+)</integer></dict>",
+                             plist.split("<key>StartCalendarInterval</key>", 1)[1])
+        self.assertEqual(["25", "55"], minutes)
+
+    def test_the_brain_minutes_come_from_the_environment(self):
+        result = self.run_install(LOOM_BRAIN_AT="05 35")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("<dict><key>Minute</key><integer>5</integer></dict>", self.brain_plist())
+
+    def test_no_brain_minutes_falls_back_to_the_interval(self):
+        result = self.run_install(LOOM_BRAIN_AT="", LOOM_BRAIN_INTERVAL="900")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("<key>StartInterval</key><integer>900</integer>", self.brain_plist())
+        self.assertNotIn("StartCalendarInterval", self.brain_plist())
+
+    def test_bad_brain_minutes_install_nothing(self):
+        for bad in ("60", "half", "25,55"):
+            with self.subTest(bad=bad):
+                result = self.run_install(LOOM_BRAIN_AT=bad)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("LOOM_BRAIN_AT", result.stderr)
+                self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
+
     def test_station_path_prefers_the_lanes_opencode_install(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
