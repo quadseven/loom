@@ -357,9 +357,21 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     loom:triage before a rule existed is not rewritten into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
-    return [i for i in found if isinstance(i, dict) and "pull_request" not in i
+    pool = [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
             and not brain.not_work_reason(i)]
+    if not pool:
+        return pool
+    journals, authors = brain.goal_journals(gh, repo), brain.trusted_authors()
+    kept = []
+    for issue in pool:
+        reason = brain.protected_reason(issue, journals, authors)
+        if reason:
+            print("rewrite: %s#%s left alone: %s" % (repo, issue.get("number"), reason),
+                  file=sys.stderr)
+        else:
+            kept.append(issue)
+    return kept
 
 
 def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:

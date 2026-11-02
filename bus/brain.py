@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Container, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import runners
@@ -3227,6 +3227,18 @@ def _in_place_refusal(source: Dict[str, Any], env: Optional[Dict[str, str]]) -> 
     return None
 
 
+def _check_retitle(source: Dict[str, Any], title: str) -> None:
+    """Refuse a rewrite that changes the title of an issue that is not a plain
+    ticket: a wayfinder issue, a loom:goal, or one claimed by the operator
+    (loom#2143)."""
+    names = _labels(source)
+    plain = not (any(n.startswith("wayfinder:") for n in names) or "loom:goal" in names
+                 or operator_claimed(source, trusted_authors()))
+    if not plain and title.strip() != str(source.get("title") or "").strip():
+        raise ValueError("#%s is not a plain ticket (wayfinder, loom:goal or claimed by the "
+                         "operator), so a rewrite may not change its title" % source.get("number"))
+
+
 def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
                       title: str, body: str, lane: Optional[str],
                       goal: Optional[int] = None) -> Dict[str, Any]:
@@ -3236,6 +3248,7 @@ def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
     The body is written first, so a refusal after it leaves no label claiming
     an issue whose body is not yet a ticket."""
     number = int(source["number"])
+    _check_retitle(source, title)
     new = tickets.with_original(body, source)
     parse_ticket(new)
     names = _ticket_labels(gh, repo, new, lane)
@@ -3734,8 +3747,57 @@ def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# A live goal or a goal journal is read by every session, so no pass may
+# retitle or rewrite it into a ticket (loom#2143): a title that starts so, a
+# claim by this Loom's operator, or a line of a goal body naming it.
+GOAL_TITLE_PREFIXES = ("goals:", "goal journal", "[goal]")
+_NAMED_ISSUE = re.compile(r"#(\d+)")
+_JOURNAL_LINE = re.compile(r"journal|live goal", re.I)
+
+
+def named_journals(goal_bodies: Iterable[Any]) -> Set[int]:
+    """The issue numbers a goal body names on a line that says journal or live
+    goal."""
+    found: Set[int] = set()
+    for body in goal_bodies:
+        for line in str(body or "").splitlines():
+            if _JOURNAL_LINE.search(line):
+                found.update(int(n) for n in _NAMED_ISSUE.findall(line))
+    return found
+
+
+def goal_journals(gh: GitHub, repo: str) -> Set[int]:
+    """The issues the open loom:goal issues of the repo name as journals or
+    live goals (named_journals)."""
+    goals = gh.paginate("/repos/%s/issues?labels=loom%%3Agoal&state=open&per_page=100" % repo)
+    return named_journals(g.get("body") for g in goals
+                          if isinstance(g, dict) and "loom:goal" in _labels(g))
+
+
+def operator_claimed(issue: Dict[str, Any], authors: Iterable[str]) -> bool:
+    """Whether the issue carries a claim:<login> label of one of this Loom's
+    own operator logins (LOOM_BRIEF_AUTHORS, `authors`)."""
+    mine = {a.lower() for a in authors}
+    return any(login in mine for login in tickets.claimed_by(issue))
+
+
+def protected_reason(issue: Dict[str, Any], journals: Container[int],
+                     authors: Iterable[str]) -> Optional[str]:
+    """Why no pass may rewrite the issue into a ticket or label it for that,
+    or None: it is an operator's claimed issue, a goal's journal or live goal,
+    or titled like one."""
+    if operator_claimed(issue, authors):
+        return "claimed by the operator"
+    if int(issue.get("number") or 0) in journals:
+        return "named by a goal as a journal or live goal"
+    if str(issue.get("title") or "").strip().lower().startswith(GOAL_TITLE_PREFIXES):
+        return "titled as a goal or a goal journal"
+    return None
+
+
 def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
-                 briefers: Sequence[str] = ()) -> Optional[str]:
+                 briefers: Sequence[str] = (),
+                 journals: Container[int] = ()) -> Optional[str]:
     if "pull_request" in issue:
         return "pull request"
     if authors and tickets.owned_elsewhere(issue, authors, briefers):
@@ -3744,7 +3806,7 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     names = _labels(issue)
     if any(name.startswith("loom:") for name in names) or needs_human(names):
         return "already labelled"
-    return not_work_reason(issue)
+    return not_work_reason(issue) or protected_reason(issue, journals, authors)
 
 
 def _oldest_open_issues(gh: GitHub, repo: str):
@@ -3780,6 +3842,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     cap = goal_cap()
     authors = trusted_authors()
     briefers = trusted_briefers()
+    journals = goal_journals(gh, repo)
     lines: List[str] = []
     done = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
@@ -3788,7 +3851,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if done >= limit:
             break
         number = int(issue["number"])
-        skip = _triage_skip(issue, authors, briefers)
+        skip = _triage_skip(issue, authors, briefers, journals)
         if skip:
             continue
         missing = missing_sections(issue.get("body"))

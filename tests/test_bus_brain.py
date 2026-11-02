@@ -3845,6 +3845,20 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_a_goal_or_journal_issue_is_not_triaged(self):
+        # loom#2143: a live goal issue was labelled and rewritten into a ticket.
+        routes = Routes([
+            item(5, title="Goals: the live goal", body="broken"),
+            item(6, title="Goal journal for the repo", body="broken"),
+            item(7, title="[goal] keep it green", body="broken"),
+            item(9, title="Plain notes", body="broken"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        routes.issues.append(item(1, labels=["loom:goal"], body="Journal: #9\n"))
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_an_issue_awaiting_a_live_check_is_not_triaged(self):
         # 2026-10-21: 55 open issues carried awaiting-live-check and 35 of them
         # were briefed and run again. Finished work is not new work.
