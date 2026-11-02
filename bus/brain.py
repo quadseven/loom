@@ -4399,6 +4399,12 @@ def _refuse_person_change_request(details: Dict[str, Any]) -> None:
         raise ValueError("blocked: " + ", ".join(blockers))
 
 
+def merge_completed(err: Exception) -> bool:
+    """Whether merge raised this after GitHub had merged: settling failed,
+    the merge did not."""
+    return getattr(err, "merge_completed", False) is True
+
+
 def merge(gh: GitHub, repo: str, number: int,
           ticket: Optional[Tuple[str, int]] = None, adopt: bool = False,
           env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -4460,13 +4466,17 @@ def merge(gh: GitHub, repo: str, number: int,
     if result.get("merged") is not True:
         raise ValueError("GitHub did not confirm the merge")
     branch = pr["head"]["ref"]
-    # GitHub's own auto-delete may have removed it already: still merged.
-    gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
-            ok=(404, 422))
-    if association:
-        _settle_merged_ticket(gh, repo, number, str(pr.get("body") or ""), association, issue)
-    if adopt:
-        notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
+    try:
+        # GitHub's own auto-delete may have removed it already: still merged.
+        gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
+                ok=(404, 422))
+        if association:
+            _settle_merged_ticket(gh, repo, number, str(pr.get("body") or ""), association, issue)
+        if adopt:
+            notify.post(gh, repo, number, ADOPT_COMMENT, notify.MERGED)
+    except (ValueError, GitHubError) as err:
+        setattr(err, "merge_completed", True)
+        raise
     return {"merged": True, "pull_request": (repo, number),
             "ticket": association, "head_sha": sha}
 

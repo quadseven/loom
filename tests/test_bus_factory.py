@@ -10,7 +10,7 @@ from urllib.parse import unquote
 from unittest import mock
 
 from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
-from bus.github import GitHubError, Response
+from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
@@ -63,7 +63,10 @@ class FakeGitHub:
         # detail read is what a token with administration read gets back.
         self.classic_enabled = False
         self.classic = Response(404, {"message": "Branch not protected"})
-        self.merge_refused = set()
+        # Pull request number to what its merge raises, and whether the merge
+        # had already happened when it did (an error while settling).
+        self.merge_refused = {}
+        self.head_date = "2020-01-01T00:00:00Z"
         self.attempts = {}
         self.update_status = 202
         self.files = {}
@@ -143,6 +146,8 @@ class FakeGitHub:
             if isinstance(self.rules, Exception):
                 raise self.rules
             return Response(200, self.rules)
+        if re.search(r"/commits/sha\d+$", path):
+            return Response(200, {"commit": {"committer": {"date": self.head_date}}})
         if path.endswith("/branches/main/protection"):
             if isinstance(self.classic, Exception):
                 raise self.classic
@@ -298,8 +303,11 @@ class Base(unittest.TestCase):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
                 raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
-            if number in gh.merge_refused:
-                raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
+            refused = gh.merge_refused.get(number)
+            if refused is not None and getattr(refused, "merge_completed", False):
+                self.merged.append((number, ticket))
+            if refused is not None:
+                raise refused
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
@@ -1139,17 +1147,106 @@ class PullRequests(Base):
         self.assertEqual(self.land_behind(self.NOT_STRICT), self.UPDATED)
         self.assertEqual(self.merged, [])
 
-    def test_a_refused_behind_merge_takes_the_update_path(self):
-        self.gh.merge_refused.add(50)
-        self.assertEqual(self.land_behind(self.NOT_STRICT), self.UPDATED)
+    BEHIND_405 = "Head branch is not up to date with the base branch"
+
+    def refused(self, err):
+        """A pass where the merge of a behind non-strict pull request raises."""
+        self.gh.merge_refused[50] = err
+        return self.land_behind(self.NOT_STRICT)
+
+    def hold(self, number=50):
+        self.gh.comments.setdefault(number, []).append(
+            {"id": 901, "user": {"login": "example-fleet"}, "body": "Not merging this yet.",
+             "created_at": "2030-01-01T00:00:00Z"})
+
+    def test_a_405_saying_behind_takes_the_landing_update(self):
+        self.assertEqual(self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405)),
+                         self.UPDATED)
         self.assertEqual(self.merged, [])
-        # The landing path's update, which takes the lock; hygiene's does not.
+        # The landing path's update takes the lock; hygiene's does not.
         self.assertEqual(self.lock_holder, 50)
+
+    def test_a_405_for_another_reason_takes_no_lock(self):
+        self.refused(GitHubError("merge -> 405", 405, "Base branch was modified."))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_gate_refusal_takes_no_lock(self):
+        self.refused(ValueError("blocked: review did not pass on this head"))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_shadow_hold_takes_no_lock_even_saying_behind(self):
+        self.refused(ShadowHeld("shadow mode: not up to date"))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_rate_limit_takes_no_lock_even_saying_behind(self):
+        self.refused(RateLimited("merge -> 405", 405, self.BEHIND_405, 0))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_server_error_takes_no_lock(self):
+        self.refused(GitHubError("merge -> 500", 500, self.BEHIND_405))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_stops_every_update_in_the_pass(self):
+        # The merge commit an update makes postdates the hold, and a newer
+        # head lifts a hold, so an update would lift it.
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405))
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_stops_the_update_on_a_strict_base(self):
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.land_behind([{"type": "required_status_checks", "parameters": {}}])
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_from_before_the_head_does_not_stop_the_update(self):
+        self.gh.head_date = "2031-01-01T00:00:00Z"
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.land_behind([{"type": "required_status_checks", "parameters": {}}])
+        self.assertEqual(updates, self.UPDATED)
+
+    def test_held_comments_that_cannot_be_ruled_out_stop_the_update(self):
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}), \
+                mock.patch.object(self.gh, "rest", side_effect=GitHubError("no", 500)):
+            f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+            self.assertTrue(f._hold_stands(REPO, 50, "sha50", "x"))
+
+    def test_keep_current_and_hygiene_and_the_red_base_update_respect_a_hold(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.hold()
+        full = self.gh.pulls[50]
+        issue = self.gh.issues[5]
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        f._runs["sha50"] = [{"name": "ci", "conclusion": "failure"}]
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}), \
+                mock.patch.object(f, "_green_on_base", return_value=True):
+            f._keep_current(REPO, 50, full)
+            f._hygiene_update(REPO, 50, issue, full)
+            self.assertFalse(f._update_base_fixed(REPO, 50, full, "sha50"))
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_an_error_while_settling_is_a_completed_merge(self):
+        err = GitHubError("label write -> 405", 405, self.BEHIND_405)
+        err.merge_completed = True
+        with mock.patch("bus.factory._say") as say:
+            updates = self.refused(err)
+        self.assertEqual(updates, [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertIsNone(self.lock_holder)
+        said = " ".join(c.args[0] for c in say.call_args_list)
+        self.assertIn("settling", said)
+        self.assertNotIn("did not merge", said)
 
     def test_a_refused_merge_of_a_current_pull_request_is_not_updated(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
-        self.gh.merge_refused.add(50)
+        self.gh.merge_refused[50] = GitHubError("merge -> 405", 405, self.BEHIND_405)
         self.go()
         self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
 
