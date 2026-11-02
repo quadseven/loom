@@ -6027,6 +6027,10 @@ def _step_record(message: str) -> Dict[str, Any]:
         try:
             saved = json.loads(encoded)
             record.update({k: saved[k] for k in ("started_at", "step", "step_index", "notes")})
+            # The tick's own length when its wrapper bounded it below
+            # tick_clock.TICK_MINUTES (loom#2469); absent, the default.
+            if tick_clock.valid_tick_minutes(saved.get("tick_minutes")):
+                record["tick_minutes"] = saved["tick_minutes"]
             # Per-step start and end times (loom#2104); a record written
             # before them has none.
             times = saved.get("times")
@@ -6051,8 +6055,12 @@ def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime)
 
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
               note: Optional[str] = None, holder: Optional[str] = None,
-              now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Read the tick record, or append one step to the current lock commit."""
+              now: Optional[datetime] = None,
+              tick_minutes: Optional[int] = None) -> Dict[str, Any]:
+    """Read the tick record, or append one step to the current lock commit.
+    `tick_minutes`, given with the lock step, is the tick's own length when
+    it is shorter than tick_clock.TICK_MINUTES (a lane machine tick bounded
+    by another brain's slot, loom#2469); the clock and the budget read it."""
     now = now or datetime.now(timezone.utc)
     ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
     ref = gh.rest("GET", ref_path, ok=(404,))
@@ -6079,6 +6087,14 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         record["started_at"] = at
         record["notes"] = []
         record["times"] = []
+        record.pop("tick_minutes", None)
+        if tick_minutes is not None:
+            if (isinstance(tick_minutes, bool) or not isinstance(tick_minutes, int)
+                    or tick_minutes < tick_clock.MIN_TICK_MINUTES):
+                raise ValueError("--tick-minutes must be a whole number of at least %d"
+                                 % tick_clock.MIN_TICK_MINUTES)
+            if tick_clock.valid_tick_minutes(tick_minutes):
+                record["tick_minutes"] = tick_minutes
     record["step"] = step
     record["step_index"] = TICK_STEPS.index(step) + 1
     _time_step(record, step, at)
@@ -6088,7 +6104,8 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
     record["holder"] = holder
     clean = "\n".join(line for line in message.splitlines() if not line.startswith(STEP_MARKER))
     new_message = clean + "\n" + STEP_MARKER + json.dumps(
-        {k: record[k] for k in ("started_at", "step", "step_index", "notes", "times")},
+        {k: record[k] for k in ("started_at", "step", "step_index", "notes", "times",
+                                "tick_minutes") if k in record},
         separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
@@ -6137,7 +6154,8 @@ def _cmd_sweep(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_step(gh: GitHub, args: argparse.Namespace) -> None:
     now = datetime.now(timezone.utc)
     try:
-        record = tick_step(gh, _repo(args.lock_repo), args.name, args.note, args.holder, now)
+        record = tick_step(gh, _repo(args.lock_repo), args.name, args.note, args.holder, now,
+                           tick_minutes=getattr(args, "tick_minutes", None))
     except BudgetRefused as exc:
         # Recorded, and loud: the brain reads the clock and this before it
         # moves on.
@@ -7339,7 +7357,7 @@ def parser() -> argparse.ArgumentParser:
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
     sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
     rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
-    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true")
+    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true"); st.add_argument("--tick-minutes", type=int, help="with lock: the tick's own length when shorter than %d minutes (a bounded lane machine tick)" % tick_clock.TICK_MINUTES)
     sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
     es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")

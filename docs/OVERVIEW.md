@@ -30,7 +30,7 @@ Labels on the ticket show where it is: `loom:queued`, `briefed`, `running`,
 |---|---|
 | Goal | One issue per project that says what Loom is driving toward. |
 | Ticket | One issue for one change: why, what, three checks, size. |
-| Brain | The planner. It decides what to brief and rules on anything stuck. It runs every 30 minutes by default (`LOOM_BRAIN_INTERVAL`). |
+| Brain | The planner. It decides what to brief and rules on anything stuck. It runs every 30 minutes by default, at :25 and :55 on the lane machine (`LOOM_BRAIN_AT`). |
 | Station | The dispatcher. One process on the lane machine that runs every minute: it hands tickets to free lanes, moves labels, runs the factory and posts reports. It does no coding itself. |
 | Lane | One worker slot: one AI coding tool on one subscription or key (codex, claude, agy, spark and others). Each works one ticket at a time. |
 | Factory | The station's merge step: lands clean pull requests, sends findings back to lanes, and moves stuck work up a model ladder. |

@@ -3,7 +3,9 @@
 #
 #   lanes/mac/brain.sh
 #
-# launchd runs it every LOOM_BRAIN_INTERVAL seconds (lanes/mac/install.sh).
+# launchd runs it at LOOM_BRAIN_AT minutes past each hour (default 25 and
+# 55), or every LOOM_BRAIN_INTERVAL seconds with LOOM_BRAIN_AT empty
+# (lanes/mac/install.sh).
 # It takes the brain lock, refreshes its own checkout of this repo, runs an
 # agent CLI headless on docs/MUSE.md, and releases the lock, also when the
 # agent fails or times out. A lock held by anyone else (Muse, an interactive
@@ -26,8 +28,13 @@
 # Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
 # checkout's origin), LOOM_BRAIN_LADDER, LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
 # (the agent's hard stop, also the lock's expiry), LOOM_BRAIN_WAIT (minutes to
-# wait for a held lock: 25 for a live tick, 0 otherwise), and LOOM_BRAIN_SCOPE: all
-# (the default) or live, which leaves everything but cluster work to Muse.
+# wait for a held lock: 25 for a live tick, 0 otherwise), LOOM_BRAIN_SCOPE: all
+# (the default) or live, which leaves everything but cluster work to Muse, and
+# LOOM_BRAIN_YIELD_AT: the minutes past each hour when another brain's tick
+# starts (default 10 and 40, Muse's slots in docs/MUSE.md; empty for none).
+# The tick's lock expires by the next of those, and its agent is cut off 2
+# minutes before it, so no hold of this tick spans another brain's start
+# (loom#2469).
 # LOOM_TRANSCRIPT_URL, LOOM_TRANSCRIPT_TOKEN_SSM and LOOM_AWS_REGION, when
 # set, are where the wrapper reads the handoff packet. LOOM_BRAIN_FABRIC_ASK,
 # when set and non-empty, opts the tick into one Fabric question (asked by
@@ -55,6 +62,40 @@ SCOPE="${LOOM_BRAIN_SCOPE:-all}"
 # LOOM_BRAIN_WAIT_STEP (tests shorten it).
 if [ "$SCOPE" = live ]; then WAIT="${LOOM_BRAIN_WAIT:-25}"; else WAIT="${LOOM_BRAIN_WAIT:-0}"; fi
 WAIT_STEP="${LOOM_BRAIN_WAIT_STEP:-60}"
+# Another brain's tick slots, as minutes past the hour (loom#2469). From
+# 2026-11-01 to 02 the lane machine's 30-minute StartInterval drifted onto
+# Muse's :10 and :40 starts and held the lock 16 to 29 minutes over them,
+# and each such Muse tick stood down. Every tick step needs the lock (only
+# the holder records a step), so the hold is bounded instead of split.
+YIELD_AT="${LOOM_BRAIN_YIELD_AT-10 40}"
+
+# Minutes from now (epoch seconds $1) to the next slot in YIELD_AT,
+# rounded down, so a lock that long expires at or before the slot; empty
+# when YIELD_AT names none. A slot this very second is the next hour's.
+minutes_to_slot() {
+  local into=$(($1 % 3600)) best="" m d
+  for m in $YIELD_AT; do
+    d=$((10#$m * 60 - into))
+    [ "$d" -gt 0 ] || d=$((d + 3600))
+    if [ -z "$best" ] || [ "$d" -lt "$best" ]; then best="$d"; fi
+  done
+  [ -z "$best" ] || echo $((best / 60))
+}
+
+# The lock's minutes and the agent's hard stop for a tick taking the lock
+# at epoch $1: LOCK_MINUTES (MINUTES + 5, or less to expire by the next
+# slot) and TICK_MINUTES (MINUTES, or 2 under the lock when capped, so
+# the unlock runs before the slot).
+tick_bounds() {
+  local slot
+  LOCK_MINUTES=$((MINUTES + 5)) TICK_MINUTES="$MINUTES"
+  slot="$(minutes_to_slot "$1")"
+  [ -n "$slot" ] || return 0
+  [ "$slot" -ge "$LOCK_MINUTES" ] && return 0
+  LOCK_MINUTES="$slot"
+  [ $((slot - 2)) -lt "$TICK_MINUTES" ] && TICK_MINUTES=$((slot - 2))
+  return 0
+}
 ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
@@ -228,6 +269,10 @@ run_rung() {
 [ -n "${LOOM_REPOS:-}" ] || exit 0
 [ -n "$ORIGIN" ] && [ -n "$LOCK_REPO" ] || { say "no origin remote in $REPO_ROOT, so no lock repo"; exit 1; }
 case "$SCOPE" in all|live) ;; *) say "LOOM_BRAIN_SCOPE must be all or live"; exit 1 ;; esac
+for m in $YIELD_AT; do
+  [[ "$m" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$m))" -le 59 ] ||
+    { say "LOOM_BRAIN_YIELD_AT must list minutes past the hour, 0 to 59"; exit 1; }
+done
 [[ "$MINUTES" =~ ^[0-9]+$ ]] && [ "$MINUTES" -ge 5 ] || { say "LOOM_BRAIN_MINUTES must be a number of at least 5"; exit 1; }
 # No rung that can run: no lock and no model call.
 if ! ladder_open; then
@@ -238,23 +283,40 @@ fi
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 
-# The lock outlives the agent by 5 minutes, so a tick cut off by the timeout
-# still releases it below before anyone else could take it.
+# The lock outlives the agent by 5 minutes (2 when bounded by another
+# brain's slot), so a tick cut off by the timeout still releases it below
+# before anyone else could take it.
 [[ "$WAIT" =~ ^[0-9]+$ && "$WAIT_STEP" =~ ^[0-9]+$ ]] || { say "LOOM_BRAIN_WAIT and LOOM_BRAIN_WAIT_STEP must be whole numbers"; exit 1; }
+# LOOM_BRAIN_NOW (epoch seconds) stands in for the clock in tick_bounds
+# only; tests set it.
 deadline=$(( $(date +%s) + WAIT * 60 ))
-until bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$((MINUTES + 5))" --run "$RUN_ID" >> "$LOG" 2>&1; do
+while :; do
+  tick_bounds "${LOOM_BRAIN_NOW:-$(date +%s)}"
+  # Too close to another brain's slot for a useful tick (5 minutes of agent
+  # after a minute of setup): yield it whole.
+  if [ "$TICK_MINUTES" -lt 6 ]; then
+    say "tick skipped: another brain's tick starts in $LOCK_MINUTES minutes (LOOM_BRAIN_YIELD_AT $YIELD_AT)"
+    beat skipped 0
+    exit 0
+  fi
+  bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$LOCK_MINUTES" --run "$RUN_ID" >> "$LOG" 2>&1 && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
     beat skipped 0
     exit 0
   fi
   sleep "$WAIT_STEP"
 done
+# The agent's hard stop counts from here, so a bounded tick's agent ends
+# before its lock does, setup time included.
+LOCKED_AT="$(date +%s)"
+[ "$TICK_MINUTES" -eq "$MINUTES" ] ||
+  say "tick bounded to $TICK_MINUTES minutes: another brain's tick starts in $LOCK_MINUTES (LOOM_BRAIN_YIELD_AT $YIELD_AT)"
 trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
 # launchd stops a job with SIGTERM; exiting on it runs the EXIT trap.
 trap 'exit 143' TERM INT
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
-brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record lock step"
+brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" --tick-minutes "$TICK_MINUTES" >> "$LOG" 2>&1 || say "could not record lock step"
 
 # With GitHub App settings (the Loom Brain App) the tick writes as that App,
 # never as the operator (loom#1142): every rung's gh and GitHub API calls get
@@ -340,7 +402,7 @@ $HOLDER, which edits your journal of the day there instead of emailing the \
 issue's watchers with a new comment; evidence whose blocker kind has no issue \
 of exactly that kind goes to the goal home's journal, never the closest \
 issue. This replaces the 15-minute limit in MUSE.md: stop within \
-$((MINUTES - 5)) minutes; you are cut off at $MINUTES. $SHADOW_LINE"
+$((TICK_MINUTES - 5)) minutes; you are cut off at $TICK_MINUTES. $SHADOW_LINE"
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
 live data through REST APIs, but has no cluster or database access. Do what \
@@ -349,7 +411,7 @@ database access, put on the ticket for Muse to act on; and a ship or roll \
 that is due when Muse has not done it within its tick. Before any measurement, run timeout 120 python3 -m bus.brain \
 resume \$LOOM_REPOS --holder $HOLDER --lock-repo $LOCK_REPO (it walks every goal on GitHub, so a stall must not eat the tick) and finish every resume item it lists: work \
 another brain yielded, yours however fresh its journals are. Spend at most \
-$((MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \
+$((TICK_MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \
 tickets (shipped, no proof yet): spend up to a third of the tick on them, \
 oldest first. Write a proof only from evidence you saw in this tick; for a \
 ticket you cannot verify, leave a one-line note on it naming what evidence is \
@@ -407,7 +469,7 @@ for lane in $RUNGS; do
   if ! rung_ready "$lane"; then why="${why:+$why; }$lane: $RUNG_WHY"; continue; fi
   [ "$RUNG_FUEL" = known ] || say "fuel unknown for lane $lane ($RUNG_WHY); the tick tries it"
   now="$(date +%s)"
-  [ -n "$deadline" ] || deadline=$((now + MINUTES * 60))
+  [ -n "$deadline" ] || deadline=$((LOCKED_AT + TICK_MINUTES * 60))
   if [ $((deadline - now)) -lt 300 ]; then say "no time left for lane $lane"; break; fi
   RUNG="$lane" MODEL="$RUNG_MODEL" AGENT_TIMEOUT=$((deadline - now))
   say "tick start (lane $RUNG, model $MODEL, scope $SCOPE)"

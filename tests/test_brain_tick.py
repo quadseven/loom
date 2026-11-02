@@ -145,6 +145,9 @@ class BrainTickTest(unittest.TestCase):
             "LOOM_REPOS": "example/project",
             "LOOM_STATUS_REPO": "example/loom",
             "FAKE_LOG": str(self.log),
+            # No other brain's slot bounds these ticks; the slot tests below
+            # set their own (loom#2469).
+            "LOOM_BRAIN_YIELD_AT": "",
         }
         # The claude lane's runner says it has usage, as on the lane machine.
         self.usage("claude", True)
@@ -269,7 +272,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual(0, run.returncode)
         self.assertIn("-m bus lock", calls[0])
         self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
-                         "--lock-repo example/loom", calls[1])
+                         "--lock-repo example/loom --tick-minutes 40", calls[1])
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
@@ -768,6 +771,84 @@ class BrainTickTest(unittest.TestCase):
         claude = [c for c in calls if c.startswith("claude ")][0]
         self.assertIn("--model claude-sonnet-5-5", claude)
         self.assertIn("stop within 15 minutes; you are cut off at 20", claude)
+
+
+
+# 2026-11-01T20:00:00Z, the top of an hour; Muse's slots are :10 and :40.
+HOUR = 1793563200
+MUSE_SLOTS = (10, 40)
+
+
+class BrainSlotTest(unittest.TestCase):
+    """loom#2469: the lane machine's tick never holds the lock over the start
+    of a Muse tick. From 2026-11-01 to 02 its drifting 30-minute ticks held
+    the lock 16 to 29 minutes from 19:52Z, 00:39Z and 02:04Z, over Muse's
+    20:10Z, 00:40Z and 02:10Z starts."""
+
+    _tick_setup = BrainTickTest.setUp
+    usage = BrainTickTest.usage
+    tick = BrainTickTest.tick
+    beat = BrainTickTest.beat
+
+    def setUp(self):
+        self._tick_setup()
+        del self.env["LOOM_BRAIN_YIELD_AT"]
+
+    def lock_minutes(self, calls):
+        locks = [c for c in calls if " -m bus lock " in c]
+        return int(locks[-1].split("--minutes ", 1)[1].split()[0]) if locks else None
+
+    def next_slot(self, second):
+        return min(m * 60 + (3600 if m * 60 <= second else 0) for m in MUSE_SLOTS)
+
+    def test_no_hold_spans_a_muse_tick_start_from_any_start_minute(self):
+        for minute in range(60):
+            for second in (minute * 60, minute * 60 + 59):
+                with self.subTest(start="%02d:%02d" % divmod(second, 60)):
+                    if self.log.exists():
+                        self.log.unlink()
+                    _, calls = self.tick(FAKE_LOCK="1", LOOM_BRAIN_NOW=str(HOUR + second))
+                    held = self.lock_minutes(calls)
+                    if held is None:
+                        # Yielded whole: under 6 minutes to the next slot.
+                        self.assertLess(self.next_slot(second) - second, 8 * 60)
+                        continue
+                    self.assertLessEqual(second + held * 60, self.next_slot(second))
+
+    def test_a_tick_at_25_past_runs_until_2_minutes_before_40(self):
+        _, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR + 25 * 60))
+        self.assertEqual(15, self.lock_minutes(calls))
+        self.assertIn("--tick-minutes 13", [c for c in calls if "step lock" in c][0])
+        claude = [c for c in calls if c.startswith("claude ")][0]
+        self.assertIn("stop within 8 minutes; you are cut off at 13", claude)
+        self.assertIn("tick bounded to 13 minutes", (self.home / "logs" / "brain.log").read_text())
+
+    def test_the_drifted_1952_tick_no_longer_spans_2010(self):
+        # 19:52Z on 2026-11-01 took the lock with a 45-minute expiry.
+        _, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR - 8 * 60))
+        self.assertEqual(18, self.lock_minutes(calls))
+
+    def test_a_start_just_before_a_slot_yields_the_whole_tick(self):
+        run, calls = self.tick(LOOM_BRAIN_NOW=str(HOUR + 39 * 60 + 7))
+        self.assertEqual(0, run.returncode)
+        self.assertEqual([], [c for c in calls if " -m bus lock " in c])
+        self.assertIn("tick skipped: another brain's tick starts in 0 minutes",
+                      (self.home / "logs" / "brain.log").read_text())
+        last, ok = self.beat()
+        self.assertEqual("skipped", last["outcome"])
+        self.assertTrue(ok)
+
+    def test_far_from_a_slot_the_tick_keeps_its_full_length(self):
+        _, calls = self.tick(LOOM_BRAIN_YIELD_AT="30", LOOM_BRAIN_NOW=str(HOUR + 31 * 60))
+        self.assertEqual(45, self.lock_minutes(calls))
+        self.assertIn("--tick-minutes 40", [c for c in calls if "step lock" in c][0])
+
+    def test_a_bad_slot_list_never_takes_the_lock(self):
+        for bad in ("60", "ten", "5,35"):
+            with self.subTest(bad=bad):
+                run, calls = self.tick(LOOM_BRAIN_YIELD_AT=bad)
+                self.assertEqual(1, run.returncode)
+                self.assertEqual([], calls)
 
 
 if __name__ == "__main__":

@@ -344,8 +344,15 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    yours, never a peer's, so go on). Exit 1 means a peer holds it after the
    5-minute wait: the line starts `lock held by <holder>` and says how long
    it has held it and when it expires. Stop then, and quote that line in the
-   stand-down so it names the holder and its age. The lock outlives the
-   25-minute tick, so no other brain takes it mid-tick.
+   stand-down so it names the holder and its age. Act on the result of
+   your last lock attempt only: when you run it again (a retry, a second
+   `--wait`), the earlier attempt's `lock held by` line is superseded, so
+   never post a stand-down from it; a later `lock acquired` line means you
+   hold the lock and the tick runs. The lock outlives the
+   25-minute tick, so no other brain takes it mid-tick. Muse's ticks start
+   at :10 and :40 past the hour; the lane machine's tick starts at :25 and
+   :55 and its lock expires by your next start (loom#2469), so a lane hold
+   that still blocks you after the 5-minute wait is one past that bound.
    Then run `python3 -m bus.brain step lock --holder muse`.
 2. First run `python3 -m bus.brain step status --holder muse`. The first read
    of every tick is the handoff packet: the comment marked
