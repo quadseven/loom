@@ -213,6 +213,11 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
+        if method == "POST" and path == "/graphql" and "pullRequests(states:OPEN)" in json.loads(
+                body)["query"]:
+            # resume's repo weights (brain.repo_weights): none weighed, so
+            # the repos are read in the order given.
+            return 200, {}, b'{"data": {}}'
         if method == "POST" and path == "/graphql" and "subIssues" in json.loads(body)["query"]:
             return 200, {}, json.dumps({"data": {"repository": self.sub_issue_states(
                 json.loads(body)["query"])}}).encode()
@@ -233,8 +238,17 @@ class Routes:
             _, subs = self.routes.get(
                 ("GET", "/repos/%s/issues/%s/sub_issues" % (repo, number)), (200, []))
             out["e" + number] = {"subIssues": {"totalCount": len(subs), "nodes": [
-                {"number": s["number"], "state": s["state"].upper()} for s in subs]}}
+                _sub_node(s) for s in subs]}}
         return out
+
+
+def _sub_node(issue):
+    """A REST sub-issue as a GraphQL node: what _sub_issue_states and
+    _sub_issue_tickets (SUB_ISSUE_FIELDS) ask for."""
+    return {"number": issue["number"], "state": issue["state"].upper(),
+            "title": issue.get("title"), "createdAt": issue.get("created_at"),
+            "closedAt": issue.get("closed_at"), "updatedAt": issue.get("updated_at"),
+            "labels": {"nodes": [{"name": x["name"]} for x in issue.get("labels") or []]}}
 
 
 def lock_routes(holder="lane-machine", expires="2030-01-01T12:30:00Z"):

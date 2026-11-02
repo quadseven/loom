@@ -416,7 +416,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
    Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse
-   --deadline 1.5`. It refuses unless you hold the lock. It prints each
+   --deadline 1.5`. It refuses unless you hold the lock. It reads the repos
+   side by side, the lightest first (as status does), so a deadline leaves
+   only heavy repos unread. It prints each
    repo's goal sections as soon as that repo is read and logs progress to
    stderr (the repo, the requests so far, and every rate-limit or retry
    wait), so a killed run keeps what it printed. `--deadline MINUTES`

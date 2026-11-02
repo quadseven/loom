@@ -95,21 +95,22 @@ class ResumeSkipTests(unittest.TestCase):
         self.assertNotIn("resume merge %s#3" % MOVED, out)
         self.assertIn("## Verify due", out)
 
-    def test_a_repo_whose_pull_requests_answer_moved_is_named_once(self):
+    def test_a_repo_whose_first_read_answers_moved_is_named_once(self):
+        # The open issue listing is a repo's first read (loom#2483): a moved
+        # repo is named once from it, and none of its own reads follow, its
+        # pull requests included. Another repo's handoff item there (#3) may
+        # still be read, and is named as moved.
         routes = Routes(self.routes())
-
-        def moved_pulls(method, url, headers, body):
-            if "/repos/%s/pulls" % MOVED in url:
-                return 301, {}, json.dumps(MOVED_BODY).encode()
-            return routes(method, url, headers, body)
-
-        out, _ = quiet(brain.resume, GitHub("t", transport=moved_pulls), [MOVED, REPO],
+        out, _ = quiet(brain.resume, GitHub("t", transport=routes), [MOVED, REPO],
                        "lane-machine", LOCK_REPO, NOW, ENV)
         line = "- skipped %s: HTTP 301 Moved Permanently: renamed or transferred" % MOVED
         self.assertEqual(1, out.count(line))
         self.assertIn("## Sensitive pull requests", out)
         self.assertIn("- resume merge %s#7 (deferred by muse at %s)" % (REPO, at(5)), out)
-        self.assertNotIn(("GET", "/repos/%s/issues" % MOVED), routes.calls)
+        self.assertEqual(1, routes.calls.count(("GET", "/repos/%s/issues" % MOVED)))
+        self.assertNotIn(("GET", "/repos/%s/pulls" % MOVED), routes.calls)
+        self.assertFalse([p for m, p in routes.calls
+                          if p.startswith("/repos/%s/issues/" % MOVED) and p != "/repos/%s/issues/3" % MOVED])
 
     def test_a_handoff_item_that_answers_forbidden_is_named(self):
         routes = self.routes()
