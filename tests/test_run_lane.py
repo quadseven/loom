@@ -1005,6 +1005,41 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_a_probe_stays_a_probe_when_the_lookup_closes_its_input_early(self):
+        # A grep -q that exits at its first match can leave a writer upstream
+        # with SIGPIPE, and under pipefail a matched file then read as a
+        # scratch file (loom#2380). A probe list far past the pipe buffer,
+        # with the match first, makes that writer still busy when grep exits.
+        function = re.search(r"^drop_agent_files\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        stubs = (
+            "set -uo pipefail\n"
+            "safe_git() { return 0; }\n"
+            "python3() {\n"
+            "  case \"$3\" in\n"
+            "    bus.probe_drop) printf '.test_write\\n'\n"
+            "      for i in $(seq 1 40000); do printf 'zz-filler/%040d\\n' 0; done ;;\n"
+            "  esac\n"
+            "}\n"
+            "REPO_ROOT=. TREE=. BASE=HEAD BRIEF=brief.md FIX_UPSTREAM= TICKET=T042\n"
+            "FIX_PR=7 CONFLICTS= TITLE=\n")
+        result = subprocess.run(["/bin/bash", "-c", stubs + function + "drop_agent_files"],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("dropped sandbox probe file: .test_write", result.stdout)
+        self.assertNotIn("dropped scratch file", result.stdout)
+
+    def test_no_lane_script_pipes_into_a_quiet_grep(self):
+        # grep -q stops reading at its first match; under pipefail the writer's
+        # SIGPIPE then fails the whole test. Feed it a here-string instead.
+        shape = re.compile(r"\|\s*grep\s+(?:-[A-Za-z]+\s+)*(?:-[A-Za-z]*q|--quiet)")
+        hits = []
+        for path in sorted(RUNNER.parent.rglob("*.sh")):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if not line.lstrip().startswith("#") and shape.search(line):
+                    hits.append("%s:%d: %s" % (path.name, number, line.strip()))
+        self.assertEqual(hits, [])
+
     def test_a_bin_file_the_diff_references_is_kept(self):
         self.drop_brief(text=BRIEF.replace("Make the thing work.",
                                            "Add bin/tool and the run.sh that calls it."))
