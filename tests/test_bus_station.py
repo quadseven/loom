@@ -4597,6 +4597,35 @@ class PassBudgetTest(Base):
             self.run_pass()
         later.assert_called_once()
 
+    def test_the_note_pass_runs_every_pass_while_a_step_holds_the_rotation(self):
+        # loom#2092: on 2026-11-02 one step carried over at the request
+        # target pass after pass, holding the rotation on itself for hours,
+        # and seven shipped tickets crossed 24h with no note because the
+        # note pass never came round. It runs every pass, outside the
+        # rotation; its own stamp keeps it to one run per VERIFY_NOTE_EVERY.
+        def carried(_station):
+            raise TargetReached("other read carried over at request target")
+
+        notes = mock.Mock(__name__="note_stale_shipped")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "roll_source_pins", carried), \
+                mock.patch.object(station.Station, "note_stale_shipped", notes):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(self.rotation(), 0, "the carried step still holds the rotation")
+        self.assertEqual(notes.call_count, 2)
+
+    def test_a_note_pass_that_fails_does_not_stop_the_step_loop(self):
+        def limited(_station):
+            raise RateLimited("GET /repos/x/issues -> 403", 403, "", 0)
+
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "note_stale_shipped", limited), \
+                mock.patch.object(station.Station, "release_factory_held", later):
+            self.run_pass()
+        later.assert_called_once()
+
     def test_a_step_that_crashes_keeps_its_place_in_the_rotation(self):
         self.seed_rotation(0)
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
@@ -12753,6 +12782,18 @@ class VerifyNoteTest(Base):
         for n in (4, 5, 6):
             self.assertEqual(self.notes(n), [], "ticket %d" % n)
             self.assertEqual(self.fake.comments[n], [], "ticket %d" % n)
+
+    def test_a_ticket_inside_the_last_hour_before_24h_is_noted(self):
+        # The pass runs at most once a VERIFY_NOTE_EVERY and passes come
+        # minutes apart, so a ticket noted only from 24h would sit past the
+        # mark unnoted until the next run. It is noted an hour early.
+        self.fake.add(8, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(23.5))
+        self.fake.add(9, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(22))
+        self.station().note_stale_shipped()
+        self.assertEqual(len(self.notes(8)), 1)
+        self.assertEqual(self.notes(9), [])
 
     def test_the_note_is_one_comment_edited_in_place(self):
         st = self.station()
