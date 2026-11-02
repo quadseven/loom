@@ -20,7 +20,8 @@ from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _
 from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
-                     parse as parse_status_events, strip_body as strip_status_body)
+                     parse as parse_status_events, resort as resort_events,
+                     strip_body as strip_status_body)
 from .labels import HANDOFF, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import tick_clock
@@ -1431,12 +1432,12 @@ STATUS_DEADLINE_MINUTES = 1.5
 STATUS_PARTIAL_EXIT = 3
 
 
-def repo_weights(gh: Any, repos: Sequence[str]) -> Dict[str, int]:
-    """How much status has to read in each repo: its open issues and pull
-    requests, counted for every repo in one GraphQL query. Nothing when
-    there is one repo to order, or when GitHub will not answer the query;
-    the repos are then read in the order given, and a repo GitHub will not
-    show is named by its own section read."""
+def repo_weights(gh: Any, repos: Sequence[str], who: str = "status") -> Dict[str, int]:
+    """How much status or resume (`who`) has to read in each repo: its open
+    issues and pull requests, counted for every repo in one GraphQL query.
+    Nothing when there is one repo to order, or when GitHub will not answer
+    the query; the repos are then read in the order given, and a repo GitHub
+    will not show is named by its own section read."""
     order = list(dict.fromkeys(repos))
     if len(order) < 2:
         return {}
@@ -1451,8 +1452,8 @@ def repo_weights(gh: Any, repos: Sequence[str]) -> Dict[str, int]:
         answer = gh.rest("POST", "/graphql", {"query": "query { %s }" % " ".join(fields),
                                               "variables": {}}).data
     except GitHubError as err:
-        _progress("status: reading in the order given; the repo sizes were not read: %s"
-                  % _one_line(str(err), 200))
+        _progress("%s: reading in the order given; the repo sizes were not read: %s"
+                  % (who, _one_line(str(err), 200)))
         return {}
     data = answer.get("data") if isinstance(answer, dict) else None
     weights: Dict[str, int] = {}
@@ -2134,26 +2135,59 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False
 
 def _finishable_tree(gh: GitHub, repo: str, goal: int
                      ) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
-    """goal_tree's epics as finished_epics reads them: only an open epic
-    that is not the standing one can be finished, so only those epics'
+    """goal_tree's open epics as finished_epics reads them: only an open
+    epic that is not the standing one can be finished, so only those epics'
     tickets are read, and their sub-issues' states come in one GraphQL read
-    (EPIC_STATES) instead of one REST read per epic. Every other epic keeps
+    (EPIC_STATES) instead of one REST read per epic. The standing epic keeps
     an empty ticket list, which finished_epics never looks at. On
     2026-10-27 resume read 25 sub-issue lists for quadseven/loom, 12 of them
-    for closed epics (loom#2078)."""
-    direct = _direct_children(gh, repo, goal)
-    epics = _goal_epics(gh, repo, goal, direct)
-    wanted = [int(e.get("number") or 0) for e in epics
-              if e.get("state", "open") == "open" and not standing_epic(e)]
+    for closed epics (loom#2078).
+
+    Every other read comes from what resume already holds or needs no body
+    (loom#2483): the goal's sub-issues are read as status reads them (light,
+    SUB_ISSUE_FIELDS), since an epic is read here only for its number,
+    title, state and labels; and the open epics whose Part of line names the
+    goal, and the open tickets, come from the repo's open issue listing
+    (_issues). Closed epics can never be finished, so the listing of every
+    epic, open and closed, and the search for Part of tickets past the
+    sub-issue limit (whose open epics the listing names too) are not read.
+    On 2026-11-02 those reads were 2.1 MB of the 7.5 MB a resume of 19 repos
+    moved."""
+    listed = _issues(gh, repo)
+    epics = _open_goal_epics(_sub_issue_tickets(gh, repo, [goal])[goal], listed, goal)
+    wanted = [int(e.get("number") or 0) for e in epics if not standing_epic(e)]
     if not wanted:
         return [(epic, []) for epic in epics]
-    open_tickets = [i for i in gh.paginate(
-        "/repos/%s/issues?labels=loom:ticket&state=open&per_page=100" % repo)
-        if isinstance(i, dict) and "pull_request" not in i]
+    open_tickets = _open_tickets(listed)
     subs = _sub_issue_states(gh, repo, wanted)
     return [(epic, _tree_tickets(int(epic.get("number") or 0), subs[n], open_tickets)
              if n in subs else [])
             for epic, n in ((e, int(e.get("number") or 0)) for e in epics)]
+
+
+def _open_goal_epics(direct: Sequence[Any], listed: Sequence[Dict[str, Any]], goal: int
+                     ) -> List[Dict[str, Any]]:
+    """The goal's open epics: its sub-issues labelled epic, then the open
+    epics of the repo's open issue listing whose body says Part of #goal,
+    each once, as _goal_epics finds them but without the closed ones."""
+    epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
+    seen = {int(e.get("number") or 0) for e in epics}
+    for item in listed:
+        number = int(item.get("number") or 0) if isinstance(item, dict) else 0
+        if (number and number not in seen and number != goal and _epic_label(item)
+                and _names_goal(item.get("body"), goal)):
+            epics.append(item)
+            seen.add(number)
+    return [e for e in epics if e.get("state", "open") == "open"]
+
+
+def _open_tickets(listed: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The open loom:ticket issues of a repo's open issue listing (_issues),
+    in listing order: the issues GitHub's `labels=loom:ticket&state=open`
+    listing answers (its label filter ignores case), without reading them a
+    second time."""
+    return [i for i in listed if isinstance(i, dict)
+            and "loom:ticket" in [name.lower() for name in _labels(i)]]
 
 
 # Epics one sub-issue state query asks for; each brings up to 100 sub-issues.
@@ -6213,13 +6247,16 @@ def _goal_journals(gh: GitHub, repos: Sequence[str], authors: Sequence[str],
     goals: List[GoalJournals] = []
     for repo in repos:
         try:
-            found = []
-            for issue in _issues(gh, repo):
-                if "loom:goal" not in _labels(issue):
-                    continue
-                comments = _goal_home_comments(gh, repo, int(issue["number"]))
-                found.append((repo, issue, handoff.journals(comments, authors),
-                              handoff.untrusted_journal_logins(comments, authors)))
+            homes = [i for i in _issues(gh, repo) if "loom:goal" in _labels(i)]
+            # Each goal's comments are read side by side, each goal's pages
+            # too (_goal_home_comments): read one page after another, a goal
+            # home of 750 comments was eight reads in a row before any of the
+            # repo's parts could start (loom#2483).
+            read = _read_each(lambda issue, at=repo: _goal_home_comments(
+                gh, at, int(issue["number"]), int(issue.get("comments") or 0)), homes)
+            found = [(repo, issue, handoff.journals(comments, authors),
+                      handoff.untrusted_journal_logins(comments, authors))
+                     for issue, comments in zip(homes, read, strict=True)]
         except GitHubError as err:
             reason = unreadable(err)
             if reason is None or skipped is None:
@@ -6283,11 +6320,48 @@ def _revision_or_reason(gh: GitHub, item: Tuple[str, int]) -> Tuple[Optional[str
         return None, reason
 
 
-def _goal_home_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
-    """Every comment on one goal home as {"body", "at", "login"}."""
-    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+def _goal_home_comments(gh: GitHub, repo: str, number: int, count: int = 0
+                        ) -> List[Dict[str, Any]]:
+    """Every comment on one goal home as {"body", "at", "login"}. With
+    `count`, the listing's comment count, the pages after the first are read
+    side by side (_comment_pages_side_by_side)."""
+    path = "/repos/%s/issues/%d/comments" % (repo, number)
+    comments = (_comment_pages_side_by_side(gh, path, count) if count > COMMENT_PAGE
+                else gh.paginate(path))
     return [{"body": c.get("body"), "at": c.get("created_at"),
              "login": (c.get("user") or {}).get("login")} for c in comments]
+
+
+# GitHub's largest page of comments.
+COMMENT_PAGE = 100
+
+
+def _comment_pages_side_by_side(gh: GitHub, path: str, count: int) -> List[Any]:
+    """Every comment at `path`, as gh.paginate reads them, with the pages
+    that `count` (the listing's comment count) says are there read side by
+    side after the first. The first page is read alone, so it carries the
+    issue body's status events as paginate's does (GitHub._with_body_events).
+    A comment added since the listing is followed through the last page's
+    next link, or the page after a kept full page answered 304; a page
+    emptied by deleted comments reads as no comments."""
+    base = path + "?per_page=%d" % COMMENT_PAGE
+    pages = (int(count) - 1) // COMMENT_PAGE + 1
+    answers = [gh.rest("GET", base)]
+    answers += _read_each(lambda page: gh.rest("GET", "%s&page=%d" % (base, page)),
+                          range(2, pages + 1))
+    items: List[Any] = []
+    for answer in answers:
+        items.extend(answer.data if isinstance(answer.data, list) else [])
+    last, page = answers[-1], pages
+    while True:
+        nxt = _next_link(last.headers.get("link", ""))
+        if (not nxt and last.status == 304 and isinstance(last.data, list)
+                and len(last.data) >= COMMENT_PAGE):
+            nxt = "%s&page=%d" % (base, page + 1)
+        if not nxt:
+            return resort_events(items)
+        last, page = gh.rest("GET", nxt), page + 1
+        items.extend(last.data if isinstance(last.data, list) else [])
 
 
 def _goal_home_journals(gh: GitHub, repo: str, number: int,
@@ -6429,6 +6503,15 @@ def _ready_sensitive(gh: GitHub, repo: str, pr: Dict[str, Any], now: datetime,
     if not _checks_green(details) or not sha or not _review_check_passed(gh, repo, sha, check):
         return None
     return {"created": created, "repo": repo, "pr": pr, "ticket": ticket, "details": details}
+
+
+def _sensitive_listed(gh: GitHub, repo: str) -> bool:
+    """Whether the repo's open issue listing (_issues reads it, pull requests
+    included) holds a pull request labelled both needs-brain and
+    class:sensitive: without one, _ready_sensitive_in finds none."""
+    listed = gh.paginate("/repos/%s/issues?state=open" % repo)
+    return any(isinstance(i, dict) and "pull_request" in i
+               and {"needs-brain", "class:sensitive"} <= set(_labels(i)) for i in listed)
 
 
 def _ready_sensitive_in(gh: GitHub, repo: str, now: datetime, check: str
@@ -6591,10 +6674,16 @@ def _resume_one(gh: GitHub, repo: str, authors: Sequence[str], shared: _ResumePa
     with a fault. A dropped connection is raised, so per_repo.each reads the
     repo once more; anything that is not a GitHubError is raised too."""
     def read() -> Tuple[Any, ...]:
-        # The sensitive pull requests come first: a repo GitHub will not
-        # show there is named once and its goals are never read.
+        # The open issue listing first, which the goal journals read too: a
+        # repo GitHub will not show is named once and its goals are never
+        # read. Its pull requests carry their labels, so the open pull
+        # requests are listed only when one of them may be a ready sensitive
+        # one (_sensitive_listed); on 2026-11-02 that listing was 19 reads
+        # and 556 KB of a resume over 19 repos, two of them pull requests to
+        # check (loom#2483).
         try:
-            ready = _ready_sensitive_in(gh, repo, now, check)
+            ready = (_ready_sensitive_in(gh, repo, now, check)
+                     if _sensitive_listed(gh, repo) else [])
             skipped: Dict[str, str] = {}
             mine = _goal_journals(gh, [repo], authors, skipped)
         except GitHubError as err:
@@ -6695,7 +6784,14 @@ def _resume_pass(gh: GitHub, repos: List[str], holder: str, authors: Sequence[st
         _progress("resume: reading %s (requests: %d)" % (repo, getattr(gh, "requests", 0)))
         return _resume_one(reads, repo, authors, shared, now, check, trusted, stop)
 
-    for repo, done, value in per_repo.each(repos, gather, seconds, READ_WORKERS,
+    # The lightest repos are read first, as status reads them (lightest_first):
+    # in the order given, the heaviest repos shared the link from the start,
+    # and on a slow tick the deadline left 12 of 19 repos unread, the heavy
+    # ones among them (loom#2483). Every section that spans the repos keeps
+    # the order given (`kept` below), so only the order the repos print in
+    # changes.
+    order = lightest_first(repos, repo_weights(reads, repos, "resume"))
+    for repo, done, value in per_repo.each(order, gather, seconds, READ_WORKERS,
                                            clock=lambda: _clock(), until=stop):
         if not done:
             if isinstance(value, per_repo.PastDeadline):

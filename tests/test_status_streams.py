@@ -158,6 +158,8 @@ class ResumeStreamTest(unittest.TestCase):
             return []
         for target, name, value in (
                 (brain, "_lock_holder", lambda *a: None),
+                (brain, "repo_weights", lambda *a: {}),
+                (brain, "_sensitive_listed", lambda *a: True),
                 (brain, "_goal_journals", journals),
                 (brain, "_ready_sensitive_in", sensitive),
                 (brain, "_verify_due_in", lambda *a: []),
