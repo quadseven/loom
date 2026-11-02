@@ -42,7 +42,7 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from . import notify, shadow, tickets
+from . import closing, notify, shadow, tickets
 from .github import GitHubError, RateLimited
 
 SOUND, DIFFERS, UNPROVEN, UNCITED, UNKNOWN = "sound", "differs", "unproven", "uncited", "unknown"
@@ -465,10 +465,11 @@ class _Pass:
                                reason="; ".join(lines(report)))
             self.seen[key] = self.now
             return
+        # Noted before the reopen, so a failed reopen does not comment again.
         if not self.posted.get(key):
             notify.post(self.gh, repo, number, refusal(report), notify.REOPENED)
             self.posted[key] = self.now
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+        closing.reopen(self.gh, repo, number, refusal(report), said=True)
         self.posted.pop(key, None)
         self.seen[key] = self.now
         self.reopened[ticket] = self.now

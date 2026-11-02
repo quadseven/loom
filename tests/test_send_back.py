@@ -75,7 +75,16 @@ class StationStepTest(unittest.TestCase):
         st.state = self.state
         st.now = now.timestamp()
         st.s = SimpleNamespace(repos=self.repos, review_bot=BOT)
-        st.gh = SimpleNamespace(rest=lambda *a, **k: self.patched.append(a))
+
+        def rest(method, path, body=None, **_):
+            # A reopen posts its reason through bus/closing.py (loom#2444), so a
+            # comment POST counts as posted, in _comment's (repo, number, body) shape.
+            if method == "POST" and path.endswith("/comments"):
+                self.posted.append((path.split("/")[2] + "/" + path.split("/")[3],
+                                    int(path.split("/")[5]), body["body"]))
+            else:
+                self.patched.append((method, path, body))
+        st.gh = SimpleNamespace(rest=rest)
         st._comment = lambda *a: self.posted.append(a)
 
         def pages(path):

@@ -124,7 +124,8 @@ class SourceTests(unittest.TestCase):
                           verified_by="codex/model-x")
 
     def close(self, reason="completed"):
-        return brain.close(self.gh, REPO, TICKET, reason, env=ENV)
+        note = "No longer needed." if reason == "not_planned" else None
+        return brain.close(self.gh, REPO, TICKET, reason, note, env=ENV)
 
     def test_rewritten_from_reads_the_line_and_the_older_refs_line(self):
         self.assertEqual(brain.rewritten_from(ticket_body()), SOURCE)

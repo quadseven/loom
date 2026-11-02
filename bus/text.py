@@ -142,6 +142,11 @@ def scrub_paths(text: str) -> str:
     return PATH_RE.sub("<path>", text)
 
 
+def has_reason(text: object) -> bool:
+    """Whether text has anything a reader sees: an HTML comment is not a reason."""
+    return bool(re.sub(r"<!--.*?-->", "", str(text or ""), flags=re.DOTALL).strip())
+
+
 def check(text: str) -> None:
     """Raise ValueError for text the brain must never post."""
     if LOCAL_PATH_RE.search(text):
