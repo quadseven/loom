@@ -162,10 +162,13 @@ def diff_findings(code_sources: Dict[str, str], test_sources: Dict[str, str],
     return findings
 
 
-def pull_findings(gh: object, repo: str, number: int, head: str,
-                  ticket_body: str = "") -> List[str]:
-    """Read changed Python files from a pull request and inspect their source."""
-    entries = []
+def _filename(item: Dict[str, object]) -> str:
+    return str(item.get("filename") or "")
+
+
+def _pull_files(gh: object, repo: str, number: int) -> List[Dict[str, object]]:
+    """Every changed-file entry of a pull request, up to 30 pages."""
+    entries: List[Dict[str, object]] = []
     for page in range(1, 31):
         data = gh.rest("GET", "/repos/%s/pulls/%d/files?per_page=100&page=%d"
                        % (repo, number, page)).data or []
@@ -173,20 +176,22 @@ def pull_findings(gh: object, repo: str, number: int, head: str,
         entries.extend(batch)
         if len(batch) < 100:
             break
-    code = [str(item.get("filename") or "") for item in entries
-            if str(item.get("filename") or "").endswith(".py")
-            and not is_test_path(str(item.get("filename") or ""))]
-    tests = [item for item in entries if is_test_path(str(item.get("filename") or ""))]
+    return entries
+
+
+def pull_findings(gh: object, repo: str, number: int, head: str,
+                  ticket_body: str = "") -> List[str]:
+    """Read changed Python files from a pull request and inspect their source."""
+    patches = {_filename(item): str(item.get("patch") or "")
+               for item in _pull_files(gh, repo, number)}
+    code = [path for path in patches if path.endswith(".py") and not is_test_path(path)]
     if not code:
         return []
-    code_sources = _read_sources(gh, repo, code, head)
-    code_patches = {str(item.get("filename") or ""): str(item.get("patch") or "")
-                    for item in entries if str(item.get("filename") or "") in code}
-    test_paths = [str(item.get("filename") or "") for item in tests]
-    test_sources = _read_sources(gh, repo, test_paths, head)
-    patches = {str(item.get("filename") or ""): str(item.get("patch") or "")
-               for item in tests}
-    return diff_findings(code_sources, test_sources, patches, ticket_body, code_patches)
+    tests = [path for path in patches if is_test_path(path)]
+    return diff_findings(_read_sources(gh, repo, code, head),
+                         _read_sources(gh, repo, tests, head),
+                         {path: patches[path] for path in tests}, ticket_body,
+                         {path: patches[path] for path in code})
 
 
 def _read_sources(gh: object, repo: str, paths: Sequence[str], head: str) -> Dict[str, str]:
