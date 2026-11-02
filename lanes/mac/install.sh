@@ -194,6 +194,10 @@ with open(sys.argv[1], "rb") as plist:
 keep_installed LOOM_TRUSTED_BRIEFERS
 keep_installed LOOM_BRIEF_AUTHORS
 keep_installed LOOM_ASK_ANSWERERS
+keep_installed LOOM_ANTHROPIC_BUDGET_USD
+keep_installed LOOM_ANTHROPIC_BUDGET_SINCE
+keep_installed LOOM_ANTHROPIC_BUDGET_EXPIRES
+keep_installed LOOM_NO_TOPUP
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot

@@ -160,6 +160,15 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("LOOM_ANTHROPIC_BUDGET_SINCE", asks)
         self.assertIn("1 of 2 lanes can take work: 1 held at a limit.", body)
 
+    def test_a_zero_balance_anthropic_reading_renders_as_used_up(self):
+        rows = [reading("anthropic", ["anthropic"], "credit", 100.0, source="LOOM_NO_TOPUP",
+                        remaining=0.0, unit="USD", note="anthropic credit is never topped up")]
+        body = usage.render(usage.build(rows, NOW))
+        anthropic = provider_row(body, "anthropic")
+        self.assertIn("<strong>100%</strong> used", anthropic)
+        self.assertIn("<strong>0%</strong> left", anthropic)
+        self.assertIn("USD 0.00 left", anthropic)
+
     def test_a_snapshot_older_than_two_hours_is_marked_stale_everywhere(self):
         rows = [reading("codex", ["codex"], "weekly", 50, (NOW + timedelta(days=2)).isoformat(),
                         age=timedelta(hours=19)),

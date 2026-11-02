@@ -52,6 +52,8 @@ class InstallScriptTest(unittest.TestCase):
         # owner check or the App check.
         full = {k: v for k, v in os.environ.items()
                 if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO")
+                and k not in ("LOOM_ANTHROPIC_BUDGET_USD", "LOOM_ANTHROPIC_BUDGET_SINCE",
+                              "LOOM_ANTHROPIC_BUDGET_EXPIRES", "LOOM_NO_TOPUP")
                 and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
                                        "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
@@ -289,6 +291,20 @@ class InstallScriptTest(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_keeps_the_anthropic_budget_and_no_topup_settings(self):
+        settings = {
+            "LOOM_ANTHROPIC_BUDGET_USD": "0",
+            "LOOM_ANTHROPIC_BUDGET_SINCE": "2026-10-18",
+            "LOOM_ANTHROPIC_BUDGET_EXPIRES": "",
+            "LOOM_NO_TOPUP": "anthropic",
+        }
+        self.assertEqual(self.run_install(**settings).returncode, 0)
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        station = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+        for key, value in settings.items():
+            self.assertIn("<key>%s</key><string>%s</string>" % (key, value), station)
 
     def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
         self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)

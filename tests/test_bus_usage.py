@@ -258,6 +258,13 @@ class UsageTests(unittest.TestCase):
         row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
         self.assertIsNone(row["used_pct"])
 
+    def test_anthropic_without_a_budget_is_used_up_when_the_provider_is_never_topped_up(self):
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"],
+                                      {"LOOM_NO_TOPUP": "zen, anthropic"}, 1000)[0]
+        self.assertEqual((row["used_pct"], row["remaining"]), (100.0, 0.0))
+        self.assertEqual(row["source"], "LOOM_NO_TOPUP")
+        self.assertIn("never topped up", row["note"])
+
     def test_codex_on_a_machine_without_session_logs_says_so(self):
         rows = usage.codex_records(["codex"], Path(self.home) / "no-sessions", 1000)
         self.assertIsNone(rows[0]["used_pct"])
