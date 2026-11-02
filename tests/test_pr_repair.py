@@ -7,6 +7,8 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -440,6 +442,22 @@ class CliTest(unittest.TestCase):
             rc = pr_repair.main([self.brief, "--pr-json", self.pr_json, "codex", "gpt-test", "T42"])
         self.assertEqual(rc, 3)
         self.assertIn("cannot read pr-json:", out.getvalue())
+
+
+class PreviewTest(unittest.TestCase):
+    def test_preview_writes_the_text_and_edits_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            preview = Path(tmp) / "preview"
+            result = {"title": "T", "body": "B", "reason": "", "changed": True,
+                      "old_hash": "a", "new_hash": "b"}
+            with mock.patch.object(pr_repair, "_gh_pr_view", return_value={}), \
+                    mock.patch.object(pr_repair, "reconcile", return_value=result), \
+                    mock.patch.object(pr_repair, "_gh_pr_edit") as edit:
+                code = pr_repair.main(["brief", "--apply", "7", "--repo", "o/r",
+                                       "--preview", str(preview), "codex", "m", "T1"])
+            self.assertEqual(code, 0)
+            self.assertEqual(preview.read_text(), "T\nB\n")
+            edit.assert_not_called()
 
 
 if __name__ == "__main__":

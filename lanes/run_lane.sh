@@ -461,7 +461,7 @@ summary_note() {
 # (its AGENTS.md rules), and another redid work its operator notes said had
 # shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Never commit a real person'"'"'s mail or street address, in any repo, private ones included: use example.com and an invented value in tests. The push is refused otherwise.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -934,18 +934,32 @@ PY
 # outside those sections. Scope changes are logged with old/new body hashes.
 # Exit: 0 = updated, 1 = no change needed, 2 = refused, 3 = gh/helper error.
 repair_pr_text() {
-  local summary=() private=()
+  local summary=() private=() preview rc=0
   [ -f "$WORKDIR/$TICKET.summary.md" ] && summary=(--summary "$WORKDIR/$TICKET.summary.md")
   repo_is_public || private=(--private)
+  preview="$(mktemp "${TMPDIR:-/tmp}/loom-repair.XXXXXX")" || return 3
+  # The repaired text goes through the personal data scan before any edit.
+  NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
+    --apply "$FIX_PR" --preview "$preview" --repo "$REPO" \
+    ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} \
+    "$BRIEF" "$LANE" "$MODEL" "$TICKET" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    leak_scan --text-file "$preview" --personal-data || rc=$?
+    [ "$rc" -le 0 ] || { rm -f "$preview"; echo "PR text repair refused: personal data scan exited $rc"; return 2; }
+  fi
+  rm -f "$preview"
+  [ "$rc" -eq 0 ] || return "$rc"
   NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -m bus.pr_repair \
     --apply "$FIX_PR" --repo "$REPO" ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} \
     "$BRIEF" "$LANE" "$MODEL" "$TICKET"
 }
 
 # Prints the text of file $1 when it is fit for a ticket comment: at most
-# 32 KB of non-empty ASCII that passes bus/text.py's checks. Otherwise says
+# 32 KB of non-empty ASCII that passes the personal data scan and bus/text.py's
+# checks. Otherwise says
 # why on stderr and fails.
 checked_text() {
+  leak_scan --text-file "$1" --personal-data > /dev/null || return 1
   PYTHONPATH="$REPO_ROOT" python3 - "$1" <<'PY'
 import sys
 from pathlib import Path
@@ -2851,16 +2865,16 @@ check_contract_change() {
 # say where the edits are. Never touches the ticket's branch or an open pull
 # request. A side branch on a public repo is as public as a pull request, so
 # the same leak scan runs first, and any repo not known to be private counts
-# as public; a refused or unavailable scan keeps no branch.
+# as public. A private repo gets the personal data scan. A refused or
+# unavailable scan keeps no branch.
 push_side() {
-  local from="$1" side="$2" range
-  if [ "${REPO_PRIVATE:-}" != true ]; then
-    range="$BASE..$from"
-    [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
-    if ! (cd "$TREE" && leak_scan --diff "$range" --allow-repo-ref "$REPO") >> "$LOG" 2>&1; then
-      printf 'the public repo leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
-      return 1
-    fi
+  local from="$1" side="$2" range scan=(--allow-repo-ref "$REPO")
+  range="$BASE..$from"
+  [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
+  [ "${REPO_PRIVATE:-}" = true ] && scan=(--personal-data)
+  if ! (cd "$TREE" && leak_scan --diff "$range" "${scan[@]}") >> "$LOG" 2>&1; then
+    printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
+    return 1
   fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
@@ -4099,6 +4113,48 @@ for BRIEF in "$INBOX"/*.md; do
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
     park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); $HANDOFF" "$PARK_CLASS"; continue
   fi
+  # A private repo is spared the public repo rules, never the one on real
+  # mail and street addresses.
+  if [ "$REPO_PRIVATE" != false ]; then
+    keep_scanner_current || true
+    SCAN_RANGE="$BASE..HEAD"
+    [ -n "$FIX_UPSTREAM" ] && SCAN_RANGE="$FIX_UPSTREAM...HEAD"
+    LEAK_RC=0
+    # Each commit, patch and message: a value added and then removed passes
+    # the net diff and still goes up in history.
+    LEAK_OUT="$(cd "$TREE" && leak_scan --diff "$SCAN_RANGE" --personal-data 2>&1)" || LEAK_RC=$?
+    if [ "$LEAK_RC" -eq 1 ]; then
+      park "$BRIEF" "personal data scan failed; nothing pushed: $LEAK_OUT"
+      continue
+    elif [ "$LEAK_RC" -ne 0 ]; then
+      park "$BRIEF" "personal data scan could not run; nothing pushed: $LEAK_OUT" transient
+      continue
+    fi
+    printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    if [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ]; then
+      INTENT_CLASS=""
+      INTENT_TEXT=""
+      prepare_intent "$BRIEF" >> "$LOG" 2>&1
+      if [ -n "$DROPPED_SCRATCH_FILES" ]; then
+        INTENT_TEXT="${INTENT_TEXT}
+- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
+      fi
+      compose_pr_body
+      BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
+      printf '%s\n%s\n' "${TITLE:-$TICKET}" "$PR_BODY" > "$BODY_FILE"
+      LEAK_RC=0
+      LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --personal-data 2>&1)" || LEAK_RC=$?
+      rm -f "$BODY_FILE"
+      if [ "$LEAK_RC" -eq 1 ]; then
+        park "$BRIEF" "PR body personal data scan failed; nothing pushed: $LEAK_OUT"
+        continue
+      elif [ "$LEAK_RC" -ne 0 ]; then
+        park "$BRIEF" "personal data scan could not run on the PR body; nothing pushed: $LEAK_OUT" transient
+        continue
+      fi
+      printf '%s\n' "$LEAK_OUT" >> "$LOG"
+    fi
+  fi
   if [ "$REPO_PRIVATE" = false ]; then
     keep_scanner_current || true
     if [ ! -f "$LEAK_SCANNER" ]; then
@@ -4332,15 +4388,6 @@ Review threads this round left without a reply: $UNANSWERED"
     fi
     mv "$BRIEF" "$INBOX/done/"
     continue
-  fi
-  if [ "$REPO_PRIVATE" = true ]; then
-    INTENT_CLASS=""
-    INTENT_TEXT=""
-    prepare_intent "$BRIEF" >> "$LOG" 2>&1
-    if [ -n "$DROPPED_SCRATCH_FILES" ]; then
-      INTENT_TEXT="${INTENT_TEXT}
-- Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
-    fi
   fi
   # The class label goes on after the PR exists: a repo without the label
   # must never cost a finished run its PR (2026-10-14, ten runs lost theirs).

@@ -783,6 +783,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="path to a file holding gh pr view --json title,body output")
     parser.add_argument("--apply", type=int, metavar="PR",
                         help="apply the repair to this PR number via gh")
+    parser.add_argument("--preview", metavar="FILE",
+                        help="with --apply: write the repaired title and body to "
+                             "FILE and leave the pull request as it is")
     parser.add_argument("--repo",
                         help="owner/name repository for --apply, and where a "
                              "bug line's #N is looked up")
@@ -834,6 +837,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not result["changed"]:
         print("PR text is current on #%d" % args.apply)
         return 1
+
+    if args.preview:
+        with open(args.preview, "w", encoding="utf-8") as fh:
+            fh.write("%s\n%s\n" % (result["title"], result["body"]))
+        return 0
 
     try:
         _gh_pr_edit(args.repo, args.apply, str(result["title"]), str(result["body"]))
