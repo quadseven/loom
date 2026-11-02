@@ -1,0 +1,169 @@
+name: lane
+
+# One Loom lane run on an ephemeral self-hosted runner (quadseven/loom#1824).
+# The station dispatches it for a slot in LOOM_RUNNER_SLOTS with one brief
+# (bus/runners.py) and reads back the sealed report; nothing of the run stays
+# anywhere once the runner pod is gone. docs/LANES.md, "Lanes on cluster
+# runners", says what the runner set and the AWS role must provide.
+#
+# Inputs are read from the event file by lanes/k8s/lane_job.py, never put in
+# a step's environment: GitHub prints that in the public job log. Nothing the
+# job prints names a key, an SSM parameter, a probe address or the brief, and
+# run_lane.sh's own output goes into the sealed report only.
+#
+# The lane role trusts this file on main only: the station dispatches on main,
+# and the job sets no environment (one would change the OIDC subject).
+#
+# Repository variables (none in this file):
+#   LOOM_LANE_DISPATCHERS          logins that may dispatch (the station App's)
+#   LOOM_LANE_ROLE_ARN             the AWS role this workflow assumes by OIDC
+#   LOOM_LANE_AWS_REGION           that role's region
+#   LOOM_LANE_EGRESS_ALLOW_PROBE   host:port the runner must reach
+#   LOOM_RUNNER_GATEWAY_URL        the gateway's in-cluster origin (spark, free)
+# and one repository secret, so its private addresses are masked in the log:
+#   LOOM_LANE_EGRESS_DENY_PROBES   IPv4:port addresses the runner must not reach
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: Lane slot, e.g. opencode-go-2
+        required: true
+        type: string
+      ticket:
+        description: Ticket key (the brief's file name without .md)
+        required: true
+        type: string
+      brief:
+        description: The brief text
+        required: true
+        type: string
+      run_id:
+        description: The station's id for this run (32 hex digits)
+        required: true
+        type: string
+      settings:
+        description: The slot's NAME=value settings, one a line (no secrets)
+        required: false
+        type: string
+      report_key:
+        description: The station's report public key (PEM)
+        required: true
+        type: string
+      report_mac_key:
+        description: The run's report MAC key (masked by the job)
+        required: true
+        type: string
+
+run-name: lane ${{ inputs.slot }} ${{ inputs.run_id }}
+
+permissions: {}
+
+concurrency:
+  group: lane-${{ inputs.slot }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    name: Run one lane brief
+    # A pull request's own workflow could name this runner label too (a
+    # repository's runners cannot be held to one workflow); this one runs
+    # only when dispatched on main.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: arc-loom-lanes
+    # The agent's own bound (LOOM_AGENT_TIMEOUT, an hour), the checks
+    # (LOOM_CHECK_TIMEOUT) and the push, with room to seal the report.
+    timeout-minutes: 150
+    env:
+      # The job's files: under HOME, which no agent sandbox shows, and on
+      # the runner's work volume rather than its small /tmp.
+      LOOM_JOB_DIR: ${{ github.workspace }}/loom-job
+    permissions:
+      contents: read   # check out this repo
+      id-token: write  # the OIDC token the AWS role is assumed with
+    steps:
+      # Only the station's App or a login in LOOM_LANE_DISPATCHERS (a
+      # repository variable, space- or comma-separated) may start a run.
+      - name: Refuse an untrusted dispatcher
+        env:
+          ACTOR: ${{ github.triggering_actor }}
+          TRUSTED: ${{ vars.LOOM_LANE_DISPATCHERS }}
+        run: |
+          set -euo pipefail
+          trusted=" $(printf '%s' "$TRUSTED" | tr ',\t\n' '   ') "
+          if [ -z "$ACTOR" ] || [[ "$trusted" != *" $ACTOR "* ]]; then
+            echo "::error::$ACTOR may not dispatch lane runs (LOOM_LANE_DISPATCHERS)"
+            exit 1
+          fi
+
+      - name: Check out loom
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: loom
+          persist-credentials: false
+
+      # The leak scanner the lane runs before every push to a public repo,
+      # at the commit check.workflow-hygiene.yml pins.
+      - name: Check out the leak scanner
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: quadseven/infra-public
+          ref: 2ee764949a68bed6a1b4b3bcd6785a251f49da8f
+          path: infra-public
+          persist-credentials: false
+
+      - name: Read the dispatch
+        id: prepare
+        env:
+          LOOM_RUNNER_GATEWAY_URL: ${{ vars.LOOM_RUNNER_GATEWAY_URL }}
+        run: python3 -B loom/lanes/k8s/lane_job.py prepare
+
+      # Before any key is read: no agent runs on a runner whose egress is
+      # not narrowed (lanes/agent_sandbox.sh sandbox_ready).
+      - name: Prove egress is narrowed
+        env:
+          LOOM_EGRESS_DENY_PROBES: ${{ secrets.LOOM_LANE_EGRESS_DENY_PROBES }}
+          LOOM_EGRESS_ALLOW_PROBE: ${{ vars.LOOM_LANE_EGRESS_ALLOW_PROBE }}
+        run: python3 -B loom/lanes/k8s/lane_job.py egress
+
+      - name: Assume the lane role
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.LOOM_LANE_ROLE_ARN }}
+          aws-region: ${{ vars.LOOM_LANE_AWS_REGION }}
+          role-duration-seconds: 900
+          mask-aws-account-id: true
+          # The session goes to the next step only, not to every later one.
+          output-credentials: true
+          output-env-credentials: false
+
+      - name: Copy the lane's SSM values
+        env:
+          AWS_ACCESS_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+          AWS_SECRET_ACCESS_KEY: ${{ steps.aws.outputs.aws-secret-access-key }}
+          AWS_SESSION_TOKEN: ${{ steps.aws.outputs.aws-session-token }}
+          AWS_REGION: ${{ vars.LOOM_LANE_AWS_REGION }}
+        run: python3 -B loom/lanes/k8s/lane_job.py ssm
+
+      - name: Run the lane once
+        env:
+          LOOM_EGRESS_DENY_PROBES: ${{ secrets.LOOM_LANE_EGRESS_DENY_PROBES }}
+          LOOM_EGRESS_ALLOW_PROBE: ${{ vars.LOOM_LANE_EGRESS_ALLOW_PROBE }}
+          LOOM_LEAK_SCANNER: ${{ github.workspace }}/infra-public/.github/scripts/check_private_leaks.py
+        run: python3 -B loom/lanes/k8s/lane_job.py run
+
+      # Only after the dispatch was read: its run_id is then checked as 32
+      # hex digits before it names the artifact.
+      - name: Seal the report
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: python3 -B loom/lanes/k8s/lane_job.py report
+
+      - name: Upload the report
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lane-report-${{ inputs.run_id }}
+          path: ${{ github.workspace }}/loom-job/report/
+          retention-days: 3
+          if-no-files-found: ignore
