@@ -55,13 +55,21 @@ def _names_state(expr, assigned, seen=None):
     return False
 
 
+def _targets(node):
+    """The targets of a plain or annotated assignment with a value, else none."""
+    if isinstance(node, ast.Assign):
+        return node.targets
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return [node.target]
+    return []
+
+
 def _assigned(scope):
     assigned = {}
     for node in ast.walk(scope):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    assigned.setdefault(target.id, []).append(node.value)
+        for target in _targets(node):
+            if isinstance(target, ast.Name):
+                assigned.setdefault(target.id, []).append(node.value)
     return assigned
 
 
@@ -88,9 +96,9 @@ def direct_writes(source):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
                     and _sends_state(node, assigned):
                 found.add(node.lineno)
-            if isinstance(node, ast.Assign) and any(
-                    isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
-                    and t.slice.value == "state" for t in node.targets) and _writes_body(node):
+            if any(isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant)
+                   and t.slice.value == "state" for t in _targets(node)) \
+                    and _writes_body(node):
                 found.add(node.lineno)
             if isinstance(node, ast.Constant) and isinstance(node.value, str) \
                     and "mutation" in node.value and (
@@ -235,6 +243,14 @@ class TheScanCatches(unittest.TestCase):
 
     def test_a_body_built_first(self):
         source = ('def f(gh):\n    body = {"title": "t"}\n    body["state"] = "closed"\n'
+                  '    gh.rest("PATCH", "/x", body)\n')
+        self.assertEqual(direct_writes(source), [3])
+
+    def test_a_body_with_an_annotation(self):
+        source = ('def f(gh):\n    body: dict = {"state": "closed"}\n'
+                  '    gh.rest("PATCH", "/x", body)\n')
+        self.assertEqual(direct_writes(source), [3])
+        source = ('def f(gh):\n    body: dict = {}\n    body["state"]: str = "closed"\n'
                   '    gh.rest("PATCH", "/x", body)\n')
         self.assertEqual(direct_writes(source), [3])
 
