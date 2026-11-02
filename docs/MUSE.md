@@ -9,7 +9,10 @@ brain's and none is the operator's (loom#1142); `LOOM_GITHUB_TOKEN` is only
 for a Muse without them. Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
-`close`, verified moves and merges refuse every ticket as untrusted. Set `LOOM_GOAL_CAP`
+`close`, verified moves and merges refuse every ticket as untrusted. Set
+`LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
+listed login's answer line as no answer until the label pass clears the ask
+(docs/LANES.md, Ask answerers). Set `LOOM_GOAL_CAP`
 to the station's value too: unset, a Muse tick uses the default cap of 16
 while the station and the lane machine's brain use theirs, and a brief the
 lane machine would file (a factory ticket included) is refused as over the
@@ -31,9 +34,10 @@ result, not a failure to retry or work around. Name each such pull request or
 ticket in the journal as "would merge" or "would close". Never merge or close
 a pull request or issue any other way (curl, `gh pr merge`, `gh issue close`,
 the web), in shadow or out of it. In shadow, also never approve a pull
-request, add `ready-to-land` or `loom:shipped` by hand, or write onto a branch
-Loom does not own, by any route: `bus.brain move` records a ship instead of
-taking it, and the tick's `gh` refuses the rest and records them.
+request or add `ready-to-land` by hand, or write onto a branch Loom does not
+own, by any route: the tick's `gh` refuses the rest and records them. A move
+to `loom:shipped` is a state fact, not a merge or a close, and goes through;
+leave it to each goal's ship rules.
 
 ## What Muse does and leaves
 
@@ -68,6 +72,13 @@ To read a file in a repo (a test, a script, a doc) without the web tool:
 
 A scheduled run on 2026-10-21 asked the operator to approve a web fetch of
 one loom test file and stopped until the operator answered.
+
+Every list read paginates: issue comments, events, timelines and labels. A
+GitHub list returns the oldest 30 by default, so the last item of one read is
+not the newest. Follow the `Link` header to its end with `per_page=100`, or
+use a Loom command, which pages for you (`gh api --paginate` does too). A
+ticket with 36 comments read this way ended 18 days before its newest comment
+and hid the operator's own answers (loom#2387).
 
 ## Operate, do not report
 
@@ -209,6 +220,9 @@ project goals. Muse, the lane machine's tick and the operator's interactive
 session are peers here: each improves the brain and the factory, through
 tickets and pull requests like any other work.
 
+- Each tick, add a `- Scoreboard:` line to the journal, copied from
+  `python3 -m bus.review_debt line OWNER/NAME#N`, naming the goal home
+  (docs/BRAIN.md, Review and guard debt).
 - Each tick, note in the journal what slowed the factory down, one
   `- Friction:` line each (docs/BRAIN.md, Journal): a lane PR that failed
   for a reason the runner could catch, a step done by hand that the station
@@ -248,8 +262,11 @@ steps on each tick:
    branch. Keep a heartbeat current while working with
    `python3 -m bus.lane heartbeat OWNER/NAME#N --lane muse`.
 4. Open the pull request with `python3 -m bus.lane pr OWNER/NAME#N
-   --base BASE`. The command writes the standard Intent section, class label
-   and ticket reference, then moves the ticket to `loom:pr`.
+   --base BASE`. The command writes the standard Intent section with its Risk
+   line, the class and tier labels and the ticket reference, then moves the
+   ticket to `loom:pr`. A `## Risk` section in `.loom/summary.md` supplies the
+   door and blast radius (docs/LANES.md); without one the line reads
+   `door unstated`.
 5. Journal one line on the ticket describing the result.
 
 Claims expire after two hours without a heartbeat. A claim without a pull
@@ -266,7 +283,10 @@ Work it leaves must not wait for that brain's next tick while it keeps
 journaling, so stage work is handed off per goal and stage, not by who
 journaled last. The stages are `review`, `merge`, `failed` (re-brief or
 close a `loom:failed` ticket), `ask`, `regression` (admit a brief for a
-live regression) and `brief` (a brief named but not written this tick).
+live regression), `brief` (a brief named but not written this tick) and
+`needs-brain` (a decision left open on a `loom:briefed` ticket that carries
+`needs-brain`; the defer changes no label, hold or state, and the `done`
+line for that stage and ticket retires it).
 
 - Defer: for each item ready for a stage that you leave undone this tick,
   run `python3 -m bus.brain defer OWNER/NAME#ITEM --stage STAGE --holder HOLDER`
@@ -317,9 +337,15 @@ this tick"; a step with no note shows nothing there. Each step call records
 when that step started and when the previous one ended, and prints the
 tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
-1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
-   Stop if the lock is held. The lock outlives the 25-minute tick, so no
-   other brain takes it mid-tick.
+1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30 --wait 5`.
+   Read its exit code and its one line, not an earlier one. Exit 0 means you
+   hold the lock: the line starts `lock acquired: yours`, or `lock acquired:
+   already yours` when you had taken it earlier this tick (a re-attempt is
+   yours, never a peer's, so go on). Exit 1 means a peer holds it after the
+   5-minute wait: the line starts `lock held by <holder>` and says how long
+   it has held it and when it expires. Stop then, and quote that line in the
+   stand-down so it names the holder and its age. The lock outlives the
+   25-minute tick, so no other brain takes it mid-tick.
    Then run `python3 -m bus.brain step lock --holder muse`.
 2. First run `python3 -m bus.brain step status --holder muse`. The first read
    of every tick is the handoff packet: the comment marked
@@ -330,7 +356,19 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    with the Rules below and the commit they come from. Open defers of a
    brain no longer ticking (the packet marks them open work for any brain)
    are finished before new work, through `resume` as below.
-   Run `python3 -m bus.brain status $LOOM_REPOS`. Read the lane status and,
+   Run `python3 -m bus.brain status $LOOM_REPOS --deadline 1.5`. It reads
+   the repos side by side, the lightest first, prints each repo's section as
+   soon as that repo is read, and logs progress to stderr. The light repos
+   print within seconds, so a deadline leaves only heavy ones unread.
+   `--deadline MINUTES` (default 1.5) stops the reads inside your command
+   timeout (about 115 s): the sections across repos and the lane status
+   take a few seconds more, so the command ends near 100 s. It prints `status skipped OWNER/NAME: deadline` for each repo
+   it did not finish, then the sections across repos from the repos it
+   read, ends with `status partial: not read this run: ...`, and exits 3. A
+   repo that timed out or that GitHub answered with a fault is named in its
+   section and also exits 3. Exit 3 means partial, not failed: a repo it
+   names is not a repo with nothing ready; read it next tick, or run status
+   for the named repos alone. Read the lane status and,
    for each goal, its latest journal, report, measurement and completed
    action, and its report deadline. Every goal under "Reports owed before
    unlock" gets its report in the report step this tick, in every scope,
@@ -370,8 +408,19 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    followed by the answer: what was done, or the answer to the question.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
-   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse`. It
-   refuses unless you hold the lock. Each `resume` line it prints is stage
+   Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse
+   --deadline 1.5`. It refuses unless you hold the lock. It prints each
+   repo's goal sections as soon as that repo is read and logs progress to
+   stderr (the repo, the requests so far, and every rate-limit or retry
+   wait), so a killed run keeps what it printed. `--deadline MINUTES`
+   (default 8) stops the reads in time: keep it under your command timeout
+   (1.5 fits a 2-minute one). At the deadline it prints `resume skipped
+   OWNER/NAME: deadline` for each repo it did not finish, then the
+   freshness line and the cross-repo sections from the repos it read, and
+   exits 3. A repo that timed out, or a repo or handoff item GitHub
+   answered with a fault, is named with why (under "Timed-out repos" or
+   "Failed repos", or `read failed` in its goal's section) and also exits 3. Exit 3 means partial, not failed: act on what
+   it printed and read the named repos next tick. Each `resume` line it prints is stage
    work another brain yielded (Handing off stage work): finish those items
    first, before measuring anything or starting new work, under the same
    rules as the steps below (a merge still needs a ready pull request).
@@ -436,6 +485,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
    `- Audit: OWNER/NAME#N proof by LANE/MODEL: pass|fail, what was re-read`.
+   An audit line about a merge or a close comes from the output of
+   `python3 -m bus.brain audit-close OWNER/NAME#N`, with the cited hash, the
+   merge commit and whether the default branch has it (docs/BRAIN.md, Close
+   audits); comments alone prove nothing.
 5. First run `python3 -m bus.brain step failed --holder muse`. Handle `loom:failed` tickets. Start with each repo's "Past the last rung"
    section in `status`: the failed tickets that ran on all three rungs, oldest
    first, each with its open pull request, its mergeable state, and each
@@ -495,6 +548,27 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    operator or trusted login) when no such record exists
    (bus/decision_claim.py, loom#2089). A ruling cited from a repo doc
    ("per the operator ruling in docs/MUSE.md") is not refused.
+   Record an answer the operator gave outside the ticket with a line
+   starting `Operator answer YYYY-MM-DD:` and the answer, or a step that is
+   done with `Finished:`; other prose leaves the ask open. The dated line
+   claims a person's decision, so those commands refuse it when no record
+   exists: it is for what the operator said, never for what you expect.
+   Only these two lines count from a `LOOM_ASK_ANSWERERS` login, and each needs
+   words on the line; `Done:` and prose from such a login leave the ask open.
+
+   Tell the operator something needs them only from
+   `python3 -m bus.needs_you`, run in the same turn (`--repo OWNER/NAME` to
+   narrow it). A needs-you item never comes from a `needs:human` count, from
+   a list carried over from an earlier tick, or from a comment read that did
+   not page to the end. Quote the ask verbatim as the command prints it, with
+   its time and the latest comment. Only its "Needs you" section needs a
+   person. "Check first" means a pull request naming the ticket merged after
+   the ask: read it, then record the answer on the ticket, or treat it as
+   needs you. A station verification tag is not a question to a person: the
+   brain or the verify pass takes it. If the command exits 1 its report is
+   incomplete: say so, and never report nothing from it. It prints within
+   40 seconds (`--deadline SECONDS`); a repo or ticket not read by then is
+   listed as unread, and it exits 1.
 7. First run `python3 -m bus.brain step brief --holder muse`. Fill every free lane slot with the highest-ranked work (The brain's job),
    skipping any ticket whose `Not before:` line names a later UTC time (the
    operator asked for it later; the station will not claim it before then,
@@ -646,7 +720,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
      is empty. Read the previous report to fill this in.
    - `Next:` one line, what the brain will do before the next report.
    - Needs you: only what only the operator can do for THIS goal, or
-     "nothing new for this goal". Never a count: this line is what `journal`
+     "nothing new for this goal", from the "Needs you" section of
+     `python3 -m bus.needs_you` run this tick (step 6). Never a count: this line is what `journal`
      compares to tell a new ask from an unchanged one.
    - Waiting on you: the next line, always. Copy it from the "## Waiting on
      you" section of `status`, which fills it from data: "Waiting on you: 28
@@ -702,23 +777,23 @@ on hard work):
   model `spark/...`, any repo, private ones included) when lane status shows
   them available; then on a public repo muse, then agy (muse runs
   remotely); then the free lane, one slot per free provider (`free-ollama`,
-  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`) at its pinned
+  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
   free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
-  opencode-go-4, muse, copilot, free-nvidia, free-kilo and free-groq on public repos only
+  opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
-  are NVIDIA NIM, Kilo and Groq).
+  are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`); then the other free
+  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
   lanes, openrouter and workersai, or on a public repo zen and zai (the
-  operator wants every free tier used up, 2026-10-19); then codex or opencode-go (opencode-go-4 on public repos only); an
+  operator wants every free tier used up, 2026-10-19); then opencode-go (its strong tier; opencode-go-4 on public repos only) or codex; an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (public repos only)
-  or codex, never a free lane. A hard ticket a spark
+- Hard: a spark slot first, then anthropic, claude, agy (public repos only),
+  opencode-go (its strong tier) or codex, never a free lane. A hard ticket a spark
   fails climbs the model ladder. Keep the anthropic slots busy with hard work
   while the credit lasts. Tiers follow the Artificial Analysis Intelligence
   Index: a lane's model goes in the tier its score supports.

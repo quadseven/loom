@@ -104,8 +104,6 @@ class FakeGitHub:
         return None
 
     def _goal_route(self, method, path, body):
-        if path == "/repos/example-owner/project/issues/12/comments?per_page=100":
-            return self.answer(self.comments)
         if path == "/repos/example-owner/project/issues/12/comments" and method == "POST":
             self.comments.append(body)
             return self.answer(body)

@@ -397,6 +397,55 @@ class PullRequests(Base):
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
 
+    def test_moves_are_counted_since_the_last_claim_or_hold(self):
+        def note(at, body, who=ME["login"]):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
+        rung = "<!-- loom:rung 2 -->\nNot a failure (9 tickets wait on lane a): the factory " \
+               "moved this ticket up the model ladder to rung 2, m on lane b."
+        stall = "Not a failure (briefed 3 hours on lane b with no claim): the factory moved " \
+                "this ticket to lane c, in its difficulty tier."
+        climb = "%s\nEscalated to rung 1 of 3: m on lane a." % brain.ESCALATE_MARKER
+        claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, stall), note(3, climb)], [ME["login"]]), 3)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, claim), note(3, climb)], [ME["login"]]), 1)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, rung), note(2, factory.MOVE_CAP_MARKER), note(3, stall)], [ME["login"]]), 1)
+
+    def test_a_strangers_comment_neither_adds_a_move_nor_resets_the_count(self):
+        def note(at, body, who):
+            return {"created_at": "2030-01-01T00:00:%02dZ" % at, "body": body,
+                    "user": {"login": who}}
+        climb = "%s\nEscalated" % brain.ESCALATE_MARKER
+        claim = "Claimed for lane a (body sha256 %s)" % ("0" * 12)
+        self.assertEqual(factory.unclaimed_moves([note(1, climb, "stranger")], [ME["login"]]), 0)
+        self.assertEqual(factory.unclaimed_moves(
+            [note(1, climb, ME["login"]), note(2, claim, "stranger"),
+             note(3, factory.MOVE_CAP_MARKER, "stranger")], [ME["login"]]), 1)
+        self.assertEqual(factory.unclaimed_moves([note(1, "quoted " + climb, ME["login"])], [ME["login"]]), 0)
+
+    def test_a_ticket_moved_to_the_cap_with_no_claim_is_held_for_the_brain(self):
+        """loom#2333: a ticket went between two rungs 13 times with no run."""
+        self.gh.ticket(5, "briefed", lane="claude")
+        self.gh.comments[5] = [{"id": n, "user": ME, "created_at": "2030-01-01T00:00:00Z",
+                                "body": "%s\nmoved" % brain.ESCALATE_MARKER} for n in range(6)]
+        run = factory.Factory.__new__(factory.Factory)
+        run.gh, run.actions, run.trusted = self.gh, 0, {ME["login"]}
+        self.assertTrue(run._move_capped(REPO, self.gh.issues[5], self.gh.comments[5]))
+        names = [x["name"] for x in self.gh.issues[5]["labels"]]
+        self.assertIn("needs-brain", names)
+        self.assertIn(factory.RUNAWAY, names)
+        self.assertTrue(any(factory.MOVE_CAP_MARKER in str(c.get("body"))
+                            for c in self.gh.comments[5]))
+
+    def test_the_move_cap_can_be_turned_off(self):
+        with mock.patch.dict(os.environ, {"LOOM_UNCLAIMED_MOVE_CAP": "0"}):
+            self.assertFalse(brain.past_move_cap(100))
+        with mock.patch.dict(os.environ, {"LOOM_UNCLAIMED_MOVE_CAP": "2"}):
+            self.assertTrue(brain.past_move_cap(2))
+
     def test_a_box_said_to_be_already_in_tree_with_no_code_is_sent_back(self):
         """loom#2333: every box read "not built: already in tree" and it merged."""
         ticket_body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
@@ -3057,12 +3106,36 @@ class Tickets(Base):
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
 
-    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
-        # A ticket that ran every rung is left loom:failed for the brain, but
-        # its open lane pull request is closed so the lane does not stall on it.
+    def test_a_past_ladder_ticket_whose_pull_request_head_is_green_keeps_that_pull_request_open(self):
         self.gh.ticket(7, "failed")
         self.gh.comments[7] += ALL_RUNGS
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+        self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
+
+    def test_a_stuck_ticket_past_the_ladder_with_green_head_keeps_its_pull_request_open(self):
+        self.gh.ticket(5, "pr")
+        self.gh.comments[5] += ALL_RUNGS + [{"body": FIX_ASKED, "user": ME}]
+        self.gh.pull(50, 5, green=True, mergeable=True, resolved=False)
+        self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+        self.assertEqual(self.moved, [(5, "failed", None)])
+
+    def test_a_failed_ticket_past_the_last_rung_closes_its_lane_pull_request(self):
+        # A ticket that ran every rung is left loom:failed for the brain, and
+        # its open lane pull request is closed when its head has a failing check.
+        self.gh.ticket(7, "failed")
+        self.gh.comments[7] += ALL_RUNGS
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual((self.moved, self.fixed), ([], []))
         self.assertEqual(len(self.closed), 1)
@@ -3084,7 +3157,7 @@ class Tickets(Base):
         self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
         self.gh.comments[7] += ALL_RUNGS + [
             {"body": factory.GAVE_UP + " (x; ran on none).", "user": ME}]
-        self.gh.pull(70, 7, resolved=False)
+        self.gh.pull(70, 7, green=False, resolved=False)
         self.go()
         self.assertEqual([c[0] for c in self.closed], [70])
         note = self.closed[0][1]
@@ -3491,8 +3564,8 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
         # Then the free provider slots: on a private repo only the two allowed
         # private code (infra#5617), then codex.
-        self.assertEqual(factory.TIERS["easy"][6:11], factory.FREE_POOL)
-        self.assertEqual(factory.TIERS["medium"][6:11], factory.FREE_POOL)
+        self.assertEqual(factory.TIERS["easy"][6:12], factory.FREE_POOL)
+        self.assertEqual(factory.TIERS["medium"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
                          ("free-ollama", "free-gemma", "openrouter"))
 
@@ -3514,10 +3587,10 @@ class Tickets(Base):
             self.assertLess(medium.index(lane), medium.index("codex"))
         # On a private repo the public-only ones are skipped.
         self.assertEqual(factory.lanes_of("medium", True)[4:9],
-                         ("free-ollama", "free-gemma", "openrouter", "workersai", "codex"))
+                         ("free-ollama", "free-gemma", "openrouter", "workersai", "opencode-go"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
-        for lane in ("free-nvidia", "free-kilo", "free-groq"):
+        for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
             self.assertIn(lane, factory.PUBLIC_ONLY)
         for lane in ("free-ollama", "free-gemma"):
             self.assertNotIn(lane, factory.PUBLIC_ONLY)

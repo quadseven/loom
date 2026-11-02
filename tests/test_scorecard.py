@@ -26,6 +26,7 @@ from bus import factory, scorecard  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from dashboard import views  # noqa: E402
 from test_bus_factory import Base as FactoryBase, iso as factory_iso  # noqa: E402
+from test_bus_factory import NOW as FACTORY_NOW, REPO as FACTORY_REPO  # noqa: E402
 
 AUDIT_AT = scorecard._ts(scorecard.AUDIT_AT)
 NOW = AUDIT_AT + 86400
@@ -33,7 +34,8 @@ REPO = "example-owner/example-app"
 BOT = "grug-tribe"
 LANES_LOGIN = "loom-lanes[bot]"
 # The lanes the audit's damaging verdicts reach at the default threshold of 3.
-DEMOTED_AT_3 = {"claude", "codex", "spark", "opencode-go", "free"}
+# The audit's opencode-go records name their models, which each fall short.
+DEMOTED_AT_3 = {"claude", "codex", "spark", "free"}
 
 
 def iso(at):
@@ -107,6 +109,48 @@ class AuditCounts(unittest.TestCase):
             scorecard.main(["clear", "codex-2", "--state", state])
         self.assertIn("cleared lane codex-2", out.getvalue())
         self.assertNotIn("codex", card(state=state).demoted())
+
+    def test_a_demotion_on_a_picking_lane_binds_to_the_model(self):
+        got = card()
+        got.data["records"] = {
+            "r%d" % i: {"lane": lane, "model": model, "at": NOW - 60, "review": scorecard.BAD_WORK}
+            for i, (lane, model) in enumerate((("opencode-go", "opencode-go/beam-free"),
+                                               ("opencode-go-2", "opencode-go/beam-free"),
+                                               ("opencode-go", "opencode-go/beam-free"),
+                                               ("opencode-go-3", "opencode-go/gpt-6-luna")))}
+        self.assertEqual(quiet(got.demote), ["model:opencode-go/beam-free"])
+        slots = scorecard.demoted_slots(got.demoted(), ["opencode-go", "opencode-go-2", "opencode-go-3"])
+        self.assertEqual(slots, {})
+        self.assertTrue(got.clear("model:opencode-go/beam-free"))
+        self.assertEqual(got.demoted(), {})
+
+    def test_failed_proof_audits_still_demote_a_picking_lane(self):
+        got = card()
+        got.data["audits"] = {"a%d" % i: {"lane": "opencode-go", "at": NOW - 60} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_record_with_no_model_counts_against_a_picking_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "opencode-go", "model": "unknown", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["opencode-go"])
+
+    def test_a_slot_that_does_not_pick_is_still_demoted_by_lane(self):
+        got = card()
+        got.data["records"] = {"r%d" % i: {"lane": "codex", "model": "gpt-6-luna", "at": NOW - 60,
+                                           "review": scorecard.BAD_WORK} for i in range(3)}
+        self.assertEqual(quiet(got.demote), ["codex"])
+
+    def test_the_brief_line_names_demoted_models_or_says_the_card_is_unreadable(self):
+        state = tempfile.mkdtemp()
+        got = card(state=state)
+        self.assertEqual(scorecard.demoted_models_line(got), "none")
+        got.data["demoted"]["model:opencode-go/beam-free"] = {"why": "x"}
+        got.data["demoted"]["codex"] = {"why": "y"}
+        self.assertEqual(scorecard.demoted_models_line(got), "opencode-go/beam-free")
+        with open(os.path.join(state, scorecard.FILE), "w") as out:
+            out.write("{broken")
+        self.assertEqual(scorecard.demoted_models_line(card(state=state)), "unreadable")
 
     def test_demoted_lanes_cover_their_slots(self):
         slots = scorecard.demoted_slots({"codex": "x", "free": "y", "opencode-go": "z"},
@@ -225,7 +269,7 @@ class Table(unittest.TestCase):
         self.assertEqual([r["lane"] for r in views.parse_lane_rows(body)], ["codex"])
         page = views.render_lanes({"lanes": [], "scorecard": rows})
         self.assertIn("Scorecard", page)
-        self.assertIn("5 demoted", page)
+        self.assertIn("4 demoted", page)
         # The demoted lanes come first.
         self.assertIn('<tbody><tr class="scorecard-demoted"><th scope="row">claude', page)
 
@@ -293,6 +337,56 @@ class FactoryStepAside(FactoryBase):
         self.assertNotEqual(self.lane(7), "spark-2")
         self.assertIn("lane spark-2 is demoted (%s; the operator clears it)" % why,
                       self.gh.comments[7][-1]["body"])
+
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n"):
+        self.gh.ticket(number, "queued", body=body)
+        self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
+        self.gh.issues[number]["created_at"] = factory_iso(0)
+
+    def notes(self, number):
+        return "\n".join(str(c.get("body") or "") for c in self.gh.comments[number])
+
+    def test_a_demoted_lane_with_a_fresh_heartbeat_is_never_given_a_queued_ticket(self):
+        # loom#2430: _up read only limited and available, so a demoted lane
+        # with a fresh heartbeat took a queued ticket, and the same pass's
+        # step-aside moved it straight back ("The station gave this queued
+        # ticket lane X" then "Not a failure (lane X is demoted ...)").
+        self.queued(7)
+        first = factory.TIERS["medium"][0]
+        why = "3 bad outcomes in 7 days (1 reverts, 2 failed deploys)"
+        worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
+                                 available=list(factory.TIERS["medium"]),
+                                 demoted={first: why})
+        with mock.patch("bus.factory._say"):
+            worker.assign_queued()
+            worker.run()
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertNotEqual(self.lane(7), first)
+        self.assertIn("The station gave this queued ticket lane %s" % self.lane(7), self.notes(7))
+        self.assertNotIn("is demoted", self.notes(7))
+
+    def test_a_queued_ticket_whose_only_up_lane_is_demoted_waits(self):
+        self.queued(7)
+        first = factory.TIERS["medium"][0]
+        worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
+                                 available=[first], demoted={first: "bad work"})
+        with mock.patch("bus.factory._say"):
+            worker.assign_queued()
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertNotIn("lane:" + first, [x["name"] for x in self.gh.issues[7]["labels"]])
+
+    def test_a_step_aside_never_moves_a_ticket_onto_a_demoted_lane(self):
+        # The tier move off a limited lane skipped only limited and
+        # unavailable lanes: it picked the demoted one, which bounced it on.
+        self.gh.ticket(7, "briefed", lane="codex", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": factory_iso(60)}]
+        first = factory.TIERS["medium"][0]
+        with mock.patch("bus.factory._say"):
+            self.go(limited=["codex"], demoted={first: "bad work"},
+                    available=list(factory.TIERS["medium"]))
+        self.assertNotIn(self.lane(7), (first, "codex"))
+        self.assertNotIn("is demoted", self.notes(7))
 
 
 if __name__ == "__main__":

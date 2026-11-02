@@ -80,6 +80,7 @@ LOOM_FREE_KILO_URL="${LOOM_FREE_KILO_URL:-}"
 LOOM_FREE_KILO_MODEL="${LOOM_FREE_KILO_MODEL:-free/kilo}"
 LOOM_FREE_GROQ_URL="${LOOM_FREE_GROQ_URL:-}"
 LOOM_FREE_GROQ_MODEL="${LOOM_FREE_GROQ_MODEL:-free/groq}"
+LOOM_FREE_OPENROUTER_MODEL="${LOOM_FREE_OPENROUTER_MODEL:-free/openrouter}"
 LOOM_FREE_CONTEXT="${LOOM_FREE_CONTEXT:-120000}"
 LOOM_FREE_OUTPUT="${LOOM_FREE_OUTPUT:-16384}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
@@ -89,7 +90,7 @@ LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CODEX_ONLY_MODEL LOOM_AGY_ONLY_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_AGY_EFFORT LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
-  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
+  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_OPENROUTER_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -176,18 +177,23 @@ if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
 fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
-# LOOM_TRUSTED_BRIEFERS is kept nowhere but the installed plists, so a reinstall
-# that leaves it unset keeps the station plist's list instead of silently
-# dropping every trusted login. Setting it, even to empty, replaces the list.
-if [ -z "${LOOM_TRUSTED_BRIEFERS+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ]; then
-  LOOM_TRUSTED_BRIEFERS="$(python3 -B -c '
+# These login lists are kept nowhere but the installed plists, so a reinstall
+# that leaves one unset keeps the station plist's list instead of silently
+# dropping every login. Setting one, even to empty, replaces the list.
+keep_installed() {
+  local value
+  [ -z "${!1+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ] || return 0
+  value="$(python3 -B -c '
 import plistlib, sys
 with open(sys.argv[1], "rb") as plist:
-    print(plistlib.load(plist).get("EnvironmentVariables", {}).get("LOOM_TRUSTED_BRIEFERS", ""))
-' "$AGENTS/com.loom.station.plist")" ||
-    { echo "cannot read LOOM_TRUSTED_BRIEFERS from $AGENTS/com.loom.station.plist: set it in the environment" >&2; exit 1; }
-  export LOOM_TRUSTED_BRIEFERS
-fi
+    print(plistlib.load(plist).get("EnvironmentVariables", {}).get(sys.argv[2], ""))
+' "$AGENTS/com.loom.station.plist" "$1")" ||
+    { echo "cannot read $1 from $AGENTS/com.loom.station.plist: set it in the environment" >&2; exit 1; }
+  export "$1=$value"
+}
+keep_installed LOOM_TRUSTED_BRIEFERS
+keep_installed LOOM_BRIEF_AUTHORS
+keep_installed LOOM_ASK_ANSWERERS
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
@@ -324,10 +330,14 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default: the
-# installed station plist's value, else empty) names another operator's logins whose loom:ticket briefs it builds without
-# adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
-# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
+# with LOOM_REPOS empty it stays idle. LOOM_BRIEF_AUTHORS defaults to the
+# installed station plist's value, else empty. LOOM_TRUSTED_BRIEFERS (same
+# default) names another operator's logins whose loom:ticket briefs it builds without
+# adopting their claims (docs/LANES.md, Trusted briefers). LOOM_ASK_ANSWERERS
+# (same default) names logins whose two answer lines clear an ask (docs/LANES.md,
+# Ask answerers). It also reads LOOM_STATUS_REPO (default:
+# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_BRAIN_BACKUP_HOLDERS
+# (brain holders each judged on their own journal ticks), LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
@@ -420,6 +430,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
+    <key>LOOM_ASK_ANSWERERS</key><string>$(xml "${LOOM_ASK_ANSWERERS:-}")</string>
     <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
     <key>LOOM_NO_LANE_REROUTE</key><string>$(xml "${LOOM_NO_LANE_REROUTE:-}")</string>
     <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
@@ -442,6 +453,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_CLAIM_REFEREE</key><string>$(xml "${LOOM_CLAIM_REFEREE:-}")</string>
     <key>LOOM_ENGINE_CLAIMS</key><string>$(xml "${LOOM_ENGINE_CLAIMS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
+    <key>LOOM_BRAIN_BACKUP_HOLDERS</key><string>$(xml "${LOOM_BRAIN_BACKUP_HOLDERS:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
@@ -494,7 +506,7 @@ echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bu
 # (default 1800), take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_TRUSTED_BRIEFERS,
+# LOOM_TRUSTED_BRIEFERS, LOOM_ASK_ANSWERERS,
 # LOOM_AWS_REGION, LOOM_BRAIN_*, the rungs' LOOM_CODEX_MODEL,
 # LOOM_SPARK_MODEL and LOOM_SPARK_URL, and LOOM_TRANSCRIPT_URL and
 # LOOM_TRANSCRIPT_TOKEN_SSM (for the handoff packet) from the installing

@@ -918,6 +918,90 @@ class SettledSubjectTest(StationBase):
                       filed["body"])
 
 
+class SettleBeforeFilingTest(StationBase):
+    """loom#2451: four epic-over-cap issues named closed epics of another
+    public repo and stayed open for days. The station read those epics
+    closed, so its settled callback had the answer, but each pass that could
+    write spent its WRITES_MAX writes on other invariants first and returned
+    before the settle step ran. The callback here is the station's own, over
+    the goal shape the station builds for the other repo."""
+
+    HOME = 64
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.gh.private = set()
+        self.gh.issues[GOAL] = {"number": GOAL, "id": 9000 + GOAL, "state": "open",
+                                "title": "Goal", "labels": [{"name": "loom:goal"}], "body": ""}
+        self.station = station.Station(self.gh, self.settings, now=T0)
+        self.station._invariant_repo = REPO
+
+    def far_epics(self, state, numbers=(35,)):
+        """Epics of the other repo, under its goal home, each holding 22
+        closed tickets; the facts carry the shape the station builds."""
+        self.gh.subs[(OTHER, self.HOME)] = [
+            dict(epic(n, state=state), body="Part of #%d" % self.HOME) for n in numbers]
+        for n in numbers:
+            self.gh.subs[(OTHER, n)] = [ticket(100 + i, state="closed") for i in range(22)]
+        self.gh.tickets[OTHER] = []
+        facts = Facts(T0)
+        facts.shapes = [self.station._goal_shape(OTHER, {
+            "number": self.HOME, "title": "Goal: other", "body": "",
+            "labels": [{"name": "loom:goal"}]})]
+        return facts
+
+    def report(self, number, far):
+        """A per-violation issue as the station filed it, naming the epic
+        only in its text: no subject in the marker, no station map entry."""
+        key = invariants.Breach("epic-over-cap", "%s#%d" % (OTHER, far), "t", (), T0).key
+        self.gh.issues[number] = {
+            "number": number, "id": 9000 + number, "state": "open", "closed_at": None,
+            "title": "Epic issue %d of %s holds 26 tickets (cap 15)" % (far, OTHER),
+            "body": "%s\nEvidence:\n- Epic issue %d of %s of goal home issue %d of %s holds "
+                    "26 tickets\n\nPart of #%d" % (invariants.MARKER % key, far, OTHER,
+                                                   self.HOME, OTHER, GOAL),
+            "labels": [{"name": n} for n in ("loom:invariant", "awaiting-live-check")]}
+        return self.gh.issues[number]
+
+    def others(self, tag):
+        """Enough unrelated breaches to spend every write of a pass."""
+        return [invariants.Breach("goal-full", "x/%s#%d" % (tag, n), "Goal %s %d is full" % (
+            tag, n), ("line",), T0) for n in range(invariants.WRITES_MAX)]
+
+    def run_filer(self, facts, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, {}, now, self.said.append,
+                         settled=lambda inv, subject: self.station._invariant_settled(
+                             facts, inv, subject)).run(breaches)
+
+    def test_a_closed_epic_of_another_repo_settles_its_report_while_filing_spends_the_writes(self):
+        facts = self.far_epics("closed")
+        filed = self.report(90, 35)
+        self.run_filer(facts, self.others("a"))
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertEqual(filed["state_reason"], "not_planned")
+        self.assertIn("epic issue 35 of %s is closed" % OTHER, filed["body"])
+        self.assertTrue(any("closed settled" in line for line in self.said), self.said)
+
+    def test_the_reports_drain_while_every_pass_files_something_else(self):
+        far = (35, 88, 141, 46)
+        facts = self.far_epics("closed", far)
+        reports = [self.report(90 + i, n) for i, n in enumerate(far)]
+        # FOLD_MAX closes a pass: two passes settle all four.
+        for n in range(2):
+            self.run_filer(facts, self.others("p%d" % n), T0 + n * invariants.CHECK_EVERY)
+        self.assertEqual([r["state"] for r in reports], ["closed"] * len(far), self.said)
+
+    def test_an_open_epic_of_another_repo_keeps_its_report_open(self):
+        facts = self.far_epics("open")
+        filed = self.report(90, 35)
+        self.run_filer(facts, self.others("a"))
+        self.assertEqual(filed["state"], "open")
+        self.assertFalse(any("closed settled" in line for line in self.said), self.said)
+
+
 class FilerTest(unittest.TestCase):
     def setUp(self):
         self.gh = FakeGH()
@@ -1565,6 +1649,67 @@ class InvariantTest(unittest.TestCase):
             with self.subTest(shape):
                 self.assertEqual(invariants.lane_pr_stalled(
                     Facts(T0, lane_pulls=[self.pull(T0 - 25 * 3600, **shape)])), [])
+
+
+
+class ReviewDebtTest(unittest.TestCase):
+    def setUp(self):
+        self.gh, self.state, self.said = FakeGH(), {}, []
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_filer(self, facts, now):
+        found = invariants.check(facts, self.said.append)
+        invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append).run(found)
+
+    def mine(self):
+        return [i for i in self.gh.issues.values() if "review-overdue" in i.get("body", "")]
+
+    def comments(self):
+        return [w for w in self.gh.writes if w[0] == "POST" and w[1].endswith("/comments")]
+
+    def test_no_review_in_eight_days_raises_one_finding_and_a_second_pass_adds_no_comment(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        self.assertEqual(len(self.mine()), 1)
+        self.assertEqual(self.mine()[0]["state"], "open")
+        self.assertIn("8 days", self.mine()[0]["title"])
+        before = len(self.comments())
+        self.run_filer(Facts(T0 + 300, review_at=T0 - 8 * DAY_S), T0 + 300)
+        self.assertEqual(len(self.mine()), 1)
+        self.assertEqual(len(self.comments()), before)
+
+    def test_seven_days_is_on_time_and_not_read_is_no_finding(self):
+        self.assertEqual(invariants.review_overdue(Facts(T0, review_at=T0 - 7 * DAY_S)), [])
+        self.assertEqual(invariants.review_overdue(Facts(T0)), [])
+
+    def test_a_new_review_clears_the_finding(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        later = T0 + invariants.CLEAR_AFTER + 300
+        self.run_filer(Facts(later, review_at=later - 60), later)
+        self.assertEqual(self.mine()[0]["state"], "closed")
+
+    def test_a_second_lapse_reports_again(self):
+        self.run_filer(Facts(T0, review_at=T0 - 8 * DAY_S), T0)
+        later = T0 + invariants.CLEAR_AFTER + 300
+        self.run_filer(Facts(later, review_at=later - 60), later)
+        again = later + 8 * DAY_S
+        self.run_filer(Facts(again, review_at=later - 60), again)
+        self.assertEqual(self.mine()[0]["state"], "open")
+
+    def test_a_guard_that_stays_unreadable_is_its_own_finding(self):
+        (found,) = invariants.guard_unreadable(Facts(T0, guards_unreadable=[3]))
+        self.assertEqual(found.invariant, "guard-unreadable")
+        self.assertTrue(found.rolling)
+        self.assertEqual(invariants.guard_unreadable(Facts(T0, guards_unreadable=[])), [])
+        self.assertEqual(invariants.guard_unreadable(Facts(T0)), [])
+
+    def test_a_guard_closed_with_no_check_is_one_rolling_finding(self):
+        (found,) = invariants.guard_no_check(Facts(T0, guards_no_check=[3, 4]))
+        self.assertTrue(found.rolling)
+        self.assertIn("#3", " ".join(found.evidence))
+        self.assertEqual(invariants.guard_no_check(Facts(T0, guards_no_check=[])), [])
+        self.assertEqual(invariants.guard_no_check(Facts(T0)), [])
 
 
 if __name__ == "__main__":

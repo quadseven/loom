@@ -54,6 +54,7 @@ from . import brain
 from . import journal
 from . import naming
 from . import notify
+from . import review_debt
 from . import shadow
 from . import text as _text
 from . import watch
@@ -148,6 +149,9 @@ TICKETS_SUBJECT = "every ticket"
 # The one subject of the rolling roll-pin-off breach: each goal home that
 # ships by roll with no roll ship document is a line in one issue.
 ROLL_SUBJECT = "every roll goal"
+REVIEW_SUBJECT = "the Loom review duty"
+GUARD_SUBJECT = "every guard ticket"
+GUARD_UNREAD_SUBJECT = "every unreadable guard ticket"
 # The one subject of the rolling merged-not-shipped breach: each ticket still
 # at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule found its commit
 # deployed is a line in one issue (loom#2025).
@@ -179,9 +183,9 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # closed, an epic back at its cap. The filer keeps each breach's subject in
 # its local state and, once the breach is gone, asks the caller's settled()
 # whether the subject itself settled; one that did closes its issue on that
-# pass, before any other clear, whatever labels it carries (loom#2022: five
-# lane-pr-stalled issues stayed open up to a day after their pull requests
-# merged or closed, and an operator closed them by hand).
+# pass, before filing or any other clear, whatever labels it carries
+# (loom#2022: five lane-pr-stalled issues stayed open up to a day after their
+# pull requests merged or closed, and an operator closed them by hand).
 SETTLES = ("lane-pr-stalled", "epic-over-cap")
 # Invariants that restate state the pull request, the epic or the dashboard
 # already shows: one tracking issue per (kind, subject repo), its list edited
@@ -414,6 +418,11 @@ class Facts:
     # pass (one repo's open pull requests answered an error): their tracking
     # issues are left as they are.
     unread: Optional[Dict[str, Tuple[str, ...]]] = None
+    # The newest Loom review journal the station knows of, and the guard
+    # tickets closed with no check (bus/review_debt.py).
+    review_at: Optional[float] = None
+    guards_no_check: Optional[List[int]] = None
+    guards_unreadable: Optional[List[int]] = None
 
 
 @dataclass(frozen=True)
@@ -1015,6 +1024,47 @@ def roll_pin_off(f: Facts) -> List[Breach]:
                    f.now, rolling=True)]
 
 
+def review_overdue(f: Facts) -> List[Breach]:
+    """The Loom review duty has no journal entry for over a week. The age is
+    in whole days, so the issue is rewritten at most once a day."""
+    if f.review_at is None or f.now - f.review_at <= review_debt.OVERDUE:
+        return []
+    days = int((f.now - f.review_at) // DAY)
+    return [Breach("review-overdue", REVIEW_SUBJECT,
+                   "No Loom review journal for %d days" % days,
+                   ("The goal asks for a routine Loom review; this goal home holds no entry "
+                    "since %s" % utc(f.review_at),
+                    "Run the review as a journal entry whose first line starts "
+                    "\"Loom review\"; the next station pass clears this"),
+                   # When it became overdue: a closed issue reopens only for a
+                   # breach after its close, and the review itself came before.
+                   f.review_at + review_debt.OVERDUE, rolling=True)]
+
+
+def guard_no_check(f: Facts) -> List[Breach]:
+    """Guard tickets closed with no merged pull request that changed a test."""
+    if not f.guards_no_check:
+        return []
+    return [Breach("guard-no-check", GUARD_SUBJECT,
+                   "%d guard tickets closed with no check" % len(f.guards_no_check),
+                   ("Closed with no merged pull request that names them and changes a test "
+                    "file: %s" % ", ".join("#%d" % n for n in f.guards_no_check),
+                    "Reopen each one and ship its test"),
+                   f.now, rolling=True)]
+
+
+def guard_unreadable(f: Facts) -> List[Breach]:
+    """Guard tickets whose pull requests stayed unreadable, try after try."""
+    if not f.guards_unreadable:
+        return []
+    return [Breach("guard-unreadable", GUARD_UNREAD_SUBJECT,
+                   "%d guard tickets cannot be read" % len(f.guards_unreadable),
+                   ("Not read after %d tries: %s" % (review_debt.GUARD_TRIES, ", ".join(
+                       "#%d" % n for n in f.guards_unreadable)),
+                    "Their state is unknown, so the guard count says unknown"),
+                   f.now, rolling=True)]
+
+
 def merged_not_shipped(f: Facts) -> List[Breach]:
     """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
     found their merge commit deployed: the move to loom:shipped failed, and
@@ -1104,7 +1154,8 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     ticket_outside_epic, epic_over_cap, goal_epics_over_cap, closed_epic_open_tickets,
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
-    untrusted_labeler, roll_pin_off, merged_not_shipped)
+    untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
+    guard_unreadable)
 
 
 def check(facts: Facts, say: Say,
@@ -1255,6 +1306,9 @@ class Filer:
         self._texts: Dict[str, str] = {}
         # Tracking issue -> older issues closed into it this pass.
         self._folded: Dict[int, int] = {}
+        # (key, number) of each older issue settled this pass, not yet
+        # counted against its tracking issue.
+        self._unrolled: List[Tuple[str, int]] = []
         self._listed: Optional[Dict[str, int]] = None
         # Issue numbers the listing found closed: clearing skips them unread.
         self._listed_closed: set = set()
@@ -1700,9 +1754,11 @@ class Filer:
         """Close the open issue of each gone SETTLES breach whose subject
         settled for good, its note at the foot of the body. Walks the listing,
         not the local map, so a breach filed before the map or gone while the
-        station was down settles too. Runs before the other clears, so a pass
-        short of writes still spends them here first, and reads no comments
-        (a deferred comment read stopped the whole clear)."""
+        station was down settles too. run() calls it before filing anything,
+        so the pass's writes go here first (loom#2451: filing spent them every
+        pass that could write, and four issues about closed epics stayed open
+        for days), and it reads no comments (a deferred comment read stopped
+        the whole clear)."""
         listing = self._listing()
         for key in list(self.subjects):
             if listing.get(key) is None or listing[key] in self._listed_closed:
@@ -1767,14 +1823,19 @@ class Filer:
         self.writes += 1
         self.folds += 1
         self._listed_closed.add(number)
-        into = self._rolled_into(key, current)
-        if into is not None and into != number:
-            self._folded[into] = self._folded.get(into, 0) + 1
+        # Counted against its tracking issue once filing has found which
+        # are open: the settle step closes before filing runs.
+        self._unrolled.append((key, number))
         return True
 
-    def _summarize_folds(self) -> None:
+    def _summarize_folds(self, current: Dict[str, Breach]) -> None:
         """One comment per tracking issue counts the older issues closed into
         it, edited in place as the count grows."""
+        for key, closed in self._unrolled:
+            into = self._rolled_into(key, current)
+            if into is not None and into != closed:
+                self._folded[into] = self._folded.get(into, 0) + 1
+        self._unrolled = []
         for number, count in self._folded.items():
             mine = [c for c in self._comments(number) if FOLD_MARKER in str(c.get("body", ""))]
             m = FOLD_COUNT_RE.search(str(mine[-1].get("body", ""))) if mine else None
@@ -1793,10 +1854,9 @@ class Filer:
 
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
         try:
-            self._settle(current)
             self._clear_gone(current)
         finally:
-            self._summarize_folds()
+            self._summarize_folds(current)
 
     def _clear_gone(self, current: Dict[str, Breach]) -> None:
         for key, number in self._listing().items():
@@ -2022,18 +2082,25 @@ class Filer:
         for b in current.values():
             if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
+        if not self.write:
+            return
+        # Settle first: it closes at most FOLD_MAX issues a pass, and filing
+        # below can spend every write (loom#2451).
+        try:
+            self._settle(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close settled issues: %s" % err)
         for b in current.values():
-            if not self.write or self.writes >= WRITES_MAX:
-                return
+            if self.writes >= WRITES_MAX:
+                break
             try:
                 self._one(b)
             except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
                 self.say("invariants: could not file %s (%s): %s" % (b.invariant, b.title, err))
-        if self.write and self.writes < WRITES_MAX:
-            try:
-                self._clear_stale(current)
-            except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
-                self.say("invariants: could not close cleared issues: %s" % err)
+        try:
+            self._clear_stale(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close cleared issues: %s" % err)
 
 
 def load(path: str, say: Say) -> Dict[str, Any]:
