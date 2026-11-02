@@ -348,7 +348,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    your last lock attempt only: when you run it again (a retry, a second
    `--wait`), the earlier attempt's `lock held by` line is superseded, so
    never post a stand-down from it; a later `lock acquired` line means you
-   hold the lock and the tick runs. The lock outlives the
+   hold the lock and the tick runs. Your 30-minute lock outlives your
    25-minute tick, so no other brain takes it mid-tick. Muse's ticks start
    at :10 and :40 past the hour; the lane machine's tick starts at :25 and
    :55 and its lock expires by your next start (loom#2469), so a lane hold
