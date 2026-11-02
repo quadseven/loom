@@ -522,10 +522,14 @@ head or one of its ancestors (any case), or the answer cites files and lines
 the head has and, when it names backticked symbols, at least one of them is
 there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing
-checkable stays open. Any other answered thread stays open, and the factory
+checkable stays open. The check reads the lane's own text before
+redaction, which drops any 32-character word such as a long test name; a
+reply whose answer held carries a `loom:answer-held` mark for that head
+(loom#2285). Any other answered thread stays open, and the factory
 reads it as a finding that survived. The brain's merge re-checks every bot
-thread resolved on a lane answer the same way, and reopens it and refuses
-the merge when the answer does not hold. The refusal posts one comment on
+thread resolved on a lane answer the same way (a held mark for the same
+head stands for the check), and reopens it and refuses the merge when the
+answer does not hold. The refusal posts one comment on
 the pull request per thread and head, marked
 `<!-- loom:rebuttal-refused v1 thread=<id> head=<sha> -->`, that quotes the
 answer, lists what it cites and says what the head showed; the refusal the

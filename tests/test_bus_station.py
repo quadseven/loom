@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import urgency  # noqa: E402
+from bus import rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -7853,6 +7853,23 @@ class AnswerTest(Base):
         self.assertIn("> The guard on a.py:2 returns before x is read.", body)
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
         self.assertFalse(os.path.exists(self.inbox("codex", "answers", name)))
+
+    def test_an_answer_citing_a_long_test_name_is_checked_before_redaction(self):
+        # loom#2285: the posted quote redacts the 32-character name, so the
+        # check reads the lane's own text and the reply carries the held mark.
+        name = "test_the_guard_returns_before_the_attribute_is_read"
+        self.fake.head_files["tests/test_a.py"] = "def %s():\n    pass\n" % name
+        self.thread()
+        self.finish({"PRRT_abcd1": "`%s` in tests/test_a.py covers it." % name})
+        body = self.fake.replies[0][1]
+        self.assertNotIn(name, body)
+        self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+        self.assertTrue(rebuttal.marked_held(body, "f" * 40))
+
+    def test_an_answer_that_does_not_hold_carries_no_held_mark(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
+        self.assertFalse(rebuttal.marked_held(self.fake.replies[0][1], "f" * 40))
 
     def test_an_answer_on_a_no_change_round_is_posted_too(self):
         self.thread()
