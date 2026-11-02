@@ -30,6 +30,41 @@ class VacuousTests(unittest.TestCase):
         patch = "@@\n-EXPECTED = {'x': 0}\n+EXPECTED = {'x': 1}\n"
         self.assertEqual(vacuous.fixture_users(tests, patch), ["test_uses_expected"])
 
+    def test_new_test_class_locals_and_keywords_are_not_changed_fixtures(self):
+        tests = ("class Existing(unittest.TestCase):\n"
+                 " def test_cat(self): self.assertTrue(cat)\n"
+                 " def test_title(self): self.assertTrue(title)\n"
+                 "class NewTests(unittest.TestCase):\n"
+                 " def test_first(self):\n  cat = world()\n  p = plan(title=\"x\")\n"
+                 " def test_second(self):\n  member = world(title=\"y\")\n")
+        patch = ("@@ -3,0 +4,6 @@\n+class NewTests(unittest.TestCase):\n"
+                 "+ def test_first(self):\n+  cat = world()\n+  p = plan(title=\"x\")\n"
+                 "+ def test_second(self):\n+  member = world(title=\"y\")\n")
+        self.assertEqual(vacuous.changed_test_names("tests/test_sample.py", tests, patch), [
+            "tests.test_sample.NewTests.test_first",
+            "tests.test_sample.NewTests.test_second",
+        ])
+
+    def test_changed_module_helper_and_class_attribute_find_fixture_users(self):
+        tests = ("ROWS = []\n"
+                 "def world(): return {}\n"
+                 "class Fixtures:\n VALUE = 1\n"
+                 "def test_rows(): assert ROWS\n"
+                 "def test_world(): assert world()\n"
+                 "def test_value(): assert Fixtures.VALUE\n"
+                 "def test_other(): assert True\n")
+        patch = ("@@ -1 +1 @@\n-ROWS = [0]\n+ROWS = [1]\n"
+                 "@@ -3,2 +3,2 @@\n-class Fixtures:\n- VALUE = 0\n"
+                 "+class Fixtures:\n+ VALUE = 1\n")
+        self.assertEqual(vacuous.fixture_users(tests, patch), [
+            "test_rows", "test_value",
+        ])
+
+    def test_changed_module_helper_definition_names_its_users(self):
+        tests = "def world(): return {}\ndef test_world(): assert world()\ndef test_other(): pass\n"
+        patch = "@@ -1 +1 @@\n-def world(): return None\n+def world(): return {}\n"
+        self.assertEqual(vacuous.fixture_users(tests, patch), ["test_world"])
+
     def test_ticket_request_for_fixture_changes_exempts_fixture_finding(self):
         tests = "EXPECTED = {'x': 1}\ndef test_expected():\n assert EXPECTED\n"
         finding = vacuous.diff_findings(

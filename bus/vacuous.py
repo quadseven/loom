@@ -102,33 +102,63 @@ def container_lookup_overrides(source: str, patch: str = "") -> List[str]:
     return sorted(found)
 
 
-def _changed_identifiers(patch: str) -> Set[str]:
-    changed = set()
-    lines = patch.splitlines()
-    for index, line in enumerate(lines):
-        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
-            continue
-        text = line[1:]
-        match = re.match(r"\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", text)
-        if not match:
-            match = re.match(r"\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=", text)
-        if match:
-            changed.add(match.group(1))
-        if line[0] in "+-":
-            for context in reversed(lines[max(0, index - 8):index]):
-                if context.startswith("@@"):
-                    break
-                if context.startswith(" "):
-                    assignment = re.match(r"\s+([A-Za-z_]\w*)\s*=\s*[\[{(]", context)
-                    if assignment:
-                        changed.add(assignment.group(1))
-                        break
+def _target_names(target: ast.AST) -> Set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return set().union(*(_target_names(item) for item in target.elts))
+    return set()
+
+
+def _changed_identifiers(patch: str, source: str = "") -> Set[str]:
+    """Return changed names declared at module or non-test class scope."""
+    if not source:
+        return set()
+    changed_lines = _added_lines(patch)
+    if not changed_lines or 0 in changed_lines:
+        added_text = [line[1:].strip() for line in patch.splitlines()
+                      if line.startswith("+") and not line.startswith("+++")]
+        changed_lines = {index for index, line in enumerate(source.splitlines(), 1)
+                         if line.strip() in added_text}
+    if not changed_lines:
+        return set()
+    tree = ast.parse(source)
+    changed: Set[str] = set()
+
+    def overlaps(node: ast.AST) -> bool:
+        return any(getattr(node, "lineno", 0) <= line <=
+                   getattr(node, "end_lineno", getattr(node, "lineno", 0))
+                   for line in changed_lines)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            is_test_class = isinstance(node, ast.ClassDef) and any(
+                isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and member.name.startswith("test") for member in node.body)
+            is_test_function = isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("test")
+            if overlaps(node) and not (is_test_class or is_test_function):
+                changed.add(node.name)
+            if isinstance(node, ast.ClassDef) and not is_test_class:
+                for member in node.body:
+                    if not overlaps(member):
+                        continue
+                    if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        changed.add(member.name)
+                    elif isinstance(member, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        targets = member.targets if isinstance(member, ast.Assign) else [member.target]
+                        for target in targets:
+                            changed.update(_target_names(target))
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and overlaps(node):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                changed.update(_target_names(target))
     return changed
 
 
 def fixture_users(test_source: str, patch: str) -> List[str]:
     """Tests whose source references a fixture or table changed in the patch."""
-    changed = _changed_identifiers(patch)
+    changed = _changed_identifiers(patch, test_source)
     if not changed:
         return []
     tree = ast.parse(test_source)
