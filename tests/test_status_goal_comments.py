@@ -32,7 +32,8 @@ PINNED_QUERY = (
     'query { repository(owner:"example-owner", name:"example-repo") {'
     " p7: pullRequest(number:7) {"
     " commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
-    " reviews(last:100) { nodes { author { __typename login } state submittedAt } }"
+    " reviews(last:100) { nodes { author { __typename login }"
+    " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     " comments(last:100) { totalCount nodes { databaseId url createdAt body"

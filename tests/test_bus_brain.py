@@ -972,6 +972,20 @@ class SensitiveResumeTests(unittest.TestCase):
                          "blocked: changes requested by a person (a-person), "
                          "changes requested by a person (reviewer-one)")
 
+    def test_merge_ready_ignores_a_change_request_from_someone_who_cannot_push(self):
+        outsider = dict(self._person_review("CHANGES_REQUESTED", "09:00", "outside-user"),
+                        authorCanPushToRepository=False)
+        self.assertEqual(brain.merge_ready(ready_node(reviews=[outsider]), "grug-tribe"), "READY")
+        maintainer = dict(self._person_review("CHANGES_REQUESTED", "09:00"),
+                          authorCanPushToRepository=True)
+        self.assertEqual(brain.merge_ready(ready_node(reviews=[outsider, maintainer]), "grug-tribe"),
+                         "blocked: changes requested by a person (reviewer-one)")
+        # An old payload without the field still blocks: it fails closed.
+        self.assertEqual(brain.merge_ready(ready_node(reviews=[self._person_review(
+            "CHANGES_REQUESTED", "09:00")]), "grug-tribe"),
+            "blocked: changes requested by a person (reviewer-one)")
+        self.assertIn("authorCanPushToRepository", brain.READY_FIELDS)
+
     def test_merge_ready_clears_a_person_request_on_dismissal_or_later_approval(self):
         # GitHub turns a dismissed review itself into DISMISSED.
         dismissed = ready_node(reviews=[self._person_review("DISMISSED", "09:00")])
@@ -1596,8 +1610,8 @@ class SensitiveResumeTests(unittest.TestCase):
         sent = []
         gh = types.SimpleNamespace(graphql=lambda query: sent.append(query) or {})
         brain._pr_graphql(gh, REPO, 8)
-        self.assertIn("reviews(last:100) { nodes { author { __typename login } state submittedAt } }",
-                      sent[0])
+        self.assertIn("reviews(last:100) { nodes { author { __typename login }"
+                      " authorCanPushToRepository state submittedAt } }", sent[0])
         self.assertEqual(sent[0].count("{"), sent[0].count("}"))
 
     def test_goal_constraints_scan_until_first_heading(self):
