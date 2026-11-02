@@ -186,6 +186,9 @@ stop_orphaned_agent() {
 if ! mkdir "$LOCK" 2>/dev/null; then
   if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
   stop_orphaned_agent "$(cat "$LOCK/pgid" 2>/dev/null || true)"
+  # The agent's watchdog and its tail reader run in a group of their own; a
+  # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
+  stop_orphaned_agent "$(cat "$LOCK/watchdog_pgid" 2>/dev/null || true)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -3338,13 +3341,21 @@ Do not search the whole filesystem (for example, find /). Search within the chec
 
 # A watchdog for the running agent wrapper: tails the run log through
 # provider_text, and stops the agent early on a terminal limit line
-# (AI_RetryError after limit text, not a single retryable 429).
+# (AI_RetryError after limit text, not a single retryable 429). Only limit
+# text arms the kill: a bare 429 is retried by the CLI, and a later
+# AI_RetryError may come from another fault (loom#2401). The tail reader is
+# a job of this function, stopped when it ends, so none outlives the run.
 agent_watchdog() {
-  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line
+  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line tail_pid=""
+  local fifo="$LOCK/watchdog.fifo"
   shopt -s nocasematch
-  tail -c +$((start + 1)) -f "$log" 2>/dev/null | provider_text | while IFS= read -r line; do
+  rm -f "$fifo"; mkfifo "$fifo" || return 0
+  trap 'kill "$tail_pid" 2>/dev/null; rm -f "$fifo"; exit 0' TERM
+  tail -c +$((start + 1)) -f "$log" 2>/dev/null > "$fifo" &
+  tail_pid=$!
+  while IFS= read -r line; do
     if [[ "$line" =~ $LIMIT_RE ]] || [[ "$line" =~ $LIMIT_CODE_RE ]] ||
-       [[ "$line" =~ 429 ]] || [[ "$line" =~ GoUsageLimitError ]]; then
+       [[ "$line" =~ GoUsageLimitError ]]; then
       seen_limit=1
     fi
     if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
@@ -3359,7 +3370,9 @@ agent_watchdog() {
       kill -KILL -- "-$agent" 2>/dev/null || kill -KILL "$agent" 2>/dev/null || true
       break
     fi
-  done
+  done < <(provider_text < "$fifo")
+  kill "$tail_pid" 2>/dev/null || true
+  rm -f "$fifo"
 }
 
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
@@ -3858,6 +3871,7 @@ for BRIEF in "$INBOX"/*.md; do
     echo $agent_pid > "$LOCK/pgid"
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
     watchdog_pid=$!
+    echo $watchdog_pid > "$LOCK/watchdog_pgid"
     wait $agent_pid
     agent_status=$?
     kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
