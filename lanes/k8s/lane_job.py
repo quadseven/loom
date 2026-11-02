@@ -44,6 +44,7 @@ DEFAULT_DENY_SSM = "/infra/leak-scan/deny-list"
 SSM_NAME_RE = re.compile(r"^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 GATEWAY_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 ORIGIN_RE = re.compile(r"^https?://[^/]+")
+FAILED_RE = re.compile(r" failed: \[([a-z]+)\] ")
 # What run_lane.sh gets from the runner's own environment; nothing else
 # passes (no ACTIONS_* token, no GITHUB_TOKEN, no AWS session).
 BASE_ENV = ("PATH", "LANG", "LC_ALL", "TZ", "USER", "LOGNAME", "SHELL", "TERM")
@@ -284,11 +285,43 @@ def lane_env() -> Dict[str, str]:
     return env
 
 
+def image_id() -> str:
+    """A fingerprint of this runner's image: its packages and the tools under
+    /usr/local/bin. A pod cannot read its own image digest, and the station
+    only needs to see that the image changed (Runners._note_image)."""
+    digest = hashlib.sha256()
+    try:
+        out = subprocess.run(["dpkg-query", "-W"], capture_output=True, timeout=60)
+        digest.update(out.stdout)
+    except (OSError, subprocess.SubprocessError):
+        pass  # not a Debian image; the tool list below still fingerprints it
+    try:
+        for entry in sorted(os.scandir("/usr/local/bin"), key=lambda e: e.name):
+            digest.update(("%s %d\n" % (entry.name, entry.stat().st_size)).encode("utf-8"))
+    except OSError:
+        pass  # no such folder here; the package list above stands alone
+    return digest.hexdigest()
+
+
+def failure_class(log: str) -> str:
+    """The class of the run's last classed failure line, "unknown" without
+    one. Only the word: the line's text may name the brief's work, and the
+    job log is public."""
+    try:
+        with open(log, encoding="utf-8", errors="replace") as fh:
+            found = FAILED_RE.findall(fh.read())
+    except OSError:
+        return "unknown"
+    return found[-1] if found else "unknown"
+
+
 def run() -> None:
     """lanes/run_lane.sh <slot> once, on the one brief in the inbox. Its
     output goes to the service log in the sealed report, not to the public
-    job log. The run's outcome is in the report, so its exit status is not
-    the job's."""
+    job log. run_lane.sh's exit status is not the job's: a brief it parks
+    exits 0. The job fails when no agent started (run_lane.sh's .agent-ran
+    mark), so Actions never shows green for a run that did no work; the
+    report steps run either way (loom#2418)."""
     job = _job()
     d = job_dir()
     home = os.path.join(d, "home")
@@ -303,6 +336,12 @@ def run() -> None:
                              env=lane_env(), stdout=out, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL)
     print("run_lane.sh exited %d" % rc)
+    base = os.path.join(home, "logs", job["slot"], job["ticket"])
+    _write(base + ".image", image_id() + "\n", 0o644)
+    if not os.path.exists(base + ".agent-ran"):
+        raise JobError("the agent did not run (%s); the reason is in the sealed report"
+                       % failure_class(base + ".log"))
+    os.remove(base + ".agent-ran")
 
 
 def report_files(home: str, slot: str, ticket: str) -> List[str]:

@@ -1190,7 +1190,7 @@ def _dispatch_get(handler, state):
         return _dispatch_usage(handler, state)
     if path == "/tiers":
         return _dispatch_tiers(handler, state)
-    if path in ("/brain", "/hot-spots"):
+    if path in ("/brain", "/brains", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
     if path == "/fleet":
         return _dispatch_fleet(handler, state)
@@ -1415,7 +1415,15 @@ def _dispatch_brain_hot_spots(handler, state, path):
     from datetime import datetime, timezone
     payload = state.response()
     waits_error = getattr(state, "waits_error", "")
-    if path == "/brain":
+    if path == "/brains":
+        tickets = [row for rows in payload.get("tickets", {}).values() if rows for row in rows]
+        data = brain_view.build_brains(payload.get("brain_step"),
+                                       payload.get("improving", {}).get("journals", []),
+                                       _merge_lane_rows(payload.get("lanes", [])), tickets,
+                                       payload.get("pull_requests", []), payload.get("issue_comments", []),
+                                       datetime.now(timezone.utc))
+        body, title, active = brain_view.render_brains(data), "Brains", "brains"
+    elif path == "/brain":
         data = brain_view.build_brain(payload.get("brain_step"), payload.get("brain_step_error"),
                                       payload.get("improving", {}).get("journals", []),
                                       payload.get("wait_rows"), waits_error)
@@ -1473,10 +1481,18 @@ def _send_dashboard_view(handler, state, path):
     tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
     status = "stale" if payload["stale"] else "live"
     if path == "/improving":
-        source = payload.get("improving", {})
-        data = views.build_improvements(source.get("journals", []), tickets,
-                                        source.get("metrics_comments", []))
-        body = views.render_improving(data)
+        # The background refresh builds this page's data (loom#2248): a
+        # request renders what it holds and makes no read or join of its
+        # own. Before the first read there is nothing to render, so the
+        # page says what is missing and when it arrives, never false zeros.
+        built = payload.get("improving_built")
+        if built is not None:
+            body = views.render_improving(built)
+        else:
+            when = html.escape(_next_refresh_text(payload.get("next_refresh_at")))
+            body = ('<p class="empty-state">Improving data has not been read yet: the tick journals '
+                    'and the daily metrics are missing; the dashboard reads them in the background '
+                    'and they refresh %s.</p>' % when)
         title, active = "Improving", "improving"
     else:
         body = views.render_lanes(_lane_view_data(payload, tickets, state=state))

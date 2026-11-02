@@ -234,7 +234,8 @@ class Claims(unittest.TestCase):
         for said in ("Done by the brain per the operator decision: closed.",
                      "per example-op's decision", "example-op decided to drop it.",
                      "The operator decided.", "operator decision recorded on #5",
-                     "the owner has approved it", "following the owner's ruling"):
+                     "the owner has approved it", "following the owner's ruling",
+                     "Operator answer 2030-01-03: (a)", "Tick note.\nOperator answer 2030-01-03: yes"):
             with self.subTest(said=said):
                 self.assertTrue(decision_claim.claim(said, ["example-op"]))
 

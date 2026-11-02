@@ -94,7 +94,7 @@ class Closes(Case):
         self.assertIn(LABEL, self.fake.names(1))
         self.assertIn("force-close", self.fake.names(1))
         self.assertNotIn("needs:human", self.fake.names(1))
-        said = [c["body"] for c in self.fake.comments[1] if status.is_status(c.get("body"))]
+        said = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertIn("unproven", " ".join(said))
 
     def test_a_neutral_review_check_is_green(self):
@@ -299,7 +299,7 @@ class Shadow(Case):
                 gh.rest("PUT", "/repos/%s/pulls/101/merge" % REPO, {})
             with self.assertRaises(ShadowHeld):
                 gh.rest("PATCH", "/repos/%s/issues/1" % REPO,
-                        {"state": "closed", "labels": ["loom:shipped"]})
+                        {"state": "closed", "labels": ["ready-to-land"]})
             self.assertEqual(self.fake.issues[1]["state"], "open")
             # The named ticket's plain close is the one request that passes.
             self.fake.issues[1]["labels"].append({"name": "force-close"})
@@ -360,6 +360,47 @@ class Guardrail(Case):
         self.assertTrue(any("evidence close paused" in s for s in said), said)
         self.assertIn("1 of 1", self.control("status"))
         self.assertIn("Paused", self.proof_issues()[0]["body"])
+
+    def asks(self):
+        number = self.proof_issues()[0]["number"]
+        return [c for c in self.fake.comments.get(number, []) if "evidence close stopped" in c["body"]]
+
+    def test_a_stop_raises_one_ask_however_many_passes_see_it(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.ticket(2)
+        now = time.time()
+        for step in range(3):
+            self.close_pass(now + step * 300)
+        self.assertEqual(len(self.asks()), 1)
+        number = self.proof_issues()[0]["number"]
+        self.assertIn("needs:human", self.fake.names(number))
+        self.assertIn("resume", self.asks()[0]["body"])
+
+    def test_a_stop_after_a_resume_raises_a_new_ask(self):
+        self.ticket(1)
+        self.close_pass()
+        self.reopen(1)
+        self.close_pass()
+        self.fake.issues[self.proof_issues()[0]["number"]]["labels"] = [
+            {"name": "loom:proof-due"}]
+        self.control("resume")
+        now = time.time() + 60
+        self.fake.issues[1]["state"] = "closed"
+        self.close_pass(now)
+        self.ticket(2)
+        self.close_pass(now + 60)
+        self.reopen(2)
+        self.close_pass(now + 120)
+        self.assertEqual(len(self.asks()), 2)
+
+    def test_an_operators_own_pause_asks_nothing(self):
+        self.ticket(1)
+        self.close_pass()
+        self.control("pause")
+        self.close_pass()
+        self.assertEqual(self.asks(), [])
 
     def test_a_reopen_at_the_limit_does_not_stop_it(self):
         now = time.time()

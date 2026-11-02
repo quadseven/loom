@@ -16,6 +16,20 @@ def actions_run(job, run, name="adapter", conclusion="failure"):
 
 
 class InfraFlake(unittest.TestCase):
+    def test_a_cancelled_unittest_job_at_its_timeout_is_a_timeout_flake(self):
+        run = actions_run(1, 10, "unittest", conclusion="cancelled")
+        run.update(started_at="2026-11-01T00:00:00Z", completed_at="2026-11-01T00:30:16Z")
+        self.assertEqual(flake.failure_kind(run), "timeout")
+
+    def test_an_early_cancelled_unittest_job_is_not_a_timeout(self):
+        run = actions_run(1, 10, "unittest", conclusion="cancelled")
+        run.update(started_at="2026-11-01T00:00:00Z", completed_at="2026-11-01T00:02:00Z")
+        self.assertNotEqual(flake.failure_kind(run), "timeout")
+
+    def test_a_test_failure_remains_a_test_failure(self):
+        run = actions_run(1, 10, "unittest", conclusion="failure")
+        self.assertEqual(flake.failure_kind(run), "failure")
+
     def test_a_setup_or_install_step_timeout_is_a_flake(self):
         self.assertTrue(flake.infra_flake(INSTALL))
         self.assertTrue(flake.infra_flake(
@@ -91,6 +105,11 @@ class FlakyNamesAndRerun(unittest.TestCase):
         run = dict(actions_run(1, 10), output={"title": "x", "summary": INSTALL})
         run.pop("id")
         self.assertEqual(flake.flaky_names(self.gh, REPO, [run]), ["adapter"])
+
+    def test_timeout_cancelled_job_is_rerunnable_without_a_log(self):
+        run = actions_run(1, 10, "unittest", conclusion="cancelled")
+        run.update(started_at="2026-11-01T00:00:00Z", completed_at="2026-11-01T00:30:16Z")
+        self.assertEqual(flake.flaky_names(self.gh, REPO, [run]), ["unittest"])
 
     def test_each_workflow_run_is_rerun_once_and_never_on_its_second_attempt(self):
         runs = [actions_run(1, 10), actions_run(2, 10, "adapter (heads)"),

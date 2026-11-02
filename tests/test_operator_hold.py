@@ -418,6 +418,8 @@ def brain_routes(body, files, patches):
         "/repos/%s/pulls/8" % BRAIN_REPO: pr,
         "/graphql": {"data": {"repository": {"pullRequest": details}}},
         "/repos/%s/issues/9/comments" % BRAIN_REPO: [],
+        # The pull request's own comments: no fleet hold on it (loom#2393).
+        "/repos/%s/issues/8/comments" % BRAIN_REPO: [],
         "/repos/%s/issues/9" % BRAIN_REPO: ticket,
         "/repos/%s/contents/.github/workflows/sync.yml" % BRAIN_REPO: {
             "content": base64.b64encode(SYNC_WORKFLOW.encode()).decode()},
@@ -520,7 +522,8 @@ class BrainMerge(unittest.TestCase):
         routes = {"/repos/%s/issues/9" % BRAIN_REPO: {
                       "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
                   "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": "bus/a.py"}],
-                  "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True}}
+                  "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True},
+                  "/search/issues": {"total_count": 0}}
         lines = brain._pull_request_lines(GitHub("t", transport=Route(routes)), BRAIN_REPO, [pr],
                                           {"prs": {8: node}}, "grug-tribe")
         self.assertIn("blocked: held for the operator", lines[1])

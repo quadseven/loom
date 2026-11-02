@@ -162,6 +162,8 @@ class Base(unittest.TestCase):
             "number": 60, "state": "open", "body": "## What\nx\n",
             "labels": [{"name": n} for n in ("loom:ticket", "loom:pr", "loom:revert")]}
         self.gh.routes["/repos/%s/issues/60/comments" % REPO] = []
+        # The revert pull request's own comments: no fleet hold (loom#2393).
+        self.gh.routes["/repos/%s/issues/77/comments" % REPO] = []
         self.gh.routes["/repos/%s/issues/60/events" % REPO] = [
             {"event": "labeled", "label": {"name": "loom:revert"}, "actor": {"login": labeler}}]
         self.gh.routes["/repos/%s/compare/%s...main" % (REPO, MERGED)] = {"status": "ahead"}

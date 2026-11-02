@@ -293,6 +293,17 @@ def run(check: Check, gh: Any,
     return ok, seen + found
 
 
+# How the verification ask opens. bus/needs_you.py reads a trusted comment
+# carrying it as the station's tag, apart from an ask a person wrote.
+ASK_OPENING = ("This ticket shipped, but Loom closes a ticket only when every "
+               "acceptance criterion has evidence")
+
+
+def is_verification_ask(text: Any) -> bool:
+    """`text` is the ask of `ask`, the station's own verification tag."""
+    return ASK_OPENING in " ".join(str(text or "").split())
+
+
 def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
     """The one ask for a shipped ticket Loom cannot verify on its own."""
     lines = []
@@ -301,10 +312,9 @@ def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
                                          else "no check Loom can run")
         lines.append("%s (%s)" % (" ".join(text.split())[:ASK_WIDTH], why))
     more = " and %d more" % (len(gaps) - ASK_SHOWN) if len(gaps) > ASK_SHOWN else ""
-    return ("Kind: decision\nThis ticket shipped, but Loom closes a ticket only when every "
-            "acceptance criterion has evidence, and these have none it can gather: %s%s. "
+    return ("Kind: decision\n%s, and these have none it can gather: %s%s. "
             "Check each one, tick it, and close the ticket, or reopen the work if one does "
-            "not hold." % ("; ".join(lines), more))
+            "not hold." % (ASK_OPENING, "; ".join(lines), more))
 
 
 def lane_ticks(ticket_body: str, pull_body: str) -> List[str]:

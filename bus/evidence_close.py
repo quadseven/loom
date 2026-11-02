@@ -31,7 +31,8 @@ The guardrail: reopens stay at or below MAX_REOPEN_RATE of the last WINDOW
 closes. A reopened ticket keeps the label, so one listing per repo finds it,
 and it stays counted after it closes again. Above the limit this close type
 stops until the operator resumes it. The first reopen of a young run stops it
-too, on purpose: fewer than 20 closes cannot hold one at 5%.
+too, on purpose: fewer than 20 closes cannot hold one at 5%. A stop raises one
+needs:human ask on a Proof due issue; an operator's own pause raises none.
 
     python3 -m bus.evidence_close status
     python3 -m bus.evidence_close pause
@@ -235,10 +236,20 @@ def rate(state: Mapping[str, Any], control: Mapping[str, Any]) -> Tuple[int, int
     return len([c for c in recent if c.get("reopened")]), len(recent)
 
 
+OPERATOR_PAUSED = "the operator paused it"
+
+
+def stop_ask(why: str) -> str:
+    """The one ask a guardrail stop raises (brain.human)."""
+    return ("Kind: decision\nThe narrow evidence close stopped: %s. Read the reopened tickets "
+            "with `python3 -m bus.evidence_close status`, then either run `python3 -m "
+            "bus.evidence_close resume` or leave it stopped." % why)
+
+
 def paused_why(state: Mapping[str, Any], control: Mapping[str, Any]) -> str:
     """Why this close type is stopped, or ""."""
     if control.get("paused"):
-        return "the operator paused it"
+        return OPERATOR_PAUSED
     reopened, total = rate(state, control)
     if total and reopened / total > MAX_REOPEN_RATE:
         return "%d of %d closes reopened, above %d%%" % (

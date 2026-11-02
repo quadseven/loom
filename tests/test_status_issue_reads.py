@@ -112,7 +112,7 @@ class StatusReadsEachIssueOnce(unittest.TestCase):
 
 
 class IssueReadsClient(unittest.TestCase):
-    def test_only_a_plain_single_issue_get_is_kept(self):
+    def test_only_a_single_issue_get_is_kept(self):
         fake = PathFake()
         gh = issue_reads.once(GitHub("t", transport=fake))
         self.assertIs(issue_reads.once(gh), gh)
@@ -120,13 +120,27 @@ class IssueReadsClient(unittest.TestCase):
             gh.rest("GET", "/repos/%s/issues/4" % REPO)
             gh.rest("GET", "/repos/%s/issues/4/comments" % REPO)
             gh.rest("GET", "/repos/%s/issues/5" % REPO, ok=(404,))
+            gh.rest("GET", "/repos/%s/issues/99" % REPO, ok=(404,))
             gh.rest("PATCH", "/repos/%s/issues/4" % REPO, {"body": "x"})
         self.assertEqual(fake.calls[("GET", "/repos/%s/issues/4" % REPO)], 1)
         self.assertEqual(fake.calls[("GET", "/repos/%s/issues/4/comments" % REPO)], 2)
-        self.assertEqual(fake.calls[("GET", "/repos/%s/issues/5" % REPO)], 2)
+        # A read that accepts a 404 keeps its success (resume's item_revision,
+        # loom#2483), and never its failure.
+        self.assertEqual(fake.calls[("GET", "/repos/%s/issues/5" % REPO)], 1)
+        self.assertEqual(fake.calls[("GET", "/repos/%s/issues/99" % REPO)], 2)
         self.assertEqual(fake.calls[("PATCH", "/repos/%s/issues/4" % REPO)], 2)
         # Every other attribute is the wrapped client's.
-        self.assertEqual(gh.requests, 7)
+        self.assertEqual(gh.requests, 8)
+
+    def test_a_kept_success_answers_a_plain_read_and_a_kept_failure_does_not_exist(self):
+        fake = PathFake()
+        gh = issue_reads.once(GitHub("t", transport=fake))
+        self.assertEqual(404, gh.rest("GET", "/repos/%s/issues/99" % REPO, ok=(404,)).status)
+        with self.assertRaises(GitHubError):
+            gh.rest("GET", "/repos/%s/issues/99" % REPO)
+        gh.rest("GET", "/repos/%s/issues/5" % REPO, ok=(404,))
+        gh.rest("GET", "/repos/%s/issues/5" % REPO)
+        self.assertEqual(fake.calls[("GET", "/repos/%s/issues/5" % REPO)], 1)
 
     def test_a_failed_read_is_not_kept(self):
         fake = PathFake()

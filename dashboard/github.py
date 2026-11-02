@@ -251,7 +251,7 @@ def _int_or(value: Any, default: int = 0) -> int:
 # fills. A pass below the budget floor reads none of them and carries every
 # source an earlier pass read; source_read_at says when each was read.
 VIEW_SOURCES = {
-    "improving": ("improving", "floor_context"),
+    "improving": ("improving", "improving_built", "floor_context"),
     "lanes": ("lanes",),
     "pull_requests": ("pull_requests", "footer_models", "footer_runs"),
     "brain_step": ("brain_step", "brain_step_error"),
@@ -292,6 +292,7 @@ class TicketStore:
                           "stale": False, "ready": False,
                           "ticket_refreshed_at": None, "next_refresh_at": None, "stale_reason": "",
                           "improving": {"journals": [], "metrics_comments": []},
+                          "improving_built": None,
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
                           "goal_context": {},
                           "goal_context_error": "the dashboard has not read its sources yet"}
@@ -472,6 +473,7 @@ class TicketStore:
                  if self._reset_at else "when GitHub's request limit resets")
         skipped = "GitHub's request budget ran low; these details refresh %s" % reset
         data.update({"improving": {"journals": [], "metrics_comments": []},
+                     "improving_built": None,
                      "lanes": [], "pull_requests": [],
                      "brain_step": None, "brain_step_error": skipped,
                      "issue_comments": [], "review_comments": [], "hot_spots_error": skipped,
@@ -555,6 +557,18 @@ class TicketStore:
             prs.extend(found)
             errors.extend(repo_errors)
         data["improving"] = {"journals": journals, "metrics_comments": metric_comments}
+        # The Improving page's join of journals to tickets is the slow work
+        # the page timed out on (loom#2248): build it here, once a pass, so
+        # a page request only renders what the refresh already holds, as
+        # the other pages do. A failed build keeps no build and says why;
+        # the page then shows its not-read message, never a per-request join.
+        rows = [row for found in (data.get("tickets") or {}).values() if found for row in found]
+        try:
+            data["improving_built"] = views.build_improvements(journals, rows, metric_comments)
+        except Exception as exc:  # noqa: BLE001 - background thread, see _read_latest_runs
+            LOG.warning("improving build failed: %s", exc)
+            data["improving_built"] = None
+            errors.append("improving build: " + (self._error_reason(exc) or type(exc).__name__))
         data["floor_context"] = _floor_context(reports, journals, self.operator_items, errors)
         data["lanes"] = lanes
         data["pull_requests"] = prs
@@ -1225,6 +1239,7 @@ class TicketStore:
                 "next_refresh_at": snapshot.get("next_refresh_at"),
                 "stale_reason": snapshot.get("stale_reason", "GitHub could not refresh ticket data"),
                 "improving": snapshot.get("improving", {}),
+                "improving_built": snapshot.get("improving_built"),
                 "lanes": snapshot.get("lanes", []),
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),

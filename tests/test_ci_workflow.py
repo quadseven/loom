@@ -12,6 +12,13 @@ WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "t
 
 
 class UnittestStep(unittest.TestCase):
+    def test_unittest_timeout_cap_and_seven_day_measurement_are_documented(self):
+        text = WORKFLOW.read_text()
+        self.assertEqual(text.count("timeout-minutes: 30"), 2)
+        self.assertIn("Seven-day incident sample (Oct 26-Nov 2)", text)
+        self.assertIn("~17.6m", text)
+        self.assertIn("~20m16s", text)
+
     def test_parallel_runner_caps_workers_to_avoid_oversubscribing_lane_checks(self):
         runner = WORKFLOW.parents[1] / "unittest_parallel.py"
         spec = __import__("importlib.util").util.spec_from_file_location("unittest_parallel", runner)

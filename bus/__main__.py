@@ -50,6 +50,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
     s.add_argument("--holder", required=True)
     s.add_argument("--minutes", type=int, default=15)
+    s.add_argument("--run", default="",
+                   help="this tick's run id; with it, a lock under the same holder "
+                   "from another run is not yours")
+    s.add_argument("--wait", type=int, default=0, metavar="MINUTES",
+                   help="try again each minute for up to this long while a peer holds the lock")
     s = sub.add_parser("unlock", help="release the brain tick lock")
     s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
     s.add_argument("--holder", required=True)
@@ -114,9 +119,13 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
             print("%s: %s" % (repo, ", ".join(changed) if changed else "no changes"))
         return 0
     if args.command == "lock":
-        ok = lock.acquire(gh, args.repo, args.holder, args.minutes)
-        print("lock acquired" if ok else "lock held by someone else")
-        return 0 if ok else 1
+        # The line names the holder, says whether the lock is the caller's
+        # own and how long it has been held (loom#2275); exit 0 whenever the
+        # caller holds the lock, its own earlier lock included.
+        result = lock.attempt_waiting(gh, args.repo, args.holder, args.minutes,
+                                      wait=args.wait, run=args.run)
+        print(result.line())
+        return 0 if result.acquired else 1
     if args.command == "unlock":
         ok = lock.release(gh, args.repo, args.holder)
         print("lock released" if ok else "lock not released")
