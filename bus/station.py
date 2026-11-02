@@ -13151,7 +13151,7 @@ class Station:
         """Refresh the lane scorecard once an hour and demote the lanes whose
         bad outcomes reach LOOM_LANE_DEMOTE_AT (bus/scorecard.py). Runs with
         the factory; LOOM_FACTORY=0 turns it off."""
-        card = scorecard.Scorecard(self.state, self.now)
+        card = scorecard.Scorecard(self.state, self.now, brief_root=self.s.home)
         if not self.s.factory_on or not card.due():
             return
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
@@ -13170,12 +13170,19 @@ class Station:
         """The free lanes that may claim a build ticket: a demoted lane
         takes none (bus/scorecard.py)."""
         demoted = self.demoted_lanes()
-        return [lane for lane in free if lane not in demoted]
+        allowed = [lane for lane in free if lane not in demoted]
+        card = scorecard.Scorecard(self.state, self.now, brief_root=self.s.home)
+        for lane in free:
+            if lane in demoted and card.allow_probe(lane):
+                allowed.append(lane)
+        if allowed:
+            card.save()
+        return allowed
 
     def demoted_lanes(self) -> Dict[str, str]:
         """Each lane slot the scorecard demoted, and why. A scorecard file
         that cannot be read demotes every lane: its demotions are unknown."""
-        card = scorecard.Scorecard(self.state, self.now)
+        card = scorecard.Scorecard(self.state, self.now, brief_root=self.s.home)
         if card.unreadable:
             _say("every lane takes no build ticket: %s" % card.unreadable)
             return {lane: card.unreadable for lane in LANES}

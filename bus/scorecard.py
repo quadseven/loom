@@ -51,6 +51,7 @@ import argparse
 import json
 import os
 import re
+import glob
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -141,10 +142,6 @@ def threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_DEMOTE_AT", DEFAULT_AT)
 
 
-def zero_done_hours(env: Optional[Mapping[str, str]] = None) -> int:
-    return _setting(os.environ if env is None else env, "LOOM_LANE_ZERO_DONE_HOURS", 24) * 3600
-
-
 def footer(body: Any) -> Optional[Tuple[str, str]]:
     """(lane, model) of the newest run the pull request's footer names."""
     found = FOOTER_RE.findall(str(body or ""))
@@ -188,10 +185,11 @@ class Scorecard:
     audits, demotions and clears, kept in `state_dir`/scorecard.json."""
 
     def __init__(self, state_dir: str, now: float,
-                 env: Optional[Mapping[str, str]] = None) -> None:
+                 env: Optional[Mapping[str, str]] = None, brief_root: Optional[str] = None) -> None:
         self.path = os.path.join(state_dir, FILE)
         self.now = now
         self.env = dict(os.environ if env is None else env)
+        self.brief_root = brief_root
         self.data: Dict[str, Any] = {"records": {}, "audits": {}, "demoted": {},
                                      "cleared": {}, "refreshed": 0}
         # A file that is there but cannot be read: its demotions are unknown,
@@ -403,6 +401,14 @@ class Scorecard:
         for failed proof audits and records that name no model (bad)."""
         found = {str(r.get("lane")) for r in self.data["records"].values()}
         found |= {str(e.get("lane")) for e in self.data["audits"].values()}
+        found |= {str(lane) for lane in self.data["demoted"]}
+        if self.brief_root:
+            path = os.path.join(self.brief_root, "briefs")
+            try:
+                found.update(name for name in os.listdir(path)
+                             if os.path.isdir(os.path.join(path, name)))
+            except OSError:
+                pass
         return sorted(found | {lane for lane, _ in AUDIT}
                       | {MODEL_KEY + str(r.get("model")) for r in self.data["records"].values()
                          if _model_bound(r)})
@@ -424,34 +430,53 @@ class Scorecard:
                 count += 1
         return count
 
-    def _earliest_brief_assign(self, lane: str) -> Optional[float]:
-        """Earliest timestamp a real brief was assigned to this lane in the window."""
+    def _brief_activity(self, lane: str) -> Tuple[int, int]:
+        """Return finished and done local briefs in the scorecard window."""
+        if not self.brief_root:
+            return 0, 0
         since = self.now - window(self.env)
-        earliest = None
-        for record in self.data["records"].values():
-            if record.get("lane") != lane:
-                continue
-            # Only consider real brief assignments (have a difficulty kind)
-            kind = record.get("kind", "-")
-            if kind == "-":
-                continue
-            at = float(record.get("at") or 0)
-            if at < since:
-                continue
-            if earliest is None or at < earliest:
-                earliest = at
-        return earliest
+        finished = done = 0
+        for kind in ("done", "failed"):
+            for path in glob.glob(os.path.join(self.brief_root, "briefs", lane, kind, "*.md")):
+                try:
+                    stamp = os.path.getmtime(path)
+                except OSError:
+                    continue
+                if stamp < since:
+                    continue
+                if kind == "failed" and self._limit_park(lane, path):
+                    continue
+                finished += 1
+                done += kind == "done"
+        return finished, done
+
+    def _limit_park(self, lane: str, brief: str) -> bool:
+        """Limit parks are availability signals, not lane yield outcomes."""
+        ticket = os.path.basename(brief)[:-3]
+        log = os.path.join(self.brief_root or "", "logs", lane, ticket + ".log")
+        try:
+            with open(log, encoding="utf-8", errors="replace") as fh:
+                return "failed: [limit]" in fh.read()
+        except OSError:
+            return False
 
     def demote(self) -> List[str]:
         """Demote each lane whose bad outcomes reach the threshold; the
-        lanes newly demoted. Also demote lanes with zero successful brief
-        completions past the LOOM_LANE_ZERO_DONE_HOURS threshold."""
+        lanes newly demoted. Zero-yield lanes are demoted after 20 finished
+        briefs in the window, excluding limit parks."""
         at = threshold(self.env)
         days = window(self.env) // 86400
-        zero_hours = zero_done_hours(self.env)
         newly = []
         for lane in self.lanes():
-            if lane in self.data["demoted"]:
+            existing = self.data["demoted"].get(lane)
+            is_zero_demotion = (isinstance(existing, dict)
+                                and str(existing.get("why", "")).startswith("zero successful"))
+            finished, done = self._brief_activity(lane)
+            done = max(done, self._successful_briefs_in_window(lane))
+            if is_zero_demotion and done:
+                del self.data["demoted"][lane]
+                existing = None
+            if existing:
                 continue
             count, what = self.bad(lane)
             if count >= at:
@@ -461,16 +486,27 @@ class Scorecard:
                 newly.append(lane)
                 _say("demoted lane %s: %s" % (lane, why))
                 continue
-            done = self._successful_briefs_in_window(lane)
             if done == 0:
-                earliest = self._earliest_brief_assign(lane)
-                if earliest is not None and self.now - earliest >= zero_hours:
-                    why = ("zero successful brief completions in %d hours (LOOM_LANE_ZERO_DONE_HOURS=%d)"
-                           % (zero_hours // 3600, zero_hours // 3600))
+                minimum = _setting(self.env, "LOOM_LANE_ZERO_DONE_FINISHED", 20)
+                if finished >= minimum:
+                    why = ("zero successful brief completions across %d finished briefs"
+                           % finished)
                     self.data["demoted"][lane] = {"at": self.now, "why": why}
                     newly.append(lane)
                     _say("demoted lane %s: %s" % (lane, why))
         return newly
+
+    def allow_probe(self, slot: str) -> bool:
+        """Reserve at most one probe assignment per zero-yield lane per hour."""
+        entry = self.data["demoted"].get(slot)
+        if not isinstance(entry, dict):
+            entry = self.data["demoted"].get(labels.base_lane(slot))
+        if not isinstance(entry, dict) or not str(entry.get("why", "")).startswith("zero successful"):
+            return False
+        if self.now - float(entry.get("probe_at") or 0) < 3600:
+            return False
+        entry["probe_at"] = self.now
+        return True
 
     def demoted(self) -> Dict[str, str]:
         """Each demoted lane and why."""

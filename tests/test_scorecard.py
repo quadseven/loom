@@ -299,57 +299,41 @@ class StationStep(unittest.TestCase):
 
 
 class ZeroDoneDemotion(unittest.TestCase):
-    def test_zero_done_lane_is_demoted_with_probe_briefs(self):
-        """A lane with zero successful brief completions in the window is demoted
-        after LOOM_LANE_ZERO_DONE_HOURS of probe briefs."""
+    def _brief_tree(self, root, failed, done=0, limited=0):
+        for folder, count, prefix in (("failed", failed, "failed"), ("done", done, "done"),
+                                      ("failed", limited, "limit")):
+            for n in range(count):
+                path = Path(root, "briefs", "zen", folder, "%s-%d.md" % (prefix, n))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("brief\n")
+                os.utime(path, (NOW - 60, NOW - 60))
+                if prefix == "limit":
+                    log = Path(root, "logs", "zen", path.stem + ".log")
+                    log.parent.mkdir(parents=True, exist_ok=True)
+                    log.write_text("ticket failed: [limit] provider limit\n")
+
+    def test_twenty_finished_zero_done_demotes_and_allows_one_probe_per_hour(self):
         state = tempfile.mkdtemp()
-        env = {"LOOM_LANE_DEMOTE_AT": "3", "LOOM_LANE_DEMOTE_DAYS": "7",
-               "LOOM_LANE_ZERO_DONE_HOURS": "24"}
-        later = NOW + 30 * 86400
-        got = card(now=later, env=env, state=state)
-        got.data["records"] = {
-            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 86400 - 3600,
-                                  "review": "clean", "merged": False, "sent_back": 0, "kind": "easy"},
-            "example-owner/r#2": {"lane": "zen", "model": "model-a", "at": later - 86400 - 7200,
-                                  "review": "findings", "merged": False, "sent_back": 0, "kind": "easy"},
-        }
-        got.data["briefs_done"] = {"zen": 0}
-        got.save()
+        root = tempfile.mkdtemp()
+        self._brief_tree(root, failed=20)
+        got = scorecard.Scorecard(state, NOW, env={"LOOM_LANE_DEMOTE_AT": "30"}, brief_root=root)
         quiet(got.demote)
         self.assertIn("zen", got.demoted())
-        self.assertIn("zero successful", got.demoted()["zen"].lower())
+        self.assertTrue(got.allow_probe("zen"))
+        self.assertFalse(got.allow_probe("zen"))
+        got.now += 3600
+        self.assertTrue(got.allow_probe("zen"))
 
-    def test_lane_with_done_briefs_is_not_demoted_for_zero_done(self):
-        """A lane with at least one successful brief completion is not demoted for zero done."""
+    def test_limit_parks_do_not_count_and_one_done_clears_zero_yield_demotion(self):
         state = tempfile.mkdtemp()
-        env = {"LOOM_LANE_DEMOTE_AT": "3", "LOOM_LANE_DEMOTE_DAYS": "7",
-               "LOOM_LANE_ZERO_DONE_HOURS": "24"}
-        later = NOW + 30 * 86400
-        got = card(now=later, env=env, state=state)
-        got.data["records"] = {
-            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 3600,
-                                  "review": "clean", "merged": True, "sent_back": 0},
-        }
-        got.data["briefs_done"] = {"zen": 1}
-        got.save()
+        root = tempfile.mkdtemp()
+        self._brief_tree(root, failed=19, limited=10)
+        got = scorecard.Scorecard(state, NOW, env={"LOOM_LANE_DEMOTE_AT": "30"}, brief_root=root)
         quiet(got.demote)
         self.assertNotIn("zen", got.demoted())
-
-    def test_limit_park_does_not_count_toward_demotion(self):
-        """A limit park (provider at usage limit) does not count as a bad outcome."""
-        state = tempfile.mkdtemp()
-        env = {"LOOM_LANE_DEMOTE_AT": "2"}
-        later = NOW + 30 * 86400
-        got = card(now=later, env=env, state=state)
-        got.data["records"] = {
-            "example-owner/r#1": {"lane": "zen", "model": "model-a", "at": later - 3600,
-                                  "review": "clean", "merged": True, "sent_back": 0,
-                                  "limit_park": True},
-            "example-owner/r#2": {"lane": "zen", "model": "model-a", "at": later - 7200,
-                                  "review": "clean", "merged": True, "sent_back": 0,
-                                  "limit_park": True},
-        }
-        got.save()
+        self._brief_tree(root, failed=20, done=1)
+        got = scorecard.Scorecard(state, NOW + 60, env={"LOOM_LANE_DEMOTE_AT": "30"}, brief_root=root)
+        got.data["demoted"]["zen"] = {"at": NOW, "why": "zero successful brief completions across 20 finished briefs"}
         quiet(got.demote)
         self.assertNotIn("zen", got.demoted())
 
