@@ -257,34 +257,39 @@ class Pruner:
         self.remove(tree, "over-keep-%d unpushed-commits=%d head=%s bundle=%s"
                     % (self.keep, tree.unpushed, tree.head[:12], bundle))
 
+    def held(self, path: str) -> Optional[str]:
+        """Why a tree must be kept whatever its age or commits, or None: a
+        link, not a git tree, in use, dirty, or holding linked worktrees.
+        Empty when the path is gone."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return ""
+        if stat.S_ISLNK(st.st_mode):
+            return "path-is-symlink"
+        if not stat.S_ISDIR(st.st_mode) or not os.path.lexists(os.path.join(path, ".git")):
+            return "not-a-git-tree"
+        if self.in_use(path):
+            return "in-use-cwd"
+        status = git_out(["status", "--porcelain", "--untracked-files=all"], path)
+        if status is None:
+            return "git-status-failed"
+        if status.strip():
+            return "dirty"
+        if os.path.isdir(os.path.join(path, ".git")) and linked_worktrees(path) > 0:
+            # A main checkout whose linked trees are elsewhere: removing it
+            # would orphan them.
+            return "holds-linked-worktrees"
+        return None
+
     def judge(self, name: str) -> Optional[Tree]:
         """Remove or keep one tree. Returns it when it is idle and clean with
         commits on no remote: the caller keeps the newest KEEP of those."""
         path = os.path.join(self.work, name)
-        try:
-            st = os.lstat(path)
-        except OSError:
-            return None
-        if stat.S_ISLNK(st.st_mode):
-            self.keep_tree(name, "path-is-symlink")
-            return None
-        if not stat.S_ISDIR(st.st_mode) or not os.path.lexists(os.path.join(path, ".git")):
-            self.keep_tree(name, "not-a-git-tree")
-            return None
-        if self.in_use(path):
-            self.keep_tree(name, "in-use-cwd")
-            return None
-        status = git_out(["status", "--porcelain", "--untracked-files=all"], path)
-        if status is None:
-            self.keep_tree(name, "git-status-failed")
-            return None
-        if status.strip():
-            self.keep_tree(name, "dirty")
-            return None
-        if os.path.isdir(os.path.join(path, ".git")) and linked_worktrees(path) > 0:
-            # A main checkout whose linked trees are elsewhere: removing it
-            # would orphan them.
-            self.keep_tree(name, "holds-linked-worktrees")
+        why = self.held(path)
+        if why is not None:
+            if why:
+                self.keep_tree(name, why)
             return None
         idle_h = (self.now - newest_mtime(path)) / 3600.0
         if idle_h < self.min_idle_hours:
@@ -300,15 +305,14 @@ class Pruner:
         if count is None or not count.strip().isdigit() or not head:
             self.keep_tree(name, "rev-list-failed")
             return None
-        unpushed = int(count.strip())
-        tree = Tree(name, path, idle_h, unpushed, head.strip())
-        if unpushed == 0:
-            if idle_h >= self.stale_days * 24:
-                self.remove(tree, "stale-%dd-pushed" % int(idle_h // 24))
-            else:
-                self.keep_tree(name, "pushed-idle-%.1fh" % idle_h)
-            return None
-        return tree
+        tree = Tree(name, path, idle_h, int(count.strip()), head.strip())
+        if tree.unpushed:
+            return tree
+        if idle_h >= self.stale_days * 24:
+            self.remove(tree, "stale-%dd-pushed" % int(idle_h // 24))
+        else:
+            self.keep_tree(name, "pushed-idle-%.1fh" % idle_h)
+        return None
 
     def prune_bundles(self) -> None:
         try:
