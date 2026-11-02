@@ -5343,6 +5343,19 @@ class FixTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
 
+    def test_a_fix_brief_names_the_kept_branch_from_a_timed_out_attempt(self):
+        side = "loom/12-fix-the-thing-timedout-1760000000"
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)",
+                     author="station-example")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, "Lane codex failed: [work] agent exited 124; the edits are on branch " + side)
+        self.comment(12, FIX_BODY)
+
+        self.run_pass()
+
+        self.assertIn("kept its edits on branch %s" % side, self.claimed_brief())
+
     def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
         # Three fix rounds in two hours were briefed for pull requests that
         # had already merged, one on the claude lane; each ran for nothing
