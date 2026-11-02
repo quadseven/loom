@@ -9401,7 +9401,7 @@ class Station:
             return 0
         rec.pop("cap", None)
         done = 0
-        for issue in rewrite.candidates(self.gh, repo):
+        for issue in rewrite.candidates(self.gh, repo, goal):
             if done >= room or self._deferred():
                 break
             number = int(issue["number"])

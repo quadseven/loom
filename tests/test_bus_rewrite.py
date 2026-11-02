@@ -46,6 +46,7 @@ class FakeGitHub:
         self.labels = []
         self.removed = []
         self.linked = []
+        self.goal_body = ""
 
     @staticmethod
     def intake():
@@ -84,7 +85,7 @@ class FakeGitHub:
         number, sub = int(m.group(1)), m.group(2)
         if number == GOAL:
             if method == "GET" and sub is None:
-                return reply(200, {"number": GOAL, "state": "open", "body": "",
+                return reply(200, {"number": GOAL, "state": "open", "body": self.goal_body,
                                    "labels": [{"name": "loom:goal"}]})
             if sub == "sub_issues":
                 return reply(201, {}) if method == "POST" else reply(200, [self.intake()])
@@ -258,6 +259,37 @@ class RewriteIssueTest(Base):
         self.fake.add_triage(7)
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
+
+    def test_claimed_issue_is_skipped_once_with_a_reason(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "claim:operator"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
+        self.assertEqual(err.getvalue().count("skipped (operator claim)"), 1)
+
+    def test_title_change_is_refused_for_claimed_issue(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "claim:operator"})
+        cmd = self.agent(BRIEF)
+        with self.assertRaisesRegex(rewrite.Invalid, "title change refused"):
+            rewrite.rewrite_issue(self.gh(), REPO, GOAL, self.fake.triage[7], cmd)
+
+    def test_goal_titles_are_protected_from_triage(self):
+        for title in ("Goals: current direction", "Goal journal", "[goal] live plan"):
+            self.assertEqual(brain._triage_skip({"title": title, "labels": []}), None)
+            self.assertTrue(brain._goal_names_journal(
+                "", {"number": 7, "title": title}))
+
+    def test_goal_body_reference_protects_a_journal_from_triage_and_rewrite(self):
+        issue = {"number": 7, "title": "Notes", "labels": []}
+        self.assertTrue(brain._goal_names_journal("Current journal: #7", issue))
+        self.fake.add_triage(7)
+        self.fake.triage[7]["title"] = "Notes"
+        self.fake.triage[7]["body"] = "Current journal: #7"
+        self.fake.goal_body = "Current journal: #7"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rewrite.candidates(self.gh(), REPO, GOAL), [])
 
     def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
         # loom#34, a wayfinder decision question labelled loom:triage before

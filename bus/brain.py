@@ -3712,9 +3712,21 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
+    if any(name.startswith("claim:") for name in names):
+        return "operator claim"
     if any(name.startswith("loom:") for name in names) or needs_human(names):
         return "already labelled"
     return not_work_reason(issue)
+
+
+def _goal_names_journal(goal_body: str, issue: Dict[str, Any]) -> bool:
+    """Whether a goal body or the issue title marks it as a journal."""
+    title = str(issue.get("title") or "").casefold()
+    if title.startswith(("goals:", "goal journal", "[goal]")):
+        return True
+    reference = r"(?<![A-Za-z0-9])#%d(?!\d)" % int(issue["number"])
+    return any(re.search(r"journal|live goal", line, re.I) and re.search(reference, line)
+               for line in goal_body.splitlines())
 
 
 def _oldest_open_issues(gh: GitHub, repo: str):
@@ -3751,6 +3763,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     authors = trusted_authors()
     briefers = trusted_briefers()
     lines: List[str] = []
+    goal_issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
+    goal_body = str(goal_issue.get("body") or "") if isinstance(goal_issue, dict) else ""
     done = 0
     intake: Optional[Tuple[int, int]] = None  # (intake epic, tickets it holds)
     areas: Optional[Dict[str, Dict[str, Any]]] = None
@@ -3759,6 +3773,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             break
         number = int(issue["number"])
         skip = _triage_skip(issue, authors, briefers)
+        if not skip and _goal_names_journal(goal_body, issue):
+            skip = "goal journal"
         if skip:
             continue
         missing = missing_sections(issue.get("body"))

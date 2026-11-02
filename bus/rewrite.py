@@ -349,7 +349,7 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
     return "brief", {"title": title, "difficulty": difficulty, "body": body}
 
 
-def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
+def candidates(gh: GitHub, repo: str, goal: int = 0) -> List[Dict[str, Any]]:
     """Open loom:triage issues (not pull requests), oldest first, leaving out
     one assigned to another operator (docs/LANES.md, Two Looms) and one that is
     not work for a lane (brain.not_work_reason: wayfinder, awaiting a live
@@ -357,9 +357,25 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     loom:triage before a rule existed is not rewritten into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
-    return [i for i in found if isinstance(i, dict) and "pull_request" not in i
-            and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
-            and not brain.not_work_reason(i)]
+    goal_body = ""
+    if goal:
+        data = gh.rest("GET", "/repos/%s/issues/%d" % (repo, goal)).data
+        goal_body = str(data.get("body") or "") if isinstance(data, dict) else ""
+    eligible = []
+    for issue in found:
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            continue
+        names = _names(issue)
+        reason = ("operator claim" if any(name.startswith("claim:") for name in names) else
+                  "goal journal" if brain._goal_names_journal(goal_body, issue)
+                  else "")
+        if reason:
+            print("rewrite %s#%d: skipped (%s)" % (repo, int(issue.get("number") or 0), reason), file=sys.stderr)
+            continue
+        if (not brain.owned_elsewhere(issue) and NEEDS_BRAIN not in names
+                and not brain.not_work_reason(issue)):
+            eligible.append(issue)
+    return eligible
 
 
 def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
@@ -393,7 +409,17 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
     Raises Invalid for a bad answer (nothing written); GitHub errors and
     brain's own refusals (ValueError) pass through."""
     prompt = prompt_for(gh, repo, issue)
-    return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout))
+    output = run_agent(cmd, prompt, timeout)
+    answer = parse_answer(output)
+    action, fields = validate(answer)
+    if action == "brief" and fields["title"] != str(issue.get("title") or ""):
+        labels = _names(issue)
+        protected = (any(name.startswith("wayfinder:") for name in labels)
+                     or "loom:goal" in labels
+                     or any(name.startswith("claim:") for name in labels))
+        if protected:
+            raise Invalid("title change refused for protected issue")
+    return apply_answer(gh, repo, goal, int(issue["number"]), output)
 
 
 if __name__ == "__main__":
