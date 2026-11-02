@@ -51,9 +51,18 @@ def budget(env: Optional[Mapping[str, str]] = None, given: Optional[float] = Non
     return value if value > 0 else DEFAULT_BUDGET
 
 
+class PastDeadline(Exception):
+    """each() stopped at its `until` before this repo's read finished."""
+
+    def __str__(self) -> str:
+        return "deadline"
+
+
 def not_read(seconds: float, err: Optional[BaseException]) -> str:
     """The reason a repo each() gave up on is named with: `err` when its
-    connection failed, else the timeout."""
+    connection failed or the run reached its deadline, else the timeout."""
+    if isinstance(err, PastDeadline):
+        return str(err)
     return "timed out after %gs (per-repo budget, %s)" % (seconds, BUDGET_ENV) if err is None \
         else "connection failed twice: %s" % err
 
@@ -114,8 +123,8 @@ class _Run:
 
 
 def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
-         workers: int, clock: Callable[[], float] = time.monotonic
-         ) -> Iterator[Tuple[str, bool, Any]]:
+         workers: int, clock: Callable[[], float] = time.monotonic,
+         until: Optional[float] = None) -> Iterator[Tuple[str, bool, Any]]:
     """Yield (repo, True, read(repo)) for each repo as its read finishes, or
     (repo, False, err) for a repo given up on: its read ran `seconds` past
     its start (err None), or its connection failed (err the failure). Either
@@ -125,6 +134,10 @@ def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
     already yielded keep their output. The budget counts from the moment a
     worker starts the repo, not from the start of the run."""
     order = list(dict.fromkeys(repos))
+    if until is not None and clock() >= until:
+        for repo in order:
+            yield repo, False, PastDeadline()
+        return
     run = _Run(order, read, clock)
     for _ in range(min(workers, len(order))):
         run.spawn()
@@ -132,6 +145,10 @@ def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
     retried: Set[str] = set()
     while pending:
         now = clock()
+        if until is not None and now >= until:
+            for repo in [r for r in order if r in pending]:
+                yield repo, False, PastDeadline()
+            return
         deadlines = run.deadlines(pending, seconds)
         for repo in [r for r in order if deadlines.get(r, now + 1) <= now]:
             # The stuck worker keeps its thread; the queue still needs one.
@@ -143,7 +160,10 @@ def each(repos: Sequence[str], read: Callable[[str], Any], seconds: float,
             run.spawn()
             yield repo, False, None
         left = [d - now for d in deadlines.values() if d > now]
-        got = run.answer(min(left, default=seconds)) if pending else None
+        wait = min(left, default=seconds)
+        if until is not None:
+            wait = min(wait, until - now)
+        got = run.answer(wait) if pending else None
         if got is None or got[0] not in pending:
             continue  # nothing yet, or a timed-out read that finished late
         if _dropped(got[2]) and got[0] not in retried:

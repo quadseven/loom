@@ -37,6 +37,9 @@ class RolledKindTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def said_on(self, issue):
+        return "\n".join(c["body"] for c in self.gh.comments.get((REPO, issue["number"]), ()))
+
     def file(self, breaches, now=T0):
         invariants.Filer(self.gh, REPO, GOAL, self.state, now, self.said.append,
                          seen=self.seen).run(breaches)
@@ -227,8 +230,8 @@ class RolledKindTest(unittest.TestCase):
         (rolled,) = self.rolled()
         # The private one closes naming no tracking issue, not the factory's.
         self.assertEqual(private["state"], "closed")
-        self.assertIn("no longer files one issue per", private["body"])
-        self.assertNotIn("#%d lists" % rolled, private["body"])
+        self.assertIn("no longer files one issue per", self.said_on(private))
+        self.assertNotIn("#%d lists" % rolled, self.said_on(private))
         # The public repo has no tracking issue open: it waits out the clear.
         self.assertEqual(public["state"], "open")
         # Its repo breaks too: it closes into that repo's issue, not the other.
@@ -238,9 +241,9 @@ class RolledKindTest(unittest.TestCase):
         mine = [n for n, i in self.rolled().items() if i["title"].endswith(self.PUBLIC)]
         self.assertEqual(len(mine), 1)
         self.assertEqual(public["state"], "closed")
-        self.assertIn("#%d lists this kind" % mine[0], public["body"])
+        self.assertIn("#%d lists this kind" % mine[0], self.said_on(public))
 
-    def test_migration_folds_a_few_a_pass_silently_with_one_edited_summary(self):
+    def test_migration_folds_a_few_a_pass_each_with_its_reason_and_one_edited_summary(self):
         old = [self.legacy(n) for n in (51, 52, 53)]
         ticketed = self.legacy(54, labels=(invariants.LABEL, "loom:ticket", "loom:briefed"))
         asks = self.legacy(56, labels=invariants.LABELS + ["needs:someone"])
@@ -248,17 +251,17 @@ class RolledKindTest(unittest.TestCase):
         self.file(self.stalled([self.pull(201)]))
         (rolled,) = self.rolled()
         closed = [i for i in old if i["state"] == "closed"]
-        self.assertEqual(len(closed), invariants.FOLD_MAX, self.said)
+        # The pass that files the tracking issue has room for one close.
+        self.assertEqual(len(closed), 1, self.said)
         for issue in closed:
             self.assertEqual(issue["state_reason"], "not_planned")
-            self.assertIn("#%d lists this kind" % rolled, issue["body"])
-        self.assertEqual(sum(": folded " in line for line in self.said), invariants.FOLD_MAX)
-        (note,) = self.gh.comments[(REPO, rolled)]
-        self.assertIn("2 older per-violation issues", note["body"])
+            self.assertIn("#%d lists this kind" % rolled, self.said_on(issue))
+        self.assertLessEqual(len(self.gh.writes), invariants.WRITES_MAX, self.gh.writes)
         self.file(self.stalled([self.pull(201)], now=T0 + 300), now=T0 + 300)
         self.assertEqual([i["state"] for i in old], ["closed"] * 3)
-        # One comment in all, on the tracking issue, edited as the count grew.
-        self.assertEqual([k for k in self.gh.comments], [(REPO, rolled)])
+        # One reason on each, and one count on the tracking issue, edited.
+        for issue in old:
+            self.assertEqual(len(self.gh.comments[(REPO, issue["number"])]), 1)
         (note,) = self.gh.comments[(REPO, rolled)]
         self.assertIn("3 older per-violation issues", note["body"])
         # A ticket keeps its factory link, an ask its operator, and another
@@ -359,6 +362,9 @@ class OldIssueSubjectTest(unittest.TestCase):
         return station.Station._invariant_settled(
             types.SimpleNamespace(_lane_pull_settled=pull), Facts(T0), invariant, subject)
 
+    def said_on(self, issue):
+        return "\n".join(c["body"] for c in self.gh.comments.get((REPO, issue["number"]), ()))
+
     def old(self, subject, title, marker=None, number=71):
         key = invariants.Breach("lane-pr-stalled", subject, "t", (), T0).key
         self.gh.issues[number] = {
@@ -377,7 +383,7 @@ class OldIssueSubjectTest(unittest.TestCase):
         self.run_filer()
         self.assertEqual(self.asked, ["%s#660" % REPO])
         self.assertEqual(issue["state"], "closed", self.said)
-        self.assertNotIn((REPO, 71), self.gh.comments)
+        self.assertEqual(len(self.gh.comments[(REPO, issue["number"])]), 1)
 
     def test_an_issue_of_another_public_repo_settles_from_its_title(self):
         issue = self.old("%s#77" % self.PUBLIC,
@@ -407,7 +413,7 @@ class OldIssueSubjectTest(unittest.TestCase):
         self.run_filer()
         # Its repo cannot be told, so it folds, and settled() is never asked.
         self.assertEqual(self.asked, [])
-        self.assertIn("no longer files one issue per", issue["body"])
+        self.assertIn("no longer files one issue per", self.said_on(issue))
         filer = invariants.Filer(self.gh, REPO, GOAL, {}, T0, self.said.append)
         hidden = invariants.Breach("ticket-outside-epic", "%s#5" % OTHER,
                                    "Ticket 5 of a private repo", ("x",), T0)
@@ -425,6 +431,82 @@ class OldIssueSubjectTest(unittest.TestCase):
         filer = invariants.Filer(self.gh, REPO, GOAL, {}, T0, self.said.append)
         b = invariants.Breach("lane-held", "%s#5" % REPO, "Ticket #5", ("x",), T0, rolling=True)
         self.assertEqual(filer._marker(b), invariants.MARKER % b.key)
+
+
+class SettleBeforeFilingTest(unittest.TestCase):
+    """loom#2408: a lane pull request issue of the 2306 shape (marker key, a
+    title naming #N, no subject map) never closed once its pull request ended,
+    because filing other invariants spent the pass's writes before settling
+    ran. The settled callback here is the real _invariant_settled over the
+    real _lane_pull_settled."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.host = types.SimpleNamespace(
+            # No station repo: the open list is the one the pass kept.
+            _pulls={}, gh=self.gh, s=types.SimpleNamespace(repos=()),
+            _invariant_ref=lambda repo, number, noun="issue": Ref(
+                "%s#%d" % (repo, number), "%s #%d" % (noun, number)))
+        self.host._lane_pull_settled = (
+            lambda repo, number: station.Station._lane_pull_settled(self.host, repo, number))
+
+    def settled(self, invariant, subject):
+        return station.Station._invariant_settled(self.host, Facts(T0), invariant, subject)
+
+    def old(self, number, pull):
+        key = invariants.Breach("lane-pr-stalled", "%s#%d" % (REPO, pull), "t", (), T0).key
+        self.gh.issues[number] = {
+            "number": number, "id": 9000 + number, "state": "open", "closed_at": None,
+            "title": "Lane pull request #%d open 13.5 hours: 1 review thread, no fix round" % pull,
+            "labels": [{"name": n} for n in invariants.LABELS], "created_at": stamp(T0),
+            "body": "%s\nBroken.\n\nTicket: #%d\n\nPart of #%d" % (
+                invariants.MARKER % key, pull - 3, GOAL)}
+        return self.gh.issues[number]
+
+    def others(self, tag, count=invariants.WRITES_MAX):
+        return [invariants.Breach("remote-silent", "%s-%d" % (tag, n), "Lane %s-%d silent" % (
+            tag, n), ("x",), T0) for n in range(count)]
+
+    def run_filer(self, breaches, now=T0):
+        invariants.Filer(self.gh, REPO, GOAL, {}, now, self.said.append,
+                         settled=self.settled).run(breaches)
+
+    def test_a_merged_pull_closes_its_issue_while_other_breaches_spend_the_writes(self):
+        issue = self.old(71, 660)
+        self.gh.pull_state[(REPO, 660)] = {"state": "closed", "merged_at": stamp(T0 + 60)}
+        self.run_filer(self.others("a"))
+        self.assertEqual(issue["state"], "closed", self.said)
+        self.assertTrue(any("closed settled" in s for s in self.said), self.said)
+
+    def test_the_list_drains_while_every_pass_files_something_else(self):
+        issues = [self.old(71 + n, 660 + n) for n in range(3)]
+        for n in range(3):
+            self.gh.pull_state[(REPO, 660 + n)] = {"state": "closed",
+                                                   "merged_at": stamp(T0 + 60)}
+        for n in range(2):
+            before = sum(1 for i in issues if i["state"] == "closed")
+            self.run_filer(self.others("p%d" % n), T0 + n * 60)
+            self.assertGreater(sum(1 for i in issues if i["state"] == "closed"), before,
+                               self.said)
+        self.assertEqual(sum(1 for i in issues if i["state"] == "closed"), 3)
+
+    def test_an_open_pull_keeps_its_issue_open(self):
+        issue = self.old(71, 660)
+        self.gh.pull_state[(REPO, 660)] = {"state": "open", "merged_at": None}
+        self.run_filer(self.others("a"))
+        self.assertEqual(issue["state"], "open")
+
+    def test_a_failing_settle_is_logged_and_filing_goes_on(self):
+        with mock.patch.object(invariants.Filer, "_settle", side_effect=OSError("disk gone")):
+            self.run_filer(self.others("a", 1))
+        self.assertTrue(any("could not close settled issues" in s and "disk gone" in s
+                            for s in self.said), self.said)
+        self.assertTrue(any(i["title"].startswith("Lane a-0") for i in self.gh.issues.values()),
+                        self.gh.issues)
 
 
 if __name__ == "__main__":

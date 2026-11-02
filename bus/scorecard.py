@@ -59,6 +59,10 @@ from . import change_class, difficulty, labels, merge_tier, revert
 from .github import GitHubError
 
 FILE = "scorecard.json"
+# Slots of these lanes pick their model per run (bus/model_pick.py, which reads
+# the demoted models), so demotion binds to a model named after MODEL_KEY.
+PICKED_LANES = ("opencode-go", "zen")
+MODEL_KEY = "model:"
 REFRESH = 3600
 DEFAULT_DAYS = 7
 DEFAULT_AT = 3
@@ -103,6 +107,12 @@ FOOTER_RE = re.compile(r"^Loom ticket \S+, lane ([A-Za-z0-9_.-]+), model (\S+?)\
 TABLE_HEAD = "| scorecard lane | model | %s | demoted |" % " | ".join(COLUMNS)
 ROW_RE = re.compile(r"^\| (?!scorecard lane)([a-z0-9_.-]+) \| ([^|]*) \|((?: [0-9]+ \|){%d}) ([^|]*) \|$"
                     % len(COLUMNS))
+
+
+def _model_bound(record: Mapping[str, Any]) -> bool:
+    """Whether a record's outcome binds to its model and not to its lane."""
+    return (labels.base_lane(str(record.get("lane"))) in PICKED_LANES
+            and record.get("model") not in (None, "", "unknown"))
 
 
 def _say(message: str) -> None:
@@ -363,26 +373,35 @@ class Scorecard:
         return rows
 
     def bad(self, lane: str) -> Tuple[int, List[str]]:
-        """The lane's bad outcomes since the later of the window's start and
-        its last clear, and what they were."""
+        """The bad outcomes of a lane or a model (MODEL_KEY) since the later
+        of the window's start and its last clear, and what they were."""
+        model = lane[len(MODEL_KEY):] if lane.startswith(MODEL_KEY) else None
         since = max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
         counts = {"bad-work findings": 0, "reverts": 0, "failed deploys": 0,
                   "failed proof audits": 0}
         for record in self.data["records"].values():
-            if record.get("lane") != lane or float(record.get("at") or 0) < since:
+            ours = (record.get("model") == model if model
+                    else record.get("lane") == lane and not _model_bound(record))
+            if not ours or float(record.get("at") or 0) < since:
                 continue
             counts["bad-work findings"] += int(record.get("review") == BAD_WORK)
             counts["reverts"] += int(bool(record.get("reverted")))
             counts["failed deploys"] += int(bool(record.get("deploy_failed")))
         counts["failed proof audits"] = sum(
             1 for e in self.data["audits"].values()
-            if e.get("lane") == lane and float(e.get("at") or 0) >= since)
+            if not model and e.get("lane") == lane and float(e.get("at") or 0) >= since)
         return sum(counts.values()), ["%d %s" % (n, what) for what, n in counts.items() if n]
 
     def lanes(self) -> List[str]:
+        """What can be demoted: every lane, and on a lane whose slots pick
+        their model per run each model (MODEL_KEY), so one model's bad work
+        does not bench the slots running others. Such a lane still answers
+        for failed proof audits and records that name no model (bad)."""
         found = {str(r.get("lane")) for r in self.data["records"].values()}
         found |= {str(e.get("lane")) for e in self.data["audits"].values()}
-        return sorted(found | {lane for lane, _ in AUDIT})
+        return sorted(found | {lane for lane, _ in AUDIT}
+                      | {MODEL_KEY + str(r.get("model")) for r in self.data["records"].values()
+                         if _model_bound(r)})
 
     def demote(self) -> List[str]:
         """Demote each lane whose bad outcomes reach the threshold; the
@@ -423,8 +442,17 @@ class Scorecard:
         for (lane, model), got in sorted(self.table().items()):
             lines.append("| %s | %s | %s | %s |" % (
                 lane, model or "-", " | ".join(str(got[c]) for c in COLUMNS),
-                "yes" if lane in demoted else "no"))
+                "yes" if lane in demoted or MODEL_KEY + model in demoted else "no"))
         return lines + difficulty.markdown(self.data["records"], self.now)
+
+
+def demoted_models_line(card: "Scorecard") -> str:
+    """The brief's Demoted-Models line, so a runner without the scorecard file
+    still skips them: the models, "none", or "unreadable" for a card the
+    station could not read."""
+    if card.unreadable:
+        return "unreadable"
+    return " ".join(sorted(k[len(MODEL_KEY):] for k in card.demoted() if k.startswith(MODEL_KEY))) or "none"
 
 
 def demoted_slots(demoted: Mapping[str, str], slots: Iterable[str]) -> Dict[str, str]:
@@ -470,7 +498,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               % card.unreadable, file=sys.stderr)
         return 1
     if args.command == "clear":
-        was = card.clear(labels.base_lane(args.lane))
+        was = card.clear(args.lane if args.lane.startswith(MODEL_KEY) else labels.base_lane(args.lane))
         card.save()
         print("cleared lane %s%s" % (args.lane, "" if was else " (it was not demoted)"))
         return 0

@@ -21,6 +21,7 @@ Nothing here decides what may merge.
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from . import brain
@@ -55,6 +56,33 @@ PYTEST_FAILED_RE = re.compile(r"\bFAILED\b", re.I)
 PYTEST_INFRA_RE = re.compile(
     r"\b(?:ReadTimeout|ConnectTimeout|ConnectionError|timeout|connection refused|"
     r"unreachable|could not connect|network is unreachable)\b", re.I)
+JOB_TIMEOUT_SECONDS = 30 * 60
+TIMEOUT_GRACE_SECONDS = 60
+
+
+def failure_kind(run: Dict[str, Any]) -> str:
+    """Classify a check failure, separating a job cancelled at its time cap.
+
+    GitHub reports job-level timeout cancellation as ``cancelled``. Check run
+    timestamps distinguish it from an early cancellation (for example, a
+    superseded pull request run) and from a test assertion failure.
+    """
+    if run.get("conclusion") == "cancelled" and _hit_job_timeout(run):
+        return "timeout"
+    if run.get("conclusion") in brain.FAILED_CONCLUSIONS:
+        return "failure"
+    return "other"
+
+
+def _hit_job_timeout(run: Dict[str, Any]) -> bool:
+    """Whether a cancelled check ran to the configured 30-minute cap."""
+    try:
+        started = datetime.fromisoformat(str(run["started_at"]).replace("Z", "+00:00"))
+        completed = datetime.fromisoformat(str(run["completed_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        return False
+    elapsed = (completed - started).total_seconds()
+    return JOB_TIMEOUT_SECONDS - TIMEOUT_GRACE_SECONDS <= elapsed <= JOB_TIMEOUT_SECONDS + 5 * 60
 
 
 def _pytest_only_infra_errors(text: str) -> bool:
@@ -128,7 +156,8 @@ def flaky_names(gh: GitHub, repo: str, runs: Sequence[Dict[str, Any]],
                 text = brain._job_log_tail(gh, repo, int(run["id"]))
             except (GitHubError, TypeError, ValueError):
                 text = None
-        if infra_flake(text) or infra_flake(_output_text(run)):
+        if (failure_kind(run) == "timeout" or infra_flake(text)
+                or infra_flake(_output_text(run))):
             found.append(name)
     return found
 

@@ -48,9 +48,14 @@ class TrustListTests(unittest.TestCase):
 
 
 class AppLoginTests(unittest.TestCase):
-    def test_the_status_goal_query_asks_for_the_author_type(self):
-        (field,) = brain._status_goal_fields([30])
-        self.assertIn("author { __typename login }", field)
+    def test_a_rest_goal_comment_keeps_the_author_type(self):
+        # Status reads goal comments through REST (loom#2464): the App's
+        # "<slug>[bot]" reads as the GraphQL Bot "<slug>", a person as a User.
+        app = brain._rest_comment_node({"user": {"login": "example-app[bot]", "type": "Bot"}})
+        person = brain._rest_comment_node({"user": {"login": "example-app", "type": "User"}})
+        self.assertEqual({"__typename": "Bot", "login": "example-app"}, app["author"])
+        self.assertEqual("example-app[bot]", rest_login(app["author"]))
+        self.assertEqual("example-app", rest_login(person["author"]))
 
     def test_a_bot_login_reads_in_its_rest_form(self):
         self.assertEqual("example-app[bot]", rest_login({"__typename": "Bot", "login": "example-app"}))

@@ -229,6 +229,12 @@ class UsageMeterTests(unittest.TestCase):
         self.assertIn("GLM Coding Plan", notes["zai"])
         self.assertIn("without a key", notes["zen"])
 
+    def test_the_copilot_lane_says_why_it_has_no_meter(self):
+        note = usage.NO_METER["copilot"]
+        self.assertTrue(note.startswith("no meter:"), note)
+        self.assertIn("provider exposes no meter for the lane's token", note)
+        self.assertIn("the lane holds itself when Copilot says the allowance is spent", note)
+
 
 if __name__ == "__main__":
     unittest.main()
