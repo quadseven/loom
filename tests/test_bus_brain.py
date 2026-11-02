@@ -53,14 +53,19 @@ class Fake:
     sub-issues and the open ticket list) are answered apart and not
     recorded, so a brief's calls keep their places."""
 
-    def __init__(self, *replies, epic=None):
+    def __init__(self, *replies, epic=None, goal_comments=None):
         self.replies = list(replies)
         self.calls = []
         self.epic = epic_issue() if epic is None else epic
         self.epic_tickets = []
+        # Goal number -> its REST comments, read side by side (loom#2464).
+        self.goal_comments = dict(goal_comments or {})
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
+        for number, comments in self.goal_comments.items():
+            if method == "GET" and path == GOAL_PAGE % (REPO, number):
+                return reply(200, comments)
         if method == "GET" and self.epic is not False:
             if path == "/repos/%s/issues/%d" % (REPO, EPIC):
                 return reply(200, self.epic)
@@ -75,6 +80,23 @@ class Fake:
 
     def assert_all_used(self):
         assert not self.replies, "unused replies: %s" % self.replies
+
+
+# The one comments page status reads for a goal of up to 100 comments.
+GOAL_PAGE = "/repos/%s/issues/%d/comments?per_page=100&page=1"
+
+
+def rest_comments(nodes):
+    """GraphQL comment nodes as the REST comments status reads (loom#2464)."""
+    out = []
+    for node in nodes:
+        author = node["author"]
+        bot = author.get("__typename") == "Bot"
+        out.append({"body": node["body"], "created_at": node["createdAt"],
+                    "updated_at": node.get("updatedAt", node["createdAt"]),
+                    "user": {"login": author["login"] + ("[bot]" if bot else ""),
+                             "type": "Bot" if bot else "User"}})
+    return out
 
 
 # An open invariant breach on goal #2: a goal with one is never quiet
@@ -657,8 +679,10 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_a_fresh_journal_on_one_goal_does_not_hide_an_overdue_report_on_another(self):
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
-        goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"},
-                 {"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z"}]
+        goals = [{"number": 1, "title": "Fresh", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z",
+                  "comments": 2},
+                 {"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}], "created_at": "2029-12-01T00:00:00Z",
+                  "comments": 2}]
         bot = {"login": "brain-bot"}
         g1 = [{"body": "<!-- loom:journal v1 -->\n- Measure: p95 2s\n- Shipped: #5", "createdAt": "2030-01-01T19:45:00Z", "author": bot},
               {"body": "<!-- loom:report v1 -->\n- Measure: p95 2s", "createdAt": "2030-01-01T19:00:00Z", "author": bot}]
@@ -666,9 +690,9 @@ class SensitiveResumeTests(unittest.TestCase):
               {"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot}]
         gh = GitHub("t", transport=Fake(
             reply(200, goals + [BREACH_ON_2]), reply(200, []),
-            reply(200, {"data": {"repository": {"g1": {"comments": {"nodes": g1}}, "g2": {"comments": {"nodes": g2}}}}}),
+            reply(200, {"data": {"repository": {}}}),
             reply(200, []), reply(200, []),
-            reply(200, [])))
+            reply(200, []), goal_comments={1: rest_comments(g1), 2: rest_comments(g2)}))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
         self.assertIn("#1 Fresh - latest journal 2030-01-01T19:45:00Z, report 2030-01-01T19:00:00Z, "
                       "measure 2030-01-01T19:45:00Z, action 2030-01-01T19:45:00Z - report ok", report)
@@ -684,7 +708,7 @@ class SensitiveResumeTests(unittest.TestCase):
         # at 16:37Z, so the report-cadence invariant fired on thirteen goal homes.
         now = brain.datetime(2030, 1, 1, 20, 0, tzinfo=brain.timezone.utc)
         goals = [{"number": 2, "title": "Stale", "labels": [{"name": "loom:goal"}],
-                  "created_at": "2029-12-01T00:00:00Z"}]
+                  "created_at": "2029-12-01T00:00:00Z", "comments": 2}]
         bot = {"login": "brain-bot"}
         app = {"__typename": "Bot", "login": "example-loom"}
         g2 = [{"body": "<!-- loom:report v1 -->\nold", "createdAt": "2030-01-01T10:26:00Z", "author": bot},
@@ -692,8 +716,8 @@ class SensitiveResumeTests(unittest.TestCase):
                "createdAt": "2030-01-01T19:52:00Z", "author": app}]
         gh = GitHub("t", transport=Fake(
             reply(200, goals + [BREACH_ON_2]), reply(200, []),
-            reply(200, {"data": {"repository": {"g2": {"comments": {"nodes": g2}}}}}),
-            reply(200, []), reply(200, []), reply(200, [])))
+            reply(200, {"data": {"repository": {}}}),
+            reply(200, []), reply(200, []), reply(200, []), goal_comments={2: rest_comments(g2)}))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED, now=now, authors=["brain-bot"])
         self.assertIn("#2 Stale - latest journal none, report 2030-01-01T10:26:00Z", report)
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]

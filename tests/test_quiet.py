@@ -60,13 +60,8 @@ class GoalHome:
 
     def goal(self):
         return {"number": GOAL, "title": "Quiet goal", "state": "open", "body": "",
-                "created_at": "2029-12-01T00:00:00Z", "labels": [{"name": "loom:goal"}]}
-
-    def graphql_nodes(self):
-        return [{"body": c["body"], "createdAt": c["created_at"],
-                 "updatedAt": c.get("updated_at", c["created_at"]),
-                 "author": {"__typename": "User", "login": c["user"]["login"]}}
-                for c in self.comments]
+                "created_at": "2029-12-01T00:00:00Z", "labels": [{"name": "loom:goal"}],
+                "comments": len(self.comments)}
 
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
@@ -76,8 +71,8 @@ class GoalHome:
             if sub_issue_graphql.asks(asked):
                 return reply(200, sub_issue_graphql.answer(
                     asked, lambda n: self.children if n == GOAL else []))
-            return reply(200, {"data": {"repository": {
-                "g%d" % GOAL: {"comments": {"nodes": self.graphql_nodes()}}}}})
+            # Status reads the goal's comments through REST (loom#2464).
+            return reply(200, {"data": {"repository": {}}})
         if method == "GET" and path == "/user":
             return reply(200, {"login": ME})
         if method == "GET" and path == "/repos/%s/issues" % REPO:
