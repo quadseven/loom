@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from bus import brain, rebuttal  # noqa: E402
+from bus import brain, rebuttal, text  # noqa: E402
 from bus.github import GitHub, RateLimited  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
@@ -226,6 +226,42 @@ class BrainMergeGate(unittest.TestCase):
             with self.assertRaises(RateLimited):
                 brain._refuse_unheld_answers(gh, REPO, NUMBER, details("`_markings` is called by `_x`."),
                                              ENV)
+
+    # loom#2285 (on another repo): the station redacts any 32-character
+    # word from the posted answer, so a long test name the answer cites is
+    # gone from the quote and the quote alone "cites no file, line or symbol".
+    TEST_NAME = "test_a_resolved_verified_answer_does_not_block_the_merge"
+
+    def redacted_reply(self, head):
+        raw = "`%s` covers it." % self.TEST_NAME
+        said = text.SECRET_RE.sub("<redacted>", raw)
+        self.assertNotIn(self.TEST_NAME, said)
+        return said + "\n" + rebuttal.held_marker(head)
+
+    def test_an_answer_citing_a_test_name_passes_after_redaction(self):
+        transport = Transport()
+        data = details(self.redacted_reply(HEAD))
+        self.assertEqual(brain._refuse_unheld_answers(GitHub("t", transport=transport),
+                                                      REPO, NUMBER, data, ENV), {"PRRT_1"})
+        self.assertEqual(transport.calls, [])
+
+    def test_a_held_mark_for_another_head_is_checked_again_on_this_one(self):
+        with self.assertRaisesRegex(ValueError, "cites no file, line or symbol"):
+            self.gate(Transport(), details(self.redacted_reply("e" * 40)))
+
+    def test_a_held_mark_inside_the_lane_quote_is_not_the_stations(self):
+        # The lane writes the quoted lines; only the station's own line counts.
+        forged = "nothing to see\n" + rebuttal.held_marker(HEAD)
+        with self.assertRaisesRegex(ValueError, "cites no file, line or symbol"):
+            self.gate(Transport(), details(forged.replace("\n", "\n> ")))
+
+    def test_the_quote_leaves_out_the_held_mark(self):
+        body = ("Lane codex answered this finding instead of changing the code:\n\n> Fine.\n"
+                + rebuttal.held_marker(HEAD))
+        self.assertEqual(rebuttal.quoted(body), "Fine.")
+        self.assertTrue(rebuttal.marked_held(body, HEAD))
+        self.assertFalse(rebuttal.marked_held(body, "e" * 40))
+        self.assertFalse(rebuttal.marked_held(body, ""))
 
     def test_merge_runs_the_gate_before_it_merges(self):
         with mock.patch.object(brain, "_refuse_unheld_answers",
