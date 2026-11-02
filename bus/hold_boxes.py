@@ -19,6 +19,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .github import GitHubError
+
 Ticket = Tuple[str, int]
 
 _TICKET = r"(?:[\w.-]+/[\w.-]+)?#\d+"
@@ -80,7 +82,8 @@ def refusal(body: str, repo: str, read: Callable[[Ticket], Dict[str, Any]],
     """Why a merge must wait for a ticket's hold box, as "blocked: ...", else "".
     It reads every ticket in `extra` (the pull request's own ticket) and every
     one the body names with Refs or Part of; `known` holds tickets already
-    read. `read` raises on a ticket it cannot read, which fails closed."""
+    read. `read` raises GitHubError or OSError on a ticket it cannot read,
+    which fails closed."""
     known = dict(known or {})
     tickets = list(extra) + [t for t in linked_tickets(body, repo) if t not in extra]
     found = []
@@ -88,7 +91,7 @@ def refusal(body: str, repo: str, read: Callable[[Ticket], Dict[str, Any]],
         ref = "%s#%d" % ticket
         try:
             issue = known[ticket] if ticket in known else (read(ticket) or {})
-        except Exception as err:  # noqa: BLE001 - any failed read fails closed
+        except (GitHubError, OSError) as err:  # an unreadable ticket fails closed
             found.append("%s unreadable (%s)" % (ref, type(err).__name__))
             continue
         if _is_epic(issue):
