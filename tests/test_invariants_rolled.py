@@ -445,7 +445,8 @@ class SettleBeforeFilingTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.host = types.SimpleNamespace(
-            _pulls={}, gh=self.gh,
+            # No station repo: the open list is the one the pass kept.
+            _pulls={}, gh=self.gh, s=types.SimpleNamespace(repos=()),
             _invariant_ref=lambda repo, number, noun="issue": Ref(
                 "%s#%d" % (repo, number), "%s #%d" % (noun, number)))
         self.host._lane_pull_settled = (

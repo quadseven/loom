@@ -166,7 +166,7 @@ agent_groups() {
 stop_orphaned_agent() {
   local leader="$1" mine groups g alive
   [[ "$leader" =~ ^[0-9]+$ ]] && kill -0 "$leader" 2>/dev/null || return 0
-  ps -o command= -p "$leader" 2>/dev/null | grep -q -- "run_lane.sh $SLOT\$" || return 0
+  grep -q -- "run_lane.sh $SLOT\$" <<<"$(ps -o command= -p "$leader" 2>/dev/null)" || return 0
   mine="$(ps -o pgid= -p $$ | tr -d ' ')"
   groups="$(agent_groups "$leader" | grep -v -x -e "$mine" -e 0 -e 1 | sort -u | tr '\n' ' ')"
   [ -n "$groups" ] || return 0
@@ -186,6 +186,9 @@ stop_orphaned_agent() {
 if ! mkdir "$LOCK" 2>/dev/null; then
   if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
   stop_orphaned_agent "$(cat "$LOCK/pgid" 2>/dev/null || true)"
+  # The agent's watchdog and its tail reader run in a group of their own; a
+  # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
+  stop_orphaned_agent "$(cat "$LOCK/watchdog_pgid" 2>/dev/null || true)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -480,11 +483,12 @@ drop_agent_files() {
   stamp="$(date -u +%FT%TZ)"
   while IFS= read -r f; do
     safe_git rm -q -f -- "$f" || return 1
-    if printf '%s\n' "$probes" | grep -Fxq -- "$f"; then
-      printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f"
-    else
-      printf '[%s] %s dropped scratch file: %s\n' "$stamp" "$TICKET" "$f"
-    fi
+    # No pipe into grep -q: its early exit can leave the writer with
+    # SIGPIPE, and under pipefail a probe would read as scratch (#2380).
+    case $'\n'"$probes"$'\n' in
+      *$'\n'"$f"$'\n'*) printf '[%s] %s dropped sandbox probe file: %s\n' "$stamp" "$TICKET" "$f" ;;
+      *) printf '[%s] %s dropped scratch file: %s\n' "$stamp" "$TICKET" "$f" ;;
+    esac
   done <<EOF
 $dropped
 EOF
@@ -1932,7 +1936,7 @@ model_listed() {
   [ "$provider" != "$model" ] || return 0
   list="$(timeout "$NET_TIMEOUT" "$(opencode_bin)" models "$provider" 2>/dev/null < /dev/null)" || return 0
   [ -n "$list" ] || return 0
-  printf '%s\n' "$list" | tr -d '\r' | grep -qxF -- "$model"
+  grep -qxF -- "$model" <<<"${list//$'\r'/}"
 }
 
 # Usage: opencode_agent <key_var> <run arguments...>
@@ -2044,7 +2048,7 @@ opencode_has_no_work() {
   local status
   [ "$(safe_git rev-parse HEAD)" = "$BASE" ] || return 1
   status="$(safe_git status --porcelain --untracked-files=all)" || return 1
-  ! printf '%s\n' "$status" | grep -v ' .loom/summary.md$' | grep -q .
+  [ -z "$(printf '%s\n' "$status" | grep -v ' .loom/summary.md$')" ]
 }
 
 # git in an agent's tree, run by the runner: never run hooks or an fsmonitor
@@ -3338,13 +3342,21 @@ Do not search the whole filesystem (for example, find /). Search within the chec
 
 # A watchdog for the running agent wrapper: tails the run log through
 # provider_text, and stops the agent early on a terminal limit line
-# (AI_RetryError after limit text, not a single retryable 429).
+# (AI_RetryError after limit text, not a single retryable 429). Only limit
+# text arms the kill: a bare 429 is retried by the CLI, and a later
+# AI_RetryError may come from another fault (loom#2401). The tail reader is
+# a job of this function, stopped when it ends, so none outlives the run.
 agent_watchdog() {
-  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line
+  local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line tail_pid=""
+  local fifo="$LOCK/watchdog.fifo"
   shopt -s nocasematch
-  tail -c +$((start + 1)) -f "$log" 2>/dev/null | provider_text | while IFS= read -r line; do
+  rm -f "$fifo"; mkfifo "$fifo" || return 0
+  trap 'kill "$tail_pid" 2>/dev/null; rm -f "$fifo"; exit 0' TERM
+  tail -c +$((start + 1)) -f "$log" 2>/dev/null > "$fifo" &
+  tail_pid=$!
+  while IFS= read -r line; do
     if [[ "$line" =~ $LIMIT_RE ]] || [[ "$line" =~ $LIMIT_CODE_RE ]] ||
-       [[ "$line" =~ 429 ]] || [[ "$line" =~ GoUsageLimitError ]]; then
+       [[ "$line" =~ GoUsageLimitError ]]; then
       seen_limit=1
     fi
     if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
@@ -3359,7 +3371,9 @@ agent_watchdog() {
       kill -KILL -- "-$agent" 2>/dev/null || kill -KILL "$agent" 2>/dev/null || true
       break
     fi
-  done
+  done < <(provider_text < "$fifo")
+  kill "$tail_pid" 2>/dev/null || true
+  rm -f "$fifo"
 }
 
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
@@ -3858,6 +3872,7 @@ for BRIEF in "$INBOX"/*.md; do
     echo $agent_pid > "$LOCK/pgid"
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
     watchdog_pid=$!
+    echo $watchdog_pid > "$LOCK/watchdog_pgid"
     wait $agent_pid
     agent_status=$?
     kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
@@ -3990,7 +4005,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$FAIL_CLASS" = auth ]; then
     # The provider refused the key, not the lane's work, so the brief is handed
     # on rather than spent and the rest of the inbox waits for the operator.
-    if printf '%s\n' "$FAILURE_OUT" | grep -qiE "$SIGNIN_RE"; then
+    if grep -qiE "$SIGNIN_RE" <<<"$FAILURE_OUT"; then
       # The CLI's own sign-in lapsed: no key parameter to renew or wait on,
       # even when the lane names one (agy names the lane user's password).
       AUTH_WHY="sign-in lapsed: sign in the $LANE lane CLI again"
@@ -4359,7 +4374,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$COMMITTED" -eq 1 ]; then
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
-      if [ -n "$FIX_PR" ] && printf '%s\n' "$PUSH_OUT" | grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)'; then
+      if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then
         NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
         if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
           park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
