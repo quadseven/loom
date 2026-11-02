@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, hold_boxes, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -727,6 +727,18 @@ def _foreign_criteria_reason(body: str, repo: str,
     return ""
 
 
+def _hold_box_reason(gh: GitHub, repo: str, pr: Dict[str, Any],
+                     ticket: Optional[Tuple[str, int]], issue: Dict[str, Any]) -> str:
+    """Block while the pull request's ticket, or one its body names with Refs
+    or Part of, has an unticked hold-before-merge box (loom#2392). `issue` is
+    the ticket already read; any other read that fails fails closed."""
+    def read(ref: Tuple[str, int]) -> Dict[str, Any]:
+        return gh.rest("GET", "/repos/%s/issues/%d" % ref).data or {}
+    own = [ticket] if ticket is not None else []
+    known = {ticket: issue} if ticket is not None else {}
+    return hold_boxes.refusal(str(pr.get("body") or ""), repo, read, known, own)
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -1107,6 +1119,9 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
             reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
         if reason:
             found.append(reason)
+    held = _hold_box_reason(gh, repo, pr, ticket, issue)
+    if held:
+        found.append(held.removeprefix("blocked: "))
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
@@ -4600,7 +4615,8 @@ def merge(gh: GitHub, repo: str, number: int,
                                              already_done.base_reader(gh, repo, pr))
             if unproven:
                 raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
-        reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+        reason = (_foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+                  or _hold_box_reason(gh, repo, pr, association, issue))
         if reason:
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
