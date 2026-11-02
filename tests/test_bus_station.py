@@ -4639,6 +4639,7 @@ class TicketsTest(unittest.TestCase):
             "Difficulty: hard\n"
             "Model: model-x\n\n"
             "# T12: Fix the thing\n\n"
+            + tickets.this_run(issue, "codex") +
             "## Why\nBecause.\n\n## What\nDo it.\nBase is fine\n"))
 
     def test_contractless_brief_lists_pr_workflow_commands_and_contract_brief_does_not(self):
@@ -4886,6 +4887,9 @@ class ClaimTest(Base):
             text = fh.read()
         self.assertEqual(text, tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
         self.assertIn("Issue: %s#12" % REPO, text)
+        # The brief names the claim label it adds as the run's own (loom#2507).
+        self.assertIn("## This run", text)
+        self.assertIn("The `claim:alice-example` label", text)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
         puts = [p for p in self.fake.paths("PUT")]

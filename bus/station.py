@@ -2618,7 +2618,8 @@ class Station:
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
                                     linked=self._linked_pulls(repo, number),
-                                    demoted_models=self._brief_demoted_models(lane))
+                                    demoted_models=self._brief_demoted_models(lane),
+                                    claim=self._lane_claim_label())
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -2816,13 +2817,18 @@ class Station:
         return "%s, %s" % (lock_state, "no keepalive stamp" if age is None
                            else "keepalive stamp %d seconds old" % age)
 
+    def _lane_claim_label(self) -> str:
+        """The claim:<operator login> label this claim adds, named in the
+        brief as the run's own claim (loom#2507); empty without a login."""
+        login = tickets.operator_login(self.s.authors)
+        return tickets.claim_label(login) if login else ""
+
     def _claim_label(self, repo: str) -> Optional[str]:
         """The claim:<operator login> label a claim adds, created in the repo
         the first time this pass needs it; None without an operator login."""
-        login = tickets.operator_login(self.s.authors)
-        if not login:
+        name = self._lane_claim_label()
+        if not name:
             return None
-        name = tickets.claim_label(login)
         if repo not in self._claim_labels:
             try:
                 self.gh.rest("POST", "/repos/%s/labels" % repo,
