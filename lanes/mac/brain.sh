@@ -493,6 +493,11 @@ for lane in $RUNGS; do
   [ "$FAIL_CLASS" = limit ] || break
   say "lane $RUNG hit a limit; the tick moves to the next rung with usage"
 done
+# The roll trees a tick leaves in $WORK/work are retired here, under the lock,
+# so no tick of this brain is using them (loom#2438): a landed tree goes, and
+# each tree kept is named in the log with its reason (bus/brain_trees.py).
+(cd "$REPO_ROOT" && LOOM_HOME="$LOOM_HOME" python3 -B -m bus.brain_trees prune) >> "$LOG" 2>&1 ||
+  say "could not retire the brain's roll trees in $WORK/work"
 brain step unlock --holder "$HOLDER" --lock-repo "$LOCK_REPO" >> "$LOG" 2>&1 || say "could not record unlock step"
 if [ "$runs" -eq 0 ]; then
   say "tick skipped: no brain lane has usage (${why:-LOOM_BRAIN_LADDER is empty})"

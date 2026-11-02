@@ -174,6 +174,16 @@ class BrainTickTest(unittest.TestCase):
         last = json.loads((state / "brain.json").read_text())
         return last, (state / "brain-ok").exists()
 
+    def test_a_tick_retires_its_roll_trees_after_the_agent_and_before_the_unlock(self):
+        # loom#2438: the roll trees in brain/work were never retired.
+        self.tick()
+        calls = self.log.read_text().splitlines()
+        prune = calls.index("python3 -B -m bus.brain_trees prune")
+        agent = max(i for i, c in enumerate(calls) if c.startswith("claude "))
+        unlock = max(i for i, c in enumerate(calls) if " step unlock " in c)
+        self.assertLess(agent, prune)
+        self.assertLess(prune, unlock)
+
     def test_heartbeats_say_how_each_tick_ended(self):
         self.tick()
         last, ok = self.beat()

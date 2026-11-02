@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import hunt_plan, labels, pr_repair, text, tickets  # noqa: E402
-from tests import sandbox_caps  # noqa: E402
+from tests import sandbox_caps, session_procs  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
 ROUND_MARKER = "<!-- loom:lane-round v1 -->"
@@ -735,8 +735,10 @@ print('leak guard: clean (shape patterns only)')
         (self.inbox / name).write_text(text)
 
     def run_lane(self, lane="codex", cwd=None, timeout=60, **env):
-        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
-                              capture_output=True, text=True, timeout=timeout)
+        # In a session of its own, emptied when the run ends or times out, so
+        # no watchdog or agent of a timed-out run outlives the test (loom#2438).
+        return session_procs.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
+                                 timeout=timeout)
 
     def lane_env(self, **env):
         return {
@@ -860,8 +862,7 @@ print('leak guard: clean (shape patterns only)')
         # of this repo there (loom#2418).
         self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
         self.drop_brief()
-        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
-                                capture_output=True, text=True, timeout=60)
+        result = session_procs.run(["bash", str(RUNNER), "codex"], env=env, timeout=60)
         self.assertNotIn("unbound variable", result.stderr)
 
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
@@ -6566,6 +6567,84 @@ exit %d
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def hung_agent(self):
+        """A codex that records its pid and hangs; returns the pid file."""
+        agent_pid = Path(self._tmp.name) / "agent.pid"
+        self.write_tool(self.bin / "codex",
+                        "#!/bin/bash\n"
+                        f"echo $$ > '{agent_pid}'\n"
+                        "exec sleep 120\n")
+        return agent_pid
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_a_run_that_times_out_leaves_no_process_of_its_tree(self):
+        # loom#2438: a test's timeout killed only the runner, and its agent,
+        # the watchdog, its tail -f and its grep lived on for hours.
+        self.drop_brief()
+        agent_pid = self.hung_agent()
+        agent = None
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.run_lane(timeout=15)
+            self.assertTrue(agent_pid.exists(), "the agent never started")
+            agent = int(agent_pid.read_text())
+            for _ in range(20):
+                if not self.alive(agent) and not self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertFalse(self.alive(agent), "the agent outlived the timed-out run")
+            self.assertEqual(self.watchdog_tails(), [])
+        finally:
+            for pid in self.watchdog_tails() + ([agent] if agent else []):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_a_watchdog_ends_itself_once_its_agent_is_gone(self):
+        # loom#2438: the watchdog runs in a group of its own and ended only
+        # when its runner stopped it, so a runner killed first left it, and its
+        # tail -f reader, until a next pass of that lane (in a test, never).
+        self.drop_brief()
+        agent_pid = self.hung_agent()
+        lock = self.loom / "run" / "codex.lock"
+        runner = subprocess.Popen(["bash", str(RUNNER), "codex"],
+                                  env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        try:
+            for _ in range(200):
+                if agent_pid.exists() and agent_pid.read_text().strip() and self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertNotEqual(self.watchdog_tails(), [], "the watchdog never started")
+            watchdog_group = int((lock / "watchdog_pgid").read_text())
+            # The runner and its job-control subshell go first, so nothing is
+            # left to stop the watchdog; then its agent goes.
+            os.killpg(runner.pid, signal.SIGKILL)
+            runner.wait(timeout=5)
+            os.kill(int(agent_pid.read_text()), signal.SIGKILL)
+            for _ in range(60):
+                if not self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(self.watchdog_tails(), [])
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(20):
+                    os.killpg(watchdog_group, 0)
+                    time.sleep(0.1)
+        finally:
+            session_procs.kill_session(runner.pid)
 
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
         # A lock written before watchdog_pgid existed still recovers.

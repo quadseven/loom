@@ -3384,15 +3384,28 @@ Do not search the whole filesystem (for example, find /). Search within the chec
 # text arms the kill: a bare 429 is retried by the CLI, and a later
 # AI_RetryError may come from another fault (loom#2401). The tail reader is
 # a job of this function, stopped when it ends, so none outlives the run.
+# The watchdog also ends itself once the agent is gone (loom#2438). It runs
+# in a process group of its own, so a runner killed before it could stop the
+# watchdog (a test's timeout kills only the runner) left the watchdog, its
+# tail -f and its grep running for hours. A read that waits
+# LOOM_WATCHDOG_POLL seconds (default 5) with no line checks the agent; a
+# live agent keeps it reading, so a real run is never cut short by this.
 agent_watchdog() {
   local agent="$1" start="${2:-0}" log="$3" seen_limit=0 line tail_pid=""
-  local fifo="$LOCK/watchdog.fifo"
+  local fifo="$LOCK/watchdog.fifo" poll="${LOOM_WATCHDOG_POLL:-5}"
+  [[ "$poll" =~ ^[1-9][0-9]*$ ]] || poll=5
   shopt -s nocasematch
   rm -f "$fifo"; mkfifo "$fifo" || return 0
   trap 'kill "$tail_pid" 2>/dev/null; rm -f "$fifo"; exit 0' TERM
   tail -c +$((start + 1)) -f "$log" 2>/dev/null > "$fifo" &
   tail_pid=$!
-  while IFS= read -r line; do
+  while :; do
+    if ! IFS= read -r -t "$poll" line; then
+      # A timeout, or the reader's end (bash 3.2 gives both status 1): read
+      # on only while the agent and the tail reader both live.
+      kill -0 "$agent" 2>/dev/null && kill -0 "$tail_pid" 2>/dev/null && continue
+      break
+    fi
     if [[ "$line" =~ $LIMIT_RE ]] || [[ "$line" =~ $LIMIT_CODE_RE ]] ||
        [[ "$line" =~ GoUsageLimitError ]]; then
       seen_limit=1
