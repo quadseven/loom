@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, invariants, metrics, station  # noqa: E402
+from bus import brain, factory, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
@@ -589,6 +589,26 @@ class StationTest(StationBase):
         self.assertIn("#660: 2 review threads, no fix round", filed["body"])
         self.assertLessEqual(len(filed["title"]), 72)
         self.assertIn("bus.brain fix", filed["body"])
+
+    def test_a_stalled_lane_pull_with_open_threads_queues_a_fix_round(self):
+        self.lane_ticket(602, labels=("loom:ticket", "loom:pr", "lane:codex"))
+        self.lane_pull(660, 602, T0 - invariants.PR_STALLED - 1)
+        self.bot_threads(1)
+        with mock.patch("bus.brain.fix", return_value=True) as fix:
+            self.run_at(T0)
+        fix.assert_called_once()
+        args, kwargs = fix.call_args
+        self.assertEqual(args[1:4], (REPO, 660, (REPO, 602)))
+        self.assertEqual(args[4], factory.FIX_NOTES)
+        self.assertEqual(kwargs["lane"], "codex")
+        self.assertEqual(kwargs["authors"], [AUTHOR])
+
+    def test_a_lane_pull_without_threads_does_not_queue_an_automatic_fix(self):
+        self.lane_ticket(602, labels=("loom:ticket", "loom:pr", "lane:codex"))
+        self.lane_pull(660, 602, T0 - invariants.PR_STALLED - 1)
+        with mock.patch("bus.brain.fix") as fix:
+            self.run_at(T0)
+        fix.assert_not_called()
 
     def test_a_lane_pull_with_its_fix_round_queued_or_waiting_to_merge_files_nothing(self):
         self.lane_ticket(603, labels=("loom:ticket", "loom:briefed", "lane:zen"))
