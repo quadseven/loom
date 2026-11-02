@@ -17,7 +17,9 @@ DAY = 86400
 
 
 def git(*args, cwd):
-    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+    # No auto gc or maintenance: a detached one could write after age().
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                           "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args],
                           cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
@@ -173,6 +175,14 @@ class BrainTreesTest(unittest.TestCase):
         self.assertIn("remove roll-linked reason=merged", out)
         self.assertFalse((self.work / "roll-linked").exists())
         self.assertNotIn("roll-linked", git("worktree", "list", cwd=main))
+
+    def test_a_fetch_or_gc_writing_in_the_git_dir_does_not_make_a_tree_fresh(self):
+        # The prune's own fetch writes FETCH_HEAD and refs each tick; were they
+        # counted, no tree would ever be idle long enough to go.
+        path = self.tree("roll-unpushed", commit=("pin.txt", "v5\n"))
+        (path / ".git" / "FETCH_HEAD").write_text("fresh\n")
+        out = self.prune()
+        self.assertIn("keep roll-unpushed reason=unpushed-commits=1", out)
 
     def test_a_link_or_a_plain_folder_is_kept_untouched(self):
         (self.work / "notes").mkdir()

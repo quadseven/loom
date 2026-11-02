@@ -127,14 +127,24 @@ def linked_worktrees(path: str) -> int:
 
 
 def newest_mtime(path: str) -> float:
-    """The newest mtime of anything in the tree, its git dir included."""
+    """The newest mtime of the tree's files, and of its git index and HEAD.
+    The rest of the git dir is left out: this prune's own fetch writes there
+    (FETCH_HEAD, refs, packs), as does git's background maintenance, and
+    either would keep every tree looking fresh, tick after tick."""
     newest = os.lstat(path).st_mtime
     for top, dirs, files in os.walk(path):
+        if top == path:
+            dirs[:] = [d for d in dirs if d != ".git"]
         for name in dirs + files:
             try:
                 newest = max(newest, os.lstat(os.path.join(top, name)).st_mtime)
             except OSError:
                 continue
+    for name in ("index", "HEAD"):
+        try:
+            newest = max(newest, os.lstat(os.path.join(path, ".git", name)).st_mtime)
+        except OSError:
+            continue
     return newest
 
 
