@@ -56,7 +56,7 @@ import fnmatch
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Container, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import change_class, status
@@ -358,7 +358,7 @@ THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!,$after:String) {"
     " repository(owner:$owner,name:$name) { pullRequest(number:$number) {"
     " reviewThreads(first:100,after:$after) { pageInfo { hasNextPage endCursor }"
-    " nodes { isResolved comments(first:1) { nodes {"
+    " nodes { id isResolved comments(first:1) { nodes {"
     " author { __typename login } body createdAt } } } } } } }")
 THREAD_PAGES = 20
 
@@ -390,17 +390,37 @@ def review_threads(gh: Any, repo: str, number: int) -> List[Mapping[str, Any]]:
     raise ValueError("more than %d pages of review threads" % THREAD_PAGES)
 
 
+def fix_committed(commits: Sequence[Mapping[str, Any]]) -> str:
+    """The committedDate of the newest commit that is not a base merge, from
+    a pull request's commit nodes (oldest first), else "". A merge commit
+    (two parents, as GitHub's update branch makes) is newer than any finding
+    but proves no fix (loom#2285)."""
+    for node in reversed(list(commits)):
+        commit = (node or {}).get("commit") or {}
+        parents = (commit.get("parents") or {}).get("totalCount")
+        if isinstance(parents, int) and parents < 2:
+            return str(commit.get("committedDate") or "")
+    return ""
+
+
 def blocking_findings(threads: Sequence[Mapping[str, Any]], committed: str,
                       by_bot: Callable[[Mapping[str, Any]], bool],
-                      env: Optional[Mapping[str, str]] = None) -> List[str]:
+                      env: Optional[Mapping[str, str]] = None,
+                      held: Container[str] = ()) -> List[str]:
     """The review-bot findings that hold an auto-merge: high or critical, or
     from a bad-work rule, whose thread is open or was resolved with no commit
     after it (deferred, or resolved by hand without a fix). `threads` are
-    every review thread (review_threads), `committed` the head commit's
-    committedDate, and `by_bot` says whether a comment is the review bot's.
-    A missing time cannot show a fix followed."""
+    every review thread (review_threads), `committed` the date of the newest
+    commit that can be a fix (fix_committed), and `by_bot` says whether a
+    comment is the review bot's. `held` names the resolved threads whose lane
+    answer was checked on the head and held (bus/rebuttal.py): an answered
+    false finding needs no commit (loom#2285). A missing time cannot show a
+    fix followed."""
     out = []
     for thread in threads:
+        tid = str(thread.get("id") or "")
+        if tid and thread.get("isResolved") and tid in held:
+            continue
         comments = (thread.get("comments") or {}).get("nodes") or []
         root = (comments[0] if comments else None) or {}
         body = str(root.get("body") or "")

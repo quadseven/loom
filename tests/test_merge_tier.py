@@ -58,6 +58,10 @@ def thread(body, resolved=False, created="2030-01-02T09:00:00Z", bot=True):
             "comments": {"nodes": [{"author": author, "body": body, "createdAt": created}]}}
 
 
+def commit(date, parents=1):
+    return {"commit": {"committedDate": date, "parents": {"totalCount": parents}}}
+
+
 def by_bot(comment):
     return brain.by_bot(dict(comment), BOT)
 
@@ -185,6 +189,32 @@ class Findings(unittest.TestCase):
         self.assertEqual(merge_tier.blocking_findings([deferred, fixed], HEAD_AT, by_bot),
                          ["medium dead-code"])
 
+    def test_a_resolved_finding_whose_answer_held_on_the_head_does_not_block(self):
+        # loom#2285: the lane answered a false finding, the station verified
+        # the answer on the head and resolved the thread; no commit follows.
+        answered = dict(thread(self.DEAD, resolved=True, created="2030-01-02T11:00:00Z"), id="T1")
+        self.assertEqual(merge_tier.blocking_findings([answered], HEAD_AT, by_bot,
+                                                      held={"T1"}), [])
+        self.assertEqual(merge_tier.blocking_findings([answered], HEAD_AT, by_bot,
+                                                      held={"T2"}), ["medium dead-code"])
+        opened = dict(answered, isResolved=False)
+        self.assertEqual(merge_tier.blocking_findings([opened], HEAD_AT, by_bot, held={"T1"}),
+                         ["medium dead-code"])
+
+    def test_a_base_merge_after_the_finding_is_not_a_fix(self):
+        # loom#2285: an update-branch merge is newer than the finding but
+        # proves nothing; only a commit with one parent counts.
+        found = thread(self.DEAD, resolved=True, created="2030-01-02T09:00:00Z")
+        commits = [commit("2030-01-02T08:00:00Z"), commit("2030-01-02T10:00:00Z", parents=2)]
+        since = merge_tier.fix_committed(commits)
+        self.assertEqual(since, "2030-01-02T08:00:00Z")
+        self.assertEqual(merge_tier.blocking_findings([found], since, by_bot),
+                         ["medium dead-code"])
+        fixed = commits + [commit("2030-01-02T10:30:00Z")]
+        self.assertEqual(merge_tier.blocking_findings(
+            [found], merge_tier.fix_committed(fixed), by_bot), [])
+        self.assertEqual(merge_tier.fix_committed([commit("2030-01-02T10:00:00Z", parents=2)]), "")
+
     def test_the_factory_never_defers_a_bad_work_finding(self):
         threads = [{"id": "T1", "isResolved": False,
                     "root": {"nodes": [{"author": {"__typename": "Bot", "login": BOT},
@@ -258,15 +288,17 @@ class Route:
 
 def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_labels=(),
            title="Keep the build cache warm", body="## Summary\nx\n", pages=None,
-           labeler="loom-station[bot]", commit_files=None, carried="ahead", patches=None):
+           labeler="loom-station[bot]", commit_files=None, carried="ahead", patches=None,
+           commits=None):
     pr = {"number": 8, "state": "open", "draft": False, "title": title,
           "body": body + "\nRefs %s#9" % REPO,
           "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}},
           "base": {"ref": "main", "repo": {"full_name": REPO}}, "mergeable": True}
     graph = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
              "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO},
-             "commits": {"nodes": [{"commit": {"committedDate": HEAD_AT,
-                                               "statusCheckRollup": {"state": "SUCCESS"}}}]},
+             "commits": {"nodes": commits or [{"commit": {
+                 "committedDate": HEAD_AT, "parents": {"totalCount": 1},
+                 "statusCheckRollup": {"state": "SUCCESS"}}}]},
              "reviewThreads": {"nodes": list(threads or ())},
              "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": "## What\nx\n",
@@ -284,6 +316,7 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
         "threads": pages if pages is not None else (None if threads is None
                                                      else [list(threads)]),
         "/repos/%s/compare/abc1234...main" % REPO: {"status": carried},
+        "/repos/%s/compare/abc1234...checked" % REPO: {"status": "ahead"},
         "/repos/%s/commits/abc1234" % REPO: {"files": commit_files or []},
         "/repos/%s/commits/checked/check-runs" % REPO: {"check_runs": [
             {"name": "Grug - Elder", "status": "completed", "conclusion": conclusion}]},
@@ -333,6 +366,31 @@ class BrainMerge(unittest.TestCase):
                 fake, refused = self.merge(files=APP_CHANGE, **kw)
                 self.assertIn(why, refused)
                 self.assertFalse(self.merged(fake))
+
+    def answered(self, answer):
+        """The dead-code finding, resolved by the station on a lane answer,
+        with no commit after it (loom#2285)."""
+        reply = "Lane codex %s\n\n> %s" % (factory.ANSWER_REPLY, answer)
+        return dict(thread(Findings.DEAD, resolved=True, created="2030-01-02T11:00:00Z"),
+                    id="T1", path="a.py",
+                    latest={"nodes": [{"author": {"__typename": "Bot", "login": "loom-station"},
+                                       "body": reply}]})
+
+    def test_a_finding_answered_and_held_on_the_head_does_not_hold_the_merge(self):
+        fake, refused = self.merge(files=APP_CHANGE, threads=[self.answered("Fixed in abc1234")])
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+
+    def test_a_base_merge_after_a_finding_does_not_release_it(self):
+        found = thread(Findings.DEAD, resolved=True, created="2030-01-02T09:00:00Z")
+        update = [{"commit": {"committedDate": "2030-01-02T08:00:00Z", "parents": {"totalCount": 1}}},
+                  {"commit": {"committedDate": HEAD_AT, "parents": {"totalCount": 2},
+                              "statusCheckRollup": {"state": "SUCCESS"}}}]
+        fake, refused = self.merge(files=APP_CHANGE, threads=[found], commits=update)
+        self.assertIn("open review findings hold the merge: medium dead-code", refused)
+        self.assertFalse(self.merged(fake))
+        fake, refused = self.merge(files=APP_CHANGE, threads=[found])
+        self.assertEqual(refused, "")
 
     # The merged commit a revert undoes, and its exact inverse.
     FORWARD = "@@ -1 +1 @@\n-buildctl-daemonless.sh build\n+buildctl --addr unix:///sock build"
