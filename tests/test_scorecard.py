@@ -319,15 +319,19 @@ class ZeroDoneDemotion(unittest.TestCase):
         # At NOW: zen may receive one probe brief
         st.now = NOW
         self.assertEqual(st._not_demoted(["zen"]), ["zen"])
+        self.assertTrue(st._can_claim("zen"))
 
         # Once probed, zen gets at most one probe brief an hour
         sc.note_probe("zen")
         st.now = NOW + 60
         self.assertEqual(st._not_demoted(["zen"]), [])
+        self.assertFalse(st._can_claim("zen"))
+        self.assertFalse(st._claim(REPO, "zen", {"number": 1}))
 
         # After an hour has passed, zen may receive another probe brief
         st.now = NOW + 3601
         self.assertEqual(st._not_demoted(["zen"]), ["zen"])
+        self.assertTrue(st._can_claim("zen"))
 
     def test_limit_park_does_not_count_toward_the_rule_and_one_done_brief_clears_the_demotion(self):
         """A test: a limit park does not count toward the rule, and one done brief

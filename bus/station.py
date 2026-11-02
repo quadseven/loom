@@ -2577,6 +2577,8 @@ class Station:
         its fix comment cannot be used (refused, as an untrusted ticket is),
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
+        if not self._can_claim(lane):
+            return False
         number = int(issue["number"])
         comments = self._claim_comments(repo, issue, number)
         if comments is None:
@@ -13175,19 +13177,16 @@ class Station:
                      merges if isinstance(merges, dict) else {})
         card.save()
 
+    def _can_claim(self, lane: str) -> bool:
+        """Whether a lane may claim a brief: not demoted, or a zero-done
+        demoted lane whose probe gate is open."""
+        return lane not in self.demoted_lanes() or scorecard.Scorecard(self.state, self.now).can_probe(lane)
+
     def _not_demoted(self, free: List[str]) -> List[str]:
         """The free lanes that may claim a build ticket: a demoted lane
         takes none (bus/scorecard.py), except that a zero-done demoted lane
         gets at most one probe brief an hour."""
-        card = scorecard.Scorecard(self.state, self.now)
-        demoted = self.demoted_lanes()
-        out = []
-        for lane in free:
-            if lane not in demoted:
-                out.append(lane)
-            elif card.can_probe(lane):
-                out.append(lane)
-        return out
+        return [lane for lane in free if self._can_claim(lane)]
 
     def demoted_lanes(self) -> Dict[str, str]:
         """Each lane slot the scorecard demoted, and why. A scorecard file
