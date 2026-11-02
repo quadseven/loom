@@ -7118,6 +7118,66 @@ exec /usr/bin/git "$@"
         self.assertIn("factory incident quadseven/loom#99", log)
         self.assertFalse(list(self.loom.glob("**/*-default-check")))
 
+    def test_a_leftover_default_check_tree_is_removed_before_checkout(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract=CONTRACT.replace(
+            "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
+            "test -f .prepared && ", ""))
+        name, _ = self.fix_brief()
+        work = Path(self._tmp.name) / "pr-work"
+        (work / "fix.txt").write_text("broken\n")
+        git("add", "fix.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Break check", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("main.txt", "new main\n")
+        leftover = self.loom / "worktrees" / (name + "-default-check")
+        leftover.mkdir(parents=True)
+        (leftover / "stale.txt").write_text("interrupted clone\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING.replace(
+            "cat > /dev/null", "test -f main.txt || exit 9\n"
+            "echo 'agent saw default branch' >> \"$FAKE_LOG\"\n"
+            "cat > /dev/null"))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent saw default branch", self.calls(), self.run_log(name + ".log"))
+        self.assertNotIn("could not check out the default branch", self.run_log(name + ".log"))
+        self.assertFalse(leftover.exists())
+        records = [json.loads(line) for line in (self.loom / "logs" / "codex" /
+                   (name + ".validation.jsonl")).read_text().splitlines()]
+        default = next(row for row in records if row["phase"] == "default-baseline")
+        self.assertEqual((default["exit"], default["revision"]), (0, self.remote_head("main")))
+
+    def test_a_leftover_default_check_tree_removal_failure_is_setup_not_work(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        real_rm = shutil.which("rm")
+        self.write_tool(self.bin / "rm", "#!/bin/sh\n"
+                        "case \"$*\" in *-default-check*) echo 'rm denied' >&2; exit 1;; esac\n"
+                        f"exec {shlex.quote(real_rm)} \"$@\"\n")
+        self.contract_repo(contract=CONTRACT.replace(
+            "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
+            "test -f .prepared && ", ""))
+        name, _ = self.fix_brief()
+        work = Path(self._tmp.name) / "pr-work"
+        (work / "fix.txt").write_text("broken\n")
+        git("add", "fix.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "Break check", cwd=work)
+        git("push", "-q", "origin", self.FIX_BRANCH, cwd=work)
+        self.advance_main("main.txt", "new main\n")
+        leftover = self.loom / "worktrees" / (name + "-default-check")
+        leftover.mkdir(parents=True)
+        (leftover / "stale.txt").write_text("interrupted clone\n")
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        log = self.run_log(name + ".log")
+        self.assertIn("could not check out the default branch for validation", log)
+        self.assertIn("failed: [factory] setup failed:", log)
+        self.assertNotIn("failed: [work]", log)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("factory incident quadseven/loom#99", log)
+
     def test_a_red_fix_head_on_green_main_reaches_the_agent_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
