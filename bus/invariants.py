@@ -1295,11 +1295,15 @@ class Filer:
         self.subjects = subjects if subjects is not None else {}
         self.settled = settled
         self.seen = seen if seen is not None else {}
-        self.read = tuple(ROLLED if read is None else read)
+        self.read: Tuple[str, ...] = ()
         # Tracking issue keys whose repo could not be read this pass.
-        self._unread_keys = {Breach(kind, "%s in %s" % (kind, repo), "", (), 0.0).key
-                             for kind, repos in (unread or {}).items() for repo in repos}
+        self._unread_keys: set = set()
+        self.reads(read, unread)
         self.writes = 0
+        # What run() had to write: (breaches to file or refresh, gone
+        # breaches whose issue may settle). The station names them when a
+        # gate stops the writing (loom#2505).
+        self.pending: Tuple[int, int] = (0, 0)
         # Older per-violation issues folded into a tracking issue this pass.
         self.folds = 0
         # Breach key -> issue number of each tracking issue (ROLL_MARKER).
@@ -1319,6 +1323,27 @@ class Filer:
         self._ticketed: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
+
+    def reads(self, read: Optional[Sequence[str]],
+              unread: Optional[Dict[str, Sequence[str]]]) -> None:
+        """Name what this pass read, as the constructor's `read` and
+        `unread` do, for a filer built before the reads (settle_early)."""
+        self.read = tuple(ROLLED if read is None else read)
+        self._unread_keys = {Breach(kind, "%s in %s" % (kind, repo), "", (), 0.0).key
+                             for kind, repos in (unread or {}).items() for repo in repos}
+
+    def settle_early(self) -> None:
+        """The settle step, before the caller's heavy reads (loom#2505): a
+        check whose reads reach the pass request target still closes what
+        settled. No breach is current yet, so only a subject the settled
+        callback calls settled for good closes, and run() later settles the
+        rest within the same FOLD_MAX and WRITES_MAX."""
+        if not self.write:
+            return
+        try:
+            self._settle({})
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close settled issues: %s" % err)
 
     def _listing(self) -> Dict[str, int]:
         """Breach key -> issue number for every loom:invariant issue, open or
@@ -2077,6 +2102,7 @@ class Filer:
         for b in current.values():
             if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
+        self.pending = (len(current), len([k for k in self.subjects if k not in current]))
         if not self.write:
             return
         # Settle first: it closes at most FOLD_MAX issues a pass, and filing

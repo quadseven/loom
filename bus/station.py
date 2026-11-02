@@ -609,6 +609,14 @@ MAX_FIX_BODY = 60000
 # it all stops claiming until the reset.
 BUDGET_FLOOR = 0.15
 PASS_REQUEST_TARGET = 500
+# Requests the invariant filer may spend past the pass target once the
+# check's reads are done (loom#2505). The reads cost 70 to 480 counted
+# requests (warm or cold cache) and end in check-run and pull request
+# list reads the target never stops, so they often finished past it, and
+# the filer then wrote nothing, every such pass. A filer pass measured 45:
+# 35 pull request state reads for the settle step, five writes, the
+# listing. The budget floor still stops writing outright.
+INVARIANT_WRITE_RESERVE = 100
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -2126,6 +2134,8 @@ class Station:
         self._waiting_asks: Optional[Dict[str, List[Dict[str, Any]]]] = None
         self._repo_privacy: Dict[str, Optional[bool]] = {}
         self._invariant_repo = ""
+        # What this pass's invariant check read; empty until its reads are done.
+        self._read_facts = invariants.Facts(now=self.now)
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
@@ -11269,34 +11279,39 @@ class Station:
         checked = state.get("checked")
         if self._num(checked) and 0 <= self.now - checked < invariants.CHECK_EVERY:
             return
+        if self._target_reached():
+            # The step loop stops at the target, so only a step called on its
+            # own gets here; its reads would carry over, so it waits unstamped.
+            _say("invariants: writing off this pass (gate: request target, reached before "
+                 "the reads): %d requests used of the %s target, the check waits for the "
+                 "next pass" % (self._pass_counted(), self.gh.target))
+            return
         state["checked"] = self.now
         # Before the reads: a check they stop waits CHECK_EVERY like any other,
         # rather than costing each pass its 270 requests again (loom#2321).
         invariants.save(path, state)
         goal = self._invariant_goal()
         self._invariant_repo = goal[0] if goal else ""
-        facts = self._invariant_facts(state)
+        filer = self._invariant_filer(state, goal)
+        if filer is not None:
+            filer.settle_early()
+            invariants.save(path, state)
+        try:
+            facts = self._invariant_facts(state)
+        except TargetReached as err:
+            if filer is not None:
+                self._say_writing_off(filer, "request target, during the reads: %s" % err,
+                                      "filing and the rest of the settle step")
+            raise
+        self._read_facts = facts
         self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
                  "LOOM_INVARIANT_GOAL" % len(breaches))
-        if goal is not None:
-            issues = state.get("issues")
-            if not isinstance(issues, dict):
-                issues = state["issues"] = {}
-            subjects = state.get("subjects")
-            if not isinstance(subjects, dict):
-                subjects = state["subjects"] = {}
-            seen = state.get("seen")
-            if not isinstance(seen, dict):
-                seen = state["seen"] = {}
-            invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred(), authors=self.s.authors,
-                             subjects=subjects, seen=seen,
-                             read=invariants.read_kinds(facts), unread=facts.unread,
-                             settled=lambda inv, subject: self._invariant_settled(
-                                 facts, inv, subject)).run(breaches)
+        if filer is not None:
+            filer.reads(invariants.read_kinds(facts), facts.unread)
+            self._file_invariants(filer, breaches, self._invariant_write_gate())
         invariants.save(path, state)
 
     def _unstick_lane_pulls(self, facts: invariants.Facts) -> None:
@@ -11338,6 +11353,74 @@ class Station:
             return None
         return match.group(1), int(match.group(2))
 
+    def _invariant_filer(self, state: Dict[str, Any],
+                         goal: Optional[Tuple[str, int]]) -> Optional[invariants.Filer]:
+        """The filer for this check, built before its reads so the settle
+        step runs first (loom#2505); None with no goal home. Its settled
+        callback reads this check's facts once they are read: before, an
+        epic reads as not settled and only a lane pull request can settle."""
+        if goal is None:
+            return None
+        maps = []
+        for name in ("issues", "subjects", "seen"):
+            if not isinstance(state.get(name), dict):
+                state[name] = {}
+            maps.append(state[name])
+        self._read_facts = invariants.Facts(now=self.now)
+        return invariants.Filer(self.gh, goal[0], goal[1], maps[0], self.now, _say,
+                                write=self._invariant_write_gate() is None,
+                                authors=self.s.authors, subjects=maps[1], seen=maps[2],
+                                settled=lambda inv, subject: self._invariant_settled(
+                                    self._read_facts, inv, subject))
+
+    def _pass_counted(self) -> int:
+        """The requests this pass's target counts so far (304s left out)."""
+        counted = getattr(self.gh, "counted", None)
+        if counted is None:
+            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
+        return int(counted)
+
+    def _invariant_write_gate(self) -> Optional[str]:
+        """What keeps this check from writing, or None. The pass target
+        reached during the check's own reads does not (loom#2505): the reads
+        are paid for, and the filer gets INVARIANT_WRITE_RESERVE past them."""
+        low = self.budget_low()
+        if low is not None:
+            resource, remaining, limit, _reset = low
+            return "budget floor, %s %d of %d left" % (resource, remaining, limit)
+        return None
+
+    def _file_invariants(self, filer: invariants.Filer, breaches: List[invariants.Breach],
+                         gate: Optional[str]) -> None:
+        """Run the filer, past the pass target by INVARIANT_WRITE_RESERVE at
+        most, and log one line whenever a gate kept it from writing all it
+        had: the gate, the requests used and the writes skipped (loom#2505:
+        a pass that read everything and wrote nothing said nothing)."""
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if gate is None and has_target:
+            self.gh.target = max(target, self._pass_counted()) + INVARIANT_WRITE_RESERVE
+        filer.write = gate is None
+        try:
+            filer.run(breaches)
+        except TargetReached as err:
+            gate = "request target reserve of %d, %s" % (INVARIANT_WRITE_RESERVE, err)
+        finally:
+            if has_target:
+                self.gh.target = target
+        if gate is not None:
+            breached, gone = filer.pending
+            self._say_writing_off(filer, gate, "%d breach(es) to file or refresh and %d gone "
+                                               "report(s) to settle" % (breached, gone))
+
+    def _say_writing_off(self, filer: invariants.Filer, gate: str, skipped: str) -> None:
+        """The one line a check logs when a gate stops its writing (loom#2505)."""
+        target = getattr(self.gh, "target", None)
+        _say("invariants: writing off this pass (gate: %s): %d requests used of the %s "
+             "target, %d writes made, skipped %s"
+             % (gate, self._pass_counted(), target if target is not None else "no",
+                filer.writes, skipped))
+
     def _invariant_settled(self, facts: invariants.Facts, invariant: str,
                            subject: str) -> Optional[str]:
         """Why a gone breach's subject is settled for good, in words a public
@@ -11353,9 +11436,11 @@ class Station:
         return None
 
     def _lane_pull_settled(self, repo: str, number: int) -> Optional[str]:
-        """How a lane pull request left the open set, or None while it is open."""
-        if any(isinstance(p, dict) and p.get("number") == number
-               for p in self._pulls.get(repo, [])):
+        """How a lane pull request left the open set, or None while it is open.
+        The settle step runs before the check's reads (loom#2505), so a
+        station repo's open list is read here, once a pass, as they read it."""
+        listed = self._open_pulls(repo) if repo in self.s.repos else self._pulls.get(repo, [])
+        if any(isinstance(p, dict) and p.get("number") == number for p in listed):
             return None
         pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
         if not isinstance(pr, dict) or pr.get("state") != "closed":
@@ -14095,10 +14180,7 @@ class Station:
         target = getattr(self.gh, "target", None)
         if not isinstance(target, int) or isinstance(target, bool):
             return False
-        counted = getattr(self.gh, "counted", None)
-        if counted is None:
-            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
-        return counted >= target
+        return self._pass_counted() >= target
 
     def _deferred(self) -> bool:
         """True when the budget is low or the pass request target has been

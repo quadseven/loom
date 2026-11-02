@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, invariants, metrics, station  # noqa: E402
+from bus import brain, factory, github, invariants, metrics, station  # noqa: E402
 from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
@@ -2066,3 +2066,154 @@ class RollPinOffTest(StationBase):
         self.gh.goal_issues[REPO][0]["body"] = "Ship rules: rolling deploys, with rollback."
         self.run_at(T0)
         self.assertEqual(self.breaches(), [])
+
+
+class TargetGH(FakeGH):
+    """FakeGH counting its requests against the pass target as bus/github.py
+    does: `base` requests were counted before the step, a paginated read of
+    a deferrable kind at or past the target raises TargetReached, and a
+    single request never stops."""
+
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.target = None
+        self.carried_over = {}
+
+    @property
+    def counted(self):
+        return self.base + len(self.calls)
+
+    def paginate(self, path):
+        kind = github.request_kind("GET", path)
+        if (isinstance(self.target, int) and kind in github.DEFERRABLE_KINDS
+                and self.counted >= self.target):
+            self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            raise github.TargetReached("%s read carried over at request target" % kind)
+        return super().paginate(path)
+
+
+class PassTargetWriteGateTest(StationBase):
+    """loom#2505: the invariant check's reads end in check-run and pull
+    request list reads the pass target never stops, so a check that began
+    under the target often ended past it, and the filer was then built with
+    write off: nothing settled, and nothing said so. Measured read-only on
+    2026-11-02 against the live repos: the reads cost 70 to 480 counted
+    requests a check, the filer 45."""
+
+    legacy = SettledSubjectTest.legacy
+    leave_open_set = SettledSubjectTest.leave_open_set
+    # The check's reads, past the pass's own: the tail that crosses the target.
+    TAIL = 60
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.gh = TargetGH(station.PASS_REQUEST_TARGET - self.TAIL // 2)
+        self.gh.private = set()
+        self.after_reads = None
+        real = station.Station._invariant_facts
+
+        def facts(st, state):
+            out = real(st, state)
+            # The check-run and pull request list reads at the end of the
+            # real check: not deferrable, so they run past the target.
+            self.gh.base += self.TAIL
+            self.after_reads = self.gh.counted
+            return out
+        patcher = mock.patch.object(station.Station, "_invariant_facts", facts)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def settled_report(self):
+        filed = self.legacy("lane-pr-stalled", "%s#660" % REPO)
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        return filed
+
+    def gate_lines(self):
+        return [line for line in self.said if line.startswith("invariants: writing off")]
+
+    def test_a_check_whose_reads_cross_the_target_still_settles_its_report(self):
+        filed = self.settled_report()
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertGreaterEqual(self.after_reads, station.PASS_REQUEST_TARGET)
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertTrue(any("closed settled" in line for line in self.said), self.said)
+        self.assertEqual(self.gate_lines(), [])
+
+    def test_the_settle_step_runs_before_the_reads_and_its_requests_are_pinned(self):
+        self.settled_report()
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        # The listing, the open list (read once a pass, and reused by the
+        # reads after), the pull request, the issue, the note and the close:
+        # six requests, before the check's first read.
+        self.assertEqual(self.gh.calls[:6], [
+            ("GET", "/repos/%s/issues?labels=loom:invariant&state=all" % REPO),
+            ("GET", "/repos/%s/pulls?state=open&per_page=100" % REPO),
+            ("GET", "/repos/%s/pulls/660" % REPO),
+            ("GET", "/repos/%s/issues/90" % REPO),
+            ("POST", "/repos/%s/issues/90/comments" % REPO),
+            ("PATCH", "/repos/%s/issues/90" % REPO)])
+        self.assertEqual(self.gh.calls.count(("GET", "/repos/%s/pulls?state=open&per_page=100"
+                                              % REPO)), 1)
+        # After the reads the filer spends nothing more on a settled report,
+        # within its reserve, and the pass target comes back.
+        self.assertEqual(self.gh.counted - self.after_reads, 0, self.gh.calls[-3:])
+        self.assertEqual(self.gh.target, station.PASS_REQUEST_TARGET)
+
+    def test_a_check_whose_reads_carry_over_at_the_target_still_settles_and_says_so(self):
+        filed = self.settled_report()
+        # Six requests of room: the settle step's own, then the goal walk's
+        # first page carries over as it does live (measured 2026-11-02:
+        # begun at 380 or 450 counted requests, every check carried over).
+        self.gh.base = station.PASS_REQUEST_TARGET - 6
+        with self.assertRaises(github.TargetReached):
+            self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        (line,) = self.gate_lines()
+        self.assertEqual(
+            line, "invariants: writing off this pass (gate: request target, during the reads: "
+                  "other read carried over at request target): %d requests used of the %d "
+                  "target, 2 writes made, skipped filing and the rest of the settle step"
+                  % (self.gh.counted, station.PASS_REQUEST_TARGET))
+        self.assertGreaterEqual(self.gh.counted, station.PASS_REQUEST_TARGET)
+
+    def test_the_budget_floor_turns_writing_off_with_one_line(self):
+        filed = self.settled_report()
+        self.gh.rate = {"core": (100, 5000, int(T0) + 3600)}
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open")
+        self.assertEqual(self.gh.writes, [])
+        (line,) = self.gate_lines()
+        self.assertEqual(
+            line, "invariants: writing off this pass (gate: budget floor, core 100 of 5000 "
+                  "left): %d requests used of the %d target, 0 writes made, skipped 0 "
+                  "breach(es) to file or refresh and 1 gone report(s) to settle"
+                  % (self.after_reads, station.PASS_REQUEST_TARGET))
+
+    def test_a_check_begun_past_the_target_says_so(self):
+        filed = self.settled_report()
+        self.gh.base = station.PASS_REQUEST_TARGET
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open")
+        (line,) = self.gate_lines()
+        self.assertEqual(line, "invariants: writing off this pass (gate: request target, "
+                               "reached before the reads): %d requests used of the %d target, "
+                               "the check waits for the next pass"
+                         % (station.PASS_REQUEST_TARGET, station.PASS_REQUEST_TARGET))
+        self.assertEqual(self.gh.calls, [])
+
+    def test_a_filer_stopped_at_its_reserve_says_so_and_keeps_its_state(self):
+        self.settled_report()
+        stop = github.TargetReached("comments read carried over at request target")
+        with mock.patch.object(invariants.Filer, "run", side_effect=stop):
+            self.run_at(T0 + invariants.CHECK_EVERY)
+        (line,) = self.gate_lines()
+        self.assertIn("(gate: request target reserve of %d, comments read carried over"
+                      % station.INVARIANT_WRITE_RESERVE, line)
+        self.assertEqual(self.gh.target, station.PASS_REQUEST_TARGET)
+        with open(os.path.join(self.home, "state", "station", "invariants.json"),
+                  encoding="utf-8") as fh:
+            self.assertIn("lane-pr-stalled", fh.read())
