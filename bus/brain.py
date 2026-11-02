@@ -2153,17 +2153,8 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     sub-issue limit (whose open epics the listing names too) are not read.
     On 2026-11-02 those reads were 2.1 MB of the 7.5 MB a resume of 19 repos
     moved."""
-    direct = _sub_issue_tickets(gh, repo, [goal])[goal]
     listed = _issues(gh, repo)
-    epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
-    seen = {int(e.get("number") or 0) for e in epics}
-    for item in listed:
-        number = int(item.get("number") or 0) if isinstance(item, dict) else 0
-        if (number and number not in seen and number != goal and _epic_label(item)
-                and _names_goal(item.get("body"), goal)):
-            epics.append(item)
-            seen.add(number)
-    epics = [e for e in epics if e.get("state", "open") == "open"]
+    epics = _open_goal_epics(_sub_issue_tickets(gh, repo, [goal])[goal], listed, goal)
     wanted = [int(e.get("number") or 0) for e in epics if not standing_epic(e)]
     if not wanted:
         return [(epic, []) for epic in epics]
@@ -2172,6 +2163,22 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     return [(epic, _tree_tickets(int(epic.get("number") or 0), subs[n], open_tickets)
              if n in subs else [])
             for epic, n in ((e, int(e.get("number") or 0)) for e in epics)]
+
+
+def _open_goal_epics(direct: Sequence[Any], listed: Sequence[Dict[str, Any]], goal: int
+                     ) -> List[Dict[str, Any]]:
+    """The goal's open epics: its sub-issues labelled epic, then the open
+    epics of the repo's open issue listing whose body says Part of #goal,
+    each once, as _goal_epics finds them but without the closed ones."""
+    epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
+    seen = {int(e.get("number") or 0) for e in epics}
+    for item in listed:
+        number = int(item.get("number") or 0) if isinstance(item, dict) else 0
+        if (number and number not in seen and number != goal and _epic_label(item)
+                and _names_goal(item.get("body"), goal)):
+            epics.append(item)
+            seen.add(number)
+    return [e for e in epics if e.get("state", "open") == "open"]
 
 
 def _open_tickets(listed: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:

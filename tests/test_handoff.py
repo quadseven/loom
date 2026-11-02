@@ -213,8 +213,7 @@ class Routes:
             self.posted.append((path, json.loads(body) if body else None))
         if method == "GET" and path.startswith("/repos/") and path.endswith("/pulls"):
             return 200, {}, b"[]"
-        if method == "POST" and path == "/graphql" and "pullRequests(states:OPEN)" in json.loads(
-                body)["query"]:
+        if _weights_query(method, path, body):
             # resume's repo weights (brain.repo_weights): none weighed, so
             # the repos are read in the order given.
             return 200, {}, b'{"data": {}}'
@@ -240,6 +239,12 @@ class Routes:
             out["e" + number] = {"subIssues": {"totalCount": len(subs), "nodes": [
                 _sub_node(s) for s in subs]}}
         return out
+
+
+def _weights_query(method, path, body):
+    """Whether the request is brain.repo_weights' GraphQL query."""
+    return (method == "POST" and path == "/graphql"
+            and "pullRequests(states:OPEN)" in json.loads(body)["query"])
 
 
 def _sub_node(issue):
