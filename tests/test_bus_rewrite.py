@@ -46,6 +46,7 @@ class FakeGitHub:
         self.labels = []
         self.removed = []
         self.linked = []
+        self.goal_body = ""
 
     @staticmethod
     def intake():
@@ -69,6 +70,9 @@ class FakeGitHub:
             return reply(200, {"private": self.private})
         m = re.fullmatch(r"/repos/%s/(.*)" % re.escape(REPO), path)
         rest = m.group(1) if m else ""
+        if method == "GET" and rest == "issues" and "loom%3Agoal" in parts.query:
+            return reply(200, [{"number": GOAL, "body": self.goal_body,
+                                "labels": [{"name": "loom:goal"}]}])
         if method == "GET" and rest == "issues":
             return reply(200, sorted(self.triage.values(), key=lambda i: i["created_at"]))
         if method == "POST" and rest == "issues":
@@ -273,6 +277,35 @@ class RewriteIssueTest(Base):
             self.fake.triage[number].update(extra)
         self.fake.add_triage(7)
         self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
+    def test_an_operator_claimed_or_goal_named_issue_is_skipped_with_one_reason(self):
+        # loom#2143: the live goal issue carried loom:triage and the
+        # operator's claim label; the rewrite turned it into a lane ticket.
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"].append({"name": "claim:example-op"})
+        self.fake.add_triage(9)
+        self.fake.add_triage(7)
+        self.fake.goal_body = "Journal: #9\n"
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-op"}), \
+                contextlib.redirect_stderr(err):
+            found = rewrite.candidates(self.gh(), REPO)
+        self.assertEqual([i["number"] for i in found], [7])
+        log = sorted(err.getvalue().strip().splitlines())
+        self.assertEqual(len(log), 2)
+        self.assertIn("#8 left alone: claimed by the operator", log[0])
+        self.assertIn("#9 left alone: named by a goal as a journal", log[1])
+
+    def test_a_retitle_of_a_claimed_goal_or_wayfinder_issue_is_refused(self):
+        for extra in ("claim:example-op", "loom:goal", "wayfinder:map"):
+            self.fake = FakeGitHub()
+            self.fake.add_triage(7)
+            self.fake.triage[7]["labels"].append({"name": extra})
+            self.fake.triage[7]["user"] = {"login": "example-op"}
+            with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-op"}):
+                with self.assertRaises(ValueError):
+                    rewrite.apply_answer(self.gh(), REPO, GOAL, 7, json.dumps(BRIEF))
+            self.assertEqual(self.fake.writes_to(7), [], extra)
 
     def test_a_human_answer_without_a_person_only_kind_writes_nothing(self):
         # 2026-10-18: a free model parked "Using GitHub credentials, locate the
