@@ -1,5 +1,6 @@
 """Test the Finding class and related functions in bus.tickets."""
 import json
+import os
 import unittest
 from datetime import datetime, timezone
 
@@ -656,3 +657,52 @@ class ProofChecksTest(unittest.TestCase):
         fix = Fix(7, "loom/9-totals", "### Thread F1 (comment 1) at cart.py:3\nWrong total\n")
         text = render_brief(REPO, self.issue(), "codex", 1, fix)
         self.assertNotIn("## Proof checks", text)
+
+
+
+def _running_issue():
+    return {"number": 2507, "title": "T", "body": "Why\n",
+            "labels": [{"name": "loom:running"}, {"name": "claim:quadseven"}]}
+
+
+class ThisRunSectionTest(unittest.TestCase):
+    """loom#2507: a lane read claim:quadseven as a person's claim and refused
+    its own ticket, then spent the run on GitHub and Buzz calls it cannot make."""
+
+    def this_run(self, text):
+        """The brief's "This run" section, up to the next heading."""
+        self.assertIn("\n## This run\n", text)
+        return text.split("\n## This run\n", 1)[1].split("\n#", 1)[0]
+
+    def test_build_brief_names_the_station_claim_as_the_runs_own(self):
+        section = self.this_run(render_brief("quadseven/loom", _running_issue(), "codex", 1))
+        self.assertIn("lane run", section)
+        self.assertIn("lane codex", section)
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("run's own claim", section)
+        self.assertIn("has no network", section)
+        self.assertIn("Buzz", section)
+
+    def test_fix_brief_carries_the_same_section(self):
+        fix = Fix(2507, "loom/2507-test", "### Thread F1 (comment 1) at a.py:1\nfirst\n")
+        section = self.this_run(render_brief("quadseven/loom", _running_issue(), "codex", 2, fix))
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("run's own claim", section)
+        self.assertIn("has no network", section)
+
+    def test_names_the_claim_the_station_passes(self):
+        """At claim time the issue does not carry the label yet: the station names it."""
+        issue = {"number": 2507, "title": "T", "body": "Why\n", "labels": []}
+        section = self.this_run(render_brief("quadseven/loom", issue, "claude", 1,
+                                             claim="claim:quadseven"))
+        self.assertIn("The `claim:quadseven` label", section)
+        self.assertIn("lane claude", section)
+
+    def test_agents_md_says_the_running_claim_is_the_lanes_own(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "AGENTS.md")
+        with open(path, encoding="utf-8") as f:
+            text = " ".join(f.read().split())
+        self.assertIn("a `claim:quadseven` label on a `loom:running` ticket is the station's "
+                      "lane claim, so it is the lane's own claim", text)
+        self.assertIn("lanes skip the claim, Buzz and journal steps", text)

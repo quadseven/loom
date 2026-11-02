@@ -745,7 +745,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = (), demoted_models: str = "") -> str:
+                  linked: Sequence[str] = (), demoted_models: str = "",
+                  claim: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -774,7 +775,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         if lane in HARD_MODELS:
             out.append("Model: %s" % HARD_MODELS[lane])
     out += ["", "# T%d: %s" % (number, title), ""]
-    text = "\n".join(out) + "\n"
+    text = "\n".join(out) + "\n" + this_run(issue, lane, claim)
     if not has_contract and ci_checks:
         text += "## Checks CI runs\n\nRun these checks before opening the pull request:\n\n"
         for source, command in ci_checks:
@@ -803,6 +804,37 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                  "%s\n\n%s\n"
                  % (fix.pr, fix.branch, ANSWER_NOTE, REPLIES_NOTE, fix.findings))
     return text
+
+
+THIS_RUN = """\
+## This run
+
+This is a lane run: the station assigned this ticket to lane %s and claimed
+it for you. The %s label and the loom:running label on this ticket are this
+run's own claim, not another worker's or a person's: work the ticket. The
+repo's rules about checking or taking claims, reading or posting to Buzz, and
+writing a journal are for brains, not lanes, so skip them.
+
+This run has no network: no GitHub API, no Buzz relay, no live reads, so do
+not try them. Change only this repo's tree, as the ticket asks, commit the
+work, and stop. Never move a label or post a comment: the runner pushes the
+branch and opens or updates the pull request, and the station moves the
+ticket.
+
+"""
+
+
+def this_run(issue: Dict[str, Any], lane: str, claim: str = "") -> str:
+    """The "This run" section every build or fix brief opens with
+    (loom#2507). Lane agents read the repo's AGENTS.md, which tells brains to
+    leave a claim:<operator> ticket alone and to check GitHub and Buzz first;
+    the station marks its own lane claim with that label and the sandbox has
+    no network, so runs refused their own ticket or spent themselves on
+    failed calls. claim is the label the station adds; without it, the
+    claim:<login> labels the issue already carries are named."""
+    names = [claim] if claim else [CLAIM_LABEL_PREFIX + login for login in claimed_by(issue)]
+    label = ", ".join("`%s`" % n for n in names) if names else "`claim:<operator>`"
+    return THIS_RUN % (lane, label)
 
 
 VERIFY_BRIEF = """\
