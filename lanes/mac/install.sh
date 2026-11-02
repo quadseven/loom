@@ -80,6 +80,7 @@ LOOM_FREE_KILO_URL="${LOOM_FREE_KILO_URL:-}"
 LOOM_FREE_KILO_MODEL="${LOOM_FREE_KILO_MODEL:-free/kilo}"
 LOOM_FREE_GROQ_URL="${LOOM_FREE_GROQ_URL:-}"
 LOOM_FREE_GROQ_MODEL="${LOOM_FREE_GROQ_MODEL:-free/groq}"
+LOOM_FREE_OPENROUTER_MODEL="${LOOM_FREE_OPENROUTER_MODEL:-free/openrouter}"
 LOOM_FREE_CONTEXT="${LOOM_FREE_CONTEXT:-120000}"
 LOOM_FREE_OUTPUT="${LOOM_FREE_OUTPUT:-16384}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
@@ -89,7 +90,7 @@ LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CODEX_ONLY_MODEL LOOM_AGY_ONLY_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_AGY_EFFORT LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
-  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
+  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_OPENROUTER_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -122,6 +123,21 @@ fi
 BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 [[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
   { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+# The brain tick's start minutes past each hour (loom#2469): :25 and :55
+# sit between Muse's :10 and :40 starts (docs/MUSE.md), so the lane
+# machine's tick no longer drifts onto them as a StartInterval did. Empty,
+# the tick runs every LOOM_BRAIN_INTERVAL seconds instead.
+BRAIN_AT="${LOOM_BRAIN_AT-25 55}"
+BRAIN_SCHEDULE="  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>"
+if [ -n "${BRAIN_AT// /}" ]; then
+  BRAIN_SCHEDULE="  <key>StartCalendarInterval</key>"$'\n'"  <array>"
+  for m in $BRAIN_AT; do
+    [[ "$m" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$m))" -le 59 ] ||
+      { echo "LOOM_BRAIN_AT must list minutes past the hour, 0 to 59" >&2; exit 1; }
+    BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"    <dict><key>Minute</key><integer>$((10#$m))</integer></dict>"
+  done
+  BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"  </array>"
+fi
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
@@ -501,8 +517,9 @@ wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
-# The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
-# (default 1800), take the brain lock and run one docs/MUSE.md tick on the
+# The brain tick (lanes/mac/brain.sh): at LOOM_BRAIN_AT minutes past each
+# hour (default 25 and 55), or every LOOM_BRAIN_INTERVAL seconds (default
+# 1800) with LOOM_BRAIN_AT empty, take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
 # LOOM_TRUSTED_BRIEFERS, LOOM_ASK_ANSWERERS,
@@ -538,7 +555,7 @@ else
     <string>/bin/bash</string>
     <string>$X_REPO/lanes/mac/brain.sh</string>
   </array>
-  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>
+$BRAIN_SCHEDULE
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>

@@ -33,8 +33,9 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
-# The only models an opencode-go lane may run: OpenCode Go's free models and
-# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# The only models an opencode-go lane may run: OpenCode Go's free models, the
+# paid ones with an allowance of at least 10,000 requests per 5 hours, and the
+# strong models bus/model_pick.py runs under its usage guard.
 # Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
 # 2026-10-23 (operator: "why the hell are we using the most expensive
 # models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
@@ -48,6 +49,8 @@ OPENCODE_GO_MODELS: Tuple[str, ...] = (
     "opencode-go/mimo-v2.6-flash",              # 30,100
     "opencode-go/deepseek-v4.1-flash",          # 34,670
     "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+    "opencode-go/gpt-6-luna",                   # 5,640; strong tier, guarded
+    "opencode-go/claude-haiku-5-5",             # 5,133; strong tier, guarded
 )
 # What a ticket's Model: line naming another opencode-go model runs instead.
 OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
@@ -55,12 +58,21 @@ OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
 
 def allowed_model(model: str) -> str:
     """The model a lane may run for `model`: the stand-in of a
-    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS,
-    else `model` itself."""
+    FORBIDDEN_MODELS model or of an opencode-go model off OPENCODE_GO_MODELS
+    or the discovered catalogue, else `model` itself."""
     for prefix, stand_in in FORBIDDEN_MODELS:
         if model.startswith(prefix):
             return stand_in
-    if model.startswith("opencode-go/") and model not in OPENCODE_GO_MODELS:
+    if model.startswith("opencode-go/"):
+        if model in OPENCODE_GO_MODELS:
+            return model
+        try:
+            from . import catalogue
+            cat = catalogue.load_catalogue()
+            if model in cat:
+                return model
+        except (ImportError, OSError, ValueError):
+            return OPENCODE_GO_STAND_IN
         return OPENCODE_GO_STAND_IN
     return model
 
@@ -674,12 +686,66 @@ def reads_stored_rows(body: str) -> bool:
                for m in _WHAT_OR_CRITERIA_RE.finditer(body or ""))
 
 
+# What proves one acceptance criterion, by its kind (bus/criteria_gate.py):
+# a code criterion is the lane's own to meet in its pull request, a live
+# one only the station's verifier can meet, and an operator one only the
+# operator's hand.
+PROOF_CHECK_BY_KIND = {
+    "code": "the pull request for this brief: it ticks this criterion, and "
+            "the change's tests pass",
+    "live": "the station's verify run, which observes it on the live system "
+            "after the change ships; a lane never ticks it",
+    "operator": "the operator, who does it by hand and ticks it; the ticket "
+                "goes to the operator for this one",
+}
+
+PROOF_CHECKS_NOTE = (
+    "Each acceptance criterion above, restated as the check that proves it. "
+    "The pull request body answers criterion by criterion: tick each code "
+    "criterion the change builds, and mark each one it does not build "
+    "\"not built: <reason>\".")
+
+
+_ACCEPTANCE_BOX_RE = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
+
+
+def _criteria_texts(body: str) -> List[str]:
+    """The ticket's acceptance criteria, as texts: the checkboxes under
+    `## Acceptance criteria` (bus/proof.py's reading), or, when that
+    section names none, under the shorter `## Acceptance` heading the
+    runner also reads. The brief check reads them the same way, so a
+    ticket it calls dispatchable always has criteria to restate."""
+    texts = [text for _, text in proof.criteria(body)]
+    if texts:
+        return texts
+    found: List[str] = []
+    inside = False
+    for line in (body or "").replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == "## Acceptance"
+            continue
+        match = _ACCEPTANCE_BOX_RE.match(line) if inside else None
+        if match:
+            found.append(match.group(2))
+    return found
+
+
+def proof_checks(body: str) -> List[Tuple[str, str]]:
+    """(criterion, the check that proves it) for each acceptance criterion
+    of a ticket body, in order (loom#2162). A brief carries these so the
+    lane knows before it starts what would prove each criterion, instead
+    of learning it from a review send-back."""
+    from . import criteria_gate  # criteria_gate imports this module
+    return [(text, PROOF_CHECK_BY_KIND[criteria_gate.kind(text)])
+            for text in _criteria_texts(body or "")]
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = ()) -> str:
+                  linked: Sequence[str] = (), demoted_models: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -698,6 +764,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             # The Finding-<id> prefix also prevents a field() match in the runner.
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
+    if demoted_models:
+        out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":
@@ -714,6 +782,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if fix is None:
+        checks = proof_checks(body)
+        if checks:
+            text += "\n## Proof checks\n\n" + PROOF_CHECKS_NOTE + "\n\n"
+            text += "".join("- %s - proved by %s.\n" % (criterion, check)
+                            for criterion, check in checks)
     if reads_stored_rows(body):
         text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)
@@ -1238,6 +1312,9 @@ def after_holds(repo: str, headers: Dict[str, str],
 if __name__ == "__main__":
     import sys
     if sys.argv[1:] == ["opencode-go-models"]:
-        print("\n".join(OPENCODE_GO_MODELS))
+        from . import catalogue
+        models = set(OPENCODE_GO_MODELS)
+        models.update(m.id for m in catalogue.load_catalogue().values())
+        print("\n".join(sorted(models)))
     else:
         sys.exit("usage: python3 -m bus.tickets opencode-go-models")

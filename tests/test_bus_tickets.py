@@ -595,3 +595,64 @@ class ReviewBriefTest(unittest.TestCase):
         text = self.brief()
         self.assertIn("Retry logs", text)
         self.assertIn("The retry logs one line per attempt", text)
+
+
+class ProofChecksTest(unittest.TestCase):
+    """A brief restates each acceptance criterion as the check that proves
+    it (loom#2162): an unmet criterion was the review bot's fastest-rising
+    send-back, and it is knowable before dispatch what would prove each
+    one. The lane's pull request then answers criterion by criterion."""
+
+    BODY = ("## Why\n\nThe totals are wrong.\n\n## What\n\nFix the total.\n\n"
+            "## Acceptance criteria\n"
+            "- [ ] A test fails without the fix and passes with it.\n"
+            "- [ ] Live: the dashboard shows the corrected total within a minute.\n"
+            "- [ ] The operator approves the rollout by hand.\n")
+
+    def issue(self, body=None):
+        return {"number": 9, "title": "Totals", "body": self.BODY if body is None else body}
+
+    def test_each_criterion_is_restated_as_its_check(self):
+        checks = tickets.proof_checks(self.BODY)
+        self.assertEqual([text for text, _ in checks], [
+            "A test fails without the fix and passes with it.",
+            "Live: the dashboard shows the corrected total within a minute.",
+            "The operator approves the rollout by hand."])
+        # A code criterion is proved by the lane's own pull request.
+        self.assertIn("pull request", checks[0][1])
+        self.assertIn("ticks this criterion", checks[0][1])
+        # A live criterion only by the station's verify run on the live system.
+        self.assertIn("verify run", checks[1][1])
+        self.assertIn("never ticks", checks[1][1])
+        # An operator criterion only by the operator's own hand.
+        self.assertIn("operator", checks[2][1])
+
+    def test_the_brief_carries_the_proof_checks(self):
+        text = render_brief(REPO, self.issue(), "codex")
+        section = text.split("## Proof checks", 1)[1]
+        self.assertIn("criterion by criterion", section)
+        self.assertIn("A test fails without the fix and passes with it.", section)
+        self.assertIn("Live: the dashboard shows the corrected total", section)
+        self.assertIn("The operator approves the rollout by hand.", section)
+
+    def test_criteria_under_the_short_acceptance_heading_are_restated(self):
+        # The runner reads criteria under "## Acceptance" too, and the
+        # brief check calls such a ticket dispatchable: its brief must
+        # restate them, not carry an empty section.
+        body = ("## Why\n\nThe totals are wrong.\n\n## What\n\nFix the total.\n\n"
+                "## Acceptance\n"
+                "- [ ] A test fails without the fix and passes with it.\n")
+        checks = tickets.proof_checks(body)
+        self.assertEqual([text for text, _ in checks],
+                         ["A test fails without the fix and passes with it."])
+        self.assertIn("## Proof checks", render_brief(REPO, self.issue(body), "codex"))
+
+    def test_a_body_without_criteria_has_no_proof_checks(self):
+        body = "## Why\n\nNo criteria were written.\n"
+        self.assertEqual([], tickets.proof_checks(body))
+        self.assertNotIn("## Proof checks", render_brief(REPO, self.issue(body), "codex"))
+
+    def test_a_fix_brief_carries_no_proof_checks(self):
+        fix = Fix(7, "loom/9-totals", "### Thread F1 (comment 1) at cart.py:3\nWrong total\n")
+        text = render_brief(REPO, self.issue(), "codex", 1, fix)
+        self.assertNotIn("## Proof checks", text)

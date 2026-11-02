@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import audit, brain, handoff
 from bus.github import GitHub
+from tests.test_handoff import _sub_node
 
 REPO = "example-owner/example-repo"
 LOCK_REPO = "example-owner/loom"
@@ -171,7 +172,7 @@ class LoomSizedResume:
         for number in map(int, re.findall(r"issue\(number:(\d+)\)", query)):
             subs = self._sub_list(number)
             out["e%d" % number] = {"subIssues": {"totalCount": len(subs), "nodes": [
-                {"number": s["number"], "state": s["state"].upper()} for s in subs[:100]]}}
+                _sub_node(s) for s in subs[:100]]}}
         return out
 
     @staticmethod
@@ -206,12 +207,19 @@ class ResumeReadsALoomSizedRepoInBudget(unittest.TestCase):
                              "resume read %d times for a loom-sized repo" % fake.reads())
 
     def test_no_epic_sub_issue_list_is_read_on_its_own(self):
-        # The goals' own sub-issue lists name the epics; the epics' tickets
-        # come in the one GraphQL query, and a closed or standing epic's
-        # tickets are not read at all.
+        # The goals' own sub-issues name the epics, read with only the
+        # fields status reads (SUB_ISSUE_FIELDS, loom#2483); the epics'
+        # tickets come in the one GraphQL query, and a closed or standing
+        # epic's tickets are not read at all. No sub-issue list is read
+        # through REST.
         fake = LoomSizedResume()
         _resume(fake)
-        self.assertEqual(fake.sub_issue_lists(), list(GOALS))
+        self.assertEqual(fake.sub_issue_lists(), [])
+        for goal in GOALS:
+            light = [q for q in fake.queries if "e%d: issue(number:%d)" % (goal, goal) in q]
+            self.assertEqual(1, len(light))
+            self.assertIn(brain.SUB_ISSUE_FIELDS, light[0])
+            self.assertNotIn("body", light[0])
         asked = " ".join(fake.queries)
         for goal in GOALS:
             for epic in EPICS[goal]:

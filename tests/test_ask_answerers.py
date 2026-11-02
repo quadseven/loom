@@ -251,7 +251,7 @@ class NeedsYou(unittest.TestCase):
         with mock.patch.dict(os.environ, env), contextlib.redirect_stdout(out), \
                 mock.patch.object(needs_you, "auth_from_env", return_value="t"), \
                 mock.patch.object(needs_you, "GitHub",
-                                  lambda token: GitHub(token, transport=fake)):
+                                  lambda token, **_: GitHub(token, transport=fake)):
             self.assertEqual(0, needs_you.main([]))
         self.assertIn("Needs you: nothing", out.getvalue())
 

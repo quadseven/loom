@@ -163,6 +163,7 @@ Rules:
 - One ticket, one branch, one PR. Lanes never merge; the factory does.
 - Merged is not shipped, and shipped is not done.
 - Briefs, logs, keys and the local `state/` tree never go to GitHub.
+- Keep README.md to the standard sections (Status, Quick start, How to test, How it deploys, Layout, Docs) with a last-checked date; a change that makes it false fixes it in the same PR.
 - GitHub text is ASCII and never puts a closing keyword next to an issue number, even to deny it.
 - A file in `.loom/sensitive-paths` makes the change `class:sensitive`, which the factory never merges. `dashboard/` is on that list: a screen merges only after the brain has looked at it at phone and desktop widths.
 - Workflows and `.loom/` are the security tier (`bus/merge_tier.py`), so they wait for the operator.
@@ -207,7 +208,7 @@ Several AI brains work this repo beside the operator: Claude Code, Muse, Dot and
 - A degraded or partial review says `Degraded review (<reason>): not a verdict`. It is not a pass, whether it concludes failure or neutral. Run `/grug improve` once the backend recovers.
 - `Grug - Guard` scans for security problems and is advisory unless the repo turns on blocking. Haunt, once called Sentinel, comments when a PR closes over an unresolved critical finding. It posts no check; answer its comment and re-verify.
 
-**Merge gate.** Rulesets enforce less than this, and this binds: CI green, `Grug - Elder` success on the head (neutral is not enough), `Grug - Chief` success or neutral, not behind base, every bot thread answered, and a test that fails without the fix. `gh pr checks` does not show threads, so read `reviewThreads` by GraphQL and `pulls/<n>/reviews`. Anyone merges what they built. Loom merges docs, test and app code tiers alone and holds deploy, security and cross-repo tiers for the operator. A change to how brains merge, close or rewrite needs a fleet chat line and a 5 minute wait. Never use `--admin`.
+**Merge gate.** Rulesets enforce less than this, and this binds: CI green, `Grug - Elder` success on the head (neutral is not enough), `Grug - Chief` success or neutral, up to date with base where a ruleset requires it (behind and GitHub-mergeable passes otherwise), every bot thread answered, and a test that fails without the fix. `gh pr checks` does not show threads, so read `reviewThreads` by GraphQL and `pulls/<n>/reviews`. Anyone merges what they built. Loom merges docs, test and app code tiers alone and holds deploy, security and cross-repo tiers for the operator. A change to how brains merge, close or rewrite needs a fleet chat line and a 5 minute wait. Never use `--admin`.
 
 **Human line.** People do: permanent deletion of records, creating, rotating or entering credentials, access grants, new spending, accepting terms. People decide: another brain's role and the fleet goal text. A second brain must agree, in writing, to clear a lane demotion, lift another brain's hold, or reopen a sound close. Everything else needs nobody. Ask with `needs:human` and one exact question. A relayed yes is not a yes. Never print a credential.
 

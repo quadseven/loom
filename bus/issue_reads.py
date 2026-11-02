@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .github import GitHub, Response
 
@@ -72,18 +72,31 @@ class IssueReads:
                     self._answers[path] = kept
             return kept
 
+    def _issue_or_failure(self, path: str, ok: Any) -> Response:
+        """A read that accepts a failure status (ok=(404,)): answered from a
+        kept answer, and its own answer kept when it is a success. A failure
+        is never kept, so a later read that does not accept it still raises.
+        Resume reads each handoff item this way (item_revision), and an item
+        named by several goals' journals was read once per goal: 21 of 103
+        single reads on 2026-11-02 (loom#2483)."""
+        with self._path_lock(path):
+            with self._lock:
+                kept = self._answers.get(path)
+            if kept is not None:
+                return kept
+            answer = self._gh.rest("GET", path, None, None, ok)
+            if answer.status == 200:
+                with self._lock:
+                    self._answers[path] = answer
+            return answer
+
     def rest(self, method: str, path: str, body: Any = None,
              etag: Any = None, ok: Any = ()) -> Response:
         plain = method == "GET" and body is None and etag is None and not ok
         if plain and ISSUE_PATH.match(path):
             return self._issue(path)
         if method == "GET" and body is None and etag is None and ISSUE_PATH.match(path):
-            # A read that accepts a failure status (ok=(404,)) is answered
-            # from a kept answer, which is a success, but is never kept.
-            with self._lock:
-                kept = self._answers.get(path)
-            if kept is not None:
-                return kept
+            return self._issue_or_failure(path, ok)
         if plain and isinstance(self._gh, GitHub):
             # A comments page reads its issue's body from this pass's answers.
             return self._gh.rest(method, path, issue=self._issue)
@@ -109,6 +122,22 @@ class IssueReads:
             # client's rest, so a comments page reads its issue once.
             return GitHub.paginate(self, path)  # type: ignore[arg-type]
         return self._gh.paginate(path)
+
+    def recall(self, path: str, validator: str) -> Optional[List[Any]]:
+        """GitHub.recall, for GitHub itself; a stand-in keeps nothing."""
+        if isinstance(self._gh, GitHub):
+            return self._gh.recall(_with_per_page(path), validator)
+        return None
+
+    def remember(self, path: str, validator: str, items: List[Any]) -> None:
+        if isinstance(self._gh, GitHub):
+            self._gh.remember(_with_per_page(path), validator, items)
+
+    def keep_listed(self, repo: str, items: List[Any]) -> None:
+        """Answer each item's single read from a listing of the repo's
+        issues read without this client (bus.needs_you reads the pages on
+        its own threads, loom#2394)."""
+        self._keep_listed("/repos/%s/issues?per_page=100" % repo, items)
 
     def _keep_listed(self, key: str, items: List[Any]) -> None:
         """Answer each listed issue's single read from the listing. Only for

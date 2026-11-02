@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import calendar
 import copy
+import gzip
 import hashlib
 import http.client
 import json
@@ -30,6 +31,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -89,6 +91,49 @@ class ShadowHeld(GitHubError, ValueError):
     def __init__(self, message: str, entry: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(message, 0, "")
         self.entry = entry or {}
+
+
+def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
+    """Refuse a PATCH that would close an issue as completed while its
+    acceptance criteria are unchecked.
+
+    The brain's close() already refuses this, but a close that bypasses it
+    -- a close five seconds after its PR merged is the shape -- used to land anyway and get reopened by the close-completeness
+    guard seconds later. Every programmatic close passes through rest(),
+    so refusing here makes the bad close impossible instead of merely
+    caught. bus/closing.py asks this too, before it posts the close
+    comment. Closes as not_planned, force-close/wontfix labels, pull
+    requests, and issues with no criteria at all are left alone, matching
+    the guard's own escape hatches.
+    """
+    if method != "PATCH" or not _ISSUE_PATH.match(path):
+        return
+    if not isinstance(body, dict) or body.get("state") != "closed":
+        return
+    if body.get("state_reason", "completed") != "completed":
+        return
+    # Re-entering rest() for the verification GET is safe: the
+    # method != "PATCH" check above stops any recursion. A failed read
+    # raises out of rest() before the PATCH is sent, so the close is
+    # refused; a 2xx read with no issue object in it refuses it too,
+    # rather than reading as an issue with no criteria (loom#656).
+    issue = gh.rest("GET", path).data
+    if not isinstance(issue, dict):
+        raise GitHubError(
+            "refusing to close %s as completed: cannot read the issue to "
+            "check its acceptance criteria" % path)
+    if "pull_request" in issue:
+        return
+    labels = [str(label.get("name") or "").lower()
+              for label in issue.get("labels") or []]
+    if any(name in labels for name in _FORCE_CLOSE_LABELS):
+        return
+    unchecked = [text for checked, text in
+                 proof.criteria(str(issue.get("body") or "")) if not checked]
+    if unchecked:
+        raise ValueError(
+            "refusing to close %s as completed with unchecked acceptance "
+            "criterion: %s" % (path, unchecked[0]))
 
 
 class RateLimited(GitHubError):
@@ -159,6 +204,10 @@ def unreadable(err: GitHubError) -> Optional[str]:
     that is not a rate limit), or a GraphQL NOT_FOUND. None for any other
     failure (5xx, a rate limit, a dropped connection), which must still end
     the command: only these are safe to skip and name."""
+    if isinstance(err, RateLimited):
+        # A refusal the client raises itself while the window is spent
+        # carries a 403 and no body: it is a budget wait, not a missing grant.
+        return None
     body = err.body or ""
     parsed = _json_or_none(body)
     message = str(parsed.get("message") or "") if isinstance(parsed, dict) else ""
@@ -217,17 +266,23 @@ _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def urllib_transport(method: str, url: str, headers: Dict[str, str],
-                     body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+                     body: Optional[bytes],
+                     timeout: float = TIMEOUT) -> Tuple[int, Dict[str, str], bytes]:
     if not url.startswith("https://"):
         raise GitHubError("refusing a non-https URL: %s" % url.split("?")[0])
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    # GitHub's JSON compresses about 6 to 8 times. Uncompressed, one status
+    # of 19 repos moved 70 MB, and from a remote brain whose link carries
+    # about 0.35 MB/s it read no repo inside its deadline (loom#2415).
+    asked = dict(headers)
+    asked.setdefault("Accept-Encoding", "gzip")
+    req = urllib.request.Request(url, data=body, method=method, headers=asked)  # noqa: S310
     try:
         # https only (checked above), never file: or custom schemes.
-        with _OPENER.open(req, timeout=TIMEOUT) as resp:  # noqa: S310
-            return resp.status, dict(resp.headers.items()), resp.read()
+        with _OPENER.open(req, timeout=timeout) as resp:  # noqa: S310
+            return _decoded(resp.status, dict(resp.headers.items()), resp.read())
     except urllib.error.HTTPError as err:
         try:
-            return err.code, dict(err.headers.items()), err.read()
+            return _decoded(err.code, dict(err.headers.items()), err.read())
         finally:
             err.close()
     except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
@@ -235,6 +290,23 @@ def urllib_transport(method: str, url: str, headers: Dict[str, str],
         # the middle of a body, which is not an OSError and used to escape
         # every caller's GitHubError handling.
         raise GitHubError("request failed: %r" % err, 0, "") from None
+
+
+def _decoded(status_: int, headers: Dict[str, str], raw: bytes
+             ) -> Tuple[int, Dict[str, str], bytes]:
+    """The answer with a gzip body unpacked and its Content-Encoding and
+    Content-Length dropped, as if it had come uncompressed. A body that does
+    not unpack is a dropped connection (status 0), so a read is tried again."""
+    named = [k for k in headers if k.lower() in ("content-encoding", "content-length")]
+    encoding = next((str(headers[k]).strip().lower() for k in named
+                     if k.lower() == "content-encoding"), "")
+    if encoding != "gzip":
+        return status_, headers, raw
+    try:
+        raw = gzip.decompress(raw)
+    except (OSError, EOFError, zlib.error) as err:
+        raise GitHubError("request failed: a gzip body did not unpack: %r" % err, 0, "") from None
+    return status_, {k: v for k, v in headers.items() if k not in named}, raw
 
 
 def _json_or_none(text: str) -> Any:
@@ -529,6 +601,9 @@ class GitHub:
         # client that does not read the section must not write into it.
         self.status_in_body = False
         self._sleep = sleep
+        # Told each retry wait before it starts (seconds), so a caller can
+        # show that a slow run is waiting and not hung.
+        self.on_wait: Optional[Callable[[float], None]] = None
         self.api = api.rstrip("/")
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
@@ -682,7 +757,7 @@ class GitHub:
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         acted = self._hold_in_shadow(method, path, body)
-        self._refuse_incomplete_close(method, path, body)
+        refuse_incomplete_close(self, method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
@@ -791,48 +866,6 @@ class GitHub:
             return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
         except Exception:  # noqa: BLE001 - any failed read holds the action
             return None
-
-    def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
-        """Refuse a PATCH that would close an issue as completed while its
-        acceptance criteria are unchecked.
-
-        The brain's close() already refuses this, but a close that bypasses it
-        -- the conducted#209 close five seconds after its PR merged is the
-        shape -- used to land anyway and get reopened by the close-completeness
-        guard seconds later. Every programmatic close passes through rest(),
-        so refusing here makes the bad close impossible instead of merely
-        caught. Closes as not_planned, force-close/wontfix labels, pull
-        requests, and issues with no criteria at all are left alone, matching
-        the guard's own escape hatches.
-        """
-        if method != "PATCH" or not _ISSUE_PATH.match(path):
-            return
-        if not isinstance(body, dict) or body.get("state") != "closed":
-            return
-        if body.get("state_reason", "completed") != "completed":
-            return
-        # Re-entering rest() for the verification GET is safe: the
-        # method != "PATCH" check above stops any recursion. A failed read
-        # raises out of rest() before the PATCH is sent, so the close is
-        # refused; a 2xx read with no issue object in it refuses it too,
-        # rather than reading as an issue with no criteria (loom#656).
-        issue = self.rest("GET", path).data
-        if not isinstance(issue, dict):
-            raise GitHubError(
-                "refusing to close %s as completed: cannot read the issue to "
-                "check its acceptance criteria" % path)
-        if "pull_request" in issue:
-            return
-        labels = [str(label.get("name") or "").lower()
-                  for label in issue.get("labels") or []]
-        if any(name in labels for name in _FORCE_CLOSE_LABELS):
-            return
-        unchecked = [text for checked, text in
-                     proof.criteria(str(issue.get("body") or "")) if not checked]
-        if unchecked:
-            raise ValueError(
-                "refusing to close %s as completed with unchecked acceptance "
-                "criterion: %s" % (path, unchecked[0]))
 
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
@@ -970,13 +1003,19 @@ class GitHub:
             except GitHubError as err:
                 if err.status != 0 or attempt == len(delays):
                     raise
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             if status in RETRY_STATUSES and attempt < len(delays):
-                self._sleep(delays[attempt])
+                self._wait(delays[attempt])
                 continue
             return status, raw_headers, raw
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _wait(self, seconds: float) -> None:
+        """Sit out one retry delay, telling `on_wait` first."""
+        if self.on_wait is not None:
+            self.on_wait(seconds)
+        self._sleep(seconds)
 
     def _keep_answer(self, url: str, status: int, data: Any,
                      resp_headers: Dict[str, str]) -> None:
@@ -1077,6 +1116,33 @@ class GitHub:
                 continue
         return removed
 
+    # A whole list kept beside the conditional answers, for a reader that
+    # knows from elsewhere whether it changed (bus.needs_you: a ticket's
+    # comments and events, checked against the issue's updated_at in the
+    # listing, loom#2394). GitHub's ETags differ per token on a private repo,
+    # so a run with a token of its own gets no 304 from the last run's ETags;
+    # updated_at is the same for every reader. The key is the list's URL with
+    # a fragment no request sends, so it never answers that URL's 304.
+    def _whole_key(self, path: str) -> str:
+        return self._url(path) + "#whole"
+
+    def recall(self, path: str, validator: str) -> Optional[List[Any]]:
+        """The list kept for `path` under this validator, or None. A hit
+        counts as a use, so prune_cache keeps it."""
+        if not self.cache_dir or not validator:
+            return None
+        key = self._whole_key(path)
+        entry = self._cached(key)
+        if entry is None or entry.get("etag") != validator or not isinstance(entry.get("data"), list):
+            return None
+        self._touch(key)
+        return list(entry["data"])
+
+    def remember(self, path: str, validator: str, items: List[Any]) -> None:
+        """Keep the whole list read for `path` under `validator`."""
+        if self.cache_dir and validator:
+            self._keep(self._whole_key(path), {"etag": validator, "data": list(items)})
+
     def paginate(self, path: str) -> List[Any]:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
@@ -1146,6 +1212,61 @@ class GitHub:
             items.extend(self.paginate(_with_page(path, _page_of(last) + 1)))
         return status.resort(items)
 
+    def page_plan(self, path: str) -> Tuple[List[Any], List[str]]:
+        """(the first page's items, the URLs of the pages after it), for a
+        caller that reads those pages on its own threads with read_page
+        (bus.needs_you, loom#2394). With no last link the whole list is read
+        here and no URL is left."""
+        if "per_page=" not in path:
+            path += ("&" if "?" in path else "?") + "per_page=100"
+        first = self.rest("GET", path)
+        last = _last_link(first.headers.get("link", ""))
+        if not last or _page_of(last) <= 1:
+            return self._paginate_from(path, first), []
+        items = list(first.data) if isinstance(first.data, list) else []
+        return items, [_with_page(path, page) for page in range(2, _page_of(last) + 1)]
+
+    def read_page(self, url: str, final: bool = False) -> List[Any]:
+        """One page from page_plan. The final page also reads on past it when
+        the list grew after the first page was read."""
+        resp = self.rest("GET", url)
+        items = list(resp.data) if isinstance(resp.data, list) else []
+        nxt = _next_link(resp.headers.get("link", "")) if final else None
+        if nxt:
+            items.extend(self.paginate(nxt))
+        return items
+
+    def last_comments(self, repo: str, number: int, count: int, keep: int = 100) -> List[Any]:
+        """The last `keep` comments on issue `number`, oldest first, exactly as
+        GitHub stores them: no status, fix-round or body events (rest() adds
+        those), the same comments a GraphQL `comments(last:keep)` returns.
+
+        `count` is the issue listing's comment count. It picks a page size
+        whose pages hold the last `keep` (_comment_pages): one or two pages,
+        not the whole list, and none at all for an issue with no comments. A
+        comment added since the listing is followed through the last page's
+        next link; one deleted since is made up from the page before. REST
+        answers arrive gzipped, which GraphQL's never do (loom#2464)."""
+        if count <= 0 or keep <= 0:
+            return []
+        size, first, last = _comment_pages(count, keep)
+        base = "/repos/%s/issues/%d/comments?per_page=%d" % (repo, number, size)
+        items: List[Any] = []
+        nxt: Optional[str] = None
+        for page in range(first, last + 1):
+            resp = self._rest("GET", "%s&page=%d" % (base, page))
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while nxt:
+            resp = self._rest("GET", nxt)
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while len(items) < keep and first > 1:
+            first -= 1
+            resp = self._rest("GET", "%s&page=%d" % (base, first))
+            items[:0] = resp.data if isinstance(resp.data, list) else []
+        return items[-keep:]
+
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",
                          {"query": query, "variables": variables or {}})
@@ -1153,6 +1274,28 @@ class GitHub:
         if data.get("errors"):
             raise GitHubError("graphql errors", resp.status, json.dumps(data["errors"]))
         return data.get("data")
+
+
+# GitHub's largest page of comments.
+COMMENT_PAGE = 100
+
+
+def _comment_pages(count: int, keep: int) -> Tuple[int, int, int]:
+    """(page size, first page, last page) that read the last `keep` of
+    `count` comments in as few requests as GitHub's page sizes allow, then
+    with the fewest comments before them: 192 comments read as two pages of
+    92 (pages 2 and 3, comments 92 to 191), not two of 100 that also carry
+    comments 0 to 91. Up to COMMENT_PAGE comments are one page."""
+    if count <= COMMENT_PAGE:
+        return COMMENT_PAGE, 1, 1
+    skip = max(0, count - keep)
+
+    def cost(size: int) -> Tuple[int, int, int]:
+        pages = (count - 1) // size - skip // size + 1
+        return pages, skip % size, -size
+
+    size = min(range(COMMENT_PAGE, 0, -1), key=cost)
+    return size, skip // size + 1, (count - 1) // size + 1
 
 
 def _per_page(url: str) -> int:
