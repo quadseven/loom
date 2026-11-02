@@ -245,7 +245,7 @@ class RolledKindTest(unittest.TestCase):
 
     def test_migration_folds_a_few_a_pass_each_with_its_reason_and_one_edited_summary(self):
         old = [self.legacy(n) for n in (51, 52, 53)]
-        ticketed = self.legacy(54, labels=(invariants.LABEL, "loom:ticket", "loom:briefed"))
+        ticketed = self.legacy(54, labels=(invariants.LABEL, "loom:ticket", "loom:pr"))
         asks = self.legacy(56, labels=invariants.LABELS + ["needs:someone"])
         other = self.legacy(55, invariant="lane-no-success", subject="zen")
         self.file(self.stalled([self.pull(201)]))
@@ -264,7 +264,7 @@ class RolledKindTest(unittest.TestCase):
             self.assertEqual(len(self.gh.comments[(REPO, issue["number"])]), 1)
         (note,) = self.gh.comments[(REPO, rolled)]
         self.assertIn("3 older per-violation issues", note["body"])
-        # A ticket keeps its factory link, an ask its operator, and another
+        # A ticket a lane has in hand keeps its factory link, an ask its operator, and another
         # kind its own clear rule.
         self.assertEqual(ticketed["state"], "open")
         self.assertEqual(asks["state"], "open")
@@ -431,6 +431,89 @@ class OldIssueSubjectTest(unittest.TestCase):
         filer = invariants.Filer(self.gh, REPO, GOAL, {}, T0, self.said.append)
         b = invariants.Breach("lane-held", "%s#5" % REPO, "Ticket #5", ("x",), T0, rolling=True)
         self.assertEqual(filer._marker(b), invariants.MARKER % b.key)
+
+
+class RewrittenTicketTest(unittest.TestCase):
+    """loom#2506: a per-violation issue of a ROLLED kind that a rewrite made
+    a loom:ticket lost loom:triage, so a cleared one never closed: seven such
+    tickets held goal slots at loom:failed, five whose pull requests had
+    already merged or closed."""
+
+    def setUp(self):
+        self.gh = FakeGH()
+        self.said = []
+        self.asked = []
+        patcher = mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": AUTHOR})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def settled(self, invariant, subject):
+        def pull(repo, number):
+            self.asked.append("%s#%d" % (repo, number))
+            return "lane pull request %d merged" % number
+        return station.Station._invariant_settled(
+            types.SimpleNamespace(_lane_pull_settled=pull), Facts(T0), invariant, subject)
+
+    def ticket(self, invariant, subject, labels, number=81, created=T0):
+        """The shape of loom#1888: a rewritten title and body, the old text
+        and its marker quoted under it."""
+        key = invariants.Breach(invariant, subject, "t", (), T0).key
+        self.gh.issues[number] = {
+            "number": number, "id": 9000 + number, "state": "open", "closed_at": None,
+            "title": "Unstick the stalled lane pull request",
+            "labels": [{"name": n} for n in labels], "created_at": stamp(created),
+            "body": "## Why\nIt stalled.\n\nPart of #%d\n\n> Original title: Lane pull "
+                    "request #%s open 7.0 hours: x\n>\n> %s\n" % (
+                        GOAL, subject.rsplit("#", 1)[1], invariants.MARKER % key)}
+        return self.gh.issues[number]
+
+    def run_filer(self, breaches=()):
+        invariants.Filer(self.gh, REPO, GOAL, {}, T0, self.said.append,
+                         settled=self.settled).run(list(breaches))
+
+    def test_a_failed_ticket_whose_pull_request_settled_closes_with_one_comment(self):
+        issue = self.ticket("lane-pr-stalled", "%s#660" % REPO,
+                            ("loom:ticket", "loom:failed", invariants.LABEL))
+        self.run_filer()
+        self.assertEqual(self.asked, ["%s#660" % REPO])
+        self.assertEqual(issue["state"], "closed", self.said)
+        (note,) = self.gh.comments[(REPO, issue["number"])]
+        self.assertIn(invariants.CLEARED_TEXT, note["body"])
+
+    def test_a_cleared_ticket_of_a_kind_with_no_settle_rule_folds(self):
+        # plan-check-failed asks no settled(): like an older issue still at
+        # loom:triage, it folds once the clear wait has passed.
+        issue = self.ticket("plan-check-failed", "%s#661" % REPO,
+                            ("loom:ticket", "loom:queued", invariants.LABEL),
+                            created=T0 - invariants.CLEAR_AFTER - 60)
+        self.run_filer()
+        self.assertEqual(issue["state"], "closed", self.said)
+        self.assertEqual(issue["state_reason"], "not_planned")
+        (note,) = self.gh.comments[(REPO, issue["number"])]
+        self.assertIn("no longer files one issue per `plan-check-failed`", note["body"])
+
+    def test_a_ticket_something_has_in_hand_stays_open(self):
+        busy = [self.ticket("lane-pr-stalled", "%s#%d" % (REPO, 670 + n), labels, number=90 + n,
+                            created=T0 - invariants.CLEAR_AFTER - 60)
+                for n, labels in enumerate((
+                    ("loom:ticket", "loom:running", "claim:someone", invariants.LABEL),
+                    ("loom:ticket", "loom:pr", invariants.LABEL),
+                    ("loom:ticket", "loom:failed", "needs:someone", invariants.LABEL),
+                    ("loom:ticket", "loom:merged", invariants.LABEL)))]
+        self.run_filer()
+        self.assertEqual([i["state"] for i in busy], ["open"] * 4, self.said)
+        self.assertEqual(self.gh.comments, {})
+        self.assertEqual(self.asked, [])
+
+    def test_a_ticket_of_a_kind_outside_rolled_is_left_alone(self):
+        issue = self.ticket("roll-pin-off", "%s#662" % REPO,
+                            ("loom:ticket", "loom:failed", invariants.LABEL),
+                            created=T0 - invariants.CLEAR_AFTER - 60)
+        writes = len(self.gh.writes)
+        self.run_filer()
+        self.assertEqual(issue["state"], "open")
+        self.assertEqual(self.gh.comments, {})
+        self.assertEqual(len(self.gh.writes), writes)
 
 
 class SettleBeforeFilingTest(unittest.TestCase):

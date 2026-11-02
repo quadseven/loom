@@ -3838,7 +3838,22 @@ def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
         return "factory incident"
     if _is_epic(issue):
         return "epic"
+    if restating_invariant(issue):
+        # Its only remedy is a GitHub operation a sandboxed lane cannot make,
+        # and the filer settles it once it clears (loom#2506).
+        return "restating invariant report"
     return None
+
+
+def restating_invariant(issue: Dict[str, Any]) -> bool:
+    """Whether the issue is a loom:invariant report of a kind that restates
+    state the pull request, the epic or the dashboard already shows
+    (invariants.ROLLED), by the kind in its marker key."""
+    from . import invariants  # invariants imports this module
+    if invariants.LABEL not in _labels(issue):
+        return False
+    m = invariants.MARKER_RE.search(str(issue.get("body") or ""))
+    return m is not None and m.group(1).split("/", 1)[0] in invariants.ROLLED
 
 
 # A live goal or a goal journal is read by every session, so no pass may
