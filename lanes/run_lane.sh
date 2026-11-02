@@ -888,7 +888,7 @@ post_replies() {
     body="$(jq -r '.reply' <<< "$entry")"
     resolve="$(jq -r '.resolve' <<< "$entry")"
     node="$(timeout "$NET_TIMEOUT" gh api graphql \
-         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{path pullRequest{number repository{nameWithOwner}} comments(last:50){nodes{body}}}}}' \
+         -f 'query=query($threadId:ID!){node(id:$threadId){... on PullRequestReviewThread{path pullRequest{number repository{nameWithOwner}} comments(last:100){nodes{body}}}}}' \
          -f "threadId=$thread" 2>> "$LOG")" || node=""
     owner="$(jq -r '.data.node.pullRequest | "\(.repository.nameWithOwner)#\(.number)"' <<< "$node" 2>> "$LOG")" || owner=""
     if [ "$owner" != "$REPO#$FIX_PR" ]; then

@@ -112,6 +112,8 @@ class FakeGitHub:
         self.head_files = {}
         # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
         self.commit_files = {}
+        # (thread id, cursor) -> the page of replies before that cursor.
+        self.older_replies = {}
         # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
         # every other search finds one file.
         self.code_absent = set()
@@ -444,6 +446,10 @@ class FakeGitHub:
         if "resolveReviewThread" in query:
             self.resolved.append(variables["id"])
             return reply(200, {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}})
+        if "PullRequestReviewThread" in query and "before" in variables:
+            # An earlier page of a thread's replies, keyed by its cursor.
+            page = self.older_replies.get((variables["id"], variables["before"]))
+            return reply(200, {"data": {"node": {"replies": page}}})
         if "PullRequestReviewThread" in query:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         editor = self.editors[data["variables"]["number"]]
@@ -8010,6 +8016,26 @@ class AnswerTest(Base):
             REPO, 99, "codex", name, brief)
         self.assertEqual((self.fake.replies, self.fake.resolved), ([], ["PRRT_abcd1"]))
         self.assertEqual(self.finding()["state"], "answered")
+
+    def test_a_resent_answer_is_found_on_an_earlier_page_of_replies(self):
+        self.thread()
+        said = "The guard on a.py:2 returns."
+        name = self.finish({"PRRT_abcd1": said})
+        posted = self.fake.replies[0][1]
+        # The first reply now sits a page back, behind a full page of others.
+        self.fake.threads["PRRT_abcd1"]["replies"] = {
+            "pageInfo": {"hasPreviousPage": True, "startCursor": "c1"},
+            "nodes": [{"body": "later %d" % i} for i in range(100)]}
+        self.fake.older_replies[("PRRT_abcd1", "c1")] = {
+            "pageInfo": {"hasPreviousPage": False, "startCursor": "c0"},
+            "nodes": [{"body": posted}]}
+        self.fake.replies.clear()
+        self.write(self.inbox("codex", "answers", name, "PRRT_abcd1.md"), said)
+        self.write(self.inbox("codex", "answers", name, ".head"), "f" * 40)
+        brief = "Model: claude-opus-5-5\n" + THREAD_FIX
+        station.Station(GitHub("token", transport=self.fake), self.settings)._post_answers(
+            REPO, 99, "codex", name, brief)
+        self.assertEqual(self.fake.replies, [])
 
     def test_a_fixed_in_answer_naming_a_foreign_commit_stays_open(self):
         self.thread()

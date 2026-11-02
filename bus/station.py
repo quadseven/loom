@@ -186,7 +186,16 @@ STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved path'
                 ' pullRequest { number headRefOid repository { nameWithOwner } }'
                 ' comments(first:1) { nodes { body author { __typename login } } }'
-                ' replies: comments(last:50) { nodes { body } } } } }')
+                ' replies: comments(last:100) { pageInfo { hasPreviousPage startCursor }'
+                ' nodes { body } } } } }')
+# The earlier replies of a review thread, one page back from `before`: a re-sent
+# answer is looked for in every reply, not only the newest page.
+REPLIES_QUERY = ('query($id:ID!,$before:String!) { node(id:$id) { ... on PullRequestReviewThread {'
+                 ' replies: comments(last:100, before:$before) {'
+                 ' pageInfo { hasPreviousPage startCursor } nodes { body } } } } }')
+# Pages read back before a thread counts as holding the reply: past that the
+# station posts nothing rather than risk a second copy.
+REPLY_PAGES = 20
 REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
                   'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -8101,7 +8110,7 @@ class Station:
             body += "\n\n" + rebuttal.held_marker(current)
         # A re-sent answer posts no second reply: the same text at the same
         # head is the same body (bus/fixrounds.py).
-        if not any(n.get("body") == body for n in (node.get("replies") or {}).get("nodes") or []):
+        if not self._thread_holds(thread_id, node, body):
             self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         if settled:
             try:
@@ -8115,6 +8124,23 @@ class Station:
                 _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
+
+    def _thread_holds(self, thread_id: str, node: Dict[str, Any], body: str) -> bool:
+        """Whether any reply on the thread already is `body`, read page by page
+        back to the first; a thread longer than REPLY_PAGES pages counts as
+        holding it, so a re-sent answer is never posted twice."""
+        page = node.get("replies") or {}
+        for _ in range(REPLY_PAGES):
+            if any(n.get("body") == body for n in page.get("nodes") or []):
+                return True
+            info = page.get("pageInfo") or {}
+            if not (info.get("hasPreviousPage") and info.get("startCursor")):
+                return False
+            older = self.gh.graphql(REPLIES_QUERY, {"id": thread_id,
+                                                    "before": info["startCursor"]}) or {}
+            page = (older.get("node") or {}).get("replies") or {}
+        _say("did not post on %s: its replies run past %d pages" % (thread_id, REPLY_PAGES))
+        return True
 
     def _keep_finding(self, finding: Dict[str, Any]) -> None:
         try:
