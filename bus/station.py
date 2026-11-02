@@ -1705,8 +1705,9 @@ class StateError(Exception):
 
 
 def _read_answer(path: str) -> str:
-    """An answer file's text, redacted of credentials and local paths; empty
-    unless it is a regular file with one link (never followed through a link)."""
+    """An answer file's text as the lane wrote it; empty unless it is a
+    regular file with one link (never followed through a link). Redact it
+    (_redacted_answer) before it is posted."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as err:
@@ -1719,7 +1720,11 @@ def _read_answer(path: str) -> str:
         st = os.fstat(fh.fileno())
         if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1):
             return ""
-        raw = fh.read(ANSWER_MAX).decode("utf-8", errors="replace")
+        return fh.read(ANSWER_MAX).decode("utf-8", errors="replace").strip()
+
+
+def _redacted_answer(raw: str) -> str:
+    """An answer's text with credentials and local paths taken out."""
     return SECRET_RE.sub("<redacted>", PATH_RE.sub("<path>", raw)).strip()
 
 
@@ -8041,7 +8046,8 @@ class Station:
 
     def _answer(self, repo: str, prs: Set[int], lane: str, thread_id: str, path: str,
                 strong: bool) -> None:
-        said = _read_answer(path)
+        raw = _read_answer(path)
+        said = _redacted_answer(raw)
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
         pr = next((n for n in sorted(prs) if _open_on(node, repo, n)), None)
         if not said or pr is None:
@@ -8053,10 +8059,15 @@ class Station:
         except ValueError as err:
             _say("answer to %s on %s#%d not posted: %s" % (thread_id, repo, pr, err))
             return
-        self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
+        # The check reads the lane's own text: redaction drops any long word,
+        # a test name the answer cites included (loom#2285).
         settled = (strong and _bot_minor(root, self.s.review_bot)
-                   and self._answer_holds(repo, pr, lane, thread_id, node, said))
+                   and self._answer_holds(repo, pr, lane, thread_id, node, raw))
+        head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+        if settled:
+            body += "\n\n" + rebuttal.held_marker(head)
+        self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
@@ -8081,7 +8092,7 @@ class Station:
                                      str(node.get("path") or ""), str(root.get("body") or ""))
         if why:
             _say("left %s on %s#%d open: lane %s's answer does not hold on the head: %s"
-                 % (thread_id, repo, pr, lane, why))
+                 % (thread_id, repo, pr, lane, _redacted_answer(why)))
         return not why
 
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:

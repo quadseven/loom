@@ -4535,12 +4535,16 @@ def _post_proof(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
 
 
 def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
+    # The newest 20 commits, with their parent counts: a review finding is
+    # fixed only by a later commit that is not a base merge
+    # (merge_tier.fix_committed, loom#2285).
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
              ' isDraft mergeable headRefName headRefOid headRepository { nameWithOwner } '
              ' reviews(last:100) { nodes { author { __typename login }'
              ' authorCanPushToRepository state submittedAt } } '
-             ' commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } } '
+             ' commits(last:20) { nodes { commit { committedDate parents { totalCount }'
+             ' statusCheckRollup { state } } } } '
              ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } }'
              ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
@@ -4584,7 +4588,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
-        _refuse_unheld_answers(gh, repo, number, details, env)
+        held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -4609,7 +4613,8 @@ def merge(gh: GitHub, repo: str, number: int,
         if reason:
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
-        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict)
+        tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict,
+                                 held)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -4907,7 +4912,8 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]],
-                      verdict: Optional[Callable[[], Optional[answer.Answer]]] = None) -> str:
+                      verdict: Optional[Callable[[], Optional[answer.Answer]]] = None,
+                      held: Container[str] = ()) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -4940,8 +4946,8 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         or factory.DEFAULT_REVIEW_BOT
     blocking = merge_tier.blocking_findings(
         merge_tier.review_threads(gh, repo, number),
-        str(_head_commit(details).get("committedDate") or ""),
-        lambda c: by_bot(dict(c), bot), env)
+        merge_tier.fix_committed((details.get("commits") or {}).get("nodes") or []),
+        lambda c: by_bot(dict(c), bot), env, held)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
     capped = merge_tier.cap_refusal(gh, repo, env)
@@ -5056,16 +5062,21 @@ def _first(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
     return nodes[index] or {}
 
 
+def _answered(thread: Dict[str, Any], bot: str, trusted: set) -> bool:
+    """A resolved bot thread whose newest comment is a lane's answer."""
+    from . import factory  # factory imports this module
+    return bool(thread.get("isResolved") and by_bot(_first(thread, "comments", 0), bot)
+                and factory.lane_answered(_first(thread, "latest", -1), trusted))
+
+
 def _unheld_answer(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
                    bot: str, trusted: set) -> str:
     """Why a resolved bot thread whose newest comment is a lane's answer was
     resolved on an answer that does not hold on the head, else ""."""
-    from . import factory  # factory imports this module
-    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
-    if not (thread.get("isResolved") and by_bot(root, bot)
-            and factory.lane_answered(latest, trusted)):
+    if not _answered(thread, bot, trusted):
         return ""
-    return rebuttal.check_on_head(gh, repo, head, rebuttal.quoted(str(latest.get("body") or "")),
+    root, latest = _first(thread, "comments", 0), _first(thread, "latest", -1)
+    return rebuttal.reply_refusal(gh, repo, head, str(latest.get("body") or ""),
                                   str(thread.get("path") or ""), str(root.get("body") or ""))
 
 
@@ -5124,17 +5135,21 @@ def _record_rebuttal_refusal(gh: GitHub, repo: str, number: int,
 
 
 def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
-                           env: Optional[Dict[str, str]] = None) -> None:
+                           env: Optional[Dict[str, str]] = None) -> Set[str]:
     """Refuse the merge when a review bot thread was resolved on a lane's
     answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
     thread is reopened, so the factory reads it as a finding that survived
     and moves it on, and the next merge sees it unresolved. The refusal
     leaves a marker comment on the pull request, and the error the journal
-    prints carries the same reason, thread and head (loom#2179)."""
+    prints carries the same reason, thread and head (loom#2179). Returns the
+    ids of the resolved threads whose answer held: such a finding needs no
+    fix commit to stop holding the merge (merge_tier.blocking_findings,
+    loom#2285)."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
     head = str(details.get("headRefOid") or "")
+    held: Set[str] = set()
     for thread in (details.get("reviewThreads") or {}).get("nodes") or []:
         why = _unheld_answer(gh, repo, head, thread, bot, trusted)
         if why:
@@ -5143,6 +5158,9 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
             raise ValueError("review thread %s was resolved on a lane answer that does not "
                              "hold on the head: %s (rebuttal-refused thread=%s head=%s)"
                              % (thread.get("id"), why, thread.get("id"), head))
+        if thread.get("id") and _answered(thread, bot, trusted):
+            held.add(str(thread["id"]))
+    return held
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
