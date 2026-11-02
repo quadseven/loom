@@ -3786,6 +3786,8 @@ def protected_reason(issue: Dict[str, Any], journals: Container[int],
     """Why no pass may rewrite the issue into a ticket or label it for that,
     or None: it is an operator's claimed issue, a goal's journal or live goal,
     or titled like one."""
+    if "loom:goal" in _labels(issue):
+        return "a goal"
     if operator_claimed(issue, authors):
         return "claimed by the operator"
     if int(issue.get("number") or 0) in journals:

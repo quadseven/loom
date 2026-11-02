@@ -13398,7 +13398,9 @@ class TwoLoomsTest(Base):
             gh = mock.Mock()
             gh.paginate.return_value = [
                 {"number": 1, "labels": [{"name": "claim:" + self.OTHER}]},
-                {"number": 2, "labels": [{"name": "claim:alice-example"}]}]
+                {"number": 2, "labels": []},
+                {"number": 3, "labels": [{"name": "claim:alice-example"}]}]
+            # An issue claimed by our own operator is left alone too (loom#2143).
             self.assertEqual([i["number"] for i in rewrite.candidates(gh, REPO)], [2])
         self.assertEqual(self.fake.names(100), ["claim:" + self.OTHER])
         self.assertEqual([c for c in self.fake.created
