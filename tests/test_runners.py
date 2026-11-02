@@ -606,6 +606,21 @@ class RunnersTest(unittest.TestCase):
                          "should not park as unfinished brief")
         self.assertIn("done: https://github.com/owner/app/pull/9", log_text)
 
+    def test_successful_run_without_brief_in_artifact_consumes_brief_into_done(self):
+        """A successful run without the brief file in artifact consumes the inbox brief
+        into done/ when the run log shows a pull request (bus/runners.py:508 repair)."""
+        run, run_id = self.dispatched()
+        artifact = self.seal(run_id, {
+            "logs/opencode-go-2/%s.log" % TICKET: "[t] %s done: https://github.com/owner/app/pull/9\n" % TICKET,
+            "logs/opencode-go-2/%s.result" % TICKET: "pr\n",
+        }, beat={"lane": "opencode-go-2", "at": 1, "available": True, "reason": ""})
+        self.finish(run, run_id, artifact, "success")
+        self.runner(now=self.now + 600).tend()
+        self.assertFalse((self.inbox / (TICKET + ".md")).exists(),
+                         "brief should be moved from inbox")
+        self.assertTrue((self.inbox / "done" / (TICKET + ".md")).exists(),
+                        "brief should be in done/")
+
 
 class StationHookTest(unittest.TestCase):
     def test_no_runner_slot_means_no_request(self):

@@ -66,6 +66,8 @@ MODEL_KEY = "model:"
 REFRESH = 3600
 DEFAULT_DAYS = 7
 DEFAULT_AT = 3
+DEFAULT_ZERO_DONE = 20
+PROBE_INTERVAL = 3600
 KEEP = 2000
 
 CLEAN, FINDINGS, BAD_WORK = "clean", "findings", "bad-work"
@@ -141,6 +143,12 @@ def threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_DEMOTE_AT", DEFAULT_AT)
 
 
+def zero_done_threshold(env: Optional[Mapping[str, str]] = None) -> int:
+    target = os.environ if env is None else env
+    raw = str(target.get("LOOM_LANE_ZERO_DONE_BRIEFS", target.get("LOOM_LANE_ZERO_DONE_AT", ""))).strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else DEFAULT_ZERO_DONE
+
+
 def zero_done_hours(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_ZERO_DONE_HOURS", 24) * 3600
 
@@ -193,7 +201,7 @@ class Scorecard:
         self.now = now
         self.env = dict(os.environ if env is None else env)
         self.data: Dict[str, Any] = {"records": {}, "audits": {}, "demoted": {},
-                                     "cleared": {}, "refreshed": 0}
+                                     "cleared": {}, "refreshed": 0, "briefs": {}}
         # A file that is there but cannot be read: its demotions are unknown,
         # so every lane counts as demoted until the operator repairs or
         # removes it, and nothing is written over it.
@@ -220,6 +228,11 @@ class Scorecard:
             for key in sorted(records, key=lambda k: float(records[k].get("at") or 0))[
                     :len(records) - KEEP]:
                 del records[key]
+        briefs = self.data.get("briefs")
+        if isinstance(briefs, dict) and len(briefs) > KEEP:
+            for key in sorted(briefs, key=lambda k: float(briefs[k].get("at") or 0))[
+                    :len(briefs) - KEEP]:
+                del briefs[key]
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as fh:
@@ -247,6 +260,7 @@ class Scorecard:
             at = float(until) - 86400
             self.data["audits"].setdefault("%s@%d" % (lane, int(at)), {"lane": lane, "at": at})
         self._deploys(deploys or {})
+        self.scan_briefs()
         self.data["refreshed"] = self.now
         self.demote()
 
@@ -403,73 +417,165 @@ class Scorecard:
         for failed proof audits and records that name no model (bad)."""
         found = {str(r.get("lane")) for r in self.data["records"].values()}
         found |= {str(e.get("lane")) for e in self.data["audits"].values()}
+        found |= {str(b.get("lane")) for b in (self.data.get("briefs") or {}).values() if b.get("lane")}
         return sorted(found | {lane for lane, _ in AUDIT}
                       | {MODEL_KEY + str(r.get("model")) for r in self.data["records"].values()
                          if _model_bound(r)})
 
-    def _successful_briefs_in_window(self, lane: str) -> int:
-        """Count successfully completed briefs for a lane in the window."""
-        since = self.now - window(self.env)
-        count = 0
-        for record in self.data["records"].values():
-            if record.get("lane") != lane:
-                continue
-            if float(record.get("at") or 0) < since:
-                continue
-            # Only count real brief assignments (have a difficulty kind)
-            kind = record.get("kind", "-")
-            if kind == "-":
-                continue
-            if record.get("merged") and record.get("review") == CLEAN:
-                count += 1
-        return count
+    def record_brief(self, lane: str, ticket: str, done: bool, limit: bool = False,
+                     at: Optional[float] = None) -> None:
+        """Record a finished brief outcome for a lane."""
+        at = self.now if at is None else at
+        self.data.setdefault("briefs", {})["%s/%s" % (lane, ticket)] = {
+            "lane": lane, "ticket": ticket, "done": bool(done),
+            "limit": bool(limit), "at": float(at),
+        }
 
-    def _earliest_brief_assign(self, lane: str) -> Optional[float]:
-        """Earliest timestamp a real brief was assigned to this lane in the window."""
+    def scan_briefs(self, home_dir: Optional[str] = None) -> None:
+        """Scan briefs from disk under briefs/<lane>/done and briefs/<lane>/failed."""
+        if home_dir is None:
+            home_dir = os.path.dirname(os.path.dirname(self.path))
+        briefs_dir = os.path.join(home_dir, "briefs")
+        if not os.path.isdir(briefs_dir):
+            return
+        logs_dir = os.path.join(home_dir, "logs")
         since = self.now - window(self.env)
-        earliest = None
-        for record in self.data["records"].values():
-            if record.get("lane") != lane:
+        try:
+            lanes = os.listdir(briefs_dir)
+        except OSError:
+            return
+        for lane in lanes:
+            lane_path = os.path.join(briefs_dir, lane)
+            if not os.path.isdir(lane_path):
                 continue
-            # Only consider real brief assignments (have a difficulty kind)
-            kind = record.get("kind", "-")
-            if kind == "-":
+            for kind in ("done", "failed"):
+                sub = os.path.join(lane_path, kind)
+                if not os.path.isdir(sub):
+                    continue
+                try:
+                    entries = os.listdir(sub)
+                except OSError:
+                    continue
+                for name in entries:
+                    if not name.endswith(".md"):
+                        continue
+                    ticket = name[:-3]
+                    file_path = os.path.join(sub, name)
+                    try:
+                        mtime = os.path.getmtime(file_path)
+                    except OSError:
+                        continue
+                    if mtime < since:
+                        continue
+                    is_limit = False
+                    if kind == "failed":
+                        log_file = os.path.join(logs_dir, lane, ticket + ".log")
+                        if os.path.isfile(log_file):
+                            try:
+                                with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
+                                    is_limit = bool(re.search(r"\bfailed: \[(limit)\]", fh.read()))
+                            except OSError:
+                                pass
+                    self.record_brief(lane, ticket, done=(kind == "done"), limit=is_limit, at=mtime)
+
+    def brief_counts(self, lane: str) -> Tuple[int, int, int]:
+        """(total_non_limit, done, limit_count) for the lane since the window
+        and its last clear."""
+        if not self.data.get("briefs"):
+            self.scan_briefs()
+        since = max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
+        done = 0
+        failed_non_limit = 0
+        limit_count = 0
+        briefs = self.data.get("briefs") or {}
+        for entry in briefs.values():
+            if not isinstance(entry, dict):
                 continue
-            at = float(record.get("at") or 0)
-            if at < since:
+            entry_lane = str(entry.get("lane") or "")
+            if entry_lane != lane and labels.base_lane(entry_lane) != lane:
                 continue
-            if earliest is None or at < earliest:
-                earliest = at
-        return earliest
+            if float(entry.get("at") or 0) < since:
+                continue
+            if entry.get("limit"):
+                limit_count += 1
+            elif entry.get("done"):
+                done += 1
+            else:
+                failed_non_limit += 1
+        return done + failed_non_limit, done, limit_count
+
+    def is_zero_done(self, lane: str) -> bool:
+        """Whether a lane is demoted under the zero-done rule."""
+        info = self.data["demoted"].get(lane)
+        if not isinstance(info, dict):
+            info = self.data["demoted"].get(labels.base_lane(lane))
+        return isinstance(info, dict) and info.get("kind") == "zero-done"
+
+    def can_probe(self, lane: str) -> bool:
+        """Whether a zero-done demoted lane may receive a probe brief:
+        at most one probe brief per hour."""
+        info = self.data["demoted"].get(lane)
+        if not isinstance(info, dict):
+            info = self.data["demoted"].get(labels.base_lane(lane))
+        if not isinstance(info, dict) or info.get("kind") != "zero-done":
+            return False
+        probed = float(info.get("probed") or 0.0)
+        return (self.now - probed) >= PROBE_INTERVAL
+
+    def note_probe(self, lane: str) -> None:
+        """Record that a probe brief was given to a zero-done demoted lane."""
+        base = labels.base_lane(lane)
+        target = lane if lane in self.data["demoted"] else base
+        info = self.data["demoted"].get(target)
+        if isinstance(info, dict):
+            info["probed"] = self.now
+            self.save()
+
+    def clear_zero_done(self, lane: str) -> bool:
+        """Clear zero-done demotion for a lane when it finishes a done brief."""
+        base = labels.base_lane(lane)
+        target = lane if lane in self.data["demoted"] else base
+        info = self.data["demoted"].get(target)
+        if isinstance(info, dict) and info.get("kind") == "zero-done":
+            self.data["demoted"].pop(target, None)
+            _say("cleared zero-done demotion for lane %s" % target)
+            self.save()
+            return True
+        return False
 
     def demote(self) -> List[str]:
         """Demote each lane whose bad outcomes reach the threshold; the
-        lanes newly demoted. Also demote lanes with zero successful brief
-        completions past the LOOM_LANE_ZERO_DONE_HOURS threshold."""
+        lanes newly demoted. Also demote lanes with zero done briefs when
+        finished briefs reach the zero-done threshold."""
         at = threshold(self.env)
         days = window(self.env) // 86400
-        zero_hours = zero_done_hours(self.env)
+        zero_thresh = zero_done_threshold(self.env)
         newly = []
         for lane in self.lanes():
+            total_non_limit, done, _ = self.brief_counts(lane)
             if lane in self.data["demoted"]:
+                info = self.data["demoted"][lane]
+                if isinstance(info, dict) and info.get("kind") == "zero-done":
+                    if done > 0:
+                        self.data["demoted"].pop(lane, None)
+                        _say("cleared zero-done demotion for lane %s: %d done briefs" % (lane, done))
                 continue
             count, what = self.bad(lane)
             if count >= at:
                 why = ("%d bad outcomes in %d days (%s), at or past LOOM_LANE_DEMOTE_AT=%d"
                        % (count, days, ", ".join(what), at))
-                self.data["demoted"][lane] = {"at": self.now, "why": why}
+                self.data["demoted"][lane] = {"at": self.now, "why": why, "kind": "bad-outcomes"}
                 newly.append(lane)
                 _say("demoted lane %s: %s" % (lane, why))
                 continue
-            done = self._successful_briefs_in_window(lane)
-            if done == 0:
-                earliest = self._earliest_brief_assign(lane)
-                if earliest is not None and self.now - earliest >= zero_hours:
-                    why = ("zero successful brief completions in %d hours (LOOM_LANE_ZERO_DONE_HOURS=%d)"
-                           % (zero_hours // 3600, zero_hours // 3600))
-                    self.data["demoted"][lane] = {"at": self.now, "why": why}
-                    newly.append(lane)
-                    _say("demoted lane %s: %s" % (lane, why))
+            if total_non_limit >= zero_thresh and done == 0:
+                why = ("%d finished briefs and 0 done, at or past zero-done threshold %d"
+                       % (total_non_limit, zero_thresh))
+                self.data["demoted"][lane] = {
+                    "at": self.now, "why": why, "kind": "zero-done", "probed": 0.0
+                }
+                newly.append(lane)
+                _say("demoted lane %s: %s" % (lane, why))
         return newly
 
     def demoted(self) -> Dict[str, str]:

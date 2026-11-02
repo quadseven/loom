@@ -4142,6 +4142,11 @@ class Helpers(unittest.TestCase):
         comments = [{"body": factory.RUNG_MARKER % 1}, CLAIM, {"body": factory.RUNG_MARKER % 2}]
         self.assertEqual(factory.tried_rungs(comments), {1})
 
+    def test_a_limit_park_does_not_charge_a_rung(self):
+        comments = [{"body": factory.RUNG_MARKER % 1}, CLAIM,
+                    {"body": "Lane zen stopped: [limit] provider at usage limit"}]
+        self.assertEqual(factory.tried_rungs(comments), set())
+
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {}), "codex")

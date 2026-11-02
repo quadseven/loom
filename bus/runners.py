@@ -619,10 +619,20 @@ class Runners:
         self._take_beat(ledger, slot, beat)
         self._note_image(ledger, slot, files, ticket)
         self._note_base(ledger, entry, files)
-        if os.path.exists(os.path.join(self.inbox(slot), ticket + ".md")):
-            why = str((beat or {}).get("reason") or "") or (
-                "the runner run ended %s without finishing the brief" % conclusion)
-            self._park(slot, ticket, "runner: %s" % why, "transient")
+        inbox_brief = os.path.join(self.inbox(slot), ticket + ".md")
+        if os.path.exists(inbox_brief):
+            log_bytes = files.get("logs/%s/%s.log" % (slot, ticket)) or b""
+            result_bytes = files.get("logs/%s/%s.result" % (slot, ticket)) or b""
+            has_done_log = b" done: https://" in log_bytes or result_bytes.strip() == b"pr"
+            if conclusion == "success" and has_done_log:
+                done_dir = os.path.join(self.inbox(slot), "done")
+                os.makedirs(done_dir, exist_ok=True)
+                os.replace(inbox_brief, os.path.join(done_dir, ticket + ".md"))
+                self.say("consumed brief for %s/%s into done/ after successful runner run" % (slot, ticket))
+            else:
+                why = str((beat or {}).get("reason") or "") or (
+                    "the runner run ended %s without finishing the brief" % conclusion)
+                self._park(slot, ticket, "runner: %s" % why, "transient")
         self.say("read the runner report for %s/%s (%s)" % (slot, ticket, conclusion))
 
     # -- reports -----------------------------------------------------------

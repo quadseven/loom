@@ -2615,6 +2615,7 @@ class Station:
                    % (lane, _sha12(issue.get("body"))),
                    self._claim_time(comments, fix_comment_id), self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        self._note_claimed_probe(lane)
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
                  % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
@@ -2625,6 +2626,12 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _note_claimed_probe(self, lane: str) -> None:
+        """Record that a zero-done demoted lane was given its probe brief."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if card.is_zero_done(lane):
+            card.note_probe(lane)
 
     def _claim_comments(self, repo: str, issue: Dict[str, Any],
                         number: int) -> Optional[List[Any]]:
@@ -4953,6 +4960,8 @@ class Station:
             if done:
                 reported[key] = kind
                 _write_json(path, reported)
+                if kind == "done":
+                    scorecard.Scorecard(self.state, self.now).clear_zero_done(lane)
 
     @staticmethod
     def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
@@ -13168,9 +13177,17 @@ class Station:
 
     def _not_demoted(self, free: List[str]) -> List[str]:
         """The free lanes that may claim a build ticket: a demoted lane
-        takes none (bus/scorecard.py)."""
+        takes none (bus/scorecard.py), except that a zero-done demoted lane
+        gets at most one probe brief an hour."""
+        card = scorecard.Scorecard(self.state, self.now)
         demoted = self.demoted_lanes()
-        return [lane for lane in free if lane not in demoted]
+        out = []
+        for lane in free:
+            if lane not in demoted:
+                out.append(lane)
+            elif card.can_probe(lane):
+                out.append(lane)
+        return out
 
     def demoted_lanes(self) -> Dict[str, str]:
         """Each lane slot the scorecard demoted, and why. A scorecard file
