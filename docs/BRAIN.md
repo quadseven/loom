@@ -1506,13 +1506,21 @@ issue moves to `needs:human`, it is listed with the asks.
 One tick at a time, under a lock: a branch `loom-lock/brain` in this repo,
 created through the API. Creating a ref that exists fails, so only one
 holder wins. The ref points at a commit whose message is
-`holder=<name> expires=<UTC time>`. A tick that finds the lock held and
-unexpired exits; one that finds it expired deletes it and tries once to
-create it. The tick deletes it when done. The lock lasts `--minutes`
-(default 15); Muse takes 30 for its 25-minute tick.
+`holder=<name> expires=<UTC time> acquired=<UTC time>`, with `run=<id>` when
+the caller passed `--run`. A tick that finds the lock held and unexpired by a
+peer exits; one that finds it expired deletes it and tries once to create
+it. A live lock that is the caller's own (the same holder, and the same run
+when `--run` is given) is acquired, not held: a re-attempt after a lost or
+misread answer never stands a brain down against itself (loom#2275). The
+tick expires it when done. The lock lasts `--minutes`
+(default 15); Muse takes 30 for its 25-minute tick. `--wait N` tries again
+each minute for up to N minutes while a peer holds it.
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
-<owner/name> --holder <name>` do this (exit 0 on success, 1 when held by
-someone else).
+<owner/name> --holder <name>` do this (exit 0 when the caller holds the lock,
+1 when a peer does). The lock line always names the holder: `lock acquired:
+yours ...`, `lock acquired: already yours ..., held 4m since <time>`, or
+`lock held by <holder> (not yours: you are <caller>), held 12m since <time>,
+at step <step>, expires <time>`.
 
 Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review `needs-brain` tickets in full
