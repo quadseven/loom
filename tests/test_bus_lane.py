@@ -275,6 +275,17 @@ class PushBranchTest(unittest.TestCase):
         self.assertEqual(sha, self.head)
         self.assertEqual(gh.refs[EXACT], self.head)
 
+    def test_a_named_branch_is_pushed_instead_of_the_ticket_branch(self):
+        # Muse's builder pushes muse/<n>-<slug>, never a loom/ lane branch
+        # (bus/muse_build.py).
+        named = "muse/" + BRANCH.split("/", 1)[1]
+        self._git("branch", "-m", named)
+        gh = FakeGitHub(self.dir, {})
+        sha = lane.push_branch(gh, REPO, NUMBER, branch=named)
+        self.assertEqual(sha, self.head)
+        self.assertEqual(gh.refs["refs/heads/" + named], self.head)
+        self.assertNotIn(EXACT, gh.refs)
+
     def test_an_up_to_date_target_is_a_no_op(self):
         gh, sha = self.push({EXACT: self.head})
         self.assertEqual(sha, self.head)
