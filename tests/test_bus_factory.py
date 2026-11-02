@@ -55,6 +55,10 @@ class FakeGitHub:
         self.details = {}
         self.writes = []
         self.behind = {}
+        # The base's rules: a strict check rule unless a test says otherwise;
+        # an exception here is a rules read that failed.
+        self.rules = [{"type": "required_status_checks",
+                       "parameters": {"strict_required_status_checks_policy": True}}]
         self.attempts = {}
         self.update_status = 202
         self.files = {}
@@ -99,6 +103,10 @@ class FakeGitHub:
 
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
+        if "/rules/branches/main" in path:
+            if isinstance(self.rules, Exception):
+                raise self.rules
+            return list(self.rules)
         if re.search(r"/issues\?labels=loom:ticket", path):
             return [i for i in self.issues.values() if i.get("state") == "open"]
         if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
@@ -1030,6 +1038,50 @@ class PullRequests(Base):
                           {"expected_head_sha": "sha50"}), self.gh.writes)
         for call in say.call_args_list:
             self.assertNotIn("up to date", call.args[0])
+
+    NOT_STRICT = [{"type": "pull_request", "parameters": {}},
+                  {"type": "required_status_checks",
+                   "parameters": {"strict_required_status_checks_policy": False}}]
+
+    def land_behind(self, rules, mergeable=True):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.gh.rules = rules
+        self.gh.pulls[50]["mergeable"] = mergeable
+        self.go()
+        return [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+
+    def test_a_ready_behind_pull_request_on_a_non_strict_repo_merges_with_no_update(self):
+        # loom#2482: the fleet merge gate dropped up-to-date on these repos.
+        self.assertEqual(self.land_behind(self.NOT_STRICT), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_repo_with_no_rules_merges_a_behind_pull_request(self):
+        self.assertEqual(self.land_behind([]), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_one_strict_rule_among_others_takes_the_update_path(self):
+        strict = {"type": "required_status_checks",
+                  "parameters": {"strict_required_status_checks_policy": True}}
+        self.assertEqual(self.land_behind(self.NOT_STRICT + [strict]),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_check_rule_that_does_not_state_its_policy_counts_as_strict(self):
+        rule = {"type": "required_status_checks", "parameters": {}}
+        self.assertEqual(self.land_behind([rule]),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_rules_that_cannot_be_read_take_the_update_path(self):
+        self.assertEqual(self.land_behind(GitHubError("no", status=403)),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_behind_pull_request_github_has_not_judged_does_not_merge(self):
+        self.land_behind(self.NOT_STRICT, mergeable=None)
+        self.assertEqual(self.merged, [])
 
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")

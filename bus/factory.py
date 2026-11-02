@@ -27,9 +27,11 @@ Neither needs a model:
   hand-back (bus/station.py _post_fix_or_escalate), which usually sends a
   round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
-  request that is behind its base is brought up to date first (GitHub's
-  update-branch), and lands only once its checks and review pass again on
-  the new head. Each repo lands at most one pull request a pass, so the
+  request behind its base lands as it stands when GitHub reports it
+  mergeable and no rule on the base requires up-to-date branches (loom#2482,
+  the fleet merge gate's rule). Any other is brought up to date first
+  (GitHub's update-branch), and lands only once its checks and review pass
+  again on the new head. Each repo lands at most one pull request a pass, so the
   next one is checked against the base that includes it. The one brought up
   to date holds the repo's landing lock (bus/landing.py, loom:landing) for
   up to 40 minutes, and no other pull request there is updated or landed
@@ -3714,17 +3716,18 @@ class Factory:
 
     def _land(self, repo: str, number: int, full: Dict[str, Any],
               issue: Dict[str, Any], comments: List[Dict[str, Any]]) -> None:
-        """Merge a ready pull request that is up to date with its base, one a
-        repo a pass; bring one that is behind up to date instead. A pull
-        request that cannot be brought up to date cleanly goes back for a
-        fix round, as a conflict does. The one brought up to date takes the
-        repo's landing lock; while another holds it, this does neither."""
+        """Merge a ready pull request, one a repo a pass. One behind its base
+        merges as it stands when _may_land_behind says so; any other behind
+        one is brought up to date instead. A pull request that cannot be
+        brought up to date cleanly goes back for a fix round, as a conflict
+        does. The one brought up to date takes the repo's landing lock; while
+        another holds it, this does neither."""
         if repo in self.landed:
             return
         held = self._lock(repo)
         if held is not None and held != number:
             return  # another pull request holds the repo's landing lock
-        if self._behind(repo, full):
+        if self._behind(repo, full) and not self._may_land_behind(repo, full):
             if repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
@@ -3734,6 +3737,28 @@ class Factory:
             self.landed.add(repo)
             if held == number:
                 self._unlock(repo, number)
+
+    def _may_land_behind(self, repo: str, full: Dict[str, Any]) -> bool:
+        """The merge gate's rule for a behind pull request (claude-stuff
+        scripts/pr-merge-gated.sh, loom#2482): it merges when GitHub says it
+        merges cleanly and no rule on the base requires up-to-date branches.
+        A check rule that does not state its policy, or rules that cannot be
+        read, count as requiring it."""
+        if full.get("mergeable") is not True:
+            return False
+        base = str((full.get("base") or {}).get("ref") or "")
+        try:
+            rules = self.gh.paginate("/repos/%s/rules/branches/%s"
+                                     % (repo, quote(base, safe="")))
+        except GitHubError as err:
+            _say("could not read the rules on %s %s, so it counts as strict: %s"
+                 % (repo, base, err))
+            return False
+        return not any(
+            rule.get("type") == "required_status_checks"
+            and (rule.get("parameters") or {}).get("strict_required_status_checks_policy")
+            is not False
+            for rule in rules)
 
     def _update_to_land(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: List[Dict[str, Any]],

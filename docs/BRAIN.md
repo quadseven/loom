@@ -1780,7 +1780,9 @@ While a pull request carries that label and was marked less than 40 minutes
 ago, the factory updates and lands no other pull request in that repo, and
 `bus.brain merge` refuses to merge any other one there. The marked one lands
 as soon as it is current and green; if main moves under it, the factory
-updates it again and it keeps the lock. The lock ends when it merges or
+updates it again and it keeps the lock. On a base with no rule requiring
+up-to-date branches, a mergeable behind pull request merges without the update
+or the lock (loom#2482). The lock ends when it merges or
 closes, or 40 minutes after the mark (from the label's event on GitHub),
 when the label comes off and the next pass picks again. Operators merging
 by hand follow the same cadence.
