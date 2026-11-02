@@ -4,7 +4,8 @@ Creating a ref that exists fails with 422, so only one holder wins. The
 message is `holder=<name> expires=<UTC> acquired=<UTC>`, with ` run=<id>` when
 the caller named its run, and ` login=<login>` when it named the GitHub
 login it writes as: a fleet brain acts as the brain only while the lock
-names its own login (docs/BRAIN.md, Shared brain duty). Every attempt answers with the holder record, so a
+names its own login (docs/BRAIN.md, Shared brain duty). Every attempt
+answers with the holder record, so a
 brain can tell its own lock from a peer's (loom#2275): a re-attempt that finds
 the caller's own live lock is acquired, and a peer's lock is told with its
 holder and how long it has held it.

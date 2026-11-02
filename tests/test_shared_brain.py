@@ -112,11 +112,11 @@ class ActingBrainTests(unittest.TestCase):
 
 
 class BrainArtifactTrustTests(unittest.TestCase):
-    def test_status_and_resume_read_fleet_brains_journals(self):
-        self.assertEqual(["operator", "loom-brain[bot]", MUSE, CODEX],
-                         brain.require_trusted_authors(ENV, "resume"))
+    """Read trust stays on LOOM_BRIEF_AUTHORS: a briefer's comment is not a
+    brain's proof or journal just because the login is a fleet brain. The
+    operator lists a fleet brain in LOOM_BRIEF_AUTHORS deliberately."""
 
-    def proven_by(self, login):
+    def proven_by(self, login, env=ENV):
         class Comments:
             def paginate(self, path):
                 return [{"user": {"login": login}, "body": "proof", "html_url": "u"}]
@@ -125,18 +125,35 @@ class BrainArtifactTrustTests(unittest.TestCase):
                 mock.patch.object(brain.proof, "read", lambda body: record), \
                 mock.patch.object(brain.proof, "contract", lambda body: "c"), \
                 mock.patch.object(brain.proof, "check"):
-            return brain._check_proven(Comments(), REPO, 5, {"body": ""}, ENV)
+            return brain._check_proven(Comments(), REPO, 5, {"body": ""}, env)
 
-    def test_a_close_trusts_a_fleet_brains_proof(self):
-        self.assertEqual("u", self.proven_by(MUSE))
-
-    def test_a_close_still_refuses_a_strangers_proof(self):
+    def test_a_briefers_proof_is_not_a_brains_proof(self):
         with self.assertRaisesRegex(ValueError, "no loom:proof comment"):
-            self.proven_by("stranger")
+            self.proven_by(MUSE)
 
-    def test_an_empty_loom_list_is_still_refused(self):
+    def test_a_fleet_brain_listed_as_a_loom_login_proves(self):
+        listed = dict(ENV, LOOM_BRIEF_AUTHORS=ENV["LOOM_BRIEF_AUTHORS"] + " " + MUSE)
+        self.assertEqual("u", self.proven_by(MUSE, listed))
+
+    def test_status_and_resume_read_only_loom_logins(self):
+        self.assertEqual(["operator", "loom-brain[bot]"],
+                         brain.require_trusted_authors(ENV, "resume"))
+
+    def test_a_listed_fleet_brain_still_needs_the_lock_to_write(self):
+        # Listing a fleet brain for read trust does not let it act unlocked.
+        listed = dict(env(MUSE), LOOM_BRIEF_AUTHORS=ENV["LOOM_BRIEF_AUTHORS"] + " " + MUSE)
+        g = FakeGit()
         with self.assertRaises(ValueError):
-            brain.require_trusted_authors({"LOOM_TRUSTED_BRIEFERS": MUSE}, "resume")
+            brain.check_acting_brain(GitHub("tok", transport=g), REPO, listed, NOW)
+
+    def test_the_loom_brain_app_acts_without_a_login_on_the_lock(self):
+        g = FakeGit()
+        self.assertIsNone(brain.check_acting_brain(GitHub("tok", transport=g), REPO,
+                                                   env("loom-brain[bot]"), NOW))
+
+    def test_an_unknown_login_is_left_to_the_other_gates(self):
+        g = FakeGit()
+        self.assertIsNone(brain.check_acting_brain(GitHub("tok", transport=g), REPO, ENV, NOW))
 
 
 if __name__ == "__main__":

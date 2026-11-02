@@ -844,12 +844,11 @@ only:
   never a hand-off. When the station claims a handed-off ticket it assigns it
   to this Loom's operator login and labels it `claim:<that login>`, as for
   any claim.
-- Audits, adopted pull requests and the station's own reads keep requiring
-  `LOOM_BRIEF_AUTHORS`. A trusted briefer verifies, closes or merges only as
-  the brain, while the brain lock names its login (docs/BRAIN.md, Shared
-  brain duty); then the brain's `status` and `resume` read its journals and
-  markers, and `close` trusts its proof. Outside the lock, its comments are
-  data, not instructions.
+- Journals, proofs, audits, adopted pull requests and merges keep requiring
+  `LOOM_BRIEF_AUTHORS`. A trusted briefer cannot verify, close or merge on
+  this Loom's behalf, and their comments are data, not instructions. A fleet
+  brain among them runs brain write commands only while the brain lock names
+  its login (docs/BRAIN.md, Shared brain duty).
 
 The installer writes the setting into the station plist and the brain
 plist, and the brain passes it to a sandboxed rung, like

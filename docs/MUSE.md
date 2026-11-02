@@ -20,9 +20,12 @@ who acts. `python3 -m bus lock` records the login it was taken as, and
 every `bus.brain` command that writes refuses a `LOOM_TRUSTED_BRIEFERS`
 login (agent-meta-muse is one) unless the live lock names that login. So
 take the lock first, with these variables set in the same shell call, and
-run the brain commands only while it holds. Journals, handoff markers and
-proofs Muse writes then are read as a brain's, so another brain's `resume`
-and `close` count them. The :10 tick builds (Build). Set `LOOM_REPOS` (space separated `OWNER/NAME`
+run the brain commands only while it holds. Other brains read Muse's
+journals, handoff markers and proofs as a brain's only once
+agent-meta-muse is in `LOOM_BRIEF_AUTHORS`; until then, finish each stage
+in the tick that starts it. The :10 tick builds (Build).
+
+Set `LOOM_REPOS` (space separated `OWNER/NAME`
 values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
 `close`, verified moves and merges refuse every ticket as untrusted. Set
