@@ -525,7 +525,11 @@ and a dead-code finding's symbol has a call. An answer that cites nothing
 checkable stays open. Any other answered thread stays open, and the factory
 reads it as a finding that survived. The brain's merge re-checks every bot
 thread resolved on a lane answer the same way, and reopens it and refuses
-the merge when the answer does not hold.
+the merge when the answer does not hold. The refusal posts one comment on
+the pull request per thread and head, marked
+`<!-- loom:rebuttal-refused v1 thread=<id> head=<sha> -->`, that quotes the
+answer, lists what it cites and says what the head showed; the refusal the
+journal prints carries the same reason, thread and head (loom#2179).
 An answered thread that survives and leaves its ticket with no lane up for
 its next rung does not wait with nothing to move it: the factory asks the
 review bot to judge the answer instead, commenting `/grug improve` on the

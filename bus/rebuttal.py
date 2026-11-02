@@ -136,6 +136,17 @@ def _cited(answer: str, thread_path: str) -> List[Tuple[str, int, int]]:
     return cited
 
 
+def citations(answer: str, thread_path: str = "") -> List[str]:
+    """What the answer cites for the head to show, as a refusal comment names
+    it: each file (with its line or lines) and each backticked symbol."""
+    out = []
+    for path, start, end in _cited((answer or "").strip(), thread_path):
+        out.append(path if not start else "%s:%d" % (path, start) if start == end
+                   else "%s:%d-%d" % (path, start, end))
+    out += ["`%s`" % s for s in _symbols(answer)]
+    return list(dict.fromkeys(out))
+
+
 def _files_refusal(cited: List[Tuple[str, int, int]], head: _Head) -> str:
     for path, start, end in cited:
         text = head.text(path)

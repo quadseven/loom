@@ -4584,7 +4584,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
-        _refuse_unheld_answers(gh, repo, details, env)
+        _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
             bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
@@ -5079,12 +5079,58 @@ def _reopen(gh: GitHub, thread_id: str) -> None:
         print("could not reopen review thread %s: %s" % (thread_id, err), file=sys.stderr)
 
 
-def _refuse_unheld_answers(gh: GitHub, repo: str, details: Dict[str, Any],
+# The marker of a rebuttal refusal comment (loom#2179): one per thread and
+# head, so refusals are counted from the pull request, not from memory.
+REBUTTAL_REFUSED_MARKER = "<!-- loom:rebuttal-refused v1 thread=%s head=%s -->"
+
+
+def _rebuttal_refused_comment(thread: Dict[str, Any], head: str, why: str) -> str:
+    latest = _first(thread, "latest", -1)
+    said = rebuttal.quoted(str(latest.get("body") or ""))
+    cited = rebuttal.citations(said, str(thread.get("path") or ""))
+    thread_id = str(thread.get("id") or "")
+    return "\n".join([
+        REBUTTAL_REFUSED_MARKER % (thread_id, head),
+        "Merge refused: review thread %s on %s was resolved on a lane answer that does "
+        "not hold on head %s, so the thread was reopened." % (
+            thread_id, thread.get("path") or "the pull request", head[:12]),
+        "",
+        "The answer judged:",
+        "",
+        "\n".join("> " + line for line in (said or "(empty)").splitlines()),
+        "",
+        "Cited: %s" % (", ".join(cited) or "nothing the head can show"),
+        "On the head: %s" % why,
+    ])
+
+
+def _record_rebuttal_refusal(gh: GitHub, repo: str, number: int,
+                             thread: Dict[str, Any], head: str, why: str) -> None:
+    """Post the refusal's marker comment, once per thread and head. The merge
+    is refused whatever this does: a failed read or post is logged."""
+    marker = REBUTTAL_REFUSED_MARKER % (thread.get("id") or "", head)
+    try:
+        comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        if any(marker in str((c or {}).get("body") or "") for c in comments):
+            return
+        body = _rebuttal_refused_comment(thread, head, why)
+        _check_written_text(body)
+        notify.post(gh, repo, number, body, notify.RECORD)
+    except RateLimited:
+        raise
+    except (GitHubError, ValueError) as err:
+        print("could not record the rebuttal refusal on %s#%d: %s" % (repo, number, err),
+              file=sys.stderr)
+
+
+def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
                            env: Optional[Dict[str, str]] = None) -> None:
     """Refuse the merge when a review bot thread was resolved on a lane's
     answer that does not hold on the head (bus/rebuttal.py, loom#2081). The
     thread is reopened, so the factory reads it as a finding that survived
-    and moves it on, and the next merge sees it unresolved."""
+    and moves it on, and the next merge sees it unresolved. The refusal
+    leaves a marker comment on the pull request, and the error the journal
+    prints carries the same reason, thread and head (loom#2179)."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
@@ -5093,8 +5139,10 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, details: Dict[str, Any],
         why = _unheld_answer(gh, repo, head, thread, bot, trusted)
         if why:
             _reopen(gh, str(thread.get("id") or ""))
+            _record_rebuttal_refusal(gh, repo, number, thread, head, why)
             raise ValueError("review thread %s was resolved on a lane answer that does not "
-                             "hold on the head: %s" % (thread.get("id"), why))
+                             "hold on the head: %s (rebuttal-refused thread=%s head=%s)"
+                             % (thread.get("id"), why, thread.get("id"), head))
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
