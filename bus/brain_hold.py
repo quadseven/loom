@@ -24,8 +24,16 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Sequence
 
 LABEL = "needs-brain"
+# Equal to bus.brain.HUMAN_MARKER and bus.answer.HUMAN_MARKER.
+HUMAN_MARKER = "<!-- loom:human v1 -->"
 # A hold this old is resolved; a younger one may still be answered.
 HOLD_AGE = 24 * 3600
+# A ticket with an open lane pull request that has waited on the brain this
+# long goes to a person once per head commit (loom#1250), before the 6-hour
+# lane-pr-stalled invariant (bus/invariants.py) fires.
+STALL_AGE = 4 * 3600
+# Last line of that ask: the pull request head it was posted for.
+STALL_MARKER = "<!-- loom:brain-stall %s -->"
 # At most this many holds are resolved a run, and a run at most every
 # LIFT_EVERY seconds, stamped however the run ends (bus/station.py
 # lift_brain_holds): on 2026-10-20 an hourly sweep stamped only on success
@@ -121,6 +129,17 @@ def repair_note(found: Setter, hours: float, why: str) -> str:
     return ("%s\nThe needs-brain hold %s set %.0f hours ago (%s) is lifted: the pull "
             "request's body now passes the plan check, so the factory moves the ticket "
             "again." % (LIFT_MARKER, found.login, hours, why))
+
+
+def stall_ask(repo: str, ticket: int, number: int, sha: str, hours: float) -> str:
+    """The comment that sends a ticket stalled on the brain to a person: the
+    loom:human marker, the one exact ask, and the head it was posted for."""
+    return ("%s\nKind: decision\nPull request #%d of %s#%d has waited on the brain "
+            "(needs-brain) for %.0f hours and no brain tick has taken it. Merge it with "
+            "python3 -m bus.brain merge %s#%d, or send it back to a lane with "
+            "python3 -m bus.brain fix %s#%d --ticket %s#%d --file FIX.md.\n%s"
+            % (HUMAN_MARKER, number, repo, ticket, hours, repo, number, repo, number, repo,
+               ticket, STALL_MARKER % sha))
 
 
 def counts() -> Dict[str, int]:

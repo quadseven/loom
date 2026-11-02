@@ -2,14 +2,15 @@
 # Install the lanes (and the station) as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
-#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark,
+#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot,
 #     plus the extra slots anthropic-2 to anthropic-8, codex-2, opencode-go-2
 #     opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL) and opencode-go-4
 #     (LOOM_OPENCODE_GO_4_MODEL, Muse Spark Contributor: public repos only)
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
-# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM, optional
+# LOOM_OPENCODE_GO_KEY_SSM, LOOM_ANTHROPIC_KEY_SSM, LOOM_ZAI_KEY_SSM,
+# LOOM_COPILOT_KEY_SSM, optional
 # LOOM_AWS_REGION; zen needs no key); they are written into the local plists
 # only, never into this repo. A lane whose key is missing reports itself
 # unavailable and receives no work. The spark lane needs no key: set
@@ -79,6 +80,7 @@ LOOM_FREE_KILO_URL="${LOOM_FREE_KILO_URL:-}"
 LOOM_FREE_KILO_MODEL="${LOOM_FREE_KILO_MODEL:-free/kilo}"
 LOOM_FREE_GROQ_URL="${LOOM_FREE_GROQ_URL:-}"
 LOOM_FREE_GROQ_MODEL="${LOOM_FREE_GROQ_MODEL:-free/groq}"
+LOOM_FREE_OPENROUTER_MODEL="${LOOM_FREE_OPENROUTER_MODEL:-free/openrouter}"
 LOOM_FREE_CONTEXT="${LOOM_FREE_CONTEXT:-120000}"
 LOOM_FREE_OUTPUT="${LOOM_FREE_OUTPUT:-16384}"
 LOOM_SPARK_MODEL="${LOOM_SPARK_MODEL:-}"
@@ -88,7 +90,7 @@ LOOM_SPARK_OUTPUT="${LOOM_SPARK_OUTPUT:-4096}"
 export LOOM_CODEX_MODEL LOOM_CODEX_ONLY_MODEL LOOM_AGY_ONLY_MODEL LOOM_CLAUDE_MODEL LOOM_OPENROUTER_MODEL LOOM_OPENCODE_GO_MODEL LOOM_OPENCODE_GO_3_MODEL LOOM_OPENCODE_GO_4_MODEL \
   LOOM_OPENCODE_GO_PROBE_URL LOOM_OPENCODE_GO_PROBE_HEADER LOOM_ANTHROPIC_MODEL \
   LOOM_ZEN_MODEL LOOM_ZAI_MODEL LOOM_WORKERSAI_MODEL LOOM_AGY_MODEL LOOM_AGY_EFFORT LOOM_SPARK_URL LOOM_SPARK_2_URL LOOM_SPARK_3_URL LOOM_SPARK_4_URL LOOM_SPARK_MODEL \
-  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
+  LOOM_FREE_GATEWAY_URL LOOM_FREE_OLLAMA_URL LOOM_FREE_OLLAMA_MODEL LOOM_FREE_GEMMA_URL LOOM_FREE_GEMMA_MODEL LOOM_FREE_NVIDIA_URL LOOM_FREE_NVIDIA_MODEL LOOM_FREE_KILO_URL LOOM_FREE_KILO_MODEL LOOM_FREE_GROQ_URL LOOM_FREE_GROQ_MODEL LOOM_FREE_OPENROUTER_MODEL LOOM_FREE_CONTEXT LOOM_FREE_OUTPUT \
   LOOM_SPARK_CONTEXT LOOM_SPARK_OUTPUT
 # Briefs may only name repos of these owners. Default: this checkout's owner.
 LOOM_REPO_OWNERS="${LOOM_REPO_OWNERS:-$(git -C "$REPO_ROOT" remote get-url origin | sed -E 's#^.*[:/]([^/]+)/[^/]+$#\1#')}"
@@ -121,6 +123,21 @@ fi
 BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 [[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
   { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+# The brain tick's start minutes past each hour (loom#2469): :25 and :55
+# sit between Muse's :10 and :40 starts (docs/MUSE.md), so the lane
+# machine's tick no longer drifts onto them as a StartInterval did. Empty,
+# the tick runs every LOOM_BRAIN_INTERVAL seconds instead.
+BRAIN_AT="${LOOM_BRAIN_AT-25 55}"
+BRAIN_SCHEDULE="  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>"
+if [ -n "${BRAIN_AT// /}" ]; then
+  BRAIN_SCHEDULE="  <key>StartCalendarInterval</key>"$'\n'"  <array>"
+  for m in $BRAIN_AT; do
+    [[ "$m" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$m))" -le 59 ] ||
+      { echo "LOOM_BRAIN_AT must list minutes past the hour, 0 to 59" >&2; exit 1; }
+    BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"    <dict><key>Minute</key><integer>$((10#$m))</integer></dict>"
+  done
+  BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"  </array>"
+fi
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
@@ -175,9 +192,26 @@ if [ "${LOOM_DASHBOARD:-}" = 1 ]; then
 fi
 AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$LOOM_HOME/logs"
+# These login lists are kept nowhere but the installed plists, so a reinstall
+# that leaves one unset keeps the station plist's list instead of silently
+# dropping every login. Setting one, even to empty, replaces the list.
+keep_installed() {
+  local value
+  [ -z "${!1+set}" ] && [ -e "$AGENTS/com.loom.station.plist" ] || return 0
+  value="$(python3 -B -c '
+import plistlib, sys
+with open(sys.argv[1], "rb") as plist:
+    print(plistlib.load(plist).get("EnvironmentVariables", {}).get(sys.argv[2], ""))
+' "$AGENTS/com.loom.station.plist" "$1")" ||
+    { echo "cannot read $1 from $AGENTS/com.loom.station.plist: set it in the environment" >&2; exit 1; }
+  export "$1=$value"
+}
+keep_installed LOOM_TRUSTED_BRIEFERS
+keep_installed LOOM_BRIEF_AUTHORS
+keep_installed LOOM_ASK_ANSWERERS
 
 LANES=("$@")
-[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark
+[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
   codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
   free-ollama free-gemma free-nvidia free-kilo free-groq)
@@ -311,10 +345,14 @@ done
 # turns briefed ticket issues into local briefs and reports outcomes
 # (docs/BRAIN.md). It reads LOOM_REPOS,
 # LOOM_BRIEF_AUTHORS and LOOM_REPO_OWNERS from the installing environment;
-# with LOOM_REPOS empty it stays idle. LOOM_TRUSTED_BRIEFERS (default empty)
-# names another operator's logins whose loom:ticket briefs it builds without
-# adopting their claims (docs/LANES.md, Trusted briefers). It also reads LOOM_STATUS_REPO (default:
-# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_DISCORD_MENTION,
+# with LOOM_REPOS empty it stays idle. LOOM_BRIEF_AUTHORS defaults to the
+# installed station plist's value, else empty. LOOM_TRUSTED_BRIEFERS (same
+# default) names another operator's logins whose loom:ticket briefs it builds without
+# adopting their claims (docs/LANES.md, Trusted briefers). LOOM_ASK_ANSWERERS
+# (same default) names logins whose two answer lines clear an ask (docs/LANES.md,
+# Ask answerers). It also reads LOOM_STATUS_REPO (default:
+# this checkout's origin), LOOM_DISCORD_WEBHOOK_SSM, LOOM_BRAIN_BACKUP_HOLDERS
+# (brain holders each judged on their own journal ticks), LOOM_DISCORD_MENTION,
 # LOOM_DIGEST_HOUR, LOOM_REPORT_DIGEST_TIMES (local times of the report digest,
 # default 10:00,21:00; empty sends each report), LOOM_AWS_REGION, LOOM_RETRY_MAX (automatic retries per
 # ticket, default 2), and LOOM_DISCORD_CHANNEL_ID,
@@ -407,6 +445,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_DEPLOY</key><string>$(xml "${LOOM_DEPLOY:-1}")</string>
     <key>LOOM_BRIEF_AUTHORS</key><string>$(xml "${LOOM_BRIEF_AUTHORS:-}")</string>
     <key>LOOM_TRUSTED_BRIEFERS</key><string>$(xml "${LOOM_TRUSTED_BRIEFERS:-}")</string>
+    <key>LOOM_ASK_ANSWERERS</key><string>$(xml "${LOOM_ASK_ANSWERERS:-}")</string>
     <key>LOOM_GOAL_CAP</key><string>$(xml "${LOOM_GOAL_CAP:-}")</string>
     <key>LOOM_NO_LANE_REROUTE</key><string>$(xml "${LOOM_NO_LANE_REROUTE:-}")</string>
     <key>LOOM_UNVERIFIED_LIMIT</key><string>$(xml "${LOOM_UNVERIFIED_LIMIT:-}")</string>
@@ -429,6 +468,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_CLAIM_REFEREE</key><string>$(xml "${LOOM_CLAIM_REFEREE:-}")</string>
     <key>LOOM_ENGINE_CLAIMS</key><string>$(xml "${LOOM_ENGINE_CLAIMS:-}")</string>
     <key>LOOM_DISCORD_WEBHOOK_SSM</key><string>$(xml "${LOOM_DISCORD_WEBHOOK_SSM:-}")</string>
+    <key>LOOM_BRAIN_BACKUP_HOLDERS</key><string>$(xml "${LOOM_BRAIN_BACKUP_HOLDERS:-}")</string>
     <key>LOOM_DISCORD_MENTION</key><string>$(xml "${LOOM_DISCORD_MENTION:-}")</string>
     <key>LOOM_DIGEST_HOUR</key><string>$(xml "${LOOM_DIGEST_HOUR:-}")</string>
     <key>LOOM_REPORT_DIGEST_TIMES</key><string>$(xml "${LOOM_REPORT_DIGEST_TIMES-10:00,21:00}")</string>
@@ -477,11 +517,12 @@ wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
-# The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
-# (default 1800), take the brain lock and run one docs/MUSE.md tick on the
+# The brain tick (lanes/mac/brain.sh): at LOOM_BRAIN_AT minutes past each
+# hour (default 25 and 55), or every LOOM_BRAIN_INTERVAL seconds (default
+# 1800) with LOOM_BRAIN_AT empty, take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
-# LOOM_TRUSTED_BRIEFERS,
+# LOOM_TRUSTED_BRIEFERS, LOOM_ASK_ANSWERERS,
 # LOOM_AWS_REGION, LOOM_BRAIN_*, the rungs' LOOM_CODEX_MODEL,
 # LOOM_SPARK_MODEL and LOOM_SPARK_URL, and LOOM_TRANSCRIPT_URL and
 # LOOM_TRANSCRIPT_TOKEN_SSM (for the handoff packet) from the installing
@@ -495,6 +536,14 @@ if [ "${LOOM_BRAIN:-1}" = 0 ]; then
   rm -f "$PLIST" "$LOOM_HOME/state/brain.json" "$LOOM_HOME/state/brain-ok"
   echo "removed $LABEL (LOOM_BRAIN=0)"
 else
+  # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and off by
+  # default, so the brain's plist carries the Fabric key parameter name only
+  # when the opt-in is configured; the station's plist above keeps it always.
+  if [ -n "${LOOM_BRAIN_FABRIC_ASK:-}" ]; then
+    BRAIN_LOOM_ENV="$(loom_env)"
+  else
+    BRAIN_LOOM_ENV="$(loom_env LOOM_FABRIC_KEY_SSM)"
+  fi
   cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -506,7 +555,7 @@ else
     <string>/bin/bash</string>
     <string>$X_REPO/lanes/mac/brain.sh</string>
   </array>
-  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>
+$BRAIN_SCHEDULE
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>
@@ -515,7 +564,7 @@ else
     <key>PATH</key><string>$X_HOME/.local/bin:$X_HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key><string>$X_HOME</string>
     <key>LOOM_HOME</key><string>$X_LOOM</string>
-$(loom_env)
+$BRAIN_LOOM_ENV
 $(app_env BRAIN_)
   </dict>
 </dict>

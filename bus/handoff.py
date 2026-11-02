@@ -46,7 +46,7 @@ def _trusted_report_time(comment: Any, body: str, at_key: str) -> Optional[str]:
     return stamp if created <= stamp <= updated else None
 # GitHub work any brain can do. Ships and rolls are not here: they stay with
 # whoever a goal's rules name.
-STAGES = ("review", "merge", "failed", "ask", "regression", "brief")
+STAGES = ("review", "merge", "failed", "ask", "regression", "brief", "needs-brain")
 # The old rule: a brain outside its own scope acts only when no other brain
 # journaled in this window.
 QUIET = timedelta(hours=2)
@@ -56,7 +56,7 @@ _REV = r"[A-Za-z0-9._:-]+"
 _KEY = r"[a-f0-9]{8}"
 _NOTE = r'(?:"([^"]*)"|([^\s>]+))'
 _MARK = re.compile(
-    r'<!-- loom:(defer|done) v1 stage=([a-z]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
+    r'<!-- loom:(defer|done) v1 stage=([a-z-]+) item=(%s)(?: rev=(%s))?(?: key=(%s))?(?: note=%s)? holder=(%s)(?: note=%s)? -->'
     % (_ITEM, _REV, _KEY, _NOTE, _HOLDER, _NOTE))
 _TICK = re.compile(r"^Tick \S+, (%s)\s*$" % _HOLDER, re.M)
 _TICK_AT = re.compile(r"^Tick (\S+), (%s)\s*$" % _HOLDER, re.M)

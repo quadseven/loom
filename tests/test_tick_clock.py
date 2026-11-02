@@ -279,6 +279,65 @@ class BudgetGuardTests(unittest.TestCase):
         brain._check_defer_budget(gh, REPO, "peer", "deferred on budget", at(8))
 
 
+class BoundedTickTests(unittest.TestCase):
+    """loom#2469: a lane machine tick bounded by Muse's next slot records its
+    own length, and the clock and the budget guard read it."""
+
+    def test_a_bounded_lock_step_records_its_length_and_the_clock_reads_it(self):
+        _, gh = held_lock()
+        record = brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=13)
+        self.assertEqual(13, record["tick_minutes"])
+        self.assertEqual(13, brain.tick_step(gh, REPO)["tick_minutes"])
+        self.assertTrue(tick_clock.elapsed_line(record, at(9)).startswith(
+            "elapsed 9 of 13 minutes (240 seconds left): past 8"))
+        self.assertIn("budget: spent", tick_clock.budget_status(record, at(8)))
+        self.assertIn("refused until 8 minutes", tick_clock.budget_status(record, at(7)))
+
+    def test_a_budget_deferral_in_a_bounded_tick_is_allowed_from_its_own_budget(self):
+        _, gh = held_lock()
+        brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=13)
+        with self.assertRaises(brain.BudgetRefused):
+            brain.tick_step(gh, REPO, "verify", "deferred verify on budget", holder="muse", now=at(7))
+        record = brain.tick_step(gh, REPO, "brief", "deferred brief on budget", holder="muse",
+                                 now=at(9))
+        self.assertEqual("deferred brief on budget [elapsed 9 of 13 minutes]",
+                         record["notes"][-1]["text"])
+
+    def test_a_length_at_or_past_the_default_is_the_default_tick(self):
+        _, gh = held_lock()
+        record = brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=40)
+        self.assertNotIn("tick_minutes", record)
+        self.assertIn("of 25 minutes", tick_clock.elapsed_line(record, at(1)))
+
+    def test_a_new_lock_step_drops_the_last_ticks_length(self):
+        _, gh = held_lock()
+        brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=13)
+        record = brain.tick_step(gh, REPO, "lock", holder="muse", now=at(30))
+        self.assertNotIn("tick_minutes", record)
+
+    def test_a_length_under_five_minutes_is_refused(self):
+        _, gh = held_lock()
+        with self.assertRaises(ValueError):
+            brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0), tick_minutes=4)
+
+    def test_an_unreadable_saved_length_reads_as_the_default(self):
+        for bad in ("13", 3, True, 25, None):
+            with self.subTest(bad=bad):
+                saved = {"started_at": "2030-01-01T12:00:00Z", "step": "lock", "step_index": 1,
+                         "notes": [], "tick_minutes": bad}
+                record = brain._step_record("holder=muse\nloom:tick=" + json.dumps(saved))
+                self.assertEqual(25, tick_clock.tick_minutes(record))
+
+    def test_the_cli_takes_the_length(self):
+        _, gh = held_lock()
+        out = io.StringIO()
+        args = argparse.Namespace(lock_repo=REPO, name="lock", note=None, holder="muse",
+                                  show=False, tick_minutes=13)
+        with mock.patch.object(brain, "datetime", clock(at(0))), contextlib.redirect_stdout(out):
+            brain._cmd_step(gh, args)
+        self.assertTrue(out.getvalue().startswith("elapsed 0 of 13 minutes"), out.getvalue())
+
+
 class JournalFooterTests(unittest.TestCase):
     def test_the_footer_lists_each_steps_minutes(self):
         record = {"started_at": "2030-01-01T12:00:00Z", "times": [

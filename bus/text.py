@@ -58,7 +58,11 @@ _SPAN = re.compile(r"(?<!`)(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DO
 # good read; the service went down at 08:02Z, and the next read, at 09:02Z,
 # was the first to fail. Text that dates an outage that way must name both.
 _TIME = r"~?\s*(?:\d{4}-\d{2}-\d{2}[ T])?\d{1,2}:\d{2}(?::\d{2})?Z?"
-_DOWN = r"(?:unreachable|down|unavailable|offline|failing|erroring|503)"
+# `503` is a status only when it is not an issue or pull request reference:
+# `#503` is a ticket, a reference with a repo name in front of it is too, and
+# `PR 503` names a pull request.
+_DOWN = (r"(?:unreachable|down|unavailable|offline|failing|erroring"
+         r"|(?<![#/\w])(?<![Pp][Rr] )503)")
 # Within one sentence: a full stop ends it, a decimal point does not.
 _SAME_SENTENCE = r"(?:(?![.!?](?:\s|$))[^\n])"
 _OUTAGE_SINCE = re.compile(
@@ -136,6 +140,11 @@ def scrub_mentions(text: str, allow: Optional[Iterable[str]] = None) -> str:
 def scrub_paths(text: str) -> str:
     """The text with every local path replaced by <path>."""
     return PATH_RE.sub("<path>", text)
+
+
+def has_reason(text: object) -> bool:
+    """Whether text has anything a reader sees: an HTML comment is not a reason."""
+    return bool(re.sub(r"<!--.*?-->", "", str(text or ""), flags=re.DOTALL).strip())
 
 
 def check(text: str) -> None:

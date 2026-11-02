@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import answer, proof, status
+from .stale_claims import outside_hold
 
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
@@ -32,8 +33,9 @@ FORBIDDEN_MODELS: Tuple[Tuple[str, str], ...] = (
     ("gpt-6-sol", "gpt-6-luna"),
     ("gemini-4-argon", "gemini-3.8-flash-high"),
 )
-# The only models an opencode-go lane may run: OpenCode Go's free models and
-# the paid ones with an allowance of at least 10,000 requests per 5 hours.
+# The only models an opencode-go lane may run: OpenCode Go's free models, the
+# paid ones with an allowance of at least 10,000 requests per 5 hours, and the
+# strong models bus/model_pick.py runs under its usage guard.
 # Kimi K2.7 Code (1,350 per 5 h) spent the Go plan's allowance in hours on
 # 2026-10-23 (operator: "why the hell are we using the most expensive
 # models... STOP THAT"). An allow-list, not a deny-list, so a model Go adds
@@ -47,6 +49,8 @@ OPENCODE_GO_MODELS: Tuple[str, ...] = (
     "opencode-go/mimo-v2.6-flash",              # 30,100
     "opencode-go/deepseek-v4.1-flash",          # 34,670
     "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
+    "opencode-go/gpt-6-luna",                   # 5,640; strong tier, guarded
+    "opencode-go/claude-haiku-5-5",             # 5,133; strong tier, guarded
 )
 # What a ticket's Model: line naming another opencode-go model runs instead.
 OPENCODE_GO_STAND_IN = "opencode-go/mimo-v2.6-flash"
@@ -549,6 +553,21 @@ ANSWER_NOTE = (
     "finding on a strong model's round; anything else still needs a fix.")
 
 
+# Every review thread a fix brief lists needs an answer (2026-10-31: about two
+# thirds of open threads on lane pull requests were findings no round
+# answered, so the merge gate held them). The runner posts each entry after
+# the push and names any listed thread left without one (lanes/run_lane.sh
+# unanswered_threads).
+REPLIES_NOTE = (
+    "Answer every review thread listed below: write .loom/replies.json as a JSON "
+    "array with one {\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
+    "object per thread (THREAD_ID is the id after `### Thread`). When this round's "
+    "change fixes the finding, set resolve true and say in the reply what changed "
+    "and where. When you do not fix it, set resolve false and give a concrete reason "
+    "that points at the code. A thread answered in `.loom-answers/` needs no entry "
+    "here. The runner posts the entries after the push and reports every listed "
+    "thread left without an answer.")
+
 # Where a run that timed out or hit a limit after editing left its edits (lanes/run_lane.sh
 # preserve_timedout), as the failure reason names it.
 TIMEDOUT_RE = re.compile(r"the edits are on branch ([A-Za-z0-9._/-]+-timedout-[0-9]+)")
@@ -667,12 +686,66 @@ def reads_stored_rows(body: str) -> bool:
                for m in _WHAT_OR_CRITERIA_RE.finditer(body or ""))
 
 
+# What proves one acceptance criterion, by its kind (bus/criteria_gate.py):
+# a code criterion is the lane's own to meet in its pull request, a live
+# one only the station's verifier can meet, and an operator one only the
+# operator's hand.
+PROOF_CHECK_BY_KIND = {
+    "code": "the pull request for this brief: it ticks this criterion, and "
+            "the change's tests pass",
+    "live": "the station's verify run, which observes it on the live system "
+            "after the change ships; a lane never ticks it",
+    "operator": "the operator, who does it by hand and ticks it; the ticket "
+                "goes to the operator for this one",
+}
+
+PROOF_CHECKS_NOTE = (
+    "Each acceptance criterion above, restated as the check that proves it. "
+    "The pull request body answers criterion by criterion: tick each code "
+    "criterion the change builds, and mark each one it does not build "
+    "\"not built: <reason>\".")
+
+
+_ACCEPTANCE_BOX_RE = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
+
+
+def _criteria_texts(body: str) -> List[str]:
+    """The ticket's acceptance criteria, as texts: the checkboxes under
+    `## Acceptance criteria` (bus/proof.py's reading), or, when that
+    section names none, under the shorter `## Acceptance` heading the
+    runner also reads. The brief check reads them the same way, so a
+    ticket it calls dispatchable always has criteria to restate."""
+    texts = [text for _, text in proof.criteria(body)]
+    if texts:
+        return texts
+    found: List[str] = []
+    inside = False
+    for line in (body or "").replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == "## Acceptance"
+            continue
+        match = _ACCEPTANCE_BOX_RE.match(line) if inside else None
+        if match:
+            found.append(match.group(2))
+    return found
+
+
+def proof_checks(body: str) -> List[Tuple[str, str]]:
+    """(criterion, the check that proves it) for each acceptance criterion
+    of a ticket body, in order (loom#2162). A brief carries these so the
+    lane knows before it starts what would prove each criterion, instead
+    of learning it from a review send-back."""
+    from . import criteria_gate  # criteria_gate imports this module
+    return [(text, PROOF_CHECK_BY_KIND[criteria_gate.kind(text)])
+            for text in _criteria_texts(body or "")]
+
+
 def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   fix: Optional[Fix] = None,
                   ci_checks: Optional[List[Tuple[str, str]]] = None,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
-                  linked: Sequence[str] = ()) -> str:
+                  linked: Sequence[str] = (), demoted_models: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -691,6 +764,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             # The Finding-<id> prefix also prevents a field() match in the runner.
             summary = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", f.text).split())[:200]
             out.append("Finding-%s: %s" % (f.id, summary))
+    if demoted_models:
+        out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":
@@ -707,6 +782,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += "\n"
     if body:
         text += body + "\n"
+    if fix is None:
+        checks = proof_checks(body)
+        if checks:
+            text += "\n## Proof checks\n\n" + PROOF_CHECKS_NOTE + "\n\n"
+            text += "".join("- %s - proved by %s.\n" % (criterion, check)
+                            for criterion, check in checks)
     if reads_stored_rows(body):
         text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)
@@ -719,11 +800,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
         text += ("\n## Fix\n\nThis ticket already has pull request #%d on branch %s. "
                  "Fix what is listed below on that branch: change only what the findings "
                  "need and keep the rest of the work.\n\n%s\n\n"
-                 "You may also write .loom/replies.json as a JSON array of "
-                 "{\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
-                 "objects; the runner posts these after pushing and resolves threads marked "
-                 "true.\n\n%s\n"
-                 % (fix.pr, fix.branch, ANSWER_NOTE, fix.findings))
+                 "%s\n\n%s\n"
+                 % (fix.pr, fix.branch, ANSWER_NOTE, REPLIES_NOTE, fix.findings))
     return text
 
 
@@ -1033,6 +1111,48 @@ def claimed_by(issue: Dict[str, Any]) -> List[str]:
     return [login for login in found if login]
 
 
+# A lane's report labels a ticket loom:pr a moment after its pull request opens,
+# and a pass reads open pull requests once: this long past the label, a missing
+# pull request is really missing.
+PULL_GONE_GRACE = 600
+
+
+def pull_gone(timeline: Iterable[Any], repo: str, number: int, now: float,
+              authors: Iterable[str]) -> bool:
+    """Whether a ticket at loom:pr, with no open pull request in its repo
+    linking it, has nothing to wait for. Its timeline may show a pull request
+    by one of `authors` in another repo that names it (still open), or one
+    that merged after the ticket's last brief and fell outside the closed page
+    the station reads: those keep the label. A merge from before the last
+    brief is spent. A stranger's pull request counts for nothing: anyone can
+    write a Refs line in any repo."""
+    allowed = {a.lower() for a in authors}
+    events = [e for e in timeline if isinstance(e, dict)]
+    labelled = [(str((e.get("label") or {}).get("name") or ""), str(e.get("created_at") or ""))
+                for e in events if e.get("event") == "labeled"]
+    put = max((at for name, at in labelled if name == "loom:pr"), default="")
+    if not put or now - calendar.timegm(time.strptime(put, "%Y-%m-%dT%H:%M:%SZ")) < PULL_GONE_GRACE:
+        return False
+    briefed = max((at for name, at in labelled if name in ("loom:queued", "loom:briefed")),
+                  default="")
+    line = re.compile(r"^Refs %s#%d\b" % (re.escape(repo), number), re.M)
+    bare = re.compile(r"^Refs #%d\b" % number, re.M)
+    home = "/repos/%s" % repo.lower()
+    for event in events:
+        source = event.get("source") if isinstance(event.get("source"), dict) else {}
+        pull = source.get("issue") if isinstance(source.get("issue"), dict) else {}
+        body = str(pull.get("body") or "")
+        here = str(pull.get("repository_url") or "").lower().endswith(home)
+        if (event.get("event") != "cross-referenced" or "pull_request" not in pull
+                or _login(pull.get("user")) not in allowed
+                or not (line.search(body) or (here and bare.search(body)))):
+            continue
+        merged = str((pull.get("pull_request") or {}).get("merged_at") or "")
+        if pull.get("state") == "open" or merged > briefed:
+            return False
+    return True
+
+
 def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
                     briefers: Iterable[str] = ()) -> Optional[str]:
     """The login that owns an issue when it is another operator's, else None.
@@ -1043,7 +1163,14 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
     its own operator logins (LOOM_BRIEF_AUTHORS); anything else is left
     alone. A trusted briefer (LOOM_TRUSTED_BRIEFERS) owns nothing for this
     Loom, except that a loom:ticket they authored is handed to it even when
-    they assigned or claim-labelled it to themselves."""
+    they assigned or claim-labelled it to themselves.
+
+    Outside work beats anything of ours (loom#2333): an issue under
+    outside_hold, or assigned to a person who is not one of ours, is theirs
+    even beside our claim or operator. An App assignee owns nothing."""
+    held = outside_hold(issue)
+    if held:
+        return held
     logins = assignees(issue) + claimed_by(issue)
     if not logins:
         return None
@@ -1052,6 +1179,10 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
     if (author and author not in allowed
             and brief_author_trusted(issue, (), briefers)):
         allowed.add(author)
+    outsider = next((a for a in assignees(issue)
+                     if a not in allowed and not a.endswith("[bot]")), None)
+    if outsider:
+        return outsider
     if any(login in allowed for login in logins):
         return None
     return logins[0]

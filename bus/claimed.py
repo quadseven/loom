@@ -45,6 +45,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from . import evidence
 from . import proof
 from . import verify_data
+from .stale_claims import OVERFLOW_CLAIM
 
 CLAIM_PREFIX = "claim:"
 LIVE_LABEL = "awaiting-live-check"
@@ -131,6 +132,8 @@ def skip_reason(issue: Dict[str, Any]) -> str:
         return "not an open issue"
     if not any(name.startswith(CLAIM_PREFIX) for name in names):
         return "no claim label"
+    if OVERFLOW_CLAIM in names:
+        return "outside work"
     held = next((name for name in names if _holds(name)), "")
     if held:
         return "labelled %s" % held
