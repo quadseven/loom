@@ -8552,12 +8552,35 @@ class Station:
                           "Idle review label on pull request #%d; held on the stuck path." % number)
         return True
 
+    def _live_idle_pull(self, repo: str, issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """The pull request as it stands now, so a label removed since the
+        hourly search drops its digest line at once. None when it is closed or
+        gone; the cached row when the read fails."""
+        try:
+            number = int(issue.get("number") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not number:
+            return None
+        try:
+            resp = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
+        except GitHubError:
+            return issue
+        live = resp.data
+        if resp.status == 404 or not isinstance(live, dict):
+            return None
+        if str(live.get("state") or "open") != "open":
+            return None
+        return live
+
     def _idle_pull_lines(self) -> List[str]:
         """The operator choices for idle pull requests in the next digest."""
         rows = []
         for repo, issue in self._idle_pull_requests():
-            if not any(str(label.get("name") if isinstance(label, dict) else label) == "grug:idle"
-                       for label in issue.get("labels", [])):
+            issue = self._live_idle_pull(repo, issue)
+            if issue is None or not any(
+                    str(label.get("name") if isinstance(label, dict) else label) == "grug:idle"
+                    for label in issue.get("labels", [])):
                 continue
             updated = self._epoch(str(issue.get("updated_at") or ""))
             idle_days = max(0, int((self.now - updated) // 86400)) if updated else 0

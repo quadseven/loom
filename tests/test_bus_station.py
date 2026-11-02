@@ -75,6 +75,8 @@ class FakeGitHub:
         self.editors = {}
         self.pulls = []
         self.search_items = []
+        # Pull requests read as issues: number -> the live issue object.
+        self.pull_issues = {}
         self.calls = []
         self.version = 1
         self.lanes_issues = []
@@ -470,6 +472,8 @@ class FakeGitHub:
         if sub == "sub_issues":
             return reply(200, self.sub_issues.get(n, []))
         found = {None: self.issues, "events": self.events, "comments": self.comments}
+        if sub is None and n not in self.issues and n in self.pull_issues:
+            return reply(200, self.pull_issues[n])
         if sub in found:
             if sub is None and n not in found[sub]:
                 return reply(404, {"message": "Not Found"})
@@ -8920,6 +8924,7 @@ class AsksTest(Base):
                                    "labels": [{"name": "grug:idle"}],
                                    "pull_request": {"url": "unused"}}]
         self.fake.pulls = [{"number": 77, "body": "", "head": {"ref": "operator/topic"}}]
+        self.fake.pull_issues[77] = self.fake.search_items[0]
         self.fake.add_ask(5)
         self.go()
         content = self.sent[-1][1]["content"]
@@ -8928,6 +8933,28 @@ class AsksTest(Base):
         self.fake.search_items[0]["labels"] = []
         self.go(NOON + 24 * 3600)
         self.assertFalse(any("#77" in payload["content"] for _, payload in self.sent[1:]))
+
+    def test_idle_label_removed_inside_the_cache_hour_drops_the_line_at_once(self):
+        item = {"number": 77, "title": "Review update", "body": "", "state": "open",
+                "updated_at": "2030-05-03T12:00:00Z",
+                "labels": [{"name": "grug:idle"}], "pull_request": {"url": "unused"}}
+        self.fake.search_items = [dict(item)]
+        self.fake.pulls = [{"number": 77, "body": "", "head": {"ref": "operator/topic"}}]
+        self.fake.pull_issues[77] = dict(item)
+        gh = GitHub("token", transport=self.fake)
+        st = station.Station(gh, self.settings, now=NOON)
+        self.assertEqual(len(st._idle_pull_lines()), 1)
+        # The search result is cached for the hour; the live pull request
+        # has lost its label, so the line goes at once.
+        self.fake.pull_issues[77]["labels"] = []
+        later = station.Station(gh, self.settings, now=NOON + 60)
+        self.assertEqual(later._idle_pull_lines(), [])
+        # A closed pull request drops out the same way.
+        self.fake.pull_issues[77].update(labels=[{"name": "grug:idle"}], state="closed")
+        self.assertEqual(later._idle_pull_lines(), [])
+        searches = [path for method, path in self.fake.calls
+                    if method == "GET" and "label:grug:idle" in path]
+        self.assertEqual(len(searches), 1)
 
     def test_idle_scan_searches_at_most_once_per_repo_per_hour(self):
         self.fake.add_ask(5)
