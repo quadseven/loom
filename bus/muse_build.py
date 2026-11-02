@@ -122,9 +122,9 @@ def trusted_author(item: Dict[str, Any]) -> bool:
     return str(item.get("author_association") or "").upper() in TRUSTED_ASSOCIATIONS
 
 
-def hold(item: Dict[str, Any]) -> Optional[str]:
-    """Why the pick rule leaves this issue alone, or None when it is buildable
-    by its labels and body."""
+def _kind_hold(item: Dict[str, Any]) -> Optional[str]:
+    """Why the issue is not a ticket Muse may take: a pull request, closed,
+    a stranger's, or a parent (an epic or goal by title or sub-issues)."""
     if "pull_request" in item:
         return "a pull request"
     if str(item.get("state") or "open") != "open":
@@ -135,11 +135,20 @@ def hold(item: Dict[str, Any]) -> Optional[str]:
         return "an epic or goal by its title"
     if int((item.get("sub_issues_summary") or {}).get("total") or 0) > 0:
         return "has sub-issues"
+    return None
+
+
+def _label_hold(item: Dict[str, Any]) -> Optional[str]:
     for name in _names(item):
         low = name.lower()
         if low in HOLD_LABELS or low.startswith(HOLD_PREFIXES):
             return "label " + name
-    body = str(item.get("body") or "")
+    return None
+
+
+def _body_hold(body: str) -> Optional[str]:
+    """Why the body is not buildable in one tick: no size of XS to M, or no
+    acceptance checkbox."""
     stated = hunt_plan.stated_size(body)
     try:
         size = hunt_plan.size_letter(stated) if stated else ""
@@ -150,6 +159,13 @@ def hold(item: Dict[str, Any]) -> Optional[str]:
     if not _BOX.search(body):
         return "no acceptance checkbox"
     return None
+
+
+def hold(item: Dict[str, Any]) -> Optional[str]:
+    """Why the pick rule leaves this issue alone, or None when it is buildable
+    by its author, labels and body."""
+    return (_kind_hold(item) or _label_hold(item)
+            or _body_hold(str(item.get("body") or "")))
 
 
 def priority(item: Dict[str, Any]) -> int:
@@ -299,10 +315,8 @@ def release(gh: Any, repo: str, number: int, note: str) -> None:
                 % (RELEASE_MARKER, line, SIGNATURE), notify.RECORD)
 
 
-def next_work(gh: Any, repos: Sequence[str]) -> Optional[Work]:
-    """What Muse works on now: its own open pull request, else its held
-    ticket, else a newly claimed one; None when nothing is buildable."""
-    login = check_identity(gh)
+def _own_pr(gh: Any, repos: Sequence[str], login: str) -> Optional[Work]:
+    """Muse's own open pull request in `repos`, with its branch and ticket."""
     app = login[:-len("[bot]")] if login.endswith("[bot]") else login
     wanted = {r.lower() for r in repos}
     for owner in _owners(repos):
@@ -315,6 +329,12 @@ def next_work(gh: Any, repos: Sequence[str]) -> Optional[Work]:
             named = re.match(r"muse/(\d+)-", branch)
             return Work("pr", repo, number, str(pr.get("title") or ""),
                         str(pr.get("html_url") or ""), branch, int(named.group(1)) if named else 0)
+    return None
+
+
+def _held_claim(gh: Any, repos: Sequence[str]) -> Optional[Work]:
+    """A ticket Muse holds, letting go of any whose build has merged."""
+    wanted = {r.lower() for r in repos}
     for owner in _owners(repos):
         for item in _search(gh, 'org:%s is:issue is:open label:"%s"' % (owner, CLAIM_LABEL)):
             repo, number = _repo_of(item), int(item["number"])
@@ -327,6 +347,16 @@ def next_work(gh: Any, repos: Sequence[str]) -> Optional[Work]:
             title = str(item.get("title") or "")
             return Work("claim", repo, number, title, str(item.get("html_url") or ""),
                         branch_for(number, title), number)
+    return None
+
+
+def next_work(gh: Any, repos: Sequence[str]) -> Optional[Work]:
+    """What Muse works on now: its own open pull request, else its held
+    ticket, else a newly claimed one; None when nothing is buildable."""
+    login = check_identity(gh)
+    found = _own_pr(gh, repos, login) or _held_claim(gh, repos)
+    if found is not None:
+        return found
     work = pick(gh, repos)
     if work is None:
         return None

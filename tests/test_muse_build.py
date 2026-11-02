@@ -73,53 +73,71 @@ class FakeGitHub:
     def rest(self, method, path, body=None, ok=(), **kwargs):
         self.calls.append((method, path, body))
         if path.startswith("/search/issues"):
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)["q"][0]
-            if "is:pr" in query:
-                return Response(200, {"items": list(self.own_prs)})
-            if "label:claim:muse" in query or 'label:"claim:muse"' in query:
-                items = [i for i in self.issues.values()
-                         if "claim:muse" in [x["name"] for x in i["labels"]]]
-                return Response(200, {"items": items})
-            page = int(urllib.parse.parse_qs(urllib.parse.urlparse(path).query).get("page", ["1"])[0])
-            items = sorted(self.issues.values(), key=lambda i: i["created_at"])
-            return Response(200, {"items": items[(page - 1) * 100:page * 100]})
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)", path)
-        if m and method == "GET":
-            return Response(200, self.issues[(m.group(1), int(m.group(2)))])
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/labels/(.+)", path)
-        if m and method == "GET":
-            if (m.group(1), urllib.parse.unquote(m.group(2))) in self.labels_made:
-                return Response(200, {})
-            return Response(404, None)
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/labels", path)
-        if m and method == "POST":
-            self.labels_made.add((m.group(1), body["name"]))
-            return Response(201, {})
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels", path)
-        if m and method == "POST":
-            found = self.issues[(m.group(1), int(m.group(2)))]
-            found["labels"] += [{"name": x} for x in body["labels"]]
-            if self.race:
-                found["labels"].append({"name": self.race})
-            return Response(200, found["labels"])
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels/(.+)", path)
-        if m and method == "DELETE":
-            found = self.issues[(m.group(1), int(m.group(2)))]
-            gone = urllib.parse.unquote(m.group(3))
-            found["labels"] = [x for x in found["labels"] if x["name"] != gone]
-            return Response(200, [])
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/comments", path)
-        if m and method == "POST":
-            key = (m.group(1), int(m.group(2)))
-            self.comments.setdefault(key, []).append(
-                {"id": 1, "body": body["body"], "user": {"login": self.login or "someone"}})
-            return Response(201, {"id": 1})
-        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls/(\d+)", path)
-        if m and method == "GET":
-            return Response(200, {"number": int(m.group(2)), "head": {"ref": self.pr_branch}})
-        if path.endswith("/pulls") and method == "POST":
-            return Response(201, {"number": 77, "html_url": "https://example.com/pull/77"})
+            return self._search(path)
+        for verb, pattern, handler in self.ROUTES:
+            m = re.fullmatch(pattern, path)
+            if m and method == verb:
+                return handler(self, m.group(1), *m.groups()[1:], body=body)
         return Response(200, {})
+
+    def _search(self, path):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        q = query["q"][0]
+        if "is:pr" in q:
+            return Response(200, {"items": list(self.own_prs)})
+        if 'label:"claim:muse"' in q:
+            return Response(200, {"items": [i for i in self.issues.values()
+                                            if "claim:muse" in [x["name"] for x in i["labels"]]]})
+        page = int(query.get("page", ["1"])[0])
+        items = sorted(self.issues.values(), key=lambda i: i["created_at"])
+        return Response(200, {"items": items[(page - 1) * 100:page * 100]})
+
+    def _get_issue(self, repo, number, body=None):
+        return Response(200, self.issues[(repo, int(number))])
+
+    def _get_label(self, repo, name, body=None):
+        made = (repo, urllib.parse.unquote(name)) in self.labels_made
+        return Response(200, {}) if made else Response(404, None)
+
+    def _make_label(self, repo, body=None):
+        self.labels_made.add((repo, body["name"]))
+        return Response(201, {})
+
+    def _add_labels(self, repo, number, body=None):
+        found = self.issues[(repo, int(number))]
+        found["labels"] += [{"name": x} for x in body["labels"]]
+        if self.race:
+            found["labels"].append({"name": self.race})
+        return Response(200, found["labels"])
+
+    def _drop_label(self, repo, number, name, body=None):
+        found = self.issues[(repo, int(number))]
+        gone = urllib.parse.unquote(name)
+        found["labels"] = [x for x in found["labels"] if x["name"] != gone]
+        return Response(200, [])
+
+    def _comment(self, repo, number, body=None):
+        self.comments.setdefault((repo, int(number)), []).append(
+            {"id": 1, "body": body["body"], "user": {"login": self.login or "someone"}})
+        return Response(201, {"id": 1})
+
+    def _get_pull(self, repo, number, body=None):
+        return Response(200, {"number": int(number), "head": {"ref": self.pr_branch}})
+
+    def _open_pull(self, repo, body=None):
+        return Response(201, {"number": 77, "html_url": "https://example.com/pull/77"})
+
+    REPO = r"/repos/([^/]+/[^/]+)"
+    ROUTES = (
+        ("GET", REPO + r"/issues/(\d+)", _get_issue),
+        ("GET", REPO + r"/labels/(.+)", _get_label),
+        ("POST", REPO + r"/labels", _make_label),
+        ("POST", REPO + r"/issues/(\d+)/labels", _add_labels),
+        ("DELETE", REPO + r"/issues/(\d+)/labels/(.+)", _drop_label),
+        ("POST", REPO + r"/issues/(\d+)/comments", _comment),
+        ("GET", REPO + r"/pulls/(\d+)", _get_pull),
+        ("POST", REPO + r"/pulls", _open_pull),
+    )
 
     def paginate(self, path):
         self.calls.append(("GET", path, None))
