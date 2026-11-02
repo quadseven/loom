@@ -178,7 +178,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets
 from .github import GitHub, GitHubError, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -734,14 +734,10 @@ def _say(message: str) -> None:
 
 
 def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
-    """Close a pull request with its reason appended to its body, in one edit:
-    a comment and then a close sent the operator two emails for one event
-    (2026-10-21), and a body edit sends none."""
+    """Close a pull request with its reason in a comment, first: a reason in
+    the body left the close unexplained in the thread (loom#2444)."""
     brain._check_written_text(comment)
-    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
-    body = str(pr.get("body") or "").rstrip()
-    gh.rest("PATCH", "/repos/%s/pulls/%d" % (repo, number),
-            {"state": "closed", "body": (body + "\n\n" if body else "") + comment})
+    closing.close_pull(gh, repo, number, comment)
 
 
 def _ts(value: Any) -> float:
@@ -2128,11 +2124,9 @@ class Factory:
                 continue
             if self.actions >= MAX_ACTIONS:
                 return
-            body = str(found.get("body") or "").rstrip()
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(found["number"])), {
-                "state": "closed", "state_reason": "not_planned",
-                "body": body + "\n\nClosed: #%s closed without merging, so these findings "
-                "never landed." % match.group(1)})
+            closing.close(self.gh, repo, int(found["number"]),
+                          "Pull request #%s closed without merging, so these findings "
+                          "never landed." % match.group(1), "not_planned")
             self.actions += 1
             _say("closed %s#%s: pull request #%s closed unmerged"
                  % (repo, found["number"], match.group(1)))
@@ -2805,8 +2799,7 @@ class Factory:
                    "Closed by the station: the review asked for this change to be split and "
                    "no fix round can do it. The work continues as %s." % names)
         self._relabel(repo, issue, brain._moved_labels(_labels(issue), "closed-unmerged", None))
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, ticket),
-                     {"state": "closed", "state_reason": "not_planned"})
+        closing.close(self.gh, repo, ticket, done, "not_planned", said=True)
         self.actions += 1
         _say("split %s#%d into %s and closed it" % (repo, number, names))
         return True

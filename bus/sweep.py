@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import notify, shadow, text
+from . import closing, shadow, text
 from .github import GitHubError
 
 SWEEP_REPOS = ("quadseven/loom", "quadseven/grug")
@@ -236,8 +236,7 @@ def _close(gh: Any, action: Action, issue: Dict[str, Any]) -> None:
     if shadow.guard("PATCH", path, {"state": "closed", "state_reason": reason}, issue,
                     source="muse sweep close") is not None:
         raise ValueError("shadow mode held the close; recorded in the shadow ledger")
-    notify.post(gh, action.repo, action.number, close_comment(action), notify.CLOSED)
-    gh.rest("PATCH", path, {"state": "closed", "state_reason": reason})
+    closing.close(gh, action.repo, action.number, close_comment(action), reason)
 
 
 def _batches(items: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:

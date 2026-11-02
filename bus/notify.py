@@ -61,7 +61,7 @@ KINDS = {
     PROOF: "the proof record of a verified or shipped move",
     AUDIT: "the result of a proof audit",
     HELD: "a ticket held apart from open work, with what it waits for",
-    CLOSED: "why an issue was closed",
+    CLOSED: "why an issue or pull request was closed",
     REOPENED: "why an issue was opened again",
     SOURCE: "a note on the source issue of a rewritten ticket",
     REPAIR: "the factory edited text instead of sending a pull request back",

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from unittest import mock
 
+from shadow_env import setUpModule, tearDownModule  # noqa: F401
+
 from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, Response
 from bus.tickets import FIX_MARKER
@@ -1509,8 +1511,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #52.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #52."))
-        self.assertEqual(self.gh.comments.get(50, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[50]], ["Superseded by #52."])
         self.assertEqual(self.merged, [(52, (REPO, 5))])
 
     def test_lane_pull_request_closed_when_ticket_merged_through_different_pr(self):
@@ -1521,8 +1522,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #51."))
-        self.assertEqual(self.gh.comments.get(50, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[50]], ["Superseded by #51."])
         self.assertEqual(self.merged, [])
 
     def test_old_merge_does_not_supersede_regression_pull_request(self):
@@ -2507,7 +2507,8 @@ class DeferredFindings(Base):
         by = {f["number"]: f.get("state") for f in self.gh.filed}
         self.assertEqual(by, {760: "closed", 761: "open", 762: "open"})
         self.assertEqual(self.gh.filed[0]["state_reason"], "not_planned")
-        self.assertIn("closed without merging", self.gh.filed[0]["body"])
+        (said,) = self.gh.comments[760]
+        self.assertIn("closed without merging", said["body"])
 
 
 class ChangeClasses(Base):
@@ -3142,12 +3143,11 @@ class Tickets(Base):
         self.assertEqual(self.closed[0][0], 70)
         self.assertIn("past the last rung of the model ladder", self.closed[0][1])
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
-        # One email, not two: the reason goes into the pull request's body
-        # with the close, and it says what happened rather than asking someone
-        # to close what the station just closed (2026-10-21).
-        self.assertEqual(self.gh.comments.get(70, []), [])
+        # The thread says why, once (loom#2444), and says what happened
+        # rather than asking someone to close what the station just closed.
+        (said,) = self.gh.comments[70]
+        self.assertIn("past the last rung of the model ladder", said["body"])
         self.assertEqual(self.gh.pulls[70]["state"], "closed")
-        self.assertIn("past the last rung of the model ladder", self.gh.pulls[70]["body"])
         self.assertNotIn("close this pull request", self.gh.pulls[70]["body"])
 
     def test_a_handed_off_ticket_past_the_ladder_closes_its_lane_pull_request(self):
@@ -3165,7 +3165,7 @@ class Tickets(Base):
         self.assertIn("past the last rung of the model ladder", note)
         self.assertIn("hand-off pool (%s)" % factory.HANDOFF_LABEL, note)
         self.assertEqual(self.gh.pulls[70]["state"], "closed")
-        self.assertEqual(self.gh.comments.get(70, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[70]], [note])
         self.assertEqual((self.moved, self.fixed, self.merged), ([], [], []))
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
         self.go()  # once: nothing more on the next pass

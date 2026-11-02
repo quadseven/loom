@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, close_audit, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, strip_body as strip_status_body)
@@ -2449,9 +2449,7 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
                               source="bus.brain close-epic")
         raise ShadowHeld("shadow mode: would close epic %s#%d; recorded in the shadow ledger "
                          "and left open" % (repo, number), entry)
-    notify.post(gh, repo, number, note, notify.CLOSED)
-    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-            {"state": "closed", "state_reason": "completed"})
+    closing.close(gh, repo, number, note, "completed")
 
 
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
@@ -5190,6 +5188,8 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     """Close a ticket. Completed only once it is verified with a proof that
     still matches its criteria, all checked (never close before live
     verification); not_planned for tickets the brain drops, with no proof.
+    The thread says why first: the note, or for a proven close with no note
+    the proof, so a drop needs a note (bus/closing.py).
     A ticket rewritten from an issue then settles that issue
     (settle_source); the line saying what happened to it is returned."""
     if reason not in ("completed", "not_planned"):
@@ -5197,6 +5197,8 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
     if note is not None:
         _check_written_text(note)
         _check_decision_claim(gh, repo, number, note, env)
+    if reason == "not_planned" and not text.has_reason(note):
+        raise ValueError("a dropped ticket needs --note saying why it closes")
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
     names = _labels(issue)
     if issue.get("state") != "open" or "loom:ticket" not in names:
@@ -5215,10 +5217,9 @@ def close(gh: GitHub, repo: str, number: int, reason: str = "completed",
                               source="bus.brain close")
         raise ShadowHeld("shadow mode: would close %s#%d as %s; recorded in the shadow ledger "
                          "and left open" % (repo, number, reason), entry)
-    if note is not None:
-        notify.post(gh, repo, number, note, notify.CLOSED)
-    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-            {"state": "closed", "state_reason": reason})
+    words = note if text.has_reason(note) else (
+        "Closed as completed: the ticket is verified (%s)." % _proof_words(number, proof_url))
+    closing.close(gh, repo, number, words, reason)
     # After the close, so a refused close leaves the ticket's labels as they were.
     kept = closing_labels(names, trusted_authors(env))
     if kept != names:
@@ -5333,20 +5334,20 @@ def settle_source(gh: GitHub, repo: str, number: int, body: Any, reason: str,
             return "shadow mode: would close source issue #%d; recorded, left open" % source
         marker = _source_marker(number, outcome)
         said = _said_for(comments, number)
-        if said is None or not said.startswith(marker):
-            comment = "%s\n%s" % (marker, words)
+        fresh = said is None or not said.startswith(marker)
+        comment = "%s\n%s" % (marker, words)
+        if fresh:
             _check_written_text(comment)
-            notify.post(gh, repo, source, comment, notify.SOURCE)
-        elif outcome != "closed":
-            return None
         if outcome == "closed":
             if unproven and any(not checked for checked, _ in
                                 proof.criteria(str(issue.get("body") or ""))):
                 gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, source),
                         {"labels": [FORCE_CLOSE_LABEL]})
-            gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source),
-                    {"state": "closed", "state_reason": "completed"})
+            closing.close(gh, repo, source, comment, "completed", said=not fresh)
             return "closed source issue #%d as completed" % source
+        if not fresh:
+            return None
+        notify.post(gh, repo, source, comment, notify.SOURCE)
         return "left source issue #%d open with a comment" % source
     except RateLimited:
         raise
@@ -5378,8 +5379,7 @@ def reopen_source(gh: GitHub, repo: str, number: int, body: Any,
         comment = ("%s\nThe audit of ticket #%d failed its proof, so this issue, closed for "
                    "that proof, is open again." % (reopened, number))
         _check_written_text(comment)
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, source), {"state": "open"})
-        notify.post(gh, repo, source, comment, notify.REOPENED)
+        closing.reopen(gh, repo, source, comment)
         return "reopened source issue #%d" % source
     except RateLimited:
         raise
@@ -5424,7 +5424,10 @@ def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
         notify.post(gh, repo, number, comment, notify.AUDIT)
         return "audit of %s#%d passed" % (repo, number)
     if issue.get("state") != "open":
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"state": "open"})
+        # Its own line: the audit comment comes last, since audit.unaudited
+        # finds the proof again only until it lands, so a failed step retries.
+        closing.reopen(gh, repo, number, "The audit of this ticket's proof failed, so the "
+                       "ticket is open again.")
     gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [audit.LABEL]})
     move(gh, repo, number, "shipped", note=comment)
     said = "audit of %s#%d failed: back to shipped, lane %s held" % (

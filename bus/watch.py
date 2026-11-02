@@ -54,6 +54,7 @@ import re
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+from . import closing
 from . import handoff
 from . import naming
 from . import notify
@@ -1113,9 +1114,7 @@ class Watcher:
                         continue
                     body = self._quiet_body(rec, reason == "completed")
                     _text.check(body)
-                    notify.post(self.gh, self.repo, number, body, notify.CLOSED)
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                                 {"state": "closed", "state_reason": reason})
+                    closing.close(self.gh, self.repo, int(number), body, reason)
                     self.writes += 2
                     self.say("watch: closed quiet %s#%d" % (self.repo, number))
             except (GitHubError, OSError, ValueError) as err:
