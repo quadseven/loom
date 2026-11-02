@@ -218,6 +218,11 @@ class FakeGitHub:
             # The epic shape's Part of search (loom#2023): no issue here is
             # linked to an epic by its Part of line alone.
             if "label:grug:idle" in parts.query:
+                pages = getattr(self, "search_pages", None)
+                if pages is not None:
+                    page = int((re.search(r"(?:^|&)page=(\d+)", parts.query) or [0, 1])[1])
+                    return reply(200, {"total_count": sum(len(p) for p in pages),
+                                       "items": pages[page - 1] if page <= len(pages) else []})
                 return reply(200, {"items": self.search_items})
             return reply(200, {"items": []})
         if method == "GET" and parts.path == "/repos/%s" % REPO:
@@ -8955,6 +8960,23 @@ class AsksTest(Base):
         searches = [path for method, path in self.fake.calls
                     if method == "GET" and "label:grug:idle" in path]
         self.assertEqual(len(searches), 1)
+
+    def test_idle_scan_follows_search_pages_past_the_first(self):
+        def item(n):
+            return {"number": n, "title": "Pull %d" % n, "body": "", "state": "open",
+                    "updated_at": "2030-05-03T12:00:00Z",
+                    "labels": [{"name": "grug:idle"}], "pull_request": {"url": "unused"}}
+        self.fake.search_pages = [[item(70), item(71)], [item(72)]]
+        self.fake.pulls = [{"number": n, "body": "", "head": {"ref": "operator/topic"}}
+                           for n in (70, 71, 72)]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=NOON)
+        with mock.patch.object(station, "IDLE_SEARCH_PER_PAGE", 2):
+            found = st._idle_pull_requests()
+        self.assertEqual([issue["number"] for _, issue in found], [70, 71, 72])
+        searches = [path for method, path in self.fake.calls
+                    if method == "GET" and "label:grug:idle" in path]
+        self.assertEqual(len(searches), 2)
+        self.assertIn("per_page=2&page=2", searches[1])
 
     def test_idle_scan_searches_at_most_once_per_repo_per_hour(self):
         self.fake.add_ask(5)

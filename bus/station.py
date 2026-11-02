@@ -237,6 +237,10 @@ DIGEST_TITLE = "Loom asks digest"
 DIGEST_MARKER = "<!-- loom:digest v1 -->"
 # Room kept for the mention, which _send adds in front.
 MENTION_ROOM = 40
+# The hourly grug:idle search: GitHub search serves at most 100 per page and
+# 1000 results in all.
+IDLE_SEARCH_PER_PAGE = 100
+IDLE_SEARCH_MAX_PAGES = 10
 ASK_GOAL_REF_RE = re.compile(r"(?<![\w/])#([0-9]+)\b")
 FIX_ROUNDS_DEFAULT = 3
 # A ticket whose fix rounds stop (bus/converge.py: no rung left above a stuck
@@ -8520,14 +8524,31 @@ class Station:
         for repo in self.s.repos:
             if not tickets.REPO_RE.fullmatch(repo):
                 continue
-            query = "/search/issues?q=repo:%s+is:pr+is:open+label:grug:idle&per_page=100" % repo
-            data = self.gh.rest("GET", query).data
-            for issue in (data.get("items", []) if isinstance(data, dict) else []):
+            for issue in self._search_idle_pulls(repo):
                 if isinstance(issue, dict) and "pull_request" in issue:
                     if not self._hold_idle_lane_pull(repo, issue):
                         found.append((repo, issue))
         _write_json(path, {"at": self.now, "items": found})
         return found
+
+    def _search_idle_pulls(self, repo: str) -> List[Any]:
+        """Every open grug:idle pull request in one repo. One page in the
+        usual case; further pages only while the search reports more, up to
+        the search API's 1000-result ceiling."""
+        items: List[Any] = []
+        for page in range(1, IDLE_SEARCH_MAX_PAGES + 1):
+            query = ("/search/issues?q=repo:%s+is:pr+is:open+label:grug:idle"
+                     "&per_page=%d&page=%d" % (repo, IDLE_SEARCH_PER_PAGE, page))
+            data = self.gh.rest("GET", query).data
+            batch = data.get("items", []) if isinstance(data, dict) else []
+            if not isinstance(batch, list):
+                break
+            items.extend(batch)
+            total = data.get("total_count") if isinstance(data, dict) else None
+            if len(batch) < IDLE_SEARCH_PER_PAGE or \
+                    (isinstance(total, int) and len(items) >= total):
+                break
+        return items
 
     def _hold_idle_lane_pull(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Hold the linked ticket for an idle lane pull request without a new comment."""
