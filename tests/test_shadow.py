@@ -1057,6 +1057,7 @@ class EveryPathTest(unittest.TestCase):
         ("bus/invariants.py", "_close_silently"): "self._held(",
         ("bus/invariants.py", "_roll_clear"): "self._held(",
         ("bus/station.py", "_close_done_ticket"): "shadow.active(",
+        ("bus/station.py", "compare_send_back_counts"): "shadow.active(",
         ("bus/station.py", "_settle_claimed"): "shadow.active(",
         ("bus/sweep.py", "_close"): "shadow.guard(",
         ("bus/watch.py", "_close_quiet"): "shadow.guard(",
