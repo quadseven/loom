@@ -80,6 +80,34 @@ use a Loom command, which pages for you (`gh api --paginate` does too). A
 ticket with 36 comments read this way ended 18 days before its newest comment
 and hid the operator's own answers (loom#2387).
 
+## Product watch reads
+
+A goal's product watch reads its product's own API, for WoW the stuck list
+and the health findings. Read them with the helper, not a hand-built URL:
+
+    python3 -m bus.product_read stuck
+    python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
+    python3 -m bus.product_read health
+
+It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
+overseer host's `/dev` world, so the read is `/dev/api/v2/stuck` there. The
+base is never the Loom dashboard's host, which serves no product API and
+answers 404 for every `/dev` and `/api/v2` path (loom#2481: four ticks read
+"404" from it while the overseer's `/dev/api/v2/stuck` answered 200), and
+never the overseer host without `/dev`, whose bare `/api/v2/stuck` redirects
+to the HTML homepage. The helper takes the base from `LOOM_PRODUCT_URL`,
+else from the station's `LOOM_HEALTH_URLS` health entry, else from the SSM
+parameter `LOOM_PRODUCT_URL_SSM` names (default `/muse/product_url`, which
+this VM's identity reads). It refuses a base on the dashboard's host. Set
+`LOOM_TAILNET_PROXY` to the tailnet-only egress proxy for the read; the SSM
+read keeps the shell's own proxy. Never export the tailnet proxy.
+
+A failed read prints the URL it asked and what came back (the HTTP status,
+the redirect target, or a body that was not JSON) and exits 1; journal that
+line as it is, so the next reader can see which host answered. Exit 2 means
+no usable base: say which sources it named. Never claim a count from a
+failed read.
+
 ## Operate, do not report
 
 When a diagnosis needs live evidence, read it directly before deciding or
@@ -944,7 +972,7 @@ head commit from its files and raises the label to match, never lowering it:
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
   requests", and leaves the merge to the brain. While a clean one waits, the
   factory brings it up to date with its base when it falls behind (one a
-  repo a pass), so the brain's merge gate does not refuse it as behind. Its conflicts, failing
+  repo a pass), so it does not drift into a conflict and a strict base does not refuse it. Its conflicts, failing
   checks, high findings and missing tests still go back to its lane, and its
   medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the

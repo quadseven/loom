@@ -569,9 +569,11 @@ ticket climbs, and past the last rung it is left `loom:failed` for the brain. It
 open lane pull request is closed then, or on any later pass, as is one whose
 open ticket was rewritten as a newer ticket, each with one comment naming the
 ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
-keeps the default branch green: a ready pull request that is behind its base
-is brought up to date first (GitHub's update-branch) and lands only after its
-checks and review pass again on the new head; each repo lands at most one a
+keeps the default branch green: a ready pull request behind its base lands as
+it stands when GitHub reports it mergeable and no rule on the base requires
+up-to-date branches; any other is brought up to date first (GitHub's
+update-branch) and lands only after its checks and review pass again on the
+new head; each repo lands at most one a
 pass, `loom:urgent` and `loom:regression` tickets first, then by their
 ticket's `Priority:`, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
