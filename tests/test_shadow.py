@@ -660,6 +660,18 @@ class OutcomeReportTest(ShadowCase):
         self.assertEqual(pair["verdict"], "hold")
         self.assertTrue(pair["damaging"])
 
+    def test_a_hold_verdict_on_an_unreadable_pull_request_is_still_damaging(self):
+        # docs/BRAIN.md: unknown is neither damage nor clean, except under a Hold.
+        shadow.record("operator-verdict", REPO, 8, "pr", label="hold", sha=self.SHA, now=1010)
+        shadow.record("merge", REPO, 8, "pr", sha=self.SHA, tier="app-code", now=1000)
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            data = self._data(self._make_gh({}))
+        pair = data["merge_pairs"][0]
+        self.assertEqual(pair["outcome"], shadow.UNKNOWN)
+        self.assertTrue(pair["damaging"])
+        self.assertEqual(data["by_repo_tier"][(REPO, "app-code")]["damaging"], 1)
+        self.assertEqual(data["clean_by_repo"][REPO], 0)
+
     def test_the_newest_verdict_wins(self):
         shadow.record("operator-verdict", REPO, 8, "pr", label="hold", sha=self.SHA, now=1010)
         shadow.record("operator-verdict", REPO, 8, "pr", label="merge", sha=self.SHA, now=1020)
@@ -790,6 +802,18 @@ class OutcomeReportTest(ShadowCase):
             shadow.record("merge", REPO, number, "pr", sha=self.SHA, now=1000 + number)
         prs = self._pulls(self._pr(1), self._pr(2, head_sha="c" * 40), self._pr(3), self._pr(4))
         self.assertEqual(self._data(self._make_gh(prs))["clean_by_repo"][REPO], 2)
+
+    def test_pending_and_unknown_leave_the_clean_count_unchanged(self):
+        # Neither resets nor adds: two clean merges either side of an open
+        # pull request and one it cannot read still count 2.
+        for number in (1, 2, 3, 4):
+            shadow.record("merge", REPO, number, "pr", sha=self.SHA, now=1000 + number)
+        prs = self._pulls(self._pr(1), self._pr(2, state="open", merged=False), self._pr(4))
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            data = self._data(self._make_gh(prs))
+        self.assertEqual([p["bearing"] for p in data["merge_pairs"]],
+                         [shadow.CLEAN, shadow.PENDING, shadow.UNKNOWN, shadow.CLEAN])
+        self.assertEqual(data["clean_by_repo"][REPO], 2)
 
     def test_the_clean_count_is_per_repo_across_tiers_in_time_order(self):
         # A damaging merge in one tier, later than a clean close in another.

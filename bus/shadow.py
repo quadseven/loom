@@ -84,10 +84,6 @@ import traceback
 from typing import Any, Dict, Iterator, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote
 
-# Avoid circular import: GitHub is imported inside functions that need it
-if False:
-    from .github import GitHub
-
 from . import text
 
 SWITCH = "LOOM_SHADOW"

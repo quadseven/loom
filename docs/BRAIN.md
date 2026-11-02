@@ -2016,7 +2016,8 @@ tier, then the clean decisions each repo has since its last damaging one,
 within the `--since` window. A still-open pull request or issue (`pending`)
 and an outcome the report could not establish (`unknown`: a failed read, a
 partial revert search, or a merge with no recorded head) are neither damage
-nor clean.
+nor clean, with one exception: an operator Hold verdict is damage whatever the
+read showed, until the pull request merges as is at the recorded head.
 `--ledger-only` lists the ledger's lines with no GitHub read.
 
 The switch fails closed. `LOOM_SHADOW` turns shadow off only when it reads
