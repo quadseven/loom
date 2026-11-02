@@ -3603,6 +3603,27 @@ class PastLastRungTests(unittest.TestCase):
         self.assertIn("never resolve a thread a person opened", " ".join(step.lower().split()))
 
 
+class MuseLockStepTests(unittest.TestCase):
+    def muse_step_one(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "MUSE.md"), encoding="utf-8") as f:
+            muse = f.read()
+        step = muse.split("\n1. Run `python3 -m bus lock", 1)[1].split("\n2. ", 1)[0]
+        return " ".join(step.split())
+
+    def test_a_stand_down_comes_only_from_the_last_lock_attempt(self):
+        # loom#2469: a 21:10 ET stand-down line was posted from an earlier
+        # attempt's held result while the acquiring --wait was still waiting.
+        step = self.muse_step_one()
+        self.assertIn("Act on the result of your last lock attempt only", step)
+        self.assertIn("never post a stand-down from it", step)
+
+    def test_step_one_names_both_brains_slots(self):
+        step = self.muse_step_one()
+        self.assertIn("Muse's ticks start at :10 and :40", step)
+        self.assertIn("starts at :25 and :55", step)
+
+
 class VerifyDueTests(unittest.TestCase):
     NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
     LIVE = "- [ ] Live: the dashboard shows the new column"
