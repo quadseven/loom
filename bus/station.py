@@ -5352,6 +5352,7 @@ class Station:
                      self.clean_labels,
                      self.queue_stateless_tickets,
                      self.note_stale_shipped,
+                     self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
@@ -14376,6 +14377,56 @@ class Station:
                 _say("watch_logs failed: %s" % err)
         finally:
             self._end_pass_locally()
+
+    def compare_send_back_counts(self) -> None:
+        """Run the one seven-day comparison of bus/send_back.py, at most
+        hourly until it is done; it never runs a second time."""
+        from . import send_back
+        repo = send_back.REPO
+        if repo not in self.s.repos:
+            return
+        path = os.path.join(self.state, send_back.STATE_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        checked = saved.get("checked_at")
+        if saved.get("completed") or (isinstance(checked, (int, float))
+                                      and 0 <= self.now - checked < 3600):
+            return
+        landed_at = self._epoch(send_back.LANDED_AT)
+        if not landed_at or self.now < landed_at + send_back.WAIT:
+            _write_json(path, {"checked_at": self.now})
+            return
+        # One repo's trailing week at a time, counted and dropped, so only the
+        # three totals are held across repos.
+        found = {rule: 0 for rule in send_back.RULES}
+        for source in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(source):
+                continue  # Only an owner/name goes into the path, as elsewhere here.
+            week = self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
+                                  % (source, send_back.since(self.now)))
+            for rule, n in send_back.counts(week, self.s.review_bot,
+                                            datetime.fromtimestamp(self.now,
+                                                                   timezone.utc)).items():
+                found[rule] += n
+        _say("send-back comparison for #%d: %s" % (send_back.TICKET, found))
+        reopen = send_back.not_fallen(found)
+        if shadow.active(repo):
+            if reopen:
+                shadow.record_held(shadow.REOPEN, repo, send_back.TICKET, "issue",
+                                   source="seven-day send-back comparison",
+                                   reason="send-back counts have not fallen")
+        else:
+            # The result goes on the ticket either way, so the live box can be
+            # settled from it; only counts that have not fallen reopen.
+            existing = self._paginate("/repos/%s/issues/%d/comments"
+                                      % (repo, send_back.TICKET))
+            if not any(send_back.MARKER in str(c.get("body") or "") for c in existing
+                       if isinstance(c, dict)):
+                self._comment(repo, send_back.TICKET, send_back.report(found), "report")
+            if reopen:
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, send_back.TICKET),
+                             {"state": "open"})
+        _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})
 
     def _end_pass_locally(self) -> None:
         """Local housekeeping that needs no GitHub request: finished lane
