@@ -3639,6 +3639,35 @@ class PastLastRungTests(unittest.TestCase):
         self.assertIn("never resolve a thread a person opened", " ".join(step.lower().split()))
 
 
+class RebriefPastLadderTests(unittest.TestCase):
+    """Test re-briefing a ticket that is past the model ladder and marked loom:failed."""
+
+    def test_rebrief_past_ladder_failed_ticket_creates_fresh_loom_ticket(self):
+        """A past-ladder loom:failed ticket can be re-briefed with a fresh loom:ticket brief."""
+        failed_ticket = item(9, labels=["loom:ticket", "loom:failed", "lane:codex"],
+                             title="Past ladder work", body=BODY + "\n\nPart of #2\n")
+        fake = Fake(
+            reply(200, goal()),         # GET /issues/1 (goal) - from open_epic
+            reply(200, []),             # GET /issues/1/sub_issues - from _goal_children
+            reply(201, {"id": 202, "number": 20, "html_url": "https://example.com/t/20"}),  # POST new issue
+            reply(201, {}),             # POST /issues/2/sub_issues - link to epic
+        )
+        gh = GitHub("t", transport=fake)
+        url = brain.brief(gh, REPO, EPIC, "Re-brief past ladder work",
+                          BODY + "\n\nRe-briefed after exhausting the model ladder.", "codex",
+                          difficulty="medium")
+        self.assertEqual(url, "https://example.com/t/20")
+        # Find the POST to create the new issue
+        created = [c for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues")]
+        self.assertEqual(len(created), 1)
+        new_issue = created[0][2]  # request payload
+        self.assertIn("loom:ticket", new_issue["labels"])
+        self.assertNotIn("loom:failed", new_issue["labels"])
+        self.assertIn("loom:briefed", new_issue["labels"])
+        self.assertIn("lane:codex", new_issue["labels"])
+        self.assertIn("Re-briefed after exhausting the model ladder", new_issue["body"])
+
+
 class MuseLockStepTests(unittest.TestCase):
     def muse_step_one(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
