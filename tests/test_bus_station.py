@@ -271,8 +271,6 @@ class FakeGitHub:
         if method == "GET" and rest.startswith("compare/"):
             base = rest[len("compare/"):].split("...", 1)[0]
             return reply(200, {"status": "ahead" if base in self.carried else "behind"})
-        if method == "GET" and rest == "commits":
-            return reply(200, [])
         runs = re.match(r"commits/([0-9a-f]{40})/check-runs$", rest)
         if method == "GET" and runs:
             if self.check_runs_status != 200:

@@ -14382,7 +14382,7 @@ class Station:
         """Run the one seven-day comparison of bus/send_back.py, at most
         hourly until it is done; it never runs a second time."""
         from . import send_back
-        repo = self.s.self_repo
+        repo = send_back.REPO
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)
@@ -14392,9 +14392,7 @@ class Station:
         if saved.get("completed") or (isinstance(checked, (int, float))
                                       and 0 <= self.now - checked < 3600):
             return
-        landed = send_back.landed_at(self._paginate(
-            "/repos/%s/commits?path=%s&per_page=100" % (repo, send_back.LANDED_PATH)))
-        landed_at = self._epoch(landed) if landed else None
+        landed_at = self._epoch(send_back.LANDED_AT)
         if not landed_at or self.now < landed_at + send_back.WAIT:
             _write_json(path, {"checked_at": self.now})
             return
@@ -14405,17 +14403,21 @@ class Station:
         found = send_back.counts(comments, self.s.review_bot,
                                  datetime.fromtimestamp(self.now, timezone.utc))
         _say("send-back comparison for #%d: %s" % (send_back.TICKET, found))
-        if send_back.not_fallen(found):
-            if shadow.active(repo):
+        reopen = send_back.not_fallen(found)
+        if shadow.active(repo):
+            if reopen:
                 shadow.record_held(shadow.REOPEN, repo, send_back.TICKET, "issue",
                                    source="seven-day send-back comparison",
                                    reason="send-back counts have not fallen")
-            else:
-                existing = self._paginate("/repos/%s/issues/%d/comments"
-                                          % (repo, send_back.TICKET))
-                if not any(send_back.MARKER in str(c.get("body") or "") for c in existing
-                           if isinstance(c, dict)):
-                    self._comment(repo, send_back.TICKET, send_back.report(found), "report")
+        else:
+            # The result goes on the ticket either way, so the live box can be
+            # settled from it; only counts that have not fallen reopen.
+            existing = self._paginate("/repos/%s/issues/%d/comments"
+                                      % (repo, send_back.TICKET))
+            if not any(send_back.MARKER in str(c.get("body") or "") for c in existing
+                       if isinstance(c, dict)):
+                self._comment(repo, send_back.TICKET, send_back.report(found), "report")
+            if reopen:
                 self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, send_back.TICKET),
                              {"state": "open"})
         _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})

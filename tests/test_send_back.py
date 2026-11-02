@@ -44,11 +44,15 @@ class CountsTest(unittest.TestCase):
         self.assertFalse(send_back.not_fallen(fell))
         self.assertTrue(send_back.not_fallen(dict(fell, **{"weakened-test": 18})))
 
-    def test_the_clock_starts_at_the_oldest_commit(self):
-        commits = [{"commit": {"committer": {"date": "2026-11-02T00:00:00Z"}}},
-                   {"commit": {"committer": {"date": "2026-11-01T00:00:00Z"}}}]
-        self.assertEqual(send_back.landed_at(commits), "2026-11-01T00:00:00Z")
-        self.assertIsNone(send_back.landed_at([]))
+    def test_the_numbers_to_beat_are_the_filed_week(self):
+        # The prior week's 0 weakened-test findings would reopen on any one.
+        self.assertEqual(send_back.FILED_COUNTS, {"acceptance-criterion-unmet": 27,
+                                                  "weakened-test": 18, "intent-mismatch": 13})
+        self.assertFalse(send_back.not_fallen({"acceptance-criterion-unmet": 9,
+                                               "weakened-test": 1, "intent-mismatch": 6}))
+
+    def test_the_clock_starts_at_the_merge_of_2170(self):
+        self.assertEqual(send_back.LANDED_AT, "2026-11-01T09:08:45Z")
 
 
 class StationStepTest(unittest.TestCase):
@@ -56,40 +60,39 @@ class StationStepTest(unittest.TestCase):
         self.state = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.state)
         self.posted, self.patched = [], []
-        self.landed = "2026-11-01T00:00:00Z"
         self.findings = [finding("weakened-test")] * 18
+        self.shadow = False
+        self.repos = [send_back.REPO]
 
     def run_step(self, now=NOW):
         st = station.Station.__new__(station.Station)
         st.state = self.state
         st.now = now.timestamp()
-        st.s = SimpleNamespace(self_repo="example-owner/sample", repos=["example-owner/sample"],
-                               review_bot=BOT)
+        st.s = SimpleNamespace(repos=self.repos, review_bot=BOT)
         st.gh = SimpleNamespace(rest=lambda *a, **k: self.patched.append(a))
         st._comment = lambda *a: self.posted.append(a)
 
         def pages(path):
-            if "/commits?" in path:
-                return [{"commit": {"committer": {"date": self.landed}}}] if self.landed else []
-            return self.findings if "/pulls/comments" in path else []
+            if "/pulls/comments" in path:
+                return self.findings
+            return [{"body": c[2]} for c in self.posted] if "/comments" in path else []
         st._paginate = pages
-        with mock.patch.object(station.shadow, "active", return_value=False):
+        with mock.patch.object(station.shadow, "active", return_value=self.shadow):
             st.compare_send_back_counts()
 
     def saved(self):
         with open(os.path.join(self.state, send_back.STATE_FILE)) as fh:
             return json.load(fh)
 
-    def test_nothing_runs_before_the_file_lands(self):
-        self.landed = None
-        self.run_step()
+    def test_nothing_runs_inside_the_seven_days_after_2170_merged(self):
+        self.run_step(datetime(2026, 11, 8, 9, 8, tzinfo=timezone.utc))
         self.assertEqual((self.posted, self.patched), ([], []))
         self.assertNotIn("completed", self.saved())
 
-    def test_nothing_runs_inside_the_seven_days(self):
-        self.landed = (NOW - timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        self.run_step()
-        self.assertEqual((self.posted, self.patched), ([], []))
+    def test_the_step_runs_once_seven_days_after_2170_merged(self):
+        self.run_step(datetime(2026, 11, 8, 9, 9, tzinfo=timezone.utc))
+        self.assertEqual(len(self.posted), 1)
+        self.assertTrue(self.saved()["completed"])
 
     def test_counts_that_have_not_fallen_reopen_the_ticket_once(self):
         self.run_step()
@@ -100,11 +103,26 @@ class StationStepTest(unittest.TestCase):
         self.assertEqual((len(self.posted), len(self.patched)), (1, 1))
         self.assertTrue(self.saved()["completed"])
 
-    def test_counts_that_fell_finish_with_no_reopen(self):
+    def test_counts_that_fell_post_the_numbers_and_do_not_reopen(self):
         self.findings = []
         self.run_step()
-        self.assertEqual((self.posted, self.patched), ([], []))
+        self.assertEqual(len(self.posted), 1)
+        self.assertIn("All three fell.", self.posted[0][2])
+        self.assertEqual(self.patched, [])
         self.assertTrue(self.saved()["completed"])
+
+    def test_shadow_mode_holds_the_reopen_and_posts_nothing(self):
+        self.shadow = True
+        with mock.patch.object(station.shadow, "record_held") as held:
+            self.run_step()
+        self.assertEqual((self.posted, self.patched), ([], []))
+        self.assertEqual(held.call_args[0][:3], (station.shadow.REOPEN, send_back.REPO, 2162))
+
+    def test_a_station_not_serving_the_home_repo_never_runs_it(self):
+        self.repos = ["example-owner/sample"]
+        self.run_step()
+        self.assertEqual((self.posted, self.patched), ([], []))
+        self.assertFalse(os.path.exists(os.path.join(self.state, send_back.STATE_FILE)))
 
 
 if __name__ == "__main__":
