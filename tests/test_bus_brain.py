@@ -5764,6 +5764,93 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(fake.subs[30], [31, 26])
         self.assertEqual(fake.subs[20], [23, 24, 25])
 
+    def test_an_open_epic_over_capacity_moves_its_16th_ticket_to_next_epic(self):
+        # T2085: Epic #1883 holds 16 tickets (cap 15). The 16th ticket moves
+        # to the next intake epic so Epic #1883 stays within capacity.
+        url = "https://api.github.com/repos/%s/issues/1883" % REPO
+        tickets_1883 = [
+            item(100 + i, body="## Why\nwhy\n\nPart of #1883\n", labels=("loom:ticket",),
+                 created_at="2030-01-%02dT00:00:00Z" % (i + 1), parent_issue_url=url)
+            for i in range(16)
+        ]
+        fake = self.repo()
+        fake.issues[1883] = dict(item(1883, body="Part of #1\n", labels=("epic",)),
+                                 title="Epic: big batch")
+        fake.subs[1].append(1883)
+        fake.subs[1883] = [t["number"] for t in tickets_1883]
+        for t in tickets_1883:
+            fake.issues[t["number"]] = t
+
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        self.assertEqual(len(fake.subs[1883]), brain.EPIC_TICKET_CAP)
+        self.assertEqual(fake.subs[1883], [100 + i for i in range(15)])
+        opened = [n for n in fake.subs[1] if n != 1883]
+        self.assertEqual(len(opened), 1)
+        next_epic = opened[0]
+        self.assertEqual(fake.subs[next_epic], [115])
+        self.assertEqual(fake.issues[115]["body"], "## Why\nwhy\n\nPart of #%d\n" % next_epic)
+
+    def test_an_open_epic_over_capacity_moves_excess_tickets_into_existing_intake_epic(self):
+        url = "https://api.github.com/repos/%s/issues/1883" % REPO
+        tickets_1883 = [
+            item(100 + i, body="## Why\nwhy\n\nPart of #1883\n", labels=("loom:ticket",),
+                 created_at="2030-01-%02dT00:00:00Z" % (i + 1), parent_issue_url=url)
+            for i in range(16)
+        ]
+        fake = self.repo(epics=[(60, 5)])
+        fake.issues[1883] = dict(item(1883, body="Part of #1\n", labels=("epic",)),
+                                 title="Epic: big batch")
+        fake.subs[1].append(1883)
+        fake.subs[1883] = [t["number"] for t in tickets_1883]
+        for t in tickets_1883:
+            fake.issues[t["number"]] = t
+
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (1, 0))
+        self.assertEqual(len(fake.subs[1883]), brain.EPIC_TICKET_CAP)
+        self.assertEqual(fake.subs[60][-1], 115)
+        self.assertEqual(fake.issues[115]["body"], "## Why\nwhy\n\nPart of #60\n")
+
+    def test_an_open_epic_with_multiple_excess_tickets_moves_all_excess_tickets(self):
+        url = "https://api.github.com/repos/%s/issues/1883" % REPO
+        tickets_1883 = [
+            item(100 + i, body="## Why\nwhy\n\nPart of #1883\n", labels=("loom:ticket",),
+                 created_at="2030-01-%02dT00:00:00Z" % (i + 1), parent_issue_url=url)
+            for i in range(17)
+        ]
+        fake = self.repo(epics=[(60, 5)])
+        fake.issues[1883] = dict(item(1883, body="Part of #1\n", labels=("epic",)),
+                                 title="Epic: big batch")
+        fake.subs[1].append(1883)
+        fake.subs[1883] = [t["number"] for t in tickets_1883]
+        for t in tickets_1883:
+            fake.issues[t["number"]] = t
+
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (2, 0))
+        self.assertEqual(len(fake.subs[1883]), brain.EPIC_TICKET_CAP)
+        self.assertEqual(fake.subs[60][-2:], [115, 116])
+
+    def test_standing_repairs_epic_is_exempt_from_ticket_capacity(self):
+        url = "https://api.github.com/repos/%s/issues/1883" % REPO
+        tickets_1883 = [
+            item(100 + i, body="## Why\nwhy\n\nPart of #1883\n", labels=("loom:ticket",),
+                 created_at="2030-01-%02dT00:00:00Z" % (i + 1), parent_issue_url=url)
+            for i in range(16)
+        ]
+        fake = self.repo()
+        fake.issues[1883] = dict(item(1883, body="Part of #1\n", labels=("epic",)),
+                                 title=brain.REPAIRS_TITLE)
+        fake.subs[1].append(1883)
+        fake.subs[1883] = [t["number"] for t in tickets_1883]
+        for t in tickets_1883:
+            fake.issues[t["number"]] = t
+
+        moved, left = self.move(fake)
+        self.assertEqual((moved, left), (0, 0))
+        self.assertEqual(len(fake.subs[1883]), 16)
+
 
 class CloseEpicTests(unittest.TestCase):
     """loom#638: the brain closes a finished epic with a one-line note."""
