@@ -3150,13 +3150,20 @@ update_fix_branch() {
 # edits on a side branch, which the brief's Earlier attempt section names. The agent cannot
 # fetch it: the sandbox keeps .git read-only, and two codex runs on one ticket
 # started over and ended with no commit (2026-10-21). So the runner merges it
-# into the tree before the agent starts. A branch that will not fetch or merge
-# cleanly is left out and logged: the agent starts from the base, as before.
+# into the tree before the agent starts, on a first build and on a fix round
+# alike (2026-11-02: a fix round never got its kept edits, so each round
+# timed out again). A branch that will not fetch or merge cleanly is left out
+# and logged: the agent starts from the base, as before. On a fix round whose
+# default branch merge still conflicts, a second merge cannot start, and an
+# abort would undo that merge, so the kept branch is left out instead.
 resume_earlier_attempt() {
   local side
-  [ -z "$FIX_PR" ] || return 0
   side="$(grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' "$BRIEF" | head -1 | awk '{print $NF}')"
   [ -n "$side" ] || return 0
+  if [ -n "$CONFLICTS" ]; then
+    echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side while the default branch merge conflicts; the agent starts without it" >> "$LOG"
+    return 0
+  fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q origin "+refs/heads/$side:refs/remotes/origin/$side" >> "$LOG" 2>&1 &&
      safe_git merge --no-edit "origin/$side" >> "$LOG" 2>&1; then
