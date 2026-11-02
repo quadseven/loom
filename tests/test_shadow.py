@@ -789,7 +789,7 @@ class GhGuardTest(ShadowCase):
     ]
     LET = [
         ["pr", "view", "5", "-R", REPO, "--json", "title"],
-        ["pr", "close", "5", "-R", REPO],
+        ["pr", "close", "5", "-R", REPO, "--comment", "Superseded."],
         ["issue", "comment", "5", "-R", REPO, "--body", "ready-to-land soon"],
         ["issue", "edit", "5", "-R", REPO, "--add-label", "loom:answered"],
         ["issue", "edit", "5", "-R", REPO, "--add-label", "loom:shipped"],
@@ -1035,31 +1035,15 @@ class EveryPathTest(unittest.TestCase):
                              r"\b(closeIssue|reopenIssue)\b")
     SHELL_CLOSE = re.compile(r"\bgh\s+issue\s+(close|reopen)\b|"
                              r"\bgh\s+api\b.*\bstate=(closed|open)\b")
-    # Every Python function that closes or reopens an issue (loom#1551): each
-    # sends it with GitHub.rest, where _hold_in_shadow holds it, and the ones
-    # that post a note first ask the guard before the note, so a held close
-    # never says it closed. The value is what it asks ("" when the request
-    # is sent before any note, so the choke point alone holds it).
+    # Every Python function that closes or reopens: bus/closing.py alone
+    # (loom#2444), which asks the guard before its note, so a held close never
+    # says it closed. Its request still goes through GitHub.rest, where
+    # _hold_in_shadow holds it. The value is what the site asks itself ("":
+    # the asking is in _change, checked below).
     CLOSE_SITES = {
-        ("bus/brain.py", "close_epic"): "shadow.active(",
-        ("bus/brain.py", "close"): "shadow.active(",
-        ("bus/brain.py", "settle_source"): "shadow.active(",
-        ("bus/brain.py", "reopen_source"): "",
-        ("bus/brain.py", "audit_proof"): "",
-        ("bus/close_audit.py", "_refuse"): "shadow.active(",
-        ("bus/factory.py", "_default_close"): "",   # a pull request: let through
-        ("bus/factory.py", "_close_unmerged_follow_ups"): "",
-        ("bus/factory.py", "_split_pr"): "",
-        ("bus/health.py", "_close_settled"): "shadow.active(",
-        ("bus/invariants.py", "_reopen"): "self._held(",
-        ("bus/invariants.py", "_fold"): "self._held(",
-        ("bus/invariants.py", "_close_quiet"): "self._held(",
-        ("bus/invariants.py", "_close_silently"): "self._held(",
-        ("bus/invariants.py", "_roll_clear"): "self._held(",
-        ("bus/station.py", "_close_done_ticket"): "shadow.active(",
-        ("bus/station.py", "_settle_claimed"): "shadow.active(",
-        ("bus/sweep.py", "_close"): "shadow.guard(",
-        ("bus/watch.py", "_close_quiet"): "shadow.guard(",
+        ("bus/closing.py", "close"): "",
+        ("bus/closing.py", "close_pull"): "",   # a pull request: let through
+        ("bus/closing.py", "reopen"): "",
     }
     # A state of "closed" or "open" that is no write: the guard's own tables
     # and a dashboard row.
@@ -1131,6 +1115,9 @@ class EveryPathTest(unittest.TestCase):
             with self.subTest(site=key, line=line):
                 if asks:
                     self.assertIn(asks, before, "%s:%d closes before it asks the guard" % (key[0], line))
+        closes = (ROOT / "bus" / "closing.py").read_text(encoding="utf-8")
+        self.assertLess(closes.index("_check_not_held(gh, path, change)"),
+                        closes.index("notify.post("))
         # The choke point every one of them sends through.
         rest = (ROOT / "bus" / "github.py").read_text(encoding="utf-8")
         self.assertRegex(rest, r"def _rest\(self[^)]*\)[^:]*:\n(?:.*\n){0,4}\s+(?:acted = )?self\._hold_in_shadow\(")

@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from urllib.parse import unquote
 from unittest import mock
 
+from shadow_env import setUpModule, tearDownModule  # noqa: F401
+
 from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
-from bus.github import GitHubError, Response
+from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
 REPO = "example-org/example-repo"
@@ -55,6 +57,18 @@ class FakeGitHub:
         self.details = {}
         self.writes = []
         self.behind = {}
+        # The base's rules: a strict check rule unless a test says otherwise;
+        # an exception here is a rules read that failed.
+        self.rules = [{"type": "required_status_checks",
+                       "parameters": {"strict_required_status_checks_policy": True}}]
+        # The branch's classic protection: off, unless a test turns it on. The
+        # detail read is what a token with administration read gets back.
+        self.classic_enabled = False
+        self.classic = Response(404, {"message": "Branch not protected"})
+        # Pull request number to what its merge raises, and whether the merge
+        # had already happened when it did (an error while settling).
+        self.merge_refused = {}
+        self.head_date = "2020-01-01T00:00:00Z"
         self.attempts = {}
         self.update_status = 202
         self.files = {}
@@ -130,6 +144,18 @@ class FakeGitHub:
         return self._write(method, path, body)
 
     def _get(self, path):
+        if "/rules/branches/main" in path:
+            if isinstance(self.rules, Exception):
+                raise self.rules
+            return Response(200, self.rules)
+        if re.search(r"/commits/sha\d+$", path):
+            return Response(200, {"commit": {"committer": {"date": self.head_date}}})
+        if path.endswith("/branches/main/protection"):
+            if isinstance(self.classic, Exception):
+                raise self.classic
+            return self.classic
+        if path.endswith("/branches/main"):
+            return Response(200, {"protection": {"enabled": self.classic_enabled}})
         m = re.search(r"/issues/(\d+)$", path)
         if m:
             number = int(m.group(1))
@@ -279,6 +305,11 @@ class Base(unittest.TestCase):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
                 raise GitHubError("PUT /repos/%s/pulls/%d/merge -> 405" % (repo, number), 405)
+            refused = gh.merge_refused.get(number)
+            if refused is not None and getattr(refused, "merge_completed", False):
+                self.merged.append((number, ticket))
+            if refused is not None:
+                raise refused
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
@@ -1031,6 +1062,206 @@ class PullRequests(Base):
         for call in say.call_args_list:
             self.assertNotIn("up to date", call.args[0])
 
+    NOT_STRICT = [{"type": "pull_request", "parameters": {}},
+                  {"type": "required_status_checks",
+                   "parameters": {"strict_required_status_checks_policy": False}}]
+
+    def land_behind(self, rules):
+        """Run a pass on a ready behind pull request; its update-branch calls."""
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.gh.rules = rules
+        self.lock_holder = self.go().locks.get(REPO)
+        return [w[1] for w in self.gh.writes if w[1].endswith("/update-branch")]
+
+    def test_a_ready_behind_pull_request_on_a_non_strict_repo_merges_with_no_update(self):
+        # loom#2482: the fleet merge gate dropped up-to-date on these repos.
+        self.assertEqual(self.land_behind(self.NOT_STRICT), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_repo_with_no_rules_merges_a_behind_pull_request(self):
+        self.assertEqual(self.land_behind([]), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_one_strict_rule_among_others_takes_the_update_path(self):
+        strict = {"type": "required_status_checks",
+                  "parameters": {"strict_required_status_checks_policy": True}}
+        self.assertEqual(self.land_behind(self.NOT_STRICT + [strict]),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_check_rule_that_does_not_state_its_policy_counts_as_strict(self):
+        rule = {"type": "required_status_checks", "parameters": {}}
+        self.assertEqual(self.land_behind([rule]),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_rules_that_cannot_be_read_take_the_update_path(self):
+        self.assertEqual(self.land_behind(GitHubError("no", status=403)),
+                         ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    UPDATED = ["/repos/%s/pulls/50/update-branch" % REPO]
+
+    def test_rules_that_read_as_something_other_than_a_list_count_as_strict(self):
+        self.assertEqual(self.land_behind(None), self.UPDATED)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.lock_holder, 50)
+
+    def test_a_full_page_of_rules_counts_as_strict(self):
+        # One page is read, so a rule past it would go unseen.
+        self.assertEqual(self.land_behind([{"type": "pull_request"}] * 100), self.UPDATED)
+        self.assertEqual(self.merged, [])
+
+    def test_classic_protection_with_strict_checks_takes_the_update_path(self):
+        self.gh.classic_enabled = True
+        self.gh.classic = Response(200, {"required_status_checks": {"strict": True}})
+        self.assertEqual(self.land_behind(self.NOT_STRICT), self.UPDATED)
+        self.assertEqual(self.merged, [])
+
+    def test_classic_protection_with_loose_checks_merges(self):
+        self.gh.classic_enabled = True
+        self.gh.classic = Response(200, {"required_status_checks": {"strict": False}})
+        self.assertEqual(self.land_behind(self.NOT_STRICT), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_classic_protection_with_no_required_checks_merges(self):
+        self.gh.classic_enabled = True
+        self.gh.classic = Response(200, {"enforce_admins": {"enabled": True}})
+        self.assertEqual(self.land_behind(self.NOT_STRICT), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_404_on_classic_protection_means_none(self):
+        self.gh.classic_enabled = True
+        self.assertEqual(self.land_behind(self.NOT_STRICT), [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_classic_protection_that_cannot_be_read_counts_as_strict(self):
+        self.gh.classic_enabled = True
+        self.gh.classic = GitHubError("no", status=403)
+        self.assertEqual(self.land_behind(self.NOT_STRICT), self.UPDATED)
+        self.assertEqual(self.merged, [])
+
+    def test_classic_protection_that_reads_as_a_non_object_counts_as_strict(self):
+        self.gh.classic_enabled = True
+        self.gh.classic = Response(200, ["odd"])
+        self.assertEqual(self.land_behind(self.NOT_STRICT), self.UPDATED)
+        self.assertEqual(self.merged, [])
+
+    BEHIND_405 = "Head branch is not up to date with the base branch"
+
+    def refused(self, err):
+        """A pass where the merge of a behind non-strict pull request raises."""
+        self.gh.merge_refused[50] = err
+        return self.land_behind(self.NOT_STRICT)
+
+    def hold(self, number=50):
+        self.gh.comments.setdefault(number, []).append(
+            {"id": 901, "user": {"login": "example-fleet"}, "body": "Not merging this yet.",
+             "created_at": "2030-01-01T00:00:00Z"})
+
+    def test_a_405_saying_behind_takes_the_landing_update(self):
+        self.assertEqual(self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405)),
+                         self.UPDATED)
+        self.assertEqual(self.merged, [])
+        # The landing path's update takes the lock; hygiene's does not.
+        self.assertEqual(self.lock_holder, 50)
+
+    def test_a_405_for_another_reason_takes_no_lock(self):
+        self.refused(GitHubError("merge -> 405", 405, "Base branch was modified."))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_gate_refusal_takes_no_lock(self):
+        self.refused(ValueError("blocked: review did not pass on this head"))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_shadow_hold_takes_no_lock_even_saying_behind(self):
+        self.refused(ShadowHeld("shadow mode: not up to date"))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_rate_limit_takes_no_lock_even_saying_behind(self):
+        self.refused(RateLimited("merge -> 405", 405, self.BEHIND_405, 0))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_server_error_takes_no_lock(self):
+        self.refused(GitHubError("merge -> 500", 500, self.BEHIND_405))
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_stops_every_update_in_the_pass(self):
+        # The merge commit an update makes postdates the hold, and a newer
+        # head lifts a hold, so an update would lift it.
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405))
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_stops_the_update_on_a_strict_base(self):
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.land_behind([{"type": "required_status_checks", "parameters": {}}])
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
+    def test_a_hold_from_before_the_head_does_not_stop_the_update(self):
+        self.gh.head_date = "2031-01-01T00:00:00Z"
+        self.hold()
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.land_behind([{"type": "required_status_checks", "parameters": {}}])
+        self.assertEqual(updates, self.UPDATED)
+
+    def test_held_comments_that_cannot_be_ruled_out_stop_the_update(self):
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}), \
+                mock.patch.object(self.gh, "rest", side_effect=GitHubError("no", 500)):
+            f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+            self.assertTrue(f._hold_stands(REPO, 50, "sha50", "x"))
+
+    def test_keep_current_and_hygiene_and_the_red_base_update_respect_a_hold(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.hold()
+        full = self.gh.pulls[50]
+        issue = self.gh.issues[5]
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=["Alice-Example"])
+        f._runs["sha50"] = [{"name": "ci", "conclusion": "failure"}]
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}), \
+                mock.patch.object(f, "_green_on_base", return_value=True):
+            f._keep_current(REPO, 50, full)
+            f._hygiene_update(REPO, 50, issue, full)
+            self.assertFalse(f._update_base_fixed(REPO, 50, full, "sha50"))
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_an_error_while_settling_is_a_completed_merge(self):
+        err = GitHubError("label write -> 405", 405, self.BEHIND_405)
+        err.merge_completed = True
+        with mock.patch("bus.factory._say") as say:
+            updates = self.refused(err)
+        self.assertEqual(updates, [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertIsNone(self.lock_holder)
+        said = " ".join(c.args[0] for c in say.call_args_list)
+        self.assertIn("settling", said)
+        self.assertNotIn("did not merge", said)
+
+    def test_a_refused_merge_of_a_current_pull_request_is_not_updated(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.merge_refused[50] = GitHubError("merge -> 405", 405, self.BEHIND_405)
+        self.go()
+        self.assertEqual([w for w in self.gh.writes if w[1].endswith("/update-branch")], [])
+
+    def test_only_a_pull_request_github_calls_mergeable_may_land_behind(self):
+        # The pass filters a conflict and an unjudged head earlier, so this
+        # asks the rule itself.
+        self.gh.rules = self.NOT_STRICT
+        f = self.go()
+        full = {"base": {"ref": "main"}}
+        self.assertTrue(f._may_land_behind(REPO, dict(full, mergeable=True)))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=False)))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=None)))
+
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
@@ -1509,8 +1740,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #52.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #52."))
-        self.assertEqual(self.gh.comments.get(50, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[50]], ["Superseded by #52."])
         self.assertEqual(self.merged, [(52, (REPO, 5))])
 
     def test_lane_pull_request_closed_when_ticket_merged_through_different_pr(self):
@@ -1521,8 +1751,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
-        self.assertTrue(self.gh.pulls[50]["body"].endswith("Superseded by #51."))
-        self.assertEqual(self.gh.comments.get(50, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[50]], ["Superseded by #51."])
         self.assertEqual(self.merged, [])
 
     def test_old_merge_does_not_supersede_regression_pull_request(self):
@@ -2507,7 +2736,8 @@ class DeferredFindings(Base):
         by = {f["number"]: f.get("state") for f in self.gh.filed}
         self.assertEqual(by, {760: "closed", 761: "open", 762: "open"})
         self.assertEqual(self.gh.filed[0]["state_reason"], "not_planned")
-        self.assertIn("closed without merging", self.gh.filed[0]["body"])
+        (said,) = self.gh.comments[760]
+        self.assertIn("closed without merging", said["body"])
 
 
 class ChangeClasses(Base):
@@ -3142,12 +3372,11 @@ class Tickets(Base):
         self.assertEqual(self.closed[0][0], 70)
         self.assertIn("past the last rung of the model ladder", self.closed[0][1])
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
-        # One email, not two: the reason goes into the pull request's body
-        # with the close, and it says what happened rather than asking someone
-        # to close what the station just closed (2026-10-21).
-        self.assertEqual(self.gh.comments.get(70, []), [])
+        # The thread says why, once (loom#2444), and says what happened
+        # rather than asking someone to close what the station just closed.
+        (said,) = self.gh.comments[70]
+        self.assertIn("past the last rung of the model ladder", said["body"])
         self.assertEqual(self.gh.pulls[70]["state"], "closed")
-        self.assertIn("past the last rung of the model ladder", self.gh.pulls[70]["body"])
         self.assertNotIn("close this pull request", self.gh.pulls[70]["body"])
 
     def test_a_handed_off_ticket_past_the_ladder_closes_its_lane_pull_request(self):
@@ -3165,7 +3394,7 @@ class Tickets(Base):
         self.assertIn("past the last rung of the model ladder", note)
         self.assertIn("hand-off pool (%s)" % factory.HANDOFF_LABEL, note)
         self.assertEqual(self.gh.pulls[70]["state"], "closed")
-        self.assertEqual(self.gh.comments.get(70, []), [])
+        self.assertEqual([c["body"] for c in self.gh.comments[70]], [note])
         self.assertEqual((self.moved, self.fixed, self.merged), ([], [], []))
         self.assertIn({"name": "loom:failed"}, self.gh.issues[7]["labels"])
         self.go()  # once: nothing more on the next pass

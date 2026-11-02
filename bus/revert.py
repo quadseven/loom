@@ -184,13 +184,19 @@ def _say(message: str) -> None:
     print("revert: %s" % message, flush=True)
 
 
+# Scheduled checks that report on main as a whole. Their result says nothing
+# about the commit they ran on, so it never starts a fix-forward or a revert.
+REPORT_CHECKS = ("spot-mutation",)
+
+
 def latest_runs(runs: Sequence[Dict[str, Any]], skip: str = "") -> List[Dict[str, Any]]:
     """The newest run of each check name (a re-run replaces the run before
-    it), without the review check `skip`, which reviews and does not test."""
+    it), without the review check `skip`, which reviews and does not test, or
+    a REPORT_CHECKS run, which lands on whatever commit main was at."""
     newest: Dict[str, Dict[str, Any]] = {}
     for run in runs:
         name = str(run.get("name") or "")
-        if not name or name == skip:
+        if not name or name == skip or name in REPORT_CHECKS:
             continue
         old = newest.get(name)
         if old is None or int(run.get("id") or 0) >= int(old.get("id") or 0):

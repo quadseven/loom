@@ -444,42 +444,162 @@ class LabelTests(unittest.TestCase):
         self.assertIn("loom:factory", created)
 
 
+def take(gh, holder, minutes=15, now=None, run=""):
+    """(whether the caller holds the lock after one attempt, the holder's name)."""
+    got = lock.attempt(gh, REPO, holder, minutes, now, run)
+    return got.acquired, got.holder.name
+
+
 class LockTests(unittest.TestCase):
     def test_acquire_free(self):
         g = FakeGit()
         gh = GitHub("tok", api="https://api.github.com", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertEqual(g.lock_message(),
-                         "holder=tick-1 expires=" + stamp(NOW + timedelta(minutes=15)))
+                         "holder=tick-1 expires=" + stamp(NOW + timedelta(minutes=15))
+                         + " acquired=" + stamp(NOW))
 
     def test_held_by_other(self):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW + timedelta(minutes=5)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (False, "other"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (False, "other"))
         self.assertIn("holder=other", g.lock_message())
         self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     def test_held_by_self(self):
+        # loom#2275: a re-attempt that finds the caller's own live lock holds
+        # it; it is not told "held" and does not stand down against itself.
         g = FakeGit()
         g.seed_lock("tick-1", stamp(NOW + timedelta(minutes=5)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (False, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
+        self.assertEqual("held", g.refs["heads/loom-lock/brain"])
         self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
+
+    def test_a_re_attempt_after_its_own_acquire_is_acquired_and_says_so(self):
+        # The 2026-11-01 misread: a brain that already took the lock tries
+        # again and must read the answer as its own lock, with its age.
+        g = FakeGit()
+        gh = GitHub("tok", transport=g)
+        self.assertTrue(lock.attempt(gh, REPO, "muse", 30, NOW).acquired)
+        again = lock.attempt(gh, REPO, "muse", 30, NOW + timedelta(minutes=2))
+        self.assertTrue(again.acquired)
+        self.assertTrue(again.already)
+        line = again.line(NOW + timedelta(minutes=2))
+        self.assertTrue(line.startswith("lock acquired: already yours (holder muse)"), line)
+        self.assertIn("held 2m since 2030-01-01T12:00:00Z", line)
+        self.assertNotIn("lock held by", line)
+
+    def test_a_peers_lock_names_the_peer_and_its_age(self):
+        g = FakeGit()
+        gh = GitHub("tok", transport=g)
+        lock.attempt(gh, REPO, "lane-machine", 45, NOW - timedelta(minutes=1), run="r1")
+        held = lock.attempt(gh, REPO, "muse", 30, NOW)
+        self.assertFalse(held.acquired)
+        self.assertEqual(("lane-machine", "r1"), (held.holder.name, held.holder.run))
+        self.assertEqual(NOW - timedelta(minutes=1), held.holder.acquired)
+        self.assertEqual("lock held by lane-machine, run r1 (not yours: you are muse), "
+                         "held 1m since 2030-01-01T11:59:00Z, expires 2030-01-01T12:44:00Z",
+                         held.line(NOW))
+
+    def test_an_old_lock_without_a_start_reads_its_age_from_the_tick_record(self):
+        g = FakeGit()
+        g.seed_lock("lane-machine", stamp(NOW + timedelta(minutes=30)))
+        g.commits["held"]["message"] += ('\nloom:tick={"started_at":"2030-01-01T11:50:00Z",'
+                                         '"step":"merge","step_index":3,"notes":[{"ts":"x",'
+                                         '"step":"lock","text":"run=zzz holder=zzz"}],"times":[]}')
+        held = lock.attempt(GitHub("tok", transport=g), REPO, "muse", 30, NOW)
+        self.assertFalse(held.acquired)
+        self.assertEqual(("lane-machine", ""), (held.holder.name, held.holder.run))
+        self.assertIn("held 10m since 2030-01-01T11:50:00Z, at step merge", held.line(NOW))
+
+    def test_an_unknown_age_is_said_not_guessed(self):
+        g = FakeGit()
+        g.seed_lock("lane-machine", stamp(NOW + timedelta(minutes=30)))
+        line = lock.attempt(GitHub("tok", transport=g), REPO, "muse", 30, NOW).line(NOW)
+        self.assertIn("lock held by lane-machine (not yours: you are muse), held for an "
+                      "unknown time", line)
+
+    def test_the_same_holder_from_another_run_is_not_yours(self):
+        g = FakeGit()
+        gh = GitHub("tok", transport=g)
+        lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="old")
+        held = lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="new")
+        self.assertFalse(held.acquired)
+        self.assertIn("lock held by lane-machine, run old (same holder name, another run)",
+                      held.line(NOW))
+        # The same run, or a caller naming no run (the agent its wrapper
+        # locked for), owns it.
+        self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="old").already)
+        self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW).already)
+
+    def test_a_takeover_lost_after_the_stale_delete_is_held_not_yours(self):
+        # Another taker re-creates the lock between the stale-lock delete and
+        # the caller's second create: the caller never held it, even when
+        # the winner carries the caller's own holder name.
+        for winner in ("lane-machine", "muse"):
+            g = FakeGit()
+            g.seed_lock("old", stamp(NOW - timedelta(minutes=1)))
+            real = g.__call__
+
+            def racing(method, url, headers, body, g=g, real=real, winner=winner):
+                answer = real(method, url, headers, body)
+                if method == "DELETE":
+                    g.seed_lock(winner, stamp(NOW + timedelta(minutes=30)))
+                return answer
+
+            held = lock.attempt(GitHub("tok", transport=racing), REPO, "muse", 30, NOW)
+            self.assertFalse(held.acquired, winner)
+            self.assertFalse(held.already, winner)
+            self.assertEqual(winner, held.holder.name)
+            self.assertTrue(held.line(NOW).startswith("lock held by %s" % winner))
+
+    def test_a_bounded_wait_takes_the_lock_once_the_peer_lets_go(self):
+        g = FakeGit()
+        g.seed_lock("lane-machine", stamp(NOW + timedelta(minutes=2, seconds=30)))
+        gh = GitHub("tok", transport=g)
+        clock = [NOW]
+
+        def sleep(seconds):
+            clock[0] += timedelta(seconds=seconds)
+
+        got = lock.attempt_waiting(gh, REPO, "muse", 30, wait=5,
+                                   clock=lambda: clock[0], sleep=sleep)
+        self.assertTrue(got.acquired)
+        self.assertEqual(3, got.waited)
+        self.assertIn("holder=muse", g.lock_message())
+
+    def test_a_bounded_wait_gives_up_at_its_deadline(self):
+        g = FakeGit()
+        g.seed_lock("lane-machine", stamp(NOW + timedelta(minutes=40)))
+        gh = GitHub("tok", transport=g)
+        clock = [NOW]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += timedelta(seconds=seconds)
+
+        got = lock.attempt_waiting(gh, REPO, "muse", 30, wait=3,
+                                   clock=lambda: clock[0], sleep=sleep)
+        self.assertFalse(got.acquired)
+        self.assertEqual([60, 60, 60], sleeps)
+        self.assertIn("; waited 3m", got.line(clock[0]))
 
     def test_expired_takeover(self):
         g = FakeGit()
         g.seed_lock("other", stamp(NOW - timedelta(minutes=1)))
         gh = GitHub("tok", transport=g)
-        self.assertEqual(lock.acquire(gh, REPO, "tick-1", 15, NOW), (True, "tick-1"))
+        self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
         self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     def test_release_by_holder_and_wrong_holder(self):
         g = FakeGit()
         gh = GitHub("tok", transport=g)
-        lock.acquire(gh, REPO, "tick-1", 15, NOW)
+        take(gh, "tick-1", 15, NOW)
         self.assertFalse(lock.release(gh, REPO, "tick-2"))
         self.assertIn("heads/loom-lock/brain", g.refs)
         self.assertTrue(lock.release(gh, REPO, "tick-1"))
@@ -497,7 +617,7 @@ class LockTests(unittest.TestCase):
         gh = GitHub("tok", transport=FakeGit())
         for bad in ("", "a b", "a=b", "a\nb", "x/y"):
             with self.assertRaises(ValueError):
-                lock.acquire(gh, REPO, bad)
+                lock.attempt(gh, REPO, bad)
             with self.assertRaises(ValueError):
                 lock.release(gh, REPO, bad)
         self.assertEqual(gh.requests, 0)
@@ -643,18 +763,27 @@ class CliTests(unittest.TestCase):
         code, out, err = self.run_cli(["lock", REPO, "--holder", "h1"], FakeGit())
         self.assertEqual(code, 0)
         self.assertIn("requests: ", err)
-        self.assertIn("lock acquired\n", out)
+        self.assertTrue(out.startswith("lock acquired: yours (holder h1), expires "), out)
         g = FakeGit()
         g.seed_lock("other", stamp(datetime.now(timezone.utc) + timedelta(hours=1)))
         code, out, _ = self.run_cli(["lock", REPO, "--holder", "h1"], g)
         self.assertEqual(code, 1)
-        self.assertIn("lock held by other\n", out)
-        # Test self-lock behavior prints the holder
+        self.assertTrue(out.startswith("lock held by other (not yours: you are h1), held "), out)
+        # loom#2275: the caller's own live lock is acquired, exit 0, and the
+        # line says it is already the caller's.
         g = FakeGit()
         g.seed_lock("h1", stamp(datetime.now(timezone.utc) + timedelta(hours=1)))
         code, out, _ = self.run_cli(["lock", REPO, "--holder", "h1"], g)
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("lock acquired: already yours (holder h1)"), out)
+
+    def test_lock_run_marks_another_run_of_the_same_holder(self):
+        g = FakeGit()
+        self.assertEqual(0, self.run_cli(["lock", REPO, "--holder", "h1", "--run", "a"], g)[0])
+        self.assertIn(" run=a", g.lock_message().splitlines()[0])
+        code, out, _ = self.run_cli(["lock", REPO, "--holder", "h1", "--run", "b"], g)
         self.assertEqual(code, 1)
-        self.assertIn("lock held by h1\n", out)
+        self.assertIn("(same holder name, another run)", out)
 
     def test_unlock_exit_codes(self):
         g = FakeGit()

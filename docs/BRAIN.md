@@ -56,6 +56,7 @@ that talks to GitHub about tickets.
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
 | `closed-unproven` | The station closed the ticket on merged code with its Live box unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
 | `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
+| `loom:mutation` | The one rolling report of the weekly spot mutation run (`bus/mutation_run.py`). Never a ticket; a survivor to fix gets its own. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
@@ -1364,6 +1365,26 @@ that fails posts nothing, so a bad API answer cannot start a second comment.
   withheld; they stay in the lane log and on the ticket. A public repo's
   detail that fails the public repo leak scan is withheld the same way.
 
+## A close says why first
+
+Every close and reopen goes through `bus/closing.py` (loom#2444). It posts a
+plain-English reason in the thread, then changes the state. It refuses an empty
+reason, and a reason that is only an HTML comment. It sends no state change when
+the post fails, and it asks shadow mode and the acceptance-criteria check first,
+so a refused close leaves no comment saying it closed. Machine data in a reason
+goes in an HTML comment, since ticket comments are read as email. When GitHub
+refuses the state change it deletes the comment, so a retry does not repeat it.
+A note Loom edits in place (a reopened or cleared invariant) is the reason for
+that thread, and no second comment is posted.
+
+`python3 -m bus.brain close` with no `--note` says the proof on a completed
+close; `--reason not_planned` needs `--note`. `tests/test_closing_gateway.py`
+fails on any direct state write, and on a shell close with no `--comment`. A
+close costs two writes, and each bulk path keeps its cap: `CLOSE_DONE_PER_PASS`,
+the invariants and watch `WRITES_MAX`, `FOLD_MAX`, and the factory and sweep
+`MAX_ACTIONS`. A rung's `gh` guard refuses a `gh issue` or `gh pr` close or reopen
+with no `--comment`, and any `gh api` state write, shadow on or off.
+
 ## Where a new comment is posted
 
 Every new comment on an issue or pull request goes through `notify.post` in
@@ -1399,7 +1420,7 @@ pull request's review thread is not a new issue comment and is not scanned.
 | `proof` | The proof record of a verified or shipped move. |
 | `audit` | The result of a proof audit. |
 | `held` | A ticket held apart from open work, with what it waits for. |
-| `closed` | Why an issue was closed. |
+| `closed` | Why an issue or pull request was closed. |
 | `reopened` | Why an issue was opened again. |
 | `source` | A note on the source issue of a rewritten ticket. |
 | `repair` | The factory edited text instead of sending a pull request back. |
@@ -1505,13 +1526,21 @@ issue moves to `needs:human`, it is listed with the asks.
 One tick at a time, under a lock: a branch `loom-lock/brain` in this repo,
 created through the API. Creating a ref that exists fails, so only one
 holder wins. The ref points at a commit whose message is
-`holder=<name> expires=<UTC time>`. A tick that finds the lock held and
-unexpired exits; one that finds it expired deletes it and tries once to
-create it. The tick deletes it when done. The lock lasts `--minutes`
-(default 15); Muse takes 30 for its 25-minute tick.
+`holder=<name> expires=<UTC time> acquired=<UTC time>`, with `run=<id>` when
+the caller passed `--run`. A tick that finds the lock held and unexpired by a
+peer exits; one that finds it expired deletes it and tries once to create
+it. A live lock that is the caller's own (the same holder, and the same run
+when `--run` is given) is acquired, not held: a re-attempt after a lost or
+misread answer never stands a brain down against itself (loom#2275). The
+tick expires it when done. The lock lasts `--minutes`
+(default 15); Muse takes 30 for its 25-minute tick. `--wait N` tries again
+each minute for up to N minutes while a peer holds it.
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
-<owner/name> --holder <name>` do this (exit 0 on success, 1 when held by
-someone else).
+<owner/name> --holder <name>` do this (exit 0 when the caller holds the lock,
+1 when a peer does). The lock line always names the holder: `lock acquired:
+yours ...`, `lock acquired: already yours ..., held 4m since <time>`, or
+`lock held by <holder> (not yours: you are <caller>), held 12m since <time>,
+at step <step>, expires <time>`.
 
 Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review `needs-brain` tickets in full
@@ -1771,7 +1800,11 @@ While a pull request carries that label and was marked less than 40 minutes
 ago, the factory updates and lands no other pull request in that repo, and
 `bus.brain merge` refuses to merge any other one there. The marked one lands
 as soon as it is current and green; if main moves under it, the factory
-updates it again and it keeps the lock. The lock ends when it merges or
+updates it again and it keeps the lock. On a base with no rule requiring
+up-to-date branches, a mergeable behind pull request merges without the update
+or the lock (loom#2482). GitHub refusing that merge with a 405 that says behind takes
+the update and the lock. A gate refusal, a shadow hold or a rate limit does not.
+No factory update runs while a fleet hold stands. The lock ends when it merges or
 closes, or 40 minutes after the mark (from the label's event on GitHub),
 when the label comes off and the next pass picks again. Operators merging
 by hand follow the same cadence.

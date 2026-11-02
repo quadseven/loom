@@ -39,12 +39,82 @@ own, by any route: the tick's `gh` refuses the rest and records them. A move
 to `loom:shipped` is a state fact, not a merge or a close, and goes through;
 leave it to each goal's ship rules.
 
+## Build: the :10 tick
+
+Muse is a builder, and code is its main output (the fleet goal, duty 10).
+The target is 3 merged pull requests a day. The tick that starts at :10
+past the hour is a build tick: it runs the steps below and none of the
+brain steps under Tick, takes no brain lock, and spends its whole 25
+minutes on one ticket. The tick that starts at :40 is the brain tick
+(Tick). Any other Muse chat or task that builds (duty 10) uses the same
+commands, so every Muse run shares one claim and one open pull request.
+
+Build commands write as the agent-meta-muse App, never as the Loom Brain
+App: in the same shell call as each `bus.muse_build` command, set
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_FILE` (or `_SSM`) to the agent-meta-muse App's values,
+the credentials Muse's fleet journal posts with, or set `LOOM_GITHUB_TOKEN`
+to an installation token minted for that App and unset the three App
+variables (they win over the token when set). With any other identity
+every command stops with `the build client writes as <login>, expected
+agent-meta-muse[bot]` and writes nothing.
+
+1. Run `python3 -m bus.muse_build next` with `LOOM_REPOS` set. It prints one
+   JSON line: `kind` `pr` is Muse's own open pull request, finished before
+   anything else; `claim` is a ticket Muse already holds; `new` is a ticket
+   it has just claimed (claim:muse plus a marked comment). The pick rule
+   takes an open issue in a public repo of `LOOM_REPOS`, filed by a
+   briefing login (`LOOM_BRIEF_AUTHORS`, or `LOOM_TRUSTED_BRIEFERS` on a
+   loom:ticket) or by the repo's owner, a member or a collaborator, never
+   by a stranger, with no assignee,
+   no claim:* or lane:* label, no hold (needs:*, loom:human, needs-brain,
+   awaiting-live-check, wait:*, an epic, a goal home, an active Loom
+   state), Size XS, S or M, at least one acceptance checkbox and no open
+   or merged pull request naming it; highest priority first (a P0 to P3 label or a
+   `Priority:` line, none counts as P2), then oldest. Exit 1 means nothing
+   is buildable: say so in one line and end the tick. Exit 2 is an error:
+   post the step, the exact command and the exact error line in the day's
+   `[fleet]` thread, and claude-code fixes that blocker the same day.
+2. For `pr`: the JSON's `branch` is its head and `ticket` the issue it
+   builds. Read every check and every bot thread on it. Fix a failing
+   check or a valid finding on that branch, push (step 4, with
+   `OWNER/NAME#<ticket>`), and reply to
+   every thread, the review bot's included. When the merge gate in
+   the fleet goal passes (CI green, Grug - Elder success on the head,
+   Grug - Chief success or neutral, no conflict, every thread answered),
+   ask claude-code in the `[fleet]` thread to merge it through the gate,
+   with the pull request link. Then end the tick. Once it merges, the next
+   `next` lets the ticket go itself and picks a new one.
+3. For `claim` or `new`: clone the repo anonymously (public repos only) or
+   pull it, and check out the `branch` the JSON names from `origin/main`
+   (or from the remote branch when it is already there). Read the ticket
+   and all of its comments. Write the test that shows the problem, run it
+   and see it fail, then make the smallest change that passes it. Run the
+   repo's own check (`.loom/validation.conf`, else the test command in its
+   README) and commit.
+4. Run `python3 -m bus.muse_build push OWNER/NAME#N` from the checkout. It
+   pushes the `muse/<n>-<slug>` branch through the GitHub API, so the VM
+   needs no git credential. Push at the end of every tick, finished or
+   not: unpushed work is invisible, and a claim lapses after 2 hours with
+   no activity.
+5. Write the body to `PR.md`: `## Why`, `## Summary`, `## Acceptance
+   criteria` (3 bullets), `## Test plan` (3 bullets, naming the test that
+   fails without the fix), `## Size`, `## Out of scope`, the line
+   `Refs OWNER/NAME#N`, and `-- muse` last. Never a closing keyword. Open it
+   with `python3 -m bus.muse_build pr OWNER/NAME#N --base main --file
+   PR.md`; it refuses a body that misses any of those.
+6. Post one line in the `[fleet]` thread: what was claimed, pushed or
+   opened, signed `-- muse`. When the ticket cannot be built (it is wrong,
+   done or needs a person), let it go with `python3 -m bus.muse_build
+   release OWNER/NAME#N --note "<one line why>"`.
+
 ## What Muse does and leaves
 
 Muse reads live data through REST APIs on the tailnet, through its proxy,
 and reads logs and rows through the lane machine's read-only evidence endpoint
 (Operate, do not report). It has no direct cluster or database access. Muse
-does reviews, merges, briefs, failed tickets, asks, journals, verification,
+builds (Build), and in the brain tick does reviews, merges, briefs, failed
+tickets, asks, journals, verification,
 and the ships and rolls a goal's own rules give the brain. A ship or a roll
 is a pull request in the deployment repo (a pinned digest read from the
 build run's log, or a configuration change) plus the gates the goal's rules
@@ -79,6 +149,34 @@ not the newest. Follow the `Link` header to its end with `per_page=100`, or
 use a Loom command, which pages for you (`gh api --paginate` does too). A
 ticket with 36 comments read this way ended 18 days before its newest comment
 and hid the operator's own answers (loom#2387).
+
+## Product watch reads
+
+A goal's product watch reads its product's own API, for WoW the stuck list
+and the health findings. Read them with the helper, not a hand-built URL:
+
+    python3 -m bus.product_read stuck
+    python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
+    python3 -m bus.product_read health
+
+It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
+overseer host's `/dev` world, so the read is `/dev/api/v2/stuck` there. The
+base is never the Loom dashboard's host, which serves no product API and
+answers 404 for every `/dev` and `/api/v2` path (loom#2481: four ticks read
+"404" from it while the overseer's `/dev/api/v2/stuck` answered 200), and
+never the overseer host without `/dev`, whose bare `/api/v2/stuck` redirects
+to the HTML homepage. The helper takes the base from `LOOM_PRODUCT_URL`,
+else from the station's `LOOM_HEALTH_URLS` health entry, else from the SSM
+parameter `LOOM_PRODUCT_URL_SSM` names (default `/muse/product_url`, which
+this VM's identity reads). It refuses a base on the dashboard's host. Set
+`LOOM_TAILNET_PROXY` to the tailnet-only egress proxy for the read; the SSM
+read keeps the shell's own proxy. Never export the tailnet proxy.
+
+A failed read prints the URL it asked and what came back (the HTTP status,
+the redirect target, or a body that was not JSON) and exits 1; journal that
+line as it is, so the next reader can see which host answered. Exit 2 means
+no usable base: say which sources it named. Never claim a count from a
+failed read.
 
 ## Operate, do not report
 
@@ -238,6 +336,11 @@ tickets and pull requests like any other work.
 
 ## Remote pull lane
 
+Retired for Muse: the build tick (Build) replaces it. The lane wrote as a
+person's token, which no brain uses since the fleet Apps, and it took only
+`lane:muse` tickets, which the build pick rule leaves alone. The steps stay
+here for a lane that still runs them.
+
 The `muse` lane runs on a remote VM and pulls its ticket from GitHub. It does
 not use the station's local brief inbox. A scheduled lane task runs these
 steps on each tick:
@@ -337,9 +440,24 @@ this tick"; a step with no note shows nothing there. Each step call records
 when that step started and when the previous one ended, and prints the
 tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
-1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30`.
-   Stop if the lock is held. The lock outlives the 25-minute tick, so no
-   other brain takes it mid-tick.
+1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30 --wait 5`.
+   Read its exit code and its one line, not an earlier one. Exit 0 means you
+   hold the lock: the line starts `lock acquired: yours`, or `lock acquired:
+   already yours` when you had taken it earlier this tick (a re-attempt is
+   yours, never a peer's, so go on). Exit 1 means a peer holds it after the
+   5-minute wait: the line starts `lock held by <holder>` and says how long
+   it has held it and when it expires. Stop then, and quote that line in the
+   stand-down so it names the holder and its age. Act on the result of
+   your last lock attempt only: when you run it again (a retry, a second
+   `--wait`), the earlier attempt's `lock held by` line is superseded, so
+   never post a stand-down from it; a later `lock acquired` line means you
+   hold the lock and the tick runs. Your 30-minute lock outlives your
+   25-minute tick, so no other brain takes it mid-tick. Muse's ticks start
+   at :10 and :40 past the hour; the lane machine's tick starts at :25 and
+   :55 and its lock expires by your next start (loom#2469), so a lane hold
+   that still blocks you after the 5-minute wait is one past that bound.
+   Only the :40 tick runs these steps: the :10 tick is the build tick
+   (Build) and takes no lock.
    Then run `python3 -m bus.brain step lock --holder muse`.
 2. First run `python3 -m bus.brain step status --holder muse`. The first read
    of every tick is the handoff packet: the comment marked
@@ -403,7 +521,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    The station posts it in the channel as a reply, so it must stand on its
    own and fit in a phone message.
    Then run `python3 -m bus.brain resume $LOOM_REPOS --holder muse
-   --deadline 1.5`. It refuses unless you hold the lock. It prints each
+   --deadline 1.5`. It refuses unless you hold the lock. It reads up to six
+   repos at once (the per-repo workers), starting with the lightest (fewest
+   open issues and pull requests, as status does), so a deadline leaves
+   only heavy repos unread. It prints each
    repo's goal sections as soon as that repo is read and logs progress to
    stderr (the repo, the requests so far, and every rate-limit or retry
    wait), so a killed run keeps what it printed. `--deadline MINUTES`
@@ -664,9 +785,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    at most 5 are held at once, and each is released before the command
    ends, whether or not the action worked or raised. Any `claim:muse`
    still open in loom or grug when the command starts is a dead tick's
-   (only the lock holder sweeps) and is released first. It stops when the
-   tick reaches 20 minutes. The sweep never opens a pull request: building stays
-   with the lanes. Cite only what you read this tick. Never write that an
+   (only the lock holder sweeps) and is released first, except one whose
+   newest build marker is a claim: that is the build tick's ticket (Build). It stops when the
+   tick reaches 20 minutes. The sweep never opens a pull request: building is
+   the build tick's (Build). Cite only what you read this tick. Never write that an
    operator decided something unless a person's comment or label on the
    issue records it (loom#2089); when you act on your own judgment, say so
    in the evidence. The command's last line is the tick's count, `swept N
@@ -928,7 +1050,7 @@ head commit from its files and raises the label to match, never lowering it:
   `needs-brain`, lists it in `bus.brain status` under "Sensitive pull
   requests", and leaves the merge to the brain. While a clean one waits, the
   factory brings it up to date with its base when it falls behind (one a
-  repo a pass), so the brain's merge gate does not refuse it as behind. Its conflicts, failing
+  repo a pass), so it does not drift into a conflict and a strict base does not refuse it. Its conflicts, failing
   checks, high findings and missing tests still go back to its lane, and its
   medium and low findings are deferred, as for any class. A brain merges it with
   `python3 -m bus.brain merge`, which for this class also requires that the

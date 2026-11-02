@@ -27,10 +27,9 @@ started. The list is rewritten in place only when it changes. A list that
 empties says "none"; after CLEAR_AFTER of none the issue closes with one
 cleared note (edited, not reposted, on a later clear), and a violation that
 returns reopens the same issue. A repo whose facts could not be read keeps
-its issue as it is. Older per-violation issues of those kinds close with no
-comment, their note at the foot of the body, FOLD_MAX a pass and never one
-rewritten into a ticket; the one comment is a running count on the tracking
-issue of their repo, edited in place.
+its issue as it is. Older per-violation issues of those kinds close with a
+comment saying why, FOLD_MAX a pass and never one rewritten into a ticket; a
+running count on the tracking issue of their repo is edited in place.
 Adding an invariant is one function in INVARIANTS plus a test.
 
 Everything here is written to a public repo. A subject in another repo comes
@@ -51,6 +50,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import brain
+from . import closing
 from . import journal
 from . import naming
 from . import notify
@@ -216,10 +216,12 @@ ROLL_CHECKED = "Last checked: %s (checked every station pass; this issue is edit
 # rewriter never turns it into a ticket and freezes the list.
 ROLL_LABELS = [LABEL]
 # Per pass, at most this many older per-violation issues close into a tracking
-# issue, within WRITES_MAX. Each is one PATCH and no comment: a comment mails
-# everyone watching, so 105 of them would be 105 mails. The one comment is
-# FOLD_SUMMARY on the tracking issue, edited in place.
+# issue, within WRITES_MAX. Each says why in a comment first (bus/closing.py),
+# and this cap bounds those mails. FOLD_SUMMARY on the tracking issue counts
+# them, edited in place.
 FOLD_MAX = 2
+# One close's writes (its note and its PATCH) and the count on the tracking issue.
+FOLD_WRITES = 3
 FOLD_MARKER = "<!-- loom:invariant roll-folded -->"
 FOLD_SUMMARY = "%d older per-violation issues closed into this list so far (last at %s)."
 FOLD_COUNT_RE = re.compile(r"^([0-9]+) older per-violation issues", re.M)
@@ -1293,11 +1295,15 @@ class Filer:
         self.subjects = subjects if subjects is not None else {}
         self.settled = settled
         self.seen = seen if seen is not None else {}
-        self.read = tuple(ROLLED if read is None else read)
+        self.read: Tuple[str, ...] = ()
         # Tracking issue keys whose repo could not be read this pass.
-        self._unread_keys = {Breach(kind, "%s in %s" % (kind, repo), "", (), 0.0).key
-                             for kind, repos in (unread or {}).items() for repo in repos}
+        self._unread_keys: set = set()
+        self.reads(read, unread)
         self.writes = 0
+        # What run() had to write: (breaches to file or refresh, gone
+        # breaches whose issue may settle). The station names them when a
+        # gate stops the writing (loom#2505).
+        self.pending: Tuple[int, int] = (0, 0)
         # Older per-violation issues folded into a tracking issue this pass.
         self.folds = 0
         # Breach key -> issue number of each tracking issue (ROLL_MARKER).
@@ -1317,6 +1323,27 @@ class Filer:
         self._ticketed: set = set()
         # Rolling breach key -> its issue, once this pass has it open.
         self._rolling_open: Dict[str, int] = {}
+
+    def reads(self, read: Optional[Sequence[str]],
+              unread: Optional[Dict[str, Sequence[str]]]) -> None:
+        """Name what this pass read, as the constructor's `read` and
+        `unread` do, for a filer built before the reads (settle_early)."""
+        self.read = tuple(ROLLED if read is None else read)
+        self._unread_keys = {Breach(kind, "%s in %s" % (kind, repo), "", (), 0.0).key
+                             for kind, repos in (unread or {}).items() for repo in repos}
+
+    def settle_early(self) -> None:
+        """The settle step, before the caller's heavy reads (loom#2505): a
+        check whose reads reach the pass request target still closes what
+        settled. No breach is current yet, so only a subject the settled
+        callback calls settled for good closes, and run() later settles the
+        rest within the same FOLD_MAX and WRITES_MAX."""
+        if not self.write:
+            return
+        try:
+            self._settle({})
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close settled issues: %s" % err)
 
     def _listing(self) -> Dict[str, int]:
         """Breach key -> issue number for every loom:invariant issue, open or
@@ -1612,12 +1639,12 @@ class Filer:
                                                                 utc(self.now)),
                           "", "Evidence:"] + self._evidence(b))
         _text.check(body)
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number), {"state": "open"})
         if note is not None and note.get("id") is not None:
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, note["id"]),
                          {"body": body})
+            closing.reopen(self.gh, self.repo, number, body, said=True)
         else:
-            notify.post(self.gh, self.repo, number, body, notify.REOPENED)
+            closing.reopen(self.gh, self.repo, number, body)
         self.writes += 1
         self.say("invariants: reopened %s#%d: %s" % (self.repo, number, b.title))
         return True
@@ -1722,12 +1749,10 @@ class Filer:
         if mine and mine[-1].get("id") is not None:
             self.gh.rest("PATCH", "/repos/%s/issues/comments/%s" % (self.repo, mine[-1]["id"]),
                          {"body": note})
+            closing.close(self.gh, self.repo, number, note, "not_planned", said=True)
         else:
-            notify.post(self.gh, self.repo, number, note, notify.CLOSED)
-        self.writes += 1
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                     {"state": "closed", "state_reason": "not_planned"})
-        self.writes += 1
+            closing.close(self.gh, self.repo, number, note, "not_planned")
+        self.writes += 2
         self._listed_closed.add(number)
         self.say("invariants: closed cleared tracking issue %s#%d" % (self.repo, number))
         return True
@@ -1741,30 +1766,31 @@ class Filer:
             return
         body = ("Folded into #%d, the one rolling issue for this invariant: it lists "
                 "this subject with the others and is updated in place." % into)
-        if not any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments):
-            _text.check(body)
-            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
-            self.writes += 1
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                     {"state": "closed", "state_reason": "not_planned"})
-        self.writes += 1
+        said = any(("Folded into #%d" % into) in str(c.get("body", "")) for c in comments)
+        _text.check(body)
+        closing.close(self.gh, self.repo, number, body, "not_planned", said=said)
+        self.writes += 1 if said else 2
         self.say("invariants: folded %s#%d into #%d" % (self.repo, number, into))
 
     def _settle(self, current: Dict[str, Breach]) -> None:
         """Close the open issue of each gone SETTLES breach whose subject
-        settled for good, its note at the foot of the body. Walks the listing,
+        settled for good, its note as a comment. Walks the listing,
         not the local map, so a breach filed before the map or gone while the
-        station was down settles too. run() calls it before filing anything,
-        so the pass's writes go here first (loom#2451: filing spent them every
-        pass that could write, and four issues about closed epics stayed open
-        for days), and it reads no comments (a deferred comment read stopped
-        the whole clear)."""
+        station was down settles too, oldest issue first. run() calls it
+        before filing anything, so the pass's writes go here first
+        (loom#2451: filing spent them every pass that could write, and four
+        issues about closed epics stayed open for days), and it reads no
+        comments (a deferred comment read stopped the whole clear)."""
         listing = self._listing()
         for key in list(self.subjects):
             if listing.get(key) is None or listing[key] in self._listed_closed:
                 self.subjects.pop(key, None)
-        for key, number in listing.items():
-            if self.writes + 2 > WRITES_MAX or self.folds >= FOLD_MAX:
+        # Oldest first. GitHub lists the newest first, and at FOLD_MAX closes
+        # a pass the oldest issues waited behind every newer settled one
+        # (loom#2451: three reports about epics closed for five days sat
+        # behind about 25 newer ones at two closes a writable pass).
+        for key, number in sorted(listing.items(), key=lambda item: item[1]):
+            if self.writes + FOLD_WRITES > WRITES_MAX or self.folds >= FOLD_MAX:
                 return
             invariant = key.split("/", 1)[0]
             if (key in current or invariant not in SETTLES or key in self._rolls
@@ -1800,27 +1826,25 @@ class Filer:
 
     def _close_settled(self, key: str, number: int, issue: Dict[str, Any], why: str,
                        current: Dict[str, Breach]) -> bool:
-        """Close an issue whose subject settled, saying how at the foot of its
-        body. False when shadow mode holds it (recorded in the ledger)."""
-        if not self._close_silently(key, number, issue, "%s%s: %s." % (
+        """Close an issue whose subject settled, saying how in a comment.
+        False when shadow mode holds it (recorded in the ledger)."""
+        if not self._close_older(key, number, issue, "%s%s: %s." % (
                 CLEARED_TEXT, utc(self.now), why.rstrip(".")), current, "settled: " + why):
             return False
         self.say("invariants: closed settled %s#%d: %s" % (self.repo, number, why))
         return True
 
-    def _close_silently(self, key: str, number: int, issue: Dict[str, Any], note: str,
+    def _close_older(self, key: str, number: int, issue: Dict[str, Any], note: str,
                         current: Dict[str, Breach], why: str) -> bool:
-        """Close an older issue of a ROLLED kind with one PATCH: the note goes
-        at the foot of its body, since a comment on each would mail everyone
-        watching. The tracking issue of its repo, if open, counts it. False
-        when shadow mode holds it."""
+        """Close an older issue of a ROLLED kind with its note as a comment,
+        two writes under WRITES_MAX and FOLD_MAX (loom#2444). The tracking
+        issue of its repo, if open, counts it. False when shadow mode holds
+        it."""
         if self._held(number, {"state": "closed", "state_reason": "not_planned"}, issue, why):
             return False
         _text.check(note)
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                     {"state": "closed", "state_reason": "not_planned",
-                      "body": "%s\n\n%s" % (str(issue.get("body") or "").rstrip(), note)})
-        self.writes += 1
+        closing.close(self.gh, self.repo, number, note, "not_planned")
+        self.writes += 2
         self.folds += 1
         self._listed_closed.add(number)
         # Counted against its tracking issue once filing has found which
@@ -1933,7 +1957,7 @@ class Filer:
         if (any(n.startswith("needs:") for n in labels) or TICKET_LABEL in labels
                 or invariant not in self.read):
             return True
-        if self.writes + 2 > WRITES_MAX:
+        if self.writes + FOLD_WRITES > WRITES_MAX:
             return False
         into = self._rolled_into(key, current)
         at = _epoch(issue.get("created_at"))
@@ -1943,7 +1967,7 @@ class Filer:
             return True
         where = "#%d lists this kind for its repo" % into if into else (
             "it keeps one tracking issue per repo, titled \"Invariant: %s in <repo>\"" % invariant)
-        if self._close_silently(key, number, issue, (
+        if self._close_older(key, number, issue, (
                 "Closed: the station no longer files one issue per `%s` violation; %s." % (
                     invariant, where)), current,
                 "folded: %s files no issue per violation" % invariant):
@@ -2002,13 +2026,9 @@ class Filer:
         already_explained = any(CLEARED_TEXT in str(c.get("body", ""))
                                 and (_epoch(c.get("created_at")) or 0) >= max(times)
                                 for c in comments)
-        if not already_explained:
-            _text.check(body)
-            notify.post(self.gh, self.repo, number, body, notify.CLOSED)
-            self.writes += 1
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (self.repo, number),
-                     {"state": "closed", "state_reason": "not_planned"})
-        self.writes += 1
+        _text.check(body)
+        closing.close(self.gh, self.repo, number, body, "not_planned", said=already_explained)
+        self.writes += 1 if already_explained else 2
         self.say("invariants: closed cleared %s#%d" % (self.repo, number))
         return True
 
@@ -2082,6 +2102,7 @@ class Filer:
         for b in current.values():
             if b.invariant in SETTLES and not b.rolling:
                 self.subjects[b.key] = b.subject
+        self.pending = (len(current), len([k for k in self.subjects if k not in current]))
         if not self.write:
             return
         # Settle first: it closes at most FOLD_MAX issues a pass, and filing

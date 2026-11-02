@@ -94,7 +94,7 @@ class Closes(Case):
         self.assertIn(LABEL, self.fake.names(1))
         self.assertIn("force-close", self.fake.names(1))
         self.assertNotIn("needs:human", self.fake.names(1))
-        said = [c["body"] for c in self.fake.comments[1] if status.is_status(c.get("body"))]
+        said = [c["body"] for c in self.fake.comments[1] if not status.is_status(c.get("body"))]
         self.assertIn("unproven", " ".join(said))
 
     def test_a_neutral_review_check_is_green(self):

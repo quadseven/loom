@@ -41,6 +41,7 @@ from . import brain_hold
 from . import claimed
 from . import claim_referee
 from . import close_audit
+from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
@@ -549,9 +550,9 @@ LANE_MODELS = {
     "claude": CLAUDE_MODELS,
     "anthropic": ["claude*"],
     "openrouter": ["openrouter/*:free"],
-    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS), so a pin to
-    # a low-allowance Go model is never routed to an opencode-go lane.
-    "opencode-go": list(tickets.OPENCODE_GO_MODELS),
+    # Only the allow-listed models (tickets.OPENCODE_GO_MODELS) and free models,
+    # so a pin to a low-allowance Go model is never routed to an opencode-go lane.
+    "opencode-go": list(tickets.OPENCODE_GO_MODELS) + ["opencode-go/*-free"],
     "zen": ["opencode/*-free"],
     "zai": ["zai/glm-4.7-flash", "zai/glm-4.5-flash"],
     "workersai": ["cloudflare-workers-ai/@cf/*"],
@@ -608,6 +609,14 @@ MAX_FIX_BODY = 60000
 # it all stops claiming until the reset.
 BUDGET_FLOOR = 0.15
 PASS_REQUEST_TARGET = 500
+# Requests the invariant filer may spend past the pass target once the
+# check's reads are done (loom#2505). The reads cost 70 to 480 counted
+# requests (warm or cold cache) and end in check-run and pull request
+# list reads the target never stops, so they often finished past it, and
+# the filer then wrote nothing, every such pass. A filer pass measured 45:
+# 35 pull request state reads for the settle step, five writes, the
+# listing. The budget floor still stops writing outright.
+INVARIANT_WRITE_RESERVE = 100
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -2125,6 +2134,8 @@ class Station:
         self._waiting_asks: Optional[Dict[str, List[Dict[str, Any]]]] = None
         self._repo_privacy: Dict[str, Optional[bool]] = {}
         self._invariant_repo = ""
+        # What this pass's invariant check read; empty until its reads are done.
+        self._read_facts = invariants.Facts(now=self.now)
         # The GitHub budget as the last pass left it, and the reset it was
         # last reported low for.
         self._budget: Optional[Dict[str, Any]] = None
@@ -2597,7 +2608,7 @@ class Station:
         name = tickets.ticket_name(repo, number, attempt)
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
-                                    None if fix else self._timedout_branch(comments),
+                                    self._timedout_branch(comments),
                                     notes=tickets.operator_notes(
                                         comments, list(self.s.authors) + list(self.s.briefers)
                                         + list(self.s.owners)),
@@ -5352,6 +5363,7 @@ class Station:
                      self.clean_labels,
                      self.queue_stateless_tickets,
                      self.note_stale_shipped,
+                     self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
@@ -10269,17 +10281,16 @@ class Station:
         if error:
             _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
         try:
-            self._routine(repo, number, "Closed: %s. %s Not verified live; its criteria "
-                          "were not ticked one by one."
-                          % (reason, verify_data.close_facts(branch, pulls, error)))
             # force-close is the close-completeness guard's escape hatch:
             # this close is by rule, not a claim that each box was seen to
             # hold. Without it the guard reopened 46 of 175 such closes,
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": marks})
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                         {"state": "closed", "state_reason": "completed"})
+            closing.close(self.gh, repo, number,
+                          "Closed: %s. %s Not verified live; its criteria were not ticked "
+                          "one by one." % (reason, verify_data.close_facts(branch, pulls, error)),
+                          "completed")
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept + [m for m in marks if m not in kept]})
@@ -11038,8 +11049,8 @@ class Station:
             pacer.wait()
             self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": ticked})
         pacer.wait()
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                     {"state": "closed", "state_reason": "completed"})
+        # Posted above, or by an earlier pass the marker names.
+        closing.close(self.gh, repo, number, comment, "completed", said=True)
         _say("settle-claimed: closed %s#%d, merged as PR %s" % (repo, number, shown))
         return 1
 
@@ -11334,34 +11345,147 @@ class Station:
         checked = state.get("checked")
         if self._num(checked) and 0 <= self.now - checked < invariants.CHECK_EVERY:
             return
+        if self._target_reached():
+            # The step loop stops at the target, so only a step called on its
+            # own gets here; its reads would carry over, so it waits unstamped.
+            _say("invariants: writing off this pass (gate: request target, reached before "
+                 "the reads): %d requests used of the %s target, the check waits for the "
+                 "next pass" % (self._pass_counted(), self.gh.target))
+            return
         state["checked"] = self.now
         # Before the reads: a check they stop waits CHECK_EVERY like any other,
         # rather than costing each pass its 270 requests again (loom#2321).
         invariants.save(path, state)
         goal = self._invariant_goal()
         self._invariant_repo = goal[0] if goal else ""
-        facts = self._invariant_facts(state)
+        filer = self._invariant_filer(state, goal)
+        if filer is not None:
+            filer.settle_early()
+            invariants.save(path, state)
+        try:
+            facts = self._invariant_facts(state)
+        except TargetReached as err:
+            if filer is not None:
+                self._say_writing_off(filer, "request target, during the reads: %s" % err,
+                                      "filing and the rest of the settle step")
+            raise
+        self._read_facts = facts
+        self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
                  "LOOM_INVARIANT_GOAL" % len(breaches))
-        if goal is not None:
-            issues = state.get("issues")
-            if not isinstance(issues, dict):
-                issues = state["issues"] = {}
-            subjects = state.get("subjects")
-            if not isinstance(subjects, dict):
-                subjects = state["subjects"] = {}
-            seen = state.get("seen")
-            if not isinstance(seen, dict):
-                seen = state["seen"] = {}
-            invariants.Filer(self.gh, goal[0], goal[1], issues, self.now, _say,
-                             write=not self._deferred(), authors=self.s.authors,
-                             subjects=subjects, seen=seen,
-                             read=invariants.read_kinds(facts), unread=facts.unread,
-                             settled=lambda inv, subject: self._invariant_settled(
-                                 facts, inv, subject)).run(breaches)
+        if filer is not None:
+            filer.reads(invariants.read_kinds(facts), facts.unread)
+            self._file_invariants(filer, breaches, self._invariant_write_gate())
         invariants.save(path, state)
+
+    def _unstick_lane_pulls(self, facts: invariants.Facts) -> None:
+        """Queue a brain fix round for each stale lane pull request blocked by
+        trusted review threads, then mark it queued in this pass's facts."""
+        if facts.lane_pulls is None:
+            return
+        for index, pull in enumerate(facts.lane_pulls):
+            if (self.now - pull.at <= invariants.PR_STALLED or not pull.drives
+                    or not pull.threads or pull.fix_pending or pull.ticket is None
+                    or "loom:pr" not in pull.labels
+                    or "needs-brain" in pull.labels or "loom:failed" in pull.labels):
+                continue
+            repo, number = self._invariant_ref_parts(pull.pr.key)
+            ticket = self._invariant_ref_parts(pull.ticket.key)
+            if repo is None or ticket is None:
+                continue
+            lane = next((label[5:] for label in pull.labels if label.startswith("lane:")), None)
+            if lane in REMOTE_LANES:
+                continue
+            try:
+                queued = brain.fix(self.gh, repo, number, ticket, factory.FIX_NOTES,
+                                   lane=lane, authors=self.s.authors)
+            except RateLimited:
+                raise
+            except (GitHubError, ValueError) as err:
+                _say("invariants: could not queue a fix round for stalled pull request %s: %s"
+                     % (pull.pr.label, err))
+                continue
+            if queued:
+                facts.lane_pulls[index] = pull._replace(fix_pending=True)
+                _say("invariants: queued a fix round for stalled pull request %s" % pull.pr.label)
+
+    @staticmethod
+    def _invariant_ref_parts(ref: str) -> Optional[Tuple[str, int]]:
+        """The repository and issue number from an invariant ref."""
+        match = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", ref)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2))
+
+    def _invariant_filer(self, state: Dict[str, Any],
+                         goal: Optional[Tuple[str, int]]) -> Optional[invariants.Filer]:
+        """The filer for this check, built before its reads so the settle
+        step runs first (loom#2505); None with no goal home. Its settled
+        callback reads this check's facts once they are read: before, an
+        epic reads as not settled and only a lane pull request can settle."""
+        if goal is None:
+            return None
+        maps = []
+        for name in ("issues", "subjects", "seen"):
+            if not isinstance(state.get(name), dict):
+                state[name] = {}
+            maps.append(state[name])
+        self._read_facts = invariants.Facts(now=self.now)
+        return invariants.Filer(self.gh, goal[0], goal[1], maps[0], self.now, _say,
+                                write=self._invariant_write_gate() is None,
+                                authors=self.s.authors, subjects=maps[1], seen=maps[2],
+                                settled=lambda inv, subject: self._invariant_settled(
+                                    self._read_facts, inv, subject))
+
+    def _pass_counted(self) -> int:
+        """The requests this pass's target counts so far (304s left out)."""
+        counted = getattr(self.gh, "counted", None)
+        if counted is None:
+            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
+        return int(counted)
+
+    def _invariant_write_gate(self) -> Optional[str]:
+        """What keeps this check from writing, or None. The pass target
+        reached during the check's own reads does not (loom#2505): the reads
+        are paid for, and the filer gets INVARIANT_WRITE_RESERVE past them."""
+        low = self.budget_low()
+        if low is not None:
+            resource, remaining, limit, _reset = low
+            return "budget floor, %s %d of %d left" % (resource, remaining, limit)
+        return None
+
+    def _file_invariants(self, filer: invariants.Filer, breaches: List[invariants.Breach],
+                         gate: Optional[str]) -> None:
+        """Run the filer, past the pass target by INVARIANT_WRITE_RESERVE at
+        most, and log one line whenever a gate kept it from writing all it
+        had: the gate, the requests used and the writes skipped (loom#2505:
+        a pass that read everything and wrote nothing said nothing)."""
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if gate is None and has_target:
+            self.gh.target = max(target, self._pass_counted()) + INVARIANT_WRITE_RESERVE
+        filer.write = gate is None
+        try:
+            filer.run(breaches)
+        except TargetReached as err:
+            gate = "request target reserve of %d, %s" % (INVARIANT_WRITE_RESERVE, err)
+        finally:
+            if has_target:
+                self.gh.target = target
+        if gate is not None:
+            breached, gone = filer.pending
+            self._say_writing_off(filer, gate, "%d breach(es) to file or refresh and %d gone "
+                                               "report(s) to settle" % (breached, gone))
+
+    def _say_writing_off(self, filer: invariants.Filer, gate: str, skipped: str) -> None:
+        """The one line a check logs when a gate stops its writing (loom#2505)."""
+        target = getattr(self.gh, "target", None)
+        _say("invariants: writing off this pass (gate: %s): %d requests used of the %s "
+             "target, %d writes made, skipped %s"
+             % (gate, self._pass_counted(), target if target is not None else "no",
+                filer.writes, skipped))
 
     def _invariant_settled(self, facts: invariants.Facts, invariant: str,
                            subject: str) -> Optional[str]:
@@ -11378,9 +11502,11 @@ class Station:
         return None
 
     def _lane_pull_settled(self, repo: str, number: int) -> Optional[str]:
-        """How a lane pull request left the open set, or None while it is open."""
-        if any(isinstance(p, dict) and p.get("number") == number
-               for p in self._pulls.get(repo, [])):
+        """How a lane pull request left the open set, or None while it is open.
+        The settle step runs before the check's reads (loom#2505), so a
+        station repo's open list is read here, once a pass, as they read it."""
+        listed = self._open_pulls(repo) if repo in self.s.repos else self._pulls.get(repo, [])
+        if any(isinstance(p, dict) and p.get("number") == number for p in listed):
             return None
         pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
         if not isinstance(pr, dict) or pr.get("state") != "closed":
@@ -14120,10 +14246,7 @@ class Station:
         target = getattr(self.gh, "target", None)
         if not isinstance(target, int) or isinstance(target, bool):
             return False
-        counted = getattr(self.gh, "counted", None)
-        if counted is None:
-            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
-        return counted >= target
+        return self._pass_counted() >= target
 
     def _deferred(self) -> bool:
         """True when the budget is low or the pass request target has been
@@ -14443,6 +14566,58 @@ class Station:
         finally:
             self._end_pass_locally()
 
+    def compare_send_back_counts(self) -> None:
+        """Run the one seven-day comparison of bus/send_back.py, at most
+        hourly until it is done; it never runs a second time."""
+        from . import send_back
+        repo = send_back.REPO
+        if repo not in self.s.repos:
+            return
+        path = os.path.join(self.state, send_back.STATE_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        checked = saved.get("checked_at")
+        if saved.get("completed") or (isinstance(checked, (int, float))
+                                      and 0 <= self.now - checked < 3600):
+            return
+        landed_at = self._epoch(send_back.LANDED_AT)
+        if not landed_at or self.now < landed_at + send_back.WAIT:
+            _write_json(path, {"checked_at": self.now})
+            return
+        # One repo's trailing week at a time, counted and dropped, so only the
+        # three totals are held across repos.
+        found = {rule: 0 for rule in send_back.RULES}
+        for source in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(source):
+                continue  # Only an owner/name goes into the path, as elsewhere here.
+            week = self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
+                                  % (source, send_back.since(self.now)))
+            for rule, n in send_back.counts(week, self.s.review_bot,
+                                            datetime.fromtimestamp(self.now,
+                                                                   timezone.utc)).items():
+                found[rule] += n
+        _say("send-back comparison for #%d: %s" % (send_back.TICKET, found))
+        reopen = send_back.not_fallen(found)
+        if shadow.active(repo):
+            if reopen:
+                shadow.record_held(shadow.REOPEN, repo, send_back.TICKET, "issue",
+                                   source="seven-day send-back comparison",
+                                   reason="send-back counts have not fallen")
+        else:
+            # The result goes on the ticket either way, so the live box can be
+            # settled from it; only counts that have not fallen reopen.
+            existing = self._paginate("/repos/%s/issues/%d/comments"
+                                      % (repo, send_back.TICKET))
+            reported = any(send_back.MARKER in str(c.get("body") or "") for c in existing
+                           if isinstance(c, dict))
+            report = send_back.report(found)
+            if reopen:
+                # The report says it reopens, so it is the reason (loom#2444).
+                closing.reopen(self.gh, repo, send_back.TICKET, report, said=reported)
+            elif not reported:
+                self._comment(repo, send_back.TICKET, report, "report")
+        _write_json(path, {"completed": True, "compared_at": self.now, "counts": found})
+
     def _end_pass_locally(self) -> None:
         """Local housekeeping that needs no GitHub request: finished lane
         trees, old lane logs, the disk, the usage snapshot and the command
@@ -14452,6 +14627,9 @@ class Station:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
+        self._tend_usage()
+
+    def _tend_usage(self) -> None:
         try:
             records = usage.collect(self.s.home, now=self.now)
             usage.write(self.s.home, records)
@@ -14459,9 +14637,28 @@ class Station:
         except OSError as err:
             _say("could not write usage limits: %s" % err)
         try:
+            self._refresh_model_catalogue()
+        except Exception as err:
+            _say("model catalogue refresh failed: %s" % err)
+        try:
             self.post_chain()
         except OSError as err:
             _say("could not send the command chain snapshot: %s" % err)
+
+    def _refresh_model_catalogue(self) -> None:
+        from . import catalogue
+        cat_file = catalogue.catalogue_file(self.s.home)
+        now = self.now
+        try:
+            mtime = cat_file.stat().st_mtime
+            if now - mtime < catalogue.DISCOVERY_INTERVAL:
+                return
+        except OSError:
+            pass
+        url = os.environ.get("LOOM_OPENCODE_GO_MODELS_URL", catalogue.OPENCODE_GO_MODELS_URL)
+        discovered = catalogue.discover_models(url=url)
+        if discovered:
+            catalogue.save_catalogue(discovered, cat_file)
 
     def tend_runners(self) -> None:
         """The slots in LOOM_RUNNER_SLOTS: dispatch their briefs to cluster

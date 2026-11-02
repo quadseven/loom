@@ -93,6 +93,49 @@ class ShadowHeld(GitHubError, ValueError):
         self.entry = entry or {}
 
 
+def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
+    """Refuse a PATCH that would close an issue as completed while its
+    acceptance criteria are unchecked.
+
+    The brain's close() already refuses this, but a close that bypasses it
+    -- a close five seconds after its PR merged is the shape -- used to land anyway and get reopened by the close-completeness
+    guard seconds later. Every programmatic close passes through rest(),
+    so refusing here makes the bad close impossible instead of merely
+    caught. bus/closing.py asks this too, before it posts the close
+    comment. Closes as not_planned, force-close/wontfix labels, pull
+    requests, and issues with no criteria at all are left alone, matching
+    the guard's own escape hatches.
+    """
+    if method != "PATCH" or not _ISSUE_PATH.match(path):
+        return
+    if not isinstance(body, dict) or body.get("state") != "closed":
+        return
+    if body.get("state_reason", "completed") != "completed":
+        return
+    # Re-entering rest() for the verification GET is safe: the
+    # method != "PATCH" check above stops any recursion. A failed read
+    # raises out of rest() before the PATCH is sent, so the close is
+    # refused; a 2xx read with no issue object in it refuses it too,
+    # rather than reading as an issue with no criteria (loom#656).
+    issue = gh.rest("GET", path).data
+    if not isinstance(issue, dict):
+        raise GitHubError(
+            "refusing to close %s as completed: cannot read the issue to "
+            "check its acceptance criteria" % path)
+    if "pull_request" in issue:
+        return
+    labels = [str(label.get("name") or "").lower()
+              for label in issue.get("labels") or []]
+    if any(name in labels for name in _FORCE_CLOSE_LABELS):
+        return
+    unchecked = [text for checked, text in
+                 proof.criteria(str(issue.get("body") or "")) if not checked]
+    if unchecked:
+        raise ValueError(
+            "refusing to close %s as completed with unchecked acceptance "
+            "criterion: %s" % (path, unchecked[0]))
+
+
 class RateLimited(GitHubError):
     """GitHub refused a call for budget: a 403 or 429 with no requests left in
     the window, or its secondary rate limit. `until` is when the window
@@ -714,7 +757,7 @@ class GitHub:
     def _rest(self, method: str, path: str, body: Any = None,
               etag: Optional[str] = None, ok: Tuple[int, ...] = ()) -> Response:
         acted = self._hold_in_shadow(method, path, body)
-        self._refuse_incomplete_close(method, path, body)
+        refuse_incomplete_close(self, method, path, body)
         url = self._url(path)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
@@ -823,48 +866,6 @@ class GitHub:
             return self._rest("GET", "/repos/%s/issues/%d" % (found.repo, found.number)).data
         except Exception:  # noqa: BLE001 - any failed read holds the action
             return None
-
-    def _refuse_incomplete_close(self, method: str, path: str, body: Any) -> None:
-        """Refuse a PATCH that would close an issue as completed while its
-        acceptance criteria are unchecked.
-
-        The brain's close() already refuses this, but a close that bypasses it
-        -- the conducted#209 close five seconds after its PR merged is the
-        shape -- used to land anyway and get reopened by the close-completeness
-        guard seconds later. Every programmatic close passes through rest(),
-        so refusing here makes the bad close impossible instead of merely
-        caught. Closes as not_planned, force-close/wontfix labels, pull
-        requests, and issues with no criteria at all are left alone, matching
-        the guard's own escape hatches.
-        """
-        if method != "PATCH" or not _ISSUE_PATH.match(path):
-            return
-        if not isinstance(body, dict) or body.get("state") != "closed":
-            return
-        if body.get("state_reason", "completed") != "completed":
-            return
-        # Re-entering rest() for the verification GET is safe: the
-        # method != "PATCH" check above stops any recursion. A failed read
-        # raises out of rest() before the PATCH is sent, so the close is
-        # refused; a 2xx read with no issue object in it refuses it too,
-        # rather than reading as an issue with no criteria (loom#656).
-        issue = self.rest("GET", path).data
-        if not isinstance(issue, dict):
-            raise GitHubError(
-                "refusing to close %s as completed: cannot read the issue to "
-                "check its acceptance criteria" % path)
-        if "pull_request" in issue:
-            return
-        labels = [str(label.get("name") or "").lower()
-                  for label in issue.get("labels") or []]
-        if any(name in labels for name in _FORCE_CLOSE_LABELS):
-            return
-        unchecked = [text for checked, text in
-                     proof.criteria(str(issue.get("body") or "")) if not checked]
-        if unchecked:
-            raise ValueError(
-                "refusing to close %s as completed with unchecked acceptance "
-                "criterion: %s" % (path, unchecked[0]))
 
     def _request(self, body: Any,
                  if_none_match: Optional[str]) -> Tuple[Dict[str, str], Optional[bytes]]:
@@ -1235,6 +1236,37 @@ class GitHub:
             items.extend(self.paginate(nxt))
         return items
 
+    def last_comments(self, repo: str, number: int, count: int, keep: int = 100) -> List[Any]:
+        """The last `keep` comments on issue `number`, oldest first, exactly as
+        GitHub stores them: no status, fix-round or body events (rest() adds
+        those), the same comments a GraphQL `comments(last:keep)` returns.
+
+        `count` is the issue listing's comment count. It picks a page size
+        whose pages hold the last `keep` (_comment_pages): one or two pages,
+        not the whole list, and none at all for an issue with no comments. A
+        comment added since the listing is followed through the last page's
+        next link; one deleted since is made up from the page before. REST
+        answers arrive gzipped, which GraphQL's never do (loom#2464)."""
+        if count <= 0 or keep <= 0:
+            return []
+        size, first, last = _comment_pages(count, keep)
+        base = "/repos/%s/issues/%d/comments?per_page=%d" % (repo, number, size)
+        items: List[Any] = []
+        nxt: Optional[str] = None
+        for page in range(first, last + 1):
+            resp = self._rest("GET", "%s&page=%d" % (base, page))
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while nxt:
+            resp = self._rest("GET", nxt)
+            items.extend(resp.data if isinstance(resp.data, list) else [])
+            nxt = _next_link(resp.headers.get("link", ""))
+        while len(items) < keep and first > 1:
+            first -= 1
+            resp = self._rest("GET", "%s&page=%d" % (base, first))
+            items[:0] = resp.data if isinstance(resp.data, list) else []
+        return items[-keep:]
+
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
         resp = self.rest("POST", "/graphql",
                          {"query": query, "variables": variables or {}})
@@ -1242,6 +1274,28 @@ class GitHub:
         if data.get("errors"):
             raise GitHubError("graphql errors", resp.status, json.dumps(data["errors"]))
         return data.get("data")
+
+
+# GitHub's largest page of comments.
+COMMENT_PAGE = 100
+
+
+def _comment_pages(count: int, keep: int) -> Tuple[int, int, int]:
+    """(page size, first page, last page) that read the last `keep` of
+    `count` comments in as few requests as GitHub's page sizes allow, then
+    with the fewest comments before them: 192 comments read as two pages of
+    92 (pages 2 and 3, comments 92 to 191), not two of 100 that also carry
+    comments 0 to 91. Up to COMMENT_PAGE comments are one page."""
+    if count <= COMMENT_PAGE:
+        return COMMENT_PAGE, 1, 1
+    skip = max(0, count - keep)
+
+    def cost(size: int) -> Tuple[int, int, int]:
+        pages = (count - 1) // size - skip // size + 1
+        return pages, skip % size, -size
+
+    size = min(range(COMMENT_PAGE, 0, -1), key=cost)
+    return size, skip // size + 1, (count - 1) // size + 1
 
 
 def _per_page(url: str) -> int:

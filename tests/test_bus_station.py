@@ -5346,6 +5346,19 @@ class FixTest(Base):
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:running",
                                                "claim:alice-example"])
 
+    def test_a_fix_brief_names_the_kept_branch_from_a_timed_out_attempt(self):
+        side = "loom/12-fix-the-thing-timedout-1760000000"
+        self.fake.add(12)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)",
+                     author="station-example")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        self.comment(12, "Lane codex failed: [work] agent exited 124; the edits are on branch " + side)
+        self.comment(12, FIX_BODY)
+
+        self.run_pass()
+
+        self.assertIn("kept its edits on branch %s" % side, self.claimed_brief())
+
     def test_a_fix_for_a_pull_request_that_merged_is_never_briefed(self):
         # Three fix rounds in two hours were briefed for pull requests that
         # had already merged, one on the claude lane; each ran for nothing
@@ -11306,8 +11319,8 @@ class CloseDoneTest(Base):
         self.assertEqual(self.fake.issues[5]["state_reason"], "completed")
         self.assertIn("force-close", self.fake.names(5))
         self.assertNotIn("force-close", self.fake.names(2))
-        plain = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
-        self.assertEqual(plain, [])
+        (said,) = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
+        self.assertIn("Closed:", said)
 
     def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
         # 2026-10-22: a ticket whose criteria were all host checks closed as
@@ -11332,7 +11345,7 @@ class CloseDoneTest(Base):
 
     def close_text(self, number):
         return "\n".join(c["body"] for c in self.fake.comments[number]
-                         if status.is_status(c.get("body")))
+                         if not status.is_status(c.get("body")))
 
     def test_a_shipped_ticket_with_a_time_window_earlier_than_the_log_start_closes(self):
         # A shipped ticket whose Live line names a time window that ended before
@@ -13452,7 +13465,9 @@ class TwoLoomsTest(Base):
             gh = mock.Mock()
             gh.paginate.return_value = [
                 {"number": 1, "labels": [{"name": "claim:" + self.OTHER}]},
-                {"number": 2, "labels": [{"name": "claim:alice-example"}]}]
+                {"number": 2, "labels": []},
+                {"number": 3, "labels": [{"name": "claim:alice-example"}]}]
+            # An issue claimed by our own operator is left alone too (loom#2143).
             self.assertEqual([i["number"] for i in rewrite.candidates(gh, REPO)], [2])
         self.assertEqual(self.fake.names(100), ["claim:" + self.OTHER])
         self.assertEqual([c for c in self.fake.created

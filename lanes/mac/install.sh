@@ -123,6 +123,21 @@ fi
 BRAIN_INTERVAL="${LOOM_BRAIN_INTERVAL:-1800}"
 [[ "$BRAIN_INTERVAL" =~ ^[0-9]+$ ]] && [ "$BRAIN_INTERVAL" -ge 60 ] ||
   { echo "LOOM_BRAIN_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
+# The brain tick's start minutes past each hour (loom#2469): :25 and :55
+# sit between Muse's :10 and :40 starts (docs/MUSE.md), so the lane
+# machine's tick no longer drifts onto them as a StartInterval did. Empty,
+# the tick runs every LOOM_BRAIN_INTERVAL seconds instead.
+BRAIN_AT="${LOOM_BRAIN_AT-25 55}"
+BRAIN_SCHEDULE="  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>"
+if [ -n "${BRAIN_AT// /}" ]; then
+  BRAIN_SCHEDULE="  <key>StartCalendarInterval</key>"$'\n'"  <array>"
+  for m in $BRAIN_AT; do
+    [[ "$m" =~ ^[0-9]{1,2}$ ]] && [ "$((10#$m))" -le 59 ] ||
+      { echo "LOOM_BRAIN_AT must list minutes past the hour, 0 to 59" >&2; exit 1; }
+    BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"    <dict><key>Minute</key><integer>$((10#$m))</integer></dict>"
+  done
+  BRAIN_SCHEDULE="$BRAIN_SCHEDULE"$'\n'"  </array>"
+fi
 STATION_INTERVAL="${LOOM_STATION_INTERVAL:-60}"
 [[ "$STATION_INTERVAL" =~ ^[0-9]+$ ]] && [ "$STATION_INTERVAL" -ge 60 ] ||
   { echo "LOOM_STATION_INTERVAL must be a number of seconds, at least 60" >&2; exit 1; }
@@ -502,8 +517,9 @@ wait_job_gone "gui/$(id -u)/$LABEL"
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "installed $LABEL -> lanes/mac/station.sh (deploys main, then python3 -m bus station; idle unless LOOM_REPOS is set)"
 
-# The brain tick (lanes/mac/brain.sh): every LOOM_BRAIN_INTERVAL seconds
-# (default 1800), take the brain lock and run one docs/MUSE.md tick on the
+# The brain tick (lanes/mac/brain.sh): at LOOM_BRAIN_AT minutes past each
+# hour (default 25 and 55), or every LOOM_BRAIN_INTERVAL seconds (default
+# 1800) with LOOM_BRAIN_AT empty, take the brain lock and run one docs/MUSE.md tick on the
 # first lane in LOOM_BRAIN_LADDER (default claude codex spark) that has
 # usage. It reads LOOM_REPOS, LOOM_STATUS_REPO, LOOM_BRIEF_AUTHORS,
 # LOOM_TRUSTED_BRIEFERS, LOOM_ASK_ANSWERERS,
@@ -539,7 +555,7 @@ else
     <string>/bin/bash</string>
     <string>$X_REPO/lanes/mac/brain.sh</string>
   </array>
-  <key>StartInterval</key><integer>$BRAIN_INTERVAL</integer>
+$BRAIN_SCHEDULE
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$X_LOOM/logs/brain-service.log</string>
   <key>StandardErrorPath</key><string>$X_LOOM/logs/brain-service.log</string>

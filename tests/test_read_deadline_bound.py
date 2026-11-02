@@ -147,7 +147,7 @@ CHILD = textwrap.dedent("""
     from test_read_deadline_bound import _routes
     routes = Routes(_routes())
     def transport(method, url, headers, body):
-        if "/repos/%%s/issues/2/sub_issues" %% REPO2 in url:
+        if url.endswith("/graphql") and b"second-repo" in body and b"subIssues" in body:
             threading.Event().wait(%(blocked)r)
         return routes(method, url, headers, body)
     with mock.patch.object(brain, "GitHub", lambda *a, **kw: GitHub("t", transport=transport)), \\

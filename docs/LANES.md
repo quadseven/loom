@@ -35,6 +35,14 @@ complexity 15, no swallowed errors, no dead code, docs in step, ASCII
 only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
+Before pushing to a private repository, the lane runner runs the same scanner
+with `--personal-data`, which refuses only real mail and street addresses. The
+household values are deny-list terms, and no marker waives them. The scanner's
+`--diff` reads each commit's patch and message too, since a value added and then
+removed passes a net diff and still goes up in history. The pull
+request body on a private repo is scanned before the push. Repaired PR text,
+review replies and ticket answers pass the personal data scan before they post.
+
 Before pushing a branch or opening a pull request on a public repository, the
 lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
@@ -225,7 +233,15 @@ comment) carry `live-cluster check could not run: <reason>`.
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
-`lanes/mac/brain.sh` every `LOOM_BRAIN_INTERVAL` seconds (default 1800). A
+`lanes/mac/brain.sh` at `LOOM_BRAIN_AT` minutes past each hour (default
+`25 55`), or every `LOOM_BRAIN_INTERVAL` seconds (default 1800) with
+`LOOM_BRAIN_AT` empty. Those starts sit between Muse's :10 and :40 ticks, and
+the tick's lock expires by the next minute in `LOOM_BRAIN_YIELD_AT` (default
+`10 40`, Muse's starts; empty for no bound), with its agent cut off 2 minutes
+before that, so no lane machine hold spans a Muse tick's start (loom#2469).
+A tick with under 6 minutes left before that start skips. The bounded length
+goes on the tick record (`bus.brain step lock --tick-minutes`), so the tick
+clock and its budget read it. A
 tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
 `$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
@@ -553,9 +569,11 @@ ticket climbs, and past the last rung it is left `loom:failed` for the brain. It
 open lane pull request is closed then, or on any later pass, as is one whose
 open ticket was rewritten as a newer ticket, each with one comment naming the
 ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
-keeps the default branch green: a ready pull request that is behind its base
-is brought up to date first (GitHub's update-branch) and lands only after its
-checks and review pass again on the new head; each repo lands at most one a
+keeps the default branch green: a ready pull request behind its base lands as
+it stands when GitHub reports it mergeable and no rule on the base requires
+up-to-date branches; any other is brought up to date first (GitHub's
+update-branch) and lands only after its checks and review pass again on the
+new head; each repo lands at most one a
 pass, `loom:urgent` and `loom:regression` tickets first, then by their
 ticket's `Priority:`, then the oldest. A pull request whose only
 fault is a failed Actions job gets that job run once more before it is sent
@@ -1350,11 +1368,15 @@ checks, the goal shapes) leaves its tracking issue as it is, and so does a
 pass that could not read one repo's open pull requests for that repo's
 lane-pr-stalled issue: the other repos' issues still update. Closing it rather than leaving it
 open keeps an empty list from holding a goal out of quiet (docs/BRAIN.md).
+When a trusted lane pull request has been open past the six-hour limit, its
+ticket is still at `loom:pr`, and trusted review threads remain without a
+pending fix round, the station queues `bus.brain fix` on the ticket and returns
+it to its lane. Tickets awaiting brain review or past the model ladder remain
+on their existing path.
 The per-violation issues these kinds filed before this close into the
 tracking issue of their kind and their own subject repo as the station meets
-them: closed as not planned with no comment, their note at the foot of the
-body, and a running count in one comment on the tracking issue, edited in
-place (a comment on each would mail everyone watching). The subject comes from
+them: closed as not planned with a comment saying why, and a running count in
+one comment on the tracking issue, edited in place. The subject comes from
 the station's map, else the `subject=` of the issue's marker, else a reference
 in its text, and only one that hashes back to the key counts. The marker names
 a subject only where the breach's public text already does, so a private repo
@@ -1391,7 +1413,7 @@ A per-violation `lane-pr-stalled` or `epic-over-cap` issue filed before
 loom#2099 whose subject settled for good
 (its pull request merged or was closed unmerged, its epic is back at the
 cap) closes on the first pass the breach is gone, whatever labels it carries
-(not a `loom:ticket`), with one note in its body naming how; these closes
+(not a `loom:ticket`), with one comment naming how; these closes
 come before the other clears, read no comments (loom#2022), and walk the
 issue listing rather than the local map, so one filed before the map or gone
 while the station was down settles too (loom#2257). Other cleared issues
