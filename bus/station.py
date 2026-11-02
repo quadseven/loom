@@ -14400,6 +14400,8 @@ class Station:
         # three totals are held across repos.
         found = {rule: 0 for rule in send_back.RULES}
         for source in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(source):
+                continue  # Only an owner/name goes into the path, as elsewhere here.
             week = self._paginate("/repos/%s/pulls/comments?since=%s&per_page=100"
                                   % (source, send_back.since(self.now)))
             for rule, n in send_back.counts(week, self.s.review_bot,

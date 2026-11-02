@@ -51,7 +51,7 @@ def counts(comments: Iterable[Mapping[str, Any]], bot: str, now: datetime) -> Di
 
 def not_fallen(found: Mapping[str, int]) -> bool:
     """Whether any rule has not fallen below its count at filing. A rule the
-    mapping lacks reads as no findings."""
+    mapping lacks reads as a count of zero, which has fallen."""
     return any(found.get(rule, 0) >= FILED_COUNTS[rule] for rule in RULES)
 
 

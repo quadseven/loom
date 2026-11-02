@@ -68,6 +68,7 @@ class StationStepTest(unittest.TestCase):
         self.findings = [finding("weakened-test")] * 18
         self.shadow = False
         self.repos = [send_back.REPO]
+        self.by_repo = {}
 
     def run_step(self, now=NOW):
         st = station.Station.__new__(station.Station)
@@ -79,7 +80,8 @@ class StationStepTest(unittest.TestCase):
 
         def pages(path):
             if "/pulls/comments" in path:
-                return self.findings
+                return self.by_repo.get(path.split("/")[2] + "/" + path.split("/")[3],
+                                        self.findings)
             return [{"body": c[2]} for c in self.posted] if "/comments" in path else []
         st._paginate = pages
         with mock.patch.object(station.shadow, "active", return_value=self.shadow):
@@ -126,10 +128,14 @@ class StationStepTest(unittest.TestCase):
                                      reason="send-back counts have not fallen")
 
     def test_counts_add_up_across_the_served_repos(self):
-        self.repos = [send_back.REPO, "example-owner/sample"]
-        self.findings = [finding("weakened-test")] * 9
+        self.repos = [send_back.REPO, "example-owner/sample", "not a repo?x=1"]
+        self.by_repo = {send_back.REPO: [finding("weakened-test")] * 10,
+                        "example-owner/sample": [finding("weakened-test")] * 8
+                        + [finding("intent-mismatch")] * 2}
+        self.findings = [finding("weakened-test")] * 50  # what an unvetted path would read
         self.run_step()
-        self.assertIn("weakened-test: 18 (was 18)", self.posted[0][2])
+        self.assertIn("weakened-test: 18 (was 18), intent-mismatch: 2 (was 13)",
+                      self.posted[0][2])
         self.assertEqual(self.patched[0][2], {"state": "open"})
 
     def test_a_station_not_serving_the_home_repo_never_runs_it(self):
