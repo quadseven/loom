@@ -3821,8 +3821,19 @@ def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = No
     if issue is not None and (_is_epic(issue) or any(
             name.startswith("wayfinder:") for name in _labels(issue))):
         return None
-    if any(_CHECKBOX.match(line)
-           for line in _body_sections(body).get("acceptance criteria", [])):
+    criteria = _body_sections(body).get("acceptance criteria", [])
+    if any(_CHECKBOX.match(line) for line in criteria):
+        for line in criteria:
+            criterion = _CHECKBOX.sub("", line, count=1)
+            kept = re.search(r"\b(?:still|keeps?|unchanged|continues?|no longer regresses)\b",
+                             criterion, re.I)
+            requests_test = re.search(r"\b(?:test|tests)\b", criterion, re.I)
+            names_test = re.search(r"\btests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py\b",
+                                   criterion)
+            if kept and requests_test and not names_test:
+                return ("kept behaviour criteria that ask for a test must name the existing "
+                        "test path under tests/; otherwise reword the criterion as a "
+                        "behaviour change whose test fails on main")
         return None
     return ("the body has no acceptance criteria: add an ## Acceptance criteria section "
             "with at least one - [ ] checkbox, so a lane has something to prove. The draft "
