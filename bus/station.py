@@ -5214,10 +5214,13 @@ class Station:
             return
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
-        closed = self.gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated"
-                              "&direction=desc&per_page=100" % repo).data
-        for pr in closed if isinstance(closed, list) else []:
-            if isinstance(pr, dict) and pr.get("state") == "closed":
+        # Fetch ALL closed PRs (paginated). The reconcile window uses only the
+        # first 100 (most recently updated); _clear_pull_gone uses the full
+        # list to find merged PRs beyond the 100-item window.
+        all_closed = self._paginate("/repos/%s/pulls?state=closed&sort=updated"
+                                    "&direction=desc&per_page=100" % repo)
+        closed = all_closed[:100] if isinstance(all_closed, list) else []
+        for pr in closed:
                 merged = self._terminal_label(pr) == "loom:merged"
                 pool = tickets_by_number if merged else waiting
                 landed = [other for other in closed if other is not pr and isinstance(other, dict)
@@ -5257,13 +5260,16 @@ class Station:
                         if "loom:merged" in _label_names(ticket):
                             _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
         for number, ticket in tickets_by_number.items():
-            self._clear_pull_gone(repo, number, ticket, open_prs)
+            self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
     def _clear_pull_gone(self, repo: str, number: int, ticket: Dict[str, Any],
-                         open_prs: List[Dict[str, Any]]) -> None:
+                         open_prs: List[Dict[str, Any]],
+                         closed_prs: List[Dict[str, Any]]) -> None:
         """A ticket cannot hold loom:pr with no open pull request: it goes
         back to the queue for a lane (loom#2333). Reconcile, above, has moved
-        every ticket whose pull request closed in the window it reads."""
+        every ticket whose pull request closed in the window it reads. If a
+        merged pull request covering the ticket exists but fell outside that
+        window, move the ticket to loom:merged instead of requeueing."""
         names = _label_names(ticket)
         allowed = {a.lower() for a in self.s.authors}
         if ("loom:pr" not in names
@@ -5273,6 +5279,25 @@ class Station:
                 or self._owned_elsewhere(repo, ticket)):
             return
         timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        merged_pr = self._find_merged_covering_pr(timeline, repo, ticket, allowed)
+        if merged_pr is None:
+            # Timeline didn't have it; check all closed PRs (paginated beyond 100)
+            merged_pr = self._find_merged_covering_pr_in_closed(closed_prs, repo, ticket, allowed)
+        if merged_pr is not None:
+            pr_number = int(merged_pr["number"])
+            merged_at = merged_pr.get("merged_at")
+            states = {"loom:" + state for state in brain.STATES}
+            kept = self._drop_claim(n for n in names if n not in states
+                                    and not n.startswith(("lane:", WAIT)))
+            kept.append("loom:merged")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+            ticket["labels"] = [{"name": name} for name in kept]
+            self._routine(repo, number,
+                          "Pull request #%d merged at %s and covers this ticket, "
+                          "so it moved to loom:merged." % (pr_number, merged_at))
+            _say("%s#%d: loom:pr with merged covering pull request #%d, moved to loom:merged"
+                 % (repo, number, pr_number))
+            return
         if not tickets.pull_gone(timeline, repo, number, self.now, self.s.authors):
             return
         states = {"loom:" + state for state in brain.STATES}
@@ -5284,6 +5309,48 @@ class Station:
         self._routine(repo, number, "No open pull request carries this ticket, so it left "
                       "loom:pr and is back at loom:queued.")
         _say("%s#%d: loom:pr with no open pull request, requeued" % (repo, number))
+
+    def _find_merged_covering_pr_in_closed(self, closed_prs: List[Dict[str, Any]],
+                                            repo: str, ticket: Dict[str, Any],
+                                            allowed: Set[str]) -> Optional[Dict[str, Any]]:
+        """Find a merged pull request in the given closed PRs that covers the ticket.
+        Returns the pull request dict or None."""
+        for pr in closed_prs:
+            if not isinstance(pr, dict):
+                continue
+            if pr.get("state") != "closed":
+                continue
+            merged_at = pr.get("merged_at")
+            if not merged_at:
+                continue
+            if tickets._login(pr.get("user")) not in allowed:
+                continue
+            if _covers_pr(ticket, repo, pr):
+                return pr
+        return None
+
+    def _find_merged_covering_pr(self, timeline: List[Dict[str, Any]], repo: str,
+                                  ticket: Dict[str, Any], allowed: Set[str]) -> Optional[Dict[str, Any]]:
+        """Find a merged pull request in the timeline that covers the ticket.
+        Returns the pull request dict or None."""
+        events = [e for e in timeline if isinstance(e, dict)]
+        for event in events:
+            if event.get("event") != "cross-referenced":
+                continue
+            source = event.get("source") if isinstance(event.get("source"), dict) else {}
+            pull = source.get("issue") if isinstance(source.get("issue"), dict) else {}
+            if not isinstance(pull, dict) or "pull_request" not in pull:
+                continue
+            if tickets._login(pull.get("user")) not in allowed:
+                continue
+            if pull.get("state") != "closed":
+                continue
+            merged_at = str((pull.get("pull_request") or {}).get("merged_at") or "")
+            if not merged_at:
+                continue
+            if _covers_pr(ticket, repo, pull):
+                return pull
+        return None
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
