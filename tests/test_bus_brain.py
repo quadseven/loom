@@ -3885,6 +3885,12 @@ class Routes:
             return reply(200, [])
         if path.startswith("/repos/%s/issues?" % REPO):
             return self._issue_page(path)
+        # Handle individual issue GET requests (e.g., /repos/.../issues/3)
+        if path.startswith("/repos/%s/issues/" % REPO) and not path.endswith("/sub_issues"):
+            issue_num = int(path.split("/issues/")[1].split("/")[0])
+            for issue in self.issues:
+                if issue["number"] == issue_num:
+                    return reply(200, issue)
         if path.startswith("/search/issues?") and self.search is not None:
             return reply(200, {"items": self.search})
         return None
@@ -3922,6 +3928,9 @@ INTAKE = 3
 class TriageTests(unittest.TestCase):
     def run_triage(self, routes, limit=25):
         # The goal's intake epic is #3 (intake_epic has its own tests).
+        # Include the epic issue in the mock so open_epic can read it.
+        epic = item(INTAKE, labels=["epic"], body="Done when: done.\n\nSize: S\n\nPart of #1\n")
+        routes.issues.insert(0, epic)
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
             return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
@@ -5550,7 +5559,8 @@ class MoveFromGoalTests(unittest.TestCase):
         return [c for c in calls if c[0] == "POST" and c[1].endswith("/sub_issues")]
 
     def test_triage_moves_a_direct_child_of_the_goal_under_the_intake_epic(self):
-        routes = Routes([item(5, parent_issue_url=self.GOAL_URL)])
+        routes = Routes([item(INTAKE, labels=["epic"], body="Done when: done.\n\nSize: S\n\nPart of #1\n"),
+                         item(5, parent_issue_url=self.GOAL_URL)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
             brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
@@ -5558,7 +5568,8 @@ class MoveFromGoalTests(unittest.TestCase):
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
     def test_triage_files_a_ready_area_issue_under_its_area_epic(self):
-        routes = Routes([item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
+        routes = Routes([item(70, labels=["epic"], body="Done when: done.\n\nSize: S\n\nPart of #1\n"),
+                         item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
         areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
         with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
                 unittest.mock.patch.object(brain, "intake_epic", return_value=70) as epic:
@@ -5571,7 +5582,8 @@ class MoveFromGoalTests(unittest.TestCase):
 
     def test_triage_does_not_take_an_issue_out_of_another_parent(self):
         other = "https://api.github.com/repos/%s/issues/77" % REPO
-        routes = Routes([item(5, parent_issue_url=other), item(6)])
+        routes = Routes([item(INTAKE, labels=["epic"], body="Done when: done.\n\nSize: S\n\nPart of #1\n"),
+                         item(5, parent_issue_url=other), item(6)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
             brain.triage(GitHub("t", transport=routes), REPO, 1, 25)

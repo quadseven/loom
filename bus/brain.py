@@ -2903,9 +2903,13 @@ def placement_epic(gh: GitHub, repo: str, named: int, room: int = 1) -> int:
             if standing or repairs_batch(issue):
                 # A full repairs epic: the repair goes to a batch with room.
                 return repairs_epic(gh, repo, parent, room, full=(number,))
-            return intake_epic(gh, repo, parent, room, exclude=(number,))
+            epic = intake_epic(gh, repo, parent, room, exclude=(number,))
+            open_epic(gh, repo, epic)
+            return epic
         if "loom:goal" in _labels(issue):
-            return intake_epic(gh, repo, number, room)
+            epic = intake_epic(gh, repo, number, room)
+            open_epic(gh, repo, epic)
+            return epic
         parent = _issue_goal(issue)
         if parent is None:
             break
@@ -3036,6 +3040,7 @@ def place_under_epic(gh: GitHub, repo: str, issue: Dict[str, Any]) -> int:
     if goal is None:
         raise ValueError("%s has no open goal home to put the ticket under" % repo)
     epic = intake_epic(gh, repo, goal)
+    open_epic(gh, repo, epic)
     file_under_epic(gh, repo, epic, issue)
     return epic
 
@@ -3421,6 +3426,7 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     else:
         if epic is None:
             epic = intake_epic(gh, repo, goal)
+            open_epic(gh, repo, epic)
         made = _file_ticket(gh, repo, epic, title, _with_part_of(full_body, epic),
                             lane, [REGRESSION])
     if why is not None:
@@ -3599,6 +3605,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
         epic = intake_epic(gh, repo, goal)
+        open_epic(gh, repo, epic)
     if source is not None:
         # A rewrite's draft may carry its own Part of line naming another
         # issue (loom#2033); the ticket names the epic it is filed under.
@@ -3998,9 +4005,11 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             area = _ticket_area(areas, issue)
             if area:
                 found = intake_epic(gh, repo, goal, area=area)
+                open_epic(gh, repo, found)
                 intake = (found, 0)
             elif intake is None or intake[1] >= EPIC_TICKET_CAP:
                 found = intake_epic(gh, repo, goal)
+                open_epic(gh, repo, found)
                 intake = (found, len(_epic_tickets(gh, repo, found)))
             if not _link_to_goal(gh, repo, intake[0], issue, under=goal):
                 # GitHub refused the sub-issue link: the Part of line links it
