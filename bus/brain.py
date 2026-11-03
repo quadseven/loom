@@ -5173,9 +5173,9 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
     and moves it on, and the next merge sees it unresolved. The refusal
     leaves a marker comment on the pull request, and the error the journal
     prints carries the same reason, thread and head (loom#2179). Returns the
-    ids of the resolved threads whose answer held: such a finding needs no
-    fix commit to stop holding the merge (merge_tier.blocking_findings,
-    loom#2285)."""
+    ids of the resolved threads the station marked held for this head on a
+    minor finding (_station_held, loom#2519); merge_tier.blocking_findings
+    still blocks a high, critical or bad-work finding among them."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
@@ -5189,9 +5189,20 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
             raise ValueError("review thread %s was resolved on a lane answer that does not "
                              "hold on the head: %s (rebuttal-refused thread=%s head=%s)"
                              % (thread.get("id"), why, thread.get("id"), head))
-        if thread.get("id") and _answered(thread, bot, trusted):
+        if thread.get("id") and _station_held(thread, head, bot, trusted):
             held.add(str(thread["id"]))
     return held
+
+
+def _station_held(thread: Dict[str, Any], head: str, bot: str, trusted: set) -> bool:
+    """An answered thread the station itself settled for this head: its
+    latest reply carries the station's held mark for `head`, and the finding
+    is one the station may settle (factory._bot_minor). An answer that merely
+    holds on the head is not the station's verdict (loom#2519)."""
+    from . import factory  # factory imports this module
+    return (_answered(thread, bot, trusted)
+            and rebuttal.marked_held(str(_first(thread, "latest", -1).get("body") or ""), head)
+            and factory._bot_minor(_first(thread, "comments", 0), bot))
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the

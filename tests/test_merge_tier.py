@@ -189,17 +189,23 @@ class Findings(unittest.TestCase):
         self.assertEqual(merge_tier.blocking_findings([deferred, fixed], HEAD_AT, by_bot),
                          ["medium dead-code"])
 
-    def test_a_resolved_finding_whose_answer_held_on_the_head_does_not_block(self):
-        # loom#2285: the lane answered a false finding, the station verified
-        # the answer on the head and resolved the thread; no commit follows.
-        answered = dict(thread(self.DEAD, resolved=True, created="2030-01-02T11:00:00Z"), id="T1")
-        self.assertEqual(merge_tier.blocking_findings([answered], HEAD_AT, by_bot,
-                                                      held={"T1"}), [])
-        self.assertEqual(merge_tier.blocking_findings([answered], HEAD_AT, by_bot,
-                                                      held={"T2"}), ["medium dead-code"])
-        opened = dict(answered, isResolved=False)
-        self.assertEqual(merge_tier.blocking_findings([opened], HEAD_AT, by_bot, held={"T1"}),
-                         ["medium dead-code"])
+    def test_an_answered_high_or_bad_work_finding_blocks_even_when_held(self):
+        """loom#2519 acceptance: a resolved high or bad-work finding whose
+        thread is in `held` still blocks the merge with no fix commit after
+        it. An answer the station held no longer stands in for the fix, so
+        this replaces the #2285 tests that pinned the opposite,
+        `test_a_resolved_finding_whose_answer_held_on_the_head_does_not_block`
+        and `test_a_finding_answered_and_held_on_the_head_does_not_hold_the_merge`."""
+        for body, want in ((self.INTENT, "high intent-mismatch"),
+                           (self.DEAD, "medium dead-code")):
+            with self.subTest(want=want):
+                answered = dict(thread(body, resolved=True, created="2030-01-02T11:00:00Z"),
+                                id="T1")
+                self.assertEqual(merge_tier.blocking_findings([answered], HEAD_AT, by_bot,
+                                                              held={"T1"}), [want])
+                opened = dict(answered, isResolved=False)
+                self.assertEqual(merge_tier.blocking_findings([opened], HEAD_AT, by_bot,
+                                                              held={"T1"}), [want])
 
     def test_a_base_merge_after_the_finding_is_not_a_fix(self):
         # loom#2285: an update-branch merge is newer than the finding but
@@ -376,10 +382,11 @@ class BrainMerge(unittest.TestCase):
                     latest={"nodes": [{"author": {"__typename": "Bot", "login": "loom-station"},
                                        "body": reply}]})
 
-    def test_a_finding_answered_and_held_on_the_head_does_not_hold_the_merge(self):
+    def test_a_bad_work_finding_answered_and_held_on_the_head_still_holds_the_merge(self):
+        # loom#2519: an answer stands in for no fix commit on a bad-work finding.
         fake, refused = self.merge(files=APP_CHANGE, threads=[self.answered("Fixed in abc1234")])
-        self.assertEqual(refused, "")
-        self.assertTrue(self.merged(fake))
+        self.assertIn("open review findings hold the merge: medium dead-code", refused)
+        self.assertFalse(self.merged(fake))
 
     def test_a_base_merge_after_a_finding_does_not_release_it(self):
         found = thread(Findings.DEAD, resolved=True, created="2030-01-02T09:00:00Z")

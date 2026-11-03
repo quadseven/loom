@@ -245,6 +245,32 @@ class BrainMergeGate(unittest.TestCase):
                                                       REPO, NUMBER, data, ENV), {"PRRT_1"})
         self.assertEqual(transport.calls, [])
 
+    HIGH = ("high | _correctness_ | `intent-mismatch` | medium\n\n"
+            "No acceptance criterion is met.")
+
+    def held_ids(self, data):
+        return brain._refuse_unheld_answers(GitHub("t", transport=Transport(ancestors={"abc1234"})),
+                                            REPO, NUMBER, data, ENV)
+
+    def test_only_a_minor_finding_marked_held_for_this_head_is_exempt(self):
+        # loom#2519: an answer that merely holds is not the station's verdict;
+        # only its mark for this head, on a finding it may settle, exempts.
+        self.assertEqual(self.held_ids(details("Fixed in abc1234\n" + rebuttal.held_marker(HEAD))),
+                         {"PRRT_1"})
+        self.assertEqual(self.held_ids(details("Fixed in abc1234\n"
+                                               + rebuttal.held_marker("e" * 40))), set())
+        self.assertEqual(self.held_ids(details("Fixed in abc1234")), set())
+
+    def test_an_answered_high_finding_is_never_exempt(self):
+        data = details("Fixed in abc1234\n" + rebuttal.held_marker(HEAD), finding=self.HIGH)
+        self.assertEqual(self.held_ids(data), set())
+
+    def test_a_finding_from_a_person_with_the_bots_login_is_never_exempt(self):
+        data = details("Fixed in abc1234\n" + rebuttal.held_marker(HEAD))
+        data["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]["author"] = {
+            "__typename": "User", "login": "grug-tribe"}
+        self.assertEqual(self.held_ids(data), set())
+
     def test_a_held_mark_for_another_head_is_checked_again_on_this_one(self):
         with self.assertRaisesRegex(ValueError, "cites no file, line or symbol"):
             self.gate(Transport(), details(self.redacted_reply("e" * 40)))
