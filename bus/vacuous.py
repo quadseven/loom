@@ -102,33 +102,60 @@ def container_lookup_overrides(source: str, patch: str = "") -> List[str]:
     return sorted(found)
 
 
-def _changed_identifiers(patch: str) -> Set[str]:
-    changed = set()
-    lines = patch.splitlines()
-    for index, line in enumerate(lines):
-        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
+def _changed_identifiers(source: str, patch: str) -> Set[str]:
+    """Return changed names declared at module or non-test class scope."""
+    changed_lines = _added_lines(patch)
+    tree = ast.parse(source)
+    changed: Set[str] = set()
+    if not changed_lines or 0 in changed_lines:
+        for line in patch.splitlines():
+            if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+                continue
+            match = re.match(r"[+-](?:async\s+def|def)\s+([A-Za-z_]\w*)", line)
+            if not match:
+                match = re.match(r"[+-]([A-Za-z_]\w*)\s*(?::[^=]+)?=", line)
+            if match and not match.group(1).startswith("test"):
+                changed.add(match.group(1))
+
+    def target_names(target: ast.expr) -> Set[str]:
+        if isinstance(target, ast.Name):
+            return {target.id}
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return set().union(*(target_names(item) for item in target.elts))
+        return set()
+
+    def declaration_names(node: ast.stmt) -> Set[str]:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            return {node.name} if not node.name.startswith("test") else set()
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            return set().union(*(target_names(item) for item in targets))
+        return set()
+
+    for node in tree.body:
+        is_test_class = isinstance(node, ast.ClassDef) and any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name.startswith("test") for member in node.body)
+        if (not is_test_class and any(
+                node.lineno <= line <= getattr(node, "end_lineno", node.lineno)
+                for line in changed_lines)):
+            changed.update(declaration_names(node))
+        if not isinstance(node, ast.ClassDef):
             continue
-        text = line[1:]
-        match = re.match(r"\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", text)
-        if not match:
-            match = re.match(r"\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=", text)
-        if match:
-            changed.add(match.group(1))
-        if line[0] in "+-":
-            for context in reversed(lines[max(0, index - 8):index]):
-                if context.startswith("@@"):
-                    break
-                if context.startswith(" "):
-                    assignment = re.match(r"\s+([A-Za-z_]\w*)\s*=\s*[\[{(]", context)
-                    if assignment:
-                        changed.add(assignment.group(1))
-                        break
+        is_test_class = any(isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and member.name.startswith("test") for member in node.body)
+        if is_test_class:
+            continue
+        for member in node.body:
+            if any(member.lineno <= line <= getattr(member, "end_lineno", member.lineno)
+                   for line in changed_lines):
+                changed.update(declaration_names(member))
     return changed
 
 
 def fixture_users(test_source: str, patch: str) -> List[str]:
     """Tests whose source references a fixture or table changed in the patch."""
-    changed = _changed_identifiers(patch)
+    changed = _changed_identifiers(test_source, patch)
     if not changed:
         return []
     tree = ast.parse(test_source)
