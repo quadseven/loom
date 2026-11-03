@@ -442,6 +442,47 @@ class RunnersTest(unittest.TestCase):
         self.runner().tend()
         self.assertEqual(len(self.gh.posts("/dispatches")), sent)
 
+    MISSING = [{"phase": "baseline", "exit": 127, "revision": "aaa", "ok": False},
+               {"phase": "baseline", "exit": 127, "revision": "aaa", "ok": False}]
+
+    def test_a_check_the_runner_cannot_run_stays_stopped_when_the_head_moves(self):
+        # Exit 127 is a tool missing from the runner image (run_lane.sh calls
+        # 125-127 "validation environment unavailable"): a new commit on the
+        # repo cannot install it, so the stop holds until the image changes.
+        self.gh.heads["owner/app"] = "aaa"
+        self.run_base("owner.app-1", self.MISSING)
+        self.gh.heads["owner/app"] = "bbb"
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-2")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent)
+        line = self.failure_line("owner.app-2")
+        self.assertIn("[transient]", line)
+        self.assertIn("cannot run", line)
+
+    def test_a_new_runner_image_lifts_a_stop_for_a_check_it_cannot_run(self):
+        self.gh.heads["owner/app"] = "aaa"
+        self.public["owner/other"] = True
+        self.run_base("owner.app-1", self.MISSING, image="image-a")
+        self.gh.heads["owner/app"] = "bbb"
+        self.run_other_repo(image="image-b")
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-3")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent + 1)
+
+    def test_a_check_the_runner_cannot_run_is_tried_again_after_a_day(self):
+        # A sole stopped repo stops every run, so no report could show a new
+        # image: the day probe still applies.
+        self.gh.heads["owner/app"] = "aaa"
+        self.run_base("owner.app-1", self.MISSING)
+        self.gh.heads["owner/app"] = "bbb"
+        self.now += runners.IMAGE_PROBE + 1
+        sent = len(self.gh.posts("/dispatches"))
+        self.drop_brief(name="owner.app-2")
+        self.runner().tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), sent + 1)
+
     def test_a_stop_compares_the_briefs_own_base_branch(self):
         self.gh.heads["owner/app"] = "zzz"
         self.gh.refs["release"] = "aaa"
