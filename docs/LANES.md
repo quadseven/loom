@@ -256,7 +256,12 @@ tick takes the brain lock in `LOOM_STATUS_REPO` (a held lock ends the tick
 before any model call), updates its own clone of this repo under
 `$LOOM_HOME/brain`, runs an agent CLI on docs/MUSE.md with a hard stop of
 `LOOM_BRAIN_MINUTES` (default 40), and releases the lock, also after a
-failure. It logs to
+failure. Before the unlock it retires the roll trees ticks leave in
+`$LOOM_HOME/brain/work` (`python3 -m bus.brain_trees prune`, loom#2438): a
+tree whose work landed on the default branch goes, every other tree is kept
+and named in the log with its reason, and of the idle trees with commits on
+no remote the newest 8 are kept, older ones saved to a git bundle in
+`$LOOM_HOME/brain/retired` (kept 30 days) and removed. It logs to
 `$LOOM_HOME/logs/brain.log`. `LOOM_BRAIN=0` at install removes it. A live tick waits up to `LOOM_BRAIN_WAIT` minutes (default 25) for a lock another brain holds, because it is the only tick that ships. With
 `LOOM_BRAIN_SCOPE=live` the tick does only the work that needs the cluster
 (ships and rolls, checks that need cluster or database access) and leaves the
@@ -526,10 +531,16 @@ A fix brief may answer a finding instead of fixing it: the agent writes the
 reason to `.loom-answers/<thread id>.md`, the runner moves that folder out of
 the tree (never committed; links dropped unread), and the station posts each
 answer as the reply on its thread, redacted and text-checked. The station
+refuses an answer unposted when the pull request has moved past the head the
+round recorded beside its answers (its own push counts), and keeps each
+finding's state (pending, picked up, answered) at that head in
+`state/fix-findings.json` (bus/fixrounds.py). A re-sent answer posts no second
+reply. The station
 resolves the thread only when the round ran on a ladder model, the thread
 is the review bot's own medium or low finding, and the answer holds on the
 pull request head (bus/rebuttal.py, loom#2081): "Fixed in <sha>" names the
-head or one of its ancestors (any case), or the answer cites files and lines
+head or one of its ancestors (any case) and that commit touches the thread's
+file, or the answer cites files and lines
 the head has and, when it names backticked symbols, at least one of them is
 there, every "`f` is called by `g`" claim is a real call there,
 and a dead-code finding's symbol has a call. An answer that cites nothing

@@ -403,6 +403,25 @@ rule merge cannot check (`... rule merge cannot check: <rule>`), or an
 unreadable goal home (`goal home unreadable`) is a blocker, so status never
 says READY for a pull request merge would refuse on these rules.
 
+### Ticket hold boxes
+
+`bus.brain merge` reads the pull request's ticket and every ticket its body
+names with `Refs` or `Part of`, and refuses while one has an unticked
+hold-before-merge box (loom#2392). The shared merge gate's ticket-holds row
+reads boxes the same way (`bus/hold_boxes.py`):
+
+- An explicit hold always holds: "keep this PR blocked", "do not merge",
+  "decides to merge".
+- A box that says "before ... merge" holds, unless it is about after-merge
+  or live proof: it opens with `Live:`, or says "after the deploy", "after
+  the rollout" or "after merge".
+
+Epics are skipped: their boxes are their children. A ticket that cannot be
+read fails closed (`OWNER/NAME#N unreadable`). The refusal names the ticket
+and the box (`blocked: OWNER/NAME#N unticked hold-before-merge box '...'`),
+and `bus.brain status` shows the same blocker instead of READY. Tick the box
+once its proof is in, then merge.
+
 ## Onboarding a repo
 
 `python3 -m bus.brain onboard <owner/name> [--review-check NAME] [--operator LOGIN]` readies a
@@ -836,7 +855,14 @@ event; if the log covers less than the box needs, it stays on `loom:awaiting-evi
 A lane proof passed the shape check, which cannot tell evidence a lane read
 from evidence a weak model wrote to look complete. So each tick audits one:
 `resume` lists the oldest verified ticket whose newest proof a lane made in
-the last 24 hours and no audit has judged, as a `resume audit` item. Re-read
+the last 24 hours and no audit has judged, as a `resume audit` item. Read
+the proof whole first; a comment read clipped to a few hundred characters
+loses the criteria and evidence past the cut:
+
+    python3 -m bus.brain proof OWNER/NAME#N
+
+It prints the newest proof a trusted login posted, with who posted it, when,
+the lane that made it and its link, then the body with nothing cut. Re-read
 each criterion's evidence yourself (the logs, endpoints or pages the proof
 names), then record the result:
 
@@ -1133,7 +1159,8 @@ the sandboxed agent to answer every review thread it lists: one entry per
 thread in `.loom/replies.json` (thread id, reply text, and a resolve boolean,
 true when the round fixed it, false with a concrete reason when it declines),
 or an answer file in `.loom-answers/`. The runner posts valid entries after a
-successful push and resolves those marked true; missing or invalid files
+successful push, skips a reply the thread already holds, and resolves those
+marked true only when the round's commits change the thread's file; missing or invalid files
 produce no replies. A listed thread left with neither is named in the log and
 in the round comment on the pull request ("Review threads this round left
 without a reply"). An entry

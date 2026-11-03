@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, hold_boxes, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -731,6 +731,18 @@ def _foreign_criteria_reason(body: str, repo: str,
     return ""
 
 
+def _hold_box_reason(gh: GitHub, repo: str, pr: Dict[str, Any],
+                     ticket: Optional[Tuple[str, int]], issue: Dict[str, Any]) -> str:
+    """Block while the pull request's ticket, or one its body names with Refs
+    or Part of, has an unticked hold-before-merge box (loom#2392). `issue` is
+    the ticket already read; any other read that fails fails closed."""
+    def read(ref: Tuple[str, int]) -> Dict[str, Any]:
+        return gh.rest("GET", "/repos/%s/issues/%d" % ref).data or {}
+    own = [ticket] if ticket is not None else []
+    known = {ticket: issue} if ticket is not None else {}
+    return hold_boxes.refusal(str(pr.get("body") or ""), repo, read, known, own)
+
+
 def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
     return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
 
@@ -1111,6 +1123,9 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
             reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
         if reason:
             found.append(reason)
+    held = _hold_box_reason(gh, repo, pr, ticket, issue)
+    if held:
+        found.append(held.removeprefix("blocked: "))
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
@@ -4624,7 +4639,8 @@ def merge(gh: GitHub, repo: str, number: int,
                                              already_done.base_reader(gh, repo, pr))
             if unproven:
                 raise ValueError("blocked: no code on the base backs: " + "; ".join(unproven))
-        reason = _foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+        reason = (_foreign_criteria_reason(str(pr.get("body") or ""), repo, env)
+                  or _hold_box_reason(gh, repo, pr, association, issue))
         if reason:
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
@@ -5157,9 +5173,9 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
     and moves it on, and the next merge sees it unresolved. The refusal
     leaves a marker comment on the pull request, and the error the journal
     prints carries the same reason, thread and head (loom#2179). Returns the
-    ids of the resolved threads whose answer held: such a finding needs no
-    fix commit to stop holding the merge (merge_tier.blocking_findings,
-    loom#2285)."""
+    ids of the resolved threads the station marked held for this head on a
+    minor finding (_station_held, loom#2519); merge_tier.blocking_findings
+    still blocks a high, critical or bad-work finding among them."""
     from . import factory  # factory imports this module
     bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
@@ -5173,9 +5189,20 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
             raise ValueError("review thread %s was resolved on a lane answer that does not "
                              "hold on the head: %s (rebuttal-refused thread=%s head=%s)"
                              % (thread.get("id"), why, thread.get("id"), head))
-        if thread.get("id") and _answered(thread, bot, trusted):
+        if thread.get("id") and _station_held(thread, head, bot, trusted):
             held.add(str(thread["id"]))
     return held
+
+
+def _station_held(thread: Dict[str, Any], head: str, bot: str, trusted: set) -> bool:
+    """An answered thread the station itself settled for this head: its
+    latest reply carries the station's held mark for `head`, and the finding
+    is one the station may settle (factory._bot_minor). An answer that merely
+    holds on the head is not the station's verdict (loom#2519)."""
+    from . import factory  # factory imports this module
+    return (_answered(thread, bot, trusted)
+            and rebuttal.marked_held(str(_first(thread, "latest", -1).get("body") or ""), head)
+            and factory._bot_minor(_first(thread, "comments", 0), bot))
 
 
 # A sensitive change (bus/change_class.py) is never merged by the factory; the
@@ -5432,7 +5459,7 @@ def writer_login(gh: Any, env: Optional[Dict[str, str]] = None) -> str:
 
 # Brain commands outside the lock check: reads, and `step`, whose tick
 # record only the lock's holder may write (tick_step checks it).
-READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step")
+READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step", "proof")
 
 
 def check_acting_brain(gh: Any, lock_repo: str, env: Optional[Dict[str, str]] = None,
@@ -5721,6 +5748,23 @@ def _audit_comment(result: str, record: Dict[str, Any], note: str) -> str:
     return ("%s\nAudit: the brain re-read the evidence of %s and it does not hold: %s\n\n"
             "The ticket is back to shipped, and lane %s takes no verify run for %d hours." % (
                 audit.marker(result, lane), made, note, lane, audit.HOLD // 3600))
+
+
+def proof_text(gh: GitHub, repo: str, number: int, env: Optional[Dict[str, str]] = None) -> str:
+    """The ticket's newest trusted proof comment, whole: a head line naming
+    who posted it, when, which lane made it and its link, then the body with
+    nothing cut. A proof audit re-reads every criterion's evidence, so a read
+    clipped to a few hundred characters cannot audit it."""
+    found = audit.newest(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                         trusted_authors(env))
+    if found is None:
+        raise ValueError("%s#%d has no proof from a trusted login (LOOM_BRIEF_AUTHORS)"
+                         % (repo, number))
+    comment, record = found
+    head = "proof on %s#%d by %s at %s, verified_by `%s`: %s" % (
+        repo, number, comment_login(comment) or "unknown", comment.get("created_at") or "unknown",
+        _one_line(record.get("verified_by"), 120) or "unknown", comment.get("html_url") or "no link")
+    return head + "\n\n" + str(comment.get("body") or "")
 
 
 def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
@@ -6727,11 +6771,12 @@ def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     due = sorted(due, key=lambda x: (x[0], x[1], int(x[2]["number"])))
     out = ["", "## Lane proof audit (one a tick, oldest first)"]
     for posted, repo, issue, record in due[:1]:
-        out.append("- resume audit %s#%s proof by `%s` %dh ago: re-read each criterion's "
-                   "evidence, then run python3 -m bus.brain audit %s#%s --result pass|fail "
-                   "--note TEXT" % (
+        out.append("- resume audit %s#%s proof by `%s` %dh ago: read the whole proof with "
+                   "python3 -m bus.brain proof %s#%s, re-read each criterion's evidence, then run "
+                   "python3 -m bus.brain audit %s#%s --result pass|fail --note TEXT" % (
                        repo, issue["number"], _one_line(record.get("verified_by"), 120),
-                       max(0, int(now.timestamp() - posted) // 3600), repo, issue["number"]))
+                       max(0, int(now.timestamp() - posted) // 3600), repo, issue["number"],
+                       repo, issue["number"]))
     return out if due else out + ["- none"]
 
 
@@ -7710,6 +7755,7 @@ def parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
+    pf = sub.add_parser("proof", help="print a ticket's newest trusted proof comment whole, for a proof audit"); pf.add_argument("ticket")
     ac = sub.add_parser("audit-close", help="the facts a close audit line carries: cited hash, merge commit, on the default branch or not; exit 0 only when sound"); ac.add_argument("ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
@@ -7817,6 +7863,11 @@ def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
     print(audit_proof(gh, repo, number, args.result, args.note))
 
 
+def _cmd_proof(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    print(proof_text(gh, repo, number))
+
+
 def _cmd_audit_close(gh: GitHub, args: argparse.Namespace) -> int:
     """Print what git holds for a ticket's close (bus/close_audit.py)."""
     repo, number = _ref(args.ticket, "ticket")
@@ -7914,6 +7965,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize, "live": _cmd_live,
             "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
+            "proof": _cmd_proof,
             "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,

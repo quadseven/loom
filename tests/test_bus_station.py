@@ -110,6 +110,10 @@ class FakeGitHub:
         self.carried = set()
         self.check_runs_status = 200
         self.head_files = {}
+        # Commit sha -> the files it changed, for a "Fixed in <sha>" answer.
+        self.commit_files = {}
+        # (thread id, cursor) -> the page of replies before that cursor.
+        self.older_replies = {}
         # Strings a code search of the repo finds nothing for (bus/unmeetable.py);
         # every other search finds one file.
         self.code_absent = set()
@@ -232,6 +236,10 @@ class FakeGitHub:
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
             return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
+        changed = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, parts.path)
+        if method == "GET" and changed and changed.group(1) in self.commit_files:
+            return reply(200, {"sha": changed.group(1).ljust(40, "0"),
+                               "files": [{"filename": f} for f in self.commit_files[changed.group(1)]]})
         other = re.match(r"/repos/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/issues/(\d+)$", parts.path)
         if other and other.group(1) != REPO:
             found = self.foreign.get((other.group(1), int(other.group(2))))
@@ -438,6 +446,10 @@ class FakeGitHub:
         if "resolveReviewThread" in query:
             self.resolved.append(variables["id"])
             return reply(200, {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}})
+        if "PullRequestReviewThread" in query and "before" in variables:
+            # An earlier page of a thread's replies, keyed by its cursor.
+            page = self.older_replies.get((variables["id"], variables["before"]))
+            return reply(200, {"data": {"node": {"replies": page}}})
         if "PullRequestReviewThread" in query:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         editor = self.editors[data["variables"]["number"]]
@@ -4144,6 +4156,28 @@ class FixRoundsInPlaceTest(unittest.TestCase):
                 "comments": {"nodes": [{"databaseId": 9, "body": "change this",
                                          "author": {"login": "grug-tribe[bot]"}}]}}
 
+    def test_finding_revision_protocol_requires_pickup_and_cited_commit(self):
+        finding = {"id": "PRRT_1", "path": "a.py", "revision": "a" * 40,
+                   "state": "pending"}
+        picked = fixrounds.transition_finding(finding, "picked_up", "a" * 40,
+                                               "a" * 40)
+        self.assertEqual(picked["state"], "picked_up")
+        self.assertEqual(fixrounds.transition_finding(picked, "picked_up", "a" * 40,
+                                                       "a" * 40), picked)
+        stale = fixrounds.transition_finding(picked, "answered", "b" * 40,
+                                              "b" * 40, "c" * 40, ["a.py"])
+        self.assertIsNone(stale)
+        wrong_file = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                   "a" * 40, "c" * 40, ["other.py"])
+        self.assertIsNone(wrong_file)
+        answered = fixrounds.transition_finding(picked, "answered", "a" * 40,
+                                                 "a" * 40, "c" * 40, ["a.py"])
+        self.assertEqual(answered["state"], "answered")
+        self.assertEqual(fixrounds.transition_finding(answered, "answered", "a" * 40,
+                                                       "a" * 40, "c" * 40, ["a.py"]), answered)
+        self.assertEqual(fixrounds.transition_finding(answered, "picked_up", "a" * 40,
+                                                       "a" * 40), answered)
+
     def lane_pushes(self, sha):
         """The lane claimed the round, ran it and pushed: the ticket is back
         at loom:pr."""
@@ -4560,6 +4594,35 @@ class PassBudgetTest(Base):
             self.run_pass()
             later.assert_not_called()
             self.assertGreater(self.rotation(), 0)
+            self.run_pass()
+        later.assert_called_once()
+
+    def test_the_note_pass_runs_every_pass_while_a_step_holds_the_rotation(self):
+        # loom#2092: on 2026-11-02 one step carried over at the request
+        # target pass after pass, holding the rotation on itself for hours,
+        # and seven shipped tickets crossed 24h with no note because the
+        # note pass never came round. It runs every pass, outside the
+        # rotation; its own stamp keeps it to one run per VERIFY_NOTE_EVERY.
+        def carried(_station):
+            raise TargetReached("other read carried over at request target")
+
+        notes = mock.Mock(__name__="note_stale_shipped")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "roll_source_pins", carried), \
+                mock.patch.object(station.Station, "note_stale_shipped", notes):
+            self.run_pass()
+            self.run_pass()
+        self.assertEqual(self.rotation(), 0, "the carried step still holds the rotation")
+        self.assertEqual(notes.call_count, 2)
+
+    def test_a_note_pass_that_fails_does_not_stop_the_step_loop(self):
+        def limited(_station):
+            raise RateLimited("GET /repos/x/issues -> 403", 403, "", 0)
+
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        with mock.patch.object(station.Station, "note_stale_shipped", limited), \
+                mock.patch.object(station.Station, "release_factory_held", later):
             self.run_pass()
         later.assert_called_once()
 
@@ -7837,7 +7900,12 @@ class AnswerTest(Base):
             "comments": {"nodes": [{"author": author,
                                     "body": "%s | _correctness_ | `%s`\n\nx" % (severity, kind)}]}}
 
-    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX):
+    def finding(self, tid="PRRT_abcd1", head="f" * 40):
+        return fixrounds.load_findings(fixrounds.findings_path(self.home))[
+            fixrounds.finding_key(tid, head)]
+
+    def finish(self, answers, model="claude-opus-5-5", kind="done", fix_body=THREAD_FIX,
+               head="f" * 40):
         body = BODY.replace("Model: model-x", "Model: " + model)
         self.fake.add(12, state="running", body=body)
         self.fake.comments[99] = []
@@ -7847,6 +7915,8 @@ class AnswerTest(Base):
         self.write(self.inbox("codex", kind, name + ".md"), brief)
         for tid, text in answers.items():
             self.write(self.inbox("codex", "answers", name, tid + ".md"), text)
+        if answers and head:
+            self.write(self.inbox("codex", "answers", name, ".head"), head + "\n")
         if kind == "failed":
             self.write(os.path.join(self.home, "logs", "codex", name + ".log"),
                        "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing\n")
@@ -7930,8 +8000,71 @@ class AnswerTest(Base):
     def test_a_fixed_in_answer_resolves_only_for_a_commit_on_the_head(self):
         self.thread()
         self.fake.carried.add("abc1234")
+        self.fake.commit_files["abc1234"] = ["a.py"]
         self.finish({"PRRT_abcd1": "Fixed in abc1234"})
         self.assertEqual(self.fake.resolved, ["PRRT_abcd1"])
+
+    def test_a_fixed_in_answer_whose_commit_skips_the_cited_file_stays_open(self):
+        self.thread()
+        self.fake.carried.add("abc1234")
+        self.fake.commit_files["abc1234"] = ["other.py"]
+        self.finish({"PRRT_abcd1": "Fixed in abc1234"})
+        self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
+        self.assertEqual(self.finding()["state"], "picked_up")
+
+    def test_an_answer_against_an_older_head_is_rejected(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."}, head="e" * 40)
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_a_fix_round_that_recorded_no_head_is_rejected(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."}, head="")
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], []))
+
+    def test_an_accepted_answer_is_recorded_as_answered_at_its_revision(self):
+        self.thread()
+        self.finish({"PRRT_abcd1": "The guard on a.py:2 returns."})
+        found = self.finding()
+        self.assertEqual((found["state"], found["revision"], found["path"]),
+                         ("answered", "f" * 40, "a.py"))
+
+    def test_resending_an_answer_never_duplicates_its_reply(self):
+        self.thread()
+        said = "The guard on a.py:2 returns."
+        name = self.finish({"PRRT_abcd1": said})
+        posted = self.fake.replies[0][1]
+        self.fake.threads["PRRT_abcd1"]["replies"] = {"nodes": [{"body": posted}]}
+        self.fake.replies.clear()
+        self.fake.resolved.clear()
+        # The report ran twice: the same answers come round again.
+        self.write(self.inbox("codex", "answers", name, "PRRT_abcd1.md"), said)
+        self.write(self.inbox("codex", "answers", name, ".head"), "f" * 40)
+        brief = "Model: claude-opus-5-5\n" + THREAD_FIX
+        station.Station(GitHub("token", transport=self.fake), self.settings)._post_answers(
+            REPO, 99, "codex", name, brief)
+        self.assertEqual((self.fake.replies, self.fake.resolved), ([], ["PRRT_abcd1"]))
+        self.assertEqual(self.finding()["state"], "answered")
+
+    def test_a_resent_answer_is_found_on_an_earlier_page_of_replies(self):
+        self.thread()
+        said = "The guard on a.py:2 returns."
+        name = self.finish({"PRRT_abcd1": said})
+        posted = self.fake.replies[0][1]
+        # The first reply now sits a page back, behind a full page of others.
+        self.fake.threads["PRRT_abcd1"]["replies"] = {
+            "pageInfo": {"hasPreviousPage": True, "startCursor": "c1"},
+            "nodes": [{"body": "later %d" % i} for i in range(100)]}
+        self.fake.older_replies[("PRRT_abcd1", "c1")] = {
+            "pageInfo": {"hasPreviousPage": False, "startCursor": "c0"},
+            "nodes": [{"body": posted}]}
+        self.fake.replies.clear()
+        self.write(self.inbox("codex", "answers", name, "PRRT_abcd1.md"), said)
+        self.write(self.inbox("codex", "answers", name, ".head"), "f" * 40)
+        brief = "Model: claude-opus-5-5\n" + THREAD_FIX
+        station.Station(GitHub("token", transport=self.fake), self.settings)._post_answers(
+            REPO, 99, "codex", name, brief)
+        self.assertEqual(self.fake.replies, [])
 
     def test_a_fixed_in_answer_naming_a_foreign_commit_stays_open(self):
         self.thread()
@@ -12649,6 +12782,39 @@ class VerifyNoteTest(Base):
         for n in (4, 5, 6):
             self.assertEqual(self.notes(n), [], "ticket %d" % n)
             self.assertEqual(self.fake.comments[n], [], "ticket %d" % n)
+
+    def test_a_held_rotation_still_leaves_every_overdue_ticket_noted_or_attempted(self):
+        # loom#2092 box 1 end to end: more overdue shipped tickets than the
+        # reserved lane can reach, and the step rotation held on a step that
+        # carries over each pass (2026-11-02). After one real pass every
+        # overdue ticket has a note or an attempt on the ledger.
+        def carried(_station):
+            raise TargetReached("other read carried over at request target")
+
+        self.write(os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE),
+                   json.dumps({"next": 0}))
+        with mock.patch.object(station.Station, "roll_source_pins", carried):
+            self.run_pass()
+        with open(os.path.join(self.home, "state", "station", station.VERIFY_FILE)) as fh:
+            attempted = json.load(fh)
+        unreached = [n for n in (1, 2, 3, 4, 6) if "%s#%d" % (REPO, n) not in attempted]
+        # The reserved lane reaches at most one more; the notes cover the rest.
+        self.assertGreaterEqual(len(unreached), 2)
+        for n in unreached:
+            self.assertEqual(len(self.notes(n)), 1, "ticket %d" % n)
+        self.assertEqual(self.notes(5), [])
+
+    def test_a_ticket_inside_the_last_hour_before_24h_is_noted(self):
+        # The pass runs at most once a VERIFY_NOTE_EVERY and passes come
+        # minutes apart, so a ticket noted only from 24h would sit past the
+        # mark unnoted until the next run. It is noted an hour early.
+        self.fake.add(8, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(23.5))
+        self.fake.add(9, lane="codex", body=SHIPPED_BODY, state="shipped",
+                      events=shipped_at(22))
+        self.station().note_stale_shipped()
+        self.assertEqual(len(self.notes(8)), 1)
+        self.assertEqual(self.notes(9), [])
 
     def test_the_note_is_one_comment_edited_in_place(self):
         st = self.station()
