@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -416,6 +417,36 @@ class HandoffCommandTest(unittest.TestCase):
         with self.assertRaises(OSError) as ctx:
             brain_memory.fetch_handoff("http://dashboard.example.com/x?key=Q", "TOKEN")
         self.assertNotIn("dashboard", str(ctx.exception))
+
+
+class FetchProxyTest(unittest.TestCase):
+    """A dashboard read goes through the proxy it is given, and only that one."""
+
+    def test_the_opener_for_a_proxy_routes_through_it_and_never_redirects(self):
+        opener = brain_memory.opener_for("http://proxy.example.test:3130")
+        proxies = [h.proxies for h in opener.handlers
+                   if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertEqual(proxies, [{"https": "http://proxy.example.test:3130",
+                                    "http": "http://proxy.example.test:3130"}])
+        self.assertTrue(any(isinstance(h, brain_memory._NoRedirect) for h in opener.handlers))
+
+    def test_no_proxy_keeps_the_shared_opener(self):
+        self.assertIs(brain_memory.opener_for(""), brain_memory._OPENER)
+
+    def test_fetch_json_uses_the_proxied_opener(self):
+        resp = mock.MagicMock()
+        resp.status = 200
+        resp.read.return_value = b'{"readings": []}'
+        resp.__enter__.return_value = resp
+        fake = mock.Mock()
+        fake.open.return_value = resp
+        with mock.patch.object(brain_memory, "opener_for", return_value=fake) as made, \
+                mock.patch.object(brain_memory._OPENER, "open") as shared:
+            result = brain_memory.fetch_json("https://dashboard.example.com/api/usage", "TOKEN",
+                                             "usage", "http://proxy.example.test:3130")
+        self.assertEqual(result, {"readings": []})
+        made.assert_called_once_with("http://proxy.example.test:3130")
+        shared.assert_not_called()
 
 
 class FetchRetryTest(unittest.TestCase):

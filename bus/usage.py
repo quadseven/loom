@@ -593,13 +593,14 @@ def _live_token(env: Dict[str, str]) -> str:
     return station.read_ssm(ssm, env.get("LOOM_AWS_REGION", "").strip() or "us-east-1")
 
 
-def fetch_live(url: str, token: str) -> Dict[str, Any]:
+def fetch_live(url: str, token: str, proxy: str = "") -> Dict[str, Any]:
     from .brain_memory import fetch_json
-    return fetch_json(url, token, "usage")
+    return fetch_json(url, token, "usage", proxy)
 
 
 def _live(env: Dict[str, str], now: float) -> int:
     url = live_url(env)
+    proxy = env.get("LOOM_TAILNET_PROXY", "").strip()
     if not url:
         print("the live usage read needs LOOM_TRANSCRIPT_URL (the dashboard) and "
               "LOOM_HANDOFF_TOKEN or LOOM_TRANSCRIPT_TOKEN_SSM", file=sys.stderr)
@@ -610,10 +611,14 @@ def _live(env: Dict[str, str], now: float) -> int:
             print("the live usage read needs LOOM_HANDOFF_TOKEN or LOOM_TRANSCRIPT_TOKEN_SSM",
                   file=sys.stderr)
             return 1
-        packet = fetch_live(url, token)
-    # The fetch's errors never carry the URL or the token.
+        # The dashboard is tailnet-only: a remote brain reads it through its
+        # tailnet proxy, like its other tailnet reads (docs/MUSE.md).
+        packet = fetch_live(url, token, proxy=proxy)
+    # The fetch's errors never carry the URL, the proxy or the token.
     except OSError as err:
-        print("could not read the live usage snapshot: %s" % err, file=sys.stderr)
+        print("could not read the live usage snapshot: %s%s" % (err, "" if proxy else (
+            "; the dashboard is tailnet-only, so off the tailnet set LOOM_TAILNET_PROXY "
+            "to the tailnet proxy for this read")), file=sys.stderr)
         return 1
     except subprocess.SubprocessError as err:
         print("could not read the dashboard token (%s)" % type(err).__name__, file=sys.stderr)
@@ -637,7 +642,8 @@ def main(argv: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None,
          now: Optional[float] = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m bus.usage")
     parser.add_argument("--live", action="store_true",
-                        help="print the station's live snapshot from the dashboard (GET /api/usage)")
+                        help="print the station's live snapshot from the dashboard (GET /api/usage), "
+                             "through LOOM_TAILNET_PROXY when it is set")
     args = parser.parse_args(argv)
     env = dict(os.environ if env is None else env)
     now = time.time() if now is None else now
