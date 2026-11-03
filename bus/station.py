@@ -12022,6 +12022,7 @@ class Station:
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
+                           ("headerless", self._invariant_headerless),
                            ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
@@ -12147,6 +12148,35 @@ class Station:
                 if repo not in self._publics:
                     self._publics[repo] = self._public(repo)
                 out.append((ref, factory.tier_lanes(issue, not self._publics[repo])))
+        return out
+
+    def _invariant_headerless(self) -> List[invariants.Ref]:
+        """Each open ticket carrying loom:queued and a lane: label whose body
+        parses to no brief headers: no lane can claim such a ticket, so the
+        invariant pass names it instead of the claim path rejecting it
+        silently. A body the parser refuses (ValueError) is unreadable, not
+        headerless. The read is the narrow loom:queued list, not the full
+        loom:ticket list _invariant_queued pays for only when a held lane
+        needs it: the queued set is small, so naming stranded tickets every
+        pass does not make every pass pay the all-tickets read."""
+        out: List[invariants.Ref] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            for issue in self._paginate("/repos/%s/issues?labels=loom:queued&state=open" % repo):
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                names = _label_names(issue)
+                if ("loom:ticket" not in names or "loom:queued" not in names
+                        or not any(n.startswith("lane:") for n in names)):
+                    continue
+                try:
+                    headers = tickets.parse(issue.get("body"))[0]
+                except ValueError:
+                    continue
+                if headers:
+                    continue
+                out.append(self._invariant_ref(repo, int(issue["number"])))
         return out
 
     def _invariant_checks(self) -> List[invariants.Check]:
