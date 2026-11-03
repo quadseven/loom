@@ -4719,11 +4719,11 @@ class PassBudgetTest(Base):
             self.run_pass()
         later.assert_called_once()
 
-    def test_the_note_pass_runs_every_pass_while_a_step_holds_the_rotation(self):
-        # loom#2092: on 2026-11-02 one step carried over at the request
-        # target pass after pass, holding the rotation on itself for hours,
-        # and seven shipped tickets crossed 24h with no note because the
-        # note pass never came round. It runs every pass, outside the
+    def test_the_note_pass_runs_every_pass_while_a_step_repeats_a_carry_over(self):
+        # loom#2092: one step carried over at the request target pass after
+        # pass, holding the rotation on itself for hours, and seven shipped
+        # tickets crossed 24h with no note because the note pass never came
+        # round. It runs every pass, outside the
         # rotation; its own stamp keeps it to one run per VERIFY_NOTE_EVERY.
         def carried(_station):
             raise TargetReached("other read carried over at request target")
@@ -4734,8 +4734,25 @@ class PassBudgetTest(Base):
                 mock.patch.object(station.Station, "note_stale_shipped", notes):
             self.run_pass()
             self.run_pass()
-        self.assertEqual(self.rotation(), 0, "the carried step still holds the rotation")
+        self.assertEqual(self.rotation(), 0, "the rotation completes after skipping the carried step")
         self.assertEqual(notes.call_count, 2)
+
+    def test_a_repeated_target_carry_over_skips_the_step_and_continues(self):
+        def carried(_station):
+            raise TargetReached("read carried over at request target")
+
+        carried.__name__ = "roll_source_pins"
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        err = io.StringIO()
+        with mock.patch.object(station.Station, "roll_source_pins", carried), \
+                mock.patch.object(station.Station, "release_factory_held", later), \
+                contextlib.redirect_stderr(err):
+            self.run_pass()
+            later.assert_not_called()
+            self.run_pass()
+        later.assert_called_once()
+        self.assertIn("step roll_source_pins skipped after repeated carry-over", err.getvalue())
 
     def test_a_note_pass_that_fails_does_not_stop_the_step_loop(self):
         def limited(_station):
