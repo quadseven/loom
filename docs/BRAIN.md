@@ -1595,6 +1595,18 @@ misread answer never stands a brain down against itself (loom#2275). The
 tick expires it when done. The lock lasts `--minutes`
 (default 15); Muse takes 30 for its 25-minute tick. `--wait N` tries again
 each minute for up to N minutes while a peer holds it.
+
+Every write to the lock branch after it is created (a tick step appended to
+the tick record, the release that expires it) is a compare-and-swap, never a
+forced update (loom#2558). The writer builds its commit on the head it read
+and moves the branch with a non-forced ref update, which GitHub refuses when
+that commit does not descend from the branch head. GitHub can serve a lock
+head two step commits old (loom#2555), so a forced write on such a read would
+drop the newer step commits. On a refusal the writer waits 2, 4, then 8
+seconds, reading the branch again and building on the newer head each time;
+if every read stays old it writes nothing and fails with an error naming the
+head it read and the head the branch is at (`lock.write_branch`,
+`LockHeadMoved` in bus/lock.py).
 `python3 -m bus lock <owner/name> --holder <name>` and `python3 -m bus unlock
 <owner/name> --holder <name>` do this (exit 0 when the caller holds the lock,
 1 when a peer does). The lock line always names the holder: `lock acquired:
