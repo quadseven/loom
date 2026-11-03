@@ -444,7 +444,10 @@ through `resume`.
 
 Usage figures for a journal come from the station's live snapshot:
 `python3 -m bus.usage --live` (the dashboard's `GET /api/usage`, with the
-same read-only token). Plain `python3 -m bus.usage` reads the lane machine's
+same read-only token). The dashboard is tailnet-only, so run it with
+`LOOM_TAILNET_PROXY` set to the tailnet proxy for that one command, as the
+product reads do; without it the read goes through the shell's own proxy
+and fails to connect. Plain `python3 -m bus.usage` reads the lane machine's
 own files and, on this VM, says it is not the lane machine instead.
 
 ## Tick
