@@ -12783,6 +12783,27 @@ class VerifyNoteTest(Base):
             self.assertEqual(self.notes(n), [], "ticket %d" % n)
             self.assertEqual(self.fake.comments[n], [], "ticket %d" % n)
 
+    def test_a_held_rotation_still_leaves_every_overdue_ticket_noted_or_attempted(self):
+        # loom#2092 box 1 end to end: more overdue shipped tickets than the
+        # reserved lane can reach, and the step rotation held on a step that
+        # carries over each pass (2026-11-02). After one real pass every
+        # overdue ticket has a note or an attempt on the ledger.
+        def carried(_station):
+            raise TargetReached("other read carried over at request target")
+
+        self.write(os.path.join(self.home, "state", "station", station.STEP_ROTATION_FILE),
+                   json.dumps({"next": 0}))
+        with mock.patch.object(station.Station, "roll_source_pins", carried):
+            self.run_pass()
+        with open(os.path.join(self.home, "state", "station", station.VERIFY_FILE)) as fh:
+            attempted = json.load(fh)
+        unreached = [n for n in (1, 2, 3, 4, 6) if "%s#%d" % (REPO, n) not in attempted]
+        # The reserved lane reaches at most one more; the notes cover the rest.
+        self.assertGreaterEqual(len(unreached), 2)
+        for n in unreached:
+            self.assertEqual(len(self.notes(n)), 1, "ticket %d" % n)
+        self.assertEqual(self.notes(5), [])
+
     def test_a_ticket_inside_the_last_hour_before_24h_is_noted(self):
         # The pass runs at most once a VERIFY_NOTE_EVERY and passes come
         # minutes apart, so a ticket noted only from 24h would sit past the
