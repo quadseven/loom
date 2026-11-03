@@ -103,6 +103,12 @@ TICK_STEPS = ("lock", "status", "merge", "verify", "failed", "asks", "brief", "t
               "journal", "unlock")
 RUNAWAY = "loom:runaway"
 STEP_MARKER = "loom:tick="
+# Waits, in seconds, between fresh reads of the tick record when the sweep
+# guard reads a step before triage (loom#2555). A read of the lock branch
+# just after a step wrote it can answer an older head, so the record looks
+# a step or two behind; it never looks ahead. Bounded: a sweep that really
+# comes before triage is refused within about 45 seconds.
+SWEEP_REREAD_WAITS = (3.0, 6.0, 12.0, 24.0)
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 # A lane table older than this many seconds is republished by the station on
 # its next pass, and called stale by status. Passes came 7 to 12 minutes apart
@@ -6382,6 +6388,45 @@ def _step_record(message: str) -> Dict[str, Any]:
     return record
 
 
+def _too_early_for_sweep(record: Dict[str, Any]) -> bool:
+    """Whether the record is at a step before triage (or at none): the one
+    refusal a stale read of the lock branch can cause."""
+    step = record.get("step")
+    if step not in TICK_STEPS:
+        return True
+    return TICK_STEPS.index(step) < TICK_STEPS.index(sweep.SWEEP_FROM[0])
+
+
+def _read_tick(gh: GitHub, lock_repo: str) -> Tuple[Optional[str], Dict[str, Any], str, Any]:
+    """(the lock head sha or None, its tick record, its message, the commit
+    answer or None) as the lock branch reads now."""
+    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
+    ref = gh.rest("GET", ref_path, ok=(404,))
+    if ref.status == 404:
+        return None, _step_record(""), "", None
+    sha = ref.data["object"]["sha"]
+    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
+    if commit.status == 404:
+        return None, _step_record(""), "", None
+    message = str(commit.data.get("message") or "")
+    return sha, _step_record(message), message, commit
+
+
+def _read_tick_for_sweep(gh: GitHub, lock_repo: str, sleep: Callable[[float], None]
+                         ) -> Tuple[Optional[str], Dict[str, Any], str, Any]:
+    """_read_tick, read again after each SWEEP_REREAD_WAITS wait while the
+    record shows a step before triage (loom#2555): the step the brain just
+    recorded may not be readable yet. A record at or past triage is taken
+    at once, so a sweep after the journal is refused with no wait."""
+    read = _read_tick(gh, lock_repo)
+    for wait in SWEEP_REREAD_WAITS:
+        if not _too_early_for_sweep(read[1]):
+            break
+        sleep(wait)
+        read = _read_tick(gh, lock_repo)
+    return read
+
+
 def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:
     """The sweep step's guard, asked before the record moves: it reads the
     step the tick was at. A sweep before triage is refused, not recorded;
@@ -6398,23 +6443,20 @@ def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime)
 def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
               note: Optional[str] = None, holder: Optional[str] = None,
               now: Optional[datetime] = None,
-              tick_minutes: Optional[int] = None) -> Dict[str, Any]:
+              tick_minutes: Optional[int] = None,
+              sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
     """Read the tick record, or append one step to the current lock commit.
     `tick_minutes`, given with the lock step, is the tick's own length when
     it is shorter than tick_clock.TICK_MINUTES (a lane machine tick bounded
-    by another brain's slot, loom#2469); the clock and the budget read it."""
+    by another brain's slot, loom#2469); the clock and the budget read it.
+    The sweep step reads the record again, after `sleep`, while it shows a
+    step before triage (loom#2555)."""
     now = now or datetime.now(timezone.utc)
-    ref_path = "/repos/%s/git/ref/heads/%s" % (lock_repo, lock.LOCK_BRANCH)
-    ref = gh.rest("GET", ref_path, ok=(404,))
-    if ref.status == 404:
-        return _step_record("")
-    sha = ref.data["object"]["sha"]
-    commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (lock_repo, sha), ok=(404,))
-    if commit.status == 404:
-        return _step_record("")
-    message = str(commit.data.get("message") or "")
-    record = _step_record(message)
-    if step is None:
+    if step == "sweep":
+        sha, record, message, commit = _read_tick_for_sweep(gh, lock_repo, sleep)
+    else:
+        sha, record, message, commit = _read_tick(gh, lock_repo)
+    if sha is None or step is None:
         return record
     if step not in TICK_STEPS:
         raise ValueError("step must be one of %s" % ", ".join(TICK_STEPS))
@@ -6461,14 +6503,15 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
 
 
 def run_sweep(gh: GitHub, lock_repo: str, holder: str, plan: Sequence[Dict[str, Any]],
-              clock: Optional[Callable[[], datetime]] = None) -> Tuple[str, List[str]]:
+              clock: Optional[Callable[[], datetime]] = None,
+              sleep: Callable[[float], None] = time.sleep) -> Tuple[str, List[str]]:
     """Run the brain's sweep plan (bus/sweep.py) for the lock holder: the
     tick record gives the guard its step and start time, a rewrite is a
     brief in place under the named epic (brief --refs), and the report line
     is appended to the tick record as the sweep step's note."""
     clock = clock or (lambda: datetime.now(timezone.utc))
     _lock_holder(gh, lock_repo, holder, clock())
-    record = tick_step(gh, lock_repo)
+    record = _read_tick_for_sweep(gh, lock_repo, sleep)[1]
 
     def rewrite(repo: str, number: int, epic: int, title: str, body: str) -> str:
         return brief(gh, repo, epic, title, body, refs=number, holder=holder)
@@ -6476,7 +6519,7 @@ def run_sweep(gh: GitHub, lock_repo: str, holder: str, plan: Sequence[Dict[str, 
     result = sweep.run(gh, plan, record, TICK_STEPS, rewrite, clock=clock)
     line = sweep.report_line(result)
     if record.get("step") in ("triage", "sweep"):
-        tick_step(gh, lock_repo, "sweep", line, holder, clock())
+        tick_step(gh, lock_repo, "sweep", line, holder, clock(), sleep=sleep)
     return line, result.lines
 
 

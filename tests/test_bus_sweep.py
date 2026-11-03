@@ -197,11 +197,95 @@ class TickStepsTest(unittest.TestCase):
         tick = {"started_at": stamp(START), "step": "merge", "step_index": 3, "notes": []}
         gh = FakeGH({}, tick=tick)
         with self.assertRaisesRegex(ValueError, "only after the triage step"):
-            brain.tick_step(gh, LOCK_REPO, "sweep", holder="muse", now=START + timedelta(minutes=2))
+            brain.tick_step(gh, LOCK_REPO, "sweep", holder="muse", now=START + timedelta(minutes=2),
+                            sleep=lambda _: None)
         # Merge, verify and failed are recorded as before, sweep or not.
         for step in ("merge", "verify", "failed"):
             self.assertEqual(brain.tick_step(gh, LOCK_REPO, step, holder="muse",
                                              now=START + timedelta(minutes=23))["step"], step)
+
+
+class StaleRefGH(FakeGH):
+    """A lock branch whose ref read lags: the first `lag` reads of the ref
+    after a write answer the head from before the last `behind` writes, as a
+    GitHub read replica does just after a ref update (loom#2555)."""
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.heads = [self.head]
+        self.lag = 0
+        self.behind = 0
+        self.ref_reads = 0
+
+    def _git(self, method: str, path: str, body: Any):
+        if method == "GET" and "/git/ref/heads/" in path:
+            self.ref_reads += 1
+            if self.lag > 0:
+                self.lag -= 1
+                return reply({"object": {"sha": self.heads[-1 - self.behind]}})
+            return reply({"object": {"sha": self.head}})
+        out = super()._git(method, path, body)
+        if method == "PATCH":
+            self.heads.append(self.head)
+        return out
+
+
+def through_triage(gh: StaleRefGH) -> None:
+    for minute, step in enumerate(("asks", "brief", "triage")):
+        brain.tick_step(gh, LOCK_REPO, step, holder="muse",
+                        now=START + timedelta(minutes=5, seconds=7 * minute))
+
+
+class StaleReadTest(unittest.TestCase):
+    """The 2026-11-03 07:40Z tick: asks, brief and triage were recorded, then
+    the sweep read a head two writes old and was refused at asks."""
+
+    def setUp(self):
+        tick = {"started_at": stamp(START), "step": "failed", "step_index": 5, "notes": []}
+        self.gh = StaleRefGH({1: issue(1)}, tick=tick)
+        through_triage(self.gh)
+        self.gh.lag, self.gh.behind = 2, 2
+        self.waits: List[float] = []
+
+    def test_step_sweep_reads_again_and_runs_after_triage(self):
+        saved = brain.tick_step(self.gh, LOCK_REPO, "sweep", "swept 0", "muse",
+                                START + timedelta(minutes=6), sleep=self.waits.append)
+        self.assertEqual(saved["step"], "sweep")
+        self.assertEqual(saved["sweep"], "ok")
+        self.assertEqual(len(self.waits), 2)
+        record = brain.tick_step(self.gh, LOCK_REPO)
+        self.assertEqual([t["step"] for t in record["times"]][-4:],
+                         ["asks", "brief", "triage", "sweep"])
+
+    def test_run_sweep_reads_again_and_runs_after_triage(self):
+        line, _ = brain.run_sweep(self.gh, LOCK_REPO, "muse", [close(1)],
+                                  clock=lambda: START + timedelta(minutes=6),
+                                  sleep=self.waits.append)
+        self.assertEqual(line, "swept 1 (closed 1, rewritten 0, skipped 0)")
+        self.assertEqual(self.gh.issues[1]["state"], "closed")
+        self.assertEqual(brain.tick_step(self.gh, LOCK_REPO)["step"], "sweep")
+
+    def test_a_sweep_really_before_triage_is_refused_after_bounded_reads(self):
+        tick = {"started_at": stamp(START), "step": "asks", "step_index": 6, "notes": []}
+        gh = StaleRefGH({}, tick=tick)
+        with self.assertRaisesRegex(ValueError, "tick is at asks"):
+            brain.tick_step(gh, LOCK_REPO, "sweep", holder="muse",
+                            now=START + timedelta(minutes=6), sleep=self.waits.append)
+        self.assertEqual(len(self.waits), len(brain.SWEEP_REREAD_WAITS))
+        self.assertLessEqual(sum(self.waits), 60)
+
+    def test_a_sweep_after_the_journal_is_refused_with_no_reread(self):
+        tick = {"started_at": stamp(START), "step": "journal", "step_index": 10, "notes": []}
+        gh = StaleRefGH({}, tick=tick)
+        with self.assertRaisesRegex(ValueError, "tick is at journal"):
+            brain.tick_step(gh, LOCK_REPO, "sweep", holder="muse",
+                            now=START + timedelta(minutes=6), sleep=self.waits.append)
+        self.assertEqual(self.waits, [])
+        line, _ = brain.run_sweep(gh, LOCK_REPO, "muse", [],
+                                  clock=lambda: START + timedelta(minutes=6),
+                                  sleep=self.waits.append)
+        self.assertIn("tick is at journal", line)
+        self.assertEqual(self.waits, [])
 
 
 class GuardTest(unittest.TestCase):

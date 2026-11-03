@@ -773,7 +773,10 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    close or rewrite issues in quadseven/loom and quadseven/grug in the time
    left after the brain steps, which always come first. The step runs only
    after triage and only while the tick has used under 20 of its 25
-   minutes; past that, `step sweep` records "skipped: the tick used N of
+   minutes. A read of the tick record just after the triage step can still
+   show an older step, so when it shows a step before triage the step (and
+   `bus.brain sweep`) reads it again for up to about 45 seconds before it
+   refuses (loom#2555); past 20 minutes, `step sweep` records "skipped: the tick used N of
    its 25 minutes" and the journal says so. The step prints a candidate list
    after the tick record: up to 30 of the oldest open issues with evidence
    the station already holds (`merged` with the merge sha, `duplicate` with
