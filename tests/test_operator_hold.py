@@ -401,6 +401,16 @@ class Route:
 BRAIN_REPO = "example-owner/example-repo"
 
 
+# The other tickets PR_BODY names with Part of and Refs: an epic, and a
+# ticket with no hold box (loom#2392 reads both).
+LINKED_TICKETS = {
+    "/repos/%s/issues/5697" % BRAIN_REPO: {"number": 5697, "state": "open", "body": "x",
+                                           "labels": [{"name": "epic"}]},
+    "/repos/%s/issues/5771" % BRAIN_REPO: {"number": 5771, "state": "open", "body": "x",
+                                           "labels": [{"name": "loom:ticket"}]},
+}
+
+
 def brain_routes(body, files, patches):
     pr = {"number": 8, "state": "open", "draft": False, "body": body + "\nRefs %s#9" % BRAIN_REPO,
           "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": BRAIN_REPO}},
@@ -413,6 +423,7 @@ def brain_routes(body, files, patches):
     ticket = {"number": 9, "state": "open", "body": TICKET_BODY if "Leave" in body else "x",
               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
     return {
+        **LINKED_TICKETS,
         "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": f, "patch": patches.get(f, "")}
                                                  for f in files],
         "/repos/%s/pulls/8" % BRAIN_REPO: pr,
@@ -523,7 +534,7 @@ class BrainMerge(unittest.TestCase):
                       "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
                   "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": "bus/a.py"}],
                   "/repos/%s/pulls/8" % BRAIN_REPO: {"mergeable": True},
-                  "/search/issues": {"total_count": 0}}
+                  "/search/issues": {"total_count": 0}, **LINKED_TICKETS}
         lines = brain._pull_request_lines(GitHub("t", transport=Route(routes)), BRAIN_REPO, [pr],
                                           {"prs": {8: node}}, "grug-tribe", hold=())
         self.assertIn("blocked: held for the operator", lines[1])

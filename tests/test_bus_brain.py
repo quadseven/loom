@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, journal, proof, station, text, tickets
+from bus import brain, hold_boxes, journal, proof, station, text, tickets
 from bus.github import GitHub, GitHubError
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -908,6 +908,85 @@ class SensitiveResumeTests(unittest.TestCase):
                 reason = brain._foreign_criteria_reason(
                     "## Acceptance criteria\n%s\n" % line, REPO, env)
                 self.assertEqual(bool(reason), blocked, reason)
+
+    # loom#2392: an unticked hold-before-merge box on a ticket the PR names.
+    HOLD_BOX = ("Prove the running version takes the new form. If it does not, "
+                "record the prerequisite and keep this PR blocked")
+
+    def _held_issue(self, box, ticked=False):
+        return {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}],
+                "body": "## Acceptance criteria\n- [x] built\n- [%s] %s\n"
+                        % ("x" if ticked else " ", box)}
+
+    def test_merge_refuses_a_ticket_with_an_unticked_hold_box_naming_it(self):
+        pr, query = self._merge_replies({"pr": {"body": self._criteria_pr("built")}})
+        fake = Fake(pr, query, reply(200, self._held_issue(self.HOLD_BOX)), reply(200, []))
+        with self.assertRaises(ValueError) as ctx:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        msg = str(ctx.exception)
+        self.assertIn("blocked: %s#9 unticked hold-before-merge box" % REPO, msg)
+        self.assertIn("Prove the running version takes the new form", msg)
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def _merged_with(self, issue, body=None):
+        pr, query = self._merge_replies({"pr": {"body": body or self._criteria_pr("built")}})
+        fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
+                    reply(200, []), reply(200, issue), reply(200, {}))
+        return brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+
+    def test_merge_passes_the_same_hold_box_ticked(self):
+        self.assertTrue(self._merged_with(self._held_issue(self.HOLD_BOX, ticked=True))["merged"])
+
+    def test_merge_passes_a_live_or_after_deploy_box(self):
+        for box in ("Live: the endpoint answers before and after the merge",
+                    "Recheck the counter after the deploy, before the next merge"):
+            with self.subTest(box=box):
+                self.assertTrue(self._merged_with(self._held_issue(box))["merged"])
+
+    def test_merge_reads_a_part_of_ticket_and_fails_closed_when_unreadable(self):
+        body = self._criteria_pr("built") + "Part of #31\n"
+        pr, query = self._merge_replies({"pr": {"body": body}})
+        issue = self._held_issue("nothing held")
+        fake = Fake(pr, query, reply(200, issue), reply(404, {"message": "Not Found"}),
+                    reply(200, []))
+        with self.assertRaisesRegex(ValueError, r"blocked: %s#31 unreadable" % REPO):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
+    def test_hold_box_forms(self):
+        cases = [
+            ("keep this PR blocked until the probe passes", True),
+            ("Do not merge until the handset proof is in", True),
+            ("before the authorized session decides to merge", True),
+            ("prove the migration ran before merge", True),
+            ("Live: the page answers before the merge window", False),
+            ("check the logs after the deploy, before the next merge", False),
+            ("Live: verify after the deploy, and keep this PR blocked till then", True),
+            ("the feature works", False),
+        ]
+        for box, held in cases:
+            with self.subTest(box=box):
+                self.assertEqual(bool(hold_boxes.hold_box_reason("- [ ] %s\n" % box)), held)
+                self.assertEqual(hold_boxes.hold_box_reason("- [x] %s\n" % box), "")
+
+    def test_hold_boxes_skip_an_epic(self):
+        epic = {"labels": [{"name": "epic"}], "body": "- [ ] keep this PR blocked\n"}
+        self.assertEqual(hold_boxes.refusal("Refs #2", REPO, lambda t: epic), "")
+
+    def test_status_prints_the_hold_box_blocker_instead_of_ready(self):
+        ticket_issue = dict(self._held_issue(self.HOLD_BOX), number=4)
+        pr = {"number": 8, "title": "Change", "head": {"ref": "loom/4-work"}}
+        fake = Fake(reply(200, ticket_issue), *merge_takes(ticket=4)[1:], reply(200, ticket_issue))
+        lines = brain._pull_request_lines(GitHub("t", transport=fake), REPO, [pr],
+                                          {"prs": {8: ready_node()}}, "grug-tribe")
+        self.assertIn("- #8 Change - blocked: %s#4 unticked hold-before-merge box" % REPO,
+                      lines[1])
+        self.assertNotIn("READY", lines[1])
+
+    def test_brain_doc_lists_the_hold_box_blocker(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                               "docs", "BRAIN.md"), encoding="utf-8") as handle:
+            self.assertIn("unticked hold-before-merge box", handle.read())
 
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}

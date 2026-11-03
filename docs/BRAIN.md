@@ -403,6 +403,25 @@ rule merge cannot check (`... rule merge cannot check: <rule>`), or an
 unreadable goal home (`goal home unreadable`) is a blocker, so status never
 says READY for a pull request merge would refuse on these rules.
 
+### Ticket hold boxes
+
+`bus.brain merge` reads the pull request's ticket and every ticket its body
+names with `Refs` or `Part of`, and refuses while one has an unticked
+hold-before-merge box (loom#2392). The shared merge gate's ticket-holds row
+reads boxes the same way (`bus/hold_boxes.py`):
+
+- An explicit hold always holds: "keep this PR blocked", "do not merge",
+  "decides to merge".
+- A box that says "before ... merge" holds, unless it is about after-merge
+  or live proof: it opens with `Live:`, or says "after the deploy", "after
+  the rollout" or "after merge".
+
+Epics are skipped: their boxes are their children. A ticket that cannot be
+read fails closed (`OWNER/NAME#N unreadable`). The refusal names the ticket
+and the box (`blocked: OWNER/NAME#N unticked hold-before-merge box '...'`),
+and `bus.brain status` shows the same blocker instead of READY. Tick the box
+once its proof is in, then merge.
+
 ## Onboarding a repo
 
 `python3 -m bus.brain onboard <owner/name> [--review-check NAME] [--operator LOGIN]` readies a
