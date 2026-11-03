@@ -5485,10 +5485,12 @@ class Station:
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
+        carried = rotation.get("carried") if isinstance(rotation, dict) else None
         start = start if isinstance(start, int) and 0 <= start < len(steps) else 0
         # Where the next pass starts, kept current so the write below records
         # it however the loop ends.
         next_step = start
+        next_carried = None
         try:
             for offset in range(len(steps)):
                 next_step = (start + offset) % len(steps)
@@ -5506,7 +5508,14 @@ class Station:
                 step = steps[next_step]
                 try:
                     if not self._timed(step):
-                        # The carried-over step starts the next pass's loop.
+                        if carried == step.__name__:
+                            _say("step %s skipped after repeated carry-over: it carried over on consecutive passes"
+                                 % step.__name__)
+                            next_step = (next_step + 1) % len(steps)
+                            continue
+                        # One carry-over starts the next pass here. If it
+                        # carries over there again, that pass skips it once.
+                        next_carried = step.__name__
                         break
                 except RateLimited:
                     # The next step starts the next pass: on 2026-10-31 a step
@@ -5520,7 +5529,7 @@ class Station:
                 next_step = 0
         finally:
             try:
-                _write_json(rotation_path, {"next": next_step})
+                _write_json(rotation_path, {"next": next_step, "carried": next_carried})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
 
