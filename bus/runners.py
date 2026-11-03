@@ -230,6 +230,15 @@ def input_size(inputs: Dict[str, str]) -> int:
     return sum(len(k) + len(v) for k, v in inputs.items())
 
 
+def red_reason(repo: str, red: Dict[str, Any]) -> str:
+    """The park reason for a brief a base stop keeps off the runner."""
+    if red.get("cannot_run"):
+        return ("this runner image cannot run the base check of %s (a tool it needs is "
+                "missing); another lane takes it" % repo)
+    return ("the base check of %s is red on this runner at %s; another lane takes it"
+            % (repo, str(red.get("revision") or "")[:12]))
+
+
 def _now() -> float:
     return time.time()
 
@@ -390,12 +399,7 @@ class Runners:
             # can reach a ticket, and this text comes from a run log.
             self.say("%s/%s not dispatched: %s is red there: %s"
                      % (slot, ticket, repo, red.get("why") or "no reason"))
-            if red.get("cannot_run"):
-                self._refuse(ledger, entry, "this runner image cannot run the base check of %s "
-                             "(a tool it needs is missing); another lane takes it" % repo)
-            else:
-                self._refuse(ledger, entry, "the base check of %s is red on this runner at %s; "
-                             "another lane takes it" % (repo, red["revision"][:12]))
+            self._refuse(ledger, entry, red_reason(repo, red))
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
@@ -462,8 +466,12 @@ class Runners:
         if self.now - float(seen) >= IMAGE_PROBE:
             del ledger["base_red"][slot][repo]
             return None
-        if red.get("cannot_run"):
-            return red
+        return red if red.get("cannot_run") else self._head_still_red(ledger, slot, repo, base, red)
+
+    def _head_still_red(self, ledger: Dict[str, Any], slot: str, repo: str, base: str,
+                        red: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """`red` while the repo's head on `base` is still the failing revision;
+        a moved head clears it, and a head that cannot be read keeps it."""
         try:
             head = self.gh.rest("GET", "/repos/%s/commits/%s"
                                 % (repo, urllib.parse.quote(base or "HEAD", safe=""))).data
