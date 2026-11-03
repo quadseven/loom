@@ -855,7 +855,14 @@ event; if the log covers less than the box needs, it stays on `loom:awaiting-evi
 A lane proof passed the shape check, which cannot tell evidence a lane read
 from evidence a weak model wrote to look complete. So each tick audits one:
 `resume` lists the oldest verified ticket whose newest proof a lane made in
-the last 24 hours and no audit has judged, as a `resume audit` item. Re-read
+the last 24 hours and no audit has judged, as a `resume audit` item. Read
+the proof whole first; a comment read clipped to a few hundred characters
+loses the criteria and evidence past the cut:
+
+    python3 -m bus.brain proof OWNER/NAME#N
+
+It prints the newest proof a trusted login posted, with who posted it, when,
+the lane that made it and its link, then the body with nothing cut. Re-read
 each criterion's evidence yourself (the logs, endpoints or pages the proof
 names), then record the result:
 

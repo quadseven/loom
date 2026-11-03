@@ -5459,7 +5459,7 @@ def writer_login(gh: Any, env: Optional[Dict[str, str]] = None) -> str:
 
 # Brain commands outside the lock check: reads, and `step`, whose tick
 # record only the lock's holder may write (tick_step checks it).
-READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step")
+READ_COMMANDS = ("status", "resume", "step-budget", "audit-close", "step", "proof")
 
 
 def check_acting_brain(gh: Any, lock_repo: str, env: Optional[Dict[str, str]] = None,
@@ -5748,6 +5748,23 @@ def _audit_comment(result: str, record: Dict[str, Any], note: str) -> str:
     return ("%s\nAudit: the brain re-read the evidence of %s and it does not hold: %s\n\n"
             "The ticket is back to shipped, and lane %s takes no verify run for %d hours." % (
                 audit.marker(result, lane), made, note, lane, audit.HOLD // 3600))
+
+
+def proof_text(gh: GitHub, repo: str, number: int, env: Optional[Dict[str, str]] = None) -> str:
+    """The ticket's newest trusted proof comment, whole: a head line naming
+    who posted it, when, which lane made it and its link, then the body with
+    nothing cut. A proof audit re-reads every criterion's evidence, so a read
+    clipped to a few hundred characters cannot audit it."""
+    found = audit.newest(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                         trusted_authors(env))
+    if found is None:
+        raise ValueError("%s#%d has no proof from a trusted login (LOOM_BRIEF_AUTHORS)"
+                         % (repo, number))
+    comment, record = found
+    head = "proof on %s#%d by %s at %s, verified_by `%s`: %s" % (
+        repo, number, comment_login(comment) or "unknown", comment.get("created_at") or "unknown",
+        _one_line(record.get("verified_by"), 120) or "unknown", comment.get("html_url") or "no link")
+    return head + "\n\n" + str(comment.get("body") or "")
 
 
 def audit_proof(gh: GitHub, repo: str, number: int, result: str, note: str,
@@ -6754,11 +6771,12 @@ def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     due = sorted(due, key=lambda x: (x[0], x[1], int(x[2]["number"])))
     out = ["", "## Lane proof audit (one a tick, oldest first)"]
     for posted, repo, issue, record in due[:1]:
-        out.append("- resume audit %s#%s proof by `%s` %dh ago: re-read each criterion's "
-                   "evidence, then run python3 -m bus.brain audit %s#%s --result pass|fail "
-                   "--note TEXT" % (
+        out.append("- resume audit %s#%s proof by `%s` %dh ago: read the whole proof with "
+                   "python3 -m bus.brain proof %s#%s, re-read each criterion's evidence, then run "
+                   "python3 -m bus.brain audit %s#%s --result pass|fail --note TEXT" % (
                        repo, issue["number"], _one_line(record.get("verified_by"), 120),
-                       max(0, int(now.timestamp() - posted) // 3600), repo, issue["number"]))
+                       max(0, int(now.timestamp() - posted) // 3600), repo, issue["number"],
+                       repo, issue["number"]))
     return out if due else out + ["- none"]
 
 
@@ -7737,6 +7755,7 @@ def parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
+    pf = sub.add_parser("proof", help="print a ticket's newest trusted proof comment whole, for a proof audit"); pf.add_argument("ticket")
     ac = sub.add_parser("audit-close", help="the facts a close audit line carries: cited hash, merge commit, on the default branch or not; exit 0 only when sound"); ac.add_argument("ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
@@ -7844,6 +7863,11 @@ def _cmd_audit(gh: GitHub, args: argparse.Namespace) -> None:
     print(audit_proof(gh, repo, number, args.result, args.note))
 
 
+def _cmd_proof(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    print(proof_text(gh, repo, number))
+
+
 def _cmd_audit_close(gh: GitHub, args: argparse.Namespace) -> int:
     """Print what git holds for a ticket's close (bus/close_audit.py)."""
     repo, number = _ref(args.ticket, "ticket")
@@ -7941,6 +7965,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
             "prioritize": _cmd_prioritize, "live": _cmd_live,
             "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
+            "proof": _cmd_proof,
             "merge": _cmd_merge, "reply": _cmd_reply,
             "fix": _cmd_fix, "triage": _cmd_triage, "human": _cmd_human,
             "defer": _cmd_defer, "done": _cmd_done, "resume": _cmd_resume,
