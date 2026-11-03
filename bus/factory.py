@@ -1022,19 +1022,24 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     leaves its rung untried: the claim after it runs the equivalent model."""
     tried: set = set()
     pending: set = set()
+    just_claimed: set = set()
     for c in comments:
         body = str(c.get("body") or "")
         if CLAIM_RE.match(body):
+            just_claimed = set(pending)
             tried |= pending
             pending = set()
         for m in RUNG_RE.finditer(body):
             rung = int(m.group(1))
             if rung == 0:
-                tried, pending = set(), set()
+                tried, pending, just_claimed = set(), set(), set()
             else:
                 pending = pending | {rung}
         if EQUIVALENT_RE.search(body):
             pending = set()
+        if re.search(r"^Lane \S+ stopped: \[limit\]", body):
+            tried -= just_claimed
+            just_claimed = set()
     return tried
 
 

@@ -2610,6 +2610,8 @@ class Station:
         its fix comment cannot be used (refused, as an untrusted ticket is),
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
+        if not self._can_claim(lane):
+            return False
         number = int(issue["number"])
         comments = self._claim_comments(repo, issue, number)
         if comments is None:
@@ -2650,6 +2652,7 @@ class Station:
                    % (lane, _sha12(issue.get("body"))),
                    self._claim_time(comments, fix_comment_id), self.s.authors)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+        self._note_claimed_probe(lane)
         if fix:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
                  % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
@@ -2660,6 +2663,12 @@ class Station:
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _note_claimed_probe(self, lane: str) -> None:
+        """Record that a zero-done demoted lane was given its probe brief."""
+        card = scorecard.Scorecard(self.state, self.now)
+        if card.is_zero_done(lane):
+            card.note_probe(lane)
 
     def _claim_comments(self, repo: str, issue: Dict[str, Any],
                         number: int) -> Optional[List[Any]]:
@@ -4993,6 +5002,8 @@ class Station:
             if done:
                 reported[key] = kind
                 _write_json(path, reported)
+                if kind == "done":
+                    scorecard.Scorecard(self.state, self.now).clear_zero_done(lane)
 
     @staticmethod
     def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
@@ -13583,11 +13594,16 @@ class Station:
                      merges if isinstance(merges, dict) else {})
         card.save()
 
+    def _can_claim(self, lane: str) -> bool:
+        """Whether a lane may claim a brief: not demoted, or a zero-done
+        demoted lane whose probe gate is open."""
+        return lane not in self.demoted_lanes() or scorecard.Scorecard(self.state, self.now).can_probe(lane)
+
     def _not_demoted(self, free: List[str]) -> List[str]:
         """The free lanes that may claim a build ticket: a demoted lane
-        takes none (bus/scorecard.py)."""
-        demoted = self.demoted_lanes()
-        return [lane for lane in free if lane not in demoted]
+        takes none (bus/scorecard.py), except that a zero-done demoted lane
+        gets at most one probe brief an hour."""
+        return [lane for lane in free if self._can_claim(lane)]
 
     def demoted_lanes(self) -> Dict[str, str]:
         """Each lane slot the scorecard demoted, and why. A scorecard file

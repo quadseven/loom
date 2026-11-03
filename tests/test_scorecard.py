@@ -298,6 +298,88 @@ class StationStep(unittest.TestCase):
         self.assertIn("| scorecard lane | model |", "\n".join(st._scorecard_lines()))
 
 
+class ZeroDoneDemotion(unittest.TestCase):
+    def test_lane_with_20_finished_briefs_and_0_done_is_demoted_and_gets_at_most_one_probe_brief_an_hour(self):
+        """A test: a lane with 20 finished briefs and 0 done is demoted and gets at
+        most one probe brief an hour; it fails on main."""
+        from bus import station
+        home = tempfile.mkdtemp()
+        state = os.path.join(home, "state", "station")
+        settings = station.Settings(home, [REPO], [LANES_LOGIN], ["example-owner"],
+                                    factory_on=True)
+        st = station.Station(GitHub("t", transport=Route({}, {})), settings, now=NOW)
+        sc = scorecard.Scorecard(st.state, NOW)
+        for i in range(20):
+            sc.record_brief("zen", "ticket-%d" % i, done=False, limit=False, at=NOW - 3600)
+        quiet(sc.demote)
+        sc.save()
+        self.assertIn("zen", sc.demoted())
+        self.assertIn("zen", st.demoted_lanes())
+
+        # At NOW: zen may receive one probe brief
+        st.now = NOW
+        self.assertEqual(st._not_demoted(["zen"]), ["zen"])
+        self.assertTrue(st._can_claim("zen"))
+
+        # Once probed, zen gets at most one probe brief an hour
+        sc.note_probe("zen")
+        st.now = NOW + 60
+        self.assertEqual(st._not_demoted(["zen"]), [])
+        self.assertFalse(st._can_claim("zen"))
+        self.assertFalse(st._claim(REPO, "zen", {"number": 1}))
+
+        # After an hour has passed, zen may receive another probe brief
+        st.now = NOW + 3601
+        self.assertEqual(st._not_demoted(["zen"]), ["zen"])
+        self.assertTrue(st._can_claim("zen"))
+
+    def test_limit_park_does_not_count_toward_the_rule_and_one_done_brief_clears_the_demotion(self):
+        """A test: a limit park does not count toward the rule, and one done brief
+        clears the demotion."""
+        state = tempfile.mkdtemp()
+        sc = scorecard.Scorecard(state, NOW)
+        # 19 work failures and 5 limit parks
+        for i in range(19):
+            sc.record_brief("zen", "failed-%d" % i, done=False, limit=False, at=NOW - 3600)
+        for i in range(5):
+            sc.record_brief("zen", "limit-%d" % i, done=False, limit=True, at=NOW - 3600)
+        sc.save()
+        quiet(sc.demote)
+        # Limit park does not count toward the 20 finished briefs rule:
+        self.assertNotIn("zen", sc.demoted())
+
+        # The 20th non-limit failure triggers demotion:
+        sc.record_brief("zen", "failed-19", done=False, limit=False, at=NOW - 3600)
+        quiet(sc.demote)
+        self.assertIn("zen", sc.demoted())
+
+        # One done brief clears the demotion:
+        sc.record_brief("zen", "done-1", done=True, limit=False, at=NOW)
+        quiet(sc.demote)
+        self.assertNotIn("zen", sc.demoted())
+
+    def test_scan_briefs_from_disk_identifies_done_and_limit_parks(self):
+        home = tempfile.mkdtemp()
+        state = os.path.join(home, "state", "station")
+        os.makedirs(os.path.join(home, "briefs", "zen", "done"), exist_ok=True)
+        os.makedirs(os.path.join(home, "briefs", "zen", "failed"), exist_ok=True)
+        os.makedirs(os.path.join(home, "logs", "zen"), exist_ok=True)
+        with open(os.path.join(home, "briefs", "zen", "done", "t1.md"), "w") as fh:
+            fh.write("done\n")
+        with open(os.path.join(home, "briefs", "zen", "failed", "t2.md"), "w") as fh:
+            fh.write("limit\n")
+        with open(os.path.join(home, "logs", "zen", "t2.log"), "w") as fh:
+            fh.write("failed: [limit] out of credit\n")
+        with open(os.path.join(home, "briefs", "zen", "failed", "t3.md"), "w") as fh:
+            fh.write("work\n")
+        with open(os.path.join(home, "logs", "zen", "t3.log"), "w") as fh:
+            fh.write("failed: [work] syntax error\n")
+        sc = scorecard.Scorecard(state, NOW)
+        sc.scan_briefs(home)
+        total, done, limit = sc.brief_counts("zen")
+        self.assertEqual((total, done, limit), (2, 1, 1))
+
+
 class FailClosed(unittest.TestCase):
     def test_a_scorecard_file_that_cannot_be_read_demotes_every_lane(self):
         from bus import station
