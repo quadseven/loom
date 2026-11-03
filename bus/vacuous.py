@@ -297,8 +297,8 @@ def _added_lines(patch: str) -> Set[int]:
     return added
 
 
-def changed_test_names(path: str, source: str, patch: str) -> List[str]:
-    """Name changed tests and tests that use a changed fixture in a file."""
+def _direct_test_names(path: str, source: str, patch: str) -> List[str]:
+    """Name tests whose own lines the patch changes."""
     module = path[:-3].replace("/", ".")
     tree = ast.parse(source)
     changed_lines = _added_lines(patch)
@@ -313,6 +313,12 @@ def changed_test_names(path: str, source: str, patch: str) -> List[str]:
                        and node in parent.body]
             names.append("%s.%s.%s" % (module, parents[0].name, node.name)
                          if parents else "%s.%s" % (module, node.name))
+    return sorted(set(names))
+
+
+def changed_test_names(path: str, source: str, patch: str) -> List[str]:
+    """Name changed tests and tests that use a changed fixture in a file."""
+    names = _direct_test_names(path, source, patch)
     # Fixture edits can affect an otherwise unchanged test. Include only
     # functions that reference a changed fixture identifier.
     for name in fixture_users(source, patch):
@@ -357,6 +363,16 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                         for name in (changed_test_names(path, source,
                                      (test_patches or {}).get(path, ""))
                                      if test_patches is not None else _test_names(path, source))})
+        # A test named only because it uses a changed fixture is still run
+        # on base, but passing there is not vacuity: the patch did not
+        # change that test, so its pass does not fail the verdict. Only a
+        # test the patch itself changes counts when it passes on base.
+        fixture_only = set()
+        if test_patches is not None:
+            direct = {name for path, source in changed_tests.items()
+                      for name in _direct_test_names(
+                          path, source, test_patches.get(path, ""))}
+            fixture_only = set(names) - direct
         deadline = time.monotonic() + timeout
         for index, name in enumerate(names):
             if name in top_level:
@@ -373,6 +389,8 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                 break
             if name in top_level and run.returncode in NOT_RUN_CODES:
                 not_run.append(name)
+            elif not run.returncode and name in fixture_only:
+                continue
             else:
                 (failed if run.returncode else passed).append(name)
     return BaseTestResults(passed, failed, timed_out, not_run)
