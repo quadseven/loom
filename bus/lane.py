@@ -198,7 +198,10 @@ def _recover_and_count(gh: GitHub, repos: Sequence[str], lane: str,
 
 def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, Dict[str, Any]]]:
     """(repo, issue) for each public queued ticket assigned to the lane in one
-    of its tiers, oldest first."""
+    of its tiers, oldest first. A ticket that matches the claim label query
+    (loom:queued plus the lane's own label) but is rejected gets one stderr
+    line naming the repo, the ticket number and the reason: a routed but
+    unclaimable ticket must not vanish silently while the lane looks idle."""
     found: List[Tuple[str, str, Dict[str, Any]]] = []
     for repo in repos:
         if not tickets.REPO_RE.fullmatch(repo):
@@ -208,31 +211,46 @@ def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, 
             continue
         for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
                                 % (repo, quote(lane, safe=""))):
-            if _takes(item, lane):
+            reason = _rejection_reason(item, lane)
+            if reason is None:
                 found.append((str(item.get("created_at") or ""), repo, item))
+            elif isinstance(item, dict) and isinstance(item.get("number"), int):
+                names = _names(item)
+                if "loom:queued" in names and "lane:" + lane in names:
+                    print("%s rejected: %s" % ("%s#%d" % (repo, item["number"]), reason),
+                          file=sys.stderr)
     found.sort(key=lambda row: (row[0], row[1], int(row[2]["number"])))
     return [(repo, item) for _, repo, item in found]
 
 
-def _takes(item: Any, lane: str) -> bool:
-    if not isinstance(item, dict) or "pull_request" in item:
-        return False
+def _rejection_reason(item: Any, lane: str) -> Optional[str]:
+    """Why the lane does not take this item, or None when it takes it."""
+    if not isinstance(item, dict):
+        return "not a ticket item"
+    if "pull_request" in item:
+        return "the item is a pull request"
     names = _names(item)
     if "loom:queued" not in names or "lane:" + lane not in names:
-        return False
+        return "not labelled for this lane"
     if brain.owned_elsewhere(item) is not None:
-        return False
+        return "owned elsewhere"
     try:
         headers = tickets.parse(item.get("body"))[0]
     except ValueError:
-        return False
+        return "unreadable brief header"
     if not headers:
-        return False  # no brief header at all: not a ticket a lane can run
+        return "no brief header"
     # The factory's reading (its default tier for a ticket with no
     # Difficulty: line), so a ticket it reserved for this lane is one the
     # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
     from .factory import difficulty_of
-    return difficulty_of(item) in REMOTE_LANES[lane]["tiers"]
+    if difficulty_of(item) not in REMOTE_LANES[lane]["tiers"]:
+        return "difficulty outside the lane's tiers"
+    return None
+
+
+def _takes(item: Any, lane: str) -> bool:
+    return _rejection_reason(item, lane) is None
 
 
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
