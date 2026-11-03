@@ -6440,26 +6440,20 @@ def _sweep_step_note(record: Dict[str, Any], note: Optional[str], now: datetime)
     return note
 
 
-def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
-              note: Optional[str] = None, holder: Optional[str] = None,
-              now: Optional[datetime] = None,
-              tick_minutes: Optional[int] = None,
-              sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
-    """Read the tick record, or append one step to the current lock commit.
-    `tick_minutes`, given with the lock step, is the tick's own length when
-    it is shorter than tick_clock.TICK_MINUTES (a lane machine tick bounded
-    by another brain's slot, loom#2469); the clock and the budget read it.
-    The sweep step reads the record again, after `sleep`, while it shows a
-    step before triage (loom#2555)."""
-    now = now or datetime.now(timezone.utc)
+def _tick_step_commit(gh: GitHub, lock_repo: str, step: Optional[str], note: Optional[str],
+                      holder: Optional[str], now: datetime, tick_minutes: Optional[int],
+                      sleep: Callable[[float], None]
+                      ) -> Tuple[Optional[str], Optional[str], Tuple[Dict[str, Any], Optional[str]]]:
+    """One try of tick_step: read the tick record and, for a step, create the
+    commit that appends it on the head read. Answers (the head read, the new
+    commit or None when nothing is written, (the record, a budget refusal))
+    for lock.write_branch to move the branch to."""
     if step == "sweep":
         sha, record, message, commit = _read_tick_for_sweep(gh, lock_repo, sleep)
     else:
         sha, record, message, commit = _read_tick(gh, lock_repo)
     if sha is None or step is None:
-        return record
-    if step not in TICK_STEPS:
-        raise ValueError("step must be one of %s" % ", ".join(TICK_STEPS))
+        return sha, None, (record, None)
     lock_info = lock._read_lock(gh, lock_repo)
     if lock_info is None or lock_info[0] != holder or lock_info[1] is None or lock_info[1] <= now:
         raise ValueError("%s does not hold the lock in %s; only the lock holder acts"
@@ -6493,10 +6487,32 @@ def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
         separators=(",", ":"))
     created = gh.rest("POST", "/repos/%s/git/commits" % lock_repo, {
         "message": new_message, "tree": commit.data["tree"]["sha"], "parents": [sha]})
-    # GitHub reads a ref at git/ref/<ref> but updates it at git/refs/<ref>;
-    # the read path answers 404 to a PATCH, so no step was ever recorded.
-    gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (lock_repo, lock.LOCK_BRANCH),
-            {"sha": created.data["sha"], "force": True})
+    return sha, created.data["sha"], (record, refused)
+
+
+def tick_step(gh: GitHub, lock_repo: str, step: Optional[str] = None,
+              note: Optional[str] = None, holder: Optional[str] = None,
+              now: Optional[datetime] = None,
+              tick_minutes: Optional[int] = None,
+              sleep: Callable[[float], None] = time.sleep) -> Dict[str, Any]:
+    """Read the tick record, or append one step to the current lock commit.
+    `tick_minutes`, given with the lock step, is the tick's own length when
+    it is shorter than tick_clock.TICK_MINUTES (a lane machine tick bounded
+    by another brain's slot, loom#2469); the clock and the budget read it.
+    The sweep step reads the record again, after `sleep`, while it shows a
+    step before triage (loom#2555). The step is written by compare-and-swap
+    (lock.write_branch): never forced over a head newer than the one read
+    (loom#2558)."""
+    now = now or datetime.now(timezone.utc)
+    if step is not None and step not in TICK_STEPS:
+        raise ValueError("step must be one of %s" % ", ".join(TICK_STEPS))
+
+    def build() -> Tuple[Optional[str], Optional[str], Tuple[Dict[str, Any], Optional[str]]]:
+        # Each try reads the branch afresh: a write refused because the
+        # branch moved builds again on the newer head (loom#2558).
+        return _tick_step_commit(gh, lock_repo, step, note, holder, now, tick_minutes, sleep)
+
+    record, refused = lock.write_branch(gh, lock_repo, build, sleep)
     if refused:
         raise BudgetRefused(refused, record)
     return record

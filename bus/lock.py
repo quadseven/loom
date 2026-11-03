@@ -17,7 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from .github import GitHub
 
@@ -28,6 +28,9 @@ LOGIN_RE = re.compile(r"[A-Za-z0-9._-]+(?:\[bot\])?")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Seconds between tries while `attempt_waiting` waits out a peer's lock.
 WAIT_STEP = 60
+# Seconds waited before each fresh read when a lock branch write is refused
+# because the branch moved past the head the writer read (loom#2558).
+WRITE_RETRY_WAITS = (2.0, 4.0, 8.0)
 
 
 def _check_holder(holder: str) -> None:
@@ -255,22 +258,76 @@ def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,
         sleep(step)
 
 
-def release(gh: GitHub, repo: str, holder: str) -> bool:
+class LockHeadMoved(RuntimeError):
+    """A lock branch write still refused after every fresh read: the branch
+    is at a head the writer could not read. It names both heads, so a step
+    never vanishes in silence (loom#2558)."""
+
+    def __init__(self, repo: str, read: str, current: Optional[str]):
+        self.repo = repo
+        self.read = read
+        self.current = current
+        if current is None:
+            where = "the branch is gone"
+        elif current == read:
+            where = "GitHub still serves %s as the head, but refuses a commit on it" % read
+        else:
+            where = "the branch is at %s" % current
+        super().__init__(
+            "the %s lock branch in %s moved past the head this write read (%s); %s. "
+            "Nothing was written: a lock branch write only fast-forwards from the head "
+            "it read (docs/BRAIN.md, The tick)" % (LOCK_BRANCH, repo, read, where))
+
+
+def _head(gh: GitHub, repo: str) -> Optional[str]:
+    ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, LOCK_BRANCH), ok=(404,))
+    return None if ref.status == 404 else ref.data["object"]["sha"]
+
+
+def write_branch(gh: GitHub, repo: str, build: Callable[[], Tuple[Optional[str], Optional[str], Any]],
+                 sleep: Callable[[float], None] = time.sleep) -> Any:
+    """Move the lock branch by compare-and-swap. `build` reads the branch and
+    answers (the head it read, the new commit whose parent is that head, a
+    result), or a None commit when there is nothing to write. The ref update
+    is never forced: GitHub refuses with 422 a commit that does not descend
+    from the branch head, so a write built on an old read (GitHub can serve a
+    head two step commits old, loom#2555) never drops the newer commits. A
+    refusal waits, then builds again from a fresh read, up to
+    len(WRITE_RETRY_WAITS) times; then LockHeadMoved names both heads."""
+    waits = list(WRITE_RETRY_WAITS)
+    while True:
+        read, new, result = build()
+        if new is None:
+            return result
+        # Updated at git/refs/<ref>: the git/ref/<ref> read path answers 404 to a PATCH.
+        resp = gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
+                       {"sha": new, "force": False}, ok=(409, 422))
+        if resp.status not in (409, 422):
+            return result
+        if not waits:
+            raise LockHeadMoved(repo, str(read), _head(gh, repo))
+        sleep(waits.pop(0))
+
+
+def release(gh: GitHub, repo: str, holder: str,
+            sleep: Callable[[float], None] = time.sleep) -> bool:
     _check_holder(holder)
-    current = _read_lock(gh, repo)
-    if current is None or current[0] != holder or current[1] is None or current[1] <= datetime.now(timezone.utc):
-        return False
-    # Keep the lock ref as the durable last-tick record. Expire it now so the
-    # next holder can replace it immediately through attempt's stale-lock path.
-    ref_path = "/repos/%s/git/ref/heads/%s" % (repo, LOCK_BRANCH)
-    ref = gh.rest("GET", ref_path)
-    sha = ref.data["object"]["sha"]
-    previous = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, sha)).data
-    message = re.sub(r"expires=\S+", "expires=" + datetime.now(timezone.utc).strftime(TIME_FORMAT),
-                     previous.get("message", ""))
-    commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
-        "message": message, "tree": previous["tree"]["sha"], "parents": [sha]})
-    # Updated at git/refs/<ref>: the git/ref/<ref> read path answers 404 to a PATCH.
-    gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
-            {"sha": commit.data["sha"], "force": True})
-    return True
+
+    def build() -> Tuple[Optional[str], Optional[str], bool]:
+        current = _read_lock(gh, repo)
+        if (current is None or current[0] != holder or current[1] is None
+                or current[1] <= datetime.now(timezone.utc)):
+            return None, None, False
+        # Keep the lock ref as the durable last-tick record. Expire it now so the
+        # next holder can replace it immediately through attempt's stale-lock path.
+        sha = _head(gh, repo)
+        if sha is None:
+            return None, None, False
+        previous = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, sha)).data
+        message = re.sub(r"expires=\S+", "expires=" + datetime.now(timezone.utc).strftime(TIME_FORMAT),
+                         previous.get("message", ""))
+        commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
+            "message": message, "tree": previous["tree"]["sha"], "parents": [sha]})
+        return sha, commit.data["sha"], True
+
+    return write_branch(gh, repo, build, sleep)
