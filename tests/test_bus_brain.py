@@ -5549,6 +5549,22 @@ class MoveFromGoalTests(unittest.TestCase):
     def sub_issue_posts(self, calls):
         return [c for c in calls if c[0] == "POST" and c[1].endswith("/sub_issues")]
 
+    def test_file_under_epic_refuses_a_ticket_when_the_epic_is_at_capacity(self):
+        fake = GoalRepo()
+        fake.issues[60] = dict(item(60, body="Part of #1\n", labels=["epic"]),
+                               title=brain.INTAKE_TITLE)
+        fake.subs[1].append(60)
+        fake.subs[60] = []
+        for number in range(100, 100 + brain.EPIC_TICKET_CAP):
+            fake.issues[number] = item(number, labels=["loom:ticket"])
+            fake.subs[60].append(number)
+        issue = item(500, labels=["loom:ticket"])
+
+        with self.assertRaisesRegex(ValueError, "already holds"):
+            brain.file_under_epic(GitHub("t", transport=fake), REPO, 60, issue)
+
+        self.assertFalse(self.sub_issue_posts(fake.calls))
+
     def test_triage_moves_a_direct_child_of_the_goal_under_the_intake_epic(self):
         routes = Routes([item(5, parent_issue_url=self.GOAL_URL)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \

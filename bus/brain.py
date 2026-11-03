@@ -3020,7 +3020,17 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
 
 def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> None:
     """Link a filed issue as the epic's sub-issue; when GitHub refuses, its
-    body gets the epic's Part of line instead."""
+    body gets the epic's Part of line instead. A full epic refuses the ticket
+    before either form of link can exceed its cap."""
+    parent = gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic)).data or {}
+    if _epic_label(parent) and not standing_epic(parent) and "epic" not in _labels(issue):
+        held = _epic_tickets(gh, repo, epic)
+        count = _open_count(held) if is_intake_epic(parent) else len(held)
+        already_held = any(int(child.get("number") or 0) == int(issue.get("number") or 0)
+                           for child in held)
+        if count >= EPIC_TICKET_CAP and not already_held:
+            raise ValueError("epic #%d already holds %d tickets (cap %d)" %
+                             (epic, count, EPIC_TICKET_CAP))
     if issue.get("id") is None or not _link_to_goal(gh, repo, epic, issue):
         body = str(issue.get("body") or "")
         if not _names_goal(body, epic) and issue.get("number"):
