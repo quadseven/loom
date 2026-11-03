@@ -610,7 +610,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
    get past them; leave the ticket open and say what is missing. Then audit
-   the `resume audit` item, if any: re-read each criterion's evidence the
+   the `resume audit` item, if any: read the proof whole with
+   `python3 -m bus.brain proof OWNER/NAME#N` (a comment read clipped to a few
+   hundred characters cannot audit it), re-read each criterion's evidence the
    lane's proof names and record the result with
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
