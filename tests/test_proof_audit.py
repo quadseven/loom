@@ -175,9 +175,53 @@ class AuditDueTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn("%s#2 proof by `zen/opencode/model-free` 5h ago" % REPO, found[0])
         self.assertIn("python3 -m bus.brain audit %s#2 --result pass|fail --note" % REPO, found[0])
+        self.assertIn("read the whole proof with python3 -m bus.brain proof %s#2" % REPO, found[0])
 
     def test_resume_says_none_when_no_lane_proof_is_due(self):
         self.assertEqual(brain._audit_resume_lines(self.gh, [REPO], NOW, ENV)[-1], "- none")
+
+
+class ProofReadTest(unittest.TestCase):
+    """A proof audit reads the lane's proof whole: a read clipped at 500
+    characters left a proof unauditable."""
+
+    def setUp(self):
+        self.fake = Tracker()
+        self.gh = GitHub("t", transport=self.fake)
+
+    def test_the_newest_trusted_proof_is_printed_whole(self):
+        long = proof_comment(3)
+        long["body"] += "\n" + "evidence line %s\n" % ("x" * 600) + "TAIL-OF-THE-PROOF"
+        long["html_url"] = "https://example.com/proof/1"
+        self.assertGreater(len(long["body"]), 1000)
+        self.fake.add(5, ["loom:verified"], [proof_comment(9), long,
+                                             proof_comment(1, login="someone-else")])
+        text = brain.proof_text(self.gh, REPO, 5, env=ENV)
+        head, _, body = text.partition("\n\n")
+        self.assertEqual(body, long["body"])
+        self.assertTrue(body.endswith("TAIL-OF-THE-PROOF"))
+        self.assertIn("proof on %s#5 by station-bot at %s" % (REPO, at(3)), head)
+        self.assertIn("`zen/opencode/model-free`", head)
+        self.assertIn("https://example.com/proof/1", head)
+        self.assertEqual(self.fake.writes(), [])
+
+    def test_an_audited_proof_is_still_read(self):
+        self.fake.add(5, ["loom:verified"], [proof_comment(3), audit_comment(2, "pass")])
+        self.assertIn("A test passes", brain.proof_text(self.gh, REPO, 5, env=ENV))
+
+    def test_no_trusted_proof_is_an_error(self):
+        for why, comments in {"no proof": [],
+                              "untrusted": [proof_comment(3, login="someone-else")]}.items():
+            with self.subTest(why=why):
+                self.fake.add(5, ["loom:verified"], comments)
+                with self.assertRaisesRegex(ValueError, "no proof from a trusted login"):
+                    brain.proof_text(self.gh, REPO, 5, env=ENV)
+
+    def test_proof_is_a_read_command(self):
+        args = brain.parser().parse_args(["proof", "%s#5" % REPO])
+        self.assertEqual(args.command, "proof")
+        self.assertIn("proof", brain.READ_COMMANDS)
+        self.assertIs(brain.COMMANDS["proof"], brain._cmd_proof)
 
 
 class HeldTest(unittest.TestCase):

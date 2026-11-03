@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from . import handoff
-from .github import _OPENER
+from .github import _OPENER, _NoRedirect
 
 # The lock step comes before the agent starts (brain.sh refreshes its
 # checkout in between), so a tick's step record may start this long before
@@ -256,17 +256,30 @@ def dashboard_url(transcript_url: str, path: str) -> str:
     return urlunsplit(parts._replace(path=parts.path.removesuffix("/api/transcripts") + path))
 
 
-def fetch_json(url: str, token: str, what: str = "handoff") -> Dict[str, Any]:
+def opener_for(proxy: str = "") -> urllib.request.OpenerDirector:
+    """The opener for a dashboard read: the shared one, or, with proxy given,
+    one that sends the read through that proxy and only that one. The
+    dashboard is tailnet-only, so a remote brain whose shell proxy cannot
+    reach the tailnet names its tailnet proxy here (LOOM_TAILNET_PROXY)."""
+    if not proxy:
+        return _OPENER
+    return urllib.request.build_opener(
+        _NoRedirect, urllib.request.ProxyHandler({"https": proxy, "http": proxy}))
+
+
+def fetch_json(url: str, token: str, what: str = "handoff", proxy: str = "") -> Dict[str, Any]:
     """GET one of the dashboard's bearer-token reads (the handoff packet, the
-    usage snapshot) as a JSON object. Errors never carry the URL or the token.
-    Retries on connection failures and 5xx server errors."""
+    usage snapshot) as a JSON object, through proxy when one is given. Errors
+    never carry the URL, the proxy or the token. Retries on connection
+    failures and 5xx server errors."""
     if not url.startswith("https://"):
         raise OSError("the %s URL is not https" % what)
+    opener = opener_for(proxy)
     req = urllib.request.Request(  # noqa: S310 - https only, checked above
         url, method="GET", headers={"User-Agent": "loom-brain", "Authorization": "Bearer " + token})
     for attempt in range(len(FETCH_RETRY_DELAYS) + 1):
         try:
-            with _OPENER.open(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310
+            with opener.open(req, timeout=FETCH_TIMEOUT) as resp:  # noqa: S310
                 status, raw = resp.status, resp.read(FETCH_MAX)
         except urllib.error.HTTPError as err:
             status, raw = err.code, b""

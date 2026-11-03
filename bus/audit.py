@@ -79,6 +79,12 @@ def _standing(comments: Iterable[Any], authors: Sequence[str]) -> Tuple[Optional
     return found, result
 
 
+def newest(comments: Iterable[Any], authors: Sequence[str]) -> Optional[Found]:
+    """The ticket's newest trusted proof comment and its record, audited or
+    not, or None."""
+    return _standing(comments, authors)[0]
+
+
 def unaudited(comments: Iterable[Any], authors: Sequence[str]) -> Optional[Found]:
     """The ticket's newest trusted proof when a lane made it and no trusted
     audit has judged it yet."""

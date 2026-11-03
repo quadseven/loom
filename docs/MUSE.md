@@ -444,7 +444,10 @@ through `resume`.
 
 Usage figures for a journal come from the station's live snapshot:
 `python3 -m bus.usage --live` (the dashboard's `GET /api/usage`, with the
-same read-only token). Plain `python3 -m bus.usage` reads the lane machine's
+same read-only token). The dashboard is tailnet-only, so run it with
+`LOOM_TAILNET_PROXY` set to the tailnet proxy for that one command, as the
+product reads do; without it the read goes through the shell's own proxy
+and fails to connect. Plain `python3 -m bus.usage` reads the lane machine's
 own files and, on this VM, says it is not the lane machine instead.
 
 ## Tick
@@ -610,7 +613,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both
    refuse a missing proof or an unchecked criterion: never invent evidence to
    get past them; leave the ticket open and say what is missing. Then audit
-   the `resume audit` item, if any: re-read each criterion's evidence the
+   the `resume audit` item, if any: read the proof whole with
+   `python3 -m bus.brain proof OWNER/NAME#N` (a comment read clipped to a few
+   hundred characters cannot audit it), re-read each criterion's evidence the
    lane's proof names and record the result with
    `python3 -m bus.brain audit OWNER/NAME#N --result pass|fail --note TEXT`
    (docs/BRAIN.md, Proof audits). Put it in the journal as
@@ -1115,8 +1120,8 @@ An auto tier still merges only when it is clean:
 - no high or critical review-bot finding, and no finding from a bad-work rule
   at any severity, is open, or was resolved with no commit after it. A
   commit that merges the base (two parents) proves no fix and does not
-  count, and a thread resolved on a lane answer that held on the head
-  (bus/rebuttal.py) needs no commit (loom#2285). The
+  count. A lane answer, even one the station marked held for the head, never
+  stands in for that commit on such a finding (loom#2519). The
   bad-work rules are the review bot's `intent-mismatch`, `unmet-criterion`,
   `dead-code` and the rules named in `merge_tier.BAD_WORK_RULES`, any rule in
   `LOOM_ELDER_BLOCKING_RULES`, and any finding whose category is `bad-work`.

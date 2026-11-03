@@ -894,6 +894,18 @@ def bot_fixed(threads: Sequence[Dict[str, Any]], bot: str) -> List[str]:
     return [str(t.get("id")) for t in threads if bot_marked_fixed(t, bot)]
 
 
+def _bot_minor(comment: Dict[str, Any], bot: str) -> bool:
+    """The review bot's own finding (its app, not a person with its login)
+    whose severity, the first field of its first line, is medium or low: the
+    only findings the station may settle on a lane's answer (loom#2519)."""
+    author = comment.get("author") or {}
+    if author.get("__typename") != "Bot" or str(author.get("login") or "").lower() != bot.lower():
+        return False
+    severity = str(comment.get("body") or "").split("\n", 1)[0].split("|", 1)[0].lower()
+    return bool(re.search(r"\b(medium|low)\b", severity)) and not re.search(
+        r"\b(critical|high)\b", severity)
+
+
 def lane_answered(comment: Dict[str, Any], trusted: set) -> bool:
     """A lane's answer to a finding, posted as the reply on its thread by a
     trusted login (bus/station.py writes it as the App)."""

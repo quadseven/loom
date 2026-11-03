@@ -318,7 +318,7 @@ class UsageTests(unittest.TestCase):
         env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
                "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE"}
         out = io.StringIO()
-        with mock.patch.object(usage, "fetch_live", lambda url, token: seen.append((url, token)) or packet), \
+        with mock.patch.object(usage, "fetch_live", lambda url, token, proxy="": seen.append((url, token)) or packet), \
                 redirect_stdout(out):
             code = usage.main(["--live"], env=env, now=now)
         self.assertEqual(code, 0)
@@ -333,11 +333,40 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("LOOM_TRANSCRIPT_URL", err.getvalue())
 
+    def test_live_goes_through_the_tailnet_proxy_when_set(self):
+        # The dashboard is tailnet-only; a remote brain whose shell proxy
+        # cannot reach the tailnet read "failed to connect" every tick.
+        seen = []
+        env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
+               "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE",
+               "LOOM_TAILNET_PROXY": " http://proxy.example.test:3130 "}
+
+        def fetch(url, token, proxy=""):
+            seen.append(proxy)
+            return {"readings": [], "received_at": None}
+        with mock.patch.object(usage, "fetch_live", fetch), redirect_stdout(io.StringIO()):
+            usage.main(["--live"], env=env, now=1000)
+        self.assertEqual(seen, ["http://proxy.example.test:3130"])
+
+    def test_live_connect_failure_without_a_proxy_names_the_tailnet_proxy(self):
+        env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
+               "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE"}
+
+        def fetch(url, token, proxy=""):
+            raise OSError("the usage read failed to connect")
+        err = io.StringIO()
+        with mock.patch.object(usage, "fetch_live", fetch), redirect_stderr(err):
+            code = usage.main(["--live"], env=env, now=1000)
+        self.assertEqual(code, 1)
+        self.assertIn("failed to connect", err.getvalue())
+        self.assertIn("LOOM_TAILNET_PROXY", err.getvalue())
+        self.assertNotIn("dashboard.example.com", err.getvalue())
+
     def test_live_with_an_empty_dashboard_says_no_snapshot_yet(self):
         env = {"LOOM_TRANSCRIPT_URL": "https://dashboard.example.com/api/transcripts",
                "LOOM_HANDOFF_TOKEN": "YOUR_HANDOFF_TOKEN_HERE"}
         out = io.StringIO()
-        with mock.patch.object(usage, "fetch_live", lambda url, token: {"readings": [], "received_at": None}), \
+        with mock.patch.object(usage, "fetch_live", lambda url, token, proxy="": {"readings": [], "received_at": None}), \
                 redirect_stdout(out):
             code = usage.main(["--live"], env=env, now=1000)
         self.assertEqual(code, 1)
