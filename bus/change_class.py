@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import os
 import re
 import sys
 from pathlib import PurePosixPath
@@ -49,15 +48,6 @@ def parse_patterns(text: str) -> List[str]:
             continue
         out.append(stripped)
     return out
-
-
-def load_patterns(path: str) -> List[str]:
-    """Globs from a sensitive-paths file on disk; missing file means []."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return parse_patterns(fh.read())
-    except OSError:
-        return []
 
 
 def is_docs(path: str) -> bool:

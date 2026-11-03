@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from dashboard import operators
 
 from . import answer, ask_state, brain, criteria_gate, decision_claim, issue_reads, status
-from .github import GitHub, GitHubError, auth_from_env, urllib_transport
+from .github import GitHub, auth_from_env, urllib_transport
 from .labels import needs_human
 
 NEEDS_YOU, CHECK_FIRST, NO_ASK = "needs you", "check first", "no written ask"

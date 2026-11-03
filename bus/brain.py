@@ -3144,13 +3144,6 @@ def _count_unproven(children: List[Dict[str, Any]]) -> Tuple[int, int]:
     return sum(1 for i in children if _unproven(i)) + (waiting - excluded), excluded
 
 
-def _goal_counts(gh: GitHub, repo: str, goal: int,
-                 issue: Optional[Dict[str, Any]] = None) -> Tuple[int, int]:
-    """(tickets that hold the limit, awaiting tickets excluded) among the
-    goal's tickets, from one read of its children."""
-    return _count_unproven(_goal_children(gh, repo, goal, issue))
-
-
 def _goal_unproven(gh: GitHub, repo: str, goal: int,
                    issue: Optional[Dict[str, Any]] = None) -> int:
     """The goal's unproven tickets; ValueError for anything that is not an

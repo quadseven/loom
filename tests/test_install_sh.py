@@ -545,6 +545,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(str(key), result.stderr)
         self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 file")
     def test_an_unreadable_key_file_is_refused(self):
         # Mode 000 has no group or other bits, but the station could not read it.
         key = self.app_key(0o000)

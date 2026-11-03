@@ -1148,12 +1148,6 @@ def ran_rungs(issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
     return {n for n, (_, model) in enumerate(CLIMB, 1) if model in models}
 
 
-def reached_rung(comments: Sequence[Dict[str, Any]]) -> int:
-    """The highest rung the ticket has run on since its ladder last started, 0
-    when none."""
-    return max(tried_rungs(comments), default=0)
-
-
 def issue_model(issue: Dict[str, Any]) -> str:
     match = re.search(r"^Model:[ \t]*(\S+)", str(issue.get("body") or ""), re.M)
     return match.group(1) if match else "unspecified"
