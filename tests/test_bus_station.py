@@ -940,6 +940,50 @@ class ReconcilePullRequestTest(Base):
         self.stale_pr()
         self.assertEqual(sorted(self.fake.names(12)), ["loom:queued", "loom:ticket"])
 
+    def test_merged_pr_outside_window_moves_ticket_to_loom_merged(self):
+        # A merged pull request that fell outside the 100-item closed-pull
+        # window should move the ticket to loom:merged, not loom:queued.
+        self.merged_with("- [x] First works; test.\n")
+        self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"),
+                                         created_at="2030-01-05T00:00:00Z"))
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "lane:codex"}]
+        merged_pr = {"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                     "source": {"issue": {"number": 99, "state": "closed",
+                                          "pull_request": {"merged_at": "2030-01-03T00:00:00Z"},
+                                          "user": {"login": "alice-example"},
+                                          "body": "Refs %s#12" % REPO}}}
+        self.fake.timelines = {12: list(self.fake.events[12]) + [merged_pr]}
+        self.fake.pulls.clear()
+        self.fake.calls.clear()
+        with mock.patch("bus.station.time.time", return_value=4102444800.0):
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        note = [c["body"] for c in self.fake.comments[12]
+                if "Pull request #99 merged" in c["body"]]
+        self.assertTrue(note, "routine note naming merged PR not found: %s" % self.fake.comments[12])
+
+    def test_closed_unmerged_pr_outside_window_requeues_ticket(self):
+        # A closed pull request that was NOT merged should still requeue the ticket.
+        self.merged_with("- [x] First works; test.\n")
+        self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"),
+                                         created_at="2030-01-05T00:00:00Z"))
+        self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "lane:codex"}]
+        closed_pr = {"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
+                     "source": {"issue": {"number": 99, "state": "closed",
+                                          "pull_request": {},
+                                          "user": {"login": "alice-example"},
+                                          "body": "Refs %s#12" % REPO}}}
+        self.fake.timelines = {12: list(self.fake.events[12]) + [closed_pr]}
+        self.fake.pulls.clear()
+        self.fake.calls.clear()
+        with mock.patch("bus.station.time.time", return_value=4102444800.0):
+            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+
     def test_loom_pr_stays_for_an_open_pull_request_in_another_repo(self):
         self.stale_pr(**{"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
                          "source": {"issue": {"state": "open", "pull_request": {},
