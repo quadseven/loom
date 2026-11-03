@@ -342,7 +342,10 @@ class Reverts:
             self._briefed = [str(x) for x in briefed]
         forwarded = kept.get("forwarded")
         if isinstance(forwarded, dict):
-            self._forwarded = {str(k): float(v) for k, v in forwarded.items()}
+            try:
+                self._forwarded = {str(k): float(v) for k, v in forwarded.items()}
+            except (TypeError, ValueError):
+                self._forwarded = {}
         tickets = kept.get("check_tickets")
         if isinstance(tickets, list):
             self._check_tickets = [str(x) for x in tickets]

@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -46,7 +47,7 @@ def ask(question: str, key_ssm: str, region: str, timeout: float = TIMEOUT) -> s
         return ""
     try:
         key = read_ssm(key_ssm, region)
-    except (OSError, ValueError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return ""
     body = json.dumps({"scope": "user",
                        "history": [{"role": "user", "content": question}]}).encode()

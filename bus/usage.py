@@ -28,11 +28,14 @@ def _record(provider: str, lanes: List[str], window: str, used_pct: Optional[flo
 
 def _utc_epoch(value: Any, now: float, relative: bool = True) -> Optional[str]:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return datetime.fromtimestamp(now + value if relative else value, timezone.utc).isoformat()
+        try:
+            return datetime.fromtimestamp(now + value if relative else value, timezone.utc).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return None
     if isinstance(value, str):
         try:
             return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
-        except ValueError:
+        except (ValueError, OverflowError, OSError):
             try:
                 return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
             except ValueError:

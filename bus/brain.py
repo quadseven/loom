@@ -2645,7 +2645,10 @@ def _ticket_area(areas: Dict[str, Dict[str, Any]], ticket: Dict[str, Any]) -> Op
         score = sum(1 for word in words if len(word) > 2 and
                     re.search(r"\b" + re.escape(word) + r"\b", text))
         scores.append((score, area))
-    return sorted(scores, key=lambda pair: (-pair[0], pair[1]))[0][1]
+    best = sorted(scores, key=lambda pair: (-pair[0], pair[1]))[0]
+    # No word in common with any area: the ticket goes to the intake epic,
+    # not to the alphabetically first area.
+    return best[1] if best[0] > 0 else None
 
 
 def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
@@ -4484,7 +4487,7 @@ def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
     for a public-only lane, or a difficulty tier the lane does not run.
     Called when a new ticket is filed, so a branch check is not yet possible."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
-    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     _check_remote_tier(body, lane)
 
@@ -4497,7 +4500,7 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
     tier the lane does not run. The body is checked when the caller has it
     (re-briefing a regression ticket); omitted for a plain queued move."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
-    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is True:
+    if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
@@ -8045,7 +8048,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         gh = GitHub(auth_from_env(), unsubscribe=True)
         gh.status_in_body = True  # read the events in the issue body (loom#1341)
         # Status comments by the trusted writers read as events (bus/status.py).
-        gh.status_authors |= {a.lower() for a in os.environ.get("LOOM_BRIEF_AUTHORS", "").split()}
+        gh.status_authors |= {a.lower() for a in trusted_authors()}
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
         if args.command not in READ_COMMANDS:

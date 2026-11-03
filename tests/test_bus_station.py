@@ -642,6 +642,35 @@ class StationLabelSyncTest(Base):
             self.assertEqual(sorted(json.load(fh)["repos"]), repos)
 
 
+class StationLabelSyncFailureTest(Base):
+    def test_a_repo_that_refuses_a_label_write_does_not_stop_the_others(self):
+        # One archived repo (every write 403) stopped the whole pass before
+        # claims and reports, every 60 seconds, since the ledger records a
+        # repo only after a successful sync.
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        with mock.patch.object(labels_module, "ensure_labels",
+                               side_effect=[GitHubError("POST labels -> 403", 403), []]) as ensure:
+            runner.sync_labels()
+        self.assertEqual([call.args[1] for call in ensure.call_args_list], repos)
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["repos"], repos[1:])
+
+
+class FailureReasonTest(Base):
+    def test_a_credential_shape_in_the_failed_line_is_redacted(self):
+        # The last "failed:" line of the log can be the agent's own output.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.write(os.path.join(self.home, "logs", "codex", "T1.log"),
+                   "[t] T1 start\n[t] T1 failed: provider said token ghp_%s rejected\n"
+                   % ("a1B2c3D4e5F6g7H8i9J0" * 2))
+        reason = runner._failure_reason("codex", "T1")
+        self.assertNotIn("ghp_", reason)
+        self.assertIn("<redacted>", reason)
+
+
 class StationKeepsAppTokenTest(Base):
     """One pass per process: the App token outlives the pass (loom#1306)."""
 
