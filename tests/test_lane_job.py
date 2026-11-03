@@ -353,6 +353,17 @@ class SsmDirAwsTest(unittest.TestCase):
             self.assertEqual(got.returncode, 2, name)
             self.assertNotIn("not a parameter", got.stdout, name)
 
+    def test_an_option_with_no_value_is_refused_not_looped_on(self):
+        # "shift 2" on one remaining argument fails without shifting, so the
+        # argument loop never ended; only the scanner's timeout stopped it.
+        for last in ("--name", "--query", "--region", "--output"):
+            got = subprocess.run(["bash", str(ROOT / "lanes" / "k8s" / "ssm-dir-bin" / "aws"), "ssm",
+                                  "get-parameter", "--name", "/infra/deny", last],
+                                 env={"PATH": os.environ["PATH"], "LOOM_SSM_DIR": str(self.ssm)},
+                                 capture_output=True, text=True, timeout=10)
+            self.assertEqual(got.returncode, 2, last)
+            self.assertIn("needs a value", got.stderr, last)
+
 
 if __name__ == "__main__":
     unittest.main()
