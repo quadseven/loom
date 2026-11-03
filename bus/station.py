@@ -688,10 +688,15 @@ VERIFY_RESERVE_FILE = "verify-reserve.json"
 # attempt ever recorded gets one missing-evidence note (loom#2092): the
 # reserved lane reaches one ticket per VERIFY_RESERVE_EVERY, so the rest of
 # the backlog waited unrecorded -- one ticket sat five days with only its
-# Shipped note. The note pass runs on the reserve's cadence, and a noted
+# Shipped note. The note pass runs every pass ahead of the step rotation
+# (Station._note_every_pass), at most once a VERIFY_NOTE_EVERY, and a noted
 # ticket's note is refreshed in place at most once a VERIFY_NOTE_REFRESH,
-# never re-posted; VERIFY_NOTE_FILE keeps when each was last written.
-VERIFY_NOTE_AFTER = 24 * 3600
+# never re-posted; VERIFY_NOTE_FILE keeps when each was last written. The
+# promise is VERIFY_NOTE_DUE; a ticket is noted VERIFY_NOTE_LEAD early, so
+# the cadence and the gap between passes never carry it past the mark.
+VERIFY_NOTE_DUE = 24 * 3600
+VERIFY_NOTE_LEAD = 3600
+VERIFY_NOTE_AFTER = VERIFY_NOTE_DUE - VERIFY_NOTE_LEAD
 VERIFY_NOTE_EVERY = VERIFY_RESERVE_EVERY
 VERIFY_NOTE_REFRESH = 24 * 3600
 VERIFY_NOTE_FILE = "verify-notes.json"
@@ -5386,7 +5391,6 @@ class Station:
                      self.referee_claims,
                      self.clean_labels,
                      self.queue_stateless_tickets,
-                     self.note_stale_shipped,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.intake_friction, self.report_review_debt,
@@ -5399,6 +5403,7 @@ class Station:
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held)
+        self._note_every_pass()
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
@@ -5440,6 +5445,22 @@ class Station:
                 _write_json(rotation_path, {"next": next_step})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
+
+    def _note_every_pass(self) -> None:
+        """The missing-evidence note pass, run every pass ahead of the step
+        rotation (loom#2092). Its promise is a deadline, and the rotation
+        gives none: on 2026-11-02 one step carried over pass after pass and
+        held the rotation on itself for hours, so seven shipped tickets
+        crossed 24h with no note. The pass's own stamp keeps it to one run
+        per VERIFY_NOTE_EVERY, and nothing it raises stops the step loop."""
+        if self._deferred():
+            return
+        try:
+            self.note_stale_shipped()
+        except TargetReached as err:
+            _say("note_stale_shipped carried over to the next pass: %s" % err)
+        except (GitHubError, OSError, ValueError) as err:
+            _say("note_stale_shipped failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
