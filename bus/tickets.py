@@ -563,7 +563,8 @@ REPLIES_NOTE = (
     "array with one {\"thread\": \"THREAD_ID\", \"reply\": \"TEXT\", \"resolve\": true} "
     "object per thread (THREAD_ID is the id after `### Thread`). When this round's "
     "change fixes the finding, set resolve true and say in the reply what changed "
-    "and where. When you do not fix it, set resolve false and give a concrete reason "
+    "and where; the runner resolves it only when this round's commits change the "
+    "thread's file. When you do not fix it, set resolve false and give a concrete reason "
     "that points at the code. A thread answered in `.loom-answers/` needs no entry "
     "here. The runner posts the entries after the push and reports every listed "
     "thread left without an answer.")

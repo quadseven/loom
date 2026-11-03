@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from bus import hunt_plan, labels, pr_repair, text, tickets  # noqa: E402
-from tests import sandbox_caps  # noqa: E402
+from tests import sandbox_caps, session_procs  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
 ROUND_MARKER = "<!-- loom:lane-round v1 -->"
@@ -104,16 +104,19 @@ if [ "$1" = api ]; then
       printf '%s %s' "${where%/issues/*}" "${where##*/}" > "$store/$id.on"
       cp "${6#body=@}" "$store/$id"; exit 0 ;;
   esac
-  # A review thread's pull request: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
-  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one.
+  # A review thread: every thread is on example/repo#7 except  # leak-guard-allow: fixture repo
+  # the ids listed in $FAKE_GH_FOREIGN_THREADS, which are on another one. It
+  # cites $FAKE_THREAD_PATH and holds the comment $FAKE_THREAD_REPLY.
   case "$*" in
     "api graphql -f query=query("*"node(id:"*)
       thread=""
       for arg in "$@"; do case "$arg" in threadId=*) thread="${arg#threadId=}" ;; esac; done
+      name=example/repo number=7
       case " ${FAKE_GH_FOREIGN_THREADS:-} " in
-        *" $thread "*) echo "example/other#3" ;;  # leak-guard-allow: fixture repo
-        *) echo "example/repo#7" ;;  # leak-guard-allow: fixture repo
+        *" $thread "*) name=example/other number=3 ;;
       esac
+      printf '{"data":{"node":{"path":"%s","pullRequest":{"number":%s,"repository":{"nameWithOwner":"%s"}},"comments":{"nodes":[{"body":"%s"}]}}}}\\n' \
+        "${FAKE_THREAD_PATH:-fix.txt}" "$number" "$name" "${FAKE_THREAD_REPLY:-a finding}"
       exit 0 ;;
   esac
   # The shadow guard reads an issue before it lets a close go: the issue
@@ -735,8 +738,10 @@ print('leak guard: clean (shape patterns only)')
         (self.inbox / name).write_text(text)
 
     def run_lane(self, lane="codex", cwd=None, timeout=60, **env):
-        return subprocess.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
-                              capture_output=True, text=True, timeout=timeout)
+        # In a session of its own, emptied when the run ends or times out, so
+        # no watchdog or agent of a timed-out run outlives the test (loom#2438).
+        return session_procs.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
+                                 timeout=timeout)
 
     def lane_env(self, **env):
         return {
@@ -860,8 +865,7 @@ print('leak guard: clean (shape patterns only)')
         # of this repo there (loom#2418).
         self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
         self.drop_brief()
-        result = subprocess.run(["bash", str(RUNNER), "codex"], env=env,
-                                capture_output=True, text=True, timeout=60)
+        result = session_procs.run(["bash", str(RUNNER), "codex"], env=env, timeout=60)
         self.assertNotIn("unbound variable", result.stderr)
 
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
@@ -2179,6 +2183,26 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                              and "PRRT_elsewhere" in c for c in calls))
         self.assertTrue(any("resolveReviewThread" in c and "PRRT_fake" in c for c in calls))
 
+    def test_fix_runner_leaves_open_a_thread_whose_file_the_round_did_not_change(self):
+        self.fix_brief()
+        replies = '[{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_THREAD_PATH="other.py")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertFalse(any("resolveReviewThread" in c for c in calls))
+
+    def test_a_resent_reply_is_not_posted_twice(self):
+        self.fix_brief()
+        replies = '[{"thread":"PRRT_fake","reply":"Addressed","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies,
+                               FAKE_THREAD_REPLY="Addressed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any("addPullRequestReviewThreadReply" in c for c in calls))
+        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+
     def test_fix_runner_skips_a_reply_the_text_check_refuses(self):
         self.fix_brief()
         # Not ASCII, so bus/text.py and checked_text refuse it.
@@ -2241,7 +2265,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertTrue(any("addPullRequestReviewThreadReply" in c for c in calls))
-        self.assertTrue(any("resolveReviewThread" in c for c in calls))
+        # No commit touched the thread's file, so the reply alone resolves nothing.
+        self.assertFalse(any("resolveReviewThread" in c for c in calls))
         self.assertFalse(any(c.startswith("git push") for c in calls))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
@@ -2844,8 +2869,11 @@ exec /usr/bin/git "$@"
         answers = self.inbox / "answers" / name
         # Only the regular file named for a thread; the symlink, the hard link
         # to a file outside the tree and the FIFO are dropped unread.
-        self.assertEqual(sorted(os.listdir(answers)), ["PRRT_1.md"])
+        self.assertEqual(sorted(os.listdir(answers)), [".head", "PRRT_1.md"])
         self.assertEqual((answers / "PRRT_1.md").read_text(), "Not valid: a.py:2 already guards it.\n")
+        # The round pushed, so its answers stand against the head it pushed.
+        self.assertEqual((answers / ".head").read_text().strip(),
+                         self.remote_head(self.FIX_BRANCH))
         files = subprocess.run(["git", "--git-dir", str(self.remote), "ls-tree", "-r", "--name-only",
                                 self.remote_head(self.FIX_BRANCH)], capture_output=True, text=True).stdout.split()
         self.assertIn("fix.txt", files)
@@ -6566,6 +6594,84 @@ exit %d
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+    def hung_agent(self):
+        """A codex that records its pid and hangs; returns the pid file."""
+        agent_pid = Path(self._tmp.name) / "agent.pid"
+        self.write_tool(self.bin / "codex",
+                        "#!/bin/bash\n"
+                        f"echo $$ > '{agent_pid}'\n"
+                        "exec sleep 120\n")
+        return agent_pid
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_a_run_that_times_out_leaves_no_process_of_its_tree(self):
+        # loom#2438: a test's timeout killed only the runner, and its agent,
+        # the watchdog, its tail -f and its grep lived on for hours.
+        self.drop_brief()
+        agent_pid = self.hung_agent()
+        agent = None
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.run_lane(timeout=15)
+            self.assertTrue(agent_pid.exists(), "the agent never started")
+            agent = int(agent_pid.read_text())
+            for _ in range(20):
+                if not self.alive(agent) and not self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertFalse(self.alive(agent), "the agent outlived the timed-out run")
+            self.assertEqual(self.watchdog_tails(), [])
+        finally:
+            for pid in self.watchdog_tails() + ([agent] if agent else []):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_a_watchdog_ends_itself_once_its_agent_is_gone(self):
+        # loom#2438: the watchdog runs in a group of its own and ended only
+        # when its runner stopped it, so a runner killed first left it, and its
+        # tail -f reader, until a next pass of that lane (in a test, never).
+        self.drop_brief()
+        agent_pid = self.hung_agent()
+        lock = self.loom / "run" / "codex.lock"
+        runner = subprocess.Popen(["bash", str(RUNNER), "codex"],
+                                  env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        try:
+            for _ in range(200):
+                if agent_pid.exists() and agent_pid.read_text().strip() and self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertNotEqual(self.watchdog_tails(), [], "the watchdog never started")
+            watchdog_group = int((lock / "watchdog_pgid").read_text())
+            # The runner and its job-control subshell go first, so nothing is
+            # left to stop the watchdog; then its agent goes.
+            os.killpg(runner.pid, signal.SIGKILL)
+            runner.wait(timeout=5)
+            os.kill(int(agent_pid.read_text()), signal.SIGKILL)
+            for _ in range(60):
+                if not self.watchdog_tails():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(self.watchdog_tails(), [])
+            with self.assertRaises(ProcessLookupError):
+                for _ in range(20):
+                    os.killpg(watchdog_group, 0)
+                    time.sleep(0.1)
+        finally:
+            session_procs.kill_session(runner.pid)
 
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
         # A lock written before watchdog_pgid existed still recovers.

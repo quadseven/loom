@@ -185,7 +185,17 @@ ANSWER_MAX = 3000
 STRONG_MODELS = frozenset(model for _, model in factory.CLIMB)
 THREAD_QUERY = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread { isResolved path'
                 ' pullRequest { number headRefOid repository { nameWithOwner } }'
-                ' comments(first:1) { nodes { body author { __typename login } } } } } }')
+                ' comments(first:1) { nodes { body author { __typename login } } }'
+                ' replies: comments(last:100) { pageInfo { hasPreviousPage startCursor }'
+                ' nodes { body } } } } }')
+# The earlier replies of a review thread, one page back from `before`: a re-sent
+# answer is looked for in every reply, not only the newest page.
+REPLIES_QUERY = ('query($id:ID!,$before:String!) { node(id:$id) { ... on PullRequestReviewThread {'
+                 ' replies: comments(last:100, before:$before) {'
+                 ' pageInfo { hasPreviousPage startCursor } nodes { body } } } } }')
+# Pages read back before a thread counts as holding the reply: past that the
+# station posts nothing rather than risk a second copy.
+REPLY_PAGES = 20
 REPLY_MUTATION = ('mutation($id:ID!,$body:String!) { addPullRequestReviewThreadReply('
                   'input:{pullRequestReviewThreadId:$id,body:$body}) { comment { id } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -1706,6 +1716,16 @@ def _say(msg: str) -> None:
 
 class StateError(Exception):
     """A state file that exists but cannot be read."""
+
+
+def _round_head(folder: str) -> str:
+    """The head a fix round's answers stand on, which the runner writes beside
+    them (lanes/run_lane.sh note_answer_head); empty when it wrote none."""
+    try:
+        with open(os.path.join(folder, ".head"), encoding="ascii") as fh:
+            return fh.read(64).strip()
+    except (OSError, ValueError):
+        return ""
 
 
 def _read_answer(path: str) -> str:
@@ -8019,20 +8039,25 @@ class Station:
         about. It is resolved when the round ran on a ladder model, the
         thread is the review bot's own medium or low finding, and the answer
         holds on the head (bus/rebuttal.py); otherwise it stays open, and the
-        factory reads it as a finding that survived."""
+        factory reads it as a finding that survived. A fix round's answer
+        also has to stand on the head the round recorded (bus/fixrounds.py).
+        asked None is a settle run: it worked from the default branch, so
+        no pull request head is its own."""
         folder = os.path.join(self.inbox(lane), "answers", name)
         try:
             entries = sorted(os.listdir(folder))
         except OSError:
             return
         strong = self._field(brief, "Model") in STRONG_MODELS
+        head = None if asked is None else _round_head(folder)
         try:
             for entry in entries:
                 m = ANSWER_FILE_RE.match(entry)
                 if not (m and (asked is None or m.group(1) in asked)):
                     continue
                 try:
-                    self._answer(repo, prs, lane, m.group(1), os.path.join(folder, entry), strong)
+                    self._answer(repo, prs, lane, m.group(1), os.path.join(folder, entry),
+                                 strong, head)
                 except RateLimited:
                     raise
                 except GitHubError as err:
@@ -8044,7 +8069,7 @@ class Station:
             shutil.rmtree(folder, ignore_errors=True)
 
     def _answer(self, repo: str, prs: Set[int], lane: str, thread_id: str, path: str,
-                strong: bool) -> None:
+                strong: bool, head: Optional[str]) -> None:
         raw = _read_answer(path)
         said = _redacted_answer(raw)
         node = (self.gh.graphql(THREAD_QUERY, {"id": thread_id}) or {}).get("node") or {}
@@ -8058,15 +8083,24 @@ class Station:
         except ValueError as err:
             _say("answer to %s on %s#%d not posted: %s" % (thread_id, repo, pr, err))
             return
+        current = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+        finding = self._picked_up(thread_id, node, current if head is None else head, current)
+        if finding is None:
+            _say("answer to %s on %s#%d refused: lane %s answered head %s, the pull request "
+                 "is at %s" % (thread_id, repo, pr, lane, head or "unknown", current))
+            return
         root = ((node.get("comments") or {}).get("nodes") or [{}])[0] or {}
         # The check reads the lane's own text: redaction drops any long word,
         # a test name the answer cites included (loom#2285).
         settled = (strong and factory._bot_minor(root, self.s.review_bot)
-                   and self._answer_holds(repo, pr, lane, thread_id, node, raw))
-        head = str((node.get("pullRequest") or {}).get("headRefOid") or "")
+                   and self._answer_holds(repo, pr, lane, thread_id, node, raw)
+                   and self._finding_answered(repo, pr, lane, finding, current, raw))
         if settled:
-            body += "\n\n" + rebuttal.held_marker(head)
-        self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
+            body += "\n\n" + rebuttal.held_marker(current)
+        # A re-sent answer posts no second reply: the same text at the same
+        # head is the same body (bus/fixrounds.py).
+        if not self._thread_holds(thread_id, node, body):
+            self.gh.graphql(REPLY_MUTATION, {"id": thread_id, "body": body})
         if settled:
             try:
                 self.gh.graphql(RESOLVE_MUTATION, {"id": thread_id})
@@ -8079,6 +8113,59 @@ class Station:
                 _say("could not resolve %s on %s#%d: %s" % (thread_id, repo, pr, err))
         _say("posted lane %s's answer on %s#%d thread %s%s" % (
             lane, repo, pr, thread_id, " and resolved it" if settled else ""))
+
+    def _thread_holds(self, thread_id: str, node: Dict[str, Any], body: str) -> bool:
+        """Whether any reply on the thread already is `body`, read page by page
+        back to the first; a thread longer than REPLY_PAGES pages counts as
+        holding it, so a re-sent answer is never posted twice."""
+        page = node.get("replies") or {}
+        for _ in range(REPLY_PAGES):
+            if any(n.get("body") == body for n in page.get("nodes") or []):
+                return True
+            info = page.get("pageInfo") or {}
+            if not (info.get("hasPreviousPage") and info.get("startCursor")):
+                return False
+            older = self.gh.graphql(REPLIES_QUERY, {"id": thread_id,
+                                                    "before": info["startCursor"]}) or {}
+            page = (older.get("node") or {}).get("replies") or {}
+        _say("did not post on %s: its replies run past %d pages" % (thread_id, REPLY_PAGES))
+        return True
+
+    def _keep_finding(self, finding: Dict[str, Any]) -> None:
+        try:
+            fixrounds.record_finding(fixrounds.findings_path(self.s.home), finding)
+        except OSError as err:
+            # Each answer is checked on GitHub again, so a lost record costs
+            # only the state of a finding, never a wrong answer.
+            _say("could not record finding %s: %s" % (finding.get("id"), err))
+
+    def _picked_up(self, thread_id: str, node: Dict[str, Any], revision: str,
+                   current: str) -> Optional[Dict[str, Any]]:
+        """The finding at the answer's revision, picked up; None when that
+        revision is not the pull request's head."""
+        known = fixrounds.load_findings(fixrounds.findings_path(self.s.home))
+        finding = (known.get(fixrounds.finding_key(thread_id, revision))
+                   or fixrounds.pending_finding(thread_id, str(node.get("path") or ""),
+                                                revision))
+        picked = fixrounds.transition_finding(finding, "picked_up", revision, current)
+        if picked is not None:
+            self._keep_finding(picked)
+        return picked
+
+    def _finding_answered(self, repo: str, pr: int, lane: str, finding: Dict[str, Any],
+                          current: str, said: str) -> bool:
+        """Record an accepted answer: a "Fixed in <sha>" answer needs a commit
+        that touches the finding's file, any other is the reason accepted."""
+        sha = rebuttal.fixed_sha(said)
+        commit, files = rebuttal.commit_files(self.gh, repo, sha) if sha else ("", [])
+        answered = fixrounds.transition_finding(finding, "answered", finding["revision"], current,
+                                                commit, files, reason_accepted=not sha)
+        if answered is None:
+            _say("left %s on %s#%d open: lane %s's commit %s does not touch %s"
+                 % (finding["id"], repo, pr, lane, sha, finding["path"]))
+            return False
+        self._keep_finding(answered)
+        return True
 
     def _answer_holds(self, repo: str, pr: int, lane: str, thread_id: str,
                       node: Dict[str, Any], said: str) -> bool:
