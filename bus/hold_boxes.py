@@ -33,7 +33,11 @@ _STRONG_HOLD = re.compile(
     r"|\bdecides? to merge\b",
     re.I,
 )
-_WEAK_HOLD = re.compile(r"\bbefore\b[^\n]*?\bmerg(?:e|es|ed|ing)\b", re.I)
+_WEAK_HOLD = re.compile(
+    r"\bbefore\s+(?:(?:the|this)\s+)?(?:merge|merging)\b"
+    r"|\bbefore\s+(?:it|this pull request|the pull request)\s+merges\b",
+    re.I,
+)
 _AFTER_MERGE = re.compile(
     r"^\s*(?:\*\*)?live\b\s*(?:\*\*)?:"
     r"|\bafter (?:the )?(?:deploy\w*|roll\w*|merg\w*)\b",
