@@ -165,6 +165,19 @@ HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Delive
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+
+
+def _utc_time(value: str) -> bool:
+    """Whether `value` is a real UTC time in the Not before form: the shape
+    alone let 2026-02-30T00:00:00Z through, and not_before then raised in
+    the station's claim step on every pass."""
+    if not NOT_BEFORE_RE.fullmatch(value):
+        return False
+    try:
+        time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 # "After: #5, owner/name#7": the ticket builds on those tickets, and is not
 # claimed until each of them is merged.
 _AFTER_ITEM = r"(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+"
@@ -238,7 +251,7 @@ _HEADER_RULES = {
               lambda v: "Model: %r is not a model id" % v),
     "Base": (lambda v: bool(BASE_RE.fullmatch(v)),
              lambda v: "Base: %r is not a branch name" % v),
-    "Not before": (lambda v: bool(NOT_BEFORE_RE.fullmatch(v)),
+    "Not before": (lambda v: _utc_time(v),
                    lambda v: "Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % v),
     "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
               lambda v: "After: %r is not a list of tickets like '#5' or "

@@ -44,7 +44,7 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence
 
 # Unlanded idle trees kept with commits on no remote; older ones are bundled
 # and removed.

@@ -6424,3 +6424,30 @@ class FleetHoldTests(unittest.TestCase):
 
 
 NOW_2393 = datetime(2030, 1, 1, 14, 0, tzinfo=timezone.utc)
+
+
+class TicketAreaTest(unittest.TestCase):
+    AREAS = {"billing": {"description": "Invoices and payments"},
+             "stability": {"description": "Service stability"}}
+
+    def test_a_ticket_with_no_word_in_common_gets_no_area(self):
+        # Every score was 0 and the alphabetically first area won, so a
+        # dashboard ticket was filed under the billing epic.
+        ticket = {"title": "Fix the dashboard clock", "body": "The clock drifts.", "labels": []}
+        self.assertIsNone(brain._ticket_area(self.AREAS, ticket))
+
+    def test_a_matching_word_still_picks_the_area(self):
+        ticket = {"title": "Stability alert is stuck", "body": "", "labels": []}
+        self.assertEqual(brain._ticket_area(self.AREAS, ticket), "stability")
+
+
+class RemoteLaneRepoReadTest(unittest.TestCase):
+    def test_a_repo_read_that_does_not_say_public_refuses_the_public_only_lane(self):
+        # An answer with no private field was read as public; like the
+        # foreign-ref check, an unreadable repo is treated as private.
+        for data in ({}, {"private": None}):
+            fake = Fake(reply(200, goal()), reply(200, []), reply(200, data))
+            gh = GitHub("t", transport=fake)
+            with self.assertRaisesRegex(ValueError, "this repo is private"):
+                brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+            self.assertFalse(any(c[0] == "POST" for c in fake.calls))

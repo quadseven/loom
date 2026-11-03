@@ -5251,14 +5251,6 @@ class Station:
                         # Check if it moved to merged
                         if "loom:merged" in _label_names(ticket):
                             _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
-                    ticket = tickets_by_number.get(number)
-                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
-                        # This is a contributor-linked ticket
-                        pool = tickets_by_number if merged else waiting
-                        self._reconcile_pr_ticket(repo, pr, pool, landed)
-                        # Check if it moved to merged
-                        if "loom:merged" in _label_names(ticket):
-                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
@@ -6632,7 +6624,12 @@ class Station:
                 continue
             prs = self._open_pulls(repo)
             for issue in issues:
-                self._hand_back_ticket(repo, issue, prs, rounds)
+                try:
+                    self._hand_back_ticket(repo, issue, prs, rounds)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("hand_back of %s#%s failed: %s" % (repo, issue.get("number"), err))
 
     def release_factory_held(self) -> None:
         """Re-queue tickets a factory incident held once that incident is
@@ -8342,7 +8339,10 @@ class Station:
                         reason = m.group(1)
         except OSError:
             pass
-        return scrub(reason) or "no reason was recorded"
+        # The agent's own output is in the log too, so the line is scrubbed
+        # for credential shapes. Not SECRET_RE: its long-token rule would
+        # take the timed-out branch name the retry reads from this line.
+        return scrub(_text.CREDENTIAL_RE.sub("<redacted>", reason)) or "no reason was recorded"
 
     def _relabel(self, repo: str, number: int, new: str, wait: str = "") -> None:
         """Move a running ticket to `new`, with wait:<wait> as its only wait
@@ -14742,7 +14742,16 @@ class Station:
         if not todo:
             return
         for repo in todo:
-            changed = labels.ensure_labels(self.gh, repo)
+            # One repo that refuses a label write (archived, or an App with
+            # no issues:write there) is tried again next pass; the rest of
+            # the pass goes on, and so do the other repos.
+            try:
+                changed = labels.ensure_labels(self.gh, repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("label sync failed in %s: %s" % (repo, err))
+                continue
             if changed:
                 _say("labels changed in %s: %s" % (repo, ", ".join(changed)))
             synced.append(repo)
@@ -14786,7 +14795,12 @@ class Station:
             # A disk under the floor takes no new work (loom#1808); a pass
             # still finishes half-done claims, reconciles and prunes.
             if not self.disk_low():
-                self._timed(self.claim_new)
+                try:
+                    self._timed(self.claim_new)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("claim_new failed: %s" % err)
             if not self._deferred():
                 try:
                     self._timed(self.assign_queued)

@@ -696,3 +696,16 @@ class ThisRunSectionTest(unittest.TestCase):
         self.assertIn("a `claim:quadseven` label on a `loom:running` ticket is the station's "
                       "lane claim, so it is the lane's own claim", text)
         self.assertIn("lanes skip the claim, Buzz and journal steps", text)
+
+
+class NotBeforeHeaderTest(unittest.TestCase):
+    def test_an_impossible_calendar_date_is_refused_by_parse(self):
+        # The shape check let 2026-02-30 through, and not_before then raised
+        # in the station's claim step on every pass until a person edited it.
+        with self.assertRaisesRegex(ValueError, "Not before"):
+            parse("Not before: 2026-02-30T00:00:00Z\nDifficulty: easy\n\n## Why\nx\n")
+
+    def test_a_real_utc_time_still_parses(self):
+        headers, _ = parse("Not before: 2026-02-28T23:59:59Z\nDifficulty: easy\n\n## Why\nx\n")
+        self.assertEqual(headers["Not before"], "2026-02-28T23:59:59Z")
+        self.assertIsNotNone(tickets.not_before(headers))

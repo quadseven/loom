@@ -115,3 +115,14 @@ class BrainEnvTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlowKeyReadTest(unittest.TestCase):
+    def test_a_timed_out_key_read_is_no_answer(self):
+        # read_ssm bounds the aws call with a timeout, whose error is not an
+        # OSError; it used to escape ask and end the station pass.
+        import subprocess
+        with mock.patch("bus.fabric.read_ssm", side_effect=subprocess.TimeoutExpired("aws", 30)), \
+                mock.patch("urllib.request.urlopen") as op:
+            self.assertEqual(fabric.ask("q", "/k", "us-east-1"), "")
+        op.assert_not_called()

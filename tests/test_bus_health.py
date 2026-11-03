@@ -1115,3 +1115,23 @@ class Settle(Base):
         self.assertEqual(self.closes(), [])
         self.pass_at(NOW + 3 * self.DAY)
         self.assertEqual(len(self.closes()), 1)
+
+
+class DeploymentStatusRevert(unittest.TestCase):
+    """A merged pull request that a later merged pull request reverted is
+    not reported as deployed: the revert check reads the ticket's other
+    merged pull requests, which used to be passed as an empty list."""
+
+    def test_a_reverted_pull_request_is_not_deployed(self):
+        merged = {"number": 123, "merged_at": "2026-10-01T00:00:00Z",
+                  "merge_commit_sha": "a" * 40}
+        revert = {"number": 124, "merged_at": "2026-10-02T00:00:00Z",
+                  "merge_commit_sha": "b" * 40}
+        with unittest.mock.patch.object(health, "_merged_prs_for_ticket", return_value=[merged, revert]), \
+                unittest.mock.patch.object(health, "_default_branch", return_value="main"), \
+                unittest.mock.patch.object(health, "_carries", return_value=True):
+            found = health._prs_with_deployment_status(
+                FakeGitHub(), REPO, 7, 0.0, env={"LOOM_SHIP_ON_MERGE": REPO})
+        self.assertEqual(found[0][0], 123)
+        self.assertNotEqual(found[0][1], "deployed")
+        self.assertEqual(found[1], (124, "deployed"))
