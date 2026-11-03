@@ -149,6 +149,9 @@ class FakeGH:
             if pull is None:
                 raise GitHubError("Not Found", 404)
             return Response(200, dict(pull, number=int(m.group(2))))
+        if m and method == "PATCH":
+            self.pull_state.setdefault((m.group(1), int(m.group(2))), {}).update(body)
+            return Response(200, {})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/pulls\?state=open&per_page=100", path)
         if m:
             return Response(200, self.pulls.get(m.group(1), []))
@@ -827,6 +830,33 @@ class SettledSubjectTest(StationBase):
         self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
         self.run_at(T0 + invariants.CHECK_EVERY)
         self.assertEqual(filed["state"], "closed", self.said)
+
+    def test_a_failed_rewritten_ticket_closes_when_its_named_pull_merged(self):
+        filed = self.legacy("lane-pr-stalled", "%s#660" % REPO,
+                             labels=["loom:ticket", "loom:failed", invariants.LABEL])
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "closed", self.said)
+        self.assertEqual(filed["state_reason"], "not_planned")
+
+    def test_a_person_claim_keeps_a_rewritten_ticket_open(self):
+        filed = self.legacy("lane-pr-stalled", "%s#660" % REPO,
+                             labels=["loom:ticket", "loom:failed", "claim:operator",
+                                     invariants.LABEL])
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(filed["state"], "open", self.said)
+
+    def test_a_rewritten_ticket_closes_its_open_lane_pull_with_a_comment(self):
+        filed = self.legacy("lane-pr-stalled", "%s#660" % REPO,
+                             labels=["loom:ticket", "loom:failed", invariants.LABEL])
+        filed["body"] += "\nFix pull request #777\n"
+        self.leave_open_set(merged_at=stamp(T0 + 100), closed_at=stamp(T0 + 100))
+        self.gh.pull_state[(REPO, 777)] = {"state": "open"}
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.assertEqual(self.gh.pull_state[(REPO, 777)]["state"], "closed")
+        self.assertIn("closing this lane pull request",
+                      self.gh.comments[(REPO, 777)][0]["body"])
 
     def test_an_old_issue_whose_finding_is_still_live_folds_into_the_tracking_issue(self):
         filed = self.legacy("lane-pr-stalled", "%s#660" % REPO)

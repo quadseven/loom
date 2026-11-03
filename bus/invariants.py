@@ -1835,7 +1835,18 @@ class Filer:
             if (key in current or invariant not in SETTLES or key in self._rolls
                     or number in self._listed_closed):
                 continue
-            if number in self._busy:
+            ticket = number in self._ticketed
+            labels = self._label_names(self._issue(number) or {}) if ticket else []
+            person_claim = any(label.startswith("claim:") and label != "claim:quadseven"
+                               for label in labels)
+            ticket_state = tickets.ticket_state({"labels": [{"name": n} for n in labels]})
+            rewritten_idle = (ticket_state in ("queued", "briefed", "failed", "answered")
+                              and not any(label.startswith("needs:") for label in labels))
+            if person_claim:
+                self.say("invariants: left rewritten ticket %s#%d open: held by a person"
+                         % (self.repo, number))
+            if number in self._busy and not (ticket and invariant == "lane-pr-stalled"
+                                              and rewritten_idle and not person_claim):
                 # Rewritten into work something has in hand: its own path
                 # closes it. An idle one settles like the issue it was
                 # (loom#2506: five whose pull requests had closed held goal
@@ -1849,8 +1860,33 @@ class Filer:
             issue = self._issue(number)
             if issue is None or issue.get("state") != "open":
                 self.subjects.pop(key, None)
+            elif ticket and invariant == "lane-pr-stalled":
+                if self._close_rewritten_ticket(key, number, issue, why, current):
+                    self.subjects.pop(key, None)
             elif self._close_settled(key, number, issue, why, current):
                 self.subjects.pop(key, None)
+
+    def _close_rewritten_ticket(self, key: str, number: int, issue: Dict[str, Any],
+                                why: str, current: Dict[str, Breach]) -> bool:
+        """Close a rewritten stalled-PR ticket and any lane PR it names."""
+        body = str(issue.get("body") or "")
+        subject = self._subject_of(key)
+        subject_number = int(subject.rsplit("#", 1)[1]) if subject else None
+        pull = next((match for match in re.finditer(
+            r"(?i)pull request #([1-9][0-9]*)", body)
+            if int(match.group(1)) != subject_number), None)
+        if self.writes + (4 if pull is not None else 2) > WRITES_MAX:
+            return False
+        if pull is not None:
+            pull_number = int(pull.group(1))
+            path = "/repos/%s/pulls/%d" % (self.repo, pull_number)
+            pull_issue = self.gh.rest("GET", path).data
+            if isinstance(pull_issue, dict) and pull_issue.get("state") == "open":
+                note = "The stalled %s has ended; closing this lane pull request." % why.rstrip(".")
+                _text.check(note)
+                closing.close_pull(self.gh, self.repo, pull_number, note)
+                self.writes += 2
+        return self._close_settled(key, number, issue, why, current)
 
     def _settled_why(self, invariant: str, subject: str, number: int) -> Optional[str]:
         """The caller's word on whether the subject settled; None when it has
