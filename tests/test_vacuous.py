@@ -30,6 +30,31 @@ class VacuousTests(unittest.TestCase):
         patch = "@@\n-EXPECTED = {'x': 0}\n+EXPECTED = {'x': 1}\n"
         self.assertEqual(vacuous.fixture_users(tests, patch), ["test_uses_expected"])
 
+    def test_added_test_locals_are_not_changed_fixtures(self):
+        source = (
+            "def world(title, **kw): return title\n"
+            "class TestNew(unittest.TestCase):\n"
+            " def test_first(self):\n  cat = world(title='one')\n"
+            "  self.assertTrue(cat)\n"
+            " def test_second(self):\n  p = plan(title='two')\n"
+            "  self.assertTrue(p)\n"
+            "class TestExisting(unittest.TestCase):\n"
+            " def test_cat(self): self.assertTrue(cat)\n"
+            " def test_title(self): self.assertTrue(title)\n")
+        patch = (
+            "@@ -1,1 +1,1 @@\n-def world(title): return title\n"
+            "+def world(title, **kw): return title\n"
+            "@@ -2,0 +3,6 @@\n"
+            "+class TestNew(unittest.TestCase):\n"
+            "+ def test_first(self):\n+  cat = world(title='one')\n"
+            "+  self.assertTrue(cat)\n"
+            "+ def test_second(self):\n+  p = plan(title='two')\n"
+            "+  self.assertTrue(p)\n")
+        self.assertEqual(vacuous.changed_test_names(
+            "tests/test_new.py", source, patch), [
+                "tests.test_new.TestNew.test_first",
+                "tests.test_new.TestNew.test_second"])
+
     def test_ticket_request_for_fixture_changes_exempts_fixture_finding(self):
         tests = "EXPECTED = {'x': 1}\ndef test_expected():\n assert EXPECTED\n"
         finding = vacuous.diff_findings(

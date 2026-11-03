@@ -103,26 +103,59 @@ def container_lookup_overrides(source: str, patch: str = "") -> List[str]:
 
 
 def _changed_identifiers(patch: str) -> Set[str]:
-    changed = set()
-    lines = patch.splitlines()
-    for index, line in enumerate(lines):
-        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
+    changed: Set[str] = set()
+    current = 0
+    edits: Dict[int, str] = {}
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            current = int(match.group(1)) if match else 0
+        elif line.startswith(("+++", "---")):
             continue
-        text = line[1:]
-        match = re.match(r"\s*(?:async\s+def|def|class)\s+([A-Za-z_]\w*)", text)
-        if not match:
-            match = re.match(r"\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=", text)
-        if match:
-            changed.add(match.group(1))
-        if line[0] in "+-":
-            for context in reversed(lines[max(0, index - 8):index]):
-                if context.startswith("@@"):
-                    break
-                if context.startswith(" "):
-                    assignment = re.match(r"\s+([A-Za-z_]\w*)\s*=\s*[\[{(]", context)
-                    if assignment:
-                        changed.add(assignment.group(1))
-                        break
+        elif line.startswith("+"):
+            edits[current] = line[1:]
+            current += 1
+        elif line.startswith("-"):
+            # The old line number is not useful for the current source tree.
+            pass
+        elif line.startswith(" "):
+            current += 1
+    if not edits:
+        return changed
+
+    # Names bound inside functions are local implementation details.
+    function_indent = -1
+    class_indent = -1
+    class_is_test = False
+    for number, text in edits.items():
+        stripped = text.lstrip()
+        indent = len(text) - len(stripped)
+        if stripped.startswith(("def ", "async def ")):
+            function_indent = indent
+            match = re.match(r"(?:async\s+)?def\s+([A-Za-z_]\w*)", stripped)
+            if indent == 0 and match and "**" not in stripped:
+                changed.add(match.group(1))
+            continue
+        if stripped.startswith("class "):
+            if indent == 0:
+                class_indent = indent
+                class_is_test = bool(re.match(r"class\s+Test", stripped))
+                match = re.match(r"class\s+([A-Za-z_]\w*)", stripped)
+                if match and not class_is_test:
+                    changed.add(match.group(1))
+            continue
+        if function_indent >= 0 and indent > function_indent:
+            continue
+        if indent == 0:
+            function_indent = -1
+            class_indent = -1
+            assignment = re.match(r"([A-Za-z_]\w*)\s*(?::[^=]+)?=", stripped)
+            if assignment:
+                changed.add(assignment.group(1))
+        elif class_indent >= 0 and indent > class_indent and not class_is_test:
+            assignment = re.match(r"([A-Za-z_]\w*)\s*(?::[^=]+)?=", stripped)
+            if assignment:
+                changed.add(assignment.group(1))
     return changed
 
 
