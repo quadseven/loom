@@ -84,6 +84,18 @@ answers the station's live usage readings, `{readings, received_at}`, to the
 same two tokens: a brain off the lane machine reads usage there
 (`python3 -m bus.usage --live`), never from its own machine's files.
 
+The station's posted snapshots live in the same database too, so every
+dashboard replica serves the same ones and a restart keeps the last of each
+(loom#2530): the table `dashboard_snapshots`, created on first use, holds one
+row per key (`usage`, `chain`, `chain_seen`, `goal_caps`, `brain_holds`,
+`bench`) with the snapshot as JSONB and the writer's time; a write never
+replaces a newer one. `POST /api/usage`, `/api/chain`, `/api/goal-caps` and
+`/api/brain-holds` answer 503 when the database refuses the write, so the
+station sends it again. A page read takes newer rows at most every 5 seconds,
+and after a failed read serves this process's memory for a minute. Without a
+configured database (or with `LOOM_TRANSCRIPTS_MEMORY=1`) each process keeps
+these in its own memory, which is safe for one replica only.
+
 The Floor's lane strip (loom#2157) shows every lane the Lanes page shows,
 with the open tickets in flight on it (briefed, running, pull request,
 merged, shipped, by the ticket's `lane:` label) and what the lane is doing:
@@ -402,7 +414,9 @@ gateway target's name (the lane, or the lane a numbered slot belongs to). A
 lane whose configured model (`LOOM_<LANE>_MODEL` in the station's
 environment) is benched on it steps aside like a lane that is down. Loom's
 own run outcomes do not feed the decision: a stored run does not say whether
-a failure was a limit. `LOOM_BENCH_STATE_FILE` keeps the dashboard's bench
-state across a restart; without it a restart starts empty and benches again
+a failure was a limit. With the database configured, each pass starts
+from the stored bench list and stores the result, so every replica publishes
+one list. `LOOM_BENCH_STATE_FILE` also keeps the dashboard's bench
+state across a restart; without either a restart starts empty and benches again
 from the window's failures.
 

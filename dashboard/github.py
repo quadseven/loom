@@ -19,7 +19,7 @@ from bus import answer, brain, fixrounds, handoff, labels, status, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import bench_store, free_view, goals, needs_you, operators, tiers_sources, transcripts, views
+from . import bench_store, free_view, goals, needs_you, operators, station_state, tiers_sources, transcripts, views
 
 
 READ_WORKERS = 8
@@ -326,6 +326,10 @@ class TicketStore:
         # The models benched for everyone (loom#969), decided each pass from
         # the gateway's call records.
         self.bench = bench_store.BenchStore.from_env()
+        # The station's posted snapshots and the bench list in the database,
+        # so every replica serves the same ones (loom#2530); None keeps them
+        # in this process only.
+        self.station_state = station_state.from_env()
 
     def _snapshot_get(self, key):
         return self._snapshot[key]
@@ -1177,7 +1181,7 @@ class TicketStore:
                 self._read_operator_asks(snapshot, previous_items)
             self._read_latest_runs(snapshot)
             self.tier_sources.refresh()
-            self.bench.update(self.tier_sources.snapshot())
+            station_state.bench_pass(self, self.tier_sources.snapshot())
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)

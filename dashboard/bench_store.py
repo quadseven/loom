@@ -9,7 +9,9 @@ station, Grug and the gateway read one list.
 The state is kept in memory and, when LOOM_BENCH_STATE_FILE is set, in that
 file (written whole, then renamed), so a restart keeps the doubled cooldowns.
 Without the file a restart starts empty and the next pass benches again from
-the window's failures.
+the window's failures. With the dashboard's database configured, each pass
+also starts from and stores the shared list (dashboard/station_state.py
+bench_pass), so every replica publishes one list.
 """
 from __future__ import annotations
 
@@ -89,6 +91,13 @@ class BenchStore:
         for event in events:
             LOG.info("bench %s: %s %s (%s)", event["kind"], event["provider"], event["model"], event["reason"])
         return events
+
+    def adopt(self, state: Mapping[str, Any]) -> None:
+        """Take the bench state another replica stored (dashboard/station_state.py)."""
+        with self._lock:
+            if dict(state) != self.state:
+                self.state = dict(state)
+                self._save()
 
     def snapshot(self, now: Optional[float] = None) -> Dict[str, Any]:
         with self._lock:

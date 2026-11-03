@@ -32,6 +32,7 @@ from .shell import page
 from . import transcripts as transcript_store
 from . import usage as usage_store
 from . import brain_memory
+from . import station_state
 from . import ticket as ticket_view
 from . import goals as goals_view
 from . import ticket_data
@@ -1033,13 +1034,30 @@ def _handle_usage_post(handler, state):
         return handler.send_json(401, {"error": "unauthorized"})
     try:
         body = _json_body(handler)
+        station_state.sync(state, force=True)
         store = getattr(state, "usage", None)
         if store is None:
             store = usage_store.Store()
             state.usage = store
-        return handler.send_json(201, store.upload(body))
+        result = store.upload(body)
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
+    return _publish(handler, state, result, "usage")
+
+
+def _publish(handler, state, result, *keys):
+    """Store the snapshots a station POST just changed, so every replica
+    serves them (loom#2530), then answer 201; 503 when the database refuses,
+    so the station sends it again."""
+    values = {"usage": lambda: station_state.usage_value(state),
+              "chain_seen": lambda: list(getattr(state, "chain_seen", None) or ())}
+    try:
+        for key in keys:
+            value = values[key]() if key in values else getattr(state, key)
+            station_state.publish(state, key, value)
+    except station_state.errors():
+        return handler.send_json(503, {"error": "station snapshot storage unavailable"})
+    return handler.send_json(201, result)
 
 
 def _handle_goal_caps_post(handler, state):
@@ -1051,7 +1069,7 @@ def _handle_goal_caps_post(handler, state):
         state.goal_caps = needs_you_view.goal_caps(_json_body(handler), time.time())
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
-    return handler.send_json(201, {"goals": len(state.goal_caps["goals"])})
+    return _publish(handler, state, {"goals": len(state.goal_caps["goals"])}, "goal_caps")
 
 
 def _handle_brain_holds_post(handler, state):
@@ -1064,7 +1082,7 @@ def _handle_brain_holds_post(handler, state):
         state.brain_holds = needs_you_view.brain_holds(_json_body(handler), time.time())
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
-    return handler.send_json(201, {"repos": len(state.brain_holds["repos"])})
+    return _publish(handler, state, {"repos": len(state.brain_holds["repos"])}, "brain_holds")
 
 
 def _handle_chain_post(handler, state):
@@ -1074,12 +1092,15 @@ def _handle_chain_post(handler, state):
         return handler.send_json(401, {"error": "unauthorized"})
     try:
         now = time.time()
-        state.chain = chain_view.chain_snapshot(_json_body(handler), now)
+        snapshot = chain_view.chain_snapshot(_json_body(handler), now)
     except (ValueError, json.JSONDecodeError) as exc:
         return handler.send_json(400, {"error": str(exc)})
-    # The post is the station's heartbeat on /fleet.
+    # The beats other replicas took are read first, so the stored list keeps
+    # them; the post is the station's heartbeat on /fleet.
+    station_state.sync(state, force=True)
+    state.chain = snapshot
     fleet.remember_beat(state, now)
-    return handler.send_json(201, {"repos": len(state.chain["repos"])})
+    return _publish(handler, state, {"repos": len(state.chain["repos"])}, "chain", "chain_seen")
 
 
 # Brain memory (dashboard/brain_memory.py): the station writes ticks,
@@ -1120,6 +1141,8 @@ def _handler_for(state):
     """Keep GET dispatch small; route groups are handled by module helpers."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path.split("?", 1)[0] not in ("/livez", "/readyz"):
+                station_state.sync(state)
             return _dispatch_get(self, state)
 
         def do_POST(self):
