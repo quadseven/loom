@@ -190,8 +190,12 @@ class Findings(unittest.TestCase):
                          ["medium dead-code"])
 
     def test_an_answered_high_or_bad_work_finding_blocks_even_when_held(self):
-        # loom#2519: an answer the station held does not stand in for a fix
-        # commit on a high, critical or bad-work finding; it fails open.
+        """loom#2519 acceptance: a resolved high or bad-work finding whose
+        thread is in `held` still blocks the merge with no fix commit after
+        it. An answer the station held no longer stands in for the fix, so
+        this replaces the #2285 tests that pinned the opposite,
+        `test_a_resolved_finding_whose_answer_held_on_the_head_does_not_block`
+        and `test_a_finding_answered_and_held_on_the_head_does_not_hold_the_merge`."""
         for body, want in ((self.INTENT, "high intent-mismatch"),
                            (self.DEAD, "medium dead-code")):
             with self.subTest(want=want):
