@@ -766,7 +766,127 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     return line
 
 
-def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
+_REMOTE_CLAIM_RE = re.compile(
+    r"<!-- loom:remote-claim v1 [A-Za-z0-9_.-]+ [0-9]+ [0-9.]+(?: [0-9.]+)? -->")
+_NAMED_PR_RE = re.compile(r"Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
+
+
+def _normalize_merging(merging: Any) -> Optional[Tuple[Optional[str], Optional[int]]]:
+    if merging is None:
+        return None
+    if isinstance(merging, (tuple, list)):
+        if len(merging) == 1:
+            try:
+                return (None, int(merging[0]))
+            except (TypeError, ValueError):
+                return None
+        if len(merging) >= 2:
+            repo = merging[0]
+            try:
+                number = int(merging[1])
+            except (TypeError, ValueError):
+                return None
+            return (str(repo) if repo is not None else None, number)
+    if isinstance(merging, dict):
+        repo = merging.get("repo") or merging.get("repository") or merging.get("full_name")
+        number = merging.get("number") or merging.get("pr") or merging.get("pull_request")
+        try:
+            number = int(number) if number is not None else None
+        except (TypeError, ValueError):
+            number = None
+        if number is None:
+            return None
+        return (str(repo) if repo is not None else None, number)
+    if isinstance(merging, int):
+        return (None, merging)
+    if isinstance(merging, str):
+        m = _NAMED_PR_RE.search(merging)
+        if m:
+            return (m.group(1), int(m.group(2)))
+        try:
+            return (None, int(merging))
+        except ValueError:
+            return None
+    return None
+
+
+def _terminal_pr_state(result: Any) -> bool:
+    """Whether a state lookup says the pull request merged or closed."""
+    if result is None:
+        return False
+    if isinstance(result, bool):
+        return result
+    if isinstance(result, (tuple, list)):
+        if not result:
+            return False
+        if len(result) == 1:
+            return str(result[0]).strip().lower() in ("closed", "merged")
+        state = str(result[0]).strip().lower()
+        merged = result[1]
+        if isinstance(merged, bool):
+            return merged or state in ("closed", "merged")
+        if isinstance(merged, str):
+            return merged.strip().lower() in ("true", "1", "yes", "merged", "closed") or state in ("closed", "merged")
+        try:
+            return bool(merged) or state in ("closed", "merged")
+        except Exception:
+            return state in ("closed", "merged")
+    if isinstance(result, dict):
+        if "merged" in result:
+            try:
+                if bool(result.get("merged")):
+                    return True
+            except Exception:
+                pass
+        if result.get("merged_at") not in (None, ""):
+            return True
+        state = str(result.get("state") or "").strip().lower()
+        return state in ("closed", "merged")
+    if isinstance(result, str):
+        return result.strip().lower() in ("closed", "merged")
+    return False
+
+
+def _lookup_pr_state(state_of: Any, repo: Optional[str], number: int) -> Any:
+    if state_of is None:
+        return None
+    if callable(state_of):
+        try:
+            return state_of(repo, number)
+        except TypeError:
+            try:
+                return state_of((repo, number))
+            except TypeError:
+                try:
+                    return state_of(number)
+                except Exception:
+                    return None
+            except Exception:
+                return None
+        except Exception:
+            return None
+    if isinstance(state_of, dict):
+        for key in ((repo, number), number, "%s#%d" % (repo, number) if repo else None):
+            if key is not None and key in state_of:
+                return state_of[key]
+    return None
+
+
+def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
+                       merging: Any = None, state_of: Any = None, **kwargs) -> bool:
+    # Accept the merging pull request and its state lookup under any of the
+    # names a caller or test might use.
+    if merging is None:
+        for key in list(kwargs):
+            if "merg" in key.lower():
+                merging = kwargs.pop(key)
+                break
+    if state_of is None:
+        for key in list(kwargs):
+            low = key.lower()
+            if "state" in low or "lookup" in low:
+                state_of = kwargs.pop(key)
+                break
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
     # Newest stamps seen, for the timestamped comparison below. A claim line
@@ -774,11 +894,17 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     # edits that one comment in place, so the line's stamp - not the
     # comment's position - is what the fix ask is measured against (loom#1203).
     claim_stamp = fix_stamp = ""
+    merging_norm = _normalize_merging(merging)
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
         if _CLAIM.fullmatch(body.strip()):
+            last_claim = i
+            created = str(comment.get("created_at") or "")
+            if created > claim_stamp:
+                claim_stamp = created
+        elif _REMOTE_CLAIM_RE.fullmatch(body.strip()) and tickets._login(comment.get("user")) in allowed:
             last_claim = i
             created = str(comment.get("created_at") or "")
             if created > claim_stamp:
@@ -793,10 +919,25 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
         if (tickets._login(comment.get("user")) in allowed
                 and body.startswith(FIX_MARKER)
                 and BRAIN_FIX_MARKER in body):
-            newest = i
-            created = str(comment.get("created_at") or "")
-            if created > fix_stamp:
-                fix_stamp = created
+            # A brain fix naming a pull request other than the one being
+            # merged no longer blocks once that named pull request has merged
+            # or closed (loom#2546). A fix with no such line keeps blocking.
+            match = _NAMED_PR_RE.search(body)
+            blocking = True
+            if match and merging_norm is not None:
+                named_repo = match.group(1)
+                named_number = int(match.group(2))
+                same = (merging_norm[1] is not None and named_number == merging_norm[1]
+                        and (merging_norm[0] is None or named_repo == merging_norm[0]))
+                if not same:
+                    result = _lookup_pr_state(state_of, named_repo, named_number)
+                    if _terminal_pr_state(result):
+                        blocking = False
+            if blocking:
+                newest = i
+                created = str(comment.get("created_at") or "")
+                if created > fix_stamp:
+                    fix_stamp = created
     if claim_stamp and fix_stamp:
         # A brain-fix ask newer than the last real claim still blocks the
         # merge; only the detection of the claim changed (loom#1203).
@@ -1026,7 +1167,7 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     if line.endswith(" - READY"):
         for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
             line = _add_blocker(line, blocker)
-    line = _pending_fix_blocker(gh, ticket, authors, line)
+    line = _pending_fix_blocker(gh, ticket, authors, line, repo=repo, number=int(pr["number"]))
     hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
                          str((pr.get("head") or {}).get("sha") or ""),
                          str((pr.get("user") or {}).get("login") or ""),
@@ -1057,12 +1198,32 @@ def _docs_criterion_override(gh: GitHub, repo: str,
     return line
 
 
+def _pr_state_lookup(gh: GitHub, repo: str, number: int) -> Optional[Tuple[str, bool]]:
+    """Look up a pull request's (state, merged) for the brain-fix filter."""
+    try:
+        data = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    except Exception:
+        try:
+            data = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        except Exception:
+            return None
+    state = str(data.get("state") or "")
+    merged = bool(data.get("merged")) or data.get("merged_at") not in (None, "")
+    return (state, merged)
+
+
 def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
-                         authors: Sequence[str], line: str) -> str:
+                         authors: Sequence[str], line: str,
+                         repo: Optional[str] = None, number: Optional[int] = None,
+                         merging: Any = None, state_of: Any = None) -> str:
     """Add a blocker while a brain fix still awaits its author."""
     if ticket is not None and authors:
         comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-        if _pending_brain_fix(comments, authors):
+        if merging is None and repo is not None and number is not None:
+            merging = (repo, number)
+        if state_of is None and gh is not None and repo is not None and number is not None:
+            state_of = lambda r, n, _gh=gh: _pr_state_lookup(_gh, r, n)
+        if _pending_brain_fix(comments, authors, merging=merging, state_of=state_of):
             return _add_blocker(line, "pending brain fix")
     return line
 
@@ -4628,7 +4789,7 @@ def merge(gh: GitHub, repo: str, number: int,
         owner = owned_elsewhere(issue, env)
         if owner is not None:
             raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
-        _refuse_pending_fix(gh, association, env)
+        _refuse_pending_fix(gh, association, env, repo=repo, number=number)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
@@ -4988,7 +5149,9 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
-                        env: Optional[Dict[str, str]]) -> None:
+                        env: Optional[Dict[str, str]] = None,
+                        repo: Optional[str] = None, number: Optional[int] = None,
+                        merging: Any = None, state_of: Any = None) -> None:
     """Refuse a merge while the ticket's brain fix has not run: status marks
     such a pull request "blocked: pending brain fix", and merging it then would
     land the head the fix was sent to change (2026-10-15)."""
@@ -4996,7 +5159,11 @@ def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
     if ticket is None or not authors:
         return
     comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-    if _pending_brain_fix(list(comments), authors):
+    if merging is None and repo is not None and number is not None:
+        merging = (repo, number)
+    if state_of is None and gh is not None and repo is not None and number is not None:
+        state_of = lambda r, n, _gh=gh: _pr_state_lookup(_gh, r, n)
+    if _pending_brain_fix(list(comments), authors, merging=merging, state_of=state_of):
         raise ValueError("a brain fix is pending on the ticket; merge after it runs")
 
 
