@@ -1274,6 +1274,24 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIsNone(brain.acceptance_refusal(BODY))
         self.assertIn("no acceptance criteria", brain.acceptance_refusal(stub, {"labels": []}))
 
+    def test_kept_behaviour_criteria_must_name_the_existing_test(self):
+        def with_criterion(text):
+            return BODY.replace("- [ ] done", "- [ ] " + text)
+
+        kept_behaviour = with_criterion(
+            "A test shows the gate still catches a vacuous lookup")
+        refusal = brain.acceptance_refusal(kept_behaviour)
+        self.assertRegex(refusal, "kept behaviour.*existing test")
+        fake = Fake()
+        with self.assertRaisesRegex(ValueError, "kept behaviour.*existing test"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
+                        kept_behaviour, "codex")
+        self.assertEqual(fake.calls, [])
+        self.assertIsNone(brain.acceptance_refusal(with_criterion(
+            "tests/test_vacuous.py keeps passing unchanged")))
+        self.assertIsNone(brain.acceptance_refusal(with_criterion(
+            "A test: a brief with no Size line is refused")))
+
     def test_move_refuses_to_brief_an_issue_with_no_acceptance_checkbox(self):
         for state in ("queued", "briefed"):
             with self.subTest(state=state):

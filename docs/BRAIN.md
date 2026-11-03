@@ -503,6 +503,10 @@ ticket becomes the epic's sub-issue and its `Part of` line names the epic;
 its Trunk, the in-flight cap, the unproven-work limit and the brief done
 journal come from the epic's goal.
 
+A criterion that preserves existing behaviour and asks for a test must name
+the existing test path under `tests/`; otherwise reword it as a behaviour
+change whose test fails on main.
+
 `python3 -m bus.brain epic OWNER/NAME --goal N --title "Epic: SENTENCE"
 --file EPIC.md` files an epic: the `epic` label, a title of at most 72
 characters, a body with a done-when and a size line, and a `Part of #N`
