@@ -102,6 +102,10 @@ OPENSSL_TIMEOUT = 60
 # stops taking the repo: one run records two (a red check runs twice).
 BASE_RED_MAX = 2
 BASE_PHASES = ("setup", "baseline", "default-baseline")
+# Exits run_lane.sh calls "validation environment unavailable" (the check
+# could not run: 127 is a command missing from the runner image). A new
+# commit on the repo cannot fix those, so only a new image lifts the stop.
+CANNOT_RUN = (125, 126, 127)
 # With no report from a slot for this long, a stopped repo gets one more run.
 IMAGE_PROBE = 86400
 # Ledger entries whose brief has left the inbox are dropped after this long.
@@ -386,8 +390,12 @@ class Runners:
             # can reach a ticket, and this text comes from a run log.
             self.say("%s/%s not dispatched: %s is red there: %s"
                      % (slot, ticket, repo, red.get("why") or "no reason"))
-            self._refuse(ledger, entry, "the base check of %s is red on this runner at %s; "
-                         "another lane takes it" % (repo, red["revision"][:12]))
+            if red.get("cannot_run"):
+                self._refuse(ledger, entry, "this runner image cannot run the base check of %s "
+                             "(a tool it needs is missing); another lane takes it" % repo)
+            else:
+                self._refuse(ledger, entry, "the base check of %s is red on this runner at %s; "
+                             "another lane takes it" % (repo, red["revision"][:12]))
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
@@ -443,7 +451,9 @@ class Runners:
         (empty is the default branch), or None. A head that moved off the
         failing revision clears it, and so does a day with no report from the
         slot: only a run can show a new runner image, and a sole red repo
-        lets none run. A head that cannot be read keeps it."""
+        lets none run. A head that cannot be read keeps it. A check the
+        runner cannot run (CANNOT_RUN) is the image's fault, not the
+        revision's, so a moved head does not clear it."""
         red = (ledger["base_red"].get(slot) or {}).get(repo)
         if (not red or int(red.get("failures") or 0) < BASE_RED_MAX
                 or red.get("base", "") != base):
@@ -452,6 +462,8 @@ class Runners:
         if self.now - float(seen) >= IMAGE_PROBE:
             del ledger["base_red"][slot][repo]
             return None
+        if red.get("cannot_run"):
+            return red
         try:
             head = self.gh.rest("GET", "/repos/%s/commits/%s"
                                 % (repo, urllib.parse.quote(base or "HEAD", safe=""))).data
@@ -516,6 +528,7 @@ class Runners:
         if known.get("revision") == revision:
             count += int(known.get("failures") or 0)
         repos[repo] = {"revision": revision, "failures": count, "base": entry.get("base", ""),
+                       "cannot_run": last.get("exit") in CANNOT_RUN,
                        "why": str(last.get("detail") or "exit %s" % last.get("exit"))[:200]}
 
     # -- following a run ---------------------------------------------------

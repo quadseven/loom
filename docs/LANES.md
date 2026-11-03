@@ -2076,8 +2076,11 @@ Each base check row in the validation record names what failed in its
 sealed report. After two such failures of one repo at one revision on a slot
 the station stops giving that slot the repo: it parks each brief `[transient]`
 without a dispatch, until the repo's head moves or a run reports a new runner
-image (a fingerprint of the image's packages and tools, `<ticket>.image`). One
-run records two failures, because a red check runs twice. A failed `setup:`
+image (a fingerprint of the image's packages and tools, `<ticket>.image`).
+When the last failure exited 125 to 127 (the check could not run: a tool the
+image lacks, such as `ruff`), a moved head does not lift the stop, because no
+commit on the repo can add a tool to the image; only a new image or the day
+probe below does. One run records two failures, because a red check runs twice. A failed `setup:`
 counts too. A check that passed on its second run counts for nothing, and only
 a fix round's default-branch rows count. A day with no report from the slot
 lets one run through, because only a run can show a new image.
