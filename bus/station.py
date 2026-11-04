@@ -2782,19 +2782,8 @@ class Station:
              % (name, lane))
         return True
 
-    def _runner_alive(self, lane: str) -> bool:
-        """Whether lane's runner holds its lock with a live pid. A name that
-        is not one of LANES counts as alive, so it never builds a path and its
-        brief is never moved."""
-        if lane not in LANES:
-            return True
-        lock = os.path.join(self.s.home, "run", lane + ".lock")
-        try:
-            with open(os.path.join(lock, "pid")) as fh:
-                pid = int(fh.read().strip())
-        except (OSError, ValueError):
-            # A lock with no readable pid may be a runner starting up.
-            return os.path.isdir(lock)
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -2802,6 +2791,50 @@ class Station:
         except PermissionError:
             pass  # alive, owned by another user (the lane user)
         return True
+
+    @staticmethod
+    def _lock_pid(lock: str, name: str) -> Optional[int]:
+        """The pid the runner recorded in its lock under `name`; None when
+        there is no readable one."""
+        try:
+            with open(os.path.join(lock, name)) as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _agent_group_alive(self, lock: str) -> Optional[int]:
+        """The leader pid of the run's still-live agent process group, or
+        None. The runner records the agent's group and its watchdog's group
+        in its lock (pgid, watchdog_pgid in lanes/run_lane.sh) so a later
+        pass can stop an orphaned agent; while either group lives, the run
+        those processes belong to is still going."""
+        for name in ("pgid", "watchdog_pgid"):
+            pid = self._lock_pid(lock, name)
+            if pid is not None and self._pid_alive(pid):
+                return pid
+        return None
+
+    def _runner_alive(self, lane: str) -> bool:
+        """Whether lane's run is still going: its runner holds its lock
+        with a live pid, or the run's agent process group outlives a dead
+        runner. A name that is not one of LANES counts as alive, so it
+        never builds a path and its brief is never moved."""
+        if lane not in LANES:
+            return True
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
+        pid = self._lock_pid(lock, "pid")
+        if pid is None:
+            # A lock with no readable pid may be a runner starting up.
+            return os.path.isdir(lock)
+        if self._pid_alive(pid):
+            return True
+        # The runner itself is gone, but its run may not be: a runner
+        # killed mid-run (a reinstall's bootout kills its process group)
+        # takes its keepalive loop with it, while the agent survives in a
+        # process group of its own. On 2026-10-25 lane agy was read as
+        # silent for 32 minutes and its ticket moved while its agent ran
+        # on and opened the run's pull request (loom#2094).
+        return self._agent_group_alive(lock) is not None
 
     def _keepalive_age(self, lane: str) -> Optional[float]:
         """Seconds since lane's runner last stamped state/usage/<lane>.alive
@@ -2839,8 +2872,12 @@ class Station:
             except (OSError, ValueError):
                 lock_state = "lock without a readable pid"
             else:
-                lock_state = ("lock pid %d dead" % pid if not self._runner_alive(lane)
-                              else "lock pid %d alive" % pid)
+                if self._pid_alive(pid):
+                    lock_state = "lock pid %d alive" % pid
+                else:
+                    group = self._agent_group_alive(lock)
+                    lock_state = ("lock pid %d dead, agent group %d alive" % (pid, group)
+                                  if group is not None else "lock pid %d dead" % pid)
         age = self._keepalive_age(lane)
         return "%s, %s" % (lock_state, "no keepalive stamp" if age is None
                            else "keepalive stamp %d seconds old" % age)
