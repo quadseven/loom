@@ -4172,7 +4172,10 @@ class HumanAndRefsTests(unittest.TestCase):
                  (item(6), "Kind: github\nSort the 25 tickets into epics.")]
         for issue, ask in cases:
             with self.subTest(ask=ask, issue=issue):
-                fake = Fake(reply(200, issue))
+                replies = [reply(200, issue)]
+                if "loom:human" in [label["name"] for label in issue.get("labels", [])]:
+                    replies.append(reply(200, [{"body": brain.HUMAN_MARKER + "\nExisting ask"}]))
+                fake = Fake(*replies)
                 with self.assertRaises(ValueError):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))
