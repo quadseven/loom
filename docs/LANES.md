@@ -331,7 +331,13 @@ holder's newest tick is over 2 hours old, or it has none in the last day, the
 station sends one urgent Discord message naming it, then one more when it
 ticks again. Each holder keeps its own alert state in
 `state/station/brain-holders-alert.json`, apart from the brain-stopped alert
-above (loom#2141).
+above (loom#2141). A holder that stood down for a peer's lock is alive, not
+stopped (loom#2606): the station also reads the yield record on the brain
+lock (docs/BRAIN.md, The tick) at most every 10 minutes, keeps each holder's
+newest yield in `state/station/brain-yields.json`, and counts a yield at most
+2 hours old like a tick. The alert names the holder's last yield, or says it
+recorded none, and the message when it is back says whether it ticked or
+yielded.
 
 ## The station
 

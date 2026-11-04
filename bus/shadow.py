@@ -364,8 +364,8 @@ def _graphql(path: str, body: Any) -> Optional[Request]:
 
 # The request shapes each method can take that shadow mode holds, in order.
 _SHAPES: Dict[str, Tuple[Any, ...]] = {
-    "PUT": (_pr_merge, _labels_write, _contents_write),
-    "POST": (_branch_merge, _labels_write, _approving_review, _graphql),
+    "PUT": (_pr_merge, _issue_edit, _labels_write, _contents_write),
+    "POST": (_branch_merge, _issue_edit, _labels_write, _approving_review, _graphql),
     "PATCH": (_issue_edit, _ref_update),
     "DELETE": (_contents_delete, _branch_delete),
 }
