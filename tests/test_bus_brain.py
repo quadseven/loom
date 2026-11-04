@@ -4159,6 +4159,29 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
         self.assert_never_edited(routes)
 
+    def test_not_work_reason_names_a_blocked_label(self):
+        # loom#1904: a blocked issue waits on something outside the repo; a
+        # lane cannot do it, so not_work_reason names it, for the plain
+        # label and for any blocked: label, and stays silent otherwise.
+        self.assertEqual(brain.not_work_reason(item(5, labels=["blocked"])), "blocked")
+        self.assertEqual(brain.not_work_reason(item(6, labels=["blocked:progression"])),
+                         "blocked")
+        self.assertIsNone(brain.not_work_reason(item(7, labels=["bug"])))
+        self.assertIsNone(brain.not_work_reason(item(8)))
+
+    def test_an_issue_labelled_blocked_is_not_triaged(self):
+        # loom#1904: triage rewrote a blocked issue into a ticket that
+        # duplicated other work and burned a lane run before a brain
+        # stopped it by hand. Blocked issues are left alone entirely.
+        routes = Routes([
+            item(5, labels=["blocked"], body="broken"),
+            item(6, labels=["bug", "blocked:progression"], body="broken"),
+            item(8, labels=["bug"], body="broken"),
+        ])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {8: ["loom:triage"]})
+        self.assert_never_edited(routes)
+
     def test_a_factory_incident_issue_is_not_triaged(self):
         # loom#918: a factory incident is filed as a plain open issue; the
         # backlog triage must leave it alone (no loom:triage, no comment).
