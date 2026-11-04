@@ -7626,8 +7626,16 @@ def _nothing_to_fix(gh: GitHub, repo: str, pr: int,
         return None
     sha = str(details.get("headRefOid") or "")
     check = review_check_name()
+    from . import factory
+    bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
+        or factory.DEFAULT_REVIEW_BOT
+    blocking = merge_tier.blocking_findings(
+        (details.get("reviewThreads") or {}).get("nodes") or [],
+        merge_tier.fix_committed((details.get("commits") or {}).get("nodes") or []),
+        lambda comment: by_bot(dict(comment), bot), env)
     if (not sha or details.get("mergeable") == "CONFLICTING" or not _checks_green(details)
-            or not _threads_resolved(details) or not _review_check_passed(gh, repo, sha, check)):
+            or not _threads_resolved(details) or blocking
+            or not _review_check_passed(gh, repo, sha, check)):
         return None
     return ("pull request #%d has nothing to fix (head %s is green, the review check "
             "%s passed on it, and no review thread is open)" % (pr, sha[:12], check))
