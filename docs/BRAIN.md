@@ -1828,6 +1828,13 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+A pending fix whose round has nothing left to fix is cancelled at merge time
+(loom#1998): when the round named only review threads, every thread it named
+is resolved, and the head is green with the review check passed on it,
+`bus.brain merge` posts a cancellation comment on the ticket and merges
+instead of refusing, and the cancelled round does not count as an attempt.
+A round that also names a failing check or a conflict keeps blocking, as
+does one whose threads are not all resolved.
 A fleet hold blocks too (loom#2393): a plain pull request comment from a
 `LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
 commit, whose text opens with `Not merging` or `Hold` (any letter case, after
