@@ -4996,11 +4996,66 @@ class HeldTicketsTest(unittest.TestCase):
         waiting, events = self.waiting()
         report = self.status_for(self.dependency(), waiting, events=events)
         self.assertIn("### Held tickets\n- #12 Add the screen - waits for #5 (pr)", report)
-        # A ticket in another repo, and one this repo no longer has open.
-        waiting, events = self.waiting(after="other-owner/other-repo#5, #404")
-        report = self.status_for(self.dependency(), waiting, events=events)
-        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "
-                      "(unreadable), #404 (unreadable)", report)
+        # A ticket in another repo, and one this repo no longer has open:
+        # both are read, both are gone, so each prints unreadable with the
+        # reason it could not be read.
+        waiting, events = self.waiting(after="other-owner/other-repo#5, #404")  # leak-guard-allow
+        routes = self.routes(self.dependency(), waiting, events=events)
+        routes[("GET", "/repos/other-owner/other-repo/issues/5")] = reply(
+            404, {"message": "Not Found"})
+        routes[("GET", "/repos/%s/issues/404" % REPO)] = reply(
+            404, {"message": "Not Found"})
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              now=None, env=TRUSTED)
+        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "  # leak-guard-allow
+                      "(unreadable: HTTP 404 Not Found), #404 "
+                      "(unreadable: HTTP 404 Not Found)", report)
+
+    def test_status_drops_a_hold_once_a_fetched_dependency_has_landed(self):
+        # Neither dependency is among this repo's open issues: one lives in
+        # another repo and is merged, one here is closed. Both are read,
+        # both have landed, so the ticket waits for nothing.
+        waiting, events = self.waiting(after="other-owner/other-repo#5, #7")  # leak-guard-allow
+        routes = self.routes(waiting, events=events)
+        routes[("GET", "/repos/other-owner/other-repo/issues/5")] = reply(
+            200, self.dependency(state="merged"))
+        routes[("GET", "/repos/%s/issues/7" % REPO)] = reply(200, {
+            "number": 7, "state": "closed", "state_reason": "completed",
+            "title": "Land the package", "body": BODY,
+            "created_at": "2029-12-01T00:00:00Z",
+            "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]})
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              now=None, env=TRUSTED)
+        self.assertIn("### Held tickets\n- none", report)
+        self.assertNotIn("### Held tickets\n- #12", report)
+
+    def test_status_prints_the_reason_for_a_transferred_dependency(self):
+        waiting, events = self.waiting(after="other-owner/other-repo#5")  # leak-guard-allow
+        routes = self.routes(waiting, events=events)
+        routes[("GET", "/repos/other-owner/other-repo/issues/5")] = reply(
+            301, {"message": "Moved Permanently"})
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              now=None, env=TRUSTED)
+        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "  # leak-guard-allow
+                      "(unreadable: HTTP 301 Moved Permanently: renamed or "
+                      "transferred)", report)
+
+    def test_status_reads_each_distinct_dependency_once(self):
+        first, events = self.waiting(after="other-owner/other-repo#5")  # leak-guard-allow
+        second, _ = self.waiting(number=13, after="other-owner/other-repo#5")  # leak-guard-allow
+        routes = self.routes(first, second, events=events)
+        routes[("GET", "/repos/other-owner/other-repo/issues/5")] = reply(
+            200, self.dependency())
+        fake = Routed(routes)
+        report = brain.status(GitHub("t", transport=fake), [REPO], REPO,
+                              now=None, env=TRUSTED)
+        reads = [c for c in fake.calls if c[0] == "GET"
+                 and c[1].split("?")[0] == "/repos/other-owner/other-repo/issues/5"]
+        self.assertEqual(len(reads), 1)
+        self.assertIn("- #12 Add the screen - waits for other-owner/other-repo#5 "  # leak-guard-allow
+                      "(pr)", report)
+        self.assertIn("- #13 Add the screen - waits for other-owner/other-repo#5 "  # leak-guard-allow
+                      "(pr)", report)
 
     def test_status_lists_no_held_ticket_when_every_dependency_is_merged(self):
         report = self.status_for(self.dependency(state="merged"), self.waiting()[0])
