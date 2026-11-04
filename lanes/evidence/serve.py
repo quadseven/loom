@@ -2,6 +2,7 @@
 """Read-only HTTP access to explicitly configured log sources and SQL queries."""
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
 import logging
@@ -221,7 +222,7 @@ def make_handler(config: dict[str, Any], token: str, logger: logging.Logger,
         def _answer(self, parts: Any, kind: str, name: str,
                     params: dict[str, str]) -> tuple[str, str, int, int]:
             """Return kind, name, status and size after sending the reply."""
-            if self.headers.get("Authorization", "") != "Bearer " + token:
+            if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
                 return kind, name, 401, self._reply(401, {"error": "unauthorized"})
             route = _ROUTES.get(parts.path)
             if route is None:

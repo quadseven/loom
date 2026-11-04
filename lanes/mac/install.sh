@@ -227,16 +227,27 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 
 # Every LOOM_* setting in the environment, as plist entries, less the names
 # given as arguments (the ones a plist writes itself: a key twice is ambiguous).
+# The dashboard's database settings (LOOM_DB_*, a password among them) go to
+# the dashboard plist through db_env only: no lane or brain reads them.
 loom_env() {
   local skip=" $* "
   env | LC_ALL=C sort | while IFS='=' read -r k v; do
     case "$k" in
-      LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS) continue ;;
+      LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS|LOOM_DB_*) continue ;;
       # Each job gets its own writer's App from app_env, never another's.
       LOOM_GITHUB_APP_*|LOOM_LANES_GITHUB_APP_*|LOOM_BRAIN_GITHUB_APP_*) continue ;;
       LOOM_*) ;; *) continue ;;
     esac
     case "$skip" in *" $k "*) continue ;; esac
+    v="$(xml "$v")"
+    printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+  done
+}
+
+# The LOOM_DB_* settings as plist entries, for the dashboard plist alone.
+db_env() {
+  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+    case "$k" in LOOM_DB_*) ;; *) continue ;; esac
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
   done
@@ -663,6 +674,7 @@ case "${LOOM_DASHBOARD:-}" in
     <key>LOOM_DASHBOARD_PORT</key><string>$(xml "$DASHBOARD_PORT")</string>
     <key>LOOM_TRANSCRIPTS_MEMORY</key><string>$(xml "$DASHBOARD_MEMORY")</string>
 $(loom_env LOOM_DASHBOARD LOOM_DASHBOARD_HOST LOOM_DASHBOARD_PORT LOOM_TRANSCRIPTS_MEMORY)
+$(db_env)
 $(app_env "")
   </dict>
 </dict>

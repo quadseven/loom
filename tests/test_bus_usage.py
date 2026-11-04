@@ -375,3 +375,12 @@ class UsageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UtcEpochTest(unittest.TestCase):
+    def test_an_out_of_range_stamp_is_unreadable_not_an_error(self):
+        # float("1e999") is inf, and fromtimestamp raises OverflowError, which
+        # collect() turned into an adapter error for the whole provider.
+        self.assertIsNone(usage._utc_epoch("1e999", 0.0))
+        self.assertIsNone(usage._utc_epoch(10 ** 20, 0.0, relative=False))
+        self.assertTrue(usage._utc_epoch(60, 0.0).startswith("1970-01-01T00:01:00"))

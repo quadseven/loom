@@ -545,6 +545,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn(str(key), result.stderr)
         self.assertFalse((self.home / "Library" / "LaunchAgents").exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 file")
     def test_an_unreadable_key_file_is_refused(self):
         # Mode 000 has no group or other bits, but the station could not read it.
         key = self.app_key(0o000)
@@ -681,6 +682,24 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_DASHBOARD_HOST</key><string></string>", plist)
         self.assertIn("<key>LOOM_DASHBOARD_PORT</key><string>8080</string>", plist)
         self.assertNotIn("transcripts are kept in memory", result.stdout)
+
+    def test_database_settings_reach_only_the_dashboard_plist(self):
+        # loom_env copied every LOOM_* value into every plist, so the
+        # dashboard's database password sat in each lane's and the brain's
+        # plist, and the unsandboxed lanes passed it on to their agents.
+        result = self.run_dashboard_install(LOOM_DASHBOARD="1", LOOM_DB_PASSWORD="placeholder",
+                                            LOOM_DB_HOST="db.example.com")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        self.assertIn("<key>LOOM_DB_PASSWORD</key><string>placeholder</string>",
+                      self.dashboard_plist().read_text())
+        self.assertIn("<key>LOOM_DB_HOST</key><string>db.example.com</string>",
+                      self.dashboard_plist().read_text())
+        others = [p for p in agents.glob("com.loom.*.plist") if p != self.dashboard_plist()]
+        self.assertTrue(any(p.name == "com.loom.codex.plist" for p in others), others)
+        self.assertTrue(any(p.name == "com.loom.brain.plist" for p in others), others)
+        for plist in others:
+            self.assertNotIn("LOOM_DB_", plist.read_text(), plist.name)
 
     def test_dashboard_zero_removes_an_installed_dashboard(self):
         self.assertEqual(self.run_dashboard_install(LOOM_DASHBOARD="1").returncode, 0)

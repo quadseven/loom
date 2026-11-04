@@ -3265,7 +3265,9 @@ update_fix_branch() {
 # abort would undo that merge, so the kept branch is left out instead.
 resume_earlier_attempt() {
   local side
-  side="$(grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' "$BRIEF" | head -1 | awk '{print $NF}')"
+  # Only the station's "## Earlier attempt" section names the branch: the
+  # ticket body above it is the author's text, never a branch to merge.
+  side="$(section 'Earlier attempt' "$BRIEF" | grep -oE 'kept its edits on branch [A-Za-z0-9._/-]+-timedout-[0-9]+' | head -1 | awk '{print $NF}')"
   [ -n "$side" ] || return 0
   if [ -n "$CONFLICTS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET: could not merge the earlier attempt's branch $side while the default branch merge conflicts; the agent starts without it" >> "$LOG"
@@ -3930,7 +3932,6 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   resume_earlier_attempt
   [ "$LANE" = opencode-go ] && { catalogue_cmd record-call "$MODEL" >> "$LOG" 2>&1 || true; }
-  LOG_START="$(wc -c < "$LOG" | tr -d ' ')"
 
   # The agent runs as a background job of a job-control subshell, which puts
   # it in its own process group (id = its pid) and records that id. If this
@@ -3943,7 +3944,7 @@ for BRIEF in "$INBOX"/*.md; do
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!

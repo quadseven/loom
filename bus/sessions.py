@@ -246,7 +246,9 @@ def opencode_events(db: Path) -> list[dict]:
         try:
             role = json.loads(mdata).get("role")
             part = json.loads(pdata)
-        except ValueError:
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if not isinstance(part, dict):
             continue
         kind, ts = part.get("type"), _stamp(created)
         if kind == "text" and part.get("text", "").strip():
@@ -314,6 +316,8 @@ def _codex_rollout(sessions: Path, tree: Path) -> Path | None:
             with f.open(errors="replace") as fh:
                 first = json.loads(fh.readline() or "{}")
         except (OSError, ValueError):
+            continue
+        if not isinstance(first, dict):
             continue
         if (first.get("payload") or {}).get("cwd") == want:
             if best is None or f.stat().st_mtime > best.stat().st_mtime:

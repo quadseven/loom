@@ -12,7 +12,12 @@ shift 2
 name=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name) name="${2:-}"; shift 2 ;;
+    # An option with no value would make "shift 2" fail without shifting,
+    # and the loop would never end.
+    --name | --region | --query | --output) [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; } ;;
+  esac
+  case "$1" in
+    --name) name="$2"; shift 2 ;;
     --region | --query | --output) shift 2 ;;
     --with-decryption) shift ;;
     *) echo "unsupported argument" >&2; exit 2 ;;

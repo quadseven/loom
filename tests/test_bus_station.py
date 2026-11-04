@@ -642,6 +642,35 @@ class StationLabelSyncTest(Base):
             self.assertEqual(sorted(json.load(fh)["repos"]), repos)
 
 
+class StationLabelSyncFailureTest(Base):
+    def test_a_repo_that_refuses_a_label_write_does_not_stop_the_others(self):
+        # One archived repo (every write 403) stopped the whole pass before
+        # claims and reports, every 60 seconds, since the ledger records a
+        # repo only after a successful sync.
+        repos = ["example-owner/first", "example-owner/second"]
+        settings = station.Settings(self.home, repos, list(AUTHORS), list(OWNERS))
+        runner = station.Station(GitHub("token", transport=self.fake), settings)
+        ledger = os.path.join(runner.state, "labels.json")
+        with mock.patch.object(labels_module, "ensure_labels",
+                               side_effect=[GitHubError("POST labels -> 403", 403), []]) as ensure:
+            runner.sync_labels()
+        self.assertEqual([call.args[1] for call in ensure.call_args_list], repos)
+        with open(ledger, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["repos"], repos[1:])
+
+
+class FailureReasonTest(Base):
+    def test_a_credential_shape_in_the_failed_line_is_redacted(self):
+        # The last "failed:" line of the log can be the agent's own output.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.write(os.path.join(self.home, "logs", "codex", "T1.log"),
+                   "[t] T1 start\n[t] T1 failed: provider said token ghp_%s rejected\n"
+                   % ("a1B2c3D4e5F6g7H8i9J0" * 2))
+        reason = runner._failure_reason("codex", "T1")
+        self.assertNotIn("ghp_", reason)
+        self.assertIn("<redacted>", reason)
+
+
 class StationKeepsAppTokenTest(Base):
     """One pass per process: the App token outlives the pass (loom#1306)."""
 
@@ -4719,11 +4748,11 @@ class PassBudgetTest(Base):
             self.run_pass()
         later.assert_called_once()
 
-    def test_the_note_pass_runs_every_pass_while_a_step_holds_the_rotation(self):
-        # loom#2092: on 2026-11-02 one step carried over at the request
-        # target pass after pass, holding the rotation on itself for hours,
-        # and seven shipped tickets crossed 24h with no note because the
-        # note pass never came round. It runs every pass, outside the
+    def test_the_note_pass_runs_every_pass_while_a_step_repeats_a_carry_over(self):
+        # loom#2092: one step carried over at the request target pass after
+        # pass, holding the rotation on itself for hours, and seven shipped
+        # tickets crossed 24h with no note because the note pass never came
+        # round. It runs every pass, outside the
         # rotation; its own stamp keeps it to one run per VERIFY_NOTE_EVERY.
         def carried(_station):
             raise TargetReached("other read carried over at request target")
@@ -4734,8 +4763,25 @@ class PassBudgetTest(Base):
                 mock.patch.object(station.Station, "note_stale_shipped", notes):
             self.run_pass()
             self.run_pass()
-        self.assertEqual(self.rotation(), 0, "the carried step still holds the rotation")
+        self.assertEqual(self.rotation(), 0, "the rotation completes after skipping the carried step")
         self.assertEqual(notes.call_count, 2)
+
+    def test_a_repeated_target_carry_over_skips_the_step_and_continues(self):
+        def carried(_station):
+            raise TargetReached("read carried over at request target")
+
+        carried.__name__ = "roll_source_pins"
+        later = mock.Mock(__name__="release_factory_held")
+        self.seed_rotation(0)
+        err = io.StringIO()
+        with mock.patch.object(station.Station, "roll_source_pins", carried), \
+                mock.patch.object(station.Station, "release_factory_held", later), \
+                contextlib.redirect_stderr(err):
+            self.run_pass()
+            later.assert_not_called()
+            self.run_pass()
+        later.assert_called_once()
+        self.assertIn("step roll_source_pins skipped after repeated carry-over", err.getvalue())
 
     def test_a_note_pass_that_fails_does_not_stop_the_step_loop(self):
         def limited(_station):

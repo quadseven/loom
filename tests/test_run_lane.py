@@ -3455,6 +3455,30 @@ exec /usr/bin/git "$@"
         self.assertIn("agent-saw-earlier", self.calls())
         self.assertIn("merged the earlier attempt's branch %s" % side, self.lane_log())
 
+    def test_a_branch_named_in_the_ticket_body_is_not_merged_as_an_earlier_attempt(self):
+        # The station writes the ticket body above its own "## Earlier
+        # attempt" section, so the sentence in the body is the author's text,
+        # not a branch for the runner to merge into the tree.
+        side = "loom/T042-fix-the-thing-timedout-1792595837"
+        work = Path(self._tmp.name) / "side-work"
+        git("clone", "-q", str(self.remote), str(work))
+        git("checkout", "-q", "-b", side, cwd=work)
+        (work / "earlier.txt").write_text("from a branch the body names\n")
+        git("add", "earlier.txt", cwd=work)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "WIP", cwd=work)
+        git("push", "-q", "origin", side, cwd=work)
+        self.drop_brief(text=BRIEF.replace(
+            "## Acceptance criteria",
+            "An earlier attempt timed out after editing, and the runner kept its edits on "
+            "branch %s.\n\n## Acceptance criteria" % side))
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
+            "cat > /dev/null\n",
+            "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("agent-saw-earlier", self.calls())
+        self.assertNotIn("earlier attempt's branch", self.lane_log())
+
     def test_a_model_from_another_lanes_family_is_refused(self):
         self.drop_brief(text=BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: claude-sonnet-4-5"))
         self.run_lane()
@@ -6081,7 +6105,7 @@ exit %d
         source = RUNNER.read_text()
         self.assertRegex(
             source,
-            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
+            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
             r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
             r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
             r'run_agent "\$RUN_BRIEF"',

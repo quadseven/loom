@@ -322,15 +322,18 @@ def _get_deployment_status(gh: GitHub, repo: str, pr: Dict[str, Any],
                            ship_on_merge: List[str],
                            ship_workflows: Dict[str, str],
                            ship_path_workflows: List[str],
-                           pin_ship_repos: List[str]) -> str:
-    """Determine deployment status for a merged PR."""
+                           pin_ship_repos: List[str],
+                           seen: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Determine deployment status for a merged PR. `seen` holds the ticket's
+    other merged pull requests, among which a later revert is looked for."""
+    seen = seen or []
     pr_number = int(pr["number"])
     merge_sha = str(pr["merge_commit_sha"])
     
     # Check if repo ships on merge
     if repo in ship_on_merge:
         branch = _default_branch(gh, repo)
-        if branch and not _reverted(gh, repo, pr, [], branch):
+        if branch and not _reverted(gh, repo, pr, seen, branch):
             return "deployed"
     
     # Check if repo has deploy workflow
@@ -343,7 +346,7 @@ def _get_deployment_status(gh: GitHub, repo: str, pr: Dict[str, Any],
                 by_sha = {str(r["head_sha"]): r for r in runs}
                 newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
                 run = _covering_run(gh, repo, pr, by_sha, newest)
-                if run and not _reverted(gh, repo, pr, [], str(run["head_sha"])):
+                if run and not _reverted(gh, repo, pr, seen, str(run["head_sha"])):
                     return "deployed"
     
     # Check if repo has path-based deploy workflows
@@ -372,7 +375,7 @@ def _get_deployment_status(gh: GitHub, repo: str, pr: Dict[str, Any],
                             by_sha = {str(r["head_sha"]): r for r in runs}
                             newest = max(runs, key=lambda r: str(r.get("created_at") or ""))
                             run = _covering_run(gh, repo, pr, by_sha, newest)
-                            if run and not _reverted(gh, repo, pr, [], str(run["head_sha"])):
+                            if run and not _reverted(gh, repo, pr, seen, str(run["head_sha"])):
                                 return "deployed"
     
     # Check if repo is deployed via pin PR in a deployment repo
@@ -432,13 +435,11 @@ def _prs_with_deployment_status(gh: GitHub, repo: str, ticket_number: int,
     
     prs = _merged_prs_for_ticket(gh, repo, ticket_number, shipped_at)
     results: List[Tuple[int, str]] = []
-    seen: List[Dict[str, Any]] = []
-    
+
     for pr in prs:
         status = _get_deployment_status(gh, repo, pr, ship_on_merge, ship_workflows,
-                                         ship_path_workflows, pin_ship_repos)
+                                         ship_path_workflows, pin_ship_repos, prs)
         results.append((int(pr["number"]), status))
-        seen.append(pr)
     
     return results
 
