@@ -5217,6 +5217,13 @@ def _resolution_counts(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
             and not _unheld_answer(gh, repo, head, thread, bot, trusted))
 
 
+def _threads_by_id(details: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The pull request's review threads, by thread id."""
+    return {str(t.get("id") or ""): t
+            for t in (details.get("reviewThreads") or {}).get("nodes") or []
+            if isinstance(t, dict)}
+
+
 def _fix_cancellable(gh: GitHub, body: str, repo: str, number: int,
                      details: Dict[str, Any], env: Optional[Dict[str, str]]) -> bool:
     """What a loom:fix body and the pull request's threads say about
@@ -5235,9 +5242,7 @@ def _fix_cancellable(gh: GitHub, body: str, repo: str, number: int,
         or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
     head = str(details.get("headRefOid") or "")
-    nodes = {str(t.get("id") or ""): t
-             for t in (details.get("reviewThreads") or {}).get("nodes") or []
-             if isinstance(t, dict)}
+    nodes = _threads_by_id(details)
     return all(thread in nodes
                and _resolution_counts(gh, repo, head, nodes[thread], bot, trusted)
                for thread in threads)
