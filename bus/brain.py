@@ -1096,6 +1096,14 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _status_ticket_pr(repo: str, pr: Dict[str, Any], ticket_numbers: set) -> bool:
+    """Whether status should show this open PR as a ticket PR."""
+    if str(pr.get("head", {}).get("ref", "")).startswith("loom/"):
+        return True
+    ticket = _safe_ticket_association(repo, pr)
+    return ticket is not None and ticket[1] in ticket_numbers
+
+
 def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optional[str]:
     """Warn when more than half of the last 10 merged PRs target a branch that
     is neither the default branch nor a goal home's declared Trunk."""
@@ -1355,7 +1363,8 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if into is not None:
         into[repo] = tickets
     pulls = list(gh.paginate("/repos/%s/pulls?state=open" % repo))
-    prs = [i for i in pulls if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
+    ticket_numbers = {int(i["number"]) for i in tickets if i.get("number") is not None}
+    prs = [i for i in pulls if _status_ticket_pr(repo, i, ticket_numbers)]
     trusted = {a.lower() for a in (authors or ())}
     adoptable = [i for i in pulls
                  if not str(i.get("head", {}).get("ref", "")).startswith("loom/")

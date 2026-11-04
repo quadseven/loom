@@ -5160,7 +5160,7 @@ class Station:
         for pr in open_prs:
             author = tickets._login(pr.get("user"))
             head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-            if head_repo != repo:
+            if head_repo != repo and author not in trusted_authors:
                 continue
             if author not in trusted_authors:
                 # A second contributor's pull request links only the
