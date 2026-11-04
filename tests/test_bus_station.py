@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import audit, brain, factory, fixrounds, handoff, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
@@ -10659,6 +10659,34 @@ class ReportsTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings,
                         now=time.time()).post_overdue_standups()
         self.assertEqual(len(self.fake.comments[40]), 1)
+
+    def test_station_skips_when_brain_report_was_edited_recently(self):
+        self.add_goal()
+        created, edited = self.ago(36 * 3600), self.ago(20 * 60)
+        body = (station.REPORT_MARKER + "\nbrain report\n"
+                + handoff.REPORTED_STAMP % edited)
+        self.comment(40, 1, body)
+        self.fake.comments[40][0].update(created_at=created, updated_at=edited)
+        self.fake.sub_issues[40] = [{"number": 41, "title": "New work", "state": "open",
+                                     "created_at": self.recent(), "labels": []}]
+
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+
+        self.assertEqual(len(self.fake.comments[40]), 1)
+
+    def test_station_posts_when_report_creation_and_edit_are_old_and_due(self):
+        self.add_goal()
+        old = self.ago(36 * 3600)
+        self.comment(40, 1, station.REPORT_MARKER + "\nold brain report")
+        self.fake.comments[40][0].update(created_at=old, updated_at=old)
+        self.fake.sub_issues[40] = [{"number": 41, "title": "New work", "state": "open",
+                                     "created_at": self.recent(), "labels": []}]
+
+        station.Station(GitHub("token", transport=self.fake), self.settings,
+                        now=time.time()).post_overdue_standups()
+
+        self.assertEqual(len(self.fake.comments[40]), 2)
 
 
 
