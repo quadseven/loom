@@ -2092,35 +2092,80 @@ class SensitiveResumeTests(unittest.TestCase):
                 "created_at": "2030-01-01T00:00:00Z",
                 "body": body + "<!-- loom:fix-head %s -->\n" % head}
 
-    def test_merge_cancels_a_pending_fix_whose_only_thread_is_resolved(self):
-        # loom#1998: the round's only finding was ruled on and its thread
-        # resolved; the head is green and the review check passed on it, so
-        # the round has nothing to fix. The merge cancels it instead of
-        # waiting a whole round, and the cancelled round records no attempt.
+    class _NotesApart(Fake):
+        """Fake that answers a comment posted on ticket 9 apart from the
+        queue, so the queue holds the same reads whenever the note is posted."""
+
+        def __call__(self, method, url, headers, body):
+            if method == "POST" and url.endswith("/issues/9/comments"):
+                self.calls.append((method, url, json.loads(body) if body else None))
+                return reply(201, {"id": 555})
+            return super().__call__(method, url, headers, body)
+
+    def _cancel_merge(self, resolved_by, merged=True):
+        """Merge pull request 8 while ticket 9 waits on a brain fix whose one
+        thread is resolved by `resolved_by`; returns (fake, fix, error)."""
         nodes = [{"id": "PRRT_1", "isResolved": True, "path": "bus/a.py",
-                  "comments": {"nodes": []}}]
+                  "resolvedBy": {"login": resolved_by}, "comments": {"nodes": []}}]
         pr, query = self._merge_replies({"details": {"reviewThreads": {"nodes": nodes}}})
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
         fix = self._brain_fix_comment(threads=("PRRT_1",))
         runs = {"check_runs": [{"name": "Grug - Elder", "status": "completed",
                                 "conclusion": "success"}]}
-        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]), reply(200, runs),
-                    reply(201, {"id": 555}), reply(200, []),
-                    reply(200, {"merged": True}),
-                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
-        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
-                             env={"LOOM_BRIEF_AUTHORS": "alice-example"})
-        self.assertTrue(result["merged"])
-        notes = [c[2]["body"] for c in fake.calls
-                 if c[0] == "POST" and c[1].endswith("/issues/9/comments")
-                 and brain.FIX_CANCELLED_MARKER in (c[2] or {}).get("body", "")]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("does not count as an attempt", notes[0])
-        cancelled = {"user": {"login": "alice-example"},
-                     "created_at": "2030-01-01T01:00:00Z", "body": notes[0]}
-        self.assertFalse(brain._pending_brain_fix([fix, cancelled], ["alice-example"]))
-        self.assertEqual(station.Station._fix_round_count(
-            [fix, cancelled], {"alice-example"}), 0)
+        fake = self._NotesApart(pr, query, reply(200, issue), reply(200, [fix]), reply(200, runs),
+                                reply(200, []), reply(200, {"merged": merged}),
+                                reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        error = None
+        try:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        except ValueError as err:
+            error = err
+        return fake, fix, error
+
+    @staticmethod
+    def _cancel_notes(fake):
+        return [c[2]["body"] for c in fake.calls
+                if c[0] == "POST" and c[1].endswith("/issues/9/comments")
+                and brain.FIX_CANCELLED_MARKER in (c[2] or {}).get("body", "")]
+
+    def test_merge_cancels_a_pending_fix_whose_only_thread_is_resolved(self):
+        # loom#1998: the round's only finding was ruled on and its thread
+        # resolved by a trusted login or the review bot; the head is green and
+        # the review check passed on it, so the round has nothing to fix. The
+        # merge cancels it instead of waiting a whole round, and the
+        # cancelled round records no attempt.
+        for resolver in ("alice-example", "grug-tribe[bot]"):
+            with self.subTest(resolver=resolver):
+                fake, fix, error = self._cancel_merge(resolver)
+                self.assertIsNone(error)
+                self.assertTrue(any(c[0] == "PUT" for c in fake.calls))
+                notes = self._cancel_notes(fake)
+                self.assertEqual(len(notes), 1)
+                self.assertIn("does not count as an attempt", notes[0])
+                cancelled = {"user": {"login": "alice-example"},
+                             "created_at": "2030-01-01T01:00:00Z", "body": notes[0]}
+                self.assertFalse(brain._pending_brain_fix([fix, cancelled], ["alice-example"]))
+                self.assertEqual(station.Station._fix_round_count(
+                    [fix, cancelled], {"alice-example"}), 0)
+
+    def test_merge_does_not_count_a_thread_an_untrusted_login_resolved(self):
+        # Anyone who can resolve a thread could otherwise clear a fix round:
+        # a resolution counts only from a trusted login, the review bot, or
+        # an answer the lane-answer gates accept.
+        for resolver in ("mallory-example", "grug-tribe", ""):
+            with self.subTest(resolver=resolver):
+                fake, _, error = self._cancel_merge(resolver)
+                self.assertRegex(str(error), "brain fix is pending")
+                self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
+                self.assertEqual(self._cancel_notes(fake), [])
+
+    def test_a_refused_merge_posts_no_cancellation(self):
+        # The cancellation is posted only once GitHub confirms the merge: a
+        # merge refused after the fix check leaves the round pending.
+        fake, _, error = self._cancel_merge("alice-example", merged=False)
+        self.assertRegex(str(error), "did not confirm the merge")
+        self.assertEqual(self._cancel_notes(fake), [])
 
     def test_merge_still_refuses_a_pending_fix_that_names_a_failing_check(self):
         # loom#1998: a round that also names a failing check keeps blocking,
@@ -2579,27 +2624,87 @@ class FixTests(unittest.TestCase):
         comments = [forged, self._fix_comment("2026-10-20T17:00:00Z")]
         self.assertTrue(brain._pending_brain_fix(comments, ["alice-example", "station"]))
 
-    def _cancellation(self, created_at, login="alice-example"):
+    def _round(self, created_at, head="dec0de", number=8):
+        """A brain fix round for pull request `number` on `head`."""
+        return {"user": {"login": "alice-example"}, "created_at": created_at,
+                "body": "%s\nPull request: %s#%d, branch loom/9-work\n%s criteria not ticked\n"
+                        "<!-- loom:fix-head %s -->\n"
+                        % (tickets.FIX_MARKER, REPO, number, brain.BRAIN_FIX_MARKER, head)}
+
+    def _cancellation(self, created_at, login="alice-example", head="dec0de", number=8):
         return {"user": {"login": login}, "created_at": created_at,
-                "body": "%s\nPull request: %s#8\n\nCancelled the pending brain fix."
-                        % (brain.FIX_CANCELLED_MARKER, REPO)}
+                "body": "%s\nPull request: %s#%d\n\nCancelled the pending brain fix.\n\n%s\n"
+                        % (brain.FIX_CANCELLED_MARKER, REPO, number,
+                           brain.FIX_CANCELLED_HEAD % head)}
 
     def test_pending_brain_fix_is_cancelled_by_a_trusted_cancellation(self):
         # loom#1998: the cancellation the brain posts when a round has
         # nothing left to fix ends the wait, like a claim does.
-        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+        comments = [self._round("2026-10-20T17:00:00Z"),
                     self._cancellation("2026-10-20T18:00:00Z")]
         self.assertFalse(brain._pending_brain_fix(comments, ["alice-example"]))
 
     def test_pending_brain_fix_ignores_a_strangers_cancellation(self):
-        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+        comments = [self._round("2026-10-20T17:00:00Z"),
                     self._cancellation("2026-10-20T18:00:00Z", login="mallory-example")]
         self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
 
     def test_a_fix_after_a_cancellation_blocks_again(self):
-        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+        comments = [self._round("2026-10-20T17:00:00Z"),
                     self._cancellation("2026-10-20T18:00:00Z"),
-                    self._fix_comment("2026-10-20T19:00:00Z")]
+                    self._round("2026-10-20T19:00:00Z")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+
+    def test_a_cancel_marker_in_mid_body_does_not_cancel(self):
+        # A trusted comment that quotes the marker, a head and a pull request
+        # line is not a cancellation: only a body that opens with the marker
+        # is one, as a fix is one only when it opens with its marker.
+        quoted = self._cancellation("2026-10-20T18:00:00Z")
+        quoted["body"] = "A lane quoted this text:\n" + quoted["body"]
+        comments = [self._round("2026-10-20T17:00:00Z"), quoted]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertEqual(station.Station._fix_round_count(comments, {"alice-example"}), 1)
+
+    def test_a_cancel_marker_inside_a_status_event_does_not_cancel(self):
+        # A status event line carries text from other places (a lane's
+        # failure, a reason); the marker inside it is not a cancellation.
+        status = {"user": {"login": "station"}, "created_at": "2026-10-20T14:55:56Z",
+                  "body": ("<!-- loom:status v1 -->\n"
+                           "Loom status for this ticket, newest first.\n\n"
+                           "- 2026-10-20T18:00:00Z The lane failed: %s Pull request: %s#8 %s\n"
+                           % (brain.FIX_CANCELLED_MARKER, REPO,
+                              brain.FIX_CANCELLED_HEAD % "dec0de"))}
+        comments = [status, self._round("2026-10-20T17:00:00Z")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def test_an_exact_station_cancel_event_cancels(self):
+        # The one status event form that counts: the whole event line is the
+        # cancellation, naming the pull request and the head.
+        status = {"user": {"login": "station"}, "created_at": "2026-10-20T14:55:56Z",
+                  "body": ("<!-- loom:status v1 -->\n"
+                           "Loom status for this ticket, newest first.\n\n"
+                           "- 2026-10-20T18:00:00Z %s Pull request: %s#8 %s\n"
+                           % (brain.FIX_CANCELLED_MARKER, REPO,
+                              brain.FIX_CANCELLED_HEAD % "dec0de"))}
+        comments = [status, self._round("2026-10-20T17:00:00Z")]
+        self.assertFalse(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def test_a_cancel_naming_a_different_head_does_not_cancel(self):
+        comments = [self._round("2026-10-20T17:00:00Z", head="dec0de"),
+                    self._cancellation("2026-10-20T18:00:00Z", head="beef01")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertEqual(station.Station._fix_round_count(comments, {"alice-example"}), 1)
+
+    def test_a_cancel_naming_a_different_pull_request_does_not_cancel(self):
+        comments = [self._round("2026-10-20T17:00:00Z"),
+                    self._cancellation("2026-10-20T18:00:00Z", number=7)]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+        self.assertEqual(station.Station._fix_round_count(comments, {"alice-example"}), 1)
+
+    def test_a_cancel_without_a_head_does_not_cancel(self):
+        bare = self._cancellation("2026-10-20T18:00:00Z")
+        bare["body"] = bare["body"].replace(brain.FIX_CANCELLED_HEAD % "dec0de", "")
+        comments = [self._round("2026-10-20T17:00:00Z"), bare]
         self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
 
     def test_a_check_that_later_passed_is_not_a_failing_check(self):
