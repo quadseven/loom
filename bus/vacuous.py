@@ -173,7 +173,8 @@ def fixture_users(test_source: str, patch: str) -> List[str]:
 
 def diff_findings(code_sources: Dict[str, str], test_sources: Dict[str, str],
                   test_patches: Dict[str, str], ticket_body: str = "",
-                  code_patches: Optional[Dict[str, str]] = None) -> List[str]:
+                  code_patches: Optional[Dict[str, str]] = None,
+                  added_test_files: Optional[Set[str]] = None) -> List[str]:
     """Find lookup overrides and changed fixtures used by changed tests."""
     findings = []
     for path, source in code_sources.items():
@@ -182,8 +183,11 @@ def diff_findings(code_sources: Dict[str, str], test_sources: Dict[str, str],
     asks_for_fixture = re.search(
         r"\b(?:change|edit|update|add|remove|correct)\b[^\n]{0,100}"
         r"\b(?:fixture|expected table|expected values)\b", ticket_body, re.I)
+    added = added_test_files or set()
     if code_sources and not asks_for_fixture:
         for path, source in sorted(test_sources.items()):
+            if path in added:
+                continue
             for name in fixture_users(source, test_patches.get(path, "")):
                 findings.append("changes a fixture used by test %s" % name)
     return findings
@@ -209,8 +213,14 @@ def _pull_files(gh: object, repo: str, number: int) -> List[Dict[str, object]]:
 def pull_findings(gh: object, repo: str, number: int, head: str,
                   ticket_body: str = "") -> List[str]:
     """Read changed Python files from a pull request and inspect their source."""
-    patches = {_filename(item): str(item.get("patch") or "")
-               for item in _pull_files(gh, repo, number)}
+    items = _pull_files(gh, repo, number)
+    patches = {_filename(item): str(item.get("patch") or "") for item in items}
+    added_test_files = {
+        _filename(item) for item in items
+        if is_test_path(_filename(item))
+        and (item.get("status") == "added"
+             or str(item.get("patch") or "").lstrip().startswith("@@ -0,0"))
+    }
     code = [path for path in patches if path.endswith(".py") and not is_test_path(path)]
     if not code:
         return []
@@ -218,7 +228,8 @@ def pull_findings(gh: object, repo: str, number: int, head: str,
     return diff_findings(_read_sources(gh, repo, code, head),
                          _read_sources(gh, repo, tests, head),
                          {path: patches[path] for path in tests}, ticket_body,
-                         {path: patches[path] for path in code})
+                         {path: patches[path] for path in code},
+                         added_test_files)
 
 
 def _read_sources(gh: object, repo: str, paths: Sequence[str], head: str) -> Dict[str, str]:
