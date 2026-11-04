@@ -844,6 +844,16 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("loom:pr", self.fake.names(12))
         self.assertNotIn("loom:briefed", self.fake.names(12))
 
+    def test_a_briefed_ticket_with_retry_branch_no_refs_promotes_to_pr(self):
+        # Retry branch without Refs line should link via branch name.
+        self.fake.add(12, state="briefed", lane="codex")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Some body without refs",
+                            "head": {"ref": "loom/12-r3", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+
     def contributor_pr(self, author="dana-example", state="open", merged_at=None):
         pr = {"number": 99, "state": state, "user": {"login": author},
               "body": "Why.\n\nRefs #12\n",
