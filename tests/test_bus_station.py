@@ -824,6 +824,26 @@ class ReconcilePullRequestTest(Base):
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
 
+    def test_a_briefed_ticket_with_retry_branch_promotes_to_pr(self):
+        # Retry branch (r-suffixed) should link same as first-attempt branch.
+        self.fake.add(12, state="briefed", lane="codex")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-r3", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+
+    def test_a_briefed_ticket_with_retry_branch_and_slug_promotes_to_pr(self):
+        # Retry branch with slug (loom/12-fix-r3) should also link.
+        self.fake.add(12, state="briefed", lane="codex")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": "loom/12-fix-r3", "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+
     def contributor_pr(self, author="dana-example", state="open", merged_at=None):
         pr = {"number": 99, "state": state, "user": {"login": author},
               "body": "Why.\n\nRefs #12\n",
