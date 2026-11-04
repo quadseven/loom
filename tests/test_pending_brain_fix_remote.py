@@ -30,13 +30,21 @@ class PendingBrainFixRemoteTests(unittest.TestCase):
 
     def test_merged_fix_pr_does_not_block_other_pr(self):
         comments = [fix_comment(41)]
+        looked_up = []
+
+        def pr_state(repo, number):
+            looked_up.append((repo, number))
+            if (repo, number) == ("example/repo", 41):
+                return {"state": "closed", "merged_at": "2030-01-02"}
+            return {"state": "open", "merged_at": None}
 
         pending = brain._pending_brain_fix(
             comments, [AUTHOR], current_pr=("example/repo", 42),
-            pr_state=lambda repo, number: {"state": "closed", "merged_at": "2030-01-02"},
+            pr_state=pr_state,
         )
 
         self.assertFalse(pending)
+        self.assertEqual(looked_up, [("example/repo", 41)])
 
     def test_fix_pr_being_merged_keeps_blocking(self):
         comments = [fix_comment(42)]
