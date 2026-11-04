@@ -4173,7 +4173,10 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     _check_written_text(ask)
     names = _labels(_open_issue(gh, repo, number))
     if needs_human(names):
-        raise ValueError("#%d is already needs:human" % number)
+        comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        if any(str((comment or {}).get("body") or "").startswith(HUMAN_MARKER)
+               for comment in comments if isinstance(comment, dict)):
+            raise ValueError("#%d is already needs:human" % number)
     notify.post(gh, repo, number, "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind),
                 notify.ASK)
     if "loom:triage" in names:
