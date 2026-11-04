@@ -1215,6 +1215,8 @@ def _dispatch_get(handler, state):
         return _dispatch_tiers(handler, state)
     if path in ("/brain", "/brains", "/hot-spots"):
         return _dispatch_brain_hot_spots(handler, state, path)
+    if path == "/roster":
+        return _dispatch_roster(handler, state)
     if path == "/fleet":
         return _dispatch_fleet(handler, state)
     if path == "/chain":
@@ -1456,6 +1458,17 @@ def _dispatch_brain_hot_spots(handler, state, path):
         data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
         body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
     return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+
+
+def _dispatch_roster(handler, state):
+    """The roster: every brain and the workhorse, their ticks, and who is
+    down, computed from the journals this snapshot already read."""
+    from . import roster
+    payload = state.response()
+    data = roster.build_roster(payload.get("improving", {}).get("journals", []),
+                               payload.get("workhorse"), datetime.now(timezone.utc))
+    return handler.send_page(page("Roster", "roster", roster.render_roster(data),
+                                  status="stale" if payload.get("stale") else "live"))
 
 
 def _dispatch_fleet(handler, state):

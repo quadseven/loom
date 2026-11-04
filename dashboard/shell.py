@@ -13,6 +13,7 @@ VIEWS = (
     ("brain", "Brain", "/brain"),
     ("fleet", "Fleet timeline", "/fleet"),
     ("brains", "Brains", "/brains"),
+    ("roster", "Roster", "/roster"),
     ("hot-spots", "Hot spots", "/hot-spots"),
     ("results", "Results", "/results"),
     ("improving", "Improving", "/improving"),
