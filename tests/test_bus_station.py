@@ -6699,6 +6699,44 @@ class SilentLaneTest(Base):
             fh.write("999999")
         self.assertIn("spark-3", self.station()._silent_lanes())
 
+    def test_a_lane_whose_agent_outlives_its_dead_runner_is_not_silent(self):
+        # loom#2094: on 2026-10-25 lane agy was read as silent for 32
+        # minutes and its running ticket moved, yet the run went on and
+        # opened its pull request. A runner killed mid-run (a reinstall's
+        # bootout kills its process group) takes its keepalive loop with it
+        # and leaves the lock's pid dead, while the agent survives in a
+        # process group of its own, whose leader the runner recorded in
+        # the lock's pgid file (lanes/run_lane.sh). The run is still going
+        # while that group lives, so the lane is not silent.
+        self.heartbeat("agy", age=40 * 60)
+        lock = os.path.join(self.home, "run", "agy.lock")
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as fh:
+            fh.write("999999")
+        with open(os.path.join(lock, "pgid"), "w") as fh:
+            fh.write(str(os.getpid()))
+        self.assertNotIn("agy", self.station()._silent_lanes())
+        with open(os.path.join(lock, "pgid"), "w") as fh:
+            fh.write("999999")
+        with open(os.path.join(lock, "watchdog_pgid"), "w") as fh:
+            fh.write(str(os.getpid()))
+        self.assertNotIn("agy", self.station()._silent_lanes())
+        with open(os.path.join(lock, "watchdog_pgid"), "w") as fh:
+            fh.write("999999")
+        self.assertIn("agy", self.station()._silent_lanes())
+
+    def test_the_station_names_a_live_agent_group_when_the_runner_pid_is_dead(self):
+        self.heartbeat("agy", age=64 * 60)
+        lock = os.path.join(self.home, "run", "agy.lock")
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w") as fh:
+            fh.write("999999")
+        with open(os.path.join(lock, "pgid"), "w") as fh:
+            fh.write(str(os.getpid()))
+        self.assertEqual(self.station()._runner_state("agy"),
+                         "lock pid 999999 dead, agent group %d alive, "
+                         "no keepalive stamp" % os.getpid())
+
     def stamp_alive(self, lane, age):
         d = os.path.join(self.home, "state", "usage")
         os.makedirs(d, exist_ok=True)
