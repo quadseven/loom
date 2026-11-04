@@ -175,7 +175,7 @@ def _workhorse_actor(workhorse, now, cadence):
         # pace come from that line alone, never mixed across lines.
         counted = int(match.group(1))
         counts = {name: int(value) for name, value in
-                  zip(("closed", "merged", "rewritten"), match.groups()[1:]) if value is not None}
+                  zip(("closed", "merged", "rewritten"), match.groups()[1:], strict=True) if value is not None}
         found = PACE_RE.search(text)
         pace = int(found.group(1)) if found else None
     line = "journal updated"
