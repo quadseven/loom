@@ -1618,6 +1618,16 @@ yours ...`, `lock acquired: already yours ..., held 4m since <time>`, or
 `lock held by <holder> (not yours: you are <caller>), held 12m since <time>,
 at step <step>, expires <time>`.
 
+A brain that stands down because a peer holds the lock records its yield on
+that lock (loom#2606): `python3 -m bus yielded <owner/name> --holder <name>`
+appends a commit whose message keeps the lock line and carries one
+`loom:yield=` line, a JSON map of each brain that yielded to `{"at": <UTC
+time>, "to": <holder>}`, its newest yield only. It is a lock branch write
+like a step (compare-and-swap), not a comment, so it emails nobody. A
+takeover of an expired lock carries the map into the new lock, and a yield
+over a day old is dropped. `lanes/mac/brain.sh` runs it when its wait for the
+lock ends. The station's backup-brain check reads it (docs/LANES.md).
+
 Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review `needs-brain` tickets in full
 (every diff, green checks and the review bot, every thread answered); merge
@@ -1818,6 +1828,13 @@ completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
+A pending fix whose round has nothing left to fix is cancelled at merge time
+(loom#1998): when the round named only review threads, every thread it named
+is resolved, and the head is green with the review check passed on it,
+`bus.brain merge` posts a cancellation comment on the ticket and merges
+instead of refusing, and the cancelled round does not count as an attempt.
+A round that also names a failing check or a conflict keeps blocking, as
+does one whose threads are not all resolved.
 A fleet hold blocks too (loom#2393): a plain pull request comment from a
 `LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
 commit, whose text opens with `Not merging` or `Hold` (any letter case, after
@@ -1999,6 +2016,20 @@ ask and not before the head commit it would merge; a newer ask, or a newer
 head, asks again. Each Merge or Hold is written once to the shadow ledger as
 an `operator-verdict` entry (its label the verdict), beside the would-merge
 it pairs with; the ledger's counts and digest leave verdicts out.
+
+When the person merges or closes that pull request themselves, the wait is
+withdrawn on the station's next pass: for an open issue still carrying the
+human label (or an old name of it) or a `needs:<login>` label whose newest
+person ask is a held pull request ask (the hold ask's words, or an operator
+ask naming "merge ... or hold" of one pull request), the station reads the
+pull request. A merged one earns one note ("Pull request #N merged at T, so
+this no longer waits on a person."), the wait labels come off, and the ticket's
+state follows the merge path; a closed unmerged one is withdrawn the same
+way and follows the closed-unmerged rule. A pull request still open leaves
+the issue unchanged. The withdrawal is once per ask: with the wait labels
+off, the issue no longer qualifies (and no longer shows on the Needs you
+page, which lists asks by those labels), and a later ask on the same issue
+is read fresh.
 
 A ticket whose every acceptance criterion is a check on a live host or
 network (a command run on a host, a reach test from a network, a port, a

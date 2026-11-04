@@ -20,6 +20,13 @@ TARGETS = (
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
     ("bus/station.py", "Station._apply_adapter_verify"),
+    # The held pull request wait withdrawal: the review bot measured the
+    # first shape at 27 against this cap, so the decomposed functions stay
+    # pinned.
+    ("bus/station.py", "Station.withdraw_held_pr_waits"),
+    ("bus/station.py", "Station._withdraw_held_pr_wait"),
+    ("bus/station.py", "Station._apply_held_wait_withdrawal"),
+    ("bus/station.py", "Station._held_wait_state"),
 )
 
 

@@ -86,6 +86,9 @@ class FakeGH:
         m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:ticket&state=open", path)
         if m:
             return list(self.tickets.get(m.group(1), []))
+        m = re.match(r"/repos/([^/]+/[^/]+)/issues\?labels=loom:queued&state=open", path)
+        if m:
+            return list(self.tickets.get(m.group(1), []))
         # The goal walk (goal, epics, tickets).
         m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues\?", path)
         if m:
@@ -530,6 +533,21 @@ class StationTest(StationBase):
         self.assertIn("1 tickets of its tier queued: #41\n", filed["body"])
         for shipped in ("#653", "#629", "#609"):
             self.assertNotIn(shipped, filed["body"])
+
+    def test_a_queued_lane_ticket_with_no_brief_headers_files_a_breach_and_a_valid_one_does_not(self):
+        self.gh.tickets.setdefault(REPO, []).append(
+            {"number": 41, "state": "open", "user": {"login": AUTHOR},
+             "body": "## Why\nA ticket filed with no header lines at all.\n",
+             "labels": [{"name": n} for n in ("loom:ticket", "loom:queued", "lane:muse")]})
+        self.gh.tickets[REPO].append(
+            {"number": 42, "state": "open", "user": {"login": AUTHOR},
+             "body": "Difficulty: medium\n\n## Why\nx\n",
+             "labels": [{"name": n} for n in ("loom:ticket", "loom:queued", "lane:muse")]})
+        self.run_at(T0)
+        (filed,) = self.breaches()
+        self.assertIn("queued-ticket-no-headers", filed["body"])
+        self.assertIn("#41", filed["title"] + filed["body"])
+        self.assertNotIn("#42", filed["title"] + filed["body"])
 
     def test_no_topup_is_read_from_the_environment(self):
         self.assertEqual(station.Settings.from_env({"LOOM_NO_TOPUP": "Anthropic, zen"}).no_topup,
@@ -1631,6 +1649,18 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual(invariants.ticket_waiting(Facts(T0)), [])
         short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane in tier medium", T0 - 60)]
         self.assertEqual(invariants.ticket_waiting(Facts(T0, waits=short)), [])
+
+    def test_a_queued_lane_ticket_with_no_brief_headers_is_named(self):
+        ticket = Ref("%s#9" % REPO, "#9")
+        (b,) = invariants.queued_ticket_no_headers(Facts(T0, headerless=[ticket]))
+        self.assertEqual(b.invariant, "queued-ticket-no-headers")
+        self.assertEqual(b.subject, ticket.key)
+        self.assertIn("#9", b.title)
+        self.assertIn("#9", " ".join(b.evidence))
+
+    def test_no_headerless_ticket_is_no_breach_and_unread_facts_find_nothing(self):
+        self.assertEqual(invariants.queued_ticket_no_headers(Facts(T0, headerless=[])), [])
+        self.assertEqual(invariants.queued_ticket_no_headers(Facts(T0)), [])
 
     def test_unread_facts_break_nothing_and_a_raising_invariant_is_logged(self):
         said = []

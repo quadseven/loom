@@ -92,6 +92,7 @@ from . import scorecard
 from . import watch
 from . import weakened
 from . import labels
+from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
@@ -2781,19 +2782,8 @@ class Station:
              % (name, lane))
         return True
 
-    def _runner_alive(self, lane: str) -> bool:
-        """Whether lane's runner holds its lock with a live pid. A name that
-        is not one of LANES counts as alive, so it never builds a path and its
-        brief is never moved."""
-        if lane not in LANES:
-            return True
-        lock = os.path.join(self.s.home, "run", lane + ".lock")
-        try:
-            with open(os.path.join(lock, "pid")) as fh:
-                pid = int(fh.read().strip())
-        except (OSError, ValueError):
-            # A lock with no readable pid may be a runner starting up.
-            return os.path.isdir(lock)
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -2801,6 +2791,50 @@ class Station:
         except PermissionError:
             pass  # alive, owned by another user (the lane user)
         return True
+
+    @staticmethod
+    def _lock_pid(lock: str, name: str) -> Optional[int]:
+        """The pid the runner recorded in its lock under `name`; None when
+        there is no readable one."""
+        try:
+            with open(os.path.join(lock, name)) as fh:
+                return int(fh.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _agent_group_alive(self, lock: str) -> Optional[int]:
+        """The leader pid of the run's still-live agent process group, or
+        None. The runner records the agent's group and its watchdog's group
+        in its lock (pgid, watchdog_pgid in lanes/run_lane.sh) so a later
+        pass can stop an orphaned agent; while either group lives, the run
+        those processes belong to is still going."""
+        for name in ("pgid", "watchdog_pgid"):
+            pid = self._lock_pid(lock, name)
+            if pid is not None and self._pid_alive(pid):
+                return pid
+        return None
+
+    def _runner_alive(self, lane: str) -> bool:
+        """Whether lane's run is still going: its runner holds its lock
+        with a live pid, or the run's agent process group outlives a dead
+        runner. A name that is not one of LANES counts as alive, so it
+        never builds a path and its brief is never moved."""
+        if lane not in LANES:
+            return True
+        lock = os.path.join(self.s.home, "run", lane + ".lock")
+        pid = self._lock_pid(lock, "pid")
+        if pid is None:
+            # A lock with no readable pid may be a runner starting up.
+            return os.path.isdir(lock)
+        if self._pid_alive(pid):
+            return True
+        # The runner itself is gone, but its run may not be: a runner
+        # killed mid-run (a reinstall's bootout kills its process group)
+        # takes its keepalive loop with it, while the agent survives in a
+        # process group of its own. On 2026-10-25 lane agy was read as
+        # silent for 32 minutes and its ticket moved while its agent ran
+        # on and opened the run's pull request (loom#2094).
+        return self._agent_group_alive(lock) is not None
 
     def _keepalive_age(self, lane: str) -> Optional[float]:
         """Seconds since lane's runner last stamped state/usage/<lane>.alive
@@ -2838,8 +2872,12 @@ class Station:
             except (OSError, ValueError):
                 lock_state = "lock without a readable pid"
             else:
-                lock_state = ("lock pid %d dead" % pid if not self._runner_alive(lane)
-                              else "lock pid %d alive" % pid)
+                if self._pid_alive(pid):
+                    lock_state = "lock pid %d alive" % pid
+                else:
+                    group = self._agent_group_alive(lock)
+                    lock_state = ("lock pid %d dead, agent group %d alive" % (pid, group)
+                                  if group is not None else "lock pid %d dead" % pid)
         age = self._keepalive_age(lane)
         return "%s, %s" % (lock_state, "no keepalive stamp" if age is None
                            else "keepalive stamp %d seconds old" % age)
@@ -5459,7 +5497,7 @@ class Station:
                      self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
-                     self.clean_labels,
+                     self.withdraw_held_pr_waits, self.clean_labels,
                      self.queue_stateless_tickets,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
@@ -6880,7 +6918,10 @@ class Station:
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
         ready = self._ready_head(comments)
-        if brain._pending_brain_fix(comments, self.s.authors):
+        if brain._pending_brain_fix(
+                comments, self.s.authors, (repo, pr_number),
+                lambda owner_repo, number: self.gh.rest(
+                    "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
             self._move_fix_to_lane(repo, number, lane, names)
             return
         if self._fix_pending(names, comments, sha):
@@ -7279,9 +7320,12 @@ class Station:
         """The fix rounds sent: each trusted loom:fix comment with a head
         marker is one round, whether or not the round moved the head. Counting
         distinct heads let a round that failed [transient] and pushed nothing
-        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
-        return sum(1 for comment in comments
-                   if isinstance(comment, dict)
+        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24).
+        A round the brain cancelled (loom#1998) never ran and does not count."""
+        cleared = set(brain.cancelled_fix_indexes(comments, authors))
+        return sum(1 for i, comment in enumerate(comments)
+                   if i not in cleared
+                   and isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and Station._fix_head(str(comment.get("body") or "")))
 
@@ -10735,6 +10779,117 @@ class Station:
             state["_at"] = self.now
             _write_json(path, state)
 
+    def withdraw_held_pr_waits(self) -> None:
+        """Withdraw a person wait on a held pull request that is over: each
+        pass, an open issue still carrying a person-wait label (the human
+        label, or a needs:<login> label) whose newest person ask is a held
+        pull request ask has that pull request read; a merged or closed one
+        withdraws the wait (one note, the wait labels off, the ticket's
+        state following the merge or closed-unmerged rule), and a
+        still-open one leaves the issue unchanged. The wait labels are what
+        the Needs-you page lists an ask by, so taking them off is what
+        drops the ask from that page. Once per ask: with the labels off the
+        issue no longer qualifies, and a later ask on the same issue is
+        read fresh."""
+        for repo in self._verify_repos():
+            try:
+                self._withdraw_held_pr_waits_repo(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not withdraw held pull request waits in %s: %s" % (repo, err))
+
+    def _withdraw_held_pr_waits_repo(self, repo: str) -> None:
+        issues = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+        for issue in issues if isinstance(issues, list) else []:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            names = _label_names(issue)
+            if any(self._held_wait_label(name) for name in names):
+                self._withdraw_held_pr_wait(repo, issue)
+
+    def _withdraw_held_pr_wait(self, repo: str, issue: Dict[str, Any]) -> None:
+        number = int(issue["number"])
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        held_number = answer.newest_held_pr(comments, self.s.authors)
+        if held_number is None:
+            return
+        pr = self._read_held_pr(repo, number, held_number)
+        if pr is None:
+            return
+        merged = bool(pr.get("merged_at")) or pr.get("merged") is True
+        if not merged and pr.get("state") != "closed":
+            return  # still open: the wait stands, the issue is unchanged
+        self._apply_held_wait_withdrawal(repo, issue, comments, pr, merged)
+        _say("withdrew the wait on %s#%d: pull request #%d %s"
+             % (repo, number, held_number, "merged" if merged else "closed without merging"))
+
+    def _read_held_pr(self, repo: str, number: int, held_number: int) -> Optional[Dict[str, Any]]:
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, held_number)).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read pull request #%d for %s#%d: %s" % (held_number, repo, number, err))
+            return None
+        return pr if isinstance(pr, dict) else None
+
+    @staticmethod
+    def _held_wait_label(name: str) -> bool:
+        """A label that holds the person wait: one of the human labels
+        (HUMAN_LABELS, whose old names include needs-operator), or a
+        needs:<login> label."""
+        return name in HUMAN_LABELS or name.startswith("needs:")
+
+    @staticmethod
+    def _held_wait_note(number: int, merged: bool, when: str) -> str:
+        if merged:
+            head = "Pull request #%d merged at %s" % (number, when) if when else \
+                "Pull request #%d merged" % number
+        else:
+            head = "Pull request #%d closed without merging at %s" % (number, when) if when else \
+                "Pull request #%d closed without merging" % number
+        return "%s, so this no longer waits on a person." % head
+
+    def _apply_held_wait_withdrawal(self, repo: str, issue: Dict[str, Any],
+                                    comments: List[Any], pr: Dict[str, Any],
+                                    merged: bool) -> None:
+        number = int(issue["number"])
+        when = str(pr.get("merged_at") or pr.get("closed_at") or pr.get("updated_at") or "")
+        note = self._held_wait_note(int(pr["number"]), merged, when)
+        said = [str(c.get("body") or "") for c in comments if isinstance(c, dict)]
+        if note not in said:
+            self._comment(repo, number, note, notify.NOTE)
+        kept = [name for name in _label_names(issue)
+                if not self._held_wait_label(name)]
+        kept = self._held_wait_state(issue, kept, pr)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": name} for name in kept]
+
+    def _held_wait_state(self, issue: Dict[str, Any], kept: List[str],
+                         pr: Dict[str, Any]) -> List[str]:
+        """The kept labels with the ticket's state following the pull
+        request's outcome, the reconcile rule (_reconcile_pr_ticket): the
+        outcome is _terminal_label's, except that a merged pull request
+        whose criteria are still unbuilt lands back at loom:queued instead
+        of loom:merged. A ticket already at loom:merged, loom:shipped or
+        loom:verified keeps that state, as in _reconcile_pr_ticket: only
+        its wait is withdrawn. A ticket carrying no state label takes the
+        outcome state, again as the reconcile rule sets it."""
+        state_names = ("queued", "briefed", "running", "pr", "ready", "answered",
+                       "failed", "merged", "shipped", "verified", "closed-unmerged")
+        states = {"loom:" + state for state in state_names}
+        terminal = {"loom:merged", "loom:shipped", "loom:verified"}
+        if terminal.intersection(kept):
+            return kept
+        kept = [name for name in kept if name not in states]
+        target = self._terminal_label(pr)
+        if target == "loom:merged" and self._unbuilt_criteria(issue, [pr]):
+            target = "loom:queued"
+        if target is not None:
+            kept.append(target)
+        return kept
+
     def clean_labels(self) -> None:
         """One label pass (bus/label_pass.py, loom#2024): remove labels that
         contradict each other or describe a step that is over, on at most
@@ -11904,6 +12059,7 @@ class Station:
                            ("runs", self._invariant_runs),
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
+                           ("headerless", self._invariant_headerless),
                            ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):
@@ -12029,6 +12185,35 @@ class Station:
                 if repo not in self._publics:
                     self._publics[repo] = self._public(repo)
                 out.append((ref, factory.tier_lanes(issue, not self._publics[repo])))
+        return out
+
+    def _invariant_headerless(self) -> List[invariants.Ref]:
+        """Each open ticket carrying loom:queued and a lane: label whose body
+        parses to no brief headers: no lane can claim such a ticket, so the
+        invariant pass names it instead of the claim path rejecting it
+        silently. A body the parser refuses (ValueError) is unreadable, not
+        headerless. The read is the narrow loom:queued list, not the full
+        loom:ticket list _invariant_queued pays for only when a held lane
+        needs it: the queued set is small, so naming stranded tickets every
+        pass does not make every pass pay the all-tickets read."""
+        out: List[invariants.Ref] = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            for issue in self._paginate("/repos/%s/issues?labels=loom:queued&state=open" % repo):
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                names = _label_names(issue)
+                if ("loom:ticket" not in names or "loom:queued" not in names
+                        or not any(n.startswith("lane:") for n in names)):
+                    continue
+                try:
+                    headers = tickets.parse(issue.get("body"))[0]
+                except ValueError:
+                    continue
+                if headers:
+                    continue
+                out.append(self._invariant_ref(repo, int(issue["number"])))
         return out
 
     def _invariant_checks(self) -> List[invariants.Check]:
@@ -12453,6 +12638,7 @@ class Station:
                                     (repo, number))
         node = {"comments": {"nodes": [
             {"body": c.get("body"), "createdAt": c.get("created_at"),
+             "updatedAt": c.get("updated_at"),
              "author": {"login": tickets._login(c.get("user"))}}
             for c in comments if isinstance(c, dict)]}}
         ledger = brain.goal_ledger(goal, node, now, authors)
@@ -13038,14 +13224,17 @@ class Station:
 
     def watch_brain_holders(self) -> None:
         """Tell the operator once when a holder in LOOM_BRAIN_BACKUP_HOLDERS
-        has posted no journal tick for BRAIN_STALE, and once when it ticks
-        again. Each holder keeps its own alert state, so a live brain elsewhere
-        does not hide a backup that stopped (loom#2141). A GitHub read error
-        makes no decision."""
+        has neither posted a journal tick nor yielded the lock to a peer for
+        BRAIN_STALE, and once when it ticks or yields again. Each holder keeps
+        its own alert state, so a live brain elsewhere does not hide a backup
+        that stopped (loom#2141); a backup that stood down for a peer's lock
+        is alive, not stopped (loom#2606). A GitHub read error makes no
+        decision."""
         if not self.s.brain_holders:
             return
         read, _, holders = self._journal()
-        if not read:
+        yields = self._holder_yields() if read else None
+        if yields is None:
             return
         path = os.path.join(self.state, "brain-holders-alert.json")
         alerts = _read_json(path, {}, strict=False)
@@ -13054,12 +13243,14 @@ class Station:
         for holder in self.s.brain_holders:
             at = holders.get(holder)
             at = at if self._num(at) else None
-            fresh = at is not None and self.now - at <= BRAIN_STALE
+            gave = yields.get(holder)
+            fresh = any(t is not None and self.now - t <= BRAIN_STALE
+                        for t in (at, gave["at"] if gave else None))
             told = alerts.get(holder)
             if fresh != (isinstance(told, dict) and told.get("sent") is True):
                 continue
             url = url or self._webhook()
-            if url is None or not self._send(url, self._holder_text(holder, fresh, at)):
+            if url is None or not self._send(url, self._holder_text(holder, fresh, at, gave)):
                 return
             if fresh:
                 alerts.pop(holder, None)
@@ -13067,14 +13258,54 @@ class Station:
                 alerts[holder] = {"sent": True, "at": self.now}
             _write_json(path, alerts)
 
-    def _holder_text(self, holder: str, fresh: bool, at: Optional[float]) -> str:
+    def _holder_yields(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Each brain's newest yield of the lock to a peer, as {"at": epoch
+        seconds, "to": the holder it yielded to}, from the yield record on the
+        lock (bus/lock.py, loom#2606). Re-read at most every JOURNAL_CHECK
+        seconds; the newest yield per brain is kept in the station state, so
+        one the lock no longer carries still counts. None when GitHub cannot
+        be read."""
+        path = os.path.join(self.state, "brain-yields.json")
+        cache = _read_json(path, {}, strict=False)
+        cache = cache if isinstance(cache, dict) else {}
+        saved = cache.get("yields") if isinstance(cache.get("yields"), dict) else {}
+        kept = {name: entry for name, entry in saved.items()
+                if isinstance(entry, dict) and self._num(entry.get("at"))
+                and isinstance(entry.get("to"), str) and lock.HOLDER_RE.fullmatch(entry["to"])}
+        checked = cache.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < JOURNAL_CHECK:
+            return kept
+        if not tickets.REPO_RE.fullmatch(self.s.status_repo or ""):
+            return kept
+        try:
+            found = lock.read_yields(self.gh, self.s.status_repo)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("brain lock yield read failed: %s" % err)
+            return None
+        for name, entry in found.items():
+            at = self._epoch(entry["at"])
+            if at is not None and at > kept.get(name, {}).get("at", 0):
+                kept[name] = {"at": at, "to": entry["to"]}
+        _write_json(path, {"checked": self.now, "yields": kept})
+        return kept
+
+    def _holder_text(self, holder: str, fresh: bool, at: Optional[float],
+                     gave: Optional[Dict[str, Any]] = None) -> str:
+        if fresh and gave and (at is None or gave["at"] > at):
+            return ("The Loom brain %s is alive again: it yielded the lock to %s at %s."
+                    % (holder, gave["to"], self._utc(gave["at"])))
         if fresh:
             return ("The Loom brain %s is ticking again (last journal tick %s)."
                     % (holder, self._utc(at or self.now)))
         since = "since " + self._utc(at) if at is not None else "in the last day"
+        yielded = ("Its last yield of the lock was to %s at %s, also over %d hours ago."
+                   % (gave["to"], self._utc(gave["at"]), BRAIN_STALE // 3600) if gave
+                   else "It recorded no yield of the lock either.")
         return ("Urgent: the Loom brain %s has posted no journal tick %s, over %d hours, "
-                "though another brain may still be ticking. Its log is brain.log on the "
-                "machine it runs on." % (holder, since, BRAIN_STALE // 3600))
+                "though another brain may still be ticking. %s Its log is brain.log on the "
+                "machine it runs on." % (holder, since, BRAIN_STALE // 3600, yielded))
 
     # -- talking to the brain --------------------------------------------
     @staticmethod

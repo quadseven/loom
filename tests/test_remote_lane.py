@@ -344,6 +344,71 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(data["number"], 4)
 
 
+class ClaimRejectionTests(unittest.TestCase):
+    """A queued, lane-labelled ticket the takes-filter rejects must not
+    vanish silently: claim prints one stderr line per rejected ticket naming
+    the repo, the ticket number and the rejection reason, and the summary
+    line keeps its format."""
+
+    def claim_err(self, gh):
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            got = lane.claim(gh, ["example/project"], now=1000)
+        return got, buf.getvalue()
+
+    def rejection_line(self, reason):
+        return "%s rejected: %s" % ("%s#%d" % ("example/project", 4), reason)
+
+    def test_a_ticket_with_no_brief_header_is_named_with_its_reason(self):
+        gh = FakeGitHub(body="## Why\nA body with no brief headers at all.\n")
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("no brief header"), err)
+        self.assertIn("scanned 1 repos, found 0 candidates", err)
+
+    def test_a_ticket_outside_the_lanes_tiers_is_named_with_its_reason(self):
+        gh = FakeGitHub(body=BODY.replace("Difficulty: medium", "Difficulty: hard"))
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("difficulty outside the lane's tiers"), err)
+        self.assertIn("scanned 1 repos, found 0 candidates", err)
+
+    def test_a_pull_request_item_is_named_with_its_reason(self):
+        gh = FakeGitHub()
+        gh.issues[4]["pull_request"] = {"url": "https://example.com/pulls/4"}
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("the item is a pull request"), err)
+
+    def test_a_ticket_owned_elsewhere_is_named_with_its_reason(self):
+        gh = FakeGitHub()
+        gh.issues[4]["assignees"] = [{"login": OUTSIDER}]
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("owned elsewhere"), err)
+
+    def test_a_ticket_not_labelled_for_this_lane_prints_no_rejection_line(self):
+        # The claim query already filters on the lane label, so a ticket
+        # without it is not routed here and must not be reported as rejected.
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": "loom:queued"}, {"name": "lane:other"}]
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertNotIn("rejected:", err)
+        self.assertEqual(lane._rejection_reason(gh.issues[4], "muse"),
+                         "not labelled for this lane")
+
+    def test_a_non_dict_item_has_its_own_reason(self):
+        self.assertEqual(lane._rejection_reason(None, "muse"), "not a ticket item")
+
+    def test_a_claimed_ticket_prints_only_the_summary_line(self):
+        gh = FakeGitHub()
+        got, err = self.claim_err(gh)
+        self.assertIsNotNone(got)
+        self.assertEqual(err.strip().splitlines(),
+                         ["scanned 1 repos, found 1 candidates"])
+
+
 class MuseSlotsTests(unittest.TestCase):
     """Four Muse lanes (operator, 2026-10-25: "Yes I want muse lanes... Like 4")."""
 
@@ -480,9 +545,9 @@ class TakesTest(unittest.TestCase):
             with self.subTest(body=body):
                 item = {"number": 5, "body": body,
                         "labels": [{"name": "loom:queued"}, {"name": "lane:muse"}]}
-                self.assertFalse(lane._takes(item, "muse"))
+                self.assertIsNotNone(lane._rejection_reason(item, "muse"))
         item["body"] = "Difficulty: easy\n\n## What\nx"
-        self.assertTrue(lane._takes(item, "muse"))
+        self.assertIsNone(lane._rejection_reason(item, "muse"))
 
 
 class RemoteBeatTests(unittest.TestCase):

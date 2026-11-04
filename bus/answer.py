@@ -271,10 +271,29 @@ def as_operator_comments(comments: Iterable[Any], trusted: Iterable[str], ops: I
     return out
 
 
+# A "merge ... or hold" ask names its pull request inside the matched
+# sentence ("Merge #12 now or hold it") or just before it ("Pull request
+# #12: merge or hold"); the number is read from the match first, then from
+# the words before it.
+_MERGE_HOLD_NUMBER_WINDOW = 60
+
+
 def held_pr(text: Any) -> Optional[int]:
-    """The pull request a lane hold ask (bus.operator_hold.ask) names, or None."""
-    found = HELD_PR_RE.search(" ".join(str(text or "").split()))
-    return int(found.group(1)) if found else None
+    """The pull request a held pull request ask names, or None: a lane hold
+    ask (bus.operator_hold.ask), or an operator ask naming "merge ... or
+    hold" of one pull request."""
+    clean = " ".join(str(text or "").split())
+    found = HELD_PR_RE.search(clean)
+    if found:
+        return int(found.group(1))
+    match = _MERGE_HOLD_RE.search(clean)
+    if match is None:
+        return None
+    named = re.findall(r"#([0-9]+)", match.group(0))
+    if not named:
+        before = clean[max(0, match.start() - _MERGE_HOLD_NUMBER_WINDOW):match.start()]
+        named = re.findall(r"#([0-9]+)", before)
+    return int(named[-1]) if named else None
 
 
 def _hold_asks(comments: Iterable[Any], trusted: Iterable[str]) -> List[Tuple[int, Mapping[str, Any]]]:
@@ -290,6 +309,23 @@ def _hold_asks(comments: Iterable[Any], trusted: Iterable[str]) -> List[Tuple[in
         if number is not None:
             out.append((number, comment))
     return out
+
+
+def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[int]:
+    """The pull request the newest person ask names as held, or None when
+    the newest ask is not a held pull request ask, or there is no ask. An
+    ask is a HUMAN_MARKER comment from a trusted login (as in _hold_asks);
+    the newest one decides, so a later ask of any other kind supersedes an
+    earlier hold ask."""
+    allowed = {str(t).lower() for t in trusted}
+    newest: Optional[int] = None
+    for comment in comments or []:
+        if not isinstance(comment, dict) or _author(comment) not in allowed:
+            continue
+        body = str(comment.get("body") or "")
+        if body.startswith(HUMAN_MARKER):
+            newest = held_pr(body)
+    return newest
 
 
 def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops: Iterable[str],

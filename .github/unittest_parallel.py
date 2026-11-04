@@ -64,7 +64,41 @@ def child_env(test_dir: Path) -> dict[str, str]:
     if env.get("PYTHONPATH"):
         python_path += os.pathsep + env["PYTHONPATH"]
     env["PYTHONPATH"] = python_path
+    for key in tuple(env):
+        if key.startswith("GIT_CONFIG_"):
+            env.pop(key)
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
     return env
+
+
+def local_push_check(test_dir: Path) -> str | None:
+    """Check that the test environment can push to a local bare repository."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="loom-local-push-") as directory:
+        root = Path(directory)
+        remote = root / "remote.git"
+        work = root / "work"
+        env = child_env(test_dir)
+        init = subprocess.run(["git", "init", "--bare", "-q", str(remote)],
+                              cwd=root, env=env, capture_output=True, text=True)
+        if init.returncode:
+            return "local Git push preflight could not initialize its bare origin: " + init.stderr.strip()
+        clone = subprocess.run(["git", "clone", "-q", str(remote), str(work)],
+                               cwd=root, env=env, capture_output=True, text=True)
+        if clone.returncode:
+            return "local Git push preflight could not clone its bare origin: " + clone.stderr.strip()
+        (work / "probe").write_text("probe\n")
+        commands = (["git", "-c", "user.name=loom", "-c", "user.email=loom@example.invalid",
+                     "add", "probe"],
+                    ["git", "-c", "user.name=loom", "-c", "user.email=loom@example.invalid",
+                     "commit", "-qm", "probe"],
+                    ["git", "push", "-q", "origin", "HEAD:refs/heads/main"])
+        for command in commands:
+            result = subprocess.run(command, cwd=work, env=env, capture_output=True, text=True)
+            if result.returncode:
+                return "local Git push preflight failed: " + (result.stderr.strip() or result.stdout.strip())
+    return None
 
 
 def work_items(modules: list[str], test_dir: Path, shard_size: int) -> list[tuple[str, list[str]]]:
@@ -111,6 +145,10 @@ def main() -> int:
     parser.add_argument("--allow-skips", action="store_true")
     args = parser.parse_args()
     test_dir = args.tests_dir.resolve()
+    push_error = local_push_check(test_dir)
+    if push_error:
+        print(push_error, file=sys.stderr)
+        return 1
     modules = discovered_modules(test_dir)
     if not modules:
         print("Ran 0 tests")

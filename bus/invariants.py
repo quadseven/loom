@@ -436,6 +436,9 @@ class Facts:
     review_at: Optional[float] = None
     guards_no_check: Optional[List[int]] = None
     guards_unreadable: Optional[List[int]] = None
+    # Open tickets carrying loom:queued and a lane: label whose body parses
+    # to no brief headers: no lane can ever claim them.
+    headerless: Optional[List[Ref]] = None
 
 
 @dataclass(frozen=True)
@@ -1080,6 +1083,25 @@ def guard_unreadable(f: Facts) -> List[Breach]:
                    f.now, rolling=True)]
 
 
+def queued_ticket_no_headers(f: Facts) -> List[Breach]:
+    """A queued, lane-labelled ticket whose body parses to no brief headers:
+    the brief parser gives the lane claim path no headers to read, so every
+    lane rejects it and it stays unclaimable until a person adds the header
+    block by hand (a bot-filed ticket sat this way in 2026-11). One
+    breach per ticket, naming it, so the stranded ticket is found in one
+    pass instead of when someone asks why nothing claimed it."""
+    if f.headerless is None:
+        return []
+    return [Breach("queued-ticket-no-headers", ref.key,
+                   "Queued ticket %s carries a lane label but no brief headers" % ref.label,
+                   ("Ticket %s is labelled loom:queued for a lane, but its body parses to "
+                    "no brief headers, so no lane can ever claim it" % ref.label,
+                    "Add the brief header block (Difficulty:, Base:) to the ticket body, "
+                    "or take the lane label off it"),
+                   f.now)
+            for ref in f.headerless]
+
+
 def merged_not_shipped(f: Facts) -> List[Breach]:
     """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
     found their merge commit deployed: the move to loom:shipped failed, and
@@ -1170,7 +1192,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
     untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
-    guard_unreadable)
+    guard_unreadable, queued_ticket_no_headers)
 
 
 def check(facts: Facts, say: Say,
