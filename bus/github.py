@@ -798,7 +798,7 @@ class GitHub:
             self.graphql("mutation($id: ID!) { updateSubscription(input: "
                          "{subscribableId: $id, state: UNSUBSCRIBED}) "
                          "{ subscribable { viewerSubscription } } }", {"id": node})
-        except (GitHubError, ValueError, TypeError) as err:
+        except (GitHubError, ValueError, TypeError, AttributeError) as err:
             self.unsubscribe_failures.append("%s: %s" % (path, err))
 
     def _check_status(self, method: str, path: str, status: int, text: str,
@@ -1079,7 +1079,10 @@ class GitHub:
         tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
+            # A kept answer is a repo's issue or pull request text, so it is
+            # the user's alone, like the token state file next to it.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(dict(entry, url=url), fh)
             os.replace(tmp, path)
         except (OSError, TypeError, ValueError):

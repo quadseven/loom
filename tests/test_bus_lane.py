@@ -212,7 +212,9 @@ class PushBranchTest(unittest.TestCase):
         full = dict(os.environ)
         if env:
             full.update(env)
-        result = subprocess.run(["git", *args], cwd=self.dir,
+        # A signed commit would get a gpgsig header the push's re-created
+        # commit lacks, so a developer's commit.gpgsign=true moved the SHA.
+        result = subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=self.dir,
                                 capture_output=True, text=True, env=full)
         if result.returncode:
             raise AssertionError("git %s failed: %s" % (args[0], result.stderr))

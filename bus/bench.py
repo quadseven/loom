@@ -51,7 +51,6 @@ LIST_TTL = 6 * 3600
 # The dashboard's read of the list (dashboard/server.py).
 LIST_PATH = "/api/bench"
 BENCHED, TRIAL = "benched", "trial"
-EVENT_KINDS = ("bench", "trial", "return", "rebench")
 
 
 class Config:

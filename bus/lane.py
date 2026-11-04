@@ -421,7 +421,7 @@ def _push_commit(gh: GitHub, repo: str, local_sha: str, local_parent: str,
             "encoding": "base64"}).data or {}
         if made.get("sha") != blob_sha:
             raise GitHubError("blob SHA mismatch for %s" % path)
-        mode = _git("ls-tree", local_sha, path).split()[0]
+        mode = _git("ls-tree", local_sha, "--", path).split()[0]
         tree_updates.append({"path": path, "mode": mode,
                              "type": "blob", "sha": blob_sha})
     base_tree = _git("rev-parse", local_parent + "^{tree}")
