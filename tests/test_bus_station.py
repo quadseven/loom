@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import rebuttal, urgency  # noqa: E402
+from bus import lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -122,6 +122,9 @@ class FakeGitHub:
         # 384 KB): path -> text, read through the git trees and blobs API.
         self.big_files = {}
         self.tree_status = 200
+        # The brain lock's commit message (bus/lock.py), or None for no lock.
+        self.lock_message = None
+        self.lock_error = False
 
     def add_foreign(self, repo, number, labels=("loom:pr",), state="open", reason=None):
         """An issue in another repo, as an After: line that names one reads it."""
@@ -318,7 +321,13 @@ class FakeGitHub:
         if method == "GET" and files:
             return reply(200, self.pull_files.get(int(files.group(1)), []))
         if method == "GET" and rest == "git/ref/heads/loom-lock/brain":
-            return reply(404, {"message": "Not Found"})
+            if self.lock_error:
+                return reply(500, {"message": "down"})
+            if self.lock_message is None:
+                return reply(404, {"message": "Not Found"})
+            return reply(200, {"object": {"sha": "f" * 40}})
+        if method == "GET" and rest == "git/commits/" + "f" * 40 and self.lock_message is not None:
+            return reply(200, {"message": self.lock_message, "tree": {"sha": "e" * 40}})
         if method == "GET" and rest == "git/trees/HEAD" and parts.query == "recursive=1":
             if self.tree_status != 200:
                 return reply(self.tree_status, {"message": "refused"})
@@ -10850,6 +10859,66 @@ class BrainTest(Base):
     def test_a_github_read_error_tells_no_backup_fault(self):
         self.settings.brain_holders = ["lane-machine"]
         self.fake.goal_error = True
+        self.go()
+        self.assertEqual(self.sent, [])
+
+    # loom#2606: a backup that stood down for a peer's lock recorded its
+    # yield on the lock; a recent yield is alive, a real stop is still told.
+    def yielded(self, age, holder="lane-machine", to="muse"):
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - age))
+        self.fake.lock_message = ("holder=%s expires=2030-01-01T00:00:00Z\n%s%s" % (
+            to, lock.YIELD_MARKER, json.dumps({holder: {"at": at, "to": to}})))
+        return at
+
+    def test_a_backup_that_yielded_the_lock_recently_is_not_told(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.yielded(15 * 60)
+        self.go()
+        self.go(60)
+        self.assertEqual(self.sent, [])
+
+    def test_a_backup_with_neither_a_tick_nor_a_yield_in_time_is_told_its_last_yield(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 4 * 3600, "lane-machine")])
+        at = self.yielded(3 * 3600)
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Urgent: the Loom brain lane-machine has posted no journal tick since",
+                      self.sent[0])
+        self.assertIn("Its last yield of the lock was to muse at %s, also over %d hours ago."
+                      % (at.replace("T", " "), station.BRAIN_STALE // 3600), self.sent[0])
+
+    def test_a_backup_with_no_yield_says_so(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.add_goal(50, [("alice-example", 600, "muse")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("It recorded no yield of the lock either.", self.sent[0])
+
+    def test_a_backup_that_yields_again_is_told_alive_once(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.tick(ok_age=60)
+        self.fake.add_goal(50, [("alice-example", 600, "muse"),
+                                ("alice-example", 3 * 3600, "lane-machine")])
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+        self.fake.add_goal(51, [("alice-example", 0, "muse")])
+        self.yielded(0)
+        self.go(station.JOURNAL_CHECK + 1)
+        self.go(2 * station.JOURNAL_CHECK + 2)
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("The Loom brain lane-machine is alive again: it yielded the lock to muse at",
+                      self.sent[1])
+
+    def test_a_lock_read_error_tells_no_backup_fault(self):
+        self.settings.brain_holders = ["lane-machine"]
+        self.fake.add_goal(50, [("alice-example", 600, "muse")])
+        self.fake.lock_error = True
         self.go()
         self.assertEqual(self.sent, [])
 
