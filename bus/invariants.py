@@ -1087,7 +1087,7 @@ def queued_ticket_no_headers(f: Facts) -> List[Breach]:
     """A queued, lane-labelled ticket whose body parses to no brief headers:
     the brief parser gives the lane claim path no headers to read, so every
     lane rejects it and it stays unclaimable until a person adds the header
-    block by hand (a bot-filed quest ticket sat this way in 2026-11). One
+    block by hand (a bot-filed ticket sat this way in 2026-11). One
     breach per ticket, naming it, so the stranded ticket is found in one
     pass instead of when someone asks why nothing claimed it."""
     if f.headerless is None:

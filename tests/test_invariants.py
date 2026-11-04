@@ -537,7 +537,7 @@ class StationTest(StationBase):
     def test_a_queued_lane_ticket_with_no_brief_headers_files_a_breach_and_a_valid_one_does_not(self):
         self.gh.tickets.setdefault(REPO, []).append(
             {"number": 41, "state": "open", "user": {"login": AUTHOR},
-             "body": "## Why\nA quest ticket filed with no header lines at all.\n",
+             "body": "## Why\nA ticket filed with no header lines at all.\n",
              "labels": [{"name": n} for n in ("loom:ticket", "loom:queued", "lane:muse")]})
         self.gh.tickets[REPO].append(
             {"number": 42, "state": "open", "user": {"login": AUTHOR},

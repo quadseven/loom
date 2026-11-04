@@ -26,7 +26,7 @@ NO_SETTLE_RULE = (
     "closed-epic-open-tickets", "epic-title-shared", "gate-hold", "plan-check-failed",
     "remote-silent", "silent-lane", "repeated-failure", "ticket-waiting", "untrusted-labeler",
     "roll-pin-off", "merged-not-shipped", "review-overdue", "guard-no-check",
-    "guard-unreadable")
+    "guard-unreadable", "queued-ticket-no-headers")
 QUIET = T0 - invariants.CLEAR_AFTER - 60
 HELD = (("claim:someone",), ("needs:someone",), ("loom:human",), ("awaiting-live-check",),
         ("loom:running",), ("loom:pr",), ("loom:ready",), ("loom:merged",))
