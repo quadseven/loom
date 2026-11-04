@@ -6880,7 +6880,10 @@ class Station:
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         names = _label_names(issue)
         ready = self._ready_head(comments)
-        if brain._pending_brain_fix(comments, self.s.authors):
+        if brain._pending_brain_fix(
+                comments, self.s.authors, (repo, pr_number),
+                lambda owner_repo, number: self.gh.rest(
+                    "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
             self._move_fix_to_lane(repo, number, lane, names)
             return
         if self._fix_pending(names, comments, sha):
