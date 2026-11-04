@@ -72,6 +72,9 @@ _OUTAGE_SINCE = re.compile(
     % (_SAME_SENTENCE, _TIME), re.I)
 _LAST_GOOD = re.compile(r"\blast (?:good|ok|healthy|successful|working)\b", re.I)
 _FIRST_BAD = re.compile(r"\bfirst (?:fail\w*|bad|error\w*|unhealthy|503)\b", re.I)
+_PUBLIC_ISSUE_REF = re.compile(
+    r"(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    r"(?:#(?P<short>[0-9]+)|/issues/(?P<url>[0-9]+))")
 
 
 def undated_outage(text: str) -> str:
@@ -140,6 +143,46 @@ def scrub_mentions(text: str, allow: Optional[Iterable[str]] = None) -> str:
 def scrub_paths(text: str) -> str:
     """The text with every local path replaced by <path>."""
     return PATH_RE.sub("<path>", text)
+
+
+def parse_deny_terms(raw: str) -> list[str]:
+    """Parse the shared leak-scan deny-list: one term per line, comments
+    ignored, and case-insensitive duplicates removed."""
+    found, seen = [], set()
+    for line in raw.splitlines():
+        term = line.strip()
+        if not term or term.startswith("#") or term.lower() in seen:
+            continue
+        found.append(term)
+        seen.add(term.lower())
+    return found
+
+
+def scrub_public_body(body: str, target_repo: str,
+                      private_repos: Iterable[str], deny_terms: Iterable[str]) -> str:
+    """Remove private repository references and deny-listed identifiers from
+    text headed to a public issue or pull request. Callers leave private targets
+    unchanged, refuse unknown target visibility, and treat unknown referenced
+    repositories as private for this safety check."""
+    hidden = {repo.lower() for repo in private_repos}
+    target = target_repo.lower()
+
+    def hide_ref(match: "re.Match[str]") -> str:
+        repo = match.group("repo")
+        if repo.lower() not in hidden or repo.lower() == target:
+            return match.group(0)
+        number = match.group("short") or match.group("url")
+        return "issue %s of a private repo" % number
+
+    out = _PUBLIC_ISSUE_REF.sub(hide_ref, body)
+    for term in deny_terms:
+        if not term:
+            continue
+        leading = r"(?<![0-9A-Za-z_])" if term[0].isalnum() or term[0] == "_" else ""
+        trailing = r"(?![0-9A-Za-z_])" if term[-1].isalnum() or term[-1] == "_" else ""
+        out = re.sub(leading + re.escape(term) + trailing,
+                     "<private identifier>", out, flags=re.IGNORECASE)
+    return PRIVATE_HOST_RE.sub("<private host>", out)
 
 
 def has_reason(text: object) -> bool:

@@ -585,6 +585,11 @@ class GitHub:
         self._node_ids: Dict[Tuple[str, int], str] = {}
         self.unsubscribe_failures: List[str] = []
         self.app: Optional[AppToken] = token if isinstance(token, AppToken) else None
+        # Visibility and the shared public-post deny-list are stable for the
+        # lifetime of this client; cache them so a burst of comments does not
+        # reread repository metadata or SSM for every write.
+        self._repo_private_cache: Dict[str, Optional[bool]] = {}
+        self._public_deny_terms: Optional[List[str]] = None
         # What the budget lines name: an App installation or a personal token.
         self.auth = "app" if self.app is not None else "token"
         self._app_login: Optional[str] = None
@@ -652,6 +657,7 @@ class GitHub:
         (bus/issue_reads.py) does not read it again (loom#2078)."""
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
+        body = self._guard_public_write(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
         if method == "POST" and self.unsubscribe and self.app is None:
             self._leave_thread(path, resp.data)
@@ -670,6 +676,138 @@ class GitHub:
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
+
+    @staticmethod
+    def _body_texts(value: Any) -> List[str]:
+        """Body strings in issue, PR, review and nested review-comment payloads."""
+        if isinstance(value, dict):
+            found = []
+            for key, item in value.items():
+                if key == "body" and isinstance(item, str):
+                    found.append(item)
+                else:
+                    found.extend(GitHub._body_texts(item))
+            return found
+        if isinstance(value, list):
+            return [text for item in value for text in GitHub._body_texts(item)]
+        return []
+
+    def _repo_is_private_for_post(self, repo: str) -> Optional[bool]:
+        if repo not in self._repo_private_cache:
+            try:
+                data = self.rest("GET", "/repos/%s" % repo, ok=(403, 404)).data
+            except GitHubError:
+                data = None
+            private = data.get("private") if isinstance(data, dict) else None
+            self._repo_private_cache[repo] = private if isinstance(private, bool) else None
+        return self._repo_private_cache[repo]
+
+    def _deny_terms_for_public_post(self) -> List[str]:
+        if self._public_deny_terms is None:
+            parameter = os.environ.get("LOOM_LEAK_DENY_SSM", "/infra/leak-scan/deny-list").strip()
+            region = os.environ.get("LOOM_AWS_REGION", "us-east-1").strip() or "us-east-1"
+            try:
+                raw = read_ssm(parameter, region)
+                terms = _text.parse_deny_terms(raw)
+            except Exception as err:
+                raise GitHubError("refusing public write: could not read the leak-scan deny-list") from err
+            if not terms:
+                raise GitHubError("refusing public write: leak-scan deny-list is empty")
+            self._public_deny_terms = terms
+        return self._public_deny_terms
+
+    def _scrub_public_payload(self, value: Any, target_repo: str,
+                              private_repos: set, deny_terms: List[str]) -> Any:
+        if isinstance(value, dict):
+            cleaned = {}
+            for key, item in value.items():
+                if key == "body" and isinstance(item, str):
+                    cleaned[key] = _text.scrub_public_body(
+                        item, target_repo, private_repos, deny_terms)
+                else:
+                    cleaned[key] = self._scrub_public_payload(
+                        item, target_repo, private_repos, deny_terms)
+            return cleaned
+        if isinstance(value, list):
+            return [self._scrub_public_payload(item, target_repo, private_repos, deny_terms)
+                    for item in value]
+        return value
+
+    def _guard_public_write(self, method: str, path: str, body: Any) -> Any:
+        """Guard every App-authored issue/PR body, comment and edit at the
+        shared REST boundary. Unknown target visibility or an unreadable
+        deny-list refuses the write rather than weakening the guard."""
+        if self.app is None or method.upper() not in ("POST", "PATCH", "PUT"):
+            return body
+        if path == "/graphql" and isinstance(body, dict):
+            query = body.get("query")
+            variables = body.get("variables")
+            if isinstance(query, str) and isinstance(variables, dict):
+                guarded = self._guard_public_graphql_reply(query, variables)
+                return dict(body, variables=guarded)
+        match = re.match(r"^/repos/([^/]+/[^/]+)/(?:issues|pulls)(?:/|$)", path)
+        if not match or not self._body_texts(body):
+            return body
+        target_repo = match.group(1)
+        target_private = self._repo_is_private_for_post(target_repo)
+        if target_private is True:
+            return body
+        if target_private is None:
+            raise GitHubError("refusing public write: could not determine target repository visibility")
+
+        private_repos = set()
+        for value in self._body_texts(body):
+            for ref in _text._PUBLIC_ISSUE_REF.finditer(value):
+                repo = ref.group("repo")
+                if repo.lower() == target_repo.lower():
+                    continue
+                if self._repo_is_private_for_post(repo) is not False:
+                    private_repos.add(repo)
+        return self._scrub_public_payload(
+            body, target_repo, private_repos, self._deny_terms_for_public_post())
+
+    def _guard_public_graphql_reply(self, query: str,
+                                    variables: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply the public-body guard to the factory's review-thread reply.
+
+        GitHub's GraphQL reply mutation identifies its destination by a thread
+        node ID, not by a repository path. Resolve that ID before writing; if
+        the destination cannot be established, fail closed.
+        """
+        if self.app is None or "addPullRequestReviewThreadReply" not in query:
+            return variables
+        body = variables.get("body")
+        thread_id = variables.get("id")
+        if not isinstance(body, str) or not isinstance(thread_id, str):
+            return variables
+        lookup = ('query($id:ID!) { node(id:$id) { ... on PullRequestReviewThread {'
+                  ' pullRequest { repository { nameWithOwner } } } } }')
+        try:
+            data = self.rest("POST", "/graphql",
+                             {"query": lookup, "variables": {"id": thread_id}}).data
+            repo = data["data"]["node"]["pullRequest"]["repository"]["nameWithOwner"]
+        except (GitHubError, KeyError, TypeError) as err:
+            raise GitHubError(
+                "refusing public review reply: could not identify target repository"
+            ) from err
+        if not isinstance(repo, str) or not re.fullmatch(r"[^/]+/[^/]+", repo):
+            raise GitHubError("refusing public review reply: could not identify target repository")
+        target_private = self._repo_is_private_for_post(repo)
+        if target_private is True:
+            return variables
+        if target_private is None:
+            raise GitHubError("refusing review reply: could not determine target repository visibility")
+
+        private_repos = set()
+        for ref in _text._PUBLIC_ISSUE_REF.finditer(body):
+            referenced = ref.group("repo")
+            if referenced.lower() == repo.lower():
+                continue
+            if self._repo_is_private_for_post(referenced) is not False:
+                private_repos.add(referenced)
+        cleaned = _text.scrub_public_body(
+            body, repo, private_repos, self._deny_terms_for_public_post())
+        return dict(variables, body=cleaned)
 
     @staticmethod
     def _without_mentions(method: str, body: Any) -> Any:
@@ -1271,8 +1409,9 @@ class GitHub:
         return items[-keep:]
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
+        variables = variables or {}
         resp = self.rest("POST", "/graphql",
-                         {"query": query, "variables": variables or {}})
+                         {"query": query, "variables": variables})
         data = resp.data if isinstance(resp.data, dict) else {}
         if data.get("errors"):
             raise GitHubError("graphql errors", resp.status, json.dumps(data["errors"]))

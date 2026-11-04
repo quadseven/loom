@@ -29,6 +29,10 @@ class TextModuleTest(unittest.TestCase):
             text.check("the job on service.internal failed")
         text.check("see docs/ROADMAP.md for the plan")
 
+    def test_public_body_scrubber_preserves_ordinary_text(self):
+        body = "Ordinary status | no private reference, just 42 tests."
+        self.assertEqual(text.scrub_public_body(body, "quadseven/loom", (), ()), body)
+
 
 class ScrubMentionsTest(unittest.TestCase):
     """A plain-text at-sign word is a GitHub mention that notifies a real
