@@ -3,9 +3,14 @@ import unittest
 from unittest import mock
 
 from bus.github import GitHub, GitHubError, Response
+from bus.text import scrub_public_body
 
 
 class PublicWriteGuardTest(unittest.TestCase):
+    def test_public_scrubber_preserves_ordinary_text_and_bare_pipe(self):
+        body = "Ordinary status | no private reference, just 42 tests."
+        self.assertEqual(scrub_public_body(body, "quadseven/loom", (), ()), body)
+
     def client(self, target_private=False, private_repos=()):
         calls = []
         gh = GitHub("test-token")

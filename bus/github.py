@@ -786,8 +786,10 @@ class GitHub:
             data = self.rest("POST", "/graphql",
                              {"query": lookup, "variables": {"id": thread_id}}).data
             repo = data["data"]["node"]["pullRequest"]["repository"]["nameWithOwner"]
-        except (GitHubError, KeyError, TypeError):
-            raise GitHubError("refusing public review reply: could not identify target repository")
+        except (GitHubError, KeyError, TypeError) as err:
+            raise GitHubError(
+                "refusing public review reply: could not identify target repository"
+            ) from err
         if not isinstance(repo, str) or not re.fullmatch(r"[^/]+/[^/]+", repo):
             raise GitHubError("refusing public review reply: could not identify target repository")
         target_private = self._repo_is_private_for_post(repo)
