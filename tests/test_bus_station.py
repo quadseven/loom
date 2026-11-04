@@ -4838,8 +4838,9 @@ class CorruptStateTest(Base):
         # and the hourly read of the repo's roll record declaration (loom#2025),
         # and the verify-note pass's own pool listing (loom#2092), and the
         # held pull request wait withdrawal's read of the open tickets
-        # (loom#1857).
-        self.assertEqual(self.run_pass().requests, 18)
+        # (loom#1857), and the invariant pass's read of the queued tickets
+        # for ones with no brief headers (loom#2571).
+        self.assertEqual(self.run_pass().requests, 19)
 
 
 class TicketsTest(unittest.TestCase):
