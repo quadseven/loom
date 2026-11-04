@@ -1831,8 +1831,16 @@ When a trusted brain fix is still pending on the linked ticket, status adds
 A pending fix whose round has nothing left to fix is cancelled at merge time
 (loom#1998): when the round named only review threads, every thread it named
 is resolved, and the head is green with the review check passed on it,
-`bus.brain merge` posts a cancellation comment on the ticket and merges
-instead of refusing, and the cancelled round does not count as an attempt.
+`bus.brain merge` merges instead of refusing, posts a cancellation comment on
+the ticket once GitHub confirms the merge, and the cancelled round does not
+count as an attempt. A merge refused at any later check posts no
+cancellation. A resolution counts only when the thread's resolver (GraphQL
+`resolvedBy`) is a `LOOM_BRIEF_AUTHORS` login or the review bot's App, or
+when the rebuttal and lane-answer gates accept the answer the thread was
+resolved on. A cancellation counts only from a trusted comment that opens
+with the cancellation marker and names the pending round's pull request and
+head, or from a status event line that is exactly that cancellation; the
+marker quoted anywhere else cancels nothing.
 A round that also names a failing check or a conflict keeps blocking, as
 does one whose threads are not all resolved.
 A fleet hold blocks too (loom#2393): a plain pull request comment from a

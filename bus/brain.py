@@ -831,26 +831,65 @@ def _is_brain_fix(comment: Dict[str, Any], allowed: set) -> bool:
             and BRAIN_FIX_MARKER in body)
 
 
-def _clearing_stamps(comment: Dict[str, Any], allowed: set) -> Tuple[str, str]:
+# A fix round as the pull request and head its loom:fix comment names.
+FixRound = Tuple[Tuple[str, int], str]
+# The one status event that is a cancellation: the whole event line, as the
+# station would write it, naming the pull request and the head. The marker
+# anywhere else in an event's text is quoted text, not a cancellation.
+_CANCEL_EVENT_RE = re.compile(
+    re.escape(FIX_CANCELLED_MARKER)
+    + r" Pull request: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)"
+    + r" <!-- loom:fix-cancelled-head ([0-9a-f]+) -->")
+
+
+def _fix_round(body: str) -> Optional[FixRound]:
+    """The (pull request, head) a loom:fix body names, or None when it does
+    not name both: such a round cannot be cancelled."""
+    pull = fixrounds.pull_of(body) if body.startswith(FIX_MARKER) else None
+    head = FIX_HEAD_RE.search(body)
+    return (pull, head.group(1)) if pull and head else None
+
+
+def _cancelled_round(body: str) -> Optional[FixRound]:
+    """The (pull request, head) a cancellation comment cancels: only a body
+    that opens with the marker, as a fix opens with its own, and names both
+    (loom#1998). The marker quoted anywhere else cancels nothing."""
+    if not body.startswith(FIX_CANCELLED_MARKER):
+        return None
+    pull = fixrounds.pull_of(body)
+    head = FIX_CANCELLED_HEAD_RE.search(body)
+    return (pull, head.group(1)) if pull and head else None
+
+
+def _cancel_event(text: str) -> Optional[FixRound]:
+    """The round a status event cancels: only an event that is exactly one
+    station cancellation line."""
+    match = _CANCEL_EVENT_RE.fullmatch(text)
+    return ((match.group(1), int(match.group(2))), match.group(3)) if match else None
+
+
+def _clearing_stamps(comment: Dict[str, Any], allowed: set,
+                     pending: Optional[FixRound] = None) -> Tuple[str, str]:
     """The claim and cancellation stamps one comment carries, each "" when
     it carries none. A claim comment's stamp is its own time, whoever wrote
-    it; a cancellation counts only from a trusted writer, as a fix does. A
-    trusted status comment carries both as event lines with their own
-    stamps: the station edits that one comment in place, so the line's
-    stamp - not the comment's position - is what counts (loom#1203)."""
+    it; a cancellation counts only from a trusted writer, as a fix does, and
+    only when it names the pending round's pull request and head. A trusted
+    status comment carries both as event lines with their own stamps: the
+    station edits that one comment in place, so the line's stamp - not the
+    comment's position - is what counts (loom#1203)."""
     body = str(comment.get("body") or "")
     claim = cancel = ""
     if _CLAIM.fullmatch(body.strip()):
         claim = str(comment.get("created_at") or "")
     if tickets._login(comment.get("user")) not in allowed:
         return claim, cancel
-    if FIX_CANCELLED_MARKER in body:
+    if pending is not None and _cancelled_round(body) == pending:
         cancel = str(comment.get("created_at") or "")
     if is_status_comment(body):
         for at, text in parse_status_events(body):
             if _CLAIM.fullmatch(text.strip()):
                 claim = max(claim, at)
-            if FIX_CANCELLED_MARKER in text:
+            if pending is not None and _cancel_event(text) == pending:
                 cancel = max(cancel, at)
     return claim, cancel
 
@@ -866,6 +905,9 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
     # comment's position - is what the fix ask is measured against (loom#1203).
     claim_stamp = cancel_stamp = fix_stamp = ""
     fix_pr: Optional[Tuple[str, int]] = None
+    # A cancellation clears only the round that is pending (loom#1998).
+    fix = _pending_fix_comment(comments, authors)
+    pending = _fix_round(str(fix.get("body") or "")) if fix else None
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
@@ -875,7 +917,7 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
         if (_CLAIM.fullmatch(body.strip()) or
                 (remote_claim and tickets._login(comment.get("user")) in allowed)):
             last_claim = i
-        claim, cancel = _clearing_stamps(comment, allowed)
+        claim, cancel = _clearing_stamps(comment, allowed, pending)
         if remote_claim and tickets._login(comment.get("user")) in allowed:
             claim = max(claim, str(comment.get("created_at") or ""))
         claim_stamp = max(claim_stamp, claim)
@@ -921,10 +963,12 @@ def _pending_fix_comment(comments: List[Any], authors: Sequence[str]) -> Optiona
 def cancelled_fix_indexes(comments: List[Any], authors: Sequence[str]) -> List[int]:
     """Indexes of the counted fix rounds a trusted cancellation cleared
     (loom#1998): a cancellation clears the newest counted round before it
-    whose head it names. A counted round is a trusted loom:fix comment with
-    its head marker, the rounds Station._fix_round_count counts."""
+    whose pull request and head it names. A counted round is a trusted
+    loom:fix comment with its head marker, the rounds
+    Station._fix_round_count counts; a cancellation is a trusted comment
+    that opens with the cancellation marker (_cancelled_round)."""
     allowed = {a.lower() for a in authors}
-    waiting: List[Tuple[str, int]] = []
+    waiting: List[Tuple[Optional[FixRound], int]] = []
     cleared: List[int] = []
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
@@ -932,16 +976,14 @@ def cancelled_fix_indexes(comments: List[Any], authors: Sequence[str]) -> List[i
         body = str(comment.get("body") or "")
         if tickets._login(comment.get("user")) not in allowed:
             continue
-        head = FIX_HEAD_RE.search(body) if body.startswith(FIX_MARKER) else None
-        if head:
-            waiting.append((head.group(1), i))
+        if body.startswith(FIX_MARKER) and FIX_HEAD_RE.search(body):
+            waiting.append((_fix_round(body), i))
             continue
-        named = FIX_CANCELLED_HEAD_RE.search(body)
-        if named and FIX_CANCELLED_MARKER in body:
-            for j in range(len(waiting) - 1, -1, -1):
-                if waiting[j][0] == named.group(1):
-                    cleared.append(waiting.pop(j)[1])
-                    break
+        named = _cancelled_round(body)
+        for j in range(len(waiting) - 1, -1, -1):
+            if named is not None and waiting[j][0] == named:
+                cleared.append(waiting.pop(j)[1])
+                break
     return cleared
 
 
@@ -4736,7 +4778,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' authorCanPushToRepository state submittedAt } } '
              ' commits(last:20) { nodes { commit { committedDate parents { totalCount }'
              ' statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved path comments(first:1) { nodes {'
+             ' reviewThreads(first:100) { nodes { id isResolved resolvedBy { login } path comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } }'
              ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'
@@ -4768,6 +4810,7 @@ def merge(gh: GitHub, repo: str, number: int,
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     details = _pr_graphql(gh, repo, number)
     tier = ""
+    cancellation: Optional[str] = None
     if adopt:
         if not _ticketless(repo, pr):
             raise ValueError("pull request is linked to a ticket; merge it without --adopt")
@@ -4789,7 +4832,7 @@ def merge(gh: GitHub, repo: str, number: int,
         owner = owned_elsewhere(issue, env)
         if owner is not None:
             raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
-        _refuse_pending_fix(gh, repo, number, association, details, env)
+        cancellation = _refuse_pending_fix(gh, repo, number, association, details, env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
@@ -4824,6 +4867,10 @@ def merge(gh: GitHub, repo: str, number: int,
         raise ValueError("GitHub did not confirm the merge")
     branch = pr["head"]["ref"]
     try:
+        if cancellation is not None and association:
+            # Posted only now, after every merge check and GitHub's own:
+            # a refused merge leaves the round pending (loom#1998).
+            notify.post(gh, association[0], association[1], cancellation, notify.RECORD)
         # GitHub's own auto-delete may have removed it already: still merged.
         gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, quote(branch, safe="/")),
                 ok=(404, 422))
@@ -5154,79 +5201,113 @@ _FIX_CHECK_LINE = re.compile(r"^- Check .+ failed$", re.M)
 _FIX_CONFLICT_LINE = "- The branch conflicts with the default branch"
 
 
-def _fix_cancellable(body: str, repo: str, number: int,
-                     details: Dict[str, Any]) -> bool:
+def _resolution_counts(gh: GitHub, repo: str, head: str, thread: Dict[str, Any],
+                       bot: str, trusted: set) -> bool:
+    """Whether a thread's resolution may clear a fix round (loom#1998). Anyone
+    who can resolve a thread could otherwise clear one, so a resolution
+    counts only when the resolver is a trusted login or the review bot's App
+    (GraphQL resolvedBy, which names an App "<slug>[bot]"), or when the
+    lane-answer gates accept the answer it was resolved on: the station held
+    it for this head (_station_held), or the answer holds on the head
+    (_unheld_answer finds nothing)."""
+    if not thread.get("isResolved"):
+        return False
+    resolver = str((thread.get("resolvedBy") or {}).get("login") or "").lower()
+    if resolver and (resolver in trusted or resolver == bot.lower() + "[bot]"):
+        return True
+    if _station_held(thread, head, bot, trusted):
+        return True
+    return (_answered(thread, bot, trusted)
+            and not _unheld_answer(gh, repo, head, thread, bot, trusted))
+
+
+def _threads_by_id(details: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The pull request's review threads, by thread id."""
+    return {str(t.get("id") or ""): t
+            for t in (details.get("reviewThreads") or {}).get("nodes") or []
+            if isinstance(t, dict)}
+
+
+def _fix_cancellable(gh: GitHub, body: str, repo: str, number: int,
+                     details: Dict[str, Any], env: Optional[Dict[str, str]]) -> bool:
     """What a loom:fix body and the pull request's threads say about
     cancelling its round (loom#1998): the round was written for this pull
-    request, it named only review threads - no failing check, no conflict -
-    and every thread it named is resolved on the pull request."""
+    request and names its head, it named only review threads - no failing
+    check, no conflict - and every thread it named is resolved on the pull
+    request by a resolution that counts (_resolution_counts)."""
     from . import factory  # factory imports this module
-    if fixrounds.pull_of(body) != (repo, number):
+    found = _fix_round(body)
+    if found is None or found[0] != (repo, number):
         return False
     threads = factory.FIX_THREAD_RE.findall(body)
     if not threads or _FIX_CHECK_LINE.search(body) or _FIX_CONFLICT_LINE in body:
         return False
-    resolved = {str(t.get("id") or ""): bool(t.get("isResolved"))
-                for t in (details.get("reviewThreads") or {}).get("nodes") or []
-                if isinstance(t, dict)}
-    return all(resolved.get(thread) for thread in threads)
+    bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
+        or factory.DEFAULT_REVIEW_BOT
+    trusted = {a.lower() for a in trusted_authors(env)}
+    head = str(details.get("headRefOid") or "")
+    nodes = _threads_by_id(details)
+    return all(thread in nodes
+               and _resolution_counts(gh, repo, head, nodes[thread], bot, trusted)
+               for thread in threads)
 
 
-def _cancel_pending_fix(gh: GitHub, repo: str, number: int,
-                        ticket: Tuple[str, int], comments: List[Any],
-                        details: Dict[str, Any],
-                        env: Optional[Dict[str, str]],
-                        authors: Sequence[str]) -> bool:
-    """Cancel the pending brain fix when its round has nothing left to fix
-    (loom#1998): the round named only review threads, every one of them is
-    resolved, and the head is green with the review check passed on it.
-    Posts the one cancellation comment the ticket gets and returns True.
-    Any doubt leaves the fix pending."""
+def _fix_cancellation(gh: GitHub, repo: str, number: int, comments: List[Any],
+                      details: Dict[str, Any], env: Optional[Dict[str, str]],
+                      authors: Sequence[str]) -> Optional[str]:
+    """The cancellation note for the pending brain fix when its round has
+    nothing left to fix (loom#1998): the round named only review threads,
+    every one of them is resolved by a resolution that counts, and the head
+    is green with the review check passed on it. Posts nothing: merge posts
+    the note once GitHub confirms the merge, so a refused merge leaves the
+    round pending. None on any doubt, which leaves the fix pending."""
     fix = _pending_fix_comment(comments, authors)
     if fix is None:
-        return False
+        return None
     body = str(fix.get("body") or "")
-    if not _fix_cancellable(body, repo, number, details):
-        return False
+    if not _fix_cancellable(gh, body, repo, number, details, env):
+        return None
     if not _checks_green(details):
-        return False
+        return None
     sha = str(details.get("headRefOid") or "")
     check = review_check_name(env)
     if not sha or not _review_check_passed(gh, repo, sha, check):
-        return False
-    note = (FIX_CANCELLED_MARKER + "\n"
+        return None
+    found = _fix_round(body)
+    if found is None:
+        return None
+    return (FIX_CANCELLED_MARKER + "\n"
             + "Pull request: %s#%d\n\n" % (repo, number)
             + "Cancelled the pending brain fix on this ticket: the round named "
               "only review threads, every thread it named is resolved, and the "
               "pull request head is green with the review check %s passed on "
               "it. There is nothing left for the round to fix, so it no longer "
               "blocks the merge. The cancelled round does not count as an "
-              "attempt.\n" % _shown(check))
-    head = FIX_HEAD_RE.search(body)
-    if head:
-        note += "\n" + FIX_CANCELLED_HEAD % head.group(1) + "\n"
-    notify.post(gh, ticket[0], ticket[1], note, notify.RECORD)
-    return True
+              "attempt.\n" % _shown(check)
+            + "\n" + FIX_CANCELLED_HEAD % found[1] + "\n")
 
 
 def _refuse_pending_fix(gh: GitHub, repo: str, number: int,
                         ticket: Optional[Tuple[str, int]],
                         details: Dict[str, Any],
-                        env: Optional[Dict[str, str]]) -> None:
+                        env: Optional[Dict[str, str]]) -> Optional[str]:
     """Refuse a merge while the ticket's brain fix has not run: status marks
     such a pull request "blocked: pending brain fix", and merging it then would
     land the head the fix was sent to change (2026-10-15). A pending fix whose
-    round has nothing left to fix is cancelled instead (loom#1998)."""
+    round has nothing left to fix does not refuse (loom#1998): the
+    cancellation note is returned for merge to post on the ticket after
+    GitHub confirms the merge, else None."""
     authors = trusted_authors(env)
     if ticket is None or not authors:
-        return
+        return None
     comments = list(gh.paginate("/repos/%s/issues/%d/comments" % ticket))
     if not _pending_brain_fix(comments, authors, (repo, number),
                               lambda owner_repo, pr_number: gh.rest(
                                   "GET", "/repos/%s/pulls/%d" % (owner_repo, pr_number)).data or {}):
-        return
-    if _cancel_pending_fix(gh, repo, number, ticket, comments, details, env, authors):
-        return
+        return None
+    note = _fix_cancellation(gh, repo, number, comments, details, env, authors)
+    if note is not None:
+        return note
     raise ValueError("a brain fix is pending on the ticket; merge after it runs")
 
 
