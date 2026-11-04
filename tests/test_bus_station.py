@@ -4836,8 +4836,10 @@ class CorruptStateTest(Base):
         # ones with no state label (loom#1653), the hourly label pass's reads
         # of open issues and of closed ones still at loom:triage (loom#2024),
         # and the hourly read of the repo's roll record declaration (loom#2025),
-        # and the verify-note pass's own pool listing (loom#2092).
-        self.assertEqual(self.run_pass().requests, 17)
+        # and the verify-note pass's own pool listing (loom#2092), and the
+        # held pull request wait withdrawal's read of the open tickets
+        # (loom#1857).
+        self.assertEqual(self.run_pass().requests, 18)
 
 
 class TicketsTest(unittest.TestCase):
@@ -5439,9 +5441,13 @@ class ClaimTest(Base):
         # find a queued or briefed one a merged pull request delivers
         # (loom#784; a conditional read the verify runs share, which the
         # done-ticket close step reuses: one more request, no more calls).
-        self.assertEqual(len(self.fake.calls), first + 6)
-        self.assertEqual(gh.requests, 9)
-        self.assertEqual(gh.not_modified, 1)
+        # The held pull request wait withdrawal reads the open tickets too,
+        # to find a person wait whose pull request is over (loom#1857); its
+        # read is conditional like the verify runs', so the second pass
+        # answers it 304 as well.
+        self.assertEqual(len(self.fake.calls), first + 7)
+        self.assertEqual(gh.requests, 10)
+        self.assertEqual(gh.not_modified, 2)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
     def test_a_304_reuses_the_stored_list(self):

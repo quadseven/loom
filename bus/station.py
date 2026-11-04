@@ -5460,7 +5460,7 @@ class Station:
                      self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
-                     self.clean_labels,
+                     self.withdraw_held_pr_waits, self.clean_labels,
                      self.queue_stateless_tickets,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
@@ -10741,6 +10741,117 @@ class Station:
         finally:
             state["_at"] = self.now
             _write_json(path, state)
+
+    def withdraw_held_pr_waits(self) -> None:
+        """Withdraw a person wait on a held pull request that is over: each
+        pass, an open issue still carrying a person-wait label (the human
+        label, or a needs:<login> label) whose newest person ask is a held
+        pull request ask has that pull request read; a merged or closed one
+        withdraws the wait (one note, the wait labels off, the ticket's
+        state following the merge or closed-unmerged rule), and a
+        still-open one leaves the issue unchanged. The wait labels are what
+        the Needs-you page lists an ask by, so taking them off is what
+        drops the ask from that page. Once per ask: with the labels off the
+        issue no longer qualifies, and a later ask on the same issue is
+        read fresh."""
+        for repo in self._verify_repos():
+            try:
+                self._withdraw_held_pr_waits_repo(repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not withdraw held pull request waits in %s: %s" % (repo, err))
+
+    def _withdraw_held_pr_waits_repo(self, repo: str) -> None:
+        issues = self._paginate("/repos/%s/issues?state=open&per_page=100" % repo)
+        for issue in issues if isinstance(issues, list) else []:
+            if not isinstance(issue, dict) or "pull_request" in issue:
+                continue
+            names = _label_names(issue)
+            if any(self._held_wait_label(name) for name in names):
+                self._withdraw_held_pr_wait(repo, issue)
+
+    def _withdraw_held_pr_wait(self, repo: str, issue: Dict[str, Any]) -> None:
+        number = int(issue["number"])
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        held_number = answer.newest_held_pr(comments, self.s.authors)
+        if held_number is None:
+            return
+        pr = self._read_held_pr(repo, number, held_number)
+        if pr is None:
+            return
+        merged = bool(pr.get("merged_at")) or pr.get("merged") is True
+        if not merged and pr.get("state") != "closed":
+            return  # still open: the wait stands, the issue is unchanged
+        self._apply_held_wait_withdrawal(repo, issue, comments, pr, merged)
+        _say("withdrew the wait on %s#%d: pull request #%d %s"
+             % (repo, number, held_number, "merged" if merged else "closed without merging"))
+
+    def _read_held_pr(self, repo: str, number: int, held_number: int) -> Optional[Dict[str, Any]]:
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, held_number)).data
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read pull request #%d for %s#%d: %s" % (held_number, repo, number, err))
+            return None
+        return pr if isinstance(pr, dict) else None
+
+    @staticmethod
+    def _held_wait_label(name: str) -> bool:
+        """A label that holds the person wait: one of the human labels
+        (HUMAN_LABELS, whose old names include needs-operator), or a
+        needs:<login> label."""
+        return name in HUMAN_LABELS or name.startswith("needs:")
+
+    @staticmethod
+    def _held_wait_note(number: int, merged: bool, when: str) -> str:
+        if merged:
+            head = "Pull request #%d merged at %s" % (number, when) if when else \
+                "Pull request #%d merged" % number
+        else:
+            head = "Pull request #%d closed without merging at %s" % (number, when) if when else \
+                "Pull request #%d closed without merging" % number
+        return "%s, so this no longer waits on a person." % head
+
+    def _apply_held_wait_withdrawal(self, repo: str, issue: Dict[str, Any],
+                                    comments: List[Any], pr: Dict[str, Any],
+                                    merged: bool) -> None:
+        number = int(issue["number"])
+        when = str(pr.get("merged_at") or pr.get("closed_at") or pr.get("updated_at") or "")
+        note = self._held_wait_note(int(pr["number"]), merged, when)
+        said = [str(c.get("body") or "") for c in comments if isinstance(c, dict)]
+        if note not in said:
+            self._comment(repo, number, note, notify.NOTE)
+        kept = [name for name in _label_names(issue)
+                if not self._held_wait_label(name)]
+        kept = self._held_wait_state(issue, kept, pr)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        issue["labels"] = [{"name": name} for name in kept]
+
+    def _held_wait_state(self, issue: Dict[str, Any], kept: List[str],
+                         pr: Dict[str, Any]) -> List[str]:
+        """The kept labels with the ticket's state following the pull
+        request's outcome, the reconcile rule (_reconcile_pr_ticket): the
+        outcome is _terminal_label's, except that a merged pull request
+        whose criteria are still unbuilt lands back at loom:queued instead
+        of loom:merged. A ticket already at loom:merged, loom:shipped or
+        loom:verified keeps that state, as in _reconcile_pr_ticket: only
+        its wait is withdrawn. A ticket carrying no state label takes the
+        outcome state, again as the reconcile rule sets it."""
+        state_names = ("queued", "briefed", "running", "pr", "ready", "answered",
+                       "failed", "merged", "shipped", "verified", "closed-unmerged")
+        states = {"loom:" + state for state in state_names}
+        terminal = {"loom:merged", "loom:shipped", "loom:verified"}
+        if terminal.intersection(kept):
+            return kept
+        kept = [name for name in kept if name not in states]
+        target = self._terminal_label(pr)
+        if target == "loom:merged" and self._unbuilt_criteria(issue, [pr]):
+            target = "loom:queued"
+        if target is not None:
+            kept.append(target)
+        return kept
 
     def clean_labels(self) -> None:
         """One label pass (bus/label_pass.py, loom#2024): remove labels that
