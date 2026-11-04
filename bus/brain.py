@@ -581,14 +581,36 @@ HELD_HEADING = "### Held tickets"
 
 
 def held_on(found: List[Dict[str, Any]], issues: List[Dict[str, Any]],
-            repo: str) -> Dict[int, List[tickets.After]]:
+            repo: str, gh: Optional[GitHub] = None) -> Dict[int, List[tickets.After]]:
     """Each ticket that waits on tickets it builds on, and the ones not merged
-    yet. Only this repo's open issues are known here, so a ticket in another
-    repo (or one no longer open) reads as unreadable."""
+    yet. A ref this repo's open issues cannot answer (another repo's ticket,
+    or one no longer open here) is read through gh, once per distinct ref,
+    through the same after_holds resolution the station's claim check uses
+    (loom#1571). A ref GitHub will not show at all (github.unreadable: moved,
+    gone or forbidden) stays unreadable, with the reason kept for the Held
+    tickets lines; any other read failure ends the run, as elsewhere in
+    status."""
     by_number = {int(i["number"]): i for i in issues if "number" in i}
+    fetched: Dict[Tuple[str, int], Optional[Dict[str, Any]]] = {}
+    reasons: Dict[Tuple[str, int], str] = {}
 
     def lookup(where: str, number: int) -> Optional[Dict[str, Any]]:
-        return by_number.get(number) if where.lower() == repo.lower() else None
+        if where.lower() == repo.lower() and number in by_number:
+            return by_number[number]
+        if gh is None:
+            return None
+        key = (where.lower(), number)
+        if key not in fetched:
+            try:
+                data = gh.rest("GET", "/repos/%s/issues/%d" % (where, number)).data
+                fetched[key] = data if isinstance(data, dict) else None
+            except GitHubError as err:
+                reason = unreadable(err)
+                if reason is None:
+                    raise
+                reasons[key] = reason
+                fetched[key] = None
+        return fetched[key]
 
     held: Dict[int, List[tickets.After]] = {}
     for issue in found:
@@ -598,7 +620,11 @@ def held_on(found: List[Dict[str, Any]], issues: List[Dict[str, Any]],
             continue  # an unusable brief is the station's to refuse
         waiting = tickets.after_holds(repo, headers, lookup)[0]
         if waiting:
-            held[int(issue["number"])] = waiting
+            held[int(issue["number"])] = [
+                a._replace(why="unreadable: %s" % reasons[(a.repo.lower(), a.number)])
+                if a.why == "unreadable" and (a.repo.lower(), a.number) in reasons
+                else a
+                for a in waiting]
     return held
 
 
@@ -1360,7 +1386,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     adoptable = [i for i in pulls
                  if not str(i.get("head", {}).get("ref", "")).startswith("loom/")
                  and _pr_author(i).lower() in trusted and _ticketless(repo, i)]
-    held = held_on(tickets, issues, repo)
+    held = held_on(tickets, issues, repo, gh)
     histories, skipped = _histories(gh, repo, tickets, now, authors or (), held)
     past = past_last_rung(tickets, histories)
     pr_of = _ticket_prs(repo, prs)
