@@ -8,7 +8,8 @@ names its own login (docs/BRAIN.md, Shared brain duty). Every attempt
 answers with the holder record, so a
 brain can tell its own lock from a peer's (loom#2275): a re-attempt that finds
 the caller's own live lock is acquired, and a peer's lock is told with its
-holder and how long it has held it.
+holder and how long it has held it. A brain that stands down for a peer's
+lock records its yield under the lock line (`record_yield`, loom#2606).
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from .github import GitHub
 
@@ -126,8 +127,52 @@ def _holder_from(message: str) -> Holder:
                   login=_field(r"(?:^|\s)login=(\S+)", first) or "")
 
 
-def read_holder(gh: GitHub, repo: str) -> Optional[Holder]:
-    """The current lock's holder record, or None when there is no lock."""
+# The yield record (loom#2606): one line under the lock line, a JSON map of
+# each brain that stood down for a peer's lock to {"at": <UTC>, "to": <the
+# holder it yielded to>}, its newest yield only. It is a commit on the lock
+# branch, never a comment, so it emails nobody; the station reads it to tell
+# a brain that yielded from one that stopped. A takeover of an expired lock
+# carries it into the new lock, and a yield older than YIELD_KEEP is dropped.
+YIELD_MARKER = "loom:yield="
+YIELD_KEEP = timedelta(days=1)
+
+
+def yields_from(message: str) -> Dict[str, Dict[str, str]]:
+    """The yield record in a lock commit message; malformed entries left out."""
+    for line in message.splitlines():
+        if not line.startswith(YIELD_MARKER):
+            continue
+        try:
+            record = json.loads(line[len(YIELD_MARKER):])
+        except ValueError:
+            return {}
+        if not isinstance(record, dict):
+            return {}
+        return {name: {"at": entry["at"], "to": entry["to"]}
+                for name, entry in record.items() if _good_yield(name, entry)}
+    return {}
+
+
+def _good_yield(name: Any, entry: Any) -> bool:
+    return (isinstance(name, str) and bool(HOLDER_RE.fullmatch(name))
+            and isinstance(entry, dict) and isinstance(entry.get("to"), str)
+            and bool(HOLDER_RE.fullmatch(entry["to"]))
+            and isinstance(entry.get("at"), str) and _parse_time(entry["at"]) is not None)
+
+
+def _with_yields(message: str, yields: Dict[str, Dict[str, str]], now: datetime) -> str:
+    """`message` with its yield line replaced by `yields`, those older than
+    YIELD_KEEP at `now` dropped; no line when none is left."""
+    keep = {name: entry for name, entry in sorted(yields.items())
+            if now - (_parse_time(entry["at"]) or now) <= YIELD_KEEP}
+    lines = [line for line in message.splitlines() if not line.startswith(YIELD_MARKER)]
+    if keep:
+        lines.append(YIELD_MARKER + json.dumps(keep, separators=(",", ":")))
+    return "\n".join(lines)
+
+
+def _read_message(gh: GitHub, repo: str) -> Optional[Tuple[str, str]]:
+    """(head sha, commit message) of the current lock, or None when absent."""
     ref = gh.rest("GET", "/repos/%s/git/ref/heads/%s" % (repo, LOCK_BRANCH),
                   ok=(404,))
     if ref.status == 404:
@@ -136,7 +181,19 @@ def read_holder(gh: GitHub, repo: str) -> Optional[Holder]:
     commit = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, sha), ok=(404,))
     if commit.status == 404:
         return None
-    return _holder_from(str(commit.data.get("message") or ""))
+    return sha, str(commit.data.get("message") or "")
+
+
+def read_holder(gh: GitHub, repo: str) -> Optional[Holder]:
+    """The current lock's holder record, or None when there is no lock."""
+    read = _read_message(gh, repo)
+    return None if read is None else _holder_from(read[1])
+
+
+def read_yields(gh: GitHub, repo: str) -> Dict[str, Dict[str, str]]:
+    """The yield record on the current lock: {} when there is no lock or none."""
+    read = _read_message(gh, repo)
+    return {} if read is None else yields_from(read[1])
 
 
 def _read_lock(gh: GitHub, repo: str) -> Optional[Tuple[str, Optional[datetime]]]:
@@ -222,14 +279,20 @@ def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
     sha = commit.data["sha"]
     if _create_ref(gh, repo, sha):
         return Attempt(True, mine, holder)
-    current = read_holder(gh, repo)
-    if current is not None:
+    read = _read_message(gh, repo)
+    if read is not None:
+        current = _holder_from(read[1])
         if current.live(now):
             if current.is_caller(holder, run):
                 return Attempt(True, current, holder, already=True)
             return Attempt(False, current, holder)
         gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
                 ok=(404, 422))
+        # The expired lock's yield record goes on into the new lock.
+        carried = _with_yields(message, yields_from(read[1]), now)
+        if carried != message:
+            sha = gh.rest("POST", "/repos/%s/git/commits" % repo, {
+                "message": carried, "tree": tree, "parents": []}).data["sha"]
     if _create_ref(gh, repo, sha):
         return Attempt(True, mine, holder)
     # A second failed create means another taker won the gap after the
@@ -256,6 +319,33 @@ def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,
             waited = int((now - start).total_seconds() // 60)
             return Attempt(result.acquired, result.holder, holder, result.already, waited)
         sleep(step)
+
+
+def record_yield(gh: GitHub, repo: str, holder: str, now: Optional[datetime] = None,
+                 sleep: Callable[[float], None] = time.sleep) -> Optional[Dict[str, str]]:
+    """Record on the lock that `holder` stood down for the brain the lock
+    names, at `now`: its yield entry, or None when no other named brain's
+    lock is there to yield to. Written by compare-and-swap (write_branch), so
+    the holder's own step commits are never dropped."""
+    _check_holder(holder)
+    now = _utc(now)
+
+    def build() -> Tuple[Optional[str], Optional[str], Optional[Dict[str, str]]]:
+        read = _read_message(gh, repo)
+        if read is None:
+            return None, None, None
+        sha, message = read
+        to = _holder_from(message).name
+        if not to or to == holder:
+            return sha, None, None
+        entry = {"at": now.strftime(TIME_FORMAT), "to": to}
+        yields = dict(yields_from(message), **{holder: entry})
+        tree = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, sha)).data["tree"]["sha"]
+        commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
+            "message": _with_yields(message, yields, now), "tree": tree, "parents": [sha]})
+        return sha, commit.data["sha"], entry
+
+    return write_branch(gh, repo, build, sleep)
 
 
 class LockHeadMoved(RuntimeError):

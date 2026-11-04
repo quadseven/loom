@@ -55,6 +55,10 @@ def _parser() -> argparse.ArgumentParser:
                    "from another run is not yours")
     s.add_argument("--wait", type=int, default=0, metavar="MINUTES",
                    help="try again each minute for up to this long while a peer holds the lock")
+    s = sub.add_parser("yielded", help="record on the brain lock that this brain stood "
+                       "down for the peer holding it")
+    s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
+    s.add_argument("--holder", required=True)
     s = sub.add_parser("unlock", help="release the brain tick lock")
     s.add_argument("repo", type=_repo, metavar="OWNER/NAME")
     s.add_argument("--holder", required=True)
@@ -130,6 +134,15 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
                                       login=brain.writer_login(gh))
         print(result.line())
         return 0 if result.acquired else 1
+    if args.command == "yielded":
+        # A stand-down leaves this on the lock, not a comment (loom#2606):
+        # the station counts a recent yield as a backup brain alive.
+        entry = lock.record_yield(gh, args.repo, args.holder)
+        if entry is None:
+            print("no yield recorded: no other brain's lock to yield to")
+            return 1
+        print("yield recorded: %s stood down for %s at %s" % (args.holder, entry["to"], entry["at"]))
+        return 0
     if args.command == "unlock":
         ok = lock.release(gh, args.repo, args.holder)
         print("lock released" if ok else "lock not released")
