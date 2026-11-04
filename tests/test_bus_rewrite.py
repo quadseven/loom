@@ -278,6 +278,16 @@ class RewriteIssueTest(Base):
         self.fake.add_triage(7)
         self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
 
+    def test_a_blocked_issue_is_not_a_candidate(self):
+        # loom#1904: a blocked issue waits on something outside the repo, so
+        # the rewriter leaves it alone, as triage does (brain.not_work_reason).
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"].append({"name": "blocked:progression"})
+        self.fake.add_triage(9)
+        self.fake.triage[9]["labels"].append({"name": "blocked"})
+        self.fake.add_triage(7)
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_a_restating_invariant_report_is_not_a_candidate(self):
         # loom#2506: per-violation reports of a ROLLED kind were rewritten
         # into lane tickets whose only remedy is a GitHub operation a

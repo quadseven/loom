@@ -3860,6 +3860,10 @@ def not_work_reason(issue: Dict[str, Any]) -> Optional[str]:
     if any(name.startswith("wayfinder:") for name in names):
         # A wayfinder map or decision ticket is planning, not work for a lane.
         return "wayfinder"
+    if "blocked" in names or any(name.startswith("blocked:") for name in names):
+        # A blocked issue waits on something outside the repo; a lane cannot
+        # do it, and rewriting one only burns a run (loom#1904).
+        return "blocked"
     if FACTORY_INCIDENT_MARKER in str(issue.get("body") or ""):
         # A factory incident is filed as a plain issue; it is not a ticket
         # the backlog should triage (loom#918).
