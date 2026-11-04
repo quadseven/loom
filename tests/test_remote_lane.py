@@ -387,6 +387,20 @@ class ClaimRejectionTests(unittest.TestCase):
         self.assertIsNone(got)
         self.assertIn(self.rejection_line("owned elsewhere"), err)
 
+    def test_a_ticket_not_labelled_for_this_lane_prints_no_rejection_line(self):
+        # The claim query already filters on the lane label, so a ticket
+        # without it is not routed here and must not be reported as rejected.
+        gh = FakeGitHub()
+        gh.issues[4]["labels"] = [{"name": "loom:queued"}, {"name": "lane:other"}]
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertNotIn("rejected:", err)
+        self.assertEqual(lane._rejection_reason(gh.issues[4], "muse"),
+                         "not labelled for this lane")
+
+    def test_a_non_dict_item_has_its_own_reason(self):
+        self.assertEqual(lane._rejection_reason(None, "muse"), "not a ticket item")
+
     def test_a_claimed_ticket_prints_only_the_summary_line(self):
         gh = FakeGitHub()
         got, err = self.claim_err(gh)
@@ -531,9 +545,9 @@ class TakesTest(unittest.TestCase):
             with self.subTest(body=body):
                 item = {"number": 5, "body": body,
                         "labels": [{"name": "loom:queued"}, {"name": "lane:muse"}]}
-                self.assertFalse(lane._takes(item, "muse"))
+                self.assertIsNotNone(lane._rejection_reason(item, "muse"))
         item["body"] = "Difficulty: easy\n\n## What\nx"
-        self.assertTrue(lane._takes(item, "muse"))
+        self.assertIsNone(lane._rejection_reason(item, "muse"))
 
 
 class RemoteBeatTests(unittest.TestCase):

@@ -114,5 +114,5 @@ class PathsTest(unittest.TestCase):
                     body="Difficulty: easy\n\n## Why\nx\n")
         free = dict(issue("loom:queued", "lane:muse"), body=held["body"])
         with mock.patch.dict("os.environ", self.ENV):
-            self.assertFalse(lane._takes(held, "muse"))
-            self.assertTrue(lane._takes(free, "muse"))
+            self.assertIsNotNone(lane._rejection_reason(held, "muse"))
+            self.assertIsNone(lane._rejection_reason(free, "muse"))

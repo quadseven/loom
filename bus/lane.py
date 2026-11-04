@@ -249,10 +249,6 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     return None
 
 
-def _takes(item: Any, lane: str) -> bool:
-    return _rejection_reason(item, lane) is None
-
-
 def _take(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
           now: float) -> Dict[str, Any]:
     number = int(issue["number"])
