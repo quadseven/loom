@@ -4675,7 +4675,7 @@ def merge(gh: GitHub, repo: str, number: int,
         owner = owned_elsewhere(issue, env)
         if owner is not None:
             raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
-        _refuse_pending_fix(gh, association, (repo, number), env)
+        _refuse_pending_fix(gh, association, (repo, number), env, details)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
@@ -5036,7 +5036,8 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
                         current_pr: Tuple[str, int],
-                        env: Optional[Dict[str, str]]) -> None:
+                        env: Optional[Dict[str, str]],
+                        details: Optional[Dict[str, Any]] = None) -> None:
     """Refuse a merge while the ticket's brain fix has not run: status marks
     such a pull request "blocked: pending brain fix", and merging it then would
     land the head the fix was sent to change (2026-10-15)."""
@@ -5044,10 +5045,62 @@ def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
     if ticket is None or not authors:
         return
     comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-    if _pending_brain_fix(list(comments), authors, current_pr,
-                          lambda owner_repo, number: gh.rest(
-                              "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
-        raise ValueError("a brain fix is pending on the ticket; merge after it runs")
+    last_fix = max((i for i, c in enumerate(comments) if isinstance(c, dict)
+                    and tickets._login(c.get("user")).lower() in
+                    {author.lower() for author in authors}
+                    and str(c.get("body") or "").startswith(FIX_MARKER)
+                    and BRAIN_FIX_MARKER in str(c.get("body") or "")), default=-1)
+    if last_fix >= 0 and any(
+            isinstance(c, dict) and tickets._login(c.get("user")).lower() in
+            {author.lower() for author in authors}
+            and "<!-- loom:brain-fix-cancelled v1 -->" in str(c.get("body") or "")
+            for c in comments[last_fix + 1:]):
+        return
+    pending = _pending_brain_fix(list(comments), authors, current_pr,
+                                 lambda owner_repo, number: gh.rest(
+                                     "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {})
+    if not pending:
+        return
+    if details and _cancel_resolved_thread_fix(gh, ticket, comments, authors, details, env):
+        return
+    raise ValueError("a brain fix is pending on the ticket; merge after it runs")
+
+
+def _cancel_resolved_thread_fix(gh: GitHub, ticket: Tuple[str, int], comments: List[Any],
+                                authors: Sequence[str], details: Dict[str, Any],
+                                env: Optional[Dict[str, str]]) -> bool:
+    """Cancel a pending fix made only of review threads once they are all
+    resolved and the current head is green and reviewed; cancellation is not
+    an attempt (loom#1998)."""
+    allowed = {author.lower() for author in authors}
+    fix = next((c for c in reversed(comments) if isinstance(c, dict)
+                and tickets._login(c.get("user")) in allowed
+                and str(c.get("body") or "").startswith(FIX_MARKER)
+                and BRAIN_FIX_MARKER in str(c.get("body") or "")), None)
+    if fix is None:
+        return False
+    body = str(fix.get("body") or "")
+    if re.search(r"(?m)^- Check `", body) or "- The branch conflicts" in body:
+        return False
+    thread_ids = re.findall(r"(?m)^### Thread ([^ ]+) \(comment ", body)
+    named_threads = re.findall(r"(?m)^- Review thread at `", body)
+    if not thread_ids or len(thread_ids) != len(named_threads):
+        return False
+    threads = {str(t.get("id")): t for t in
+               ((details.get("reviewThreads") or {}).get("nodes") or [])
+               if isinstance(t, dict)}
+    if any(thread_id not in threads or not threads[thread_id].get("isResolved")
+           for thread_id in thread_ids):
+        return False
+    head = _head_commit(details)
+    sha = str(details.get("headRefOid") or "")
+    if _checks_blocker(head) or not sha or not _review_check_passed(
+            gh, ticket[0], sha, review_check_name(env)):
+        return False
+    gh.rest("POST", "/repos/%s/issues/%d/comments" % ticket,
+            {"body": "<!-- loom:brain-fix-cancelled v1 -->\nCancelled the pending brain fix: all named review threads are resolved, "
+                     "and the current head is green with the review check passed. No fix attempt was used."})
+    return True
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:

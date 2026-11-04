@@ -2064,6 +2064,45 @@ class SensitiveResumeTests(unittest.TestCase):
                         env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
+    def test_merge_cancels_pending_fix_when_its_only_thread_is_resolved(self):
+        pr, query = self._merge_replies(changes={"details": {
+            "reviewThreads": {"nodes": [{"id": "thread-1", "isResolved": True}]}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fix = {"user": {"login": "alice-example"}, "body":
+               "%s\n%s fix\n- Review thread at `bus/a.py:1`\n\n"
+               "<!-- loom:fix-detail\n### Thread thread-1 (comment 3) at bus/a.py:1\n-->"
+               % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}
+        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]),
+                    reply(200, {"check_runs": [{"name": "Grug - Elder", "status": "completed",
+                                                "conclusion": "success"}]}),
+                    reply(201, {}), reply(200, {"merged": True}), reply(204))
+        with unittest.mock.patch.multiple(
+                brain, _refuse_operator_hold=unittest.mock.DEFAULT,
+                _refuse_merge_constraints=unittest.mock.DEFAULT,
+                _refuse_risk_tier=unittest.mock.DEFAULT,
+                _hold_blocker=unittest.mock.DEFAULT,
+                _settle_merged_ticket=unittest.mock.DEFAULT) as gates:
+            gates["_refuse_risk_tier"].return_value = "app-code"
+            gates["_hold_blocker"].return_value = None
+            result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                                 env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertTrue(result["merged"])
+        posts = [call for call in fake.calls if call[0] == "POST" and call[1].endswith("/issues/9/comments")]
+        self.assertEqual(len(posts), 1)
+        self.assertIn("cancelled", posts[0][2]["body"].lower())
+
+    def test_merge_keeps_pending_fix_when_its_round_names_a_failing_check(self):
+        pr, query = self._merge_replies()
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fix = {"user": {"login": "alice-example"}, "body":
+               "%s\n%s fix\n- Check `unittest` failed"
+               % (tickets.FIX_MARKER, brain.BRAIN_FIX_MARKER)}
+        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]))
+        with self.assertRaisesRegex(ValueError, "brain fix is pending"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+
     def test_merge_goes_ahead_once_no_brain_fix_is_pending(self):
         pr, query = self._merge_replies()
         issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
