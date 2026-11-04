@@ -12460,6 +12460,7 @@ class Station:
                                     (repo, number))
         node = {"comments": {"nodes": [
             {"body": c.get("body"), "createdAt": c.get("created_at"),
+             "updatedAt": c.get("updated_at"),
              "author": {"login": tickets._login(c.get("user"))}}
             for c in comments if isinstance(c, dict)]}}
         ledger = brain.goal_ledger(goal, node, now, authors)
