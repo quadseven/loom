@@ -544,12 +544,28 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
+def _split_owned_runaways(rows: List[Tuple[Any, Dict[str, Any]]]
+                          ) -> Tuple[List[Tuple[Any, Dict[str, Any]]],
+                                     List[Tuple[Any, Dict[str, Any], str]]]:
+    own = []
+    held = []
+    for prefix, issue in rows:
+        owner = owned_elsewhere(issue)
+        (own if owner is None else held).append(
+            (prefix, issue) if owner is None else (prefix, issue, owner))
+    return own, held
+
+
 def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
-    rows = [i for i in issues if RUNAWAY in _labels(i)
+    rows = [(None, i) for i in issues if RUNAWAY in _labels(i)
             and tickets.ticket_state(i) not in tickets.MERGED_STATES]
-    return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
-                                      for i in rows] or ["- none"])
+    own, held = _split_owned_runaways(rows)
+    lines = ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
+                                        for _, i in own] or ["- none"])
+    lines += ["- owned by %s: #%s %s" % (owner, issue["number"], issue.get("title", ""))
+              for _, issue, owner in held]
+    return lines
 
 
 HELD_HEADING = "### Held tickets"
@@ -772,7 +788,9 @@ def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     return line
 
 
-def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
+def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
+                       current_pr: Optional[Tuple[str, int]] = None,
+                       pr_state: Optional[Callable[[str, int], Dict[str, Any]]] = None) -> bool:
     allowed = {a.lower() for a in authors}
     last_claim = newest = -1
     # Newest stamps seen, for the timestamped comparison below. A claim line
@@ -780,11 +798,15 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
     # edits that one comment in place, so the line's stamp - not the
     # comment's position - is what the fix ask is measured against (loom#1203).
     claim_stamp = fix_stamp = ""
+    fix_pr: Optional[Tuple[str, int]] = None
     for i, comment in enumerate(comments):
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
-        if _CLAIM.fullmatch(body.strip()):
+        remote_claim = re.fullmatch(r"<!-- loom:remote-claim v1 [^ ]+ ([0-9]+) [0-9.]+(?: [0-9.]+)? -->",
+                                    body.strip())
+        if (_CLAIM.fullmatch(body.strip()) or
+                (remote_claim and tickets._login(comment.get("user")) in allowed)):
             last_claim = i
             created = str(comment.get("created_at") or "")
             if created > claim_stamp:
@@ -803,6 +825,12 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str]) -> bool:
             created = str(comment.get("created_at") or "")
             if created > fix_stamp:
                 fix_stamp = created
+                match = re.search(r"(?m)^Pull request: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)(?:,|$)", body)
+                fix_pr = (match.group(1), int(match.group(2))) if match else None
+    if fix_pr and current_pr is not None and fix_pr != current_pr and pr_state:
+        state = pr_state(*fix_pr)
+        if state.get("merged_at") or str(state.get("state") or "").lower() == "closed":
+            return False
     if claim_stamp and fix_stamp:
         # A brain-fix ask newer than the last real claim still blocks the
         # merge; only the detection of the claim changed (loom#1203).
@@ -1032,7 +1060,7 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     if line.endswith(" - READY"):
         for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
             line = _add_blocker(line, blocker)
-    line = _pending_fix_blocker(gh, ticket, authors, line)
+    line = _pending_fix_blocker(gh, repo, int(pr["number"]), ticket, authors, line)
     hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
                          str((pr.get("head") or {}).get("sha") or ""),
                          str((pr.get("user") or {}).get("login") or ""),
@@ -1063,12 +1091,15 @@ def _docs_criterion_override(gh: GitHub, repo: str,
     return line
 
 
-def _pending_fix_blocker(gh: GitHub, ticket: Optional[Tuple[str, int]],
-                         authors: Sequence[str], line: str) -> str:
+def _pending_fix_blocker(gh: GitHub, repo: str, pr_number: int,
+                         ticket: Optional[Tuple[str, int]], authors: Sequence[str],
+                         line: str) -> str:
     """Add a blocker while a brain fix still awaits its author."""
     if ticket is not None and authors:
         comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-        if _pending_brain_fix(comments, authors):
+        if _pending_brain_fix(comments, authors, (repo, pr_number),
+                              lambda owner_repo, number: gh.rest(
+                                  "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
             return _add_blocker(line, "pending brain fix")
     return line
 
@@ -1611,8 +1642,11 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
+    own, held = _split_owned_runaways(runaway)
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
-        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
+        repo, issue["number"], issue.get("title", "")) for repo, issue in own] or ["- none"])
+    tail += ["- owned by %s: %s#%s %s" % (owner, repo, issue["number"], issue.get("title", ""))
+             for repo, issue, owner in held]
     tail += [""] + priority_lines(found, now)
     tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)
@@ -4644,7 +4678,7 @@ def merge(gh: GitHub, repo: str, number: int,
         owner = owned_elsewhere(issue, env)
         if owner is not None:
             raise ValueError("#%d is held by %s; leave it to them" % (association[1], owner))
-        _refuse_pending_fix(gh, association, env)
+        _refuse_pending_fix(gh, association, (repo, number), env)
         verdict = _verdict_reader(gh, repo, number, details, association, env)
         _refuse_operator_hold(gh, repo, number, pr, details, association, issue, verdict)
         if not ({x.lower() for x in _labels(issue)} & {"docs", "documentation"}):
@@ -5004,6 +5038,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 
 def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
+                        current_pr: Tuple[str, int],
                         env: Optional[Dict[str, str]]) -> None:
     """Refuse a merge while the ticket's brain fix has not run: status marks
     such a pull request "blocked: pending brain fix", and merging it then would
@@ -5012,7 +5047,9 @@ def _refuse_pending_fix(gh: GitHub, ticket: Optional[Tuple[str, int]],
     if ticket is None or not authors:
         return
     comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
-    if _pending_brain_fix(list(comments), authors):
+    if _pending_brain_fix(list(comments), authors, current_pr,
+                          lambda owner_repo, number: gh.rest(
+                              "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
         raise ValueError("a brain fix is pending on the ticket; merge after it runs")
 
 
