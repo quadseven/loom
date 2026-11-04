@@ -2074,6 +2074,86 @@ class SensitiveResumeTests(unittest.TestCase):
                              env={"LOOM_BRIEF_AUTHORS": "alice-example"})
         self.assertTrue(result["merged"])
 
+    def _brain_fix_comment(self, checks=(), threads=(), head="dec0de"):
+        """A pending brain fix on ticket 9 for pull request 8, written the way
+        brain.fix and the station write one: the findings on the page, each
+        quoted thread in the hidden detail, the head the round worked on."""
+        page = ["- Check `%s` failed" % name for name in checks]
+        page += ["- Review thread at `bus/a.py:12`"] * len(threads)
+        detail = []
+        for thread in threads:
+            detail += ["### Thread %s (comment 101) at bus/a.py:12" % thread, "",
+                       "reviewer: the finding text", ""]
+        body = "%s\nPull request: %s#8, branch loom/9-work\n%s\n\n%s\n" % (
+            tickets.FIX_MARKER, REPO, brain.BRAIN_FIX_MARKER, "\n".join(page))
+        if detail:
+            body += "\n<!-- loom:fix-detail\n%s\n-->\n" % "\n".join(detail).rstrip("\n")
+        return {"user": {"login": "alice-example"},
+                "created_at": "2030-01-01T00:00:00Z",
+                "body": body + "<!-- loom:fix-head %s -->\n" % head}
+
+    def test_merge_cancels_a_pending_fix_whose_only_thread_is_resolved(self):
+        # loom#1998: the round's only finding was ruled on and its thread
+        # resolved; the head is green and the review check passed on it, so
+        # the round has nothing to fix. The merge cancels it instead of
+        # waiting a whole round, and the cancelled round records no attempt.
+        nodes = [{"id": "PRRT_1", "isResolved": True, "path": "bus/a.py",
+                  "comments": {"nodes": []}}]
+        pr, query = self._merge_replies({"details": {"reviewThreads": {"nodes": nodes}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fix = self._brain_fix_comment(threads=("PRRT_1",))
+        runs = {"check_runs": [{"name": "Grug - Elder", "status": "completed",
+                                "conclusion": "success"}]}
+        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]), reply(200, runs),
+                    reply(201, {"id": 555}), reply(200, []),
+                    reply(200, {"merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                             env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertTrue(result["merged"])
+        notes = [c[2]["body"] for c in fake.calls
+                 if c[0] == "POST" and c[1].endswith("/issues/9/comments")
+                 and brain.FIX_CANCELLED_MARKER in (c[2] or {}).get("body", "")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("does not count as an attempt", notes[0])
+        cancelled = {"user": {"login": "alice-example"},
+                     "created_at": "2030-01-01T01:00:00Z", "body": notes[0]}
+        self.assertFalse(brain._pending_brain_fix([fix, cancelled], ["alice-example"]))
+        self.assertEqual(station.Station._fix_round_count(
+            [fix, cancelled], {"alice-example"}), 0)
+
+    def test_merge_still_refuses_a_pending_fix_that_names_a_failing_check(self):
+        # loom#1998: a round that also names a failing check keeps blocking,
+        # even when every thread it names is resolved.
+        nodes = [{"id": "PRRT_1", "isResolved": True, "path": "bus/a.py",
+                  "comments": {"nodes": []}}]
+        pr, query = self._merge_replies({"details": {"reviewThreads": {"nodes": nodes}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fix = self._brain_fix_comment(checks=("lint",), threads=("PRRT_1",))
+        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]))
+        with self.assertRaisesRegex(ValueError, "brain fix is pending"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+        self.assertFalse(any(c[0] == "POST" and c[1].endswith("/issues/9/comments")
+                             for c in fake.calls))
+
+    def test_merge_still_refuses_a_pending_fix_whose_thread_is_open(self):
+        # loom#1998: the cancellation needs every named thread resolved; one
+        # still open leaves the merge refused and no cancellation posted.
+        nodes = [{"id": "PRRT_1", "isResolved": False, "path": "bus/a.py",
+                  "comments": {"nodes": []}}]
+        pr, query = self._merge_replies({"details": {"reviewThreads": {"nodes": nodes}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        fix = self._brain_fix_comment(threads=("PRRT_1",))
+        fake = Fake(pr, query, reply(200, issue), reply(200, [fix]))
+        with self.assertRaises(ValueError):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env={"LOOM_BRIEF_AUTHORS": "alice-example"})
+        self.assertFalse(any("/merge" in call[1] for call in fake.calls))
+        self.assertFalse(any(c[0] == "POST" and c[1].endswith("/issues/9/comments")
+                             for c in fake.calls))
+
     def test_merge_refuses_a_ticket_still_running_or_briefed_without_relabeling(self):
         # A ticket at loom:running or loom:briefed is mid fix round: the brain
         # sent the head back and a lane is about to push, or is pushing, a new
@@ -2498,6 +2578,29 @@ class FixTests(unittest.TestCase):
         forged["user"] = {"login": "stranger"}
         comments = [forged, self._fix_comment("2026-10-20T17:00:00Z")]
         self.assertTrue(brain._pending_brain_fix(comments, ["alice-example", "station"]))
+
+    def _cancellation(self, created_at, login="alice-example"):
+        return {"user": {"login": login}, "created_at": created_at,
+                "body": "%s\nPull request: %s#8\n\nCancelled the pending brain fix."
+                        % (brain.FIX_CANCELLED_MARKER, REPO)}
+
+    def test_pending_brain_fix_is_cancelled_by_a_trusted_cancellation(self):
+        # loom#1998: the cancellation the brain posts when a round has
+        # nothing left to fix ends the wait, like a claim does.
+        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+                    self._cancellation("2026-10-20T18:00:00Z")]
+        self.assertFalse(brain._pending_brain_fix(comments, ["alice-example"]))
+
+    def test_pending_brain_fix_ignores_a_strangers_cancellation(self):
+        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+                    self._cancellation("2026-10-20T18:00:00Z", login="mallory-example")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
+
+    def test_a_fix_after_a_cancellation_blocks_again(self):
+        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+                    self._cancellation("2026-10-20T18:00:00Z"),
+                    self._fix_comment("2026-10-20T19:00:00Z")]
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
 
     def test_a_check_that_later_passed_is_not_a_failing_check(self):
         runs = {"check_runs": [
