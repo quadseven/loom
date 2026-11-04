@@ -596,6 +596,84 @@ class LockTests(unittest.TestCase):
         self.assertIn("holder=tick-1", g.lock_message())
         self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
+    # A brain that stands down for a peer's lock records its yield on that
+    # lock (loom#2606), so the station can tell a yield from a stop. The
+    # record is a commit on the lock branch: no comment, so no email.
+    def test_a_stand_down_records_its_yield_on_the_peers_lock(self):
+        g = FakeGit()
+        g.seed_lock("muse", stamp(NOW + timedelta(minutes=20)))
+        gh = GitHub("tok", transport=g)
+        got = lock.record_yield(gh, REPO, "lane-machine", NOW)
+        self.assertEqual({"at": stamp(NOW), "to": "muse"}, got)
+        self.assertEqual({"lane-machine": {"at": stamp(NOW), "to": "muse"}},
+                         lock.yields_from(g.lock_message()))
+        self.assertEqual({"lane-machine": {"at": stamp(NOW), "to": "muse"}},
+                         lock.read_yields(gh, REPO))
+        self.assertTrue(g.lock_message().startswith("holder=muse expires="))
+        self.assertEqual((False, "muse"), take(gh, "lane-machine", 15, NOW))
+        self.assertFalse([c for c in g.calls if "issues" in c[1]])
+
+    def test_a_later_yield_replaces_the_earlier_one_of_the_same_brain(self):
+        g = FakeGit()
+        g.seed_lock("muse", stamp(NOW + timedelta(minutes=20)))
+        gh = GitHub("tok", transport=g)
+        lock.record_yield(gh, REPO, "lane-machine", NOW)
+        lock.record_yield(gh, REPO, "spare", NOW + timedelta(minutes=1))
+        lock.record_yield(gh, REPO, "lane-machine", NOW + timedelta(minutes=2))
+        self.assertEqual({"lane-machine": {"at": stamp(NOW + timedelta(minutes=2)), "to": "muse"},
+                          "spare": {"at": stamp(NOW + timedelta(minutes=1)), "to": "muse"}},
+                         lock.read_yields(gh, REPO))
+        self.assertEqual(1, g.lock_message().count(lock.YIELD_MARKER))
+
+    def test_yields_outlive_the_release_and_the_next_takeover(self):
+        g = FakeGit()
+        gh = GitHub("tok", transport=g)
+        take(gh, "muse", 30, NOW - timedelta(minutes=10))
+        lock.record_yield(gh, REPO, "lane-machine", NOW)
+        self.assertTrue(lock.release(gh, REPO, "muse"))
+        self.assertEqual(stamp(NOW), lock.read_yields(gh, REPO)["lane-machine"]["at"])
+        self.assertEqual((True, "tick-1"),
+                         take(gh, "tick-1", 15, datetime.now(timezone.utc) + timedelta(minutes=1)))
+        self.assertEqual({"lane-machine": {"at": stamp(NOW), "to": "muse"}},
+                         lock.read_yields(gh, REPO))
+
+    def test_no_yield_is_recorded_without_a_peers_lock(self):
+        g = FakeGit()
+        gh = GitHub("tok", transport=g)
+        self.assertIsNone(lock.record_yield(gh, REPO, "lane-machine", NOW))
+        self.assertEqual({}, lock.read_yields(gh, REPO))
+        take(gh, "lane-machine", 15, NOW)
+        self.assertIsNone(lock.record_yield(gh, REPO, "lane-machine", NOW))
+        self.assertEqual({}, lock.yields_from(g.lock_message()))
+
+    def test_odd_yield_records_are_never_read(self):
+        message = ("holder=muse expires=x\n" + lock.YIELD_MARKER
+                   + '{"lane-machine":{"at":"2030-01-01T12:00:00Z","to":"muse"},'
+                   '"bad name":{"at":"2030-01-01T12:00:00Z","to":"muse"},'
+                   '"x":{"at":"soon","to":"muse"},"y":{"at":"2030-01-01T12:00:00Z","to":"<@1>"},'
+                   '"z":"no"}')
+        self.assertEqual({"lane-machine": {"at": "2030-01-01T12:00:00Z", "to": "muse"}},
+                         lock.yields_from(message))
+        self.assertEqual({}, lock.yields_from("holder=muse\n" + lock.YIELD_MARKER + "{oops"))
+
+    def test_the_yielded_command_records_the_yield_and_says_so(self):
+        g = FakeGit()
+        g.seed_lock("muse", stamp(datetime.now(timezone.utc) + timedelta(minutes=20)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["yielded", REPO, "--holder", "lane-machine"],
+                            gh=GitHub("tok", transport=g))
+        self.assertEqual(0, code)
+        self.assertIn("yield recorded: lane-machine stood down for muse at ", out.getvalue())
+        self.assertIn("lane-machine", lock.yields_from(g.lock_message()))
+        g = FakeGit()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = cli.main(["yielded", REPO, "--holder", "lane-machine"],
+                            gh=GitHub("tok", transport=g))
+        self.assertEqual(1, code)
+        self.assertIn("no yield recorded", out.getvalue())
+
     def test_release_by_holder_and_wrong_holder(self):
         g = FakeGit()
         gh = GitHub("tok", transport=g)

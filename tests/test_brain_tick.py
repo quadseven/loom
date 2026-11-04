@@ -17,10 +17,10 @@ from pathlib import Path
 LANES = Path(__file__).resolve().parent.parent / "lanes"
 SCRIPT = LANES / "mac" / "brain.sh"
 
-# Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus unlock`
-# exits 0, `-m bus.brain_memory handoff` prints $FAKE_PACKET and exits
-# $FAKE_PACKET_EXIT (default 0), and `-m bus.shadow prompt` runs the real one
-# under $FAKE_REAL_PYTHON or fails. Every call is appended to $FAKE_LOG.
+# Fake python3: `-m bus lock` exits $FAKE_LOCK (default 0), `-m bus yielded`
+# exits $FAKE_YIELD (default 0), `-m bus unlock` exits 0, `-m bus.brain_memory
+# handoff` prints $FAKE_PACKET and exits $FAKE_PACKET_EXIT (default 0), and
+# `-m bus.shadow prompt` runs the real one under $FAKE_REAL_PYTHON or fails. Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$2 $3" = "bus.shadow prompt" ]; then
@@ -57,6 +57,7 @@ if [ "$3" = lock ]; then
   fi
   exit "${FAKE_LOCK:-0}"
 fi
+[ "$3" = yielded ] && exit "${FAKE_YIELD:-0}"
 exit 0
 """
 
@@ -361,9 +362,27 @@ class BrainTickTest(unittest.TestCase):
     def test_a_held_lock_skips_the_tick_before_any_model_call(self):
         run, calls = self.tick(FAKE_LOCK="1")
         self.assertEqual(0, run.returncode)
-        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls))
         self.assertIn("-m bus lock example/loom --holder lane-machine --minutes 45", calls[0])
         self.assertFalse(any(c.startswith("claude") for c in calls))
+
+    # loom#2606: a stand-down for a peer's lock leaves its yield on that
+    # lock, so the station counts it as alive, not stopped.
+    def test_a_stand_down_for_a_held_lock_records_its_yield(self):
+        run, calls = self.tick(FAKE_LOCK="1")
+        self.assertEqual(0, run.returncode)
+        self.assertEqual("python3 -m bus yielded example/loom --holder lane-machine", calls[-1])
+        self.assertEqual(("skipped", True), (self.beat()[0]["outcome"], self.beat()[1]))
+
+    def test_a_failed_yield_record_is_logged_and_the_tick_still_ends_well(self):
+        run, calls = self.tick(FAKE_LOCK="1", FAKE_YIELD="1")
+        self.assertEqual(0, run.returncode)
+        self.assertIn("no yield recorded", (self.home / "logs" / "brain.log").read_text())
+
+    def test_a_tick_that_takes_the_lock_records_no_yield(self):
+        _, calls = self.tick(LOOM_BRAIN_SCOPE="live", FAKE_LOCK_FREE_AFTER="1",
+                             LOOM_BRAIN_WAIT_STEP="0")
+        self.assertFalse([c for c in calls if " -m bus yielded " in c])
 
     def test_a_tick_runs_the_agent_in_a_fresh_checkout_then_unlocks(self):
         run, calls = self.tick()
