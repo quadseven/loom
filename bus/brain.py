@@ -544,12 +544,28 @@ def _ticket_lines(tickets: List[Dict[str, Any]], now: datetime,
     return lines
 
 
+def _split_owned_runaways(rows: List[Tuple[Any, Dict[str, Any]]]
+                          ) -> Tuple[List[Tuple[Any, Dict[str, Any]]],
+                                     List[Tuple[Any, Dict[str, Any], str]]]:
+    own = []
+    held = []
+    for prefix, issue in rows:
+        owner = owned_elsewhere(issue)
+        (own if owner is None else held).append(
+            (prefix, issue) if owner is None else (prefix, issue, owner))
+    return own, held
+
+
 def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
-    rows = [i for i in issues if RUNAWAY in _labels(i)
+    rows = [(None, i) for i in issues if RUNAWAY in _labels(i)
             and tickets.ticket_state(i) not in tickets.MERGED_STATES]
-    return ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
-                                      for i in rows] or ["- none"])
+    own, held = _split_owned_runaways(rows)
+    lines = ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
+                                        for _, i in own] or ["- none"])
+    lines += ["- owned by %s: #%s %s" % (owner, issue["number"], issue.get("title", ""))
+              for _, issue, owner in held]
+    return lines
 
 
 HELD_HEADING = "### Held tickets"
@@ -1611,8 +1627,11 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
     runaway = [(repo, issue) for repo, items in found.items() for issue in items
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
+    own, held = _split_owned_runaways(runaway)
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
-        repo, issue["number"], issue.get("title", "")) for repo, issue in runaway] or ["- none"])
+        repo, issue["number"], issue.get("title", "")) for repo, issue in own] or ["- none"])
+    tail += ["- owned by %s: %s#%s %s" % (owner, repo, issue["number"], issue.get("title", ""))
+             for repo, issue, owner in held]
     tail += [""] + priority_lines(found, now)
     tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)
