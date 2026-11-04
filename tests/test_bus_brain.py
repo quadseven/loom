@@ -4164,15 +4164,21 @@ class HumanAndRefsTests(unittest.TestCase):
         self.assertEqual(fake.calls[3][2], {"labels": ["needs:human"]})
 
     def test_human_refusals_write_nothing(self):
-        cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it."),
+        cases = [(item(6, labels=["loom:human"]), "Kind: money\nBuy it.",
+                  [{"body": brain.HUMAN_MARKER + "\nBuy it."}]),
                  (item(6, state="closed"), "Kind: money\nBuy it."),
                  (item(6, pull_request={}), "Kind: money\nBuy it."), (item(6), "Kind: money\n  "),
                  # 2026-10-18: asks like these filled the digest with factory work.
                  (item(6), "Using GitHub credentials, sort the 25 tickets into epics."),
                  (item(6), "Kind: github\nSort the 25 tickets into epics.")]
-        for issue, ask in cases:
+        for case in cases:
+            issue, ask = case[:2]
+            comments = case[2] if len(case) > 2 else []
             with self.subTest(ask=ask, issue=issue):
-                fake = Fake(reply(200, issue))
+                replies = [reply(200, issue)]
+                if brain.needs_human(brain._labels(issue)):
+                    replies.append(reply(200, comments))
+                fake = Fake(*replies)
                 with self.assertRaises(ValueError):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))

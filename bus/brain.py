@@ -4057,7 +4057,10 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
         raise ValueError("the ask must name the exact thing a person has to do")
     _check_written_text(ask)
     names = _labels(_open_issue(gh, repo, number))
-    if needs_human(names):
+    comments = (gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                if needs_human(names) else [])
+    if any(str((comment or {}).get("body") or "").startswith(HUMAN_MARKER)
+           for comment in comments):
         raise ValueError("#%d is already needs:human" % number)
     notify.post(gh, repo, number, "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind),
                 notify.ASK)
