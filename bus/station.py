@@ -92,6 +92,7 @@ from . import scorecard
 from . import watch
 from . import weakened
 from . import labels
+from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
@@ -13041,14 +13042,17 @@ class Station:
 
     def watch_brain_holders(self) -> None:
         """Tell the operator once when a holder in LOOM_BRAIN_BACKUP_HOLDERS
-        has posted no journal tick for BRAIN_STALE, and once when it ticks
-        again. Each holder keeps its own alert state, so a live brain elsewhere
-        does not hide a backup that stopped (loom#2141). A GitHub read error
-        makes no decision."""
+        has neither posted a journal tick nor yielded the lock to a peer for
+        BRAIN_STALE, and once when it ticks or yields again. Each holder keeps
+        its own alert state, so a live brain elsewhere does not hide a backup
+        that stopped (loom#2141); a backup that stood down for a peer's lock
+        is alive, not stopped (loom#2606). A GitHub read error makes no
+        decision."""
         if not self.s.brain_holders:
             return
         read, _, holders = self._journal()
-        if not read:
+        yields = self._holder_yields() if read else None
+        if yields is None:
             return
         path = os.path.join(self.state, "brain-holders-alert.json")
         alerts = _read_json(path, {}, strict=False)
@@ -13057,12 +13061,14 @@ class Station:
         for holder in self.s.brain_holders:
             at = holders.get(holder)
             at = at if self._num(at) else None
-            fresh = at is not None and self.now - at <= BRAIN_STALE
+            gave = yields.get(holder)
+            fresh = any(t is not None and self.now - t <= BRAIN_STALE
+                        for t in (at, gave["at"] if gave else None))
             told = alerts.get(holder)
             if fresh != (isinstance(told, dict) and told.get("sent") is True):
                 continue
             url = url or self._webhook()
-            if url is None or not self._send(url, self._holder_text(holder, fresh, at)):
+            if url is None or not self._send(url, self._holder_text(holder, fresh, at, gave)):
                 return
             if fresh:
                 alerts.pop(holder, None)
@@ -13070,14 +13076,54 @@ class Station:
                 alerts[holder] = {"sent": True, "at": self.now}
             _write_json(path, alerts)
 
-    def _holder_text(self, holder: str, fresh: bool, at: Optional[float]) -> str:
+    def _holder_yields(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Each brain's newest yield of the lock to a peer, as {"at": epoch
+        seconds, "to": the holder it yielded to}, from the yield record on the
+        lock (bus/lock.py, loom#2606). Re-read at most every JOURNAL_CHECK
+        seconds; the newest yield per brain is kept in the station state, so
+        one the lock no longer carries still counts. None when GitHub cannot
+        be read."""
+        path = os.path.join(self.state, "brain-yields.json")
+        cache = _read_json(path, {}, strict=False)
+        cache = cache if isinstance(cache, dict) else {}
+        saved = cache.get("yields") if isinstance(cache.get("yields"), dict) else {}
+        kept = {name: entry for name, entry in saved.items()
+                if isinstance(entry, dict) and self._num(entry.get("at"))
+                and isinstance(entry.get("to"), str) and lock.HOLDER_RE.fullmatch(entry["to"])}
+        checked = cache.get("checked")
+        if self._num(checked) and 0 <= self.now - checked < JOURNAL_CHECK:
+            return kept
+        if not tickets.REPO_RE.fullmatch(self.s.status_repo or ""):
+            return kept
+        try:
+            found = lock.read_yields(self.gh, self.s.status_repo)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("brain lock yield read failed: %s" % err)
+            return None
+        for name, entry in found.items():
+            at = self._epoch(entry["at"])
+            if at is not None and at > kept.get(name, {}).get("at", 0):
+                kept[name] = {"at": at, "to": entry["to"]}
+        _write_json(path, {"checked": self.now, "yields": kept})
+        return kept
+
+    def _holder_text(self, holder: str, fresh: bool, at: Optional[float],
+                     gave: Optional[Dict[str, Any]] = None) -> str:
+        if fresh and gave and (at is None or gave["at"] > at):
+            return ("The Loom brain %s is alive again: it yielded the lock to %s at %s."
+                    % (holder, gave["to"], self._utc(gave["at"])))
         if fresh:
             return ("The Loom brain %s is ticking again (last journal tick %s)."
                     % (holder, self._utc(at or self.now)))
         since = "since " + self._utc(at) if at is not None else "in the last day"
+        yielded = ("Its last yield of the lock was to %s at %s, also over %d hours ago."
+                   % (gave["to"], self._utc(gave["at"]), BRAIN_STALE // 3600) if gave
+                   else "It recorded no yield of the lock either.")
         return ("Urgent: the Loom brain %s has posted no journal tick %s, over %d hours, "
-                "though another brain may still be ticking. Its log is brain.log on the "
-                "machine it runs on." % (holder, since, BRAIN_STALE // 3600))
+                "though another brain may still be ticking. %s Its log is brain.log on the "
+                "machine it runs on." % (holder, since, BRAIN_STALE // 3600, yielded))
 
     # -- talking to the brain --------------------------------------------
     @staticmethod

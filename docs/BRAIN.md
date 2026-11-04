@@ -1618,6 +1618,16 @@ yours ...`, `lock acquired: already yours ..., held 4m since <time>`, or
 `lock held by <holder> (not yours: you are <caller>), held 12m since <time>,
 at step <step>, expires <time>`.
 
+A brain that stands down because a peer holds the lock records its yield on
+that lock (loom#2606): `python3 -m bus yielded <owner/name> --holder <name>`
+appends a commit whose message keeps the lock line and carries one
+`loom:yield=` line, a JSON map of each brain that yielded to `{"at": <UTC
+time>, "to": <holder>}`, its newest yield only. It is a lock branch write
+like a step (compare-and-swap), not a comment, so it emails nobody. A
+takeover of an expired lock carries the map into the new lock, and a yield
+over a day old is dropped. `lanes/mac/brain.sh` runs it when its wait for the
+lock ends. The station's backup-brain check reads it (docs/LANES.md).
+
 Order (#35): read lane status; gather events since the last journal entry
 (checks, reviews, comments, outcomes); review `needs-brain` tickets in full
 (every diff, green checks and the review bot, every thread answered); merge
