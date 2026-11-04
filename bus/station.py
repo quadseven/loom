@@ -7283,9 +7283,12 @@ class Station:
         """The fix rounds sent: each trusted loom:fix comment with a head
         marker is one round, whether or not the round moved the head. Counting
         distinct heads let a round that failed [transient] and pushed nothing
-        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24)."""
-        return sum(1 for comment in comments
-                   if isinstance(comment, dict)
+        repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24).
+        A round the brain cancelled (loom#1998) never ran and does not count."""
+        cleared = set(brain.cancelled_fix_indexes(comments, authors))
+        return sum(1 for i, comment in enumerate(comments)
+                   if i not in cleared
+                   and isinstance(comment, dict)
                    and tickets._login(comment.get("user")) in authors
                    and Station._fix_head(str(comment.get("body") or "")))
 
