@@ -40,6 +40,7 @@ class IssueEditMethodsTest(unittest.TestCase):
         return shadow.read(os.environ["LOOM_SHADOW_LEDGER"])
 
     def test_gh_guard_holds_post_input_close_and_main_mode_allows_it(self):
+        # POST had no _issue_edit handler before this regression was fixed.
         with open(os.path.join(self.tmp.name, "close.json"), "w", encoding="utf-8") as fh:
             json.dump({"state": "closed"}, fh)
         argv = ["api", "repos/%s/issues/41" % REPO, "--input", "close.json"]
@@ -52,6 +53,7 @@ class IssueEditMethodsTest(unittest.TestCase):
                 self.assertEqual(shadow.gh_guard(self.tmp.name, argv), 0)
 
     def test_rest_holds_post_close_in_shadow_and_sends_it_outside_shadow(self):
+        # Keep the Python REST choke point covered by the same POST mapping.
         path = "/repos/%s/issues/42" % REPO
         body = {"state": "closed"}
         transport = Recorder()
