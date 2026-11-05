@@ -26,8 +26,11 @@ A total of 0 or 1 is easy, 2 to 4 medium, 5 or more hard.
 change class, bus/change_class.py) over the last REPORT_DAYS days: how many
 agree, how many turned out harder or easier, and the bias (the mean of
 settled minus perceived, in tiers: +1.00 means every ticket was one tier
-harder than its brief said). The table goes on the lane status comment
-beside the scorecard.
+harder than its brief said). Review rounds and mean score accompany that
+comparison: easy=1, medium=2, hard=3, minus rounds and floored at zero.
+Only records with known review history enter that mean; missing history
+is not a clean zero-round result. The table goes on the lane status comment
+beside the scorecard and does not change routing.
 """
 from __future__ import annotations
 
@@ -43,7 +46,7 @@ FINDINGS = (0, 2)
 EASY_UP_TO, MEDIUM_UP_TO = 1, 4
 
 TABLE_HEAD = ("| difficulty lane | model | kind | scored | agree | harder | easier "
-              "| bias |")
+              "| bias | rounds | mean score |")
 
 
 def _points(value: int, bounds: Tuple[int, int]) -> int:
@@ -77,8 +80,9 @@ def perceived(body: Any) -> str:
 
 def report(records: Mapping[str, Mapping[str, Any]], since: float
            ) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    """(lane, model, kind) -> scored, agree, harder, easier and bias, over
-    the merged records since `since` that carry both difficulties."""
+    """Comparison and review cost per (lane, model, kind), over merged
+    records since `since` that carry both difficulties. Review cost has its
+    own denominator so unread history never counts as a first-pass success."""
     rows: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     for record in records.values():
         guess, got = record.get("perceived"), record.get("settled")
@@ -87,13 +91,19 @@ def report(records: Mapping[str, Mapping[str, Any]], since: float
             continue
         key = (str(record.get("lane")), str(record.get("model")), str(record.get("kind") or "-"))
         row = rows.setdefault(key, {"scored": 0, "agree": 0, "harder": 0, "easier": 0,
-                                    "delta": 0})
+                                    "delta": 0, "rounds": None, "score_count": 0, "score_sum": 0})
+        rounds, score = record.get("rounds"), record.get("score")
+        if type(rounds) is int and rounds >= 0 and type(score) is int and score >= 0:
+            row["rounds"] = (row["rounds"] or 0) + rounds
+            row["score_count"] += 1
+            row["score_sum"] += score
         delta = LEVELS.index(got) - LEVELS.index(guess)
         row["scored"] += 1
         row["delta"] += delta
         row["agree" if delta == 0 else "harder" if delta > 0 else "easier"] += 1
     for row in rows.values():
         row["bias"] = row["delta"] / row["scored"]
+        row["mean_score"] = row["score_sum"] / row["score_count"] if row["score_count"] else None
     return rows
 
 
@@ -104,12 +114,15 @@ def markdown(records: Mapping[str, Mapping[str, Any]], now: float,
     rows = report(records, now - days * 86400)
     lines = ["", "Difficulty: the brief's guess against a blind settled score (from the "
              "merged diff, fix rounds and review findings), the last %d days. A positive "
-             "bias means the work was harder than the brief said." % days, "",
-             TABLE_HEAD, "|---|---|---|---|---|---|---|---|"]
+             "bias means the work was harder than the brief said. Review score is easy=1, "
+             "medium=2, hard=3 minus review rounds, floored at zero. Rounds and mean "
+             "score use only records with known review history; '-' means unavailable." % days, "",
+             TABLE_HEAD, "|---|---|---|---|---|---|---|---|---|---|"]
     if not rows:
-        lines.append("| - | - | - | 0 | 0 | 0 | 0 | 0.00 |")
+        lines.append("| - | - | - | 0 | 0 | 0 | 0 | 0.00 | - | - |")
     for (lane, model, kind), row in sorted(rows.items()):
-        lines.append("| %s | %s | %s | %d | %d | %d | %d | %+.2f |" % (
+        lines.append("| %s | %s | %s | %d | %d | %d | %d | %+.2f | %s | %s |" % (
             lane, model or "-", kind, row["scored"], row["agree"], row["harder"],
-            row["easier"], row["bias"]))
+            row["easier"], row["bias"], "-" if row["rounds"] is None else row["rounds"],
+            "-" if row["mean_score"] is None else "%.2f" % row["mean_score"]))
     return lines
