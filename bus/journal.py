@@ -246,6 +246,25 @@ def merged(new: str, old: str, limit: int = JOURNAL_MAX) -> str:
     return new
 
 
+def _public_refs(text: str, home: str) -> str:
+    """`text` with every [owner/]name#N reference to a repo other than the
+    goal home `home` (owner/name) written as "issue N of another repo", as
+    lanes/run_lane.sh does for a lane PR body. The home's own refs stay, bare
+    or owner-qualified. bus/text.py check() does not refuse the bare name#N
+    form, and the App-boundary scrub rewrites only owner/name#N refs to
+    private repos, so a journal named private repos' issues on a public goal
+    home (loom#1750)."""
+    # bus.factory imports bus.brain, which imports this module.
+    from .factory import SCAN_REF_RE
+    owner, _, name = home.lower().partition("/")
+
+    def words(m: "re.Match[str]") -> str:
+        if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner:
+            return m.group(0)
+        return "issue %s of another repo" % m.group(3)
+    return SCAN_REF_RE.sub(words, text)
+
+
 def _self_login(gh: GitHub) -> str:
     """The login this client posts as: the App's bot login, else
     LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
@@ -305,7 +324,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     home is a backlog goal, whose report is refused with ReportBacklog.
     `steps` is the tick's "- Steps:" line (tick_clock.footer), put last in
     a journal tick and never in a report or reply."""
-    text = as_journal(text, holder)
+    text = _public_refs(as_journal(text, holder), repo)
     # A journal that says a person decided needs that person's record
     # (bus/decision_claim.py, loom#2089).
     _decision_claim.check(gh, repo, issue_number, text, list(trusted),
@@ -315,7 +334,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
         _text.check(text)
         mine = todays_journal(gh, repo, issue_number, text)
         if mine is not None:
-            body = merged(text, str(mine.get("body") or ""))
+            body = _public_refs(merged(text, str(mine.get("body") or "")), repo)
             _text.check(body)
             return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
                            {"body": body})
