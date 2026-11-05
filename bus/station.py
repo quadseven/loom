@@ -11896,6 +11896,7 @@ class Station:
         self._read_facts = facts
         self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
+        breaches = self._repair_closed_epic_open_tickets(facts, breaches)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
                  "LOOM_INVARIANT_GOAL" % len(breaches))
@@ -12010,6 +12011,125 @@ class Station:
              "target, %d writes made, skipped %s"
              % (gate, self._pass_counted(), target if target is not None else "no",
                 filer.writes, skipped))
+
+    def _repair_closed_epic_open_tickets(self, facts: invariants.Facts,
+                                            breaches: List[invariants.Breach]
+                                            ) -> List[invariants.Breach]:
+        """Move open tickets from a closed epic under an open epic of its
+        goal, or reopen the closed epic when no open epic can take them
+        (loom#2229). Runs during the invariant pass so the breach clears
+        without waiting for the next move_outside_tickets cycle. Returns the
+        breaches still broken after repair attempts."""
+        broken = [b for b in breaches if b.invariant == "closed-epic-open-tickets"]
+        if not broken or facts.shapes is None:
+            return breaches
+        goals = self._closed_epic_goal_homes(facts, broken)
+        fixed = set()
+        for repo, goal_number, epic_numbers in goals:
+            fixed.update(self._repair_closed_epics_of_goal(repo, goal_number, epic_numbers))
+        if not fixed:
+            return breaches
+        return [b for b in breaches
+                if not (b.invariant == "closed-epic-open-tickets" and b.subject in fixed)]
+
+    @staticmethod
+    def _closed_epic_goal_homes(facts: invariants.Facts,
+                                broken: List[invariants.Breach]
+                                ) -> List[Tuple[str, int, List[int]]]:
+        """Goal homes carrying the breached closed epics, with each epic's number."""
+        wanted = {b.subject for b in broken}
+        out = []
+        for shape in facts.shapes or []:
+            ref = Station._invariant_ref_parts(shape.goal.key)
+            if ref is None:
+                continue
+            repo, goal_number = ref
+            epics = []
+            for epic in shape.epics:
+                if epic.epic.key not in wanted or epic.open or not epic.open_tickets:
+                    continue
+                parts = Station._invariant_ref_parts(epic.epic.key)
+                if parts is not None and parts[0] == repo:
+                    epics.append(parts[1])
+            if epics:
+                out.append((repo, goal_number, epics))
+        return out
+
+    def _repair_closed_epics_of_goal(self, repo: str, goal: int,
+                                     epic_numbers: List[int]) -> set:
+        """Repair closed epics of one goal: move their open tickets, or
+        reopen an epic that still holds tickets after the move. Returns
+        the breach subjects (epic ref keys) that are no longer broken."""
+        try:
+            moved, left = brain.move_outside_tickets(self.gh, repo, goal)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("invariants: could not move tickets for closed epics in %s goal #%d: %s"
+                 % (repo, goal, err))
+            moved, left = 0, -1
+        if moved:
+            _say("invariants: moved %d ticket(s) from closed epics of %s goal #%d"
+                 % (moved, repo, goal))
+        fixed = set()
+        for epic_number in epic_numbers:
+            if self._reopen_closed_epic_if_needed(repo, goal, epic_number):
+                fixed.add("%s#%d" % (repo, epic_number))
+        return fixed
+
+    def _reopen_closed_epic_if_needed(self, repo: str, goal: int, epic_number: int) -> bool:
+        """Reopen a closed epic that still holds open tickets after move
+        attempts. Moves are preferred; reopen is the fallback so open
+        tickets are not left under a closed epic. True when the breach is
+        no longer present after this call."""
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, epic_number)).data
+        except RateLimited:
+            raise
+        except (GitHubError, OSError):
+            issue = None
+        if isinstance(issue, dict) and issue.get("state") == "open":
+            return not self._closed_epic_has_open_tickets(repo, goal, epic_number)
+        if self._move_cleared_closed_epic(repo, goal, epic_number):
+            return True
+        try:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, epic_number),
+                         {"state": "open"})
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not reopen epic #%d in %s: %s" % (epic_number, repo, err))
+            return False
+        _say("invariants: reopened closed epic #%d in %s (open tickets could not be moved)"
+             % (epic_number, repo))
+        return True
+
+    def _move_cleared_closed_epic(self, repo: str, goal: int, epic_number: int) -> bool:
+        """True when no open ticket remains under the closed epic after move
+        attempts. Unknown on read failure: False, so the epic is reopened
+        as the safe fallback rather than leaving the breach filed."""
+        try:
+            _, tree = brain.goal_tree(self.gh, repo, goal)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError):
+            return False
+        held_open = {int(t.get("number") or 0) for e, found in tree
+                     if e.get("state", "open") == "open" for t in found}
+        for epic, found in tree:
+            if int(epic.get("number") or 0) != epic_number:
+                continue
+            for issue in found:
+                n = int(issue.get("number") or 0)
+                if not n or n in held_open or issue.get("state") != "open":
+                    continue
+                if brain.needs_human(brain._labels(issue)):
+                    continue
+                if "loom:ticket" not in brain._labels(issue):
+                    continue
+                return False
+            return True
+        return True
 
     def _invariant_settled(self, facts: invariants.Facts, invariant: str,
                            subject: str) -> Optional[str]:

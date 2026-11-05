@@ -129,7 +129,7 @@ class FakeGH:
                                       labels=[x if isinstance(x, dict) else {"name": x}
                                               for x in issue.get("labels", [])]))
         if m and method == "PATCH":
-            self.issues[int(m.group(1))].update(body)
+            self.issues.setdefault(int(m.group(1)), {"number": int(m.group(1))}).update(body)
             return Response(200, {})
         m = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/comments/(\d+)", path)
         if method == "PATCH" and m:
@@ -687,6 +687,14 @@ class StationTest(StationBase):
                 self.setUp()
                 shape()
                 self.run_at(T0)
+                if name == "closed-epic-open-tickets":
+                    # loom#2229: the station repairs this breach on detect by
+                    # moving open tickets or reopening the epic; a breach fixed
+                    # in the same pass is not filed.
+                    self.assertEqual(self.breaches(), [], self.said)
+                    self.assertTrue(any("reopened closed epic" in s or "moved" in s
+                                        for s in self.said), self.said)
+                    continue
                 filed = self.gh.filed()
                 self.assertEqual(len(filed), 1, self.said)
                 if name in invariants.ROLLED:
@@ -2313,3 +2321,43 @@ class PassTargetWriteGateTest(StationBase):
         with open(os.path.join(self.home, "state", "station", "invariants.json"),
                   encoding="utf-8") as fh:
             self.assertIn("lane-pr-stalled", fh.read())
+
+
+class ClosedEpicRepairTest(StationBase):
+    def test_invariant_pass_reopens_a_closed_epic_when_tickets_cannot_move(self):
+        """loom#2229: the invariant pass repairs a detected closed-epic-open-
+        tickets breach by reopening the epic when no open epic can take its
+        tickets, and does not file the breach."""
+        intake = dict(epic(60), title="Epic: work that triage, rewrites and health intake find, batch 1")
+        self.gh.issues[40] = epic(40, state="closed")
+        self.gh.issues[60] = intake
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed"), intake]
+        self.gh.subs[(REPO, 40)] = [ticket(7)]
+        self.gh.subs[(REPO, 60)] = []
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [], self.said)
+        self.assertEqual(self.gh.issues[40]["state"], "open")
+        self.assertTrue(any("reopened closed epic #40" in s for s in self.said), self.said)
+
+    def test_invariant_pass_repairs_without_filing_when_tickets_move(self):
+        """loom#2229: when open tickets can move to an intake epic, the
+        invariant pass moves them and leaves no closed-epic-open-tickets
+        breach filed."""
+        intake = dict(epic(60), title="Epic: work that triage, rewrites and health intake find, batch 1")
+        movable = dict(ticket(7), id=9007)
+        self.gh.issues[40] = epic(40, state="closed")
+        self.gh.issues[60] = intake
+        self.gh.issues[7] = movable
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed"), intake]
+        self.gh.subs[(REPO, 40)] = [movable]
+        self.gh.subs[(REPO, 60)] = []
+        orig = brain._area_labels
+        brain._area_labels = lambda gh, repo: {}
+        try:
+            self.run_at(T0)
+        finally:
+            brain._area_labels = orig
+        self.assertEqual([b for b in self.breaches()
+                          if "closed-epic-open-tickets" in str(b.get("body", ""))], [], self.said)
+        self.assertTrue(any("moved" in s or "reopened closed epic #40" in s for s in self.said),
+                        self.said)
