@@ -715,7 +715,60 @@ def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
     return None
 
 
-def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
+def _stacked_prs(repo: str, pr_body: str, gh: Optional[GitHub] = None,
+                pr_number: Optional[int] = None,
+                open_prs: Optional[Dict[int, Dict[str, Any]]] = None) -> List[int]:
+    """The PR numbers mentioned in the PR body as being stacked on other PRs.
+    
+    Looks for patterns like "stacked on #N", "PR #N", "after #N" and similar.
+    Returns a list of PR numbers that are still open (merged or closed are ignored).
+    """
+    if not pr_body:
+        return []
+    
+    # Pattern to find PR numbers in text: "PR #N", "pull request #N", "stacked on #N", "after #N"
+    pr_number_re = re.compile(r"(?:stacked on|after|PR|pull request)[:\s]+#?(\d+)", re.I)
+    
+    mentioned_prs = set()
+    for match in pr_number_re.finditer(pr_body):
+        try:
+            pr_num = int(match.group(1))
+            if pr_num > 0:
+                mentioned_prs.add(pr_num)
+        except (ValueError, IndexError):
+            continue
+    
+    if not mentioned_prs:
+        return []
+    
+    # If we don't have a way to check if PRs are open (no gh and no open_prs dict),
+    # return all mentioned PRs and let the caller handle the "open" check
+    if open_prs is None and gh is None:
+        return list(mentioned_prs)
+    
+    # Check which of the mentioned PRs are still open
+    open_pr_numbers = []
+    for pr_num in mentioned_prs:
+        if open_prs is not None and pr_num in open_prs:
+            pr_state = open_prs[pr_num].get("state") or ""
+            if pr_state.lower() == "open":
+                open_pr_numbers.append(pr_num)
+        elif gh is not None:
+            try:
+                pr_data = gh.rest("GET", f"/repos/{repo}/pulls/{pr_num}").data
+                pr_state = pr_data.get("state") or ""
+                if pr_state.lower() == "open":
+                    open_pr_numbers.append(pr_num)
+            except (GitHubError, ValueError, TypeError):
+                # PR not found or cannot be read - treat as merged/closed
+                pass
+    
+    return open_pr_numbers
+
+
+def merge_ready(node: Optional[Dict[str, Any]], bot: str,
+                gh: Optional[GitHub] = None, repo: str = "",
+                pr: Optional[Dict[str, Any]] = None) -> str:
     """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
     "blocked: " and every blocker, from one pull request's READY_FIELDS.
     It reads nothing else, so the same API data always gives the same verdict."""
@@ -725,6 +778,14 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
                             *_person_blockers(node), _threads_blocker(threads),
                             _unfixed_blocker(threads, head, bot)) if b]
+    
+    # Add stacked PR blocker if PR body mentions open PRs it builds on
+    if pr and gh and repo:
+        pr_body = str(pr.get("body") or "")
+        stacked = _stacked_prs(repo, pr_body, gh, pr.get("number"), None)
+        if stacked:
+            blockers.append(f"stacked on {', '.join('#%d' % n for n in stacked)}")
+    
     return "blocked: " + ", ".join(blockers) if blockers else "READY"
 
 
@@ -800,13 +861,15 @@ def _hold_box_reason(gh: GitHub, repo: str, pr: Dict[str, Any],
     return hold_boxes.refusal(str(pr.get("body") or ""), repo, read, known, own)
 
 
-def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
-    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
+def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str,
+             gh: Optional[GitHub] = None, repo: str = "") -> str:
+    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""),
+                             merge_ready(node, bot, gh, repo, pr))
 
 
 def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                     node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
-    line = _pr_line(pr, node, bot)
+    line = _pr_line(pr, node, bot, gh, repo)
     needs_review_check = (change_class.class_of(pr) == "sensitive"
                           or _ticketless(repo, pr))
     if line.endswith(" - READY") and needs_review_check:
