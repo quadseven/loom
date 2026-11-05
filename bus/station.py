@@ -2186,6 +2186,7 @@ class Station:
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
         self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
         self._free_read = False
@@ -8552,18 +8553,22 @@ class Station:
         return rows
 
     def _lanes_issue(self, repo: str) -> int:
+        if repo in self._lanes_issues:
+            return self._lanes_issues[repo]
         found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&per_page=100"
                              % (repo, LANES_LABEL)).data
         for item in found if isinstance(found, list) else []:
             if isinstance(item, dict) and "pull_request" not in item:
-                return int(item["number"])
+                self._lanes_issues[repo] = int(item["number"])
+                return self._lanes_issues[repo]
         made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
             "title": LANES_TITLE, "labels": [LANES_LABEL],
             "body": "The station keeps the comment below current with each "
                     "lane's availability."}).data
         if not isinstance(made, dict) or "number" not in made:
             raise GitHubError("no issue was created in %s" % repo)
-        return int(made["number"])
+        self._lanes_issues[repo] = int(made["number"])
+        return self._lanes_issues[repo]
 
     def _fresh_lanes_record(self, repo: str) -> Optional[Dict[str, Any]]:
         """The saved record of a publish to `repo` within LANES_REPUBLISH;
@@ -8620,7 +8625,7 @@ class Station:
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
-            + (self._repo_pr_lines() if pr_lines is None else pr_lines)
+            + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
         return body

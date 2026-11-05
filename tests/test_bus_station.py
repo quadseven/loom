@@ -9217,6 +9217,10 @@ class SpendTest(Base):
     def test_a_new_run_republishes_on_the_next_pass(self):
         self.runs((2, "anthropic", 1.0))
         self.station().run_pass()
+        self.assertIn("pending this pass", self.fake.posts[0])
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertNotIn("pending this pass", self.fake.edits[0])
+        self.fake.edits.clear()
         self.runs((0, "anthropic-2", 2.0))
         self.station(self.NOW + 60).run_pass()
         self.assertEqual(len(self.fake.edits), 1)

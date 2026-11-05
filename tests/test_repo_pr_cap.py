@@ -96,7 +96,7 @@ class RepoPrCapTest(Base):
     def test_lane_status_shows_count_and_cap(self):
         self.pulls(3)
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
-        self.assertIn("Open pull requests: %s 3/8" % REPO, runner._lanes_body([]))
+        self.assertIn("Open pull requests: %s 3/8" % REPO, runner._lanes_body([], runner._repo_pr_lines()))
 
     def test_malformed_listing_never_becomes_zero(self):
         for data in ({}, [None], [{"user": []}], [{"user": {"login": AUTHORS[0]}}]):
@@ -159,6 +159,25 @@ class RepoPrCapTest(Base):
         self.assertEqual(len(published), 2)
         self.assertIn("1/8", published[0])
         self.assertIn("2/8", published[1])
+
+    def test_rendering_does_not_refresh_optional_pr_counts(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner, "_repo_pr_lines", side_effect=AssertionError("read")):
+            self.assertIn("Remote claims:", runner._lanes_body([]))
+
+    def test_pending_and_observed_publication_share_issue_lookup(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner, "_lane_rows", return_value=[]), \
+                mock.patch.object(runner, "_remote_claim_count", return_value=0), \
+                mock.patch.object(runner.gh, "rest", wraps=runner.gh.rest) as read:
+            runner._publish_initial_lanes()
+            runner.publish_lanes()
+        lookups = [call for call in read.call_args_list
+                   if call.args[0] == "GET" and "issues?labels=loom:lanes" in call.args[1]]
+        self.assertEqual(len(lookups), 1)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertNotIn("pending this pass", self.fake.edits[0])
 
     def test_initial_pending_status_does_not_spend_count_or_visibility_reads(self):
         self.settings.status_repo = REPO
