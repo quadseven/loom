@@ -53,6 +53,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -61,6 +62,7 @@ from . import change_class, difficulty, labels, merge_tier, revert
 from .github import GitHubError
 
 FILE = "scorecard.json"
+NOTICE_FILE = "demotion-notices.json"
 # Slots of these lanes pick their model per run (bus/model_pick.py, which reads
 # the demoted models), so demotion binds to a model named after MODEL_KEY.
 PICKED_LANES = ("opencode-go", "zen")
@@ -669,6 +671,63 @@ class Scorecard:
         """Each demoted lane and why."""
         return {lane: str(info.get("why") or "demoted") for lane, info in
                 self.data["demoted"].items() if isinstance(info, dict)}
+
+    def demotion_lines(self, pending_only: bool = False) -> Dict[str, str]:
+        """Uncleared demotions, optionally only those awaiting a delivered notice.
+
+        Keeping all active entries in each digest includes the next summary
+        and every later summary, even after the demotion is a day old.
+        """
+        if self.unreadable:
+            return {} if pending_only else {"": "needs-a-person: " + self.unreadable}
+        receipts = self._notice_receipts() if pending_only else {}
+        result = {}
+        for lane, info in sorted(self.data["demoted"].items()):
+            if not isinstance(info, dict):
+                continue
+            if pending_only and receipts.get(lane) == self._demotion_event(info):
+                continue
+            reason = " ".join(str(info.get("why") or "reason unavailable").split())
+            result[lane] = ("needs-a-person: demoted %s: %s; after review, clear with "
+                            "`python3 -m bus.scorecard clear %s`"
+                            % (lane, reason, shlex.quote(lane)))
+        return result
+
+    @staticmethod
+    def _demotion_event(info: Mapping[str, Any]) -> Dict[str, Any]:
+        return {key: info.get(key) for key in ("at", "why", "kind")}
+
+    def _notice_receipts(self) -> Dict[str, Any]:
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        try:
+            with open(path) as fh:
+                receipts = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as err:
+            raise ValueError("demotion notice receipts cannot be read (%s)" % type(err).__name__) from None
+        if not isinstance(receipts, dict):
+            raise ValueError("demotion notice receipts do not hold an object")
+        return receipts
+
+    def notice_sent(self, lane: str) -> None:
+        """Record delivery separately; never rewrite routing state after a send.
+
+        A send followed by a crash before this receipt can still be retried.
+        """
+        # AI-REVIEW 2026-11-05 [GPT-6 Astra] demotion-race:
+        # A clear or replacement during network delivery must remain authoritative.
+        current = Scorecard(os.path.dirname(self.path), self.now, self.env)
+        event = self._demotion_event(self.data["demoted"][lane])
+        active = current.data["demoted"].get(lane)
+        if current.unreadable or not isinstance(active, dict) or self._demotion_event(active) != event:
+            return
+        receipts = self._notice_receipts()
+        receipts[lane] = event
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        with open(path + ".tmp", "w") as fh:
+            json.dump(receipts, fh, sort_keys=True)
+        os.replace(path + ".tmp", path)
 
     def clear(self, lane: str) -> bool:
         """The operator clears a lane: it takes build tickets again, and its

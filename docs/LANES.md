@@ -1591,8 +1591,17 @@ cannot query the viewer or any other local service.
   `state/usage/go-budget.jsonl`.
 - A failed review on a Go or Zen slot demotes the model
   (`model:<id>` in the scorecard), not the slots: the picker skips it and the
-  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
-  proof audits and records with no model still demote the lane. Each brief for
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. The station
+  sends one `needs-a-person` notice per demotion with its findings and clear
+  command through the configured Discord report channel (bot or webhook).
+  Successful delivery is saved
+  separately in `demotion-notices.json`; failed delivery retries on the next
+  pass. A crash between delivery and saving the receipt can repeat the notice.
+  The existing `LOOM_REPORT_DIGEST_TIMES` digest lists uncleared demotions,
+  including those older than 24 hours. This does not publish a Buzz summary.
+  Clearing still requires the existing operator/peer approval; the notice
+  grants none. Failed proof audits and records with no model still demote the
+  lane. Each brief for
   these slots carries a `Demoted-Models:` line, so a runner without the
   scorecard file skips them too. An unreadable scorecard, or neither source,
   stops paid models and free models carry on.
