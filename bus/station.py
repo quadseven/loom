@@ -8703,21 +8703,10 @@ class Station:
         """Record an overdue default without attributing it to any operator."""
         number = int(issue["number"])
         comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
-        asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
-                and str(c.get("body") or "").startswith(HUMAN_MARKER)
-                and tickets._login(c.get("user")) in {name.lower() for name in self.s.authors}]
-        if not asks:
+        selected = self._overdue_decision_default(repo, number, comments)
+        if selected is None:
             return
-        index, ask = asks[-1]
-        body = str(ask.get("body") or "")
-        asked_at = self._epoch(str(ask.get("updated_at") or ask.get("created_at") or ""))
-        try:
-            choice = answer.decision_default(body)
-        except ValueError:
-            _say("decision default on %s#%d is invalid; left for correction" % (repo, number))
-            return
-        if not choice or asked_at is None or self.now - asked_at < self.s.decision_window_days * 86400:
-            return
+        index, ask, choice = selected
         later = comments[index + 1:]
         if any(answer.trusted_answer(c, self.s.authors, operators)
                or tickets._login(c.get("user")) in operators for c in later if isinstance(c, dict)):
@@ -8732,6 +8721,26 @@ class Station:
                 return
             notify.post(self.gh, repo, number, record, notify.RECORD)
         self._clear_decision_wait(repo, issue, operators)
+
+    def _overdue_decision_default(self, repo: str, number: int, comments: Sequence[Any]
+                                  ) -> Optional[Tuple[int, Dict[str, Any], str]]:
+        """Validate the newest trusted ask and its unchanged waiting window."""
+        asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+                and str(c.get("body") or "").startswith(HUMAN_MARKER)
+                and tickets._login(c.get("user")) in {name.lower() for name in self.s.authors}]
+        if not asks:
+            return None
+        index, ask = asks[-1]
+        body = str(ask.get("body") or "")
+        asked_at = self._epoch(str(ask.get("updated_at") or ask.get("created_at") or ""))
+        try:
+            choice = answer.decision_default(body)
+        except ValueError:
+            _say("decision default on %s#%d is invalid; left for correction" % (repo, number))
+            return None
+        if not choice or asked_at is None or self.now - asked_at < self.s.decision_window_days * 86400:
+            return None
+        return index, ask, choice
 
     def _clear_decision_wait(self, repo: str, issue: Dict[str, Any], operators: Sequence[str]) -> None:
         """Remove only person-wait labels after an automated record is present."""
