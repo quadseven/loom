@@ -2720,5 +2720,8 @@ Fix rounds and verification runs remain runnable. A failed or malformed PR read
 holds new builds; rate limits still propagate. Reads cover all pages, up to 25
 pages per repository; exceeding that budget is unread, never a partial count.
 The lane status shows each repository's count and cap, republishing when those
-values change. Public status hides private repository names. This is a per-pass
+values change. An overdue heartbeat publishes first with counts marked pending;
+the normal pass replaces that marker after its count reads, so optional counts
+cannot prevent the heartbeat from publishing near the request limit. Public
+status hides private repository names. This is a per-pass
 snapshot, not a reservation system for builds already running in other lanes.

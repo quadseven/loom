@@ -8592,11 +8592,15 @@ class Station:
         if not repo or self._fresh_lanes_record(repo) is not None or self._deferred():
             return
         try:
-            self._timed(self.publish_lanes)
+            self._timed(self._publish_initial_lanes)
         except RateLimited:
             raise
         except (GitHubError, OSError, ValueError) as err:
             _say("publish_lanes failed: %s" % err)
+
+    def _publish_initial_lanes(self) -> None:
+        """Publish the overdue heartbeat before spending reads on optional counts."""
+        self.publish_lanes(refresh_pr_counts=False)
 
     def _spend_shown(self) -> Optional[spend.Summary]:
         """The anthropic spend, once there is a budget or a recorded run."""
@@ -8605,7 +8609,8 @@ class Station:
             return summary
         return None
 
-    def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
+    def _lanes_body(self, rows: List[Tuple[str, str, str]],
+                    pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
         disk = self._disk_status_line()
         body = "\n".join(
@@ -8615,7 +8620,7 @@ class Station:
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
-            + self._repo_pr_lines()
+            + (self._repo_pr_lines() if pr_lines is None else pr_lines)
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
         return body
@@ -8672,7 +8677,7 @@ class Station:
         made = notify.post(self.gh, repo, number, body, notify.RECORD).data
         return int(made["id"]) if isinstance(made, dict) and "id" in made else None
 
-    def publish_lanes(self) -> None:
+    def publish_lanes(self, refresh_pr_counts: bool = True) -> None:
         repo = self.s.status_repo
         if not repo:
             return
@@ -8692,11 +8697,13 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
-        values["open PRs"] = "\n".join(self._repo_pr_lines())
+        pr_lines = (self._repo_pr_lines() if refresh_pr_counts
+                    else ["Open pull requests: pending this pass"])
+        values["open PRs"] = "\n".join(pr_lines)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
-        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows))
+        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
         _write_json(os.path.join(self.state, "lanes.json"),
                     {"repo": repo, "issue": number, "comment_id": comment_id,
                      "values": values, "at": self.now})

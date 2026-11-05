@@ -160,6 +160,16 @@ class RepoPrCapTest(Base):
         self.assertIn("1/8", published[0])
         self.assertIn("2/8", published[1])
 
+    def test_initial_pending_status_does_not_spend_count_or_visibility_reads(self):
+        self.settings.status_repo = REPO
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner, "_repo_pr_lines", side_effect=AssertionError("read")), \
+                mock.patch.object(runner, "_upsert_lanes_comment", return_value=1) as post, \
+                mock.patch.object(runner, "_lanes_issue", return_value=99):
+            runner._publish_initial_lanes()
+        self.assertIn("Open pull requests: pending this pass", post.call_args.args[2])
+        self.assertEqual(runner._repo_pr_counts, {})
+
 
 if __name__ == "__main__":
     unittest.main()
