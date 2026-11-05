@@ -764,6 +764,8 @@ FABRIC_QUESTION = (
     "pull request cards you can see, each as a link to its card. If none does, "
     "answer: none.")
 
+# The prefix of each open pull request line in the lane status comment.
+PR_LINE_PREFIX = "Open pull requests: "
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -5061,7 +5063,7 @@ class Station:
                     self._publics[repo] = self._public(repo)
                 if not self._publics[repo]:
                     name = "private repo %d" % (self.s.repos.index(repo) + 1)
-            lines.append("Open pull requests: %s %s/%d" % (
+            lines.append(PR_LINE_PREFIX + "%s %s/%d" % (
                 name, "unread" if count is None else count, cap))
         return lines
 
@@ -8750,6 +8752,22 @@ class Station:
         made = notify.post(self.gh, repo, number, body, notify.RECORD).data
         return int(made["id"]) if isinstance(made, dict) and "id" in made else None
 
+    def _carried_pr_lines(self) -> Tuple[Optional[List[str]], Optional[float], List[str]]:
+        """(stored lines, their read time, lines to show) for a publish that
+        spends no pull request reads (loom#2652). The last counted publish's
+        lines carry forward under their read time; with none stored, as after
+        a restart, the counts are pending. It reads no GitHub state."""
+        saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
+        lines = saved.get("pr_lines") if isinstance(saved, dict) else None
+        read_at = saved.get("pr_read_at") if isinstance(saved, dict) else None
+        if (not isinstance(lines, list) or not lines
+                or not all(isinstance(line, str) and line.startswith(PR_LINE_PREFIX)
+                           for line in lines)
+                or isinstance(read_at, bool) or not isinstance(read_at, (int, float))):
+            return None, None, [PR_LINE_PREFIX + "pending this pass"]
+        label = "Open pull requests (read %s): " % time.strftime("%H:%MZ", time.gmtime(read_at))
+        return lines, read_at, [label + line[len(PR_LINE_PREFIX):] for line in lines]
+
     def publish_lanes(self, refresh_pr_counts: bool = True) -> None:
         repo = self.s.status_repo
         if not repo:
@@ -8770,16 +8788,21 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
-        pr_lines = (self._repo_pr_lines() if refresh_pr_counts
-                    else ["Open pull requests: pending this pass"])
+        if refresh_pr_counts:
+            read_lines, read_at = self._repo_pr_lines(), self.now
+            pr_lines = read_lines
+        else:
+            read_lines, read_at, pr_lines = self._carried_pr_lines()
         values["open PRs"] = "\n".join(pr_lines)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
         comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
-        _write_json(os.path.join(self.state, "lanes.json"),
-                    {"repo": repo, "issue": number, "comment_id": comment_id,
-                     "values": values, "at": self.now})
+        record = {"repo": repo, "issue": number, "comment_id": comment_id,
+                  "values": values, "at": self.now}
+        if read_lines is not None:
+            record.update(pr_lines=read_lines, pr_read_at=read_at)
+        _write_json(os.path.join(self.state, "lanes.json"), record)
         _say("published lane status to %s#%d" % (repo, number))
 
     # -- asks -------------------------------------------------------------
