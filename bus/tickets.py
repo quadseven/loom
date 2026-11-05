@@ -161,7 +161,7 @@ def rewritten_source(body: Any) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -185,7 +185,7 @@ AFTER_RE = re.compile(r"%s(?:[ \t]*,[ \t]*%s)*" % (_AFTER_ITEM, _AFTER_ITEM))
 _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable|Repairs incident):")
 SLUG_MAX = 40
 # An issue rewritten in place (brain.brief --refs, loom#1229) keeps its
 # original title and text under this last section, quoted line by line, so
@@ -243,6 +243,8 @@ def ticket_name(repo: str, number: int, attempt: int = 1) -> str:
 
 # Each header's rule: (is the value usable, the message when it is not).
 _HEADER_RULES = {
+    "Repairs incident": (lambda v: bool(re.fullmatch(r"#[1-9][0-9]*", v)),
+                         lambda v: "Repairs incident: must name an incident like #7"),
     "Difficulty": (lambda v: v in DIFFICULTIES,
                    lambda v: "Difficulty: must be one of %s" % ", ".join(DIFFICULTIES)),
     "Priority": (lambda v: v in PRIORITIES,
