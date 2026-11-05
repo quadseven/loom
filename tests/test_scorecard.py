@@ -420,7 +420,8 @@ class FactoryStepAside(FactoryBase):
         self.assertIn("lane spark-2 is demoted (%s; the operator clears it)" % why,
                       self.gh.comments[7][-1]["body"])
 
-    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n"):
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n"
+               "\n## Acceptance criteria\n\n- [ ] x\n"):
         self.gh.ticket(number, "queued", body=body)
         self.gh.issues[number]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
         self.gh.issues[number]["created_at"] = factory_iso(0)

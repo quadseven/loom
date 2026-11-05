@@ -5541,7 +5541,8 @@ class ClaimTest(Base):
         self.settings.factory_on = True
         self.heartbeat("spark")
         self.fake.add(12)
-        self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n", state="queued")
+        self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n"
+                      "\n## Acceptance criteria\n\n- [ ] x\n", state="queued")
         self.fake.issues[13]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time() - 300)
