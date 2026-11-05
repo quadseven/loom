@@ -539,6 +539,7 @@ class ReadSsmProxyTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, "fake-value", "")
 
         with mock.patch.dict(os.environ, env_vars, clear=True), \
+                mock.patch.object(github.shutil, "which", return_value="/example/aws"), \
                 mock.patch.object(github.subprocess, "run", fake_run):
             github.read_ssm("/test/param", "us-east-1")
         return captured["env"]
