@@ -899,8 +899,26 @@ class Watcher:
         """REPEAT hits within WINDOW, and the first of this appearance is
         inside it too (not seen in the DAY before)."""
         first = _num(rec.get("first"))
-        return (self._window(rec) >= REPEAT and first is not None
-                and self.now - first < WINDOW)
+        if first is None:
+            self.say("watch: _new_burst: first is None for signature")
+            return False
+        window = self._window(rec)
+        if window >= REPEAT:
+            age = self.now - first
+            if age >= DAY:
+                self.say("watch: _new_burst: signature seen for %d seconds (>= DAY), cannot file new issue"
+                        % age)
+                return False
+            if age >= WINDOW:
+                self.say("watch: _new_burst: signature first appearance is %d seconds ago (>= WINDOW), cannot file new issue"
+                        % age)
+                return False
+            self.say("watch: _new_burst: signature first appearance is %d seconds ago, %d hits in window, filing issue"
+                    % (age, window))
+            return True
+        self.say("watch: _new_burst: only %d hits in window (need %d), cannot file new issue"
+                % (window, REPEAT))
+        return False
 
     def _is_open(self, number: int) -> bool:
         data = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, number)).data

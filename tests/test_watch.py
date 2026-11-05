@@ -570,6 +570,24 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.said), 1)
         self.assertIn("watch: scanned 1 logs", self.said[0])
 
+    def test_signature_quiet_for_a_day_does_not_file_new_issue(self):
+        """A signature that has been quiet for a day should not file a new issue,
+        even if it has hits in the current window."""
+        sig = "factory: re-briefed failed <repo>#<n> on codex-<n>"
+        key = ("station: %s" % sig)[:200]
+
+        # First appearance at T0
+        self.run_at(T0, lines=["station: %s" % sig])
+        self.assertEqual(len(self.gh.issues), 1)
+
+        # Prune the hits (simulate 30 minutes later)
+        self.run_at(T0 + 1800, lines=[])
+
+        # New appearance after being quiet for a day
+        # This should NOT file a new issue because the signature was quiet for a day
+        self.run_at(T0 + (31 * 3600), lines=["station: %s" % sig])
+        self.assertEqual(len(self.gh.issues), 1)
+
 
 class ExampleTextTest(WatchBase):
     def test_example_lines_pass_the_written_text_check(self):
