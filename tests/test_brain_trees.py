@@ -184,19 +184,89 @@ class BrainTreesTest(unittest.TestCase):
         out = self.prune()
         self.assertIn("keep roll-unpushed reason=unpushed-commits=1", out)
 
-    def test_a_link_or_a_plain_folder_is_kept_untouched(self):
+    def test_a_link_or_a_fresh_plain_folder_is_kept_untouched(self):
         (self.work / "notes").mkdir()
         (self.work / "link").symlink_to(self.tmp)
         out = self.prune()
-        self.assertIn("keep notes reason=not-a-git-tree", out)
         self.assertIn("keep link reason=path-is-symlink", out)
         self.assertTrue((self.work / "notes").exists())
         self.assertTrue(self.tmp.exists())
+        self.assertIn("keeps total=2 path-is-symlink=1 scratch=1", out)
+
+    def test_idle_scratch_goes_and_fresh_scratch_is_counted_not_named(self):
+        # The brain writes prompt bodies (b5298.md, body927.md) and scratch
+        # folders here; they hold no commits (loom#2564).
+        old, fresh = self.work / "b5298.md", self.work / "body927.md"
+        old.write_text("old body\n")
+        fresh.write_text("fresh body\n")
+        folder = self.work / "t0150"
+        folder.mkdir()
+        (folder / "c959.md").write_text("notes\n")
+        age(old, (brain_trees.STALE_DAYS + 1) * DAY)
+        age(folder, (brain_trees.STALE_DAYS + 1) * DAY)
+        out = self.prune()
+        self.assertFalse(old.exists(), out)
+        self.assertFalse(folder.exists(), out)
+        self.assertTrue(fresh.exists(), out)
+        self.assertIn("remove b5298.md reason=scratch-idle-4d", out)
+        self.assertIn("remove t0150 reason=scratch-idle-4d", out)
+        self.assertNotIn("keep body927.md", out)
+        self.assertNotIn("not-a-git-tree", out)
+        self.assertIn("keeps total=1 scratch=1 removed=2", out)
+        self.assertIn("recovered scratch=2: removed", out)
+
+    def test_a_folder_holding_a_git_checkout_is_kept_however_old(self):
+        self.tree("infra-ship/infra", commit=("pin.txt", "v6\n"), hours=24 * 30)
+        age(self.work / "infra-ship", 30 * DAY)
+        out = self.prune()
+        self.assertTrue((self.work / "infra-ship" / "infra").exists(), out)
+        self.assertIn("keep infra-ship reason=not-a-git-tree", out)
+
+    def test_a_tree_whose_git_dir_holds_no_objects_or_refs_goes_once_idle(self):
+        # A clone that died before its first fetch: .git/objects/info and
+        # nothing else, so git status fails every tick (loom#2563).
+        broken = self.work / "mo-review"
+        (broken / ".git" / "objects" / "info").mkdir(parents=True)
+        fresh = self.work / "mo-fresh"
+        (fresh / ".git" / "objects" / "info").mkdir(parents=True)
+        age(broken, (brain_trees.MIN_IDLE_HOURS + 1) * 3600)
+        dirty = self.tree("roll-dirty", hours=24 * 30)
+        (dirty / "README").write_text("changed\n")
+        age(dirty, 30 * DAY)
+        out = self.prune()
+        self.assertFalse(broken.exists(), out)
+        self.assertIn("remove mo-review reason=broken-git-dir", out)
+        self.assertIn("recovered broken-git-dir=1: removed", out)
+        self.assertTrue(fresh.exists(), out)
+        self.assertIn("keep mo-fresh reason=git-status-failed", out)
+        self.assertTrue(dirty.exists(), out)
+        self.assertIn("keep roll-dirty reason=dirty", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a folder whatever its mode")
+    def test_a_scratch_folder_that_cannot_be_read_is_kept(self):
+        folder = self.work / "t0151"
+        locked = folder / "locked"
+        locked.mkdir(parents=True)
+        age(folder, (brain_trees.STALE_DAYS + 1) * DAY)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        out = self.prune()
+        self.assertTrue(locked.exists(), out)
+        self.assertIn("keep t0151 reason=not-a-git-tree", out)
+
+    def test_a_git_dir_with_objects_is_not_broken_whatever_its_age(self):
+        path = self.tree("roll-unborn", hours=24 * 30)
+        (path / ".git" / "HEAD").write_text("garbage\n")
+        age(path, 30 * DAY)
+        out = self.prune()
+        self.assertTrue(path.exists(), out)
+        self.assertIn("keep roll-unborn reason=git-status-failed", out)
 
     def test_a_missing_work_folder_is_no_error(self):
         self.work.rmdir()
         out = self.prune()
         self.assertIn("keeps total=0", out)
+        self.assertNotIn("recovered", out)
 
     def test_old_bundles_go(self):
         retired = self.home / "brain" / "retired"

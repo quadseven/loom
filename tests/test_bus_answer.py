@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from bus import answer, brain, operator_hold, shadow  # noqa: E402
+from bus import answer, brain, operator_hold, shadow, tickets  # noqa: E402
 
 BOT = "loom-app[bot]"
 OP = "operator-one"
@@ -69,6 +69,18 @@ class Options(unittest.TestCase):
         self.assertEqual(answer.accept(answer.Options(answer.NUMBER), "3"), ("3", ""))
         with self.assertRaises(ValueError):
             answer.accept(answer.Options(answer.TEXT), "   ")
+
+    def test_decision_default_is_an_offered_option_and_only_reversible_decisions_may_have_one(self):
+        ask = "Kind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes"
+        self.assertEqual(answer.decision_default(ask), "Keep")
+        with self.assertRaises(ValueError):
+            answer.decision_default(ask.replace("Default: Keep", "Default: Maybe"))
+        with self.assertRaises(ValueError):
+            answer.decision_default(ask.replace("Reversible: yes", "Reversible: no"))
+        with self.assertRaises(ValueError):
+            answer.decision_default("Kind: money\nDefault: Keep\nReversible: yes")
+        with self.assertRaises(ValueError):
+            answer.decision_default("Kind: decision\nPick the approach.\nDefault: Keep\nReversible: yes")
 
 
 class Comment(unittest.TestCase):
@@ -154,3 +166,38 @@ class Verdict(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutomatedDefault(unittest.TestCase):
+    def test_default_record_is_never_an_operator_answer_or_merge_verdict(self):
+        ask = comment(answer.HUMAN_MARKER + "\nKind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes")
+        record = comment(answer.default_body(ask, "Keep", "Reverse on Needs you."), ident=2)
+        self.assertTrue(answer.trusted_default(record, ask, [BOT]))
+        self.assertIsNone(answer.trusted_answer(record, [BOT], [OP]))
+        self.assertEqual(answer.as_operator_comments([record], [BOT], [OP]), [record])
+        self.assertIsNone(answer.pr_verdict([ask, record], 12, [BOT], [OP]))
+        self.assertFalse(answer.trusted_default(dict(record, user={"login": "stranger"}), ask, [BOT]))
+        self.assertFalse(answer.trusted_default(record, dict(ask, body=ask["body"] + "\nEdited"), [BOT]))
+
+    def test_automated_default_reaches_brief_separately_and_human_answer_supersedes_it(self):
+        ask = comment(answer.HUMAN_MARKER + "\nKind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes")
+        record = comment(answer.default_body(ask, "Keep", "Reverse on Needs you."), ident=2)
+        notes = answer.default_notes([ask, record], [BOT], [OP])
+        self.assertEqual(notes, ["Automated reversible decision default: Keep. Reverse on Needs you."])
+        brief = tickets.render_brief("example-owner/app", {"number": 5, "title": "Task", "body": "Do work"},
+                                     "test", defaults=notes)
+        self.assertIn("## Automated decision default", brief)
+        self.assertNotIn("## Operator notes", brief)
+        human = comment(answer.comment_body(OP, "Close"), ident=3)
+        self.assertEqual(answer.default_notes([ask, record, human], [BOT], [OP]), [])
+
+    def test_duplicate_or_conflicting_kind_lines_refuse_defaults(self):
+        for extra in ("decision", "money", "account", "credential", "hardware", "physical"):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                answer.decision_default("Kind: decision\nKind: " + extra +
+                                        "\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes")
+
+    def test_merge_and_hold_can_never_be_automatic_defaults(self):
+        for choice in ("Merge", "Hold"):
+            with self.subTest(choice=choice), self.assertRaises(ValueError):
+                answer.decision_default("Kind: decision\nMerge #12 or hold it?\nDefault: " + choice + "\nReversible: yes")

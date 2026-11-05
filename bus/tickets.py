@@ -760,7 +760,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
                   linked: Sequence[str] = (), demoted_models: str = "",
-                  claim: str = "") -> str:
+                  claim: str = "", defaults: Sequence[str] = ()) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -806,6 +806,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if reads_stored_rows(body):
         text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)
+    if defaults:
+        text += ("\n## Automated decision default\n\nThis reversible choice followed the declared "
+                 "timeout policy, not human approval. It cannot authorize merges, access or other "
+                 "operator-only actions. A later operator answer supersedes it.\n")
+        text += "".join("> %s\n" % _CONTROL_RE.sub(" ", str(note)).replace("\n", " ")[:NOTE_CHARS]
+                        for note in defaults)
     if resume:
         text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
                  "editing, and the runner kept its edits on branch %s. The runner merges them into this tree "
