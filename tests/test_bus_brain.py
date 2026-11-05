@@ -1372,6 +1372,45 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
         self.assertEqual(tickets.priority_of(made), "P1")
 
+    def test_brief_repair_marker_survives_ticket_rendering(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
+                    difficulty="medium", repairs_incident=7)
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        made.update(number=7, title="Repair")
+        self.assertIn("Repairs incident: #7\n", tickets.render_brief(REPO, made, "codex"))
+
+    def test_brief_cli_passes_repair_incident(self):
+        argv = ["brief", REPO, "--epic", "2", "--title", "Repair", "--file", "unused",
+                "--lane", "codex", "--repairs-incident", "7"]
+        with unittest.mock.patch.object(brain, "_read", return_value=BODY), \
+                unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                unittest.mock.patch.object(brain, "_check_live_criterion"), \
+                unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = brain.main(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(make.call_args.kwargs["repairs_incident"], 7)
+
+    def test_brief_refuses_invalid_repair_incident_before_writing(self):
+        for number in (0, -1, True, "#7"):
+            with self.subTest(number=number):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "repairs-incident"):
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Repair", BODY,
+                                "codex", repairs_incident=number)
+                self.assertEqual(fake.calls, [])
+
+    def test_repair_header_rejects_invalid_or_hidden_values(self):
+        for body in ("Repairs incident: 7\n\n" + BODY,
+                     "Repairs incident: #0\n\n" + BODY,
+                     "Repairs incident: #7\nRepairs incident: #8\n\n" + BODY,
+                     BODY + "\nRepairs incident: #7\n"):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    tickets.parse(body)
+
     def test_brief_refuses_a_priority_outside_p0_to_p3(self):
         for bad in ("P4", "high", "p1"):
             with self.subTest(priority=bad):
