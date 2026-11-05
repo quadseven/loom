@@ -67,31 +67,42 @@ class RefGH:
         return resp
 
     def _git(self, method: str, path: str, body: Any):
-        if method == "GET" and path.startswith("git/ref/"):
+        handler = {"GET": self._get, "POST": self._post,
+                   "DELETE": self._delete, "PATCH": self._patch}[method]
+        return handler(path, body)
+
+    def _get(self, path: str, _body: Any):
+        if path.startswith("git/ref/"):
             ref = path[len("git/ref/"):]
             if ref == LOCK_REF and self.lagging:
                 return reply({"object": {"sha": self.lagging.pop(0)}})
             if ref not in self.refs:
                 return reply({"message": "Not Found"}, 404)
             return reply({"object": {"sha": self.refs[ref]}})
-        if method == "GET" and path.startswith("git/commits/"):
-            sha = path.rsplit("/", 1)[1]
-            return reply(self.commits[sha]) if sha in self.commits else reply({}, 404)
-        if method == "POST" and path == "git/commits":
+        assert path.startswith("git/commits/"), path
+        sha = path.rsplit("/", 1)[1]
+        return reply(self.commits[sha]) if sha in self.commits else reply({}, 404)
+
+    def _post(self, path: str, body: Any):
+        if path == "git/commits":
             sha = "n%d" % len(self.commits)
             self.commits[sha] = {"message": body["message"], "tree": {"sha": body["tree"]},
                                  "parents": list(body["parents"])}
             return reply({"sha": sha}, 201)
-        if method == "POST" and path == "git/refs":
-            ref = body["ref"][len("refs/"):]
-            if ref in self.refs:
-                return reply({"message": "Reference already exists"}, 422)
-            self.refs[ref] = body["sha"]
-            return reply({}, 201)
-        if method == "DELETE" and path.startswith("git/refs/"):
-            self.refs.pop(path[len("git/refs/"):], None)
-            return reply({}, 204)
-        assert method == "PATCH" and path.startswith("git/refs/"), (method, path)
+        assert path == "git/refs", path
+        ref = body["ref"][len("refs/"):]
+        if ref in self.refs:
+            return reply({"message": "Reference already exists"}, 422)
+        self.refs[ref] = body["sha"]
+        return reply({}, 201)
+
+    def _delete(self, path: str, _body: Any):
+        assert path.startswith("git/refs/"), path
+        self.refs.pop(path[len("git/refs/"):], None)
+        return reply({}, 204)
+
+    def _patch(self, path: str, body: Any):
+        assert path.startswith("git/refs/"), path
         ref = path[len("git/refs/"):]
         if ref not in self.refs:
             return reply({"message": "Reference does not exist"}, 422)
