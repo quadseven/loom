@@ -4865,6 +4865,91 @@ class BranchHygiene(Base):
         self.assertEqual(self.updates(), [])
         self.assertEqual((self.merged, self.fixed), ([], []))
 
+    def test_handoff_conflict_recovery_waits_six_hours(self):
+        for age, expected in ((5, False), (6, False), (7, True)):
+            with self.subTest(age=age):
+                self.setUp()
+                self.gh.ticket(5, "pr")
+                self.gh.issues[5]["labels"].append({"name": factory.HANDOFF_LABEL})
+                self.gh.events[5] = [{"event": "labeled", "created_at": iso(age * 3600),
+                                      "label": {"name": factory.HANDOFF_LABEL}, "actor": ME}]
+                self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+                self.go()
+                self.assertEqual(bool(self.fixed), expected)
+                self.assertEqual(factory.HANDOFF_LABEL in factory._labels(self.gh.issues[5]),
+                                 not expected)
+
+    def test_old_handoff_guards_do_not_mutate_ticket(self):
+        for guard in ("needs-brain", "claim:codex", "loom:running"):
+            with self.subTest(guard=guard):
+                self.setUp()
+                self.gh.ticket(5, "pr")
+                self.gh.issues[5]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": guard}]
+                self.gh.events[5] = [{"event": "labeled", "created_at": iso(7 * 3600),
+                                      "label": {"name": factory.HANDOFF_LABEL}, "actor": ME}]
+                self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+                self.go()
+                self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[5]))
+                self.assertEqual(self.fixed, [])
+
+    def test_handoff_with_unknown_age_or_no_free_lane_stays_reserved(self):
+        for history in (False, True):
+            with self.subTest(history=history):
+                self.setUp()
+                self.gh.ticket(5, "pr")
+                self.gh.issues[5]["labels"].append({"name": factory.HANDOFF_LABEL})
+                if history:
+                    self.gh.events[5] = [{"event": "labeled", "created_at": iso(7 * 3600),
+                                          "label": {"name": factory.HANDOFF_LABEL}}]
+                self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+                self.go(available=() if history else None)
+                self.assertEqual(self.fixed, [])
+                self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[5]))
+
+    def test_handoff_recovery_clears_old_model_and_rolls_back_refusal(self):
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                self.setUp()
+                original = "Model: gpt-6-luna\nDifficulty: medium\n\n## Why\nRecover conflict.\n"
+                self.gh.ticket(5, "pr", body=original)
+                self.gh.issues[5]["labels"].append({"name": factory.HANDOFF_LABEL})
+                original_labels = factory._labels(self.gh.issues[5])
+                self.gh.events[5] = [{"event": "labeled", "created_at": iso(7 * 3600),
+                                      "label": {"name": factory.HANDOFF_LABEL}}]
+                self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+                if refused:
+                    with mock.patch.object(factory.Factory, "_open_round", return_value=False):
+                        self.go()
+                    self.assertEqual(self.gh.issues[5]["body"], original)
+                    self.assertEqual(factory._labels(self.gh.issues[5]), original_labels)
+                else:
+                    self.go()
+                    self.assertNotIn("Model:", self.gh.issues[5]["body"])
+                    self.assertEqual(len(self.fixed), 1)
+
+    def test_stalled_conflict_round_resends_once_then_files_one_incident(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        original = conflict_round_comment(50, 5)
+        original["created_at"] = iso(25 * 3600)
+        self.gh.pulls[50]["head"]["sha"] = "a" * 40
+        self.gh.runs["a" * 40] = self.gh.runs["sha50"]
+        original["body"] += "<!-- loom:fix-key %s:abc -->" % ("a" * 40)
+        self.gh.comments[5].append(original)
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.go()
+        self.go()
+        self.assertEqual(len(self.fixed), 1)
+        self.assertEqual(len([x for x in self.gh.filed if "conflict" in x["title"].lower()]), 1)
+        self.gh.filed.clear()  # A closed incident no longer appears in the open listing.
+        self.go()
+        self.assertEqual(self.gh.filed, [])
+        self.gh.pulls[50]["head"]["sha"] = "b" * 40
+        self.gh.runs["b" * 40] = self.gh.runs["sha50"]
+        self.go()
+        self.assertEqual(len(self.fixed), 2)  # An old-head retry cannot hold the new head.
+
     def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)

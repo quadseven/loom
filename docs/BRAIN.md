@@ -1923,15 +1923,15 @@ behind, conflict-free one is brought up to date in small steps (at most
 two a repo a pass, never while another pull request there holds the
 landing lock or in a pass where the repo already landed one, and never on
 a head with a failed check, whose re-runs and fix rounds are the cheaper
-answer). A conflicting one gets exactly one fix round for the conflict,
+answer). A conflicting one gets a fix round for the conflict,
 open while the head it was opened for is still the head; a round opened
 before fix comments carried their head counts as open for any head, so an
 old round is never doubled. The judged send-back's holds still apply
 there, with one exception: a `needs:human` ticket gets its conflict round
 anyway, because that hold guards the pull request's merge, not its
 branch, and the label stays on the ticket through the move; a
-`needs-brain` ticket and one in the hand-off pool are left to the brain
-and that session. Hygiene never merges anything: a `class:sensitive`
+`needs-brain` ticket is left to the brain; a hand-off reserves its ticket
+for six hours. Hygiene never merges anything: a `class:sensitive`
 pull request is maintained exactly like a lane one up to the merge step,
 which stays with the brain or the operator as before. Each action is one
 station log line, and so is each skip the pass decides itself (a held
@@ -1942,6 +1942,16 @@ however many pull requests they cover. Pull requests outside the pass's
 remit (not a lane pull request, no ticket in the repo, not yet judged by
 GitHub, a red head the judge is already handling, one brought up to date
 within the cooldown) pass without a line.
+
+An unclaimed hand-off older than six hours returns to a free lane for its
+conflict. Unknown hand-off age, explicit claims, brain holds and running
+tickets remain untouched. A keyed conflict round older than 24 hours with
+no new head is re-sent once to a different free lane. The following pass
+files one factory incident for that head if it still has not moved and is
+not running; a persistent status marker prevents repeated incidents.
+
+Recovery removes the old lane model override so the selected lane uses its
+configured default. A refused fix brief restores the original body and labels.
 
 ## Merge by change class
 
