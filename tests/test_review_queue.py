@@ -21,6 +21,17 @@ class ReviewChoices(unittest.TestCase):
 
 
 class QueueRender(unittest.TestCase):
+    def test_card_uses_the_api_pr_link_and_rejects_executable_schemes(self):
+        from dashboard import review_queue
+        entry = {'repo': 'example-org/example-repo', 'number': 7,
+                 'comment_full': operator_hold.ask(18, ['review']), 'title': 'Review change'}
+        pr = {'number': 18, 'state': 'open', 'head': 'a' * 40,
+              'html_url': 'https://example.com/pull/18'}
+        text = review_queue.card(entry, {'pr': pr}, 'off')
+        self.assertIn('href="https://example.com/pull/18"', text)
+        pr['html_url'] = 'javascript:alert(1)'
+        self.assertNotIn('href=', review_queue.card(entry, {'pr': pr}, 'off'))
+
     def test_queue_exposes_hold_findings_criteria_and_unknown_proof(self):
         from dashboard import review_queue
         repo = "example-org/example-repo"

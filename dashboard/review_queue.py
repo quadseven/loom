@@ -4,6 +4,7 @@ from __future__ import annotations
 import html
 import re
 from typing import Any, Dict, Iterable, List
+from urllib.parse import urlsplit
 
 from bus import answer, brain, proof, criteria_gate
 from . import needs_you
@@ -41,8 +42,7 @@ def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
     repo, ticket = str(entry.get('repo') or ''), int(entry['number'])
     pr_number = answer.held_pr(needs_you.full_ask(entry))
     title = str(entry.get('title') or 'Held pull request')
-    url = 'https://github.com/%s/pull/%s' % (repo, pr_number)
-    link = '<a href="%s">%s</a>' % (esc(url, quote=True), esc(title)) if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) else esc(title)
+    link = _title_link(title, detail.get('pr'))
     out = ['<article class="review-item"><h2>%s</h2>' % link,
            '<p class="machine-fact">%s - pull request #%s - ticket #%d</p>' %
            (esc(repo), pr_number, ticket), '<h3>Why it waits</h3><p>%s</p>' %
@@ -59,6 +59,18 @@ def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
     out.append(_actions(entry, pr if valid else None, errors, mode))
     out.append('</article>')
     return ''.join(out)
+
+
+def _title_link(title: str, pr: Dict[str, Any] | None) -> str:
+    """Use the API's public link, never an executable URI or a fabricated host."""
+    url = str(pr.get('html_url') or '') if isinstance(pr, dict) else ''
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return html.escape(title)
+    if parsed.scheme != 'https' or not parsed.netloc:
+        return html.escape(title)
+    return '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(title))
 
 
 def _summary(pr: Dict[str, Any] | None) -> str:
@@ -87,7 +99,8 @@ def _actions(entry: Dict[str, Any], pr: Dict[str, Any] | None,
 def _review_facts(number: int, pr: Dict[str, Any], tier: str, head: str,
                   threads: List[Dict[str, Any]], reviews: List[Dict[str, Any]],
                   checks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {'number': number, 'title': pr.get('title'), 'head': head, 'tier': tier,
+    return {'number': number, 'title': pr.get('title'), 'html_url': pr.get('html_url'),
+            'head': head, 'tier': tier,
             'state': 'merged' if pr.get('merged_at') else pr.get('state'),
             'threads': [{'text': str(node['comments']['nodes'][0].get('body') or ''),
                          'resolved': bool(node.get('isResolved'))} for node in threads],
