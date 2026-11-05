@@ -1,0 +1,179 @@
+"""Held pull requests, their evidence, and the existing operator answer controls."""
+from __future__ import annotations
+
+import html
+import re
+from typing import Any, Dict, Iterable, List
+
+from bus import answer, proof
+from . import needs_you
+
+
+def held(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep every held ask, including asks whose PR detail is unavailable."""
+    return [entry for entry in entries if answer.held_pr(needs_you.full_ask(entry)) is not None]
+
+
+def criteria(body: str) -> str:
+    """Checkboxes are claims, not deployment proof. Never upgrade their meaning."""
+    boxes = proof.criteria(body)
+    if not boxes:
+        return '<p class="muted">Acceptance criteria unavailable.</p>'
+    return '<ul class="review-criteria">' + ''.join(
+        '<li><span class="machine-fact">%s</span> %s</li>' % (
+            'Claimed' if mark else 'Pending', html.escape(text))
+        for mark, text in boxes) + '</ul>'
+
+
+def _findings(pr: Dict[str, Any]) -> str:
+    threads = pr.get('threads') or []
+    rows = ''.join('<li><span class="machine-fact">%s</span> %s</li>' % (
+        'Resolved' if row.get('resolved') else 'Open', html.escape(str(row.get('text') or '')))
+        for row in threads)
+    reviews = ''.join('<details><summary>Review summary</summary><pre>%s</pre></details>' %
+                      html.escape(str(review.get('body') or '')) for review in pr.get('reviews') or [])
+    return ('<h3>Elder findings</h3>' + ('<ul>' + rows + '</ul>' if rows else
+            '<p class="muted">No inline findings in this read.</p>') + reviews)
+
+
+def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
+    esc = html.escape
+    repo, ticket = str(entry.get('repo') or ''), int(entry['number'])
+    pr_number = answer.held_pr(needs_you.full_ask(entry))
+    title = str(entry.get('title') or 'Held pull request')
+    out = ['<article class="review-item"><h2>%s</h2>' % esc(title),
+           '<p class="machine-fact">%s - pull request #%s - ticket #%d</p>' %
+           (esc(repo), pr_number, ticket), '<h3>Why it waits</h3><p>%s</p>' %
+           esc(needs_you.full_ask(entry))]
+    pr, errors = detail.get('pr'), detail.get('errors') or {}
+    valid = isinstance(pr, dict) and pr.get('number') == pr_number
+    if not valid:
+        out.append('<p class="review-error" role="status">Details unavailable. Reload to retry.</p>')
+    else:
+        out.append('<p class="machine-fact">Tier: %s | State: %s | Head: %s</p>' % (
+            esc(str(pr.get('tier') or 'Unread')), esc(str(pr.get('state') or 'Unread')),
+            esc(str(pr.get('head') or 'Unread')[:12])))
+        out.append(_findings(pr))
+        checks = ', '.join('%s: %s' % (c.get('name'), c.get('state')) for c in pr.get('checks') or [])
+        out.append('<h3>Checks</h3><p>%s</p>' % esc(checks or 'Checks unavailable.'))
+    for name in errors:
+        out.append('<p class="review-error">%s unavailable. Reload to retry.</p>' % esc(name))
+    out.extend(['<h3>Acceptance and ship proof</h3>', criteria(str(detail.get('body') or entry.get('body') or '')),
+                '<p class="muted">Checked boxes are author claims. The merge bar independently checks proof; '
+                'a merge does not establish deployment or live acceptance.</p>'])
+    if valid and not errors and pr.get('state') == 'open' and pr.get('head') and not entry.get('pending'):
+        form = needs_you.answer_form(entry, mode)
+
+        form = form.replace('data-answer ', 'data-answer data-review-pr="%d" data-review-head="%s" ' % (
+            pr_number, esc(str(pr['head']), quote=True)))
+        out.append(form)
+    elif entry.get('pending'):
+        out.append('<p role="status">Answer recorded; waiting for the station.</p>')
+    out.append('</article>')
+    return ''.join(out)
+
+
+def render(entries: Iterable[Dict[str, Any]], details: Dict[str, Any], mode: str = 'off') -> str:
+    rows = held(entries)
+    if not rows:
+        return '<p class="review-empty">No pull requests are waiting for an operator in this snapshot.</p>'
+    return '<div class="review-queue">' + ''.join(card(
+        row, details.get('%s#%d' % (row['repo'], row['number']), {}), mode) for row in rows) + '</div>'
+
+
+class Details:
+    """Read review facts once per five minutes; incomplete reads remain visible."""
+    def __init__(self, gh: Any) -> None:
+        import threading
+        self.gh = gh
+        self.cache: Dict[tuple, tuple] = {}
+        self.lock = threading.Lock()
+
+    def get(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        import time
+        repo, number = str(entry['repo']), int(entry['number'])
+        pr_number = answer.held_pr(needs_you.full_ask(entry))
+        key = (repo, number, pr_number, needs_you.full_ask(entry))
+        with self.lock:
+            now = time.monotonic()
+            self.cache = {k: v for k, v in self.cache.items() if now - v[0] < 300}
+            if key not in self.cache:
+                value = self._read(repo, number, pr_number)
+                if len(self.cache) >= 64:
+                    del self.cache[min(self.cache, key=lambda k: self.cache[k][0])]
+                self.cache[key] = (now, value)
+            return self.cache[key][1]
+
+    def _read(self, repo: str, ticket: int, number: int) -> Dict[str, Any]:
+        from bus.github import GitHubError
+        from bus import merge_tier
+        from .ticket_data import threads_from
+        result: Dict[str, Any] = {'errors': {}}
+        try:
+            base = '/repos/%s' % repo
+            issue = self.gh.rest('GET', '%s/issues/%d' % (base, ticket)).data
+            pr = self.gh.rest('GET', '%s/pulls/%d' % (base, number)).data
+            if not isinstance(issue, dict) or not isinstance(pr, dict):
+                raise ValueError('issue or pull request unavailable')
+            files = self.gh.paginate('%s/pulls/%d/files' % (base, number))
+            head = str((pr.get('head') or {}).get('sha') or '')
+            if not re.fullmatch('[0-9a-f]{40}', head):
+                raise ValueError('pull request head unavailable')
+            tier, _ = merge_tier.classify(repo, files, str(issue.get('body') or ''),
+                                         any(x.get('name') == 'class:sensitive' for x in pr.get('labels') or []))
+            checks = self._checks(base, head)
+            reviews = self.gh.paginate('%s/pulls/%d/reviews' % (base, number))
+            raw_threads = self._threads(repo, number)
+            result.update(body=str(issue.get('body') or ''), pr={
+                'number': number, 'title': pr.get('title'), 'head': head, 'tier': tier,
+                'state': 'merged' if pr.get('merged_at') else pr.get('state'),
+                'threads': threads_from({'repository': {'pullRequest': {'reviewThreads': {'nodes': raw_threads}}}}),
+                'reviews': self._elder_reviews(reviews),
+                'checks': [{'name': c.get('name'), 'state': c.get('conclusion') or c.get('status')} for c in checks]})
+        except (GitHubError, OSError, ValueError, KeyError, TypeError):
+            result['errors']['Review facts'] = 'unavailable'
+        return result
+
+    def _checks(self, base: str, head: str) -> List[Dict[str, Any]]:
+        found = []
+        for page in range(1, 101):
+            data = self.gh.rest('GET', '%s/commits/%s/check-runs?per_page=100&page=%d' %
+                                (base, head, page)).data
+            rows = data['check_runs']
+            found.extend(rows)
+            if len(found) >= data['total_count']:
+                return found
+            if not rows:
+                raise ValueError('check pagination incomplete')
+        raise ValueError('check pagination incomplete')
+
+    @staticmethod
+    def _elder_reviews(reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        import os
+        bot = os.environ.get('LOOM_REVIEW_BOT', 'grug-tribe[bot]').lower()
+        return [r for r in reviews if str((r.get('user') or {}).get('login') or '').lower() == bot
+                and str(r.get('body') or '').strip()]
+
+    def _threads(self, repo: str, number: int) -> List[Dict[str, Any]]:
+        import os
+        owner, name = repo.split('/', 1)
+        query = ('query($owner:String!,$name:String!,$number:Int!,$cursor:String) {'
+                 ' repository(owner:$owner,name:$name) { pullRequest(number:$number) {'
+                 ' reviewThreads(first:100,after:$cursor) { pageInfo { hasNextPage endCursor }'
+                 ' nodes { isResolved comments(first:1) { nodes { author { login } body createdAt } } } } } } }')
+        bot = os.environ.get('LOOM_REVIEW_BOT', 'grug-tribe[bot]').lower()
+        cursor, seen, result = None, set(), []
+        while True:
+            data = self.gh.graphql(query, {'owner': owner, 'name': name, 'number': number, 'cursor': cursor})
+            page = data['repository']['pullRequest']['reviewThreads']
+            for node in page['nodes']:
+                comments = node.get('comments', {}).get('nodes') or []
+                if comments and str((comments[0].get('author') or {}).get('login') or '').lower() == bot:
+                    result.append(node)
+            info = page['pageInfo']
+            if not info['hasNextPage']:
+                return result
+            cursor = info.get('endCursor')
+            if not cursor or cursor in seen or len(seen) >= 100:
+                raise ValueError('review thread pagination incomplete')
+            seen.add(cursor)

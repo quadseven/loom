@@ -193,7 +193,32 @@ def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
     return [name for name in _labels(issue) if name.lower() in wanted]
 
 
-def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any) -> Dict[str, Any]:
+def review_target(gh: Any, entry: Dict[str, Any], comments: List[Dict[str, Any]],
+                  expected_pr: Any = None, expected_head: Any = None) -> str:
+    """Re-read a review card's target before posting, binding the decision to its head."""
+    number = answer.held_pr(needs_you.full_ask(entry))
+    if number is None:
+        if expected_pr is not None or expected_head is not None:
+            raise Refused(409, "the current ask is not a held pull request")
+        return ""
+    asks = [str(c.get("body") or "") for c in comments
+            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
+    if not asks or answer.held_pr(asks[-1]) != number:
+        raise Refused(409, "the ask changed; reload before answering")
+    if expected_pr is not None and expected_pr != number:
+        raise Refused(409, "the held pull request changed; reload before answering")
+    repo = quote(str(entry['repo']), safe='/')
+    pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
+    head = str((pr.get('head') or {}).get('sha') or '')
+    if pr.get('state') != 'open' or pr.get('merged_at') or not re.fullmatch('[0-9a-f]{40}', head):
+        raise Refused(409, "the pull request is not open with a readable head")
+    if expected_head is not None and expected_head != head:
+        raise Refused(409, "the pull request changed; reload and review its new head")
+    return "Review target: #%d %s" % (number, head)
+
+
+def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any,
+         expected_pr: Any = None, expected_head: Any = None) -> Dict[str, Any]:
     """Post one answer to the item `entry` (a Needs-you entry) and change its
     labels. Refused for an answer the card does not offer, a text the
     written-text check refuses, no App to post as, or a closed item."""
@@ -217,7 +242,12 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
         if not isinstance(issue, dict) or issue.get("state") != "open":
             raise Refused(409, "%s#%d is not open" % (repo, number))
         comments = _comments(gh, repo, number, int(issue.get("comments") or 0))
+        target = review_target(gh, entry, comments, expected_pr, expected_head)
+        if target:
+            body += "\n\n" + target
         same = _already(comments, choice)
+        if same is not None and target and not str(same.get("body") or "").endswith(target):
+            same = None
         status = "already" if same is not None else "posted"
         if same is None:
             same = notify.post(gh, repo, number, body, notify.ANSWER).data or {}

@@ -3410,7 +3410,8 @@ class Factory:
         lifted and the other gates decide), True (Hold: held, no new ask), or
         None (no answer: the hold asks as before). Each verdict is written to
         the shadow ledger as the operator's."""
-        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators,
+                                    head=str((full.get("head") or {}).get("sha") or ""))
         if verdict is None:
             return None
         sha = str((full.get("head") or {}).get("sha") or "")
@@ -3420,7 +3421,8 @@ class Factory:
             _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
                  "other gates decide" % (repo, number, verdict.login))
             return False
-        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        _say("%s#%d stays held: the operator %s answered %s" %
+             (repo, number, verdict.login, verdict.choice.lower()))
         return True
 
     def _settle_answers(self, repo: str) -> None:
@@ -3442,6 +3444,8 @@ class Factory:
             if found is None:
                 _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
                      % (repo, number, answer.ANSWERED_LABEL))
+            elif found.choice.lower() == answer.SEND_BACK.lower():
+                self._operator_send_back(repo, issue, comments)
             elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
                 if not needs_human(_labels(issue)):
                     self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -3454,6 +3458,27 @@ class Factory:
             self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                          % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
             self.actions += 1
+
+    def _operator_send_back(self, repo: str, issue: Dict[str, Any],
+                            comments: List[Dict[str, Any]]) -> None:
+        """An explicit operator decision opens the existing fix-round path."""
+        number = answer.newest_held_pr(comments, self.trusted)
+        if number is None:
+            raise ValueError("send back has no current held pull request")
+        verdict = answer.pr_verdict(comments, number, self.trusted, self.operators)
+        if verdict is None or verdict.choice.lower() != answer.SEND_BACK.lower():
+            raise ValueError("send back is not the current operator verdict")
+        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        if pr.get("state") != "open" or pr.get("merged_at"):
+            raise ValueError("send back requires an open pull request")
+        target = answer.review_target(verdict)
+        if target is None or target != (number, str((pr.get("head") or {}).get("sha") or "")):
+            raise ValueError("send back requires its reviewed pull request head")
+        notes = "Operator requested another fix round."
+        if verdict.note:
+            notes += "\n\n" + verdict.note
+        self._open_round(repo, number, issue, notes)
+        self.sent_back.add((repo, number))
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:

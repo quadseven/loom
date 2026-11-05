@@ -5087,7 +5087,7 @@ def _verdict_reader(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
                 trusted = trusted_authors(env)
                 since = str(_head_commit(details).get("committedDate") or "")
                 verdict = answer.pr_verdict(comments, number, trusted,
-                                            answer.operators(env, trusted), since)
+                                            answer.operators(env, trusted), since, str(details.get("headRefOid") or ""))
             if verdict is not None:
                 sha = str(details.get("headRefOid") or "")
                 # The ledger is the process's own, as _shadow_merge writes it.

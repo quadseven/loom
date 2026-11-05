@@ -32,7 +32,7 @@ CHOICE_MAX = 200
 NOTE_MAX = 1000
 
 CHOICE, NUMBER, TEXT = "choice", "number", "text"
-MERGE, HOLD = "Merge", "Hold"
+MERGE, HOLD, SEND_BACK = "Merge", "Hold", "Send back"
 NOT_NOW = "Not now"
 from .kinds import DONE_KINDS
 
@@ -100,7 +100,9 @@ def options(ask: str, kind: str = "") -> Options:
     kind = (kind or ask_kind(str(ask or ""))).lower()
     if _NUMBER_RE.search(text):
         return Options(NUMBER)
-    if HELD_PR_RE.search(text) or _MERGE_HOLD_RE.search(text):
+    if HELD_PR_RE.search(text):
+        return Options(CHOICE, (MERGE, HOLD, SEND_BACK))
+    if _MERGE_HOLD_RE.search(text):
         return Options(CHOICE, (MERGE, HOLD))
     if _KEEP_CLOSE_RE.search(text):
         return Options(CHOICE, ("Keep", "Close"))
@@ -329,7 +331,7 @@ def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[
 
 
 def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops: Iterable[str],
-               since: str = "") -> Optional[Answer]:
+               since: str = "", head: str = "") -> Optional[Answer]:
     """The operator's Merge or Hold on lane pull request `number`: the newest
     operator answer saying Merge or Hold, given after the newest hold ask on
     the ticket when that ask names this pull request, and (with `since`, the
@@ -346,7 +348,15 @@ def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops
         return None
     if since and verdict.created_at and verdict.created_at < since:
         return None
+    target = review_target(verdict)
+    if target is not None and (target[0] != number or (head and target[1] != head)):
+        return None
     return verdict
+
+
+def review_target(verdict: Answer) -> Optional[Tuple[int, str]]:
+    found = re.search(r"Review target: #([0-9]+) ([0-9a-f]{40})$", verdict.note)
+    return (int(found.group(1)), found.group(2)) if found else None
 
 
 def _last_merge_or_hold(comments: Sequence[Any], asked: Any, trusted: List[str],
@@ -355,7 +365,7 @@ def _last_merge_or_hold(comments: Sequence[Any], asked: Any, trusted: List[str],
     later = list(comments)
     later = later[next(i for i, c in enumerate(later) if c is asked) + 1:]
     found = [a for a in (trusted_answer(c, trusted, ops) for c in later)
-             if a is not None and a.choice.lower() in (MERGE.lower(), HOLD.lower())]
+             if a is not None and a.choice.lower() in (MERGE.lower(), HOLD.lower(), SEND_BACK.lower())]
     return found[-1] if found else None
 
 

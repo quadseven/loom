@@ -76,7 +76,7 @@ class FactoryVerdict(Base):
     def held(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, body=PR_BODY)
-        self.go()
+        self.last_factory = self.go()
         self.assertEqual(len(self.humans), 1)
         self.assertEqual(self.merged, [])
 
@@ -120,6 +120,18 @@ class FactoryVerdict(Base):
         self.assertEqual((self.merged, len(self.humans)), ([], 1))
         verdicts = [e for e in ledger() if e["action"] == shadow.VERDICT and e["number"] == 50]
         self.assertEqual([e["label"] for e in verdicts], ["hold"])
+
+    def test_send_back_opens_one_fix_round_and_never_merges(self):
+        self.held()
+        self.gh.pulls[50]["head"]["sha"] = "a" * 40
+        self.answer("Send back")
+        self.gh.comments[5][-1]["body"] += "\n\nReview target: #50 " + "a" * 40
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(len(self.fixed), 1)
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(len(self.fixed), 1)
 
     def test_an_answer_by_someone_who_is_no_operator_changes_nothing(self):
         self.held()
