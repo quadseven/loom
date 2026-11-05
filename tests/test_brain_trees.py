@@ -213,6 +213,7 @@ class BrainTreesTest(unittest.TestCase):
         self.assertNotIn("keep body927.md", out)
         self.assertNotIn("not-a-git-tree", out)
         self.assertIn("keeps total=1 scratch=1 removed=2", out)
+        self.assertIn("recovered scratch=2: removed", out)
 
     def test_a_folder_holding_a_git_checkout_is_kept_however_old(self):
         self.tree("infra-ship/infra", commit=("pin.txt", "v6\n"), hours=24 * 30)
@@ -235,6 +236,7 @@ class BrainTreesTest(unittest.TestCase):
         out = self.prune()
         self.assertFalse(broken.exists(), out)
         self.assertIn("remove mo-review reason=broken-git-dir", out)
+        self.assertIn("recovered broken-git-dir=1: removed", out)
         self.assertTrue(fresh.exists(), out)
         self.assertIn("keep mo-fresh reason=git-status-failed", out)
         self.assertTrue(dirty.exists(), out)
@@ -264,6 +266,7 @@ class BrainTreesTest(unittest.TestCase):
         self.work.rmdir()
         out = self.prune()
         self.assertIn("keeps total=0", out)
+        self.assertNotIn("recovered", out)
 
     def test_old_bundles_go(self):
         retired = self.home / "brain" / "retired"

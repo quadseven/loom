@@ -206,6 +206,9 @@ class Pruner:
     cwds: Optional[List[str]] = None
     keep_reasons: Counter = field(default_factory=Counter)
     removed: int = 0
+    # Scratch and broken git dirs removed this tick, by kind: the recovery
+    # line names them once, so the next keeps line counting fewer is explained.
+    recovered: Counter = field(default_factory=Counter)
     fetched: Dict[str, bool] = field(default_factory=dict)
 
     def keep_tree(self, name: str, reason: str) -> None:
@@ -374,6 +377,7 @@ class Pruner:
             self.keep_tree(name, "remove-failed")
             return True
         self.removed += 1
+        self.recovered[kind] += 1
         self.say("remove %s reason=%s" % (name, kind if kind != "scratch"
                                           else "scratch-idle-%dd" % int(idle_h // 24)))
         return True
@@ -452,6 +456,9 @@ class Pruner:
             else:
                 self.retire(tree)
         self.prune_bundles()
+        if self.recovered:
+            self.say("recovered %s: removed, so later keeps lines no longer count them" % " ".join(
+                "%s=%d" % kv for kv in sorted(self.recovered.items())))
         kept = sum(self.keep_reasons.values())
         self.say("keeps total=%d %s removed=%d" % (kept, " ".join(
             "%s=%d" % kv for kv in sorted(self.keep_reasons.items(), key=lambda kv: (-kv[1], kv[0]))),
