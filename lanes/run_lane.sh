@@ -4030,7 +4030,7 @@ for BRIEF in "$INBOX"/*.md; do
   { [ -n "$TREE_STATUS" ] || [ "$TREE_HEAD" != "$BASE" ]; } && EDITED=edited
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
-  FAIL_CLASS=work
+  FAIL_CLASS=work FAIL_REASON=""
   # The whole run output (from LOG_START), for the limit and credit patterns;
   # the short tail (its last five non-blank lines), kept for the reason shown
   # to people and for the auth/transient patterns (loom#934).
@@ -4076,7 +4076,7 @@ for BRIEF in "$INBOX"/*.md; do
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
+    park "$BRIEF" "agent exited $STATUS${FAIL_REASON:+: $FAIL_REASON}$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
@@ -4146,7 +4146,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS${FAIL_REASON:+: $FAIL_REASON}$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
