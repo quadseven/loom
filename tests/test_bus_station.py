@@ -9105,6 +9105,7 @@ class StatusTest(Base):
 
     def test_republished_on_change_by_editing_the_comment(self):
         self.go()
+        self.fake.edits.clear()
         self.heartbeat("codex", available=False)
         self.go(30)
         self.assertEqual(len(self.fake.edits), 1)
@@ -9112,9 +9113,15 @@ class StatusTest(Base):
 
     def test_republished_after_an_hour(self):
         self.go()
+        self.fake.edits.clear()
         self.heartbeat("codex", age=0)
         self.go(3601 - 0)
-        self.assertEqual(len(self.fake.edits), 1)
+        # The overdue heartbeat publishes before optional PR reads; the
+        # normal pass then replaces pending with the observed counts.
+        self.assertEqual(len(self.fake.edits), 2)
+        self.assertIn("Open pull requests: pending this pass", self.fake.edits[0])
+        self.assertNotIn("pending this pass", self.fake.edits[1])
+        self.assertIn("Open pull requests:", self.fake.edits[1])
 
     def test_a_pass_stopped_at_the_target_still_publishes_an_old_table(self):
         self.go()
@@ -9210,6 +9217,10 @@ class SpendTest(Base):
     def test_a_new_run_republishes_on_the_next_pass(self):
         self.runs((2, "anthropic", 1.0))
         self.station().run_pass()
+        self.assertIn("pending this pass", self.fake.posts[0])
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertNotIn("pending this pass", self.fake.edits[0])
+        self.fake.edits.clear()
         self.runs((0, "anthropic-2", 2.0))
         self.station(self.NOW + 60).run_pass()
         self.assertEqual(len(self.fake.edits), 1)

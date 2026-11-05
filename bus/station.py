@@ -947,6 +947,20 @@ def parse_digest_times(raw: str) -> Tuple[Tuple[int, int], ...]:
     return tuple(sorted(times))
 
 
+def repo_open_pr_caps(raw: str) -> Dict[str, int]:
+    """A default cap followed by optional OWNER/REPO=cap overrides."""
+    caps = {"*": 8}
+    for token in raw.replace(",", " ").split():
+        key, value = token.split("=", 1) if "=" in token else ("*", token)
+        if (key != "*" and not tickets.REPO_RE.fullmatch(key)) or not value.isdigit():
+            raise ValueError("LOOM_REPO_OPEN_PR_CAP needs a positive default or OWNER/REPO=cap")
+        cap = int(value)
+        if cap < 1:
+            raise ValueError("LOOM_REPO_OPEN_PR_CAP must be positive")
+        caps[key] = cap
+    return caps
+
+
 class Settings:
     def __init__(self, home: str, repos: List[str], authors: List[str],
                  owners: List[str], status_repo: str = "", webhook_ssm: str = "",
@@ -1001,8 +1015,10 @@ class Settings:
                  agy_workdir: str = "",
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
-                 pass_deadline: int = 0) -> None:
+                 pass_deadline: int = 0,
+                 repo_pr_caps: Optional[Dict[str, int]] = None) -> None:
         self.home = home
+        self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
         # stack and exits (PASS_DEADLINE). 0, the default for a Settings
         # built in code, arms nothing.
@@ -1230,6 +1246,7 @@ class Settings:
                    engine_claims=claim_referee.engines(env.get("LOOM_ENGINE_CLAIMS", "")),
                    agy_workdir=_agy_workdir(env),
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
+                   repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
                    pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
 
@@ -2168,6 +2185,8 @@ class Station:
         # goal key -> the count and limit the gate hit, the briefed tickets
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
+        self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
         self._free_read = False
@@ -4907,7 +4926,98 @@ class Station:
         check holds (a fix round's brief is the ticket's own, so it is not
         checked again)."""
         return (self._fix_blocks(repo, issue, fix)
-                or (fix is None and self._brief_holds(repo, issue, comments)))
+                or (fix is None and (self._repo_pr_held(repo, issue)
+                                     or self._brief_holds(repo, issue, comments))))
+
+    def _repo_pr_count(self, repo: str) -> Optional[int]:
+        """Count every page once per pass; unread is never an empty queue."""
+        if repo not in self._repo_pr_counts:
+            try:
+                self._repo_pr_counts[repo] = self._read_repo_pr_count(repo)
+            except RateLimited:
+                raise
+            except (GitHubError, ValueError):
+                self._repo_pr_counts[repo] = None
+        return self._repo_pr_counts[repo]
+
+    def _read_repo_pr_count(self, repo: str) -> int:
+        trusted = {a.lower().removesuffix("[bot]") for a in (*self.s.authors, *self.s.briefers)}
+        counted = set()
+        for page in range(1, 26):
+            data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100&page=%d"
+                                % (repo, page)).data
+            if not isinstance(data, list):
+                raise ValueError("open pull requests could not be read")
+            for pr in data:
+                number = self._counted_pr_number(pr, trusted)
+                if number is not None:
+                    counted.add(number)
+            if len(data) < 100:
+                return len(counted)
+        raise ValueError("open pull request history exceeds the read budget")
+
+    @staticmethod
+    def _counted_pr_number(pr: Any, trusted: set) -> Optional[int]:
+        if isinstance(pr, dict) and pr.get("state") == "closed":
+            return None
+        if not isinstance(pr, dict) or not isinstance(pr.get("user"), dict):
+            raise ValueError("open pull request author could not be read")
+        user = pr["user"]
+        login = user.get("login")
+        if not isinstance(login, str) or not login:
+            raise ValueError("open pull request author could not be read")
+        login = login.lower().removesuffix("[bot]")
+        if login not in trusted:
+            return None
+        head = pr.get("head")
+        if (not isinstance(head, dict) or not isinstance(head.get("ref"), str)
+                or not head["ref"]):
+            raise ValueError("open pull request head could not be read")
+        is_agent = (user.get("type") == "Bot" or str(head.get("ref") or "").startswith("loom/")
+                    or re.search(r"^Loom ticket .+, lane [A-Za-z0-9_.-]+, model \S+\.(?:\s|$)",
+                                 str(pr.get("body") or ""), re.M))
+        if not is_agent:
+            return None
+        if type(pr.get("number")) is not int or pr["number"] < 1:
+            raise ValueError("open pull request number could not be read")
+        return pr["number"]
+
+    def _repo_pr_held(self, repo: str, issue: Dict[str, Any]) -> bool:
+        count = self._repo_pr_count(repo)
+        cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
+        if count is not None and count < cap:
+            return False
+        reason = ("held: %s has %d open pull requests (cap %d)" % (repo, count, cap)
+                  if count is not None else "held: open pull request count is unreadable")
+        if self._last_repo_pr_hold(repo, int(issue["number"])) != reason:
+            self._routine(repo, int(issue["number"]), reason)
+        _say(reason)
+        return True
+
+    def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
+        notes = []
+        for text in self._status_texts(repo, number):
+            events = [event for _, event in reversed(status.parse(text))] if status.is_status(text) else [text]
+            notes.extend(event for event in events if event.startswith("held: ")
+                         and "open pull request" in event)
+        return notes[-1] if notes else None
+
+    def _repo_pr_lines(self) -> List[str]:
+        lines = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            count = self._repo_pr_count(repo)
+            cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
+            name = repo
+            if self.s.status_repo and repo != self.s.status_repo:
+                if repo not in self._publics:
+                    self._publics[repo] = self._public(repo)
+                if not self._publics[repo]:
+                    name = "private repo %d" % (self.s.repos.index(repo) + 1)
+            lines.append("Open pull requests: %s %s/%d" % (
+                name, "unread" if count is None else count, cap))
+        return lines
 
     def _brief_holds(self, repo: str, issue: Dict[str, Any], comments: List[Any]) -> bool:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
@@ -8443,18 +8553,22 @@ class Station:
         return rows
 
     def _lanes_issue(self, repo: str) -> int:
+        if repo in self._lanes_issues:
+            return self._lanes_issues[repo]
         found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&per_page=100"
                              % (repo, LANES_LABEL)).data
         for item in found if isinstance(found, list) else []:
             if isinstance(item, dict) and "pull_request" not in item:
-                return int(item["number"])
+                self._lanes_issues[repo] = int(item["number"])
+                return self._lanes_issues[repo]
         made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
             "title": LANES_TITLE, "labels": [LANES_LABEL],
             "body": "The station keeps the comment below current with each "
                     "lane's availability."}).data
         if not isinstance(made, dict) or "number" not in made:
             raise GitHubError("no issue was created in %s" % repo)
-        return int(made["number"])
+        self._lanes_issues[repo] = int(made["number"])
+        return self._lanes_issues[repo]
 
     def _fresh_lanes_record(self, repo: str) -> Optional[Dict[str, Any]]:
         """The saved record of a publish to `repo` within LANES_REPUBLISH;
@@ -8483,11 +8597,15 @@ class Station:
         if not repo or self._fresh_lanes_record(repo) is not None or self._deferred():
             return
         try:
-            self._timed(self.publish_lanes)
+            self._timed(self._publish_initial_lanes)
         except RateLimited:
             raise
         except (GitHubError, OSError, ValueError) as err:
             _say("publish_lanes failed: %s" % err)
+
+    def _publish_initial_lanes(self) -> None:
+        """Publish the overdue heartbeat before spending reads on optional counts."""
+        self.publish_lanes(refresh_pr_counts=False)
 
     def _spend_shown(self) -> Optional[spend.Summary]:
         """The anthropic spend, once there is a budget or a recorded run."""
@@ -8496,7 +8614,8 @@ class Station:
             return summary
         return None
 
-    def _lanes_body(self, rows: List[Tuple[str, str, str]]) -> str:
+    def _lanes_body(self, rows: List[Tuple[str, str, str]],
+                    pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
         disk = self._disk_status_line()
         body = "\n".join(
@@ -8506,6 +8625,7 @@ class Station:
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
+            + (pr_lines or [])
             + self._scorecard_lines()
             + (["", summary.line()] if summary is not None else []))
         return body
@@ -8562,7 +8682,7 @@ class Station:
         made = notify.post(self.gh, repo, number, body, notify.RECORD).data
         return int(made["id"]) if isinstance(made, dict) and "id" in made else None
 
-    def publish_lanes(self) -> None:
+    def publish_lanes(self, refresh_pr_counts: bool = True) -> None:
         repo = self.s.status_repo
         if not repo:
             return
@@ -8582,10 +8702,13 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
+        pr_lines = (self._repo_pr_lines() if refresh_pr_counts
+                    else ["Open pull requests: pending this pass"])
+        values["open PRs"] = "\n".join(pr_lines)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
-        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows))
+        comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
         _write_json(os.path.join(self.state, "lanes.json"),
                     {"repo": repo, "issue": number, "comment_id": comment_id,
                      "values": values, "at": self.now})
