@@ -8756,10 +8756,15 @@ class Station:
         """(stored lines, their read time, lines to show) for a publish that
         spends no pull request reads (loom#2652). The last counted publish's
         lines carry forward under their read time; with none stored, as after
-        a restart, the counts are pending. It reads no GitHub state."""
+        a restart, the counts are pending. Lines saved for another status repo
+        or repo list are pending too: their private repo masking was for that
+        audience, and masking again would spend visibility reads. It reads no
+        GitHub state."""
         saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
-        lines = saved.get("pr_lines") if isinstance(saved, dict) else None
-        read_at = saved.get("pr_read_at") if isinstance(saved, dict) else None
+        if (not isinstance(saved, dict) or saved.get("repo") != self.s.status_repo
+                or saved.get("pr_repos") != list(self.s.repos)):
+            saved = {}
+        lines, read_at = saved.get("pr_lines"), saved.get("pr_read_at")
         if (not isinstance(lines, list) or not lines
                 or not all(isinstance(line, str) and line.startswith(PR_LINE_PREFIX)
                            for line in lines)
@@ -8801,7 +8806,8 @@ class Station:
         record = {"repo": repo, "issue": number, "comment_id": comment_id,
                   "values": values, "at": self.now}
         if read_lines is not None:
-            record.update(pr_lines=read_lines, pr_read_at=read_at)
+            record.update(pr_lines=read_lines, pr_read_at=read_at,
+                          pr_repos=list(self.s.repos))
         _write_json(os.path.join(self.state, "lanes.json"), record)
         _say("published lane status to %s#%d" % (repo, number))
 

@@ -66,6 +66,21 @@ class LanesPrCarryTest(Base):
         self.assertIn("Open pull requests: %s 6/8" % REPO, fresh[0])
         self.assertNotIn("(read ", fresh[0])
 
+    def test_lines_saved_for_another_audience_are_not_reused(self):
+        # A private status repo shows the repo name; a later public status
+        # repo must not reuse that unmasked line.
+        self.publish(READ_AT, True)
+        self.settings.status_repo = "example-owner/public"
+        published, _ = self.publish(READ_AT + 3700, False, reads_allowed=False)
+        self.assertIn("Open pull requests: pending this pass", published[0])
+        self.assertNotIn("%s 6/8" % REPO, published[0])
+
+    def test_changed_repo_list_is_not_reused(self):
+        self.publish(READ_AT, True)
+        self.settings.repos = [REPO, "example-owner/other"]
+        published, _ = self.publish(READ_AT + 3700, False, reads_allowed=False)
+        self.assertIn("Open pull requests: pending this pass", published[0])
+
     def test_first_publish_without_stored_counts_says_pending(self):
         published, runner = self.publish(READ_AT, False, reads_allowed=False)
         self.assertIn("Open pull requests: pending this pass", published[0])
