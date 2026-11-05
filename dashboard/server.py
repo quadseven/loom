@@ -138,7 +138,7 @@ def _backlog(state):
     if not source:
         return None, "LOOM_BACKLOG_SOURCE is not set"
     try:
-        raw = _backlog_bytes()
+        raw = _backlog_raw(state)
         if raw is None:
             return None, "backlog source unavailable or rejected"
         data = json.loads(raw.decode("utf-8"))
@@ -210,7 +210,7 @@ def _when(stamp):
 
 def _start_here_line(state):
     """Hunt's start-here: the top epic and its next ticket, from backlog.json."""
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     if raw is None:
         return None, "the backlog source is not set or unreadable"
     epics = _backlog_document(raw).get("epics") or []
@@ -525,6 +525,18 @@ def _backlog_bytes():
         return Path(source).read_bytes()
     except (OSError, ValueError):
         return None
+
+
+def _backlog_raw(state):
+    """The backlog bytes for a page request. A URL source is read on the
+    refresh thread (TicketStore._read_backlog) and a request serves the copy
+    it kept, so no page waits on the network (loom#2581); a file path is
+    read here. A stand-in state with no refresh thread reads the source."""
+    source = os.environ.get("LOOM_BACKLOG_SOURCE", "").strip()
+    cached = getattr(state, "backlog_cached", None)
+    if cached is None or urlsplit(source).scheme not in ("http", "https"):
+        return _backlog_bytes()
+    return cached(source)
 
 
 def _backlog_document(raw):
@@ -846,7 +858,7 @@ def _needs_you(document, state, *, source_missing=False, who=""):
 
 
 def _needs_entry(state, repo, number):
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     asks, claims, repos = _needs_sources(_backlog_document(raw or b"{}"), state)
     return needs_you_view.find(asks, claims, repo, number, repos, answers_view.posted(state))
 
@@ -1276,7 +1288,7 @@ def _dispatch_run(handler, parsed, store, runs, run_number):
 
 
 def _dispatch_backlog(handler, state, path, parsed):
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     if path == "/backlog.json":
         return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
     if path == "/backlog":
@@ -1540,6 +1552,8 @@ def _send_dashboard_view(handler, state, path):
 
 def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
+    # The refresh thread reads a URL backlog source; requests read its copy.
+    state.backlog_fetch = _backlog_bytes
 
     class DashboardHTTPServer(ThreadingHTTPServer):
         def server_bind(self):
