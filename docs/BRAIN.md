@@ -313,6 +313,10 @@ keyword. The station checks those references and the conventional branch
 number on every pass against all pull request states. A merged pull request
 repairs its open ticket to `loom:merged`; a closed, unmerged pull request gets
 `loom:closed-unmerged`. Neither outcome occupies a lane slot.
+Status also lists an open pull request under its ticket when a same-repo
+`Refs #N` line names an open Loom ticket, regardless of the branch prefix.
+The station moves a queued or briefed ticket with an open trusted `Refs #N`
+pull request to `loom:pr` before assigning new lane work.
 For a re-queued regression, a merged pull request from before the latest
 `loom:queued` or `loom:briefed` label does not move the ticket or supersede
 its newer open pull request. The current attempt still needs to merge.
@@ -2738,3 +2742,26 @@ before it (counted quiet in the digest); a heartbeat is an edit, never a new
 comment, so it is never pushed. A read that fails pushes the report. The
 daily Visibility number counts a quiet goal as current: its last report is
 owed no successor.
+
+### Open pull request backpressure
+
+Before dispatching a new build, the station counts open PRs from its configured
+brief authors and briefers. Bot authors, `loom/` branches and recognized lane
+footers count, including drafts; ordinary personal PRs do not. Keep every brain
+App in the configured briefing identities so its work contributes to the cap.
+`LOOM_REPO_OPEN_PR_CAP` defaults to 8. A positive integer changes the default;
+space-separated `OWNER/REPO=cap` entries override it for individual repositories.
+For example, `8 example/project=5` sets that repository to five. Invalid values
+refuse startup rather than silently removing the limit.
+
+At or above the cap, the ticket keeps its queued/briefed state and its status
+records the count and cap. Repeated identical holds add no new status event.
+Fix rounds and verification runs remain runnable. A failed or malformed PR read
+holds new builds; rate limits still propagate. Reads cover all pages, up to 25
+pages per repository; exceeding that budget is unread, never a partial count.
+The lane status shows each repository's count and cap, republishing when those
+values change. An overdue heartbeat publishes first with counts marked pending;
+the normal pass replaces that marker after its count reads, so optional counts
+cannot prevent the heartbeat from publishing near the request limit. Public
+status hides private repository names. This is a per-pass
+snapshot, not a reservation system for builds already running in other lanes.

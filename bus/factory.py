@@ -4613,6 +4613,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if self._move_queued_refs_pr(repo, issue):
+            return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)
         if held:
             return "%s %s" % (ref, held)
@@ -4636,6 +4638,35 @@ class Factory:
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
+
+    def _move_queued_refs_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move a queued ticket to loom:pr when a trusted same-repo PR names it."""
+        number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
+        for pr in self._open_pull_requests(repo):
+            if (pr.get("state", "open") != "open" or not self._trusted(pr)
+                    or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                    or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            labels = brain._moved_labels(_labels(issue), "pr", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+            issue["labels"] = [{"name": name} for name in labels]
+            _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
+            return True
+        return False
+
+    def _open_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open pull requests, read once for queued ticket checks."""
+        if repo not in self._open_pulls:
+            self._open_pulls[repo] = [pr for pr in self.gh.paginate(
+                "/repos/%s/pulls?state=open" % repo) if isinstance(pr, dict)]
+        return self._open_pulls[repo]
+
+    @staticmethod
+    def _refs_ticket(body: str, number: int) -> bool:
+        """Whether a bare same-repo Refs line names this ticket."""
+        return bool(re.search(r"^Refs #%d\b" % number, body, re.M))
 
     def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane this pass, or ""."""
@@ -4972,10 +5003,7 @@ class Factory:
     def _open_lane_pull(self, repo: str, ticket: int) -> Optional[Dict[str, Any]]:
         """The ticket's open trusted lane pull request, from one read of the
         repo's open pull requests a pass; None when it has none."""
-        if repo not in self._open_pulls:
-            self._open_pulls[repo] = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-                                      if isinstance(p, dict)]
-        for pr in self._open_pulls[repo]:
+        for pr in self._open_pull_requests(repo):
             if self._trusted(pr) and self._is_lane_pr(pr):
                 association = self._association(repo, pr)
                 if association and association[1] == ticket:
