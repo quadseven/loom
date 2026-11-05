@@ -603,8 +603,11 @@ what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
 open lane pull request is closed then, or on any later pass, as is one whose
-open ticket was rewritten as a newer ticket, each with one comment naming the
-ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
+open ticket was rewritten as a newer ticket, or whose ticket was closed for any
+reason, each with one comment naming the ticket (loom#2027, loom#1923; a closed
+ticket's comment names its close reason); a ticket still in a fix round keeps
+its pull request. Until the station closes it, `bus.brain status` and `resume`
+leave a pull request whose ticket is closed out of their sensitive lists. Landing
 keeps the default branch green: a ready pull request behind its base lands as
 it stands when GitHub reports it mergeable and no rule on the base requires
 up-to-date branches; any other is brought up to date first (GitHub's
@@ -1591,8 +1594,17 @@ cannot query the viewer or any other local service.
   `state/usage/go-budget.jsonl`.
 - A failed review on a Go or Zen slot demotes the model
   (`model:<id>` in the scorecard), not the slots: the picker skips it and the
-  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
-  proof audits and records with no model still demote the lane. Each brief for
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. The station
+  sends one `needs-a-person` notice per demotion with its findings and clear
+  command through the configured Discord report channel (bot or webhook).
+  Successful delivery is saved
+  separately in `demotion-notices.json`; failed delivery retries on the next
+  pass. A crash between delivery and saving the receipt can repeat the notice.
+  The existing `LOOM_REPORT_DIGEST_TIMES` digest lists uncleared demotions,
+  including those older than 24 hours. This does not publish a Buzz summary.
+  Clearing still requires the existing operator/peer approval; the notice
+  grants none. Failed proof audits and records with no model still demote the
+  lane. Each brief for
   these slots carries a `Demoted-Models:` line, so a runner without the
   scorecard file skips them too. An unreadable scorecard, or neither source,
   stops paid models and free models carry on.

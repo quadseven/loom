@@ -142,8 +142,8 @@ class AfterMerge(unittest.TestCase):
         got = self.refresh(card())
         lines = got.markdown()
         self.assertIn(difficulty.TABLE_HEAD, lines)
-        self.assertIn("| spark | nemotron-3.5-super-vl | - | 1 | 1 | 0 | 0 | +0.00 |", lines)
-        self.assertIn("| spark | nemotron-3.5-super-vl | logic | 1 | 0 | 1 | 0 | +2.00 |", lines)
+        self.assertIn("| spark | nemotron-3.5-super-vl | - | 1 | 1 | 0 | 0 | +0.00 | - | - |", lines)
+        self.assertIn("| spark | nemotron-3.5-super-vl | logic | 1 | 0 | 1 | 0 | +2.00 | - | - |", lines)
         body = "\n".join(lines)
         # The dashboard's readers of the same comment are not confused by it.
         self.assertEqual(len(scorecard.parse_rows(body)), len(got.table()))
@@ -176,11 +176,11 @@ class Report(unittest.TestCase):
         lines = difficulty.markdown(records, NOW)
         self.assertIn("the last 14 days", lines[1])
         self.assertEqual([x for x in lines if x.startswith("| codex")],
-                         ["| codex | gpt-6-luna | logic | 1 | 0 | 1 | 0 | +1.00 |"])
+                         ["| codex | gpt-6-luna | logic | 1 | 0 | 1 | 0 | +1.00 | - | - |"])
 
     def test_an_empty_report_still_has_its_table(self):
         lines = difficulty.markdown({}, NOW)
-        self.assertEqual(lines[-1], "| - | - | - | 0 | 0 | 0 | 0 | 0.00 |")
+        self.assertEqual(lines[-1], "| - | - | - | 0 | 0 | 0 | 0 | 0.00 | - | - |")
         self.assertEqual(json.loads(json.dumps(difficulty.report({}, NOW))), {})
 
 

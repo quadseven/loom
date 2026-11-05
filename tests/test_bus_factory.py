@@ -28,6 +28,11 @@ STRANGER = {"login": "mallory-example"}
 NO_OPUS = ("claude",) + factory.ANTHROPIC
 
 
+# An acceptance criteria section with one box: a queued ticket without one
+# gets no lane (loom#2249).
+ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] x\n"
+
+
 def lane_models(**models):
     """The lanes' configured model settings (LOOM_<LANE>_MODEL) for a test,
     and no others."""
@@ -771,6 +776,17 @@ class PullRequests(Base):
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
         # The lane label changed before the fix brief went out.
         self.assertIn({"name": "lane:claude"}, self.fixed[0][2])
+
+    def test_a_stuck_pull_request_whose_ticket_a_person_claimed_never_climbs(self):
+        """loom#2003: a person's claimed work gets no rung and no send-back."""
+        self.gh.ticket(5, "pr", lane="opencode-go")
+        self.gh.issues[5]["labels"].append({"name": "claim:" + ME["login"]})
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual((self.lane(5), self.model(5)), ("opencode-go", None))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.fixed, [])
 
     def test_a_review_round_that_finds_new_things_stays_on_its_lane(self):
         self.gh.ticket(5, "pr", lane="codex")
@@ -1813,6 +1829,47 @@ class PullRequests(Base):
         self.go()
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
+
+    def test_lane_pull_request_of_a_closed_ticket_is_closed_naming_its_close_reason(self):
+        # loom#1923: a ticket closed as not planned left its lane pull
+        # request open for days, read as sensitive in every tick.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5].update(state="closed", state_reason="not_planned")
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual(len(self.closed), 1)
+        number, note = self.closed[0]
+        self.assertEqual(number, 50)
+        self.assertIn("superseded", note)
+        self.assertIn("#5 was closed (not_planned)", note)
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+        self.assertEqual(self.gh.issues[5]["state"], "closed")
+        self.assertEqual(self.merged, [])
+
+    def test_closed_ticket_in_a_merged_state_with_no_merged_pull_closes_its_lane_pull(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["state"] = "closed"
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [50])
+        self.assertIn("#5 was closed (closed)", self.closed[0][1])
+
+    def test_lane_pull_request_of_an_open_ticket_is_not_closed_as_ended(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertFalse(any(n == 50 and "was closed" in note for n, note in self.closed))
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
+    def test_a_persons_pull_request_off_a_loom_branch_is_left_open_when_its_ticket_closed(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5].update(state="closed", state_reason="completed")
+        self.gh.pull(60, 5, branch="feature/my-branch", body="Refs %s#5\n" % REPO)
+        self.gh.pull(70, 5, branch="loom/5-some-title", user=STRANGER)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[60]["state"], "open")
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
 
     def test_non_loom_branch_pull_request_is_left_open(self):
         self.gh.ticket(5, "merged")
@@ -2895,7 +2952,10 @@ class Trust(Base):
 
 
 class Queued(Base):
-    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0):
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0, boxes=True):
+        # A queued ticket with no acceptance box gets no lane (loom#2249).
+        if boxes:
+            body += ACCEPTANCE
         self.gh.ticket(number, "queued", body=body)
         self.gh.issues[number]["labels"] = [
             {"name": "loom:ticket"}, {"name": "loom:queued"}]
@@ -2931,6 +2991,25 @@ class Queued(Base):
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertEqual(worker.waits["%s#7" % REPO], "waits for #5 to merge (After:)")
         self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+
+    def test_a_queued_ticket_with_no_acceptance_box_gets_no_lane_and_one_note(self):
+        # loom#2249: five box-less tickets were given lanes all night; each
+        # run was parked unrun by the runner and spent a slot and a rung.
+        self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n## Size\nS\n", boxes=False)
+        self.assign(available=["codex"])
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("queued", ""))
+        self.assertIn("needs-brain", factory._labels(issue))
+        (note,) = [c["body"] for c in self.gh.comments[7]]
+        self.assertIn("## Acceptance criteria", note)
+
+    def test_a_queued_ticket_with_an_acceptance_box_gets_a_lane(self):
+        self.queued(7)
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn("needs-brain", factory._labels(issue))
 
     def test_a_queued_ticket_whose_after_ticket_merged_gets_a_lane(self):
         self.gh.ticket(5, "merged")
@@ -3006,7 +3085,7 @@ class Queued(Base):
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3", "claude"])
         self.assertEqual(self.lane(7), "claude")
-        self.assertEqual(self.gh.issues[7]["body"], body)
+        self.assertEqual(self.gh.issues[7]["body"], body + ACCEPTANCE)
 
     def test_a_ticket_held_for_a_factory_incident_does_not_fill_its_lane(self):
         # 2026-10-18: tickets held for open factory incidents kept their
@@ -3032,7 +3111,7 @@ class Queued(Base):
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
-        self.assertEqual(self.gh.issues[7]["body"], body)
+        self.assertEqual(self.gh.issues[7]["body"], body + ACCEPTANCE)
 
     def test_private_medium_uses_the_least_loaded_available_tier_lane(self):
         self.queued(7)
@@ -3173,6 +3252,27 @@ class Tickets(Base):
         self.assertEqual(self.moved, [])
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.lane(6), "spark")
+
+    def test_a_failed_ticket_a_person_claimed_never_climbs_or_runs_away(self):
+        """loom#2003: the factory held three person-claimed tickets as
+        runaways an hour after a person claimed one."""
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.issues[6]["labels"].append({"name": "claim:" + ME["login"]})
+        for _ in range(3):
+            self.ended(6, "Lane zai failed: [work] validation failed: the check exited 2")
+        self.gh.ticket(7, "failed", lane="zai")
+        self.gh.issues[7]["labels"].append({"name": "claim:" + ME["login"]})
+        self.gh.comments[7] = [{"id": n, "user": ME, "created_at": iso(3600),
+                                "body": "%s\nmoved" % brain.ESCALATE_MARKER} for n in range(6)]
+        before = {n: list(self.gh.comments[n]) for n in (6, 7)}
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        for n in (6, 7):
+            names = [x["name"] for x in self.gh.issues[n]["labels"]]
+            self.assertNotIn(factory.RUNAWAY, names, n)
+            self.assertNotIn("needs-brain", names, n)
+            self.assertIn("lane:zai", names, n)
+            self.assertEqual(self.gh.comments[n], before[n], n)
 
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
@@ -4687,8 +4787,8 @@ class ForbiddenModels(unittest.TestCase):
 
 class NoLane(Base):
     """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
-    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
-    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n"
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
+    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
 
     def queued(self, number, body):
         self.gh.ticket(number, "queued", body=body)

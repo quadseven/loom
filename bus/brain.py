@@ -1164,6 +1164,19 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _refs_ticket_pull(repo: str, pr: Dict[str, Any], tickets: Sequence[Dict[str, Any]]) -> bool:
+    """Whether a pull request names one of this repo's open Loom tickets."""
+    try:
+        association = _ticket_association(repo, pr)
+    except ValueError:
+        return False
+    if association is None or association[0] != repo:
+        return False
+    return any(int(issue.get("number") or 0) == association[1]
+               and issue.get("state", "open") == "open"
+               and "loom:ticket" in _labels(issue) for issue in tickets)
+
+
 def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optional[str]:
     """Warn when more than half of the last 10 merged PRs target a branch that
     is neither the default branch nor a goal home's declared Trunk."""
@@ -1336,9 +1349,26 @@ def _add_blocker(line: str, blocker: str) -> str:
             if line.endswith(" - READY") else line + ", " + blocker)
 
 
-def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
-    """The sensitive pull requests section for status."""
-    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+def _ticket_closed(gh: Optional[GitHub], repo: str, pr: Dict[str, Any]) -> bool:
+    """Whether the pull request's ticket in this repo reads as closed: the
+    station closes such a pull request as superseded on its next pass, so
+    status and resume do not list it for review (loom#1923)."""
+    ticket = _safe_ticket_association(repo, pr)
+    if gh is None or ticket is None or ticket[0] != repo:
+        return False
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    except GitHubError:
+        return False
+    return isinstance(issue, dict) and issue.get("state") == "closed"
+
+
+def _sensitive_pr_lines(prs: List[Dict[str, Any]], gh: Optional[GitHub] = None,
+                        repo: str = "") -> List[str]:
+    """The sensitive pull requests section for status, without one whose
+    ticket is closed (_ticket_closed)."""
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"
+                 and not _ticket_closed(gh, repo, pr)]
     lines = ["### Sensitive pull requests"]
     lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
     return lines
@@ -1423,7 +1453,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if into is not None:
         into[repo] = tickets
     pulls = list(gh.paginate("/repos/%s/pulls?state=open" % repo))
-    prs = [i for i in pulls if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
+    prs = [i for i in pulls
+           if str(i.get("head", {}).get("ref", "")).startswith("loom/")
+           or _refs_ticket_pull(repo, i, tickets)]
     trusted = {a.lower() for a in (authors or ())}
     adoptable = [i for i in pulls
                  if not str(i.get("head", {}).get("ref", "")).startswith("loom/")
@@ -1440,11 +1472,12 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors, gh, repo, issues, shares) + [""]
     lines += runaway_lines(tickets) + [""]
-    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
+    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped,
+                                                      person_claims(tickets))) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
-    lines += [""] + _sensitive_pr_lines(prs)
+    lines += [""] + _sensitive_pr_lines(prs, gh, repo)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
@@ -7206,15 +7239,22 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     ready = list(ready)
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
-    for item in ready[:SENSITIVE_RESUME_MAX]:
+    listed = 0
+    for item in ready:
+        if listed >= SENSITIVE_RESUME_MAX:
+            break
         pr, ticket = item["pr"], item["ticket"]
-        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        if issue.get("state") == "closed":
+            continue  # the station closes it as superseded (loom#1923)
+        listed += 1
+        title = str(issue.get("title") or "")
         threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
         out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
             item["repo"], pr["number"], ticket[0], ticket[1], title,
             pr.get("title", ""), _age(pr, now), open_threads))
-    return out if ready else out + ["- none"]
+    return out if listed else out + ["- none"]
 
 
 # How long resume reads before it stops and names the repos it did not reach
@@ -7827,7 +7867,7 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
     candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
-                         and owned_elsewhere(i) is None),
+                         and owned_elsewhere(i) is None and not tickets.claimed_by(i)),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
     read = candidates[:STATUS_HISTORY_MAX]
@@ -7837,9 +7877,21 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
             [int(i["number"]) for i in candidates[STATUS_HISTORY_MAX:]])
 
 
-def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets, and for those status skipped."""
-    marks: Dict[int, str] = {}
+def person_claims(found: Sequence[Dict[str, Any]]) -> Dict[int, str]:
+    """The stuck-state tickets a person claimed (a claim:<login> label), by
+    number, with the first login a claim names. A claimed ticket is that
+    person's work, not lane work: status never marks it stuck and escalate
+    never moves it (loom#2003)."""
+    return {int(i["number"]): tickets.claimed_by(i)[0] for i in found
+            if tickets.claimed_by(i) and any("loom:" + x in _labels(i) for x in STUCK_STATES)}
+
+
+def _stuck_marks(histories: Dict[int, History], skipped: List[int],
+                 claimed: Optional[Dict[int, str]] = None) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets, for those status skipped, and for
+    those a person claimed (person_claims), which carry no next rung."""
+    marks: Dict[int, str] = {n: " - claimed by %s" % login
+                             for n, login in (claimed or {}).items()}
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
@@ -8021,6 +8073,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     owner = owned_elsewhere(issue)
     if owner is not None:
         raise ValueError("#%d is held by %s; the ladder leaves it alone" % (number, owner))
+    claimed = tickets.claimed_by(issue)
+    if claimed:
+        raise ValueError("#%d carries claim:%s; a person's claimed work is not lane work, "
+                         "and the ladder leaves it alone" % (number, claimed[0]))
     if RUNAWAY in names:
         raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:

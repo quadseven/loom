@@ -532,6 +532,16 @@ BRIEF_RES = (
     re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
 )
 RUNAWAY = "loom:runaway"
+
+
+def person_claim(issue: Dict[str, Any]) -> Optional[str]:
+    """The login a ticket's first claim:<login> label names, else None. A
+    claimed ticket is that person's work: the ladder never moves it and the
+    move cap never holds it as a runaway (loom#2003)."""
+    found = tickets.claimed_by(issue)
+    return found[0] if found else None
+
+
 # A ticket no lane takes stops moving after this many moves (loom#2333): one
 # went between two rungs 13 times in a week with no run. LOOM_UNCLAIMED_MOVE_CAP
 # sets it; 0 turns the cap off.
@@ -654,6 +664,12 @@ ask for."""
 
 # A ticket with either label is never sent back: a person or the brain has it.
 SEND_BACK_HOLDS = frozenset(HUMAN_LABELS + ("needs-brain",))
+# The one note on a queued ticket the factory holds for want of acceptance
+# criteria (Factory._no_criteria, loom#2249).
+NO_CRITERIA_NOTE = (
+    "Held for the brain (needs-brain): this ticket has no acceptance criteria a lane "
+    "can prove. Add an `## Acceptance criteria` section with at least one `- [ ]` "
+    "checkbox; no lane takes it until then.")
 
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
@@ -2201,7 +2217,10 @@ class Factory:
 
     def _move_capped(self, repo: str, issue: Dict[str, Any],
                      comments: Sequence[Dict[str, Any]]) -> bool:
-        """Hold a ticket moved move_cap() times with no claim for the brain."""
+        """Hold a ticket moved move_cap() times with no claim for the brain.
+        A ticket a person claimed (claim:<login>) is never held (loom#2003)."""
+        if person_claim(issue):
+            return False
         moves = unclaimed_moves(comments, sorted(self.trusted))
         if not brain.past_move_cap(moves):
             return False
@@ -2228,6 +2247,8 @@ class Factory:
         number = int(issue["number"])
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
+        if person_claim(issue):
+            return None  # a person's claimed work never climbs (loom#2003)
         if self._move_capped(repo, issue, comments):
             return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
@@ -2413,6 +2434,10 @@ class Factory:
         lane of its next rung, is a runaway, or is past the ladder (its pull
         request closed and the ticket given up), so nothing is sent."""
         number = int(issue["number"])
+        claimed = person_claim(issue)
+        if claimed:
+            _say("%s#%d is claimed by %s; not climbed for %s" % (repo, number, claimed, why))
+            return False
         footer = self._footer(repo, pr)
         if self._climb(repo, issue, comments, why, footer=footer) is not None:
             return True
@@ -2551,8 +2576,10 @@ class Factory:
                             ticket, old.get("merged_at"), events):
                         return
                 self._close_all_but(repo, prs, merged, closed)
-            return
-        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
+                return
+            if ticket.get("state") == "open":
+                return
+        ended =self._ended_note(repo, ticket, ticket_map) if ticket else None
         if ended is not None:
             for pr in prs:
                 if self.actions >= MAX_ACTIONS:
@@ -2585,15 +2612,17 @@ class Factory:
 
     def _ended_note(self, repo: str, ticket: Dict[str, Any],
                     ticket_map: Dict[int, Dict[str, Any]]) -> Optional[str]:
-        """Why nothing will ever build an open ticket's lane pull request, as
-        the close comment, or None while something may (loom#2027): the ticket
-        was rewritten as a newer ticket, or it is loom:failed past the last
-        rung of the model ladder. A ticket in a fix round, or failed with a
-        rung left to climb, keeps its pull request. A closed ticket is not
-        handled here."""
-        if ticket.get("state") != "open":
-            return None
+        """Why nothing will ever build a ticket's lane pull request, as the
+        close comment, or None while something may (loom#2027): the ticket
+        was closed for any reason (loom#1923), it was rewritten as a newer
+        ticket, or it is loom:failed past the last rung of the model ladder.
+        A ticket in a fix round, or failed with a rung left to climb, keeps
+        its pull request."""
         number = int(ticket["number"])
+        if ticket.get("state") != "open":
+            return ("Closed by the station as superseded: its ticket #%d was closed (%s), "
+                    "so no lane builds this pull request."
+                    % (number, ticket.get("state_reason") or "closed"))
         read: List[List[Dict[str, Any]]] = []
 
         def comments() -> List[Dict[str, Any]]:
@@ -4625,6 +4654,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if self._move_queued_refs_pr(repo, issue):
+            return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)
         if held:
             return "%s %s" % (ref, held)
@@ -4649,11 +4680,41 @@ class Factory:
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
 
+    def _move_queued_refs_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move a queued ticket to loom:pr when a trusted same-repo PR names it."""
+        number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
+        for pr in self._open_pull_requests(repo):
+            if (pr.get("state", "open") != "open" or not self._trusted(pr)
+                    or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
+                    or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            labels = brain._moved_labels(_labels(issue), "pr", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+            issue["labels"] = [{"name": name} for name in labels]
+            _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
+            return True
+        return False
+
+    def _open_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open pull requests, read once for queued ticket checks."""
+        if repo not in self._open_pulls:
+            self._open_pulls[repo] = [pr for pr in self.gh.paginate(
+                "/repos/%s/pulls?state=open" % repo) if isinstance(pr, dict)]
+        return self._open_pulls[repo]
+
+    @staticmethod
+    def _refs_ticket(body: str, number: int) -> bool:
+        """Whether a bare same-repo Refs line names this ticket."""
+        return bool(re.search(r"^Refs #%d\b" % number, body, re.M))
+
     def _queued_hold(self, repo: str, issue: Dict[str, Any]) -> str:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
-        held = self._brief_wait(repo, issue) or self._superseded_or_blocked(repo, issue)
+        held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
+                or self._superseded_or_blocked(repo, issue))
         if held:
             return "waits: " + held
         # A ticket held by After: is never briefed: the station refuses the
@@ -4678,6 +4739,27 @@ class Factory:
         else:
             return ""
         self._waiting(repo, issue["number"], reason)
+        return reason
+
+    def _no_criteria(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued build ticket with no acceptance checkbox gets no lane,
+        or "" (brief_check.criteria_verdict, the station's claim refusal).
+        It gains needs-brain and one note naming the missing section, once:
+        a ticket already carrying needs-brain gets no second note. Given a
+        lane, such a ticket was refused at the claim or parked unrun by the
+        runner, and moved across lanes all night (loom#2249)."""
+        if brief_check.criteria_verdict(str(issue.get("body") or "")) is None:
+            return ""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, NO_CRITERIA_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
+        reason = "has no acceptance criteria"
+        self._waiting(repo, number, reason)
         return reason
 
     def _superseded_or_blocked(self, repo: str, issue: Dict[str, Any]) -> str:
@@ -4984,10 +5066,7 @@ class Factory:
     def _open_lane_pull(self, repo: str, ticket: int) -> Optional[Dict[str, Any]]:
         """The ticket's open trusted lane pull request, from one read of the
         repo's open pull requests a pass; None when it has none."""
-        if repo not in self._open_pulls:
-            self._open_pulls[repo] = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-                                      if isinstance(p, dict)]
-        for pr in self._open_pulls[repo]:
+        for pr in self._open_pull_requests(repo):
             if self._trusted(pr) and self._is_lane_pr(pr):
                 association = self._association(repo, pr)
                 if association and association[1] == ticket:
@@ -5143,6 +5222,10 @@ class Factory:
             if HANDOFF_LABEL in _labels(issue) and _state(issue) in (
                     "queued", "briefed", "running", "failed"):
                 continue  # the second operator's session has it (docs/BRAIN.md)
+            if person_claim(issue) and _state(issue) in ("briefed", "failed"):
+                # A person claimed it (loom#2003): no rung move, no stall
+                # move, no runaway hold on work no lane will take.
+                continue
             if step is not None:
                 self._guarded(step, repo, issue)
 

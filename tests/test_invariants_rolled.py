@@ -480,6 +480,17 @@ class RewrittenTicketTest(unittest.TestCase):
         (note,) = self.gh.comments[(REPO, issue["number"])]
         self.assertIn(invariants.CLEARED_TEXT, note["body"])
 
+    def test_a_queued_ticket_whose_breach_cleared_closes_in_the_settled_pass(self):
+        # loom#2249: three rewritten tickets whose breach had cleared stayed
+        # open at loom:queued and kept being claimed.
+        issue = self.ticket("lane-pr-stalled", "%s#662" % REPO,
+                            ("loom:ticket", "loom:queued", invariants.LABEL))
+        self.run_filer()
+        self.assertEqual(self.asked, ["%s#662" % REPO])
+        self.assertEqual(issue["state"], "closed", self.said)
+        (note,) = self.gh.comments[(REPO, issue["number"])]
+        self.assertIn(invariants.CLEARED_TEXT, note["body"])
+
     def test_a_cleared_ticket_of_a_kind_with_no_settle_rule_folds(self):
         # plan-check-failed asks no settled(): like an older issue still at
         # loom:triage, it folds once the clear wait has passed.

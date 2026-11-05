@@ -364,7 +364,7 @@ class SensitiveResumeTests(unittest.TestCase):
         os.environ.pop("LOOM_BRIEF_AUTHORS", None)
         os.environ.pop("LOOM_TRUSTED_BRIEFERS", None)
 
-    def make_gh(self, entries):
+    def make_gh(self, entries, closed=()):
         prs = []
         details = {}
         for n, age, checks, _ in entries:
@@ -391,7 +391,8 @@ class SensitiveResumeTests(unittest.TestCase):
                 return reply(200, {"check_runs": runs})
             if path.startswith("/repos/%s/issues/" % REPO):
                 n = int(path.rsplit("/", 1)[1])
-                return reply(200, {"title": "Ticket%d" % n})
+                return reply(200, {"title": "Ticket%d" % n,
+                                   **({"state": "closed"} if n in closed else {})})
             if path == "/graphql":
                 query = json.loads(body)["query"]
                 n = int(query.split("pullRequest(number:")[1].split(")")[0])
@@ -407,6 +408,16 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
                       (REPO, REPO), items[0])
+
+    def test_sensitive_resume_leaves_out_a_pull_request_whose_ticket_is_closed(self):
+        # loom#1923: a closed ticket's pull request was listed first in every
+        # resume; the next oldest takes its place under the cap.
+        entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries, closed={7}), [REPO],
+                                              self.NOW, {})
+        numbers = [int(line.split("#")[1].split()[0]) for line in lines
+                   if line.startswith("- resume sensitive")]
+        self.assertEqual([6, 5, 4, 3, 2], numbers)
 
     def test_sensitive_resume_is_capped_at_five_oldest_first(self):
         entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
@@ -522,6 +533,26 @@ class SensitiveResumeTests(unittest.TestCase):
         lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
+    def test_status_leaves_out_a_sensitive_pull_request_whose_ticket_is_closed(self):
+        # loom#1923: pull request 1130's ticket was closed as not planned,
+        # and status listed it as sensitive in every tick for days.
+        ticket_issue = {"number": 4, "state": "closed", "state_reason": "not_planned",
+                        "labels": [{"name": "loom:ticket"}], "body": ""}
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [{"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work"},
+                         "labels": [{"name": "class:sensitive"}]}]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
+            reply(200, ticket_issue)))
+        lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
+        at = lines.index("### Sensitive pull requests")
+        self.assertEqual(lines[at + 1], "- none")
+        pr_line = next(line for line in lines if line.startswith("- #4 "))
+        self.assertFalse(pr_line.endswith("READY"), pr_line)
 
     def test_status_blocks_a_sensitive_pr_with_a_neutral_review(self):
         pr = {"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work", "sha": "head1"},
@@ -3779,6 +3810,37 @@ class EscalateTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertNotIn("nothing to fix", str(caught.exception))
+
+    def claimed_ticket(self):
+        """A failed ticket with three attempts that the operator login ccqw
+        claimed (loom#2003): one of this Loom's own logins, so the ticket is
+        not owned elsewhere."""
+        issue = stuck_ticket("failed")
+        issue["labels"] = issue["labels"] + [{"name": "claim:ccqw"}]
+        return issue
+
+    def test_status_says_who_claimed_a_failed_ticket_instead_of_stuck(self):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [self.claimed_ticket()]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/issues/9/comments"): reply(200, [claim("2030-01-01T00:11:00Z"),
+                                                             fixc("2030-01-01T00:50:00Z")]),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain ccqw"})
+        line = next(l for l in report.splitlines() if l.startswith("- #9 "))
+        self.assertIn("claimed by ccqw", line)
+        self.assertNotIn("REPEATEDLY STUCK", report)
+        self.assertNotIn("next rung", report)
+
+    def test_escalate_refuses_a_ticket_a_person_claimed_and_writes_nothing(self):
+        fake = Routed(ticket_routes(self.claimed_ticket(), TWICE,
+                                    [claim("2030-01-01T00:11:00Z"), fixc("2030-01-01T00:50:00Z")]))
+        with unittest.mock.patch.dict(os.environ,
+                                      {"LOOM_BRIEF_AUTHORS": "%s ccqw" % BRAIN}):
+            with self.assertRaisesRegex(ValueError, "claim:ccqw"):
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertFalse([c for c in fake.calls if c[0] != "GET"])
 
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")

@@ -38,7 +38,9 @@ them.
 Each merged record also gets a settled difficulty, scored blind from the
 merged diff, the send-backs and the review findings (bus/difficulty.py),
 beside the perceived one on the ticket's Difficulty: line, and the status
-comment compares the two per lane, model and kind.
+comment compares the two per lane, model and kind. Review-round cost is
+recorded independently after merge; unread history stays unknown and is
+retried without affecting routing or demotion.
 
 A read that fails keeps the last scorecard and every demotion: nothing is
 cleared by an error. A scorecard file that is there but cannot be read
@@ -51,6 +53,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -59,6 +62,7 @@ from . import change_class, difficulty, labels, merge_tier, revert
 from .github import GitHubError
 
 FILE = "scorecard.json"
+NOTICE_FILE = "demotion-notices.json"
 # Slots of these lanes pick their model per run (bus/model_pick.py, which reads
 # the demoted models), so demotion binds to a model named after MODEL_KEY.
 PICKED_LANES = ("opencode-go", "zen")
@@ -341,6 +345,78 @@ class Scorecard:
             except (GitHubError, ValueError, KeyError, TypeError) as err:
                 _say("%s has no settled difficulty yet: %s" % (key, err))
 
+        if record["merged"] and record.get("settled") in difficulty.LEVELS and "rounds" not in record:
+            try:
+                rounds = self._review_rounds(gh, repo, int(pr["number"]), bot)
+            except (GitHubError, ValueError, KeyError, TypeError) as err:
+                _say("%s has no review-round score yet: %s" % (key, err))
+            else:
+                record["rounds"] = rounds
+                record["score"] = max(0, difficulty.LEVELS.index(record["settled"]) + 1 - rounds)
+
+    def _review_rounds(self, gh: Any, repo: str, number: int, bot: str) -> int:
+        """Failed Elder heads plus human change requests, after all reads succeed.
+
+        Reviews retain commit IDs after a force push removes a reviewed head
+        from the PR's current commit list. Reruns on one head count only once;
+        a successful check with a bot change request is not a failed head.
+        """
+        from . import factory
+        commits = gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+        reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+        if any(not isinstance(c, dict) or not c.get("sha") for c in commits):
+            raise ValueError("the merged commit history cannot be read")
+        heads = {c["sha"] for c in commits}
+        heads.update(r.get("commit_id") for r in reviews if isinstance(r, dict))
+        heads.discard(None)
+        if not heads or any(not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", h)
+                            for h in heads):
+            raise ValueError("the merged review heads cannot be read")
+        check_name = self.env.get("LOOM_REVIEW_CHECK") or factory.DEFAULT_REVIEW_CHECK
+        return self._human_review_rounds(reviews, bot) + sum(
+            self._failed_review_head(gh, repo, h, check_name) for h in sorted(heads))
+
+    @staticmethod
+    def _human_review_rounds(reviews: Sequence[Any], bot: str) -> int:
+        """Count distinct human change requests after validating their authors."""
+        human = set()
+        for review in reviews:
+            if not isinstance(review, dict) or not isinstance(review.get("user"), dict):
+                raise ValueError("the merged review author cannot be read")
+            user = review["user"]
+            if (review.get("state") == "CHANGES_REQUESTED" and user.get("type") == "User"
+                    and str(user.get("login") or "").removesuffix("[bot]").lower()
+                    != bot.removesuffix("[bot]").lower()):
+                if type(review.get("id")) is not int:
+                    raise ValueError("the merged review identity cannot be read")
+                human.add(review["id"])
+        return len(human)
+
+    @staticmethod
+    def _failed_review_head(gh: Any, repo: str, head: str, check_name: str) -> bool:
+        """Read every check page, retaining only substantive failed verdicts."""
+        from . import factory
+        failed, page = False, 1
+        while True:
+            data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
+                           % (repo, head, page)).data
+            if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+                raise ValueError("the merged review checks cannot be read")
+            checks = data["check_runs"]
+            for run in checks:
+                if not isinstance(run, dict):
+                    raise ValueError("the merged review check cannot be read")
+                output = run.get("output") or {}
+                if not isinstance(output, dict):
+                    raise ValueError("the merged review output cannot be read")
+                if (run.get("name") == check_name and run.get("status") == "completed"
+                        and run.get("conclusion") == "failure"
+                        and not factory.degraded_review(output.get("title"), output.get("summary"))):
+                    failed = True
+            if len(checks) < 100:
+                return failed
+            page += 1
+
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:
         """The review outcome and send-backs, read once: a closed pull
@@ -595,6 +671,63 @@ class Scorecard:
         """Each demoted lane and why."""
         return {lane: str(info.get("why") or "demoted") for lane, info in
                 self.data["demoted"].items() if isinstance(info, dict)}
+
+    def demotion_lines(self, pending_only: bool = False) -> Dict[str, str]:
+        """Uncleared demotions, optionally only those awaiting a delivered notice.
+
+        Keeping all active entries in each digest includes the next summary
+        and every later summary, even after the demotion is a day old.
+        """
+        if self.unreadable:
+            return {} if pending_only else {"": "needs-a-person: " + self.unreadable}
+        receipts = self._notice_receipts() if pending_only else {}
+        result = {}
+        for lane, info in sorted(self.data["demoted"].items()):
+            if not isinstance(info, dict):
+                continue
+            if pending_only and receipts.get(lane) == self._demotion_event(info):
+                continue
+            reason = " ".join(str(info.get("why") or "reason unavailable").split())
+            result[lane] = ("needs-a-person: demoted %s: %s; after review, clear with "
+                            "`python3 -m bus.scorecard clear %s`"
+                            % (lane, reason, shlex.quote(lane)))
+        return result
+
+    @staticmethod
+    def _demotion_event(info: Mapping[str, Any]) -> Dict[str, Any]:
+        return {key: info.get(key) for key in ("at", "why", "kind")}
+
+    def _notice_receipts(self) -> Dict[str, Any]:
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        try:
+            with open(path) as fh:
+                receipts = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as err:
+            raise ValueError("demotion notice receipts cannot be read (%s)" % type(err).__name__) from None
+        if not isinstance(receipts, dict):
+            raise ValueError("demotion notice receipts do not hold an object")
+        return receipts
+
+    def notice_sent(self, lane: str) -> None:
+        """Record delivery separately; never rewrite routing state after a send.
+
+        A send followed by a crash before this receipt can still be retried.
+        """
+        # AI-REVIEW 2026-11-05 [GPT-6 Astra] demotion-race:
+        # A clear or replacement during network delivery must remain authoritative.
+        current = Scorecard(os.path.dirname(self.path), self.now, self.env)
+        event = self._demotion_event(self.data["demoted"][lane])
+        active = current.data["demoted"].get(lane)
+        if current.unreadable or not isinstance(active, dict) or self._demotion_event(active) != event:
+            return
+        receipts = self._notice_receipts()
+        receipts[lane] = event
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        with open(path + ".tmp", "w") as fh:
+            json.dump(receipts, fh, sort_keys=True)
+        os.replace(path + ".tmp", path)
 
     def clear(self, lane: str) -> bool:
         """The operator clears a lane: it takes build tickets again, and its
