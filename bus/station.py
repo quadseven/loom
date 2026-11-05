@@ -9690,6 +9690,7 @@ class Station:
         if factory_line:
             lines.append(factory_line)
         lines += self._digest_shadow_lines(start)
+        lines += scorecard.Scorecard(self.state, self.now).demotion_lines().values()
         if not self._digest_send("\n".join(lines)):
             _say("report digest %s not sent; next pass tries again" % slot)
             return
@@ -13943,8 +13944,18 @@ class Station:
         bad outcomes reach LOOM_LANE_DEMOTE_AT (bus/scorecard.py). Runs with
         the factory; LOOM_FACTORY=0 turns it off."""
         card = scorecard.Scorecard(self.state, self.now)
-        if not self.s.factory_on or not card.due():
+        if not self.s.factory_on:
             return
+        if card.due():
+            self._refresh_scorecard(card)
+        for lane, line in card.demotion_lines(pending_only=True).items():
+            if self._digest_send(line):
+                card.notice_sent(lane)
+            else:
+                _say("scorecard: demotion notice not sent; next pass tries again")
+
+    def _refresh_scorecard(self, card: scorecard.Scorecard) -> None:
+        """Refresh evidence separately from retrying pending notices."""
         repos = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]
         try:
             failed = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
