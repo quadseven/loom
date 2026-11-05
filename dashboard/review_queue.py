@@ -46,7 +46,7 @@ def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
     out = ['<article class="review-item"><h2>%s</h2>' % link,
            '<p class="machine-fact">%s - pull request #%s - ticket #%d</p>' %
            (esc(repo), pr_number, ticket), '<h3>Why it waits</h3><p>%s</p>' %
-           esc(needs_you.full_ask(entry))]
+           esc(str((detail.get('review_ask') or {}).get('text') or needs_you.full_ask(entry)))]
     pr, errors = detail.get('pr'), detail.get('errors') or {}
     valid = isinstance(pr, dict) and pr.get('number') == pr_number
     out.append(_summary(pr if valid else None))
@@ -56,7 +56,7 @@ def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
     out.extend(['<h3>Acceptance and ship proof</h3>', criteria(str(detail.get('body') or entry.get('body') or '')),
                 '<p class="muted">Checked boxes are author claims. The merge bar independently checks proof; '
                 'a merge does not establish deployment or live acceptance.</p>'])
-    out.append(_actions(entry, pr if valid else None, errors, mode))
+    out.append(_actions(entry, pr if valid else None, errors, mode, detail.get('review_ask')))
     out.append('</article>')
     return ''.join(out)
 
@@ -86,14 +86,14 @@ def _summary(pr: Dict[str, Any] | None) -> str:
 
 
 def _actions(entry: Dict[str, Any], pr: Dict[str, Any] | None,
-             errors: Dict[str, Any], mode: str) -> str:
+             errors: Dict[str, Any], mode: str, ask: Dict[str, str] | None = None) -> str:
     if entry.get('pending'):
         return '<p role="status">Answer recorded; waiting for the station.</p>'
-    if pr is None or errors or pr.get('state') != 'open' or not pr.get('head'):
+    if pr is None or errors or pr.get('state') != 'open' or not pr.get('head') or not ask:
         return ''
-    return needs_you.answer_form(entry, mode).replace(
-        'data-answer ', 'data-answer data-review-pr="%d" data-review-head="%s" ' % (
-            pr['number'], html.escape(str(pr['head']), quote=True)))
+    return needs_you.answer_form(dict(entry, body_ask=ask['text']), mode).replace(
+        'data-answer ', 'data-answer data-review-pr="%d" data-review-head="%s" data-review-ask="%s" ' % (
+            pr['number'], html.escape(str(pr['head']), quote=True), html.escape(ask['key'], quote=True)))
 
 
 def _review_facts(number: int, pr: Dict[str, Any], tier: str, head: str,
@@ -166,6 +166,7 @@ class Details:
             checks = self._checks(base, head)
             reviews = self.gh.paginate('%s/pulls/%d/reviews' % (base, number))
             comments = self.gh.paginate('%s/issues/%d/comments' % (base, ticket))
+            result['review_ask'] = self._ask_facts(comments, number)
             result['proof_status'] = self._proof_status(comments, str(issue.get('body') or ''))
             raw_threads = self._threads(repo, number)
             result.update(body=str(issue.get('body') or ''), pr=_review_facts(
@@ -173,6 +174,14 @@ class Details:
         except (GitHubError, OSError, ValueError, KeyError, TypeError):
             result['errors']['Review facts'] = 'unavailable'
         return result
+
+    @staticmethod
+    def _ask_facts(comments: List[Dict[str, Any]], number: int) -> Dict[str, str]:
+        ask = answer.latest_ask(comments, brain.trusted_authors())
+        if ask is None or answer.held_pr(str(ask.get('body') or '')) != number:
+            raise ValueError('current review ask unavailable')
+        return {'key': answer.review_ask_key(ask),
+                'text': str(ask['body']).replace(answer.HUMAN_MARKER, '', 1).strip()}
 
     @staticmethod
     def _proof_status(comments: List[Dict[str, Any]], body: str) -> str:

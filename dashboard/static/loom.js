@@ -259,7 +259,8 @@
         body: JSON.stringify({ repo: form.dataset.repo, number: Number(form.dataset.number), choice,
           note: form.querySelector('input[name="note"]').value, as: store.get('as'),
           review_pr: form.dataset.reviewPr ? Number(form.dataset.reviewPr) : undefined,
-          review_head: form.dataset.reviewHead || undefined }),
+          review_head: form.dataset.reviewHead || undefined,
+          review_ask: form.dataset.reviewAsk || undefined }),
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || `the answer failed (${response.status})`);

@@ -209,27 +209,48 @@ def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
 
 
 def review_target(gh: Any, entry: Dict[str, Any], comments: List[Dict[str, Any]],
-                  expected_pr: Any = None, expected_head: Any = None) -> str:
-    """Re-read a review card's target before posting, binding the decision to its head."""
+                  expected_pr: Any = None, expected_head: Any = None, expected_ask: Any = None) -> str:
+    """Re-read a review card's target before posting, binding the decision to its head and complete ask."""
     number = answer.held_pr(needs_you.full_ask(entry))
     if number is None:
-        if expected_pr is not None or expected_head is not None:
+        if any(value is not None for value in (expected_pr, expected_head, expected_ask)):
             raise Refused(409, "the current ask is not a held pull request")
         return ""
-    _check_review_ask(comments, number, expected_pr)
+    explicit = any(value is not None for value in (expected_pr, expected_head, expected_ask))
+    if explicit:
+        _require_review_fields(expected_pr, expected_head, expected_ask)
+    key = _check_review_ask(comments, number, expected_pr, expected_ask, needs_you.full_ask(entry))
     repo = quote(str(entry['repo']), safe='/')
     pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
     head = _review_head(pr, expected_head)
-    return "Review target: #%d %s" % (number, head)
+    return "Review target: #%d %s ask=%s" % (number, head, key)
 
 
-def _check_review_ask(comments: List[Dict[str, Any]], number: int, expected_pr: Any) -> None:
-    asks = [str(c.get("body") or "") for c in brain.trusted_comments(comments)
-            if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
-    if not asks or answer.held_pr(asks[-1]) != number:
+def _require_review_fields(number: Any, head: Any, ask: Any) -> None:
+    if (type(number) is not int or number <= 0 or not isinstance(head, str)
+            or not re.fullmatch('[0-9a-f]{40}', head) or not isinstance(ask, str)
+            or not re.fullmatch('[1-9][0-9]*:[0-9a-f]{64}', ask)):
+        raise Refused(409, "the reviewed PR, head and ask are required; reload the review queue")
+
+
+def _check_review_ask(comments: List[Dict[str, Any]], number: int, expected_pr: Any,
+                      expected_ask: Any, displayed: str) -> str:
+    current = answer.latest_ask(comments, brain.trusted_authors())
+    if current is None or answer.held_pr(str(current.get('body') or '')) != number:
         raise Refused(409, "the ask changed; reload before answering")
     if expected_pr is not None and expected_pr != number:
         raise Refused(409, "the held pull request changed; reload before answering")
+    try:
+        key = answer.review_ask_key(current)
+    except ValueError as error:
+        raise Refused(409, "the current review ask has no identity") from error
+    if expected_ask is not None:
+        if expected_ask != key:
+            raise Refused(409, "the reviewed ask changed; reload and read its current requirements")
+    elif (len(str(current.get('body') or '')) > operators.ASK_FULL_CHARS
+          or operators.ask_full(current.get('body')) != displayed):
+        raise Refused(409, "the complete review ask changed or was not displayed; use the review queue")
+    return key
 
 
 def _review_head(pr: Dict[str, Any], expected_head: Any) -> str:
@@ -242,7 +263,7 @@ def _review_head(pr: Dict[str, Any], expected_head: Any) -> str:
 
 
 def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any,
-         expected_pr: Any = None, expected_head: Any = None) -> Dict[str, Any]:
+         expected_pr: Any = None, expected_head: Any = None, expected_ask: Any = None) -> Dict[str, Any]:
     """Post one answer to the item `entry` (a Needs-you entry) and change its
     labels. Refused for an answer the card does not offer, a text the
     written-text check refuses, no App to post as, or a closed item."""
@@ -266,7 +287,7 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
         if not isinstance(issue, dict) or issue.get("state") != "open":
             raise Refused(409, "%s#%d is not open" % (repo, number))
         comments = _comments(gh, repo, number, int(issue.get("comments") or 0))
-        target = review_target(gh, entry, comments, expected_pr, expected_head)
+        target = review_target(gh, entry, comments, expected_pr, expected_head, expected_ask)
         if target:
             body += "\n\n" + target
         same = _existing_answer(comments, choice, target)

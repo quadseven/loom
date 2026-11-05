@@ -85,6 +85,8 @@ class ReviewReads(unittest.TestCase):
         from types import SimpleNamespace
         from unittest import mock
         finding = 'First paragraph.\n\n' + ('Detail ' * 90) + 'FINAL REQUIRED STEP <script>'
+        ask = {'id': 9, 'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']) +
+               (' details' * 300) + ' FULL ASK TAIL', 'user': {'login': 'station-bot'}}
         class GH:
             def rest(self, method, path):
                 if '/issues/' in path:
@@ -93,6 +95,8 @@ class ReviewReads(unittest.TestCase):
                     return SimpleNamespace(data={'total_count': 0, 'check_runs': []})
                 return SimpleNamespace(data={'state': 'open', 'head': {'sha': 'a' * 40}, 'labels': []})
             def paginate(self, path):
+                if path.endswith('/comments'):
+                    return [ask]
                 return [{'filename': 'docs/guide.md'}] if path.endswith('/files') else []
             def graphql(self, query, variables):
                 return {'repository': {'pullRequest': {'reviewThreads': {
@@ -101,13 +105,16 @@ class ReviewReads(unittest.TestCase):
                     'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}
         entry = {'repo': 'example-org/example-repo', 'number': 7,
                  'comment_full': operator_hold.ask(18, ['review']), 'body_ask': ''}
-        with mock.patch.dict('os.environ', {'LOOM_REVIEW_BOT': 'grug-tribe[bot]'}):
+        with mock.patch.dict('os.environ', {'LOOM_REVIEW_BOT': 'grug-tribe[bot]',
+                                             'LOOM_BRIEF_AUTHORS': 'station-bot'}):
             details = Details(GH()).get(entry)
         self.assertEqual(details['errors'], {})
         html = render([entry], {entry['repo'] + '#7': details}, mode='token')
         self.assertIn('FINAL REQUIRED STEP &lt;script&gt;', html)
         self.assertNotIn('<script>', html)
         self.assertIn('data-review-head="' + 'a' * 40 + '"', html)
+        self.assertIn('data-review-ask="' + answer.review_ask_key(ask) + '"', html)
+        self.assertIn('FULL ASK TAIL', html)
         self.assertIn('No matching trusted proof record', html)
 
     def test_every_thread_page_is_read_without_showing_other_commenters(self):
@@ -166,7 +173,7 @@ class ReviewTarget(unittest.TestCase):
         from dashboard import answers
         from types import SimpleNamespace
         from unittest import mock
-        trusted = {'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']),
+        trusted = {'id': 9, 'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']),
                    'user': {'login': 'station-bot'}}
         outsider = {'body': answer.HUMAN_MARKER + '\nPick another task.',
                     'user': {'login': 'outsider'}}
@@ -181,32 +188,44 @@ class ReviewTarget(unittest.TestCase):
         comments = answers._comments(GH(), entry['repo'], 7, 100)
         self.assertEqual(len(comments), 101)
         with mock.patch.dict('os.environ', {'LOOM_BRIEF_AUTHORS': 'station-bot'}):
-            self.assertEqual(answers.review_target(GH(), entry, comments, 18, 'a' * 40),
-                             'Review target: #18 ' + 'a' * 40)
+            self.assertEqual(answers.review_target(GH(), entry, comments, 18, 'a' * 40, answer.review_ask_key(trusted)),
+                             'Review target: #18 ' + 'a' * 40 + ' ask=' + answer.review_ask_key(trusted))
 
     def test_changed_head_refuses_before_an_answer_can_be_written(self):
         from dashboard import answers
         from types import SimpleNamespace
         entry = {'repo': 'example-org/example-repo', 'number': 7,
                  'comment_full': operator_hold.ask(18, ['review']), 'body_ask': ''}
-        comments = [{'body': answer.HUMAN_MARKER + '\n' + entry['comment_full'],
+        comments = [{'id': 9, 'body': answer.HUMAN_MARKER + '\n' + entry['comment_full'],
                      'user': {'login': 'station-bot'}}]
         gh = SimpleNamespace(rest=lambda *args: SimpleNamespace(data={
             'state': 'open', 'head': {'sha': 'b' * 40}}))
         with self.assertRaises(answers.Refused):
-            answers.review_target(gh, entry, comments, 18, 'a' * 40)
+            answers.review_target(gh, entry, comments, 18, 'a' * 40, answer.review_ask_key(comments[0]))
 
     def test_a_newer_non_pr_ask_refuses_a_stale_review_card(self):
         from dashboard import answers
         entry = {'repo': 'example-org/example-repo', 'number': 7,
                  'comment_full': operator_hold.ask(18, ['review']), 'body_ask': ''}
-        comments = [{'body': answer.HUMAN_MARKER + '\nPick another task.',
+        comments = [{'id': 9, 'body': answer.HUMAN_MARKER + '\nPick another task.',
                      'user': {'login': 'station-bot'}}]
         with self.assertRaises(answers.Refused):
-            answers.review_target(None, entry, comments, 18, 'a' * 40)
+            answers.review_target(None, entry, comments, 18, 'a' * 40, answer.review_ask_key(comments[0]))
 
 
 class BoundVerdict(unittest.TestCase):
+    def test_edited_ask_invalidates_an_already_persisted_head_bound_answer(self):
+        import hashlib
+        ask = {'id': 1, 'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']),
+               'user': {'login': 'station-bot'}}
+        key = '1:' + hashlib.sha256(ask['body'].encode()).hexdigest()
+        given = {'body': answer.comment_body('operator-one', 'Merge',
+                 'Review target: #18 ' + 'a' * 40 + ' ask=' + key),
+                 'user': {'login': 'station-bot'}}
+        ask['body'] += '\nRecovery test must pass before approval.'
+        self.assertIsNone(answer.pr_verdict([ask, given], 18, ['station-bot'],
+                                           ['operator-one'], head='a' * 40))
+
     def test_newer_trusted_non_review_ask_supersedes_each_old_review_decision(self):
         for choice in ('Merge', 'Hold', 'Send back'):
             with self.subTest(choice=choice):
@@ -221,11 +240,15 @@ class BoundVerdict(unittest.TestCase):
                                                    ['operator-one'], head='a' * 40))
 
     def test_old_head_bound_approval_cannot_authorize_a_new_head(self):
-        ask = {'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']),
+        ask = {'id': 1, 'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(18, ['review']),
                'user': {'login': 'station-bot'}}
-        given = {'body': answer.comment_body('operator-one', 'Merge', 'Review target: #18 ' + 'a' * 40),
+        note = 'Review target: #18 ' + 'a' * 40 + ' ask=' + answer.review_ask_key(ask)
+        given = {'body': answer.comment_body('operator-one', 'Merge', note),
                  'user': {'login': 'station-bot'}}
-        self.assertIsNone(answer.pr_verdict([ask, given], 18, ['station-bot'], ['operator-one'], head='b' * 40))
+        self.assertIsNotNone(answer.pr_verdict([ask, given], 18, ['station-bot'],
+                                              ['operator-one'], head='a' * 40))
+        self.assertIsNone(answer.pr_verdict([ask, given], 18, ['station-bot'],
+                                           ['operator-one'], head='b' * 40))
 
 
 class NoAutomaticReviewDecision(unittest.TestCase):

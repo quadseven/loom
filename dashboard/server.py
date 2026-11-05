@@ -897,7 +897,7 @@ def _handle_answer_post(handler, state):
             raise answers_view.Refused(409, "%s#%d is answered; the station has not applied it yet"
                                        % (repo, number))
         result = answers_view.post(state, entry, login, body.get("choice"), body.get("note"),
-                                   body.get("review_pr"), body.get("review_head"))
+                                   body.get("review_pr"), body.get("review_head"), body.get("review_ask"))
     except answers_view.Refused as exc:
         return handler.send_json(exc.code, {"error": str(exc)})
     entry = _needs_entry(state, repo, number)

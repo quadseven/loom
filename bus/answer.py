@@ -383,6 +383,22 @@ def _hold_asks(comments: Iterable[Any], trusted: Iterable[str]) -> List[Tuple[in
     return out
 
 
+def latest_ask(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[Mapping[str, Any]]:
+    """The latest complete person ask from a trusted REST comment author."""
+    allowed = {str(t).lower() for t in trusted}
+    found = [c for c in comments if isinstance(c, dict) and _author(c) in allowed
+             and str(c.get("body") or "").startswith(HUMAN_MARKER)]
+    return found[-1] if found else None
+
+
+def review_ask_key(ask: Mapping[str, Any]) -> str:
+    """Bind the comment ID and complete body, using the default record's provenance model."""
+    ident = ask.get("id")
+    if type(ident) is not int or ident <= 0:
+        raise ValueError("review ask has no comment identity")
+    return "%d:%s" % (ident, hashlib.sha256(str(ask.get("body") or "").encode()).hexdigest())
+
+
 def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[int]:
     """The pull request the newest person ask names as held, or None when
     the newest ask is not a held pull request ask, or there is no ask. An
@@ -418,14 +434,27 @@ def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops
         return None
     if since and verdict.created_at and verdict.created_at < since:
         return None
-    target = review_target(verdict)
-    if target is not None and (target[0] != number or (head and target[1] != head)):
-        return None
-    return verdict
+    return verdict if _review_binding_matches(verdict, asked, number, head) else None
+
+
+_REVIEW_TARGET_RE = re.compile(
+    r"Review target: #([1-9][0-9]*) ([0-9a-f]{40})(?: ask=([1-9][0-9]*:[0-9a-f]{64}))?$")
+
+
+def _review_binding_matches(verdict: Answer, ask: Mapping[str, Any], number: int, head: str) -> bool:
+    if "Review target:" not in verdict.note:
+        return True  # Existing manual operator answers retain their timestamp checks.
+    found = _REVIEW_TARGET_RE.search(verdict.note)
+    if not found or int(found.group(1)) != number or (head and found.group(2) != head):
+        return False
+    try:
+        return found.group(3) == review_ask_key(ask)
+    except ValueError:
+        return False
 
 
 def review_target(verdict: Answer) -> Optional[Tuple[int, str]]:
-    found = re.search(r"Review target: #([0-9]+) ([0-9a-f]{40})$", verdict.note)
+    found = _REVIEW_TARGET_RE.search(verdict.note)
     return (int(found.group(1)), found.group(2)) if found else None
 
 

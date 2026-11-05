@@ -3273,10 +3273,12 @@ class SendBackNeedsAFindingTests(unittest.TestCase):
         sha = 'a' * 40
         pr = fix_pr(head={'ref': 'loom/9-work', 'sha': sha, 'repo': {'full_name': REPO}})
         note = 'Add the missing rollback check.\n\nReview target: #8 ' + sha
-        comments = [{'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(8, ['review']),
+        comments = [{'id': 1, 'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(8, ['review']),
                      'user': {'login': 'station'}},
                     {'body': answer.comment_body('operator-one', 'Send back', note),
                      'user': {'login': 'station'}}]
+        comments[1]['body'] = answer.comment_body('operator-one', 'Send back',
+                                                  note + ' ask=' + answer.review_ask_key(comments[0]))
         issue = dict(fix_ticket(), number=9)
         first = self.routes(pr=pr)
         worker = factory.Factory(GitHub('t', transport=first), [REPO], 0,

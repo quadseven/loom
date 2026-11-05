@@ -125,7 +125,10 @@ class FactoryVerdict(Base):
         self.held()
         self.gh.pulls[50]["head"]["sha"] = "a" * 40
         self.answer("Send back")
-        self.gh.comments[5][-1]["body"] += "\n\nReview target: #50 " + "a" * 40
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
         self.last_factory._settle_answers(REPO)
         self.assertEqual(self.merged, [])
         self.assertEqual(len(self.fixed), 1)
@@ -146,7 +149,10 @@ class FactoryVerdict(Base):
     def test_stale_send_back_is_recorded_once_without_poisoning_later_answers(self):
         self.held()
         self.answer("Send back")
-        self.gh.comments[5][-1]["body"] += "\n\nReview target: #50 " + "a" * 40
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
         self.gh.ticket(6, "pr")
         self.gh.issues[6]["labels"].append({"name": answer.ANSWERED_LABEL})
         self.gh.comments[6] = [given("Yes")]

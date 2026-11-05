@@ -2008,8 +2008,10 @@ remain visible with actions disabled, rather than disappearing from the queue.
 Reads are cached for five minutes and respect the dashboard's request budget.
 
 Merge, Hold and Send back use the same authenticated answer writer as Needs
-you. A review decision is bound to the displayed pull request and head; the
-writer re-reads the current trusted ask and head before posting. A stale card
+you. A review decision is bound to the displayed pull request, head, and
+trusted ask comment ID plus complete-body hash. The card shows the complete
+ask. The writer re-reads that ask and head before posting, and the station
+checks the same binding when consuming the answer. A stale card
 returns a reload refusal. Send back opens the existing fix-round path with the
 operator's note. A repeated round writes no duplicate brief. If the head or
 ask changes before the station applies Send back, the station records one
