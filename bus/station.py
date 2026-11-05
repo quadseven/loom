@@ -6267,6 +6267,58 @@ class Station:
                 if isinstance(i, dict) and "pull_request" not in i
                 and "loom:ticket" in _label_names(i)}
 
+    def _ship_labels(self, have: List[str]) -> List[str]:
+        """The labels of a merged ticket moved to loom:shipped. Every Loom
+        state label goes, as brain._moved_labels does, so a ticket that kept
+        another state label still reads as shipped. A wait label and
+        needs-brain go too: the ship ended whatever it waited for."""
+        states = ["loom:" + item for item in brain.STATES + tickets.TICKET_STATES]
+        kept = [x for x in have if x not in states and not x.startswith("wait:")
+                and x != "needs-brain"]
+        kept.append("loom:shipped")
+        return kept
+
+    def _ship_fallback(self, repo: str, number: int, note: str) -> bool:
+        """Move a deployed merged ticket to loom:shipped when brain.move
+        refused it: ensure the label exists, swap the state labels and post
+        the note. The label write goes through the normal shadow checks (a
+        shipped move is a state fact, loom#2350), so this never grants a new
+        merge label in shadow. Returns whether the ticket ended up shipped."""
+        try:
+            from . import labels as label_defs
+            wanted = label_defs.LABELS["loom:shipped"]
+            self.gh.rest("POST", "/repos/%s/labels" % repo,
+                         {"name": "loom:shipped", "color": wanted["color"],
+                          "description": wanted["description"]}, ok=(422,))
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+            if issue.get("state") != "open":
+                return False
+            names = _label_names(issue)
+            if "loom:verified" in names:
+                return False
+            if "loom:shipped" in names and "loom:merged" not in names:
+                return True
+            if "loom:merged" not in names:
+                return False
+            kept = self._ship_labels(names)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            try:
+                notify.post(self.gh, repo, number, note, notify.SHIPPED)
+            except (GitHubError, ValueError) as err:
+                # The labels moved; a missing note is better than a stuck ticket.
+                _say("shipped %s#%d but could not post its note: %s" % (repo, number, err))
+            return True
+        except RateLimited:
+            raise
+        except ShadowHeld as err:
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            return False
+        except (GitHubError, ValueError) as err:
+            _say("ship fallback could not move %s#%d: %s" % (repo, number, err))
+            return False
+
     def _ship_one(self, repo: str, number: int, pr: Dict[str, Any], how: str,
                   what: str) -> bool:
         """Move one merged ticket to loom:shipped with a note naming how its
@@ -6287,6 +6339,10 @@ class Station:
             return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            if self._ship_fallback(repo, number, note):
+                self._deployed_seen(key, False)
+                _say("shipped %s#%d (fallback): %s carries #%d" % (repo, number, what, int(pr["number"])))
+                return True
             self._deployed_seen(key, True)
             return False
         self._deployed_seen(key, False)

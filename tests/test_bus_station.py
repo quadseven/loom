@@ -1953,6 +1953,10 @@ class ShipDeployedTest(Base):
         def refusing(method, url, headers, body):
             if method == "PUT" and urlsplit(url).path.endswith("/issues/12/labels"):
                 return reply(422, {"message": "refused"})
+            if method == "POST" and urlsplit(url).path.endswith("/labels"):
+                return reply(422, {"message": "refused"})
+            if method == "GET" and urlsplit(url).path.endswith("/issues/12"):
+                return reply(500, {"message": "unavailable"})
             return real(method, url, headers, body)
         with mock.patch("bus.station.time.time", return_value=DEPLOYED_AT + 60):
             gh = GitHub("token", transport=refusing)
