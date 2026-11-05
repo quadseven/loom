@@ -2570,8 +2570,10 @@ class Factory:
                             ticket, old.get("merged_at"), events):
                         return
                 self._close_all_but(repo, prs, merged, closed)
-            return
-        ended = self._ended_note(repo, ticket, ticket_map) if ticket else None
+                return
+            if ticket.get("state") == "open":
+                return
+        ended =self._ended_note(repo, ticket, ticket_map) if ticket else None
         if ended is not None:
             for pr in prs:
                 if self.actions >= MAX_ACTIONS:
@@ -2604,15 +2606,17 @@ class Factory:
 
     def _ended_note(self, repo: str, ticket: Dict[str, Any],
                     ticket_map: Dict[int, Dict[str, Any]]) -> Optional[str]:
-        """Why nothing will ever build an open ticket's lane pull request, as
-        the close comment, or None while something may (loom#2027): the ticket
-        was rewritten as a newer ticket, or it is loom:failed past the last
-        rung of the model ladder. A ticket in a fix round, or failed with a
-        rung left to climb, keeps its pull request. A closed ticket is not
-        handled here."""
-        if ticket.get("state") != "open":
-            return None
+        """Why nothing will ever build a ticket's lane pull request, as the
+        close comment, or None while something may (loom#2027): the ticket
+        was closed for any reason (loom#1923), it was rewritten as a newer
+        ticket, or it is loom:failed past the last rung of the model ladder.
+        A ticket in a fix round, or failed with a rung left to climb, keeps
+        its pull request."""
         number = int(ticket["number"])
+        if ticket.get("state") != "open":
+            return ("Closed by the station as superseded: its ticket #%d was closed (%s), "
+                    "so no lane builds this pull request."
+                    % (number, ticket.get("state_reason") or "closed"))
         read: List[List[Dict[str, Any]]] = []
 
         def comments() -> List[Dict[str, Any]]:

@@ -603,8 +603,11 @@ what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
 open lane pull request is closed then, or on any later pass, as is one whose
-open ticket was rewritten as a newer ticket, each with one comment naming the
-ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
+open ticket was rewritten as a newer ticket, or whose ticket was closed for any
+reason, each with one comment naming the ticket (loom#2027, loom#1923; a closed
+ticket's comment names its close reason); a ticket still in a fix round keeps
+its pull request. Until the station closes it, `bus.brain status` and `resume`
+leave a pull request whose ticket is closed out of their sensitive lists. Landing
 keeps the default branch green: a ready pull request behind its base lands as
 it stands when GitHub reports it mergeable and no rule on the base requires
 up-to-date branches; any other is brought up to date first (GitHub's
