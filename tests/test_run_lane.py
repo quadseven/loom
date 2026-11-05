@@ -1136,6 +1136,23 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertNotIn("repo-legacy-private", body)
         self.assertIn("issue 3 of another repo", body)
 
+    def test_a_first_build_body_writes_refs_through_the_fix_rounds_function(self):
+        # The first build and every fix round share bus/pr_repair.public_refs,
+        # so an owner-qualified ref to another repo reads the same in both
+        # (loom#2386). Built here: the literal fails this repo's leak scan.
+        other = "%s/%s#%d" % ("other", "repo", 5)
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as %s found." % other))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertNotIn(other, body)
+        self.assertIn("as issue 5 of another repo found.", body)
+        script = RUNNER.read_text()
+        self.assertIn("from bus.pr_repair import public_refs", script)
+        self.assertNotIn("SCAN_REF_RE", script)
+
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
         # named NAME-legacy-private exist beside public NAME repos.

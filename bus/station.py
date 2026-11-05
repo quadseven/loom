@@ -726,6 +726,11 @@ PASS_STEP_BUDGET = 300
 PASS_DEADLINE = 3600
 DEADLINE_MARKER_FILE = "pass-deadline.json"
 STEP_ROTATION_FILE = "step-rotation.json"
+# Pass steps held by name (loom#1630): LOOM_PAUSED_STEPS in the environment
+# and this state file, both space-separated step names, read every pass so a
+# pause needs no reload. A bulk cleanup holds triage, rewrite and the
+# outside-epic move this way, so its relabels draw no bot comments.
+PAUSED_STEPS_FILE = "paused_steps.txt"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
@@ -5677,6 +5682,7 @@ class Station:
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
+        paused = self._paused_steps(steps)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
@@ -5701,6 +5707,9 @@ class Station:
                             steps[next_step].__name__))
                     break
                 step = steps[next_step]
+                if step.__name__ in paused:
+                    _say("step %s paused (LOOM_PAUSED_STEPS)" % step.__name__)
+                    continue
                 try:
                     if not self._timed(step):
                         if carried == step.__name__:
@@ -5727,6 +5736,24 @@ class Station:
                 _write_json(rotation_path, {"next": next_step, "carried": next_carried})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
+
+    def _paused_steps(self, steps: Sequence[Any]) -> Set[str]:
+        """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
+        pass, read again each pass so a pause or its removal needs no reload.
+        An unreadable file pauses nothing; an unknown name is logged and
+        ignored, never raised."""
+        names = os.environ.get("LOOM_PAUSED_STEPS", "").split()
+        try:
+            with open(os.path.join(self.state, PAUSED_STEPS_FILE)) as fh:
+                names.extend(fh.read().split())
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError) as err:
+            _say("could not read %s: %s" % (PAUSED_STEPS_FILE, err))
+        known = {step.__name__ for step in steps}
+        for name in sorted(set(names) - known):
+            _say("unknown paused step %s, ignored" % name)
+        return set(names) & known
 
     def _note_every_pass(self) -> None:
         """The missing-evidence note pass, run every pass ahead of the step
