@@ -3687,9 +3687,11 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
-                 after: Optional[str] = None, priority: Optional[str] = None) -> str:
+                 after: Optional[str] = None, priority: Optional[str] = None,
+                 repairs_incident: Optional[int] = None) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
-               (("After", after), ("Not before", not_before),
+               (("Repairs incident", "#%d" % repairs_incident if repairs_incident is not None else None),
+                ("After", after), ("Not before", not_before),
                 ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
@@ -3724,7 +3726,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           regresses: Optional[int] = None, after: Optional[str] = None,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
-          resolves: Optional[str] = None, intake_of: Optional[int] = None) -> str:
+          resolves: Optional[str] = None, intake_of: Optional[int] = None,
+          repairs_incident: Optional[int] = None) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -3764,6 +3767,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
 
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
+    if repairs_incident is not None and (type(repairs_incident) is not int or repairs_incident < 1):
+        raise ValueError("repairs-incident must be a positive issue number")
     if model:
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
@@ -3798,10 +3803,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
                                       "Model": model, "Base": base, "After": after,
-                                      "Not before": not_before})
+                                      "Not before": not_before,
+                                      "Repairs incident": "#%d" % repairs_incident if repairs_incident is not None else None})
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue, epic)
@@ -8178,6 +8184,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom"); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -8249,7 +8256,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
-                resolves=args.resolves))
+                resolves=args.resolves, repairs_incident=args.repairs_incident))
 
 
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:

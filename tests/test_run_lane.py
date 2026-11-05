@@ -7481,6 +7481,91 @@ exec /usr/bin/git "$@"
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
 
+    def repair_incident(self, check="grep -qx fixed fix.txt", exit_code=1, **changes):
+        issue = {"state": "open", "labels": [{"name": "loom:factory"}],
+                 "body": "<!-- loom:factory-incident v1 -->\n\nRepo: example/repo\nKind: base-check\n"
+                         + "\ncheck: " + check + " (exit " + str(exit_code) + ")\n"}
+        issue.update(changes)
+        path = Path(self._tmp.name) / "repair-incident.json"
+        path.write_text(json.dumps(issue))
+        original = (self.bin / "gh").read_text()
+        self.write_tool(self.bin / "gh", original.replace(
+            'if [ "$1" = api ]; then',
+            'if [ "$1 $2" = "api repos/quadseven/loom/issues/7" ]; then cat "' + str(path) + '"; exit 0; fi\n'
+            'if [ "$1" = api ]; then', 1))
+
+    def run_red_repair(self, marker="Repairs incident: #7\n", fixed=True, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        check = "grep -qx fixed fix.txt" if fixed else "exit 2"
+        self.contract_repo(contract="interpreter: loom-test-python\ncheck: " + check + "\n")
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium\n", "Difficulty: medium\n" + marker))
+        return self.run_contract_lane(**env)
+
+    def test_open_incident_repair_reaches_agent_and_requires_green_final_check(self):
+        self.repair_incident()
+        result = self.run_red_repair()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.lane_log())
+        self.assertIn("known baseline", self.lane_log())
+
+    def test_ordinary_ticket_remains_held_on_red_baseline(self):
+        self.repair_incident()
+        self.run_red_repair(marker="")
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("failed: [factory]", self.lane_log())
+
+    def test_repair_with_red_final_check_fails_without_pr(self):
+        self.repair_incident(check="exit 2", exit_code=2)
+        self.run_red_repair(fixed=False)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_private_repair_uses_redacted_incident_alias(self):
+        aliases = self.loom / "state" / "incidents"
+        aliases.mkdir(parents=True, exist_ok=True)
+        (aliases / "example_repo.alias").write_text("1234abcd")
+        self.repair_incident(body="<!-- loom:factory-incident v1 -->\n\n"
+                             "Repo: private repo 1234abcd\nKind: base-check\n\n"
+                             "withheld: the lane log and the ticket have the detail")
+        result = self.run_red_repair(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.lane_log())
+
+    def test_repair_incident_guard_rejects_unrelated_or_unreadable_evidence(self):
+        function = re.search(r"^repair_baseline_allowed\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        valid = {"state": "open", "labels": [{"name": "loom:factory"}],
+                 "body": "<!-- loom:factory-incident v1 -->\nRepo: example/repo\nKind: base-check"}
+        cases = [valid, dict(valid, state="closed"), dict(valid, labels=[]),
+                 dict(valid, pull_request={}), dict(valid, body="unrelated"),
+                 dict(valid, body=valid["body"].replace("example/repo", "example/other")),
+                 dict(valid, body=valid["body"].replace("base-check", "environment")),
+                 dict(valid, body=valid["body"] + "\nKind: environment"),
+                 dict(valid, body=valid["body"] + "\nRepo: example/other"),
+                 [], None, "invalid"]
+        brief = Path(self._tmp.name) / "guard-brief"
+        brief.write_text("Repairs incident: #7\n")
+        script = (function + '\nfield() { echo "#7"; }\n'
+                  'incident_subject() { echo example/repo; }\n'
+                  'timeout() { shift; "$@"; }\n'
+                  'gh() { printf "%s" "$EVIDENCE"; }\n'
+                  'record() { :; }\nrepair_baseline_allowed\n')
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                        env={**os.environ, "BRIEF": str(brief), "BASELINE_EXIT": "1",
+                                             "FACTORY_REPO": "quadseven/loom", "CHECK_TIMEOUT": "2",
+                                             "LOG": str(self.log), "EVIDENCE": json.dumps(evidence)})
+                self.assertEqual(result.returncode == 0, evidence == valid, result.stderr)
+
+    def test_closed_repair_incident_does_not_bypass_red_baseline(self):
+        self.repair_incident(state="closed")
+        self.run_red_repair()
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
     def test_a_base_check_red_once_and_green_on_a_second_run_files_no_incident(self):
         # Loom's own base check timed out once under a busy station's load,
         # held its ticket and filed a factory incident that the next ticket's

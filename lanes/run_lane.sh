@@ -2570,6 +2570,40 @@ exclude_untracked() {
   done < <(safe_git ls-files -z --others --exclude-standard --directory)
 }
 
+# Only a named, open base-check incident for this repo admits a repair
+# past a red base. Private repos use the same opaque incident alias as
+# incident filing, without putting their name or check in public text.
+repair_baseline_allowed() {
+  local marker incident subject
+  [ "$BASELINE_EXIT" -gt 0 ] && [ "$BASELINE_EXIT" -lt 124 ] || return 1
+  [ "$(grep -c '^Repairs incident:' "$BRIEF")" = 1 ] || return 1
+  marker="$(sed -n 's/^Repairs incident: //p' "$BRIEF")"
+  [[ "$marker" =~ ^#[1-9][0-9]*$ ]] || return 1
+  subject="$(incident_subject)" || return 1
+  incident="$(timeout "$CHECK_TIMEOUT" gh api "repos/$FACTORY_REPO/issues/${marker#\#}" 2>>"$LOG")" || return 1
+  printf '%s' "$incident" | python3 -c '
+import json, sys
+try:
+    issue = json.load(sys.stdin)
+except (ValueError, TypeError):
+    sys.exit(1)
+if not isinstance(issue, dict):
+    sys.exit(1)
+body, labels = issue.get("body"), issue.get("labels")
+if not isinstance(body, str) or not isinstance(labels, list):
+    sys.exit(1)
+lines = body.splitlines()
+valid = (issue.get("state") == "open" and "pull_request" not in issue
+         and any(isinstance(label, dict) and label.get("name") == "loom:factory" for label in labels)
+         and "<!-- loom:factory-incident v1 -->" in lines
+         and [line for line in lines if line.startswith("Repo:")] == ["Repo: " + sys.argv[1]]
+         and [line for line in lines if line.startswith("Kind:")] == ["Kind: base-check"])
+sys.exit(0 if valid else 1)
+' "$subject" || return 1
+  echo "known baseline: repairing incident $marker; base check exited $BASELINE_EXIT; final check must pass" >> "$LOG"
+  record baseline-repair "$C_CHECK" "$BASELINE_EXIT" "$BASE" false "known baseline: incident $marker; final check must pass"
+}
+
 # Before the agent: interpreter, submodules, setup, then the check on the
 # current tree. A fix round checks the branch after merging the default
 # branch; a red result is compared with the default branch's own head.
@@ -2613,6 +2647,7 @@ prepare_validation() {
       return 1
     fi
     if [ "$BASELINE_EXIT" -ne 0 ]; then
+      repair_baseline_allowed && return 0
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
       note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1
@@ -2719,6 +2754,10 @@ prepare_validation() {
         return 1
       fi
       BASELINE_EXIT="$DEFAULT_EXIT"
+    fi
+    if [ -z "$changed" ] && [ -z "${DEFAULT_CHANGED:-}" ] && repair_baseline_allowed; then
+      exclude_untracked
+      return $?
     fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
