@@ -1,0 +1,191 @@
+"""The brain tick's clock (loom#2104).
+
+The tick budget was a rule the model judged for itself: docs/MUSE.md said
+"Stop at 25 minutes" and nothing told the model how much time had passed.
+Every Muse tick from 21:10 ET one evening deferred verify, failed, asks,
+brief and triage "on budget", although the 23:10 ET tick finished in about
+8 minutes, and untriaged rose to 102.
+
+This module is the one clock every step reads: the tick record's
+started_at (set by `bus.brain step lock`) against now. `bus.brain step`
+prints elapsed_line first, `bus.brain step-budget` prints it alone,
+status and resume print it at the top, and a note that defers on budget
+before BUDGET_MINUTES is refused (budget_refusal). The per-step start and
+end times live in the record's "times" list (bus.brain tick_step), and
+footer turns them into the journal's "- Steps:" line.
+
+minutes_used mirrors bus/sweep.py's function of the same name and meaning
+(loom#2100), so the sweep's 20-of-25 guard and this one read one clock.
+"""
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+TICK_MINUTES = 25
+BUDGET_MINUTES = 20
+# A tick its wrapper bounded below TICK_MINUTES records its own length in
+# the tick record's "tick_minutes" (loom#2469: the lane machine's tick ends
+# before Muse's next slot). Its budget keeps the same 5 minutes for the
+# journal and unlock: a 13-minute tick may defer on budget from minute 8.
+MIN_TICK_MINUTES = 5
+
+# A note that defers work because the tick's time ran out. Any "budget"
+# next to a defer word counts ("deferred: budget", "budget spent, skipping
+# brief", "on the 20-minute budget"), unless another budget noun qualifies
+# it: the API, App installation, per-repo read, lane, token, review and
+# per-minute budgets are counts, not the tick's clock, and a note naming one
+# is never refused (loom#2109). _OTHER_BUDGET is taken out first, either
+# side of the word: "API budget", "per-minute budget", "budget of the API",
+# "budget on API calls".
+_QUALIFIER = (r"(?:repo|api|app|installation|lane|token|review|request|rate|call|read)"
+              r"s?(?:'s)?")
+_OTHER_BUDGET = re.compile(
+    r"(?:\b(?:" + _QUALIFIER + r"|per[- ]\w+)[ \t-]+budget\b"
+    r"|\bbudget[ \t]+(?:of|for|on)[ \t]+(?:the[ \t]+)?(?:\w+[ \t]+)?"
+    + _QUALIFIER + r"\b)", re.I)
+_TIME_BUDGET = re.compile(r"\bbudget\b", re.I)
+_OUT_OF_TIME = re.compile(
+    r"\b(?:out of time|no time left|not enough time|ran out of time|"
+    r"time(?: is|'?s)? up|for time|ran long|running long|"
+    r"\d+(?: of \d+)?[- ]?minutes? elapsed|"
+    r"(?:over|past|at) the \d+[- ]?minute (?:limit|mark|line))\b", re.I)
+_DEFERS = re.compile(r"\b(defer\w*|skip\w*|spent|ran out|next tick|postpon\w*|"
+                     r"left for|not reached|no time)\b", re.I)
+# A negated claim is no claim: "not budget", "no deferral", "without
+# skipping". Taken out before the patterns above are read.
+_NEGATED = re.compile(r"\b(?:not|no|never|without)[ \t]+(?:\w+[ \t]+){0,2}?"
+                      r"(?:budget|defer\w*|skip\w*|postpon\w*)\b", re.I)
+
+
+def stamp(value: Any) -> Optional[datetime]:
+    """A tick record's UTC time ("2030-01-01T12:00:00Z"), or None."""
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def valid_tick_minutes(value: Any) -> bool:
+    """Whether `value` is a tick length the record may carry: a whole
+    number from MIN_TICK_MINUTES up to, not including, TICK_MINUTES."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and MIN_TICK_MINUTES <= value < TICK_MINUTES)
+
+
+def tick_minutes(record: Dict[str, Any]) -> int:
+    """The tick's length: the record's bounded length, else TICK_MINUTES."""
+    value = record.get("tick_minutes")
+    return value if valid_tick_minutes(value) else TICK_MINUTES
+
+
+def budget_minutes(record: Dict[str, Any]) -> int:
+    """Minutes into the tick from which a step may be deferred on budget."""
+    return max(tick_minutes(record) - (TICK_MINUTES - BUDGET_MINUTES), 0)
+
+
+def minutes_used(record: Dict[str, Any], now: datetime) -> Optional[float]:
+    """Minutes since the tick's lock step, or None with no start recorded."""
+    started = stamp(record.get("started_at"))
+    if started is None:
+        return None
+    return (now - started).total_seconds() / 60.0
+
+
+def elapsed_line(record: Dict[str, Any], now: datetime) -> str:
+    """"elapsed N of 25 minutes (S seconds left)": N is whole minutes,
+    rounded down, so a printed 20 is always a real 20 the budget guard
+    agrees with."""
+    used = minutes_used(record, now)
+    tick, budget = tick_minutes(record), budget_minutes(record)
+    if used is None:
+        return ("elapsed unknown of %d minutes: no tick start recorded "
+                "(run python3 -m bus.brain step lock first)" % tick)
+    used = max(used, 0.0)
+    left = max(int(tick * 60 - used * 60), 0)
+    line = "elapsed %d of %d minutes (%d seconds left)" % (int(used), tick, left)
+    if used >= tick:
+        return line + ": the tick is over, journal and unlock now"
+    if used >= budget:
+        return line + ": past %d, a step may be deferred on budget" % budget
+    return line
+
+
+def budget_status(record: Dict[str, Any], now: datetime) -> str:
+    """`bus.brain step-budget`: the elapsed line and whether a deferral on
+    budget is allowed now."""
+    used = minutes_used(record, now)
+    budget = budget_minutes(record)
+    if used is not None and used >= budget:
+        verdict = "budget: spent, a step may be deferred on budget"
+    elif used is None:
+        verdict = "budget: unknown, no deferral on budget without a tick start"
+    else:
+        verdict = ("budget: open, do the step; a deferral on budget is refused until "
+                   "%d minutes" % budget)
+    return "%s\n%s" % (elapsed_line(record, now), verdict)
+
+
+def claims_budget(note: Optional[str]) -> bool:
+    """Whether `note` defers or skips work because the tick's time ran out.
+    A bare "budget" next to a defer word is a claim; another budget (API,
+    App installation, per-repo read, lane, token, review, per-minute) and a
+    negation ("not budget", "no deferral") are no claim."""
+    if not note:
+        return False
+    plain = _OTHER_BUDGET.sub(" ", _NEGATED.sub(" ", note))
+    return bool((_TIME_BUDGET.search(plain) or _OUT_OF_TIME.search(plain))
+                and _DEFERS.search(plain))
+
+
+def budget_refusal(record: Dict[str, Any], note: Optional[str], now: datetime) -> Optional[str]:
+    """Why a note that defers on budget is refused, else None. Refused while
+    the tick has used under BUDGET_MINUTES, and with no start recorded."""
+    if not claims_budget(note):
+        return None
+    used = minutes_used(record, now)
+    budget = budget_minutes(record)
+    if used is not None and used >= budget:
+        return None
+    return ("refused: the note defers on budget, but %s; a step may be deferred on budget "
+            "only at %d minutes or more, so do the step (python3 -m bus.brain step-budget "
+            "reads the clock)" % (elapsed_line(record, now), budget))
+
+
+def with_elapsed(note: str, record: Dict[str, Any], now: datetime) -> str:
+    """A budget deferral note with the real elapsed minutes on it."""
+    used = minutes_used(record, now)
+    if used is None or "[elapsed " in note:
+        return note
+    return "%s [elapsed %d of %d minutes]" % (note, int(used), tick_minutes(record))
+
+
+def durations(record: Dict[str, Any], now: datetime) -> List[Tuple[str, int, bool]]:
+    """(step, seconds, still running) for each step in the record's times."""
+    out: List[Tuple[str, int, bool]] = []
+    for each in record.get("times") or []:
+        if not isinstance(each, dict):
+            continue
+        start = stamp(each.get("started_at"))
+        if start is None:
+            continue
+        end = stamp(each.get("ended_at"))
+        out.append((str(each.get("step")), max(int(((end or now) - start).total_seconds()), 0),
+                    end is None))
+    return out
+
+
+def _span(seconds: int) -> str:
+    return "%dm%02ds" % (seconds // 60, seconds % 60)
+
+
+def footer(record: Dict[str, Any], now: datetime) -> Optional[str]:
+    """The journal's "- Steps:" line: each step's time and the elapsed line,
+    so an audit sees where the tick's time went. None with no times."""
+    spans = durations(record, now)
+    if not spans:
+        return None
+    parts = ["%s %s%s" % (step, _span(sec), " (running)" if running else "")
+             for step, sec, running in spans]
+    return "- Steps: %s; %s" % (", ".join(parts), elapsed_line(record, now))

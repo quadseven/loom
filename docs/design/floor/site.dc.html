@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<title>Loom: a software factory on every AI subscription you have</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+html{background:#0e1117}
+body{margin:0;background:#0e1117;color:#e2e6ee;font-family:'Geist',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:oklch(0.82 0.14 75);text-decoration:none}a:hover{text-decoration:underline}
+*{box-sizing:border-box}
+</style>
+</helmet>
+<div style="max-width:820px;margin:0 auto;padding:28px clamp(18px,5vw,40px) 80px;display:flex;flex-direction:column;gap:72px">
+
+  <header style="display:flex;justify-content:space-between;align-items:center">
+    <span style="font-family:'Geist Mono',monospace;font-size:20px;font-weight:600;letter-spacing:-.02em">loom.</span>
+    <div style="display:flex;gap:18px;font-family:'Geist Mono',monospace;font-size:12.5px"><a href="app.dc.html">floor</a><a href="https://github.com/quadseven/loom">github</a></div>
+  </header>
+
+  <section data-screen-label="Hero" style="display:flex;flex-direction:column;gap:22px">
+    <h1 style="margin:0;font-size:clamp(34px,6vw,56px);line-height:1.05;font-weight:600;letter-spacing:-.035em;text-wrap:balance">Write a goal. Loom drives it to verified.</h1>
+    <p style="margin:0;font-size:clamp(17px,2.2vw,20px);line-height:1.5;color:#b4bcc9;max-width:640px;text-wrap:pretty">Loom is a software factory that runs on every AI subscription you have. It turns a goal into tickets, builds them in parallel, has them reviewed and fixed, ships them, and closes a ticket only when it shows up live and the goal's number moves.</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a href="app.dc.html" style="min-height:46px;display:flex;align-items:center;padding:0 18px;border-radius:10px;background:oklch(0.82 0.14 75);color:#0e1117;font-weight:600;font-size:15px;text-decoration:none">Watch the floor live</a>
+      <a href="https://github.com/quadseven/loom" style="min-height:46px;display:flex;align-items:center;padding:0 18px;border-radius:10px;border:1px solid #3a4352;color:#e2e6ee;font-weight:500;font-size:15px;text-decoration:none">Read the code</a>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:6px;padding-top:8px">
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600">41</span><span style="font-size:12.5px;color:#9aa4b4">tickets verified this week</span></div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600">7.4h</span><span style="font-size:12.5px;color:#9aa4b4">median ticket to verified</span></div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600">58%</span><span style="font-size:12.5px;color:#9aa4b4">PRs clean on the first pass</span></div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600">14</span><span style="font-size:12.5px;color:#9aa4b4">lanes across 9 providers</span></div>
+    </div>
+  </section>
+
+  <section data-screen-label="Factory" style="display:flex;flex-direction:column;gap:22px">
+    <div style="display:flex;flex-direction:column;gap:8px"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">The factory</div><h2 style="margin:0;font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:600;letter-spacing:-.02em">GitHub is the conveyor belt.</h2><p style="margin:0;font-size:16px;line-height:1.55;color:#b4bcc9;text-wrap:pretty">Labels carry each ticket along. The brain, the station and you share nothing else.</p></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;font-family:'Geist Mono',monospace;font-size:12px">
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:#9aa4b4">loom:queued</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:#c9d0db">briefed</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:oklch(0.82 0.14 75)">running</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:oklch(0.82 0.14 75)">pr</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:oklch(0.78 0.13 155)">merged</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:oklch(0.76 0.1 245)">shipped</span><span style="padding:5px 0;color:#5f6a7b">&#8594;</span>
+      <span style="padding:5px 9px;border-radius:6px;background:#1b212b;color:oklch(0.78 0.13 155)">verified</span>
+    </div>
+    <ol style="margin:0;padding:0;list-style:none;display:flex;flex-direction:column">
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">01</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Goal</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">One issue labelled loom:goal: what done looks like, how progress is measured, and the ship rules.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">02</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Brain</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">Every tick it measures the goal, puts regressions first, ranks open problems by the goal's own measure, and writes tickets for the top ones.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">03</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Ticket</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">Why, What, and exactly three checks: one names a test that fails without the fix, one is the live proof.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">04</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Station and lanes</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">Once a minute the station hands each ticket to a free lane: one agent CLI on one subscription, in its own clone and branch. Lanes never merge.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">05</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Review by grug</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">The review bot and CI check every pull request. Findings go back to the lane that wrote it. Work that stays stuck climbs a ladder of stronger models.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">06</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Merge, ship, verify</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">The brain merges ready PRs and ships them under the project's rules. A ticket closes only when its proof shows up live and its metric moved.</span></div></li>
+      <li style="display:grid;grid-template-columns:36px minmax(0,1fr);gap:14px;padding:16px 0;border-top:1px solid #1e242e;border-bottom:1px solid #1e242e"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:#7a8596">07</span><div style="display:flex;flex-direction:column;gap:4px"><span style="font-size:16px;font-weight:600">Journal and report</span><span style="font-size:15px;line-height:1.5;color:#b4bcc9">Each tick leaves a journal on the goal. Every two hours a short standup goes to your phone. You hear from it only when only you can act.</span></div></li>
+    </ol>
+  </section>
+
+  <section data-screen-label="One ticket" style="display:flex;flex-direction:column;gap:20px">
+    <div style="display:flex;flex-direction:column;gap:8px"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">Follow one ticket</div><h2 style="margin:0;font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:600;letter-spacing:-.02em">15 attempts, 3 rungs, one merge.</h2></div>
+    <div style="background:#151a22;border:1px solid #222935;border-radius:14px;padding:18px clamp(14px,3vw,22px);display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;flex-direction:column;gap:4px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:#7a8596">grug#1146</span><span style="font-size:17px;font-weight:600;line-height:1.35">The review reads the ticket a lane PR links as Refs owner/name#N</span></div>
+      <div style="display:flex;flex-direction:column">
+        <div style="display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:14px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.76 0.1 245)">09:02</span><span style="color:#c9d0db">Brain briefs it as easy, so it goes to a free lane.</span></div>
+        <div style="display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:14px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.72 0.15 25)">09:31</span><span style="color:#c9d0db">grug finds the parser only reads Refs at the start of a line. Back to the lane.</span></div>
+        <div style="display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:14px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.72 0.15 25)">11:50</span><span style="color:#c9d0db">Eleven attempts make the same mistake. The factory climbs the ladder.</span></div>
+        <div style="display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:14px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:#9aa4b4">15:05</span><span style="color:#c9d0db">Rung 2 reads the earlier attempts, sees the pattern, and matches on a word boundary.</span></div>
+        <div style="display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:14px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.78 0.13 155)">15:30</span><span style="color:#c9d0db">Clean review, green CI, merged. Still open until the next review cites its ticket live.</span></div>
+      </div>
+      <a href="app.dc.html" style="font-family:'Geist Mono',monospace;font-size:12.5px">read every attempt's transcript &#8594;</a>
+    </div>
+  </section>
+
+  <section data-screen-label="Improves" style="display:flex;flex-direction:column;gap:20px">
+    <div style="display:flex;flex-direction:column;gap:8px"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">It improves itself</div><h2 style="margin:0;font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:600;letter-spacing:-.02em">Loom is one of its own goals.</h2><p style="margin:0;font-size:16px;line-height:1.55;color:#b4bcc9;text-wrap:pretty">Each tick notes what slowed the factory down. Every two hours the biggest one becomes a ticket on Loom or on grug. It counts only when a factory number moves.</p></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:6px">
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596">noticed</span><span style="font-size:14px;line-height:1.45;color:#d3d9e3">"Lanes kept missing the failing-test check."</span></div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596">ticketed</span><span style="font-size:14px;line-height:1.45;color:#d3d9e3">loom#231: briefs name the failing test up front.</span></div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596">shipped</span><span style="font-size:14px;line-height:1.45;color:#d3d9e3">Every new brief carries the test name.</span></div>
+      <div style="background:#151a22;border:1px solid oklch(0.78 0.13 155 / 0.4);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:6px"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:oklch(0.78 0.13 155)">moved</span><span style="font-size:14px;line-height:1.45;color:#d3d9e3">First-pass clean PRs <span style="font-family:'Geist Mono',monospace">41% &#8594; 58%</span>.</span></div>
+    </div>
+  </section>
+
+  <section data-screen-label="Lanes" style="display:flex;flex-direction:column;gap:20px">
+    <div style="display:flex;flex-direction:column;gap:8px"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">Every subscription you have</div><h2 style="margin:0;font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:600;letter-spacing:-.02em">Hard work to paid lanes. Easy work to free ones.</h2></div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;font-family:'Geist Mono',monospace;font-size:12.5px">
+      <span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">codex</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">claude</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">anthropic</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">opencode-go</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">openrouter</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">zen</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">zai</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">workersai</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">agy</span><span style="padding:6px 10px;border-radius:6px;border:1px solid #262d39">spark (local vLLM)</span>
+    </div>
+    <div style="display:flex;flex-direction:column">
+      <div style="display:grid;grid-template-columns:80px minmax(0,1fr);gap:14px;padding:12px 0;border-top:1px solid #1e242e;font-size:15px;line-height:1.5"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:oklch(0.78 0.13 155)">easy</span><span style="color:#b4bcc9">spark or a free lane. Providers that train on prompts get public repos only.</span></div>
+      <div style="display:grid;grid-template-columns:80px minmax(0,1fr);gap:14px;padding:12px 0;border-top:1px solid #1e242e;font-size:15px;line-height:1.5"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:oklch(0.82 0.14 75)">medium</span><span style="color:#b4bcc9">codex or opencode-go first.</span></div>
+      <div style="display:grid;grid-template-columns:80px minmax(0,1fr);gap:14px;padding:12px 0;border-top:1px solid #1e242e;border-bottom:1px solid #1e242e;font-size:15px;line-height:1.5"><span style="font-family:'Geist Mono',monospace;font-size:13px;color:oklch(0.72 0.15 25)">hard</span><span style="color:#b4bcc9">Anthropic, claude or codex. At most half of all runs on Anthropic credit.</span></div>
+    </div>
+  </section>
+
+  <section data-screen-label="Rules" style="display:flex;flex-direction:column;gap:18px">
+    <div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">The rules</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:8px">
+      <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:16px;font-size:16px;line-height:1.45;font-weight:500">One ticket, one branch, one pull request. Lanes never merge.</div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:16px;font-size:16px;line-height:1.45;font-weight:500">Tests fail without the fix. Every bot comment is answered before merge.</div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:16px;font-size:16px;line-height:1.45;font-weight:500">Merged is not shipped, and shipped is not done.</div>
+      <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:16px;font-size:16px;line-height:1.45;font-weight:500">Subscription CLIs run on your own login. No credential sharing.</div>
+    </div>
+  </section>
+
+  <section data-screen-label="Run it" style="display:flex;flex-direction:column;gap:18px">
+    <div style="display:flex;flex-direction:column;gap:8px"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;letter-spacing:.1em;text-transform:uppercase;color:#7a8596">Run it</div><h2 style="margin:0;font-size:clamp(24px,3.4vw,32px);line-height:1.2;font-weight:600;letter-spacing:-.02em">Four steps on a Mac.</h2></div>
+    <div style="background:#090c10;border:1px solid #1e242e;border-radius:12px;padding:16px 18px;font-family:'Geist Mono',monospace;font-size:13px;line-height:1.8;overflow-x:auto;white-space:pre;color:#c9d0db"><span style="color:#5f6a7b"># 1. install on the lane machine</span>
+bash lanes/mac/install.sh
+<span style="color:#5f6a7b"># 2. give each project a goal home issue labelled loom:goal</span>
+<span style="color:#5f6a7b"># 3. point a brain at it: the installed tick, or Muse with docs/MUSE.md</span>
+<span style="color:#5f6a7b"># 4. test</span>
+python -B -m unittest discover -s tests -v</div>
+  </section>
+
+  <footer style="display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;padding-top:20px;border-top:1px solid #1e242e;font-family:'Geist Mono',monospace;font-size:12px;color:#7a8596">
+    <span>loom &#183; MIT &#183; public repo, no keys or logs on GitHub</span>
+    <div style="display:flex;gap:16px"><a href="app.dc.html">floor</a><a href="https://github.com/quadseven/loom">github</a><a href="https://github.com/quadseven/loom/blob/main/GLOSSARY.md">glossary</a></div>
+  </footer>
+</div>
+</x-dc>
+</body>
+</html>

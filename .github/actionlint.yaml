@@ -1,0 +1,4 @@
+self-hosted-runner:
+  # The ephemeral runner set for lane runs (.github/workflows/lane.yml).
+  labels:
+    - arc-loom-lanes

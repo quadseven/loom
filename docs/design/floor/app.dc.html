@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<title>Loom</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+html{background:#0e1117}
+body{margin:0;background:#0e1117;color:#e2e6ee;font-family:'Geist',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:oklch(0.82 0.14 75);text-decoration:none}a:hover{text-decoration:underline}
+*{box-sizing:border-box}
+::-webkit-scrollbar{width:0;height:0}
+</style>
+</helmet>
+<div style="display:flex;min-height:100vh;background:#0e1117">
+
+  <sc-if value="{{ wide }}" hint-placeholder-val="{{ true }}">
+    <nav style="width:232px;flex-shrink:0;position:sticky;top:0;height:100vh;border-right:1px solid #1e242e;padding:22px 14px;display:flex;flex-direction:column;gap:4px">
+      <div style="display:flex;align-items:baseline;justify-content:space-between;padding:0 10px 18px">
+        <span style="font-family:'Geist Mono',monospace;font-size:20px;font-weight:600;letter-spacing:-.02em">loom.</span>
+        <span style="display:flex;align-items:center;gap:6px;font-family:'Geist Mono',monospace;font-size:11px;color:#9aa4b4"><span style="width:7px;height:7px;border-radius:50%;background:oklch(0.78 0.13 155)"></span>14:38</span>
+      </div>
+      <sc-for list="{{ nav }}" as="n" hint-placeholder-count="8">
+        <div onClick="{{ n.onClick }}" style="display:flex;justify-content:space-between;align-items:center;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:14px;background:{{ n.bg }};color:{{ n.color }}" style-hover="background:#171d27">
+          <span>{{ n.label }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:oklch(0.82 0.14 75)">{{ n.count }}</span>
+        </div>
+      </sc-for>
+      <div style="margin-top:auto;display:flex;flex-direction:column;gap:10px;padding:14px 10px 0;border-top:1px solid #1e242e">
+        <div style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596;line-height:1.6">brain: muse holds the lock<br>tick 14:30 &#183; step 4 of 10</div>
+        <a href="Loom Site.dc.html" style="font-size:13px">About Loom &#8599;</a>
+      </div>
+    </nav>
+  </sc-if>
+
+  <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+    <sc-if value="{{ narrow }}" hint-placeholder-val="{{ false }}">
+      <div style="position:sticky;top:0;z-index:5;background:#0e1117;border-bottom:1px solid #1a1f28;height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 18px">
+        <span style="font-family:'Geist Mono',monospace;font-size:18px;font-weight:600;letter-spacing:-.02em">loom.</span>
+        <span style="display:flex;align-items:center;gap:7px;font-family:'Geist Mono',monospace;font-size:11px;color:#9aa4b4"><span style="width:7px;height:7px;border-radius:50%;background:oklch(0.78 0.13 155)"></span>tick 14:30 &#183; muse</span>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ loading }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:40px;font-family:'Geist Mono',monospace;font-size:12px;color:#7a8596">reading the bus&#8230;</div>
+    </sc-if>
+
+    <main style="width:100%;max-width:1320px;padding:24px clamp(16px,3.5vw,40px) 120px;display:flex;flex-direction:column;gap:28px">
+
+      <!-- FLOOR -->
+      <sc-if value="{{ isFloor }}" hint-placeholder-val="{{ true }}">
+        <div data-screen-label="Floor" style="display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start">
+          <div style="flex:2 1 520px;min-width:0;display:flex;flex-direction:column;gap:26px">
+            <div style="display:flex;flex-direction:column;gap:10px">
+              <div style="font-size:clamp(21px,2.4vw,28px);line-height:1.28;font-weight:500;letter-spacing:-.015em;text-wrap:pretty;max-width:760px">{{ standup.line }}</div>
+              <div style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596">standup &#183; 12:30 report &#183; all goals</div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:10px">
+              <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+                <span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Conveyor &#183; count and median wait</span>
+                <span style="font-family:'Geist Mono',monospace;font-size:11px;color:oklch(0.82 0.14 75)">pr is the bottleneck: 3.1h</span>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(88px,1fr));gap:6px">
+                <sc-for list="{{ conveyor }}" as="s" hint-placeholder-count="8">
+                  <div onClick="{{ s.onClick }}" style="cursor:pointer;background:#151a22;border:1px solid {{ s.bd }};border-radius:10px;padding:10px 11px;display:flex;flex-direction:column;gap:4px" style-hover="background:#1a2029">
+                    <span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;color:{{ s.color }}">{{ s.n }}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:11px;color:#c9d0db">{{ s.k }}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596">{{ s.wait }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596"><span>Moving now</span><span onClick="{{ goTickets }}" style="cursor:pointer;letter-spacing:0;text-transform:none;color:oklch(0.82 0.14 75)">all tickets &#8594;</span></div>
+              <sc-for list="{{ moving }}" as="t" hint-placeholder-count="5">
+                <div onClick="{{ t.open }}" style="cursor:pointer;padding:12px 14px;border-radius:10px;background:#121720;border:1px solid #1e242e;display:flex;flex-direction:column;gap:7px" style-hover="background:#171d27;border-color:#2c3442">
+                  <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:11.5px"><span style="color:#e2e6ee">{{ t.sid }}</span><span style="color:{{ t.flagColor }};text-align:right">{{ t.flag }}</span></div>
+                  <div style="font-size:14px;line-height:1.38;color:#d3d9e3;text-wrap:pretty">{{ t.title }}</div>
+                  <div style="display:flex;align-items:center;gap:12px">
+                    <div style="display:flex;gap:3px;flex:1;max-width:240px"><sc-for list="{{ t.dots }}" as="d" hint-placeholder-count="7"><span style="flex:1;height:4px;border-radius:2px;background:{{ d.c }}"></span></sc-for></div>
+                    <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.laneLine }}</span>
+                  </div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="flex:1 1 300px;min-width:0;display:flex;flex-direction:column;gap:14px">
+            <div style="background:#151a22;border:1px solid oklch(0.82 0.14 75 / 0.38);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:8px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:oklch(0.82 0.14 75)">Brain's next move</div>
+              <div style="font-size:16px;line-height:1.4;font-weight:500;text-wrap:pretty">{{ brain.next.line }}</div>
+              <div style="font-size:13px;line-height:1.5;color:#9aa4b4;text-wrap:pretty">{{ brain.next.why }}</div>
+              <span onClick="{{ goBrain }}" style="cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px;color:oklch(0.82 0.14 75)">see the reasoning &#8594;</span>
+            </div>
+            <div style="background:#151a22;border:1px solid #222935;border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Since last report</div>
+              <sc-for list="{{ standupLines }}" as="l" hint-placeholder-count="5">
+                <div style="display:flex;gap:10px;font-size:13px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:10.5px;width:58px;flex-shrink:0;padding-top:2px;color:{{ l.color }}">{{ l.k }}</span><span style="color:#c9d0db;text-wrap:pretty">{{ l.text }}</span></div>
+              </sc-for>
+            </div>
+            <div onClick="{{ goAsks }}" style="cursor:pointer;background:#151a22;border:1px solid #222935;border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:6px" style-hover="border-color:#2c3442">
+              <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase"><span style="color:#7a8596">Needs you</span><span style="color:oklch(0.82 0.14 75)">{{ askCount }}</span></div>
+              <div style="font-size:13.5px;line-height:1.45;color:#d3d9e3">{{ standup.needsYou }}</div>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- GOALS -->
+      <sc-if value="{{ isGoals }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Goals" style="display:flex;flex-direction:column;gap:20px">
+          <div style="display:flex;flex-direction:column;gap:6px"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Goals</div><div style="font-size:14px;color:#9aa4b4">Each goal is measured every tick. Regressions come first.</div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,360px),1fr));gap:14px">
+            <sc-for list="{{ goalCards }}" as="g" hint-placeholder-count="3">
+              <div style="background:#151a22;border:1px solid {{ g.bd }};border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px">
+                <div style="display:flex;flex-direction:column;gap:4px">
+                  <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:11.5px"><span style="color:#7a8596">{{ g.sid }}</span><span style="color:{{ g.tagColor }}">{{ g.tag }}</span></div>
+                  <div style="font-size:17px;line-height:1.35;font-weight:600;text-wrap:pretty">{{ g.title }}</div>
+                </div>
+                <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+                  <div style="display:flex;flex-direction:column;gap:3px">
+                    <span style="font-family:'Geist Mono',monospace;font-size:30px;font-weight:600;letter-spacing:-.02em;color:{{ g.valueColor }}">{{ g.value }}</span>
+                    <span style="font-family:'Geist Mono',monospace;font-size:11px;color:#7a8596">{{ g.metricLine }}</span>
+                  </div>
+                  <div style="display:flex;align-items:flex-end;gap:3px;height:44px;width:120px">
+                    <sc-for list="{{ g.bars }}" as="b" hint-placeholder-count="7"><span style="flex:1;border-radius:2px;height:{{ b.h }};background:{{ b.c }}"></span></sc-for>
+                  </div>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px">
+                  <sc-for list="{{ g.counts }}" as="c" hint-placeholder-count="5"><span style="display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap;font-family:'Geist Mono',monospace;font-size:11px;padding:4px 8px;border-radius:6px;background:#1b212b;color:#c9d0db"><span style="color:{{ c.color }}">{{ c.n }}</span><span>{{ c.k }}</span></span></sc-for>
+                </div>
+                <div style="font-size:13px;line-height:1.5;color:#9aa4b4;text-wrap:pretty">{{ g.report }}</div>
+                <span onClick="{{ g.open }}" style="cursor:pointer;font-family:'Geist Mono',monospace;font-size:11.5px;color:oklch(0.82 0.14 75)">{{ g.ticketsLine }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- TICKETS -->
+      <sc-if value="{{ isTickets }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Tickets" style="display:flex;flex-direction:column;gap:16px">
+          <div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Tickets</div>
+          <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:2px">
+            <sc-for list="{{ stateChips }}" as="c" hint-placeholder-count="8">
+              <span onClick="{{ c.onClick }}" style="cursor:pointer;flex-shrink:0;font-family:'Geist Mono',monospace;font-size:12px;padding:7px 11px;border-radius:999px;background:{{ c.bg }};color:{{ c.color }};border:1px solid {{ c.bd }}">{{ c.label }} <span style="color:#7a8596">{{ c.n }}</span></span>
+            </sc-for>
+          </div>
+          <div style="display:flex;gap:6px;overflow-x:auto">
+            <sc-for list="{{ goalChips }}" as="c" hint-placeholder-count="4">
+              <span onClick="{{ c.onClick }}" style="cursor:pointer;flex-shrink:0;font-family:'Geist Mono',monospace;font-size:11.5px;padding:5px 10px;border-radius:6px;background:{{ c.bg }};color:{{ c.color }}">{{ c.label }}</span>
+            </sc-for>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr));gap:8px">
+            <sc-for list="{{ ticketRows }}" as="t" hint-placeholder-count="8">
+              <div onClick="{{ t.open }}" style="cursor:pointer;padding:12px 14px;border-radius:10px;background:#121720;border:1px solid #1e242e;display:flex;flex-direction:column;gap:7px" style-hover="background:#171d27;border-color:#2c3442">
+                <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:11.5px"><span style="color:#e2e6ee">{{ t.sid }}</span><span style="color:{{ t.flagColor }};text-align:right">{{ t.flag }}</span></div>
+                <div style="font-size:14px;line-height:1.38;color:#d3d9e3;text-wrap:pretty">{{ t.title }}</div>
+                <div style="display:flex;align-items:center;gap:12px">
+                  <div style="display:flex;gap:3px;flex:1;max-width:220px"><sc-for list="{{ t.dots }}" as="d" hint-placeholder-count="7"><span style="flex:1;height:4px;border-radius:2px;background:{{ d.c }}"></span></sc-for></div>
+                  <span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ t.laneLine }}</span>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+          <sc-if value="{{ noTickets }}" hint-placeholder-val="{{ false }}"><div style="font-size:14px;color:#9aa4b4;padding:20px 0">No tickets in this state for this goal. <span onClick="{{ clearFilters }}" style="cursor:pointer;color:oklch(0.82 0.14 75)">Clear filters</span></div></sc-if>
+        </div>
+      </sc-if>
+
+      <!-- TICKET -->
+      <sc-if value="{{ isTicket }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Ticket" style="display:flex;flex-direction:column;gap:18px">
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:12px"><span onClick="{{ back }}" style="cursor:pointer;color:#9aa4b4">&#8592; tickets</span><span style="color:{{ tk.flagColor }}">{{ tk.flag }}</span></div>
+            <div style="font-family:'Geist Mono',monospace;font-size:12px;color:#7a8596">{{ tk.id }} &#183; goal {{ tk.goalSid }}</div>
+            <div style="font-size:clamp(19px,2.2vw,26px);line-height:1.3;font-weight:600;letter-spacing:-.01em;text-wrap:pretty;max-width:900px">{{ tk.title }}</div>
+            <div style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#9aa4b4">{{ tk.meta }}</div>
+            <div style="display:flex;gap:3px;max-width:640px;padding-top:4px">
+              <sc-for list="{{ tk.strip }}" as="d" hint-placeholder-count="7"><div style="flex:1;display:flex;flex-direction:column;gap:5px"><span style="height:4px;border-radius:2px;background:{{ d.c }}"></span><span style="font-family:'Geist Mono',monospace;font-size:9.5px;color:{{ d.t }};white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ d.k }}</span></div></sc-for>
+            </div>
+          </div>
+          <sc-if value="{{ narrow }}" hint-placeholder-val="{{ false }}">
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);background:#151a22;border-radius:9px;padding:3px;font-family:'Geist Mono',monospace;font-size:12px;text-align:center;position:sticky;top:60px;z-index:4">
+              <sc-for list="{{ ticketTabs }}" as="tb" hint-placeholder-count="3"><span onClick="{{ tb.onClick }}" style="cursor:pointer;padding:8px 0;border-radius:7px;background:{{ tb.bg }};color:{{ tb.color }}">{{ tb.label }}</span></sc-for>
+            </div>
+          </sc-if>
+          <div style="display:grid;grid-template-columns:{{ ticketCols }};gap:28px;align-items:start">
+
+            <sc-if value="{{ showPath }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;flex-direction:column;gap:16px;min-width:0">
+                <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:13px 15px;display:flex;flex-direction:column;gap:8px">
+                  <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">3 checks</div>
+                  <sc-for list="{{ tk.checks }}" as="c" hint-placeholder-count="3"><div style="display:flex;gap:10px;font-size:13px;line-height:1.42"><span style="font-family:'Geist Mono',monospace;width:14px;flex-shrink:0;color:{{ c.color }}">{{ c.mark }}</span><span style="color:#c9d0db">{{ c.text }}</span></div></sc-for>
+                </div>
+                <div style="display:flex;flex-direction:column">
+                  <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596;padding-bottom:10px">Path</div>
+                  <sc-for list="{{ tk.path }}" as="e" hint-placeholder-count="6">
+                    <div style="display:flex;gap:12px">
+                      <div style="display:flex;flex-direction:column;align-items:center;width:12px;flex-shrink:0"><span style="width:9px;height:9px;border-radius:50%;margin-top:5px;background:{{ e.dot }}"></span><span style="flex:1;width:1px;background:#262d39"></span></div>
+                      <div style="flex:1;padding-bottom:13px;display:flex;flex-direction:column;gap:3px;min-width:0">
+                        <div style="display:flex;justify-content:space-between;gap:8px;font-family:'Geist Mono',monospace;font-size:11px"><span style="color:{{ e.dot }}">{{ e.who }}</span><span style="color:#7a8596">{{ e.at }}</span></div>
+                        <div style="font-size:13px;line-height:1.42;color:#c9d0db;text-wrap:pretty">{{ e.text }}</div>
+                        <sc-if value="{{ e.hasMeta }}" hint-placeholder-val="{{ false }}"><div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596">{{ e.meta }}</div></sc-if>
+                      </div>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ showTranscript }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+                <sc-if value="{{ tk.multiRun }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;flex-direction:column;gap:7px">
+                    <div style="display:flex;gap:3px;max-width:560px"><sc-for list="{{ tk.runChips }}" as="a" hint-placeholder-count="15"><span onClick="{{ a.onClick }}" style="cursor:pointer;flex:1;height:26px;border-radius:4px;background:{{ a.bg }};border:1px solid {{ a.bd }};font-family:'Geist Mono',monospace;font-size:10px;color:{{ a.t }};display:flex;align-items:center;justify-content:center">{{ a.n }}</span></sc-for></div>
+                  </div>
+                </sc-if>
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+                  <span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#e2e6ee">{{ tk.runLine }}</span>
+                  <span onClick="{{ toggleThoughts }}" style="cursor:pointer;font-family:'Geist Mono',monospace;font-size:11px;padding:4px 9px;border-radius:6px;border:1px solid #262d39;color:{{ thoughtsColor }}">{{ thoughtsLabel }}</span>
+                </div>
+                <div style="display:flex;flex-direction:column">
+                  <sc-for list="{{ tk.events }}" as="e" hint-placeholder-count="8">
+                    <div style="display:flex;flex-direction:column;gap:6px;padding:12px 0;border-top:1px solid #1a1f28;min-width:0">
+                      <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:10.5px"><span style="color:{{ e.color }};letter-spacing:.06em;text-transform:uppercase">{{ e.label }}</span><span style="color:#5f6a7b">{{ e.at }}</span></div>
+                      <sc-if value="{{ e.isThink }}" hint-placeholder-val="{{ false }}"><div style="font-size:13.5px;line-height:1.55;color:#9aa4b4;font-style:italic;text-wrap:pretty">{{ e.text }}</div></sc-if>
+                      <sc-if value="{{ e.isSay }}" hint-placeholder-val="{{ false }}"><div style="font-size:14px;line-height:1.55;color:#e2e6ee;text-wrap:pretty">{{ e.text }}</div></sc-if>
+                      <sc-if value="{{ e.isBrief }}" hint-placeholder-val="{{ false }}"><div style="display:flex;flex-direction:column;gap:6px;background:#121720;border:1px solid #1e242e;border-radius:10px;padding:10px 12px"><div style="font-size:13px;line-height:1.55;color:#c9d0db;white-space:pre-wrap">{{ e.text }}</div><span onClick="{{ e.toggle }}" style="cursor:pointer;font-family:'Geist Mono',monospace;font-size:11px;color:oklch(0.82 0.14 75)">{{ e.more }}</span></div></sc-if>
+                      <sc-if value="{{ e.isCode }}" hint-placeholder-val="{{ false }}"><div style="background:#090c10;border:1px solid #1e242e;border-radius:8px;padding:9px 11px;font-family:'Geist Mono',monospace;font-size:11.5px;line-height:1.55;display:flex;flex-direction:column;gap:2px;overflow-x:auto"><div style="color:#e2e6ee;white-space:pre-wrap;word-break:break-word">{{ e.head }}</div><sc-for list="{{ e.lines }}" as="ln" hint-placeholder-count="2"><div style="color:{{ ln.c }};white-space:pre">{{ ln.t }}</div></sc-for></div></sc-if>
+                      <sc-if value="{{ e.isLog }}" hint-placeholder-val="{{ false }}"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;line-height:1.5;color:#9aa4b4">{{ e.text }}</div></sc-if>
+                      <sc-if value="{{ e.isQuote }}" hint-placeholder-val="{{ false }}"><div style="background:#151a22;border:1px solid {{ e.bd }};border-radius:10px;padding:10px 13px;font-size:13.5px;line-height:1.5;color:#d3d9e3;text-wrap:pretty">{{ e.text }}</div></sc-if>
+                      <sc-if value="{{ e.isLive }}" hint-placeholder-val="{{ false }}"><div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#9aa4b4;font-style:italic"><span style="width:7px;height:7px;border-radius:50%;background:oklch(0.82 0.14 75)"></span>{{ e.text }}</div></sc-if>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+
+            <sc-if value="{{ showPr }}" hint-placeholder-val="{{ true }}">
+              <div style="display:flex;flex-direction:column;gap:18px;min-width:0">
+                <sc-if value="{{ tk.hasPr }}" hint-placeholder-val="{{ true }}">
+                  <div style="display:flex;flex-direction:column;gap:18px">
+                    <div style="display:flex;flex-direction:column;gap:8px">
+                      <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">{{ tk.prLine }}</div>
+                      <sc-for list="{{ tk.ci }}" as="c" hint-placeholder-count="4"><div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:12px"><span style="color:#c9d0db">{{ c.name }}</span><span style="color:{{ c.color }}">{{ c.state }}</span></div></sc-for>
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:8px">
+                      <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Files</div>
+                      <sc-for list="{{ tk.files }}" as="f" hint-placeholder-count="2"><div style="display:flex;gap:8px;font-family:'Geist Mono',monospace;font-size:12px"><span style="color:#c9d0db;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ f.name }}</span><span style="color:oklch(0.78 0.13 155)">+{{ f.p }}</span><span style="color:oklch(0.72 0.15 25)">&#8722;{{ f.m }}</span></div></sc-for>
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:8px">
+                      <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">grug threads</div>
+                      <sc-for list="{{ tk.threads }}" as="th" hint-placeholder-count="1"><div style="display:flex;flex-direction:column;gap:4px;font-size:13px;line-height:1.45"><span style="font-family:'Geist Mono',monospace;font-size:11px;color:{{ th.color }}">{{ th.head }}</span><span style="color:#c9d0db">{{ th.text }}</span></div></sc-for>
+                      <sc-if value="{{ tk.noThreads }}" hint-placeholder-val="{{ false }}"><div style="font-size:13px;color:#7a8596">No open findings.</div></sc-if>
+                    </div>
+                  </div>
+                </sc-if>
+                <sc-if value="{{ tk.noPr }}" hint-placeholder-val="{{ false }}"><div style="font-size:13px;line-height:1.5;color:#9aa4b4">No pull request yet. The runner opens one when the lane's commit passes the validation contract.</div></sc-if>
+                <sc-if value="{{ tk.hasSummary }}" hint-placeholder-val="{{ false }}">
+                  <div style="display:flex;flex-direction:column;gap:8px">
+                    <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Across all attempts</div>
+                    <div style="font-size:13px;line-height:1.5;color:#c9d0db;text-wrap:pretty">{{ tk.summary }}</div>
+                  </div>
+                </sc-if>
+                <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:12px 14px;display:flex;flex-direction:column;gap:6px">
+                  <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:{{ tk.proofColor }}">{{ tk.proofHead }}</div>
+                  <div style="font-size:13px;line-height:1.45;color:#d3d9e3">{{ tk.proof }}</div>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- BRAIN -->
+      <sc-if value="{{ isBrain }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Brain" style="display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start">
+          <div style="flex:2 1 480px;min-width:0;display:flex;flex-direction:column;gap:22px">
+            <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Brain</div><div style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#9aa4b4">muse holds the lock &#183; started 14:30</div></div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="display:grid;grid-template-columns:repeat(10,1fr);gap:4px">
+                <sc-for list="{{ tickSteps }}" as="s" hint-placeholder-count="10"><div style="display:flex;flex-direction:column;gap:5px;min-width:0"><span style="height:22px;border-radius:4px;background:{{ s.bg }};border:1px solid {{ s.bd }}"></span><span style="font-family:'Geist Mono',monospace;font-size:9.5px;color:{{ s.c }};overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ s.k }}</span></div></sc-for>
+              </div>
+            </div>
+            <div style="background:#151a22;border:1px solid oklch(0.82 0.14 75 / 0.38);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:8px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:oklch(0.82 0.14 75)">Next move</div>
+              <div style="font-size:16px;line-height:1.4;font-weight:500">{{ brain.next.line }}</div>
+              <div style="font-size:13px;line-height:1.5;color:#9aa4b4">{{ brain.next.why }}</div>
+            </div>
+            <div style="display:flex;flex-direction:column">
+              <div style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596;padding-bottom:6px">Thinking, this tick</div>
+              <sc-for list="{{ thoughts }}" as="th" hint-placeholder-count="5">
+                <div style="padding:12px 0;border-top:1px solid #1e242e;display:flex;flex-direction:column;gap:5px">
+                  <div style="display:flex;gap:10px;font-family:'Geist Mono',monospace;font-size:10.5px"><span style="color:{{ th.color }};letter-spacing:.06em;text-transform:uppercase">{{ th.tag }}</span><span style="color:#5f6a7b">{{ th.ts }}</span></div>
+                  <div style="font-size:14px;line-height:1.5;color:#d3d9e3;text-wrap:pretty">{{ th.text }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="flex:1 1 300px;min-width:0;display:flex;flex-direction:column;gap:16px">
+            <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Ranked by members affected &#215; hours lost</div>
+              <sc-for list="{{ ranking }}" as="r" hint-placeholder-count="3">
+                <div style="display:flex;gap:10px;align-items:baseline"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:#7a8596;width:12px">{{ r.n }}</span><div style="flex:1;display:flex;flex-direction:column;gap:2px"><span style="font-size:13.5px;line-height:1.4;color:#d3d9e3">{{ r.text }}</span><span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596">{{ r.why }}</span></div><span style="font-family:'Geist Mono',monospace;font-size:13px;color:{{ r.color }}">{{ r.score }}</span></div>
+              </sc-for>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Handoff markers</div>
+              <sc-for list="{{ brain.markers }}" as="m" hint-placeholder-count="3"><div style="font-family:'Geist Mono',monospace;font-size:11px;line-height:1.5;color:#9aa4b4;word-break:break-word">{{ m }}</div></sc-for>
+            </div>
+            <div style="display:flex;flex-direction:column">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596;padding-bottom:6px">Recent ticks</div>
+              <sc-for list="{{ ticks }}" as="k" hint-placeholder-count="4">
+                <div style="display:flex;gap:12px;padding:9px 0;border-top:1px solid #1e242e;font-size:13px;line-height:1.4"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#e2e6ee;width:40px">{{ k.at }}</span><div style="flex:1;display:flex;flex-direction:column;gap:2px"><span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{ k.color }}">{{ k.head }}</span><span style="color:#c9d0db">{{ k.line }}</span></div></div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- HOT SPOTS -->
+      <sc-if value="{{ isHot }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Hot spots" style="display:flex;flex-direction:column;gap:22px">
+          <div style="display:flex;flex-direction:column;gap:6px"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Hot spots</div><div style="font-size:14px;color:#9aa4b4">Where tickets wait, what keeps failing, and what is stuck. Last 7 days.</div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,400px),1fr));gap:16px">
+            <div style="background:#151a22;border:1px solid #222935;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Where it slows &#183; median wait, worst</div>
+              <sc-for list="{{ dwell }}" as="d" hint-placeholder-count="6">
+                <div style="display:flex;flex-direction:column;gap:5px">
+                  <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:12px"><span style="color:{{ d.color }}">{{ d.state }}</span><span style="color:#e2e6ee">{{ d.label }}</span></div>
+                  <div style="height:6px;border-radius:3px;background:#1b212b"><div style="height:6px;border-radius:3px;width:{{ d.w }};background:{{ d.color }}"></div></div>
+                  <sc-if value="{{ d.hasNote }}" hint-placeholder-val="{{ false }}"><div style="font-size:12px;color:#9aa4b4">{{ d.note }}</div></sc-if>
+                </div>
+              </sc-for>
+            </div>
+            <div style="background:#151a22;border:1px solid #222935;border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:12px">
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">What grug keeps sending back</div>
+              <sc-for list="{{ findings }}" as="f" hint-placeholder-count="4">
+                <div style="display:flex;flex-direction:column;gap:5px">
+                  <div style="display:flex;justify-content:space-between;gap:10px;font-size:13px"><span style="color:#c9d0db">{{ f.rule }}</span><span style="font-family:'Geist Mono',monospace;color:#e2e6ee">{{ f.n }} <span style="color:{{ f.tc }}">{{ f.arrow }}</span></span></div>
+                  <div style="height:4px;border-radius:2px;background:#1b212b"><div style="height:4px;border-radius:2px;width:{{ f.w }};background:oklch(0.72 0.15 25)"></div></div>
+                </div>
+              </sc-for>
+              <div style="font-family:'Geist Mono',monospace;font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596;padding-top:6px">Lane failure rate</div>
+              <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:6px">
+                <sc-for list="{{ laneFail }}" as="l" hint-placeholder-count="5">
+                  <div style="display:flex;flex-direction:column;gap:5px"><div style="height:52px;background:#1b212b;border-radius:6px;display:flex;align-items:flex-end;overflow:hidden"><div style="width:100%;height:{{ l.h }};background:{{ l.c }}"></div></div><span style="font-family:'Geist Mono',monospace;font-size:10px;color:#9aa4b4;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ l.name }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;text-align:center">{{ l.pct }}</span></div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Repeatedly stuck &#183; up the ladder</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr));gap:8px">
+              <sc-for list="{{ stuck }}" as="t" hint-placeholder-count="3">
+                <div onClick="{{ t.open }}" style="cursor:pointer;padding:12px 14px;border-radius:10px;background:#121720;border:1px solid #1e242e;display:flex;flex-direction:column;gap:6px" style-hover="background:#171d27;border-color:#2c3442">
+                  <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:11.5px"><span>{{ t.sid }}</span><span style="color:oklch(0.72 0.15 25)">{{ t.ladder }}</span></div>
+                  <div style="font-size:14px;line-height:1.38;color:#d3d9e3">{{ t.title }}</div>
+                  <div style="font-family:'Geist Mono',monospace;font-size:10.5px;color:#7a8596">{{ t.flag }} &#183; {{ t.laneLine }}</div>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- IMPROVING -->
+      <sc-if value="{{ isImprove }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Improving" style="display:flex;flex-direction:column;gap:22px">
+          <div style="display:flex;flex-direction:column;gap:6px;max-width:760px"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Improving</div><div style="font-size:14px;line-height:1.5;color:#9aa4b4;text-wrap:pretty">Loom is a goal too (loom#30). Each tick's journal notes what slowed the factory down. Every two hours the biggest one becomes a ticket, and it counts only when a factory number moves.</div></div>
+          <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;max-width:760px">
+            <sc-for list="{{ loopStages }}" as="s" hint-placeholder-count="4">
+              <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:11px 12px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:22px;font-weight:600;color:{{ s.color }}">{{ s.n }}</span><span style="font-family:'Geist Mono',monospace;font-size:11px;color:#c9d0db">{{ s.k }}</span><span style="font-size:11.5px;color:#7a8596;line-height:1.35">{{ s.sub }}</span></div>
+            </sc-for>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),1fr));gap:10px">
+            <sc-for list="{{ improvements }}" as="i" hint-placeholder-count="6">
+              <div onClick="{{ i.open }}" style="cursor:pointer;background:#121720;border:1px solid #1e242e;border-radius:12px;padding:14px;display:flex;flex-direction:column;gap:9px" style-hover="background:#171d27;border-color:#2c3442">
+                <div style="display:flex;gap:3px"><sc-for list="{{ i.steps }}" as="d" hint-placeholder-count="4"><span style="flex:1;height:4px;border-radius:2px;background:{{ d.c }}"></span></sc-for></div>
+                <div style="font-size:14.5px;line-height:1.4;color:#e2e6ee;text-wrap:pretty">&#8220;{{ i.friction }}&#8221;</div>
+                <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:11px"><span style="color:#7a8596">{{ i.source }} &#8594; {{ i.sid }}</span><span style="color:{{ i.color }}">{{ i.state }}</span></div>
+                <sc-if value="{{ i.hasMoved }}" hint-placeholder-val="{{ false }}"><div style="font-family:'Geist Mono',monospace;font-size:11.5px;color:oklch(0.78 0.13 155)">moved: {{ i.moved }}</div></sc-if>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">The nine factory numbers &#183; vs last week</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:6px">
+              <sc-for list="{{ factory }}" as="f" hint-placeholder-count="9">
+                <div style="background:#151a22;border:1px solid #222935;border-radius:10px;padding:11px 12px;display:flex;flex-direction:column;gap:3px"><span style="font-family:'Geist Mono',monospace;font-size:20px;font-weight:600">{{ f.v }}</span><span style="font-size:12px;color:#c9d0db">{{ f.k }}</span><span style="font-family:'Geist Mono',monospace;font-size:10.5px;color:{{ f.color }}">{{ f.delta }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- LANES -->
+      <sc-if value="{{ isLanes }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Lanes and models" style="display:flex;flex-direction:column;gap:22px">
+          <div style="display:flex;flex-direction:column;gap:6px;max-width:760px"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Lanes &amp; models</div><div style="font-size:14px;line-height:1.5;color:#9aa4b4;text-wrap:pretty">Easy work on free lanes and spark, medium on codex and opencode-go, hard on Anthropic credit. At most half of runs on Anthropic.</div></div>
+          <div style="display:flex;flex-direction:column;gap:7px;max-width:560px">
+            <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:12px"><span style="color:#9aa4b4">anthropic share of runs</span><span>32% <span style="color:#7a8596">/ 50% cap</span></span></div>
+            <div style="height:8px;border-radius:4px;background:#1b212b;position:relative"><div style="height:8px;width:32%;border-radius:4px;background:oklch(0.76 0.1 245)"></div><div style="position:absolute;left:50%;top:-4px;width:2px;height:16px;background:#9aa4b4"></div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:8px">
+            <sc-for list="{{ laneRows }}" as="l" hint-placeholder-count="12">
+              <div onClick="{{ l.open }}" style="cursor:{{ l.cursor }};background:#121720;border:1px solid #1e242e;border-radius:10px;padding:11px 13px;display:flex;flex-direction:column;gap:6px">
+                <div style="display:flex;align-items:center;gap:8px;font-family:'Geist Mono',monospace;font-size:12.5px"><span style="width:7px;height:7px;border-radius:50%;background:{{ l.dot }}"></span><span style="flex:1">{{ l.slot }}</span><span style="font-size:11px;color:{{ l.dot }}">{{ l.state }}</span></div>
+                <div style="font-family:'Geist Mono',monospace;font-size:11px;color:#9aa4b4">{{ l.model }}</div>
+                <div style="font-size:12.5px;color:#c9d0db">{{ l.line }}</div>
+                <div style="display:flex;align-items:center;gap:8px"><div style="flex:1;height:3px;border-radius:2px;background:#1b212b"><div style="height:3px;border-radius:2px;width:{{ l.qw }};background:{{ l.qc }}"></div></div><span style="font-family:'Geist Mono',monospace;font-size:10px;color:#7a8596">quota {{ l.qw }}</span></div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:#7a8596">Which model opened each lane PR</span><span style="display:flex;gap:12px;font-family:'Geist Mono',monospace;font-size:11px;color:#9aa4b4"><span style="color:oklch(0.78 0.13 155)">&#9632; merged</span><span style="color:oklch(0.76 0.1 245)">&#9632; open</span><span style="color:#5f6a7b">&#9632; closed</span></span></div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,460px),1fr));gap:12px">
+              <sc-for list="{{ modelTiers }}" as="m" hint-placeholder-count="4">
+                <div style="background:#151a22;border:1px solid #222935;border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:11px">
+                  <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase"><span style="color:#c9d0db">{{ m.tier }}</span><span style="color:#7a8596">{{ m.share }}</span></div>
+                  <sc-for list="{{ m.rows }}" as="r" hint-placeholder-count="2">
+                    <div style="display:flex;flex-direction:column;gap:5px">
+                      <div style="display:flex;justify-content:space-between;gap:10px;font-family:'Geist Mono',monospace;font-size:12px"><span><span style="color:#e2e6ee">{{ r.model }}</span> <span style="color:#7a8596">{{ r.lane }}</span></span><span style="color:#9aa4b4;white-space:nowrap">{{ r.label }}</span></div>
+                      <div style="height:5px;border-radius:3px;background:#1b212b;display:flex;overflow:hidden"><span style="width:{{ r.mw }};background:oklch(0.78 0.13 155)"></span><span style="width:{{ r.ow }};background:oklch(0.76 0.1 245)"></span><span style="width:{{ r.cw }};background:#5f6a7b"></span></div>
+                    </div>
+                  </sc-for>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <!-- ASKS -->
+      <sc-if value="{{ isAsks }}" hint-placeholder-val="{{ false }}">
+        <div data-screen-label="Asks" style="display:flex;flex-direction:column;gap:18px;max-width:760px">
+          <div style="display:flex;flex-direction:column;gap:6px"><div style="font-size:26px;font-weight:600;letter-spacing:-.015em">Needs you</div><div style="font-size:14px;line-height:1.5;color:#9aa4b4">Only what only you can do. Everything else the brain does itself.</div></div>
+          <sc-for list="{{ askCards }}" as="a" hint-placeholder-count="2">
+            <div style="background:#151a22;border:1px solid {{ a.bd }};border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:10px">
+              <div style="display:flex;justify-content:space-between;font-family:'Geist Mono',monospace;font-size:11.5px"><span style="color:#7a8596">{{ a.sid }} &#183; needs-operator</span><span style="color:#9aa4b4">{{ a.age }}</span></div>
+              <div style="font-size:17px;font-weight:600;line-height:1.35">{{ a.title }}</div>
+              <div style="font-size:14px;line-height:1.5;color:#c9d0db">{{ a.ask }}</div>
+              <sc-if value="{{ a.open }}" hint-placeholder-val="{{ true }}">
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                  <sc-for list="{{ a.actions }}" as="b" hint-placeholder-count="2"><span onClick="{{ b.onClick }}" style="cursor:pointer;min-height:44px;display:flex;align-items:center;padding:0 16px;border-radius:10px;font-size:14px;font-weight:500;background:{{ b.bg }};color:{{ b.color }};border:1px solid {{ b.bd }}">{{ b.label }}</span></sc-for>
+                </div>
+              </sc-if>
+              <sc-if value="{{ a.done }}" hint-placeholder-val="{{ false }}"><div style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.78 0.13 155)">{{ a.doneText }}</div></sc-if>
+            </div>
+          </sc-for>
+          <div style="font-family:'Geist Mono',monospace;font-size:11.5px;color:#7a8596">{{ human }}</div>
+        </div>
+      </sc-if>
+    </main>
+  </div>
+
+  <sc-if value="{{ narrow }}" hint-placeholder-val="{{ false }}">
+    <div style="position:fixed;left:0;right:0;bottom:0;z-index:10;height:76px;background:#0e1117;border-top:1px solid #1e242e;display:grid;grid-template-columns:repeat(5,1fr);padding-bottom:14px">
+      <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="5">
+        <div onClick="{{ t.onClick }}" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;font-family:'Geist Mono',monospace;font-size:11px;color:{{ t.color }}"><span style="width:18px;height:3px;border-radius:2px;background:{{ t.bar }}"></span>{{ t.label }}</div>
+      </sc-for>
+    </div>
+  </sc-if>
+  <sc-if value="{{ moreOpen }}" hint-placeholder-val="{{ false }}">
+    <div onClick="{{ closeMore }}" style="position:fixed;inset:0;z-index:9;background:rgba(5,7,10,.6)"></div>
+    <div style="position:fixed;left:0;right:0;bottom:76px;z-index:11;background:#151a22;border-top:1px solid #262d39;border-radius:18px 18px 0 0;padding:10px 12px 12px;display:flex;flex-direction:column">
+      <sc-for list="{{ moreItems }}" as="m" hint-placeholder-count="4">
+        <div onClick="{{ m.onClick }}" style="cursor:pointer;min-height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 12px;border-radius:10px;font-size:15px" style-hover="background:#1b212b"><span>{{ m.label }}</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:oklch(0.82 0.14 75)">{{ m.count }}</span></div>
+      </sc-for>
+      <a href="Loom Site.dc.html" style="min-height:52px;display:flex;align-items:center;padding:0 12px;font-size:15px">About Loom &#8599;</a>
+    </div>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+const A='oklch(0.82 0.14 75)',G='oklch(0.78 0.13 155)',R='oklch(0.72 0.15 25)',B='oklch(0.76 0.1 245)',M='#7a8596',OFF='#232a35';
+const SC={queued:M,briefed:'#c9d0db',running:A,pr:A,merged:G,shipped:B,verified:G,failed:R};
+const sid=id=>id.replace('quadseven/','');
+const hm=ts=>ts?ts.slice(11,16):'';
+class Component extends DCLogic {
+  state={D:null,route:'floor',ticketId:null,tab:'transcript',run:null,filter:'all',goal:null,more:false,wide:typeof window!=='undefined'?window.innerWidth>=960:true,thoughts:true,briefOpen:false,live:0,resolved:{}};
+  componentDidMount(){
+    try{const s=JSON.parse(localStorage.getItem('loomProto')||'{}');if(s.route)this.setState({route:s.route,ticketId:s.ticketId||null});}catch(e){}
+    import(new URL('loom-data.js',document.baseURI).href).then(D=>this.setState({D}));
+    this._r=()=>this.setState({wide:window.innerWidth>=960});window.addEventListener('resize',this._r);
+    this._t=setInterval(()=>{const D=this.state.D;if(!D)return;if(this.state.live<D.transcripts.loom94[0].pending.length)this.setState(s=>({live:s.live+1}));},4000);
+  }
+  componentWillUnmount(){window.removeEventListener('resize',this._r);clearInterval(this._t);}
+  go(route,extra={}){this.setState({route,more:false,...extra},()=>{try{localStorage.setItem('loomProto',JSON.stringify({route:this.state.route,ticketId:this.state.ticketId}));}catch(e){}});try{(document.scrollingElement||document.documentElement).scrollTop=0;}catch(e){}}
+  open(id){this.go('ticket',{ticketId:id,run:null,tab:'transcript',briefOpen:false});}
+  row(t){
+    const STATES=this.state.D.STATES;const failed=t.state==='failed';const idx=failed?3:STATES.indexOf(t.state);
+    const dots=STATES.map((_,i)=>({c:i<idx?G:i===idx?(failed?R:t.state==='verified'?G:A):OFF}));
+    const flags={running:[t.age,A],queued:['queued',M],briefed:[t.sub||'briefed','#c9d0db'],pr:['pr #'+t.pr+' \u00b7 '+t.sub,t.sub==='ready'?G:A],merged:['merged',G],shipped:[t.sub||'shipped',B],verified:['verified',G],failed:[t.sub||'failed',R]};
+    let [flag,flagColor]=flags[t.state];
+    if(t.attempts>1)flag='attempt '+t.attempts+' \u00b7 '+flag;
+    if(t.regression){flagColor=R;}
+    return {...t,sid:sid(t.id),dots,flag,flagColor,laneLine:t.lane?t.lane+' \u00b7 '+t.model:'unassigned \u00b7 '+t.difficulty,ladder:'rung '+t.rung+' \u00b7 '+t.attempts+' attempts',open:()=>this.open(t.id)};
+  }
+  genDetail(t){
+    const S=this.state.D.STATES;const idx=t.state==='failed'?3:S.indexOf(t.state);
+    const steps=[['brain','Briefed from goal '+sid(t.goal)+'. '+t.difficulty+', so '+(t.lane||'the next free lane')+'.'],['lane',(t.lane||'a lane')+' claimed it from the station.'],['lane','Opened PR #'+(t.pr||'')+' on its own branch.'],['grug','Reviewed. Findings answered, CI green.'],['brain','Merged under the project ship rules.'],['brain','Shipped. Waiting for live proof.'],['ok','Verified: proof line seen live and the metric moved.']];
+    const path=steps.slice(0,Math.max(1,idx)).map((s,i)=>({ts:null,who:s[0],text:s[1]}));
+    if(t.state==='failed')path.push({ts:null,who:'fail',text:'Past the last rung. Waiting for the brain to rule on the open finding.'});
+    else if(t.state!=='verified')path.push({ts:null,who:'next',text:'Next: '+S[Math.min(idx+1,6)]+'.'});
+    return {checks:[{done:idx>2,text:'A test fails without the fix'},{done:idx>3,text:t.title},{done:t.state==='verified',text:"Live: the proof line shows and the goal's metric moved"}],path,
+      pr:t.pr?{num:t.pr,ci:[['unit',idx>=3?'pass':'running'],['format, grug recheck','pass'],['review, grug',t.sub==='fixing'?'2 open':'0 open']],files:[['bus/'+(t.id.includes('assay')?'bench':'station')+'.py',24,5],['tests/test_'+t.id.split('#')[1]+'.py',18,0]],threads:t.sub==='fixing'?[{ts:null,severity:'medium',text:'p95 is computed over all lanes, not per lane.',resolved:false},{ts:null,severity:'low',text:'Name the unit in the column header.',resolved:false}]:[]}:null,summary:t.note||null};
+  }
+  genRun(t){
+    const ev=(role,kind,text)=>({ts:null,role,kind,text});
+    if(!t.lane)return {slot:'none',model:'',outcome:'queued',events:[]};
+    return {slot:t.lane,model:t.model,outcome:t.state==='running'?'running':t.state==='failed'?'failed':'done',events:[ev('user','text','Why: '+t.title+'.\nWhat: the change, a test that fails without it, and the live proof.\nSize: M'),ev('thinking','text','Find where this lives, write the failing test first, then the smallest change that passes it.'),ev('assistant','tool_use','Bash\ncommand: python -B -m unittest discover -s tests'),ev('tool','tool_result',t.state==='running'?'running\u2026':'OK'),ev('assistant','text',t.state==='running'?'Working on the change.':'Pushed. The runner opened the pull request.')]};
+  }
+  events(t,det,run,isLast){
+    let evs=run.events.slice();
+    if(t.live)evs=evs.concat(run.pending.slice(0,this.state.live));
+    if(isLast&&det.pr)det.pr.threads.forEach(th=>{if(th.ts){evs.push({ts:th.ts,role:'grug',text:th.severity+' \u00b7 '+th.text});if(th.answer)evs.push({ts:th.ts.replace(/:00Z$/,':30Z'),role:'answer',text:th.answer});}});
+    evs=evs.map((e,i)=>({...e,_i:i})).sort((a,b)=>(a.ts&&b.ts&&a.ts!==b.ts)?(a.ts<b.ts?-1:1):a._i-b._i);
+    const out=[];const P=(o)=>out.push({isThink:false,isSay:false,isBrief:false,isCode:false,isLog:false,isQuote:false,isLive:false,lines:[],bd:'#222935',...o});
+    for(let i=0;i<evs.length;i++){const e=evs[i];const at=hm(e.ts);
+      if(e.role==='user'){const open=this.state.briefOpen;P({label:'brief',color:M,at,isBrief:true,text:open?e.text:e.text.split('\n')[0],more:open?'hide the brief':'show the full brief',toggle:()=>this.setState(s=>({briefOpen:!s.briefOpen}))});}
+      else if(e.role==='thinking'){if(this.state.thoughts)P({label:'thought',color:M,at,isThink:true,text:e.text});}
+      else if(e.role==='grug')P({label:'grug',color:R,at,isQuote:true,text:e.text,bd:'oklch(0.72 0.15 25 / 0.35)'});
+      else if(e.role==='answer')P({label:'answered',color:A,at,isQuote:true,text:e.text});
+      else if(e.kind==='tool_use'){const L=e.text.split('\n');const tool=L[0];let head,body=[];
+        if(tool==='Edit'){head=(L.find(l=>l.startsWith('file_path:'))||'').replace('file_path: ','');body=L.filter(l=>/^[+-]/.test(l)).map(l=>({t:l,c:l[0]==='+'?G:R}));}
+        else head='$ '+L.slice(1).map(l=>l.replace(/^command: /,'')).join(' ');
+        let res=[];if(evs[i+1]&&evs[i+1].kind==='tool_result'){res=evs[i+1].text.split('\n').filter(Boolean).map(l=>({t:l,c:/FAIL|Error|failed/.test(l)?R:/passed|^OK/.test(l)?G:'#9aa4b4'}));i++;}
+        P({label:tool==='Edit'?'edited':'ran',color:tool==='Edit'?G:B,at,isCode:true,head,lines:body.concat(res)});}
+      else if(e.kind==='tool_result')P({label:'output',color:M,at,isCode:true,head:'',lines:e.text.split('\n').map(l=>({t:l,c:'#9aa4b4'}))});
+      else if(e.role==='runner')P({label:'runner',color:M,at,isLog:true,text:e.text});
+      else P({label:'said',color:'#e2e6ee',at,isSay:true,text:e.text});
+    }
+    if(t.live)P({label:'live',color:A,at:'now',isLive:true,text:'thinking\u2026 streaming from '+t.lane});
+    return out;
+  }
+  renderVals(){
+    const st=this.state,D=st.D,wide=st.wide;
+    const base={wide,narrow:!wide,loading:!D};
+    const R0=['isFloor','isGoals','isTickets','isTicket','isBrain','isHot','isImprove','isLanes','isAsks'];
+    if(!D){const o={...base};R0.forEach(k=>o[k]=false);return o;}
+    const route=st.route;const S=D.STATES;
+    const rows=D.tickets.map(t=>this.row(t));
+    const asksOpen=D.asks.filter(a=>!st.resolved[a.id]).length;
+    const NAV=[['floor','Floor'],['goals','Goals'],['tickets','Tickets'],['brain','Brain'],['hotspots','Hot spots'],['improve','Improving'],['lanes','Lanes & models'],['asks','Asks']];
+    const activeKey=route==='ticket'?'tickets':route;
+    const nav=NAV.map(([k,label])=>({label,count:k==='asks'&&asksOpen?String(asksOpen):'',bg:activeKey===k?'#1b212b':'transparent',color:activeKey===k?'#e2e6ee':'#9aa4b4',onClick:()=>this.go(k,k==='tickets'?{filter:'all',goal:null}:{})}));
+    const moreKeys=['hotspots','improve','lanes','asks'];
+    const tabs=[['floor','floor'],['goals','goals'],['tickets','tickets'],['brain','brain'],['more','more']].map(([k,label])=>{const on=k==='more'?(moreKeys.includes(route)||st.more):activeKey===k&&!st.more;return {label,color:on?A:M,bar:on?A:'transparent',onClick:()=>k==='more'?this.setState(s=>({more:!s.more})):this.go(k)};});
+    const moreItems=[['hotspots','Hot spots',''],['improve','Improving',''],['lanes','Lanes & models',''],['asks','Asks',asksOpen?String(asksOpen):'']].map(([k,label,count])=>({label,count,onClick:()=>this.go(k)}));
+    // floor
+    const cnt=k=>D.tickets.filter(t=>t.state===k).length;
+    const dw=Object.fromEntries(D.dwell.map(d=>[d.state,d]));
+    const conveyor=S.concat(['failed']).map(k=>({k,n:cnt(k),color:k==='failed'?R:SC[k],bd:k==='pr'?'oklch(0.82 0.14 75 / 0.45)':'#222935',wait:dw[k]?'~'+dw[k].median+'h':k==='verified'?'done':'needs ruling',onClick:()=>this.go('tickets',{filter:k,goal:null})}));
+    const order=['running','pr','briefed','merged','shipped'];
+    const moving=rows.filter(t=>order.includes(t.state)).sort((a,b)=>order.indexOf(a.state)-order.indexOf(b.state));
+    const su=D.standup;
+    const standupLines=[...su.well.map(x=>['well',x,G]),...su.notWell.map(x=>['not well',x,R]),...su.stuck.map(x=>['stuck',x,A]),['next',su.next,B]].map(([k,text,color])=>({k,text,color}));
+    // goals
+    const goalCards=D.goals.map(g=>{const tr=g.metric.trend;const mx=Math.max(...tr),mn=Math.min(...tr);const n=D.tickets.filter(t=>t.goal===g.id).length;
+      return {sid:sid(g.id),title:g.title,value:g.metric.value,valueColor:g.metric.regression?R:'#e2e6ee',metricLine:g.metric.name+' \u00b7 was '+g.metric.prev,tag:g.metric.regression?'regression':'improving',tagColor:g.metric.regression?R:G,bd:g.metric.regression?'oklch(0.72 0.15 25 / 0.4)':'#222935',
+        bars:tr.map((v,i)=>({h:Math.round(20+80*(v-mn)/((mx-mn)||1))+'%',c:i===tr.length-1?(g.metric.regression?R:A):'#333c4a'})),
+        counts:S.concat(['failed']).filter(k=>g.counts[k]).map(k=>({k,n:g.counts[k],color:SC[k]})),report:g.report,ticketsLine:n+' tickets on this goal \u2192',open:()=>this.go('tickets',{goal:g.id,filter:'all'})};});
+    // tickets
+    const inGoal=rows.filter(t=>!st.goal||t.goal===st.goal);
+    const stateChips=['all','running','pr','briefed','queued','merged','shipped','verified','failed'].map(k=>{const n=k==='all'?inGoal.length:inGoal.filter(t=>t.state===k).length;const on=st.filter===k;return {label:k,n,bg:on?'#1b212b':'transparent',color:on?'#e2e6ee':'#9aa4b4',bd:on?'#3a4352':'#222935',onClick:()=>this.setState({filter:k})};}).filter(c=>c.n>0||c.label===st.filter);
+    const goalChips=[{id:null,label:'all goals'}].concat(D.goals.map(g=>({id:g.id,label:sid(g.id)}))).map(g=>{const on=st.goal===g.id;return {label:g.label,bg:on?'#1b212b':'transparent',color:on?'#e2e6ee':'#7a8596',onClick:()=>this.setState({goal:g.id})};});
+    const ticketRows=inGoal.filter(t=>st.filter==='all'||t.state===st.filter);
+    // ticket
+    let tk={};
+    if(route==='ticket'){
+      const t=rows.find(r=>r.id===st.ticketId)||rows[0];const det=D.details[t.id]||this.genDetail(t);
+      const runs=det.runs?D.transcripts[det.runs]:[this.genRun(t)];const ri=st.run==null?runs.length-1:st.run;const run=runs[ri];
+      const idx=t.state==='failed'?3:S.indexOf(t.state);
+      const WHO={brain:B,lane:'#9aa4b4',grug:R,fail:R,ok:G,next:OFF,live:A};
+      const pr=det.pr;
+      tk={...t,goalSid:sid(t.goal),meta:[t.lane&&t.lane+' \u00b7 '+t.model,t.difficulty,t.attempts+' attempt'+(t.attempts>1?'s':''),t.rung?'rung '+t.rung:null].filter(Boolean).join(' \u00b7 '),
+        strip:S.map((k,i)=>({k,c:i<idx?G:i===idx?(t.state==='failed'?R:t.state==='verified'?G:A):OFF,t:i===idx?'#e2e6ee':M})),
+        checks:det.checks.map(c=>({mark:c.done?'\u2713':'\u25cb',color:c.done?G:M,text:c.text})),
+        path:det.path.map(e=>({who:e.who==='next'?'next':e.who==='live'?'now':e.who==='ok'?'clean':e.who,at:e.ts?hm(e.ts):'',dot:WHO[e.who]||M,text:e.text,meta:e.meta||'',hasMeta:!!e.meta})),
+        multiRun:runs.length>1,
+        runChips:runs.map((r,i)=>({n:i+1,bg:i===ri?'#262d39':r.outcome==='done'?'oklch(0.78 0.13 155 / 0.18)':'oklch(0.72 0.15 25 / 0.14)',bd:i===ri?'#e2e6ee':'transparent',t:i===ri?'#e2e6ee':r.outcome==='done'?G:'#9aa4b4',onClick:()=>this.setState({run:i})})),
+        runLine:run.slot==='none'?'No run yet. Waiting for a free lane.':'attempt '+(ri+1)+' \u00b7 '+run.slot+' \u00b7 '+run.model+' \u00b7 '+run.outcome,
+        events:this.events(t,det,run,ri===runs.length-1),
+        hasPr:!!pr,noPr:!pr,prLine:pr?'PR #'+pr.num+' \u00b7 checks':'',
+        ci:pr?pr.ci.map(([name,s])=>({name,state:s,color:/pass|0 open/.test(s)?G:/open|fail/.test(s)?R:A})):[],
+        files:pr?pr.files.map(([name,p,m])=>({name,p,m})):[],
+        threads:pr?pr.threads.map(th=>({head:th.severity+(th.resolved?' \u00b7 resolved':' \u00b7 open'),color:th.resolved?G:R,text:th.text})):[],
+        noThreads:!pr||pr.threads.length===0,
+        summary:det.summary||'',hasSummary:!!det.summary,
+        proofHead:t.state==='verified'?'Proof \u00b7 seen live':'Proof \u00b7 waiting',proofColor:t.state==='verified'?G:A,
+        proof:t.state==='verified'?'Proof line seen on the live system and the goal metric moved. Closed loom:verified.':det.checks[2].text.replace(/^Live: /,'')+'. The brain reads it after ship.'};
+    }
+    const tab=st.tab;
+    const ticketTabs=['transcript','path','pr'].map(k=>({label:k,bg:tab===k?'#262d39':'transparent',color:tab===k?'#e2e6ee':'#9aa4b4',onClick:()=>this.setState({tab:k})}));
+    // brain
+    const TAG={regression:R,operator:A,merged:G,verifying:A,deferred:M};
+    const br=D.brain;
+    const tickSteps=br.steps.map((k,i)=>({k,bg:i<br.step?'oklch(0.78 0.13 155 / 0.5)':i===br.step?A:'#151a22',bd:i===br.step?A:i<br.step?'transparent':'#262d39',c:i===br.step?A:M}));
+    const thoughts=br.thoughts.map(t=>({...t,color:TAG[t.tag]||M}));
+    const ranking=br.ranking.map((r,i)=>({...r,n:i+1,color:i===0?A:'#e2e6ee'}));
+    const OC={running:A,done:G,stopped:M};
+    const ticks=br.ticks.map(k=>({...k,head:k.holder+' \u00b7 '+k.outcome,color:OC[k.outcome]}));
+    // hot
+    const mxd=Math.max(...D.dwell.map(d=>d.median));
+    const dwell=D.dwell.map(d=>({state:d.state,label:d.median+'h median \u00b7 '+d.worst+'h worst',w:Math.round(d.median/mxd*100)+'%',color:d.median===mxd?A:'#5f6a7b',note:d.note||'',hasNote:!!d.note}));
+    const mf=Math.max(...D.findings.map(f=>f.n));
+    const findings=D.findings.map(f=>({...f,w:Math.round(f.n/mf*100)+'%',arrow:f.trend==='down'?'\u2193':f.trend==='up'?'\u2191':'\u2192',tc:f.trend==='down'?G:f.trend==='up'?R:M}));
+    const ml=Math.max(...D.laneFail.map(l=>l[1]));
+    const laneFail=D.laneFail.map(([name,p])=>({name,pct:p+'%',h:Math.round(p/ml*100)+'%',c:p>20?R:'#3a4352'}));
+    const stuck=rows.filter(t=>t.rung>0||t.state==='failed').sort((a,b)=>b.attempts-a.attempts);
+    // improve
+    const LS=['noticed','ticketed','shipped','moved'];
+    const loopStages=LS.map((k,i)=>({k,n:D.improvements.filter(x=>x.stage>=i).length,color:i===3?G:'#e2e6ee',sub:['in a tick journal','on loom#30 or grug#1143','live on the factory','a factory number changed'][i]}));
+    const improvements=D.improvements.map(x=>{const t=rows.find(r=>r.id===x.ticket);return {...x,sid:sid(x.ticket),state:t?t.state:'',color:t?SC[t.state]:M,steps:LS.map((_,i)=>({c:i<=x.stage?(i===3?G:A):OFF})),hasMoved:!!x.moved,open:()=>this.open(x.ticket)};});
+    const factory=D.factory.map(f=>({...f,delta:'was '+f.prev+(f.cap?' \u00b7 cap '+f.cap:''),color:f.good?G:R}));
+    // lanes
+    const LC={busy:A,free:G,held:R};
+    const laneRows=D.lanes.map(l=>({...l,dot:LC[l.state],line:l.ticket?sid(l.ticket)+' \u00b7 '+l.note:(l.note||'waiting for work'),qw:l.quota+'%',qc:l.quota<25?R:'#5f6a7b',cursor:l.ticket?'pointer':'default',open:()=>l.ticket&&this.open(l.ticket)}));
+    const modelTiers=D.models.map(m=>{const mx=36;return {tier:m.tier,share:m.share+'%',rows:m.rows.map(([model,lane,prs,merged,closed])=>({model,lane,label:prs+' PRs, '+merged+' merged',mw:(merged/mx*100)+'%',ow:((prs-merged-closed)/mx*100)+'%',cw:(closed/mx*100)+'%'}))};});
+    // asks
+    const askCards=D.asks.map(a=>{const r=st.resolved[a.id];return {...a,sid:sid(a.id),open:!r,done:!!r,bd:r?'#222935':'oklch(0.82 0.14 75 / 0.38)',doneText:r?'"'+r+'" sent. The brain picks it up on the next tick.':'',
+      actions:a.actions.map((label,i)=>({label,bg:i===0?A:'transparent',color:i===0?'#0e1117':'#e2e6ee',bd:i===0?A:'#3a4352',onClick:()=>this.setState(s=>({resolved:{...s.resolved,[a.id]:label}}))}))};});
+    const o={...base,nav,tabs,moreItems,moreOpen:st.more&&!wide,closeMore:()=>this.setState({more:false}),
+      standup:su,standupLines,conveyor,moving,brain:br,askCount:String(asksOpen),
+      goTickets:()=>this.go('tickets',{filter:'all',goal:null}),goBrain:()=>this.go('brain'),goAsks:()=>this.go('asks'),
+      goalCards,stateChips,goalChips,ticketRows,noTickets:ticketRows.length===0,clearFilters:()=>this.setState({filter:'all',goal:null}),
+      tk,ticketTabs,ticketCols:wide?'260px minmax(0,1fr) 300px':'minmax(0,1fr)',showPath:wide||tab==='path',showTranscript:wide||tab==='transcript',showPr:wide||tab==='pr',
+      back:()=>this.go('tickets'),toggleThoughts:()=>this.setState(s=>({thoughts:!s.thoughts})),thoughtsLabel:st.thoughts?'thoughts: on':'thoughts: off',thoughtsColor:st.thoughts?'#e2e6ee':M,
+      tickSteps,thoughts,ranking,ticks,dwell,findings,laneFail,stuck,loopStages,improvements,factory,laneRows,modelTiers,askCards,human:D.human};
+    const map={floor:'isFloor',goals:'isGoals',tickets:'isTickets',ticket:'isTicket',brain:'isBrain',hotspots:'isHot',improve:'isImprove',lanes:'isLanes',asks:'isAsks'};
+    R0.forEach(k=>o[k]=map[route]===k);
+    return o;
+  }
+}
+</script>
+</body>
+</html>

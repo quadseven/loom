@@ -1,0 +1,16 @@
+{
+  "enableTerminalSandbox": false,
+  "permissions": {
+    "allow": [
+      "command(*)",
+      "read_file(*)",
+      "write_file(*)"
+    ],
+    "deny": [
+      "read_url(*)",
+      "execute_url(*)",
+      "command(security)",
+      "command(/usr/bin/security)"
+    ]
+  }
+}

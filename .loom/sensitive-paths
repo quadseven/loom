@@ -1,0 +1,13 @@
+# Sensitive paths for change classification (bus/change_class.py).
+# One glob per line; lines starting with # are comments. A pattern ending
+# in / is a directory prefix. Read from the default branch. Any changed
+# file matching one of these makes the whole change class:sensitive.
+bus/brain.py
+bus/factory.py
+bus/proof.py
+lanes/mac/install.sh
+.github/
+# Dashboard screens merge only after the brain has looked at them in a
+# browser at phone and desktop widths (2026-10-14: a screen merged unseen
+# with empty and junk sections).
+dashboard/
