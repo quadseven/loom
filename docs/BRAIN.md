@@ -2702,3 +2702,23 @@ before it (counted quiet in the digest); a heartbeat is an edit, never a new
 comment, so it is never pushed. A read that fails pushes the report. The
 daily Visibility number counts a quiet goal as current: its last report is
 owed no successor.
+
+### Open pull request backpressure
+
+Before dispatching a new build, the station counts open PRs from its configured
+brief authors and briefers. Bot authors, `loom/` branches and recognized lane
+footers count, including drafts; ordinary personal PRs do not. Keep every brain
+App in the configured briefing identities so its work contributes to the cap.
+`LOOM_REPO_OPEN_PR_CAP` defaults to 8. A positive integer changes the default;
+space-separated `OWNER/REPO=cap` entries override it for individual repositories.
+For example, `8 example/project=5` sets that repository to five. Invalid values
+refuse startup rather than silently removing the limit.
+
+At or above the cap, the ticket keeps its queued/briefed state and its status
+records the count and cap. Repeated identical holds add no new status event.
+Fix rounds and verification runs remain runnable. A failed or malformed PR read
+holds new builds; rate limits still propagate. Reads cover all pages, up to 25
+pages per repository; exceeding that budget is unread, never a partial count.
+The lane status shows each repository's count and cap, republishing when those
+values change. Public status hides private repository names. This is a per-pass
+snapshot, not a reservation system for builds already running in other lanes.
