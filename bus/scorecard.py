@@ -370,6 +370,13 @@ class Scorecard:
         if not heads or any(not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", h)
                             for h in heads):
             raise ValueError("the merged review heads cannot be read")
+        check_name = self.env.get("LOOM_REVIEW_CHECK") or factory.DEFAULT_REVIEW_CHECK
+        return self._human_review_rounds(reviews, bot) + sum(
+            self._failed_review_head(gh, repo, h, check_name) for h in sorted(heads))
+
+    @staticmethod
+    def _human_review_rounds(reviews: Sequence[Any], bot: str) -> int:
+        """Count distinct human change requests after validating their authors."""
         human = set()
         for review in reviews:
             if not isinstance(review, dict) or not isinstance(review.get("user"), dict):
@@ -381,8 +388,7 @@ class Scorecard:
                 if type(review.get("id")) is not int:
                     raise ValueError("the merged review identity cannot be read")
                 human.add(review["id"])
-        check_name = self.env.get("LOOM_REVIEW_CHECK") or factory.DEFAULT_REVIEW_CHECK
-        return len(human) + sum(self._failed_review_head(gh, repo, h, check_name) for h in sorted(heads))
+        return len(human)
 
     @staticmethod
     def _failed_review_head(gh: Any, repo: str, head: str, check_name: str) -> bool:

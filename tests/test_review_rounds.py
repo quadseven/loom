@@ -148,6 +148,14 @@ class ReviewRounds(unittest.TestCase):
 
 
 class RoundReport(unittest.TestCase):
+    def test_review_round_readers_stay_under_review_complexity_cap(self):
+        from test_brain_station_complexity import CAP, complexity, qualified_names
+        names = dict(qualified_names("bus/scorecard.py"))
+        for name in ("Scorecard._review_rounds", "Scorecard._human_review_rounds",
+                     "Scorecard._failed_review_head"):
+            self.assertIn(name, names)
+            self.assertLessEqual(complexity(names[name]), CAP, name)
+
     def test_mean_score_and_rounds_ignore_unknown_history_and_old_records(self):
         base = {"lane": "codex", "model": "example", "kind": "logic", "merged": True,
                 "at": NOW, "settled": "hard", "perceived": "hard"}
