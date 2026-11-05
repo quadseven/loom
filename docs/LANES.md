@@ -1214,6 +1214,20 @@ its ...s deadline without a clean finish`. The default sits above a daily
 metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
 its own (loom#1924).
 
+## Paused steps
+
+`LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
+of step method names, for example `triage_backlogs rewrite_triaged
+move_outside_tickets`. The station also reads names from
+`state/station/paused_steps.txt` (same form, any whitespace) and reads both
+again on every pass, so writing or emptying that file pauses or resumes a step
+with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
+comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
+pass and counts as done, so the rotation moves on and nothing carries over. A
+name that is not a pass step logs `unknown paused step <name>, ignored` and
+pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
+paused; the work a pass does before or after it always runs.
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
