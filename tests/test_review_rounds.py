@@ -8,7 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bus import difficulty, scorecard
+from bus import difficulty
 import test_difficulty
 from test_scorecard import BOT, NOW, REPO, card
 
@@ -120,13 +120,21 @@ class ReviewRounds(unittest.TestCase):
             self.fake.routes[self.path(head)] = {"check_runs": []}
         self.assertEqual(self.merged()["rounds"], 0)
 
-    def test_history_budget_exhaustion_never_persists_partial_count(self):
-        from unittest.mock import patch
-        with patch.object(scorecard, "MAX_REVIEW_HEADS", 2):
-            self.assertNotIn("rounds", self.merged())
-        self.fake.routes[self.path("a")] = {"check_runs": [check("a" * 40)] * 100}
-        with patch.object(scorecard, "MAX_REVIEW_CHECK_PAGES", 2):
-            self.assertNotIn("rounds", self.merged())
+    def test_more_than_25_heads_are_fully_counted(self):
+        commits = [{"sha": "%040x" % i} for i in range(1, 27)]
+        self.fake.routes["/repos/%s/pulls/1/commits" % REPO] = commits
+        for commit in commits:
+            sha = commit["sha"]
+            path = "/repos/%s/commits/%s/check-runs" % (REPO, sha)
+            self.fake.routes[path] = {"check_runs": [check(sha)]}
+        self.assertEqual(self.merged()["rounds"], 26)
+
+    def test_failure_on_fourth_check_page_is_counted(self):
+        path = self.path("a") + "?filter=all&per_page=100&page="
+        for page in range(1, 4):
+            self.fake.routes[path + str(page)] = {"check_runs": [check("a" * 40, "success")] * 100}
+        self.fake.routes[path + "4"] = {"check_runs": [check("a" * 40)]}
+        self.assertEqual(self.merged()["rounds"], 2)
 
     def test_old_settled_record_is_backfilled_without_rescoring(self):
         state = card()

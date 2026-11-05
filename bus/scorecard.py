@@ -66,10 +66,6 @@ FILE = "scorecard.json"
 PICKED_LANES = ("opencode-go", "zen")
 MODEL_KEY = "model:"
 REFRESH = 3600
-# A merge's optional metric cannot consume an unbounded history sweep.
-# Exceeding either budget leaves it unknown, never partially counted.
-MAX_REVIEW_HEADS = 25
-MAX_REVIEW_CHECK_PAGES = 3
 DEFAULT_DAYS = 7
 DEFAULT_AT = 3
 DEFAULT_ZERO_DONE = 20
@@ -371,8 +367,6 @@ class Scorecard:
         heads = {c["sha"] for c in commits}
         heads.update(r.get("commit_id") for r in reviews if isinstance(r, dict))
         heads.discard(None)
-        if len(heads) > MAX_REVIEW_HEADS:
-            raise ValueError("review history exceeds the head-read budget")
         if not heads or any(not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", h)
                             for h in heads):
             raise ValueError("the merged review heads cannot be read")
@@ -394,8 +388,8 @@ class Scorecard:
     def _failed_review_head(gh: Any, repo: str, head: str, check_name: str) -> bool:
         """Read every check page, retaining only substantive failed verdicts."""
         from . import factory
-        failed = False
-        for page in range(1, MAX_REVIEW_CHECK_PAGES + 1):
+        failed, page = False, 1
+        while True:
             data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
                            % (repo, head, page)).data
             if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
@@ -413,7 +407,7 @@ class Scorecard:
                     failed = True
             if len(checks) < 100:
                 return failed
-        raise ValueError("review history exceeds the check-page budget")
+            page += 1
 
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:

@@ -115,7 +115,7 @@ def markdown(records: Mapping[str, Mapping[str, Any]], now: float,
     lines = ["", "Difficulty: the brief's guess against a blind settled score (from the "
              "merged diff, fix rounds and review findings), the last %d days. A positive "
              "bias means the work was harder than the brief said. Review score is easy=1, "
-             "medium=2, hard=3 minus review rounds, floored at zero. Rounds and mean "
+             "medium=2, hard=3 minus review rounds, with a minimum of zero. Rounds and mean "
              "score use only records with known review history; '-' means unavailable." % days, "",
              TABLE_HEAD, "|---|---|---|---|---|---|---|---|---|---|"]
     if not rows:
