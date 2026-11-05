@@ -36,6 +36,7 @@ class FakeGitHub:
         self.comments = []
         self.build_ready = True
         self.build_sha = "e" * 40
+        self.source_ticket_labels = []
 
     def paginate(self, path):
         if path == "/repos/example-owner/project/issues/12/comments":
@@ -57,6 +58,9 @@ class FakeGitHub:
     def _source_route(self, method, path, body):
         if path == "/repos/%s/contents/%s" % ("example-owner/project", DOC):
             return self.answer({"content": self.encoded(self.doc), "sha": "doc"})
+        if path == "/repos/%s/issues/3" % SOURCE:
+            return self.answer({"labels": [{"name": name}
+                                             for name in self.source_ticket_labels]})
         if path.endswith("/pulls?state=closed&sort=updated&direction=desc&per_page=100"):
             source = path.split("/repos/", 1)[1].split("/pulls?", 1)[0]
             return self.answer(self.merges.get(source, []))
@@ -126,7 +130,8 @@ class RollPinTest(unittest.TestCase):
     def merge(self, sha, repo=SOURCE):
         pulls = self.gh.merges.setdefault(repo, [])
         pulls.insert(0, {"number": len(pulls) + 1,
-            "merged_at": "2030-01-01T00:00:00Z", "merge_commit_sha": sha})
+            "merged_at": "2030-01-01T00:00:00Z", "merge_commit_sha": sha,
+            "body": "Refs #3", "head": {"ref": "loom/3-fix"}})
 
     def test_merge_opens_one_pull_and_second_merge_updates_exact_ship_document_pins(self):
         self.merge(FIRST)
@@ -253,6 +258,35 @@ class RollPinTest(unittest.TestCase):
         self.assertTrue(merge.call_args.kwargs["adopt"])
         self.assertEqual(merge.call_args.kwargs["env"]["LOOM_BRIEF_AUTHORS"], "example-bot")
         self.assertFalse(any("Family gate is open" in c["body"] for c in self.gh.comments))
+
+    def test_nonurgent_bridge_ship_waits_two_hours_after_the_previous_ship(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", return_value={"merged": True}) as merge:
+            settings = Settings(home, [], [], [], roll_ship_docs=self.specs)
+            Station(self.gh, settings, now=1000).roll_source_pins()
+            merge.reset_mock()
+            Station(self.gh, settings, now=8199).roll_source_pins()
+            merge.assert_not_called()
+            Station(self.gh, settings, now=8200).roll_source_pins()
+        merge.assert_called_once()
+
+    def test_urgent_source_ticket_bypasses_bridge_ship_hold_and_logs_why(self):
+        self.merge(FIRST)
+        self.specs[0]["gate_url"] = "https://example.com/family-gate"
+        self.gh.source_ticket_labels = ["loom:urgent"]
+        with TemporaryDirectory() as home, \
+                mock.patch("bus.roll_pin.health.fetch", return_value={"open": True}), \
+                mock.patch("bus.roll_pin.brain.merge", return_value={"merged": True}) as merge, \
+                mock.patch("builtins.print") as printed:
+            settings = Settings(home, [], [], [], roll_ship_docs=self.specs)
+            Station(self.gh, settings, now=1000).roll_source_pins()
+            merge.reset_mock()
+            Station(self.gh, settings, now=1001).roll_source_pins()
+        merge.assert_called_once()
+        self.assertIn("urgent", " ".join(str(call.args[0]) for call in printed.call_args_list))
 
     def test_a_hand_made_roll_pin_is_alerted_when_the_family_gate_opens(self):
         self.merge(FIRST)

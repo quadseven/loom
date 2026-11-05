@@ -4,7 +4,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
+import os
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 from urllib.parse import urlsplit
@@ -20,6 +23,12 @@ MARKER = "<!-- loom:roll-pin "
 # A goal home whose body names a roll ("roll" or "rolls", not "rolling" or
 # "rollback") ships through one, so it needs a roll ship document.
 ROLL_WORD = re.compile(r"(?i)\brolls?\b")
+BRIDGE_SHIP_HOLD = 2 * 60 * 60
+BRIDGE_SHIP_FILE = "bridge_ship.json"
+
+
+def _say(message: str) -> None:
+    print("roll pin: %s" % message, flush=True)
 
 
 def ships_by_roll(body: str) -> bool:
@@ -107,12 +116,77 @@ def _validate_source(source: Any) -> None:
         raise ValueError("roll source pin paths must be unique")
 
 
-def _latest_merge(gh: GitHub, repo: str) -> str:
+def _latest_merge(gh: GitHub, repo: str) -> dict[str, Any] | None:
     pulls = gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100"
                     % repo).data or []
     merged = [p for p in pulls if p.get("merged_at") and SHA.fullmatch(
         str(p.get("merge_commit_sha") or ""))]
-    return str(max(merged, key=lambda p: p["merged_at"])["merge_commit_sha"]) if merged else ""
+    return max(merged, key=lambda p: p["merged_at"]) if merged else None
+
+
+def _urgent_reason(gh: GitHub, repo: str, pr: dict[str, Any]) -> str:
+    """The linked source ticket's urgent label, if this pull request has one."""
+    ticket = brain._ticket_association(repo, pr)
+    if ticket is None:
+        return ""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    names = {str(label.get("name") if isinstance(label, dict) else label)
+             for label in issue.get("labels") or []}
+    return "urgent fix %s#%d carries loom:urgent" % ticket if "loom:urgent" in names else ""
+
+
+def _ship_state(state_dir: str) -> tuple[str, dict[str, Any]]:
+    path = os.path.join(state_dir, BRIDGE_SHIP_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        return path, {}
+    if not isinstance(state, dict):
+        raise ValueError("bridge ship state must be a JSON object")
+    shipped_at = state.get("shipped_at")
+    if shipped_at is not None and (not isinstance(shipped_at, (int, float))
+                                   or isinstance(shipped_at, bool)
+                                   or not math.isfinite(shipped_at)):
+        raise ValueError("bridge ship state has an invalid ship time")
+    return path, state
+
+
+def _save_ship_state(path: str, state: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=1, sort_keys=True)
+    os.replace(temporary, path)
+
+
+def _gate_pull(gh: GitHub, spec: dict[str, str], deploy: str,
+               manual: dict[str, Any] | None) -> dict[str, Any] | None:
+    if manual is not None:
+        return manual
+    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
+    return next((pr for pr in pulls
+                 if (pr.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
+
+
+def _gate_is_open(gate: Any) -> bool:
+    if (not isinstance(gate, dict) or type(gate.get("open")) not in (bool, int)
+            or gate["open"] not in (0, 1)):
+        raise ValueError("roll family gate must answer with a boolean or 0/1 open field")
+    return bool(gate["open"])
+
+
+def _bridge_ship_waits(ship_state: dict[str, Any], now: float, urgent: str) -> bool:
+    last_ship = ship_state.get("shipped_at")
+    elapsed = now - last_ship if last_ship is not None else BRIDGE_SHIP_HOLD
+    if elapsed >= BRIDGE_SHIP_HOLD:
+        return False
+    if urgent:
+        _say("%s; bypassing the two-hour bridge ship hold" % urgent)
+        return False
+    _say("bridge ship held for %d more seconds after the previous ship" %
+         (BRIDGE_SHIP_HOLD - elapsed))
+    return True
 
 
 def _revision(gh: GitHub, source: dict[str, Any], merged_sha: str) -> str:
@@ -356,16 +430,16 @@ def _manual_pin_pull(gh: GitHub, goal: str, deploy: str,
 
 def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
                authors: list[str], review_check: str,
-               manual: dict[str, Any] | None = None) -> None:
-    pulls = gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100" % deploy).data or []
-    pr = manual or next((p for p in pulls if (p.get("head") or {}).get("ref") == _branch(spec["goal"])), None)
+               manual: dict[str, Any] | None, urgent: str,
+               ship_state: dict[str, Any], ship_state_path: str, now: float) -> None:
+    pr = _gate_pull(gh, spec, deploy, manual)
     if pr is None:
         return
-    gate = health.fetch(spec["gate_url"])
-    if (not isinstance(gate, dict) or type(gate.get("open")) not in (bool, int)
-            or gate["open"] not in (0, 1)):
-        raise ValueError("roll family gate must answer with a boolean or 0/1 open field")
-    if not gate["open"]:
+    if not _gate_is_open(health.fetch(spec["gate_url"])):
+        return
+    urgent = urgent or _urgent_reason(gh, deploy, pr)
+    last_ship = ship_state.get("shipped_at")
+    if _bridge_ship_waits(ship_state, now, urgent):
         return
     env = {"LOOM_BRIEF_AUTHORS": " ".join(authors), "LOOM_REVIEW_CHECK": review_check}
     try:
@@ -375,6 +449,11 @@ def _poll_gate(gh: GitHub, spec: dict[str, str], deploy: str,
         return
     except ValueError:
         _gate_alert(gh, spec["goal"], deploy, pr)
+        return
+    ship_state["shipped_at"] = now
+    ship_state["reason"] = urgent or ("two-hour hold elapsed" if last_ship is not None
+                                       else "first bridge ship")
+    _save_ship_state(ship_state_path, ship_state)
 
 
 def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:
@@ -394,20 +473,31 @@ def _gate_alert(gh: GitHub, goal: str, deploy: str, pr: dict[str, Any]) -> None:
 
 
 def run(gh: GitHub, documents: list[dict[str, str]],
-        authors: list[str] | None = None, review_check: str = "") -> None:
+        authors: list[str] | None = None, review_check: str = "",
+        state_dir: str | None = None, now: float | None = None) -> None:
+    if state_dir is None and any(spec.get("gate_url") for spec in documents):
+        raise ValueError("bridge ship gate requires a station state directory")
+    ship_state: dict[str, Any] = {}
+    ship_state_path = ""
+    if state_dir is not None:
+        ship_state_path, ship_state = _ship_state(state_dir)
     for spec in documents:
         text, _ = _content(gh, spec["repo"], spec["path"])
         manifest = _manifest(text)
         deploy = manifest["deployment_repo"]
         manual = _manual_pin_pull(gh, spec["goal"], deploy, manifest) if spec.get("gate_url") else None
+        urgent = ""
         for source in manifest["sources"]:
-            merged_sha = _latest_merge(gh, source["repo"])
-            if merged_sha:
-                revision = _revision(gh, source, merged_sha)
+            merged = _latest_merge(gh, source["repo"])
+            if merged:
+                if spec.get("gate_url"):
+                    urgent = urgent or _urgent_reason(gh, source["repo"], merged)
+                revision = _revision(gh, source, str(merged["merge_commit_sha"]))
                 if manual is None:
                     _update(gh, spec["goal"], deploy, source,
                             revision, manifest["build_workflow"])
                 _merged_build(gh, spec["goal"], deploy,
                               revision, manifest["build_workflow"])
         if spec.get("gate_url"):
-            _poll_gate(gh, spec, deploy, authors or [], review_check, manual)
+            _poll_gate(gh, spec, deploy, authors or [], review_check, manual, urgent,
+                       ship_state, ship_state_path, time.time() if now is None else now)

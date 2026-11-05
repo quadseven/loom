@@ -14919,7 +14919,7 @@ class Station:
         if self.s.roll_ship_docs:
             try:
                 roll_pin.run(self.gh, self.s.roll_ship_docs, self.s.authors,
-                             self.s.review_check)
+                             self.s.review_check, state_dir=self.state, now=self.now)
             except ValueError as err:
                 raise GitHubError("invalid roll ship document or pin: %s" % err) from err
             except health.NotLooked as err:

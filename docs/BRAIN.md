@@ -200,6 +200,14 @@ A ticket a ship rule found deployed whose move to `loom:shipped` failed is
 kept with when it was first found; one still at `loom:merged` 24 hours later
 is listed in the `merged-not-shipped` invariant (docs/LANES.md, Invariants).
 
+A roll ship document with a `gate_url` lets the station merge its ready source-pin
+pull request when the family gate opens. Gate-backed bridge ships share a
+two-hour hold across the station: a non-urgent pin waits until two hours after
+the previous successful pin merge. A linked source ticket labelled
+`loom:urgent` bypasses the hold, and the station log records the bypass reason.
+The last successful ship time is kept in the station state directory, so a
+station restart does not release the hold.
+
 ### Shipping through a pin pull request
 
 A repo that deploys through a pull request in a deployment repo (a digest
