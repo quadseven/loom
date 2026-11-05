@@ -532,6 +532,16 @@ BRIEF_RES = (
     re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
 )
 RUNAWAY = "loom:runaway"
+
+
+def person_claim(issue: Dict[str, Any]) -> Optional[str]:
+    """The login a ticket's first claim:<login> label names, else None. A
+    claimed ticket is that person's work: the ladder never moves it and the
+    move cap never holds it as a runaway (loom#2003)."""
+    found = tickets.claimed_by(issue)
+    return found[0] if found else None
+
+
 # A ticket no lane takes stops moving after this many moves (loom#2333): one
 # went between two rungs 13 times in a week with no run. LOOM_UNCLAIMED_MOVE_CAP
 # sets it; 0 turns the cap off.
@@ -2201,7 +2211,10 @@ class Factory:
 
     def _move_capped(self, repo: str, issue: Dict[str, Any],
                      comments: Sequence[Dict[str, Any]]) -> bool:
-        """Hold a ticket moved move_cap() times with no claim for the brain."""
+        """Hold a ticket moved move_cap() times with no claim for the brain.
+        A ticket a person claimed (claim:<login>) is never held (loom#2003)."""
+        if person_claim(issue):
+            return False
         moves = unclaimed_moves(comments, sorted(self.trusted))
         if not brain.past_move_cap(moves):
             return False
@@ -2228,6 +2241,8 @@ class Factory:
         number = int(issue["number"])
         if RUNAWAY in _labels(issue):
             return None  # held until a brain clears the label
+        if person_claim(issue):
+            return None  # a person's claimed work never climbs (loom#2003)
         if self._move_capped(repo, issue, comments):
             return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
@@ -2413,6 +2428,10 @@ class Factory:
         lane of its next rung, is a runaway, or is past the ladder (its pull
         request closed and the ticket given up), so nothing is sent."""
         number = int(issue["number"])
+        claimed = person_claim(issue)
+        if claimed:
+            _say("%s#%d is claimed by %s; not climbed for %s" % (repo, number, claimed, why))
+            return False
         footer = self._footer(repo, pr)
         if self._climb(repo, issue, comments, why, footer=footer) is not None:
             return True
@@ -5109,6 +5128,10 @@ class Factory:
             if HANDOFF_LABEL in _labels(issue) and _state(issue) in (
                     "queued", "briefed", "running", "failed"):
                 continue  # the second operator's session has it (docs/BRAIN.md)
+            if person_claim(issue) and _state(issue) in ("briefed", "failed"):
+                # A person claimed it (loom#2003): no rung move, no stall
+                # move, no runaway hold on work no lane will take.
+                continue
             if step is not None:
                 self._guarded(step, repo, issue)
 

@@ -1455,7 +1455,8 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors, gh, repo, issues, shares) + [""]
     lines += runaway_lines(tickets) + [""]
-    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
+    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped,
+                                                      person_claims(tickets))) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
@@ -7842,7 +7843,7 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
     candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
-                         and owned_elsewhere(i) is None),
+                         and owned_elsewhere(i) is None and not tickets.claimed_by(i)),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
     read = candidates[:STATUS_HISTORY_MAX]
@@ -7852,9 +7853,21 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
             [int(i["number"]) for i in candidates[STATUS_HISTORY_MAX:]])
 
 
-def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets, and for those status skipped."""
-    marks: Dict[int, str] = {}
+def person_claims(found: Sequence[Dict[str, Any]]) -> Dict[int, str]:
+    """The stuck-state tickets a person claimed (a claim:<login> label), by
+    number, with the first login a claim names. A claimed ticket is that
+    person's work, not lane work: status never marks it stuck and escalate
+    never moves it (loom#2003)."""
+    return {int(i["number"]): tickets.claimed_by(i)[0] for i in found
+            if tickets.claimed_by(i) and any("loom:" + x in _labels(i) for x in STUCK_STATES)}
+
+
+def _stuck_marks(histories: Dict[int, History], skipped: List[int],
+                 claimed: Optional[Dict[int, str]] = None) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets, for those status skipped, and for
+    those a person claimed (person_claims), which carry no next rung."""
+    marks: Dict[int, str] = {n: " - claimed by %s" % login
+                             for n, login in (claimed or {}).items()}
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
@@ -8036,6 +8049,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     owner = owned_elsewhere(issue)
     if owner is not None:
         raise ValueError("#%d is held by %s; the ladder leaves it alone" % (number, owner))
+    claimed = tickets.claimed_by(issue)
+    if claimed:
+        raise ValueError("#%d carries claim:%s; a person's claimed work is not lane work, "
+                         "and the ladder leaves it alone" % (number, claimed[0]))
     if RUNAWAY in names:
         raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
