@@ -190,12 +190,44 @@ class Identity(AnswerTest):
     def test_an_identity_header_maps_to_an_operator_and_anyone_else_is_refused(self):
         env = {"LOOM_IDENTITY_HEADER": "Tailscale-User-Login", "LOOM_OPERATORS": "owner@github=" + OWNER}
         with mock.patch.dict(os.environ, env):
-            code, _ = self.answer_it(token=None, headers={"Tailscale-User-Login": "stranger@github"})
+            code, _ = self.answer_it(token=None, headers={"Tailscale-User-Login": "stranger@github",
+                                                          "Content-Type": "application/json"})
             self.assertEqual(code, 403)
             self.assertEqual(self.gh.writes, [])
-            code, found = self.answer_it(token=None, headers={"Tailscale-User-Login": "owner@github"})
+            code, found = self.answer_it(token=None, headers={"Tailscale-User-Login": "owner@github",
+                                                              "Content-Type": "application/json"})
         self.assertEqual(code, 200, found)
         self.assertEqual(found["answer"]["login"], OWNER)
+
+    def test_a_cross_site_post_in_identity_header_mode_is_refused(self):
+        # loom#2580: the proxy stamps the operator's identity on any request
+        # the browser sends, so a page on another origin must not answer.
+        # A non-JSON body skips the CORS preflight; Sec-Fetch-Site names the
+        # sending site.
+        env = {"LOOM_IDENTITY_HEADER": "X-Loom-Id", "LOOM_OPERATORS": "alice=" + OWNER}
+        refused = (
+            {"Content-Type": "text/plain"},
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            {},
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "cross-site"},
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "same-site"},
+        )
+        with mock.patch.dict(os.environ, env):
+            for extra in refused:
+                with self.subTest(headers=extra):
+                    code, _ = self.answer_it(token=None, headers=dict(extra, **{"X-Loom-Id": "alice"}))
+                    self.assertEqual(code, 403)
+            self.assertEqual(self.gh.writes, [])
+            code, found = self.answer_it(token=None, headers={
+                "X-Loom-Id": "alice", "Content-Type": "application/json; charset=utf-8",
+                "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(code, 200, found)
+        self.assertEqual(found["answer"]["login"], OWNER)
+        self.assertEqual(len(self.comments_posted()), 1)
+
+    def test_token_mode_does_not_check_the_request_origin(self):
+        code, found = self.answer_it(headers={"Content-Type": "text/plain"})
+        self.assertEqual(code, 200, found)
 
 
 class Posting(AnswerTest):

@@ -70,9 +70,24 @@ def identify(headers: Mapping[str, str], body: Mapping[str, Any],
         raise Refused(403, "no operator is configured (LOOM_OPERATORS or LOOM_BRIEF_AUTHORS)")
     header = str(values.get(IDENTITY_HEADER) or "").strip()
     if header:
+        _check_same_origin(headers)
         return _header_login(str(headers.get(header) or ""), known)
     _check_token(str(headers.get("Authorization") or ""), values)
     return _named_login(body, list(dict.fromkeys(known.values())))
+
+
+def _check_same_origin(headers: Mapping[str, str]) -> None:
+    """Refused (403) for a request another site could have sent (loom#2580).
+    The proxy stamps the operator's identity on every request the browser
+    makes, so a page on any origin could answer as the operator. A JSON
+    Content-Type forces a CORS preflight this server never answers, and a
+    browser's Sec-Fetch-Site, when sent, must say the page itself sent it."""
+    media = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if media != "application/json":
+        raise Refused(403, "an answer is a JSON request (Content-Type: application/json)")
+    site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        raise Refused(403, "an answer comes from this dashboard's own page")
 
 
 def _header_login(value: str, known: Mapping[str, str]) -> str:
