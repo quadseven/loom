@@ -4950,6 +4950,18 @@ class BranchHygiene(Base):
         self.go()
         self.assertEqual(len(self.fixed), 2)  # An old-head retry cannot hold the new head.
 
+    def test_stalled_unkeyed_conflict_round_is_retried_once(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)
+        original = conflict_round_comment(50, 5)
+        original["created_at"] = iso(25 * 3600)
+        self.gh.comments[5].append(original)
+
+        self.go()
+
+        self.assertEqual(len(self.fixed), 1)
+        self.assertIn("loom:conflict-retry pr=50", self.gh.comments[5][-1]["body"])
+
     def test_a_dirty_pull_request_gets_a_fix_round_naming_it(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, mergeable=False, runs=self.WAITING)

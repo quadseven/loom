@@ -3242,8 +3242,7 @@ class Factory:
         if retried:
             self._conflict_incident(repo, number, issue, sha)
             return
-        stale = bool(rounds) and all(brain.FIX_KEY_RE.search(str(comment.get("body") or ""))
-                                    and _ts(comment.get("created_at")) > 0
+        stale = bool(rounds) and all(_ts(comment.get("created_at")) > 0
                                     and self.now - _ts(comment.get("created_at")) > 24 * 3600
                                     for comment in rounds)
         if rounds and not stale:
