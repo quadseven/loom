@@ -45,6 +45,23 @@ class DemotionNoticeTest(Base):
             self.runner(runner.now + 60).score_lanes()
         self.assertEqual(send.call_count, 2)
 
+    def test_pending_notice_goes_out_when_the_refresh_carries_over(self):
+        runner = self.runner()
+        self.seed(runner)
+        card = scorecard.Scorecard(runner.state, runner.now)
+        card.data["refreshed"] = 0
+        card.save()
+        def carried(*args):
+            raise station.TargetReached("other read carried over at request target")
+        with mock.patch.object(station.Station, "_refresh_scorecard", carried), \
+                mock.patch.object(station.Station, "_digest_send", return_value=True) as send:
+            with self.assertRaises(station.TargetReached):
+                runner.score_lanes()
+            with self.assertRaises(station.TargetReached):
+                self.runner(runner.now + 60).score_lanes()
+        self.assertEqual(send.call_count, 1)
+        self.assertIn("python3 -m bus.scorecard clear codex", send.call_args.args[0])
+
     def test_refresh_posts_new_demotion_and_clear_allows_one_new_notice(self):
         runner = self.runner()
         def refresh(card, *args):

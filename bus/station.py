@@ -13946,8 +13946,16 @@ class Station:
         card = scorecard.Scorecard(self.state, self.now)
         if not self.s.factory_on:
             return
+        # Pending notices go first: they read nothing from GitHub, and a
+        # refresh that carries over at the request target on every pass
+        # kept them from ever going out (loom#2445).
+        self._send_demotion_notices(card)
         if card.due():
             self._refresh_scorecard(card)
+            self._send_demotion_notices(card)
+
+    def _send_demotion_notices(self, card: scorecard.Scorecard) -> None:
+        """Post each demotion that has no delivered notice yet, once."""
         for lane, line in card.demotion_lines(pending_only=True).items():
             if self._digest_send(line):
                 card.notice_sent(lane)
