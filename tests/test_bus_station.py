@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
@@ -407,6 +407,7 @@ class FakeGitHub:
         return reply(201, {"id": 77})
 
     def _get_issues(self, query, headers):
+        query = unquote(query)
         for label in ("closed-unproven", "loom:proof-due"):
             if "labels=%s&" % label in query:
                 return reply(200, [i for i in self.issues.values() if i["state"] == "open"
@@ -625,6 +626,7 @@ class StationLabelSyncTest(Base):
         with open(ledger, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["digest"], runner.label_digest())
 
+
     def test_unchanged_label_digest_makes_no_label_calls(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         ledger = os.path.join(runner.state, "labels.json")
@@ -650,6 +652,89 @@ class StationLabelSyncTest(Base):
             ensure.assert_not_called()
         with open(ledger, encoding="utf-8") as fh:
             self.assertEqual(sorted(json.load(fh)["repos"]), repos)
+
+
+class DecisionDefaultTest(Base):
+    def test_overdue_reversible_decision_is_answered_once_and_wait_labels_are_removed(self):
+        now = time.time()
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 4 * 86400))
+        issue = {"number": 71, "state": "open", "labels": [{"name": "loom:human"},
+                 {"name": "needs-operator"}, {"name": "needs:alice-example"}, {"name": "needs:review"}]}
+        self.fake.humans = [issue]
+        self.fake.issues[71] = issue
+        self.fake.comments[71] = [{"body": brain.HUMAN_MARKER +
+            "\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes\nKind: decision",
+            "id": 1, "user": {"login": self.fake.bot}, "created_at": created}]
+        gh = GitHub("token", transport=self.fake)
+        runner = station.Station(gh, self.settings, now=now)
+        runner.apply_decision_defaults(force=True)
+        answers = [c for c in self.fake.comments[71] if "<!-- loom:default " in c["body"]]
+        self.assertEqual(len(answers), 1)
+        self.assertIn("Keep.", answers[0]["body"])
+        self.assertIn("Reverse it by posting a new answer", answers[0]["body"])
+        self.assertNotIn("loom:human", self.fake.names(71))
+        self.assertNotIn("needs-operator", self.fake.names(71))
+        self.assertNotIn("needs:alice-example", self.fake.names(71))
+        self.assertIn(answer.ANSWERED_LABEL, self.fake.names(71))
+        self.assertIn("needs:review", self.fake.names(71))
+        runner.apply_decision_defaults(force=True)
+        self.assertEqual(len([c for c in self.fake.comments[71] if "<!-- loom:default " in c["body"]]), 1)
+
+    def test_current_needs_human_label_is_processed(self):
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 4 * 86400))
+        issue = {"number": 74, "state": "open", "labels": [{"name": "needs:human"}]}
+        self.fake.asks = [issue]
+        self.fake.issues[74] = issue
+        self.fake.comments[74] = [{"id": 1, "body": brain.HUMAN_MARKER +
+            "\nKind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes",
+            "user": {"login": self.fake.bot}, "created_at": old}]
+        station.Station(GitHub("token", transport=self.fake), self.settings, now=now).apply_decision_defaults(force=True)
+        self.assertNotIn("needs:human", self.fake.names(74))
+        self.assertTrue(any("<!-- loom:default " in c["body"] for c in self.fake.comments[74]))
+
+    def test_answer_edits_blocks_and_invalid_defaults_are_not_applied(self):
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 4 * 86400))
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        for case in ("answered", "same_time_answer", "edited", "blocked", "invalid", "missing_id"):
+            with self.subTest(case=case):
+                issue = {"number": 73, "state": "open", "labels": [{"name": "loom:human"}]}
+                ask = {"id": 1, "body": brain.HUMAN_MARKER +
+                       "\nKind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes",
+                       "user": {"login": self.fake.bot}, "created_at": old}
+                self.fake.humans = [issue]
+                self.fake.issues[73] = issue
+                self.fake.comments[73] = [ask]
+                if case in ("answered", "same_time_answer"):
+                    self.fake.comments[73].append({"id": 2, "body": answer.comment_body("alice-example", "Close"),
+                        "user": {"login": self.fake.bot}, "created_at": old if case == "same_time_answer" else recent})
+                elif case == "edited":
+                    ask["updated_at"] = recent
+                elif case == "blocked":
+                    issue["labels"].append({"name": "blocked:dependency"})
+                elif case == "invalid":
+                    ask["body"] = ask["body"].replace("Kind: decision", "Kind: money")
+                else:
+                    del ask["id"]
+                runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+                runner.apply_decision_defaults(force=True)
+                self.assertFalse([c for c in self.fake.comments[73] if "<!-- loom:default " in c["body"]])
+                self.assertIn("loom:human", self.fake.names(73))
+
+    def test_unanswered_recent_ask_waits_for_window(self):
+        now = time.time()
+        recent = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+        issue = {"number": 72, "state": "open", "labels": [{"name": "loom:human"}]}
+        self.fake.humans = [issue]
+        self.fake.issues[72] = issue
+        self.fake.comments[72] = [{"body": brain.HUMAN_MARKER +
+            "\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes\nKind: decision",
+            "user": {"login": self.fake.bot}, "created_at": recent}]
+        station.Station(GitHub("token", transport=self.fake), self.settings, now=now).apply_decision_defaults(
+            force=True)
+        self.assertFalse([c for c in self.fake.comments[72] if "<!-- loom:default " in c["body"]])
+
 
 
 class StationLabelSyncFailureTest(Base):

@@ -535,20 +535,21 @@ class LockTests(unittest.TestCase):
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="old").already)
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW).already)
 
-    def test_a_takeover_lost_after_the_stale_delete_is_held_not_yours(self):
-        # Another taker re-creates the lock between the stale-lock delete and
-        # the caller's second create: the caller never held it, even when
-        # the winner carries the caller's own holder name.
+    def test_a_takeover_lost_to_another_taker_is_held_not_yours(self):
+        # Another taker replaces the expired lock before the caller's
+        # fast-forward lands, so GitHub refuses it (loom#2579): the caller
+        # never held it, even when the winner carries the caller's own
+        # holder name.
         for winner in ("lane-machine", "muse"):
             g = FakeGit()
             g.seed_lock("old", stamp(NOW - timedelta(minutes=1)))
             real = g.__call__
 
             def racing(method, url, headers, body, g=g, real=real, winner=winner):
-                answer = real(method, url, headers, body)
-                if method == "DELETE":
+                if method == "PATCH" and "loom-lock" in url:
                     g.seed_lock(winner, stamp(NOW + timedelta(minutes=30)))
-                return answer
+                    return reply(422, {"message": "Update is not a fast forward"})
+                return real(method, url, headers, body)
 
             held = lock.attempt(GitHub("tok", transport=racing), REPO, "muse", 30, NOW)
             self.assertFalse(held.acquired, winner)
@@ -594,7 +595,9 @@ class LockTests(unittest.TestCase):
         gh = GitHub("tok", transport=g)
         self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
-        self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
+        # A fast-forward over the expired lock, never a delete (loom#2579).
+        self.assertIn(("PATCH", "git/refs/heads/loom-lock/brain"), g.calls)
+        self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     # A brain that stands down for a peer's lock records its yield on that
     # lock (loom#2606), so the station can tell a yield from a stop. The
