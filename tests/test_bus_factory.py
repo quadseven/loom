@@ -1825,6 +1825,47 @@ class PullRequests(Base):
         self.assertEqual(self.closed, [(50, "Superseded by #51.")])
         self.assertEqual(self.gh.pulls[50]["state"], "closed")
 
+    def test_lane_pull_request_of_a_closed_ticket_is_closed_naming_its_close_reason(self):
+        # loom#1923: a ticket closed as not planned left its lane pull
+        # request open for days, read as sensitive in every tick.
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5].update(state="closed", state_reason="not_planned")
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual(len(self.closed), 1)
+        number, note = self.closed[0]
+        self.assertEqual(number, 50)
+        self.assertIn("superseded", note)
+        self.assertIn("#5 was closed (not_planned)", note)
+        self.assertEqual(self.gh.pulls[50]["state"], "closed")
+        self.assertEqual(self.gh.issues[5]["state"], "closed")
+        self.assertEqual(self.merged, [])
+
+    def test_closed_ticket_in_a_merged_state_with_no_merged_pull_closes_its_lane_pull(self):
+        self.gh.ticket(5, "merged")
+        self.gh.issues[5]["state"] = "closed"
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertEqual([c[0] for c in self.closed], [50])
+        self.assertIn("#5 was closed (closed)", self.closed[0][1])
+
+    def test_lane_pull_request_of_an_open_ticket_is_not_closed_as_ended(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.go()
+        self.assertFalse(any(n == 50 and "was closed" in note for n, note in self.closed))
+        self.assertEqual(self.gh.pulls[50]["state"], "open")
+
+    def test_a_persons_pull_request_off_a_loom_branch_is_left_open_when_its_ticket_closed(self):
+        self.gh.ticket(5, "pr")
+        self.gh.issues[5].update(state="closed", state_reason="completed")
+        self.gh.pull(60, 5, branch="feature/my-branch", body="Refs %s#5\n" % REPO)
+        self.gh.pull(70, 5, branch="loom/5-some-title", user=STRANGER)
+        self.go()
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.gh.pulls[60]["state"], "open")
+        self.assertEqual(self.gh.pulls[70]["state"], "open")
+
     def test_non_loom_branch_pull_request_is_left_open(self):
         self.gh.ticket(5, "merged")
         self.gh.pull(51, 5, created=7200, updated=7200, branch="loom/5-some-title-r2",
