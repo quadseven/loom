@@ -373,6 +373,14 @@ class ClaimRejectionTests(unittest.TestCase):
         self.assertIn(self.rejection_line("difficulty outside the lane's tiers"), err)
         self.assertIn("scanned 1 repos, found 0 candidates", err)
 
+    def test_a_ticket_with_no_acceptance_box_is_not_claimed(self):
+        # loom#2249: a lane run on it is parked unrun by the runner.
+        gh = FakeGitHub(body=re.sub(r"## Acceptance criteria\n(- \[ \] .*\n)+", "", BODY))
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("no acceptance criteria"), err)
+        self.assertIn("loom:queued", [x["name"] for x in gh.issues[4]["labels"]])
+
     def test_a_pull_request_item_is_named_with_its_reason(self):
         gh = FakeGitHub()
         gh.issues[4]["pull_request"] = {"url": "https://example.com/pulls/4"}
@@ -546,7 +554,7 @@ class TakesTest(unittest.TestCase):
                 item = {"number": 5, "body": body,
                         "labels": [{"name": "loom:queued"}, {"name": "lane:muse"}]}
                 self.assertIsNotNone(lane._rejection_reason(item, "muse"))
-        item["body"] = "Difficulty: easy\n\n## What\nx"
+        item["body"] = "Difficulty: easy\n\n## What\nx\n\n## Acceptance criteria\n- [ ] x\n"
         self.assertIsNone(lane._rejection_reason(item, "muse"))
 
 

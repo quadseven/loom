@@ -111,7 +111,8 @@ class PathsTest(unittest.TestCase):
 
     def test_a_remote_lane_does_not_take_it(self):
         held = dict(issue("loom:queued", "lane:muse", "claim:overflow"),
-                    body="Difficulty: easy\n\n## Why\nx\n")
+                    body="Difficulty: easy\n\n## Why\nx\n"
+                         "\n## Acceptance criteria\n\n- [ ] x\n")
         free = dict(issue("loom:queued", "lane:muse"), body=held["body"])
         with mock.patch.dict("os.environ", self.ENV):
             self.assertIsNotNone(lane._rejection_reason(held, "muse"))

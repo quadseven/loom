@@ -1349,9 +1349,26 @@ def _add_blocker(line: str, blocker: str) -> str:
             if line.endswith(" - READY") else line + ", " + blocker)
 
 
-def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
-    """The sensitive pull requests section for status."""
-    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+def _ticket_closed(gh: Optional[GitHub], repo: str, pr: Dict[str, Any]) -> bool:
+    """Whether the pull request's ticket in this repo reads as closed: the
+    station closes such a pull request as superseded on its next pass, so
+    status and resume do not list it for review (loom#1923)."""
+    ticket = _safe_ticket_association(repo, pr)
+    if gh is None or ticket is None or ticket[0] != repo:
+        return False
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    except GitHubError:
+        return False
+    return isinstance(issue, dict) and issue.get("state") == "closed"
+
+
+def _sensitive_pr_lines(prs: List[Dict[str, Any]], gh: Optional[GitHub] = None,
+                        repo: str = "") -> List[str]:
+    """The sensitive pull requests section for status, without one whose
+    ticket is closed (_ticket_closed)."""
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"
+                 and not _ticket_closed(gh, repo, pr)]
     lines = ["### Sensitive pull requests"]
     lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
     return lines
@@ -1460,7 +1477,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
-    lines += [""] + _sensitive_pr_lines(prs)
+    lines += [""] + _sensitive_pr_lines(prs, gh, repo)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
@@ -7222,15 +7239,22 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     ready = list(ready)
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
-    for item in ready[:SENSITIVE_RESUME_MAX]:
+    listed = 0
+    for item in ready:
+        if listed >= SENSITIVE_RESUME_MAX:
+            break
         pr, ticket = item["pr"], item["ticket"]
-        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        if issue.get("state") == "closed":
+            continue  # the station closes it as superseded (loom#1923)
+        listed += 1
+        title = str(issue.get("title") or "")
         threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
         out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
             item["repo"], pr["number"], ticket[0], ticket[1], title,
             pr.get("title", ""), _age(pr, now), open_threads))
-    return out if ready else out + ["- none"]
+    return out if listed else out + ["- none"]
 
 
 # How long resume reads before it stops and names the repos it did not reach

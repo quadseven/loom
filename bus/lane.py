@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, change_class, hunt_plan, notify, pr_repair, risk_line, tickets
+from . import brain, brief_check, change_class, hunt_plan, notify, pr_repair, risk_line, tickets
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -240,6 +240,10 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
         return "unreadable brief header"
     if not headers:
         return "no brief header"
+    # As at the factory and the station's claim: a lane run on it is parked
+    # unrun by the runner (loom#2249).
+    if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
+        return "no acceptance criteria"
     # The factory's reading (its default tier for a ticket with no
     # Difficulty: line), so a ticket it reserved for this lane is one the
     # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
