@@ -850,3 +850,26 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .fleet-head { flex-basis: 124px; }
   .fleet-gist { left: 16px; right: 16px; bottom: calc(88px + env(safe-area-inset-bottom)); }
 }
+
+/* Operator review queue inherits the dashboard's palette and answer controls. */
+.review-queue { max-width: 76rem; }
+.review-item { padding: 1.5rem 0 2rem; border-top: 1px solid var(--line); }
+.review-item h2 { margin: 0 0 .5rem; font-size: 1.4rem; line-height: 1.3; }
+.review-item h3 { margin: 1.5rem 0 .5rem; font-size: 1rem; }
+.review-item p, .review-item li { max-width: 74ch; overflow-wrap: anywhere; }
+.review-item ul { padding-left: 1.25rem; }
+.review-item li + li { margin-top: .6rem; }
+.review-item pre { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 74ch; }
+.review-item details { margin: .75rem 0; }
+.review-item summary { cursor: pointer; padding: .5rem 0; }
+.review-item .answer-form { max-width: 48rem; margin-top: 1.5rem; }
+.review-item .answer-choices { display: flex; flex-wrap: wrap; gap: .5rem; }
+.review-item button { min-height: 44px; }
+.review-error { color: var(--bad); }
+.review-empty { padding: 2rem 0; color: var(--muted); }
+@media (max-width: 640px) {
+  .review-item { padding: 1.25rem 0; }
+  .review-item h2 { font-size: 1.2rem; }
+  .review-item .answer-choices button { flex: 1 1 7rem; }
+  .review-item .answer-note { width: 100%; min-width: 0; }
+}

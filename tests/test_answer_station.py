@@ -133,6 +133,32 @@ class FactoryVerdict(Base):
         self.last_factory._settle_answers(REPO)
         self.assertEqual(len(self.fixed), 1)
 
+    def test_send_back_budget_exhaustion_stops_the_batch_and_keeps_pending(self):
+        from bus.github import RateLimited
+        self.held()
+        self.answer('Send back')
+        error = RateLimited('budget exhausted', 429, '', 123)
+        with mock.patch.object(self.last_factory, '_operator_send_back', side_effect=error):
+            with self.assertRaises(RateLimited):
+                self.last_factory._settle_answers(REPO)
+        self.assertIn(answer.ANSWERED_LABEL, self.labels())
+
+    def test_stale_send_back_is_recorded_once_without_poisoning_later_answers(self):
+        self.held()
+        self.answer("Send back")
+        self.gh.comments[5][-1]["body"] += "\n\nReview target: #50 " + "a" * 40
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["labels"].append({"name": answer.ANSWERED_LABEL})
+        self.gh.comments[6] = [given("Yes")]
+        self.last_factory._settle_answers(REPO)
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.assertNotIn(answer.ANSWERED_LABEL, [x["name"] for x in self.gh.issues[6]["labels"]])
+        self.assertEqual(self.fixed, [])
+        notes = [c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(len([c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]), 1)
+
     def test_an_answer_by_someone_who_is_no_operator_changes_nothing(self):
         self.held()
         self.gh.comments[5].append(given("Merge", login="stranger"))

@@ -5,7 +5,7 @@ import html
 import re
 from typing import Any, Dict, Iterable, List
 
-from bus import answer, proof
+from bus import answer, brain, proof, criteria_gate
 from . import needs_you
 
 
@@ -20,8 +20,8 @@ def criteria(body: str) -> str:
     if not boxes:
         return '<p class="muted">Acceptance criteria unavailable.</p>'
     return '<ul class="review-criteria">' + ''.join(
-        '<li><span class="machine-fact">%s</span> %s</li>' % (
-            'Claimed' if mark else 'Pending', html.escape(text))
+        '<li><span class="machine-fact">%s / %s</span> %s</li>' % (
+            'Claimed' if mark else 'Pending', html.escape(criteria_gate.kind(text)), html.escape(text))
         for mark, text in boxes) + '</ul>'
 
 
@@ -41,36 +41,59 @@ def card(entry: Dict[str, Any], detail: Dict[str, Any], mode: str) -> str:
     repo, ticket = str(entry.get('repo') or ''), int(entry['number'])
     pr_number = answer.held_pr(needs_you.full_ask(entry))
     title = str(entry.get('title') or 'Held pull request')
-    out = ['<article class="review-item"><h2>%s</h2>' % esc(title),
+    url = 'https://github.com/%s/pull/%s' % (repo, pr_number)
+    link = '<a href="%s">%s</a>' % (esc(url, quote=True), esc(title)) if re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo) else esc(title)
+    out = ['<article class="review-item"><h2>%s</h2>' % link,
            '<p class="machine-fact">%s - pull request #%s - ticket #%d</p>' %
            (esc(repo), pr_number, ticket), '<h3>Why it waits</h3><p>%s</p>' %
            esc(needs_you.full_ask(entry))]
     pr, errors = detail.get('pr'), detail.get('errors') or {}
     valid = isinstance(pr, dict) and pr.get('number') == pr_number
-    if not valid:
-        out.append('<p class="review-error" role="status">Details unavailable. Reload to retry.</p>')
-    else:
-        out.append('<p class="machine-fact">Tier: %s | State: %s | Head: %s</p>' % (
-            esc(str(pr.get('tier') or 'Unread')), esc(str(pr.get('state') or 'Unread')),
-            esc(str(pr.get('head') or 'Unread')[:12])))
-        out.append(_findings(pr))
-        checks = ', '.join('%s: %s' % (c.get('name'), c.get('state')) for c in pr.get('checks') or [])
-        out.append('<h3>Checks</h3><p>%s</p>' % esc(checks or 'Checks unavailable.'))
+    out.append(_summary(pr if valid else None))
     for name in errors:
-        out.append('<p class="review-error">%s unavailable. Reload to retry.</p>' % esc(name))
+        out.append('<p class="review-error">%s unavailable. Try again in five minutes.</p>' % esc(name))
+    out.append('<p class="machine-fact">Ship proof: %s</p>' % esc(str(detail.get('proof_status') or 'Not read')))
     out.extend(['<h3>Acceptance and ship proof</h3>', criteria(str(detail.get('body') or entry.get('body') or '')),
                 '<p class="muted">Checked boxes are author claims. The merge bar independently checks proof; '
                 'a merge does not establish deployment or live acceptance.</p>'])
-    if valid and not errors and pr.get('state') == 'open' and pr.get('head') and not entry.get('pending'):
-        form = needs_you.answer_form(entry, mode)
-
-        form = form.replace('data-answer ', 'data-answer data-review-pr="%d" data-review-head="%s" ' % (
-            pr_number, esc(str(pr['head']), quote=True)))
-        out.append(form)
-    elif entry.get('pending'):
-        out.append('<p role="status">Answer recorded; waiting for the station.</p>')
+    out.append(_actions(entry, pr if valid else None, errors, mode))
     out.append('</article>')
     return ''.join(out)
+
+
+def _summary(pr: Dict[str, Any] | None) -> str:
+    if pr is None:
+        return '<p class="review-error" role="status">Details unavailable. Try again in five minutes.</p>'
+    esc = html.escape
+    summary = '<p class="machine-fact">Tier: %s | State: %s | Head: %s</p>' % (
+        esc(str(pr.get('tier') or 'Unread')), esc(str(pr.get('state') or 'Unread')),
+        esc(str(pr.get('head') or 'Unread')[:12]))
+    checks = ', '.join('%s: %s' % (c.get('name'), c.get('state')) for c in pr.get('checks') or [])
+    return summary + _findings(pr) + '<h3>Checks</h3><p>%s</p>' % esc(
+        checks or 'No check runs returned for this head.')
+
+
+def _actions(entry: Dict[str, Any], pr: Dict[str, Any] | None,
+             errors: Dict[str, Any], mode: str) -> str:
+    if entry.get('pending'):
+        return '<p role="status">Answer recorded; waiting for the station.</p>'
+    if pr is None or errors or pr.get('state') != 'open' or not pr.get('head'):
+        return ''
+    return needs_you.answer_form(entry, mode).replace(
+        'data-answer ', 'data-answer data-review-pr="%d" data-review-head="%s" ' % (
+            pr['number'], html.escape(str(pr['head']), quote=True)))
+
+
+def _review_facts(number: int, pr: Dict[str, Any], tier: str, head: str,
+                  threads: List[Dict[str, Any]], reviews: List[Dict[str, Any]],
+                  checks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {'number': number, 'title': pr.get('title'), 'head': head, 'tier': tier,
+            'state': 'merged' if pr.get('merged_at') else pr.get('state'),
+            'threads': [{'text': str(node['comments']['nodes'][0].get('body') or ''),
+                         'resolved': bool(node.get('isResolved'))} for node in threads],
+            'reviews': reviews,
+            'checks': [{'name': c.get('name'), 'state': c.get('conclusion') or c.get('status')}
+                       for c in checks]}
 
 
 def render(entries: Iterable[Dict[str, Any]], details: Dict[str, Any], mode: str = 'off') -> str:
@@ -79,6 +102,13 @@ def render(entries: Iterable[Dict[str, Any]], details: Dict[str, Any], mode: str
         return '<p class="review-empty">No pull requests are waiting for an operator in this snapshot.</p>'
     return '<div class="review-queue">' + ''.join(card(
         row, details.get('%s#%d' % (row['repo'], row['number']), {}), mode) for row in rows) + '</div>'
+
+
+def _review_bot_login() -> str:
+    """Canonical REST identity; GraphQL Bot authors normalize to the same login."""
+    import os
+    configured = os.environ.get('LOOM_REVIEW_BOT', '').strip().lower() or 'grug-tribe'
+    return configured if configured.endswith('[bot]') else configured + '[bot]'
 
 
 class Details:
@@ -107,7 +137,6 @@ class Details:
     def _read(self, repo: str, ticket: int, number: int) -> Dict[str, Any]:
         from bus.github import GitHubError
         from bus import merge_tier
-        from .ticket_data import threads_from
         result: Dict[str, Any] = {'errors': {}}
         try:
             base = '/repos/%s' % repo
@@ -123,16 +152,30 @@ class Details:
                                          any(x.get('name') == 'class:sensitive' for x in pr.get('labels') or []))
             checks = self._checks(base, head)
             reviews = self.gh.paginate('%s/pulls/%d/reviews' % (base, number))
+            comments = self.gh.paginate('%s/issues/%d/comments' % (base, ticket))
+            result['proof_status'] = self._proof_status(comments, str(issue.get('body') or ''))
             raw_threads = self._threads(repo, number)
-            result.update(body=str(issue.get('body') or ''), pr={
-                'number': number, 'title': pr.get('title'), 'head': head, 'tier': tier,
-                'state': 'merged' if pr.get('merged_at') else pr.get('state'),
-                'threads': threads_from({'repository': {'pullRequest': {'reviewThreads': {'nodes': raw_threads}}}}),
-                'reviews': self._elder_reviews(reviews),
-                'checks': [{'name': c.get('name'), 'state': c.get('conclusion') or c.get('status')} for c in checks]})
+            result.update(body=str(issue.get('body') or ''), pr=_review_facts(
+                number, pr, tier, head, raw_threads, self._elder_reviews(reviews), checks))
         except (GitHubError, OSError, ValueError, KeyError, TypeError):
             result['errors']['Review facts'] = 'unavailable'
         return result
+
+    @staticmethod
+    def _proof_status(comments: List[Dict[str, Any]], body: str) -> str:
+        from bus.brain import trusted_authors
+        trusted = {name.lower() for name in trusted_authors()}
+        for comment in reversed(comments):
+            if str((comment.get('user') or {}).get('login') or '').lower() not in trusted:
+                continue
+            record = proof.read(str(comment.get('body') or ''))
+            if record is not None:
+                try:
+                    proof.check(record, body)
+                except ValueError:
+                    return 'Recorded proof does not match the current acceptance contract'
+                return 'Matching proof recorded; inspect its sources on the ticket'
+        return 'No matching trusted proof record'
 
     def _checks(self, base: str, head: str) -> List[Dict[str, Any]]:
         found = []
@@ -149,26 +192,24 @@ class Details:
 
     @staticmethod
     def _elder_reviews(reviews: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        import os
-        bot = os.environ.get('LOOM_REVIEW_BOT', 'grug-tribe[bot]').lower()
-        return [r for r in reviews if str((r.get('user') or {}).get('login') or '').lower() == bot
+        bot = _review_bot_login()
+        return [r for r in reviews if brain.comment_login(r).lower() == bot
                 and str(r.get('body') or '').strip()]
 
     def _threads(self, repo: str, number: int) -> List[Dict[str, Any]]:
-        import os
         owner, name = repo.split('/', 1)
         query = ('query($owner:String!,$name:String!,$number:Int!,$cursor:String) {'
                  ' repository(owner:$owner,name:$name) { pullRequest(number:$number) {'
                  ' reviewThreads(first:100,after:$cursor) { pageInfo { hasNextPage endCursor }'
-                 ' nodes { isResolved comments(first:1) { nodes { author { login } body createdAt } } } } } } }')
-        bot = os.environ.get('LOOM_REVIEW_BOT', 'grug-tribe[bot]').lower()
+                 ' nodes { isResolved comments(first:1) { nodes { author { login __typename } body createdAt } } } } } } }')
+        bot = _review_bot_login()
         cursor, seen, result = None, set(), []
         while True:
             data = self.gh.graphql(query, {'owner': owner, 'name': name, 'number': number, 'cursor': cursor})
             page = data['repository']['pullRequest']['reviewThreads']
             for node in page['nodes']:
                 comments = node.get('comments', {}).get('nodes') or []
-                if comments and str((comments[0].get('author') or {}).get('login') or '').lower() == bot:
+                if comments and brain.comment_login(comments[0]).lower() == bot:
                     result.append(node)
             info = page['pageInfo']
             if not info['hasNextPage']:

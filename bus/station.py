@@ -8346,26 +8346,17 @@ class Station:
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
         found every thread already fixed (a stale review thread) and said
-        so. Its explanation goes on the pull request, the review bot is asked
+        so. Its explanation stays in the local lane log, the review bot is asked
         to review the head again (it resolves what it no longer raises), and
         the ticket returns to loom:pr. If the review still stands, the factory
         sends it back a rung up the model ladder (bus/factory.py), so this
         never loops on one lane."""
-        said = self._lane_said(lane, name)
-        body = "Lane %s made no change for this fix." % lane
-        if said:
-            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
-                lane, "\n".join("> " + line for line in said.splitlines()))
-        try:
-            _text.check(body)
-        except ValueError:
-            body = ("Lane %s made no change for this fix; its explanation did not "
-                    "pass the text checks and is in the lane log." % lane)
-        self._comment(repo, pr, body, notify.NOTE)
+        # Routine lane prose remains in the existing local run log. Only
+        # the review command reaches the PR; findings still use their threads.
         self._comment(repo, pr, factory.review_again(), notify.REVIEW_REQUEST)
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
-                      "on the pull request; the review bot was asked to review it again."
+                      "in its local run log; the review bot was asked to review it again."
                       % (lane, pr), notify.NOTE)
         _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
 

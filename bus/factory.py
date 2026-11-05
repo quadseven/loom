@@ -3448,7 +3448,14 @@ class Factory:
                 _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
                      % (repo, number, answer.ANSWERED_LABEL))
             elif found.choice.lower() == answer.SEND_BACK.lower():
-                self._operator_send_back(repo, issue, comments)
+                try:
+                    self._operator_send_back(repo, issue, comments)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError, ValueError) as err:
+                    _say("%s#%d: send back could not be applied; answer remains pending (%s)" %
+                         (repo, number, type(err).__name__))
+                    continue
             elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
                 if not needs_human(_labels(issue)):
                     self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -3467,21 +3474,36 @@ class Factory:
         """An explicit operator decision opens the existing fix-round path."""
         number = answer.newest_held_pr(comments, self.trusted)
         if number is None:
-            raise ValueError("send back has no current held pull request")
+            return self._reject_operator_review(repo, issue, comments, "the held ask changed")
         verdict = answer.pr_verdict(comments, number, self.trusted, self.operators)
         if verdict is None or verdict.choice.lower() != answer.SEND_BACK.lower():
-            raise ValueError("send back is not the current operator verdict")
+            return self._reject_operator_review(repo, issue, comments, "the operator decision is no longer current")
         pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         if pr.get("state") != "open" or pr.get("merged_at"):
-            raise ValueError("send back requires an open pull request")
+            return self._reject_operator_review(repo, issue, comments, "the pull request is no longer open")
         target = answer.review_target(verdict)
         if target is None or target != (number, str((pr.get("head") or {}).get("sha") or "")):
-            raise ValueError("send back requires its reviewed pull request head")
+            return self._reject_operator_review(repo, issue, comments, "the reviewed head changed or was not recorded")
         notes = "Operator requested another fix round."
         if verdict.note:
             notes += "\n\n" + verdict.note
-        self._open_round(repo, number, issue, notes)
-        self.sent_back.add((repo, number))
+        opened = self._open_round(repo, number, issue, notes)
+        if opened is not False:
+            self.sent_back.add((repo, number))
+        else:
+            _say("%s#%d: operator fix round already exists; pending answer settled" % (repo, number))
+
+    def _reject_operator_review(self, repo: str, issue: Dict[str, Any],
+                                comments: List[Dict[str, Any]], reason: str) -> None:
+        """Keep the decision's evidence and one visible rejection, without poisoning the batch."""
+        given = answer.newest(comments, self.trusted, self.operators)
+        marker = "<!-- loom:review-rejected answer=%d -->" % (given.id if given else 0)
+        if not any(str(c.get("body") or "").startswith(marker) for c in comments):
+            notify.post(self.gh, repo, int(issue['number']), marker + "\nSend back was not applied: " +
+                        reason + ". Review the current pull request and answer again.", notify.RECORD)
+        if not needs_human(_labels(issue)):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue['number'])),
+                         {"labels": [NEEDS_HUMAN]})
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:

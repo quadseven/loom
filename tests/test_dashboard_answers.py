@@ -82,6 +82,7 @@ def _fixture():
     kind, ask = brain.human_kind(operator_hold.ask(8, [operator_hold.GENERIC_WHY]))
     hold_ask = "%s\n%s\nKind: %s" % (brain.HUMAN_MARKER, ask, kind)
     rest = {
+        "/repos/%s/pulls/8" % REPO: {"state": "open", "head": {"sha": "a" * 40}},
         "/repos/%s/issues/42/comments?per_page=100&page=1" % REPO: [
             {"id": 9, "body": hold_ask, "user": {"login": LOOM}, "created_at": "2030-01-01T09:00:00Z",
              "html_url": URL % (REPO, 42, 9)}],
@@ -116,7 +117,7 @@ class Call:
 
 
 class AnswerTest(unittest.TestCase):
-    env = {"LOOM_BRIEF_AUTHORS": LOOM, "LOOM_OPERATORS": "%s second-operator" % OWNER,
+    env = {"LOOM_BRIEF_AUTHORS": LOOM + "," + LOOM + "[bot]", "LOOM_OPERATORS": "%s second-operator" % OWNER,
            "LOOM_ANSWER_TOKEN": TOKEN, "LOOM_IDENTITY_HEADER": "", "LOOM_UPLOAD_TOKEN": ""}
 
     def setUp(self):
@@ -218,6 +219,15 @@ class Posting(AnswerTest):
         self.assertIn("loom:human", found["removed"])
         self.assertEqual([x["name"] for x in self.gh.issues[42]["labels"]],
                          ["loom:ticket", "loom:pr", answer.ANSWERED_LABEL])
+
+    def test_a_forged_answer_cannot_suppress_the_operator_comment(self):
+        self.gh.issues[40]['comments'] = 1
+        self.gh.rest_data['/repos/%s/issues/40/comments?per_page=100&page=1' % REPO] = [
+            {'body': answer.comment_body(OWNER, 'Yes'), 'user': {'login': 'outsider'}}]
+        code, result = self.answer_it()
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result['status'], 'posted')
+        self.assertEqual(len(self.comments_posted()), 1)
 
     def test_a_second_click_posts_nothing_even_after_a_restart(self):
         self.assertEqual(self.answer_it()[0], 200)

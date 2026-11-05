@@ -77,8 +77,8 @@ def decision_default(text: str) -> str:
     offered = options(cleaned)
     if offered.kind != CHOICE:
         raise ValueError("a decision default requires explicit choices in the ask")
-    if offered.choices == (MERGE, HOLD):
-        raise ValueError("merge and hold require an operator answer")
+    if any(choice in (MERGE, HOLD, SEND_BACK) for choice in offered.choices):
+        raise ValueError("review actions require an operator answer")
     choice, _ = accept(offered, found[0])
     return choice
 
@@ -402,14 +402,14 @@ def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[
 
 def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops: Iterable[str],
                since: str = "", head: str = "") -> Optional[Answer]:
-    """The operator's Merge or Hold on lane pull request `number`: the newest
-    operator answer saying Merge or Hold, given after the newest hold ask on
+    """The operator's Merge, Hold or Send back on lane pull request `number`: the newest
+    operator answer saying Merge, Hold or Send back, given after the newest hold ask on
     the ticket when that ask names this pull request, and (with `since`, the
     head commit's time) not before the head it would merge. None when there
     is none: the hold stands and asks as before."""
     trusted, ops = list(trusted), list(ops)
     asks = _hold_asks(comments, trusted)
-    if not asks or asks[-1][0] != int(number):
+    if not asks or newest_held_pr(comments, trusted) != int(number):
         return None
     asked = asks[-1][1]
     asked_at = str(asked.get("created_at") or "")
@@ -431,7 +431,7 @@ def review_target(verdict: Answer) -> Optional[Tuple[int, str]]:
 
 def _last_merge_or_hold(comments: Sequence[Any], asked: Any, trusted: List[str],
                        ops: List[str]) -> Optional[Answer]:
-    """The newest operator Merge or Hold after the comment `asked`."""
+    """The newest operator Merge, Hold or Send back after the comment `asked`."""
     later = list(comments)
     later = later[next(i for i, c in enumerate(later) if c is asked) + 1:]
     found = [a for a in (trusted_answer(c, trusted, ops) for c in later)
@@ -450,7 +450,7 @@ def is_hold(verdict: Optional[Answer]) -> bool:
 def record_verdict(repo: str, number: int, verdict: Answer, sha: str = "",
                    ticket: Optional[Tuple[str, int]] = None, source: str = "",
                    env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
-    """Write the operator's Merge or Hold on a lane pull request to the
+    """Write the operator's review decision on a lane pull request to the
     shadow ledger, once per pull request, head and verdict (bus/shadow.py),
     so the ledger pairs Loom's decision with the operator's."""
     from . import shadow

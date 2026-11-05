@@ -5975,12 +5975,10 @@ class FixTest(Base):
             "rsync(1): error: opencode: (l)stat: No such file or directory",
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: agent made no commit on loom/12-fix-the-thing"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        said, again = [c["body"] for c in self.fake.comments[99]]
-        self.assertTrue(said.startswith("Lane codex made no change for this fix. It said:\n\n> I didn't"))
-        self.assertIn("> The thread is stale; <path> measures 5.", said)
-        self.assertNotIn("rsync", said)
-        self.assertNotIn("start, lane", said)
-        self.assertEqual(again, factory.REVIEW_AGAIN)
+        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN])
+        log = os.path.join(self.home, "logs", "codex", tickets.ticket_name(REPO, 12, 2) + ".log")
+        with open(log) as stream:
+            self.assertIn("I didn't change any code", stream.read())
         self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
 
     def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
@@ -6006,12 +6004,14 @@ class FixTest(Base):
         self.assertTrue(stops[0].startswith("Lane codex stopped: [transient] branch moved: "))
         self.assertEqual(station.ending_class("[work] branch moved: x"), "transient")
 
-    def test_a_lane_explanation_is_redacted_of_credentials_before_it_is_posted(self):
+    def test_local_lane_excerpt_is_redacted_and_no_chatter_is_posted(self):
         self.failed_fix([
             "I checked it. api_key=abc123 and Authorization: Bearer abcdefghijklmnop1234",
             "also ghp_" + "a1B2c3D4e5F6g7H8i9J0 leaked, plus " + "x" * 40,
             "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"])
-        said = self.fake.comments[99][0]["body"]
+        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN])
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        said = runner._lane_said("codex", tickets.ticket_name(REPO, 12, 2))
         self.assertIn("I checked it.", said)
         for secret in ("abc123", "abcdefghijklmnop1234", "ghp_", "x" * 32):
             self.assertNotIn(secret, said)

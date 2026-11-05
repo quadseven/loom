@@ -3268,6 +3268,29 @@ class SendBackNeedsAFindingTests(unittest.TestCase):
         self.no_writes(again)
         self.assertIn("holds this head and these findings", err.getvalue())
 
+    def test_operator_send_back_replay_uses_real_fix_without_claiming_a_new_round(self):
+        from bus import answer, factory, operator_hold
+        sha = 'a' * 40
+        pr = fix_pr(head={'ref': 'loom/9-work', 'sha': sha, 'repo': {'full_name': REPO}})
+        note = 'Add the missing rollback check.\n\nReview target: #8 ' + sha
+        comments = [{'body': answer.HUMAN_MARKER + '\n' + operator_hold.ask(8, ['review']),
+                     'user': {'login': 'station'}},
+                    {'body': answer.comment_body('operator-one', 'Send back', note),
+                     'user': {'login': 'station'}}]
+        issue = dict(fix_ticket(), number=9)
+        first = self.routes(pr=pr)
+        worker = factory.Factory(GitHub('t', transport=first), [REPO], 0,
+                                 trusted=['station'], operators=['operator-one'])
+        worker._operator_send_back(REPO, issue, comments)
+        self.assertEqual(worker.sent_back, {(REPO, 8)})
+        posted = first.sent('POST', '/issues/9/comments')[0]['body']
+        replay = self.routes(pr=pr, comments=[{'body': posted, 'user': {'login': 'station'}}])
+        worker = factory.Factory(GitHub('t', transport=replay), [REPO], 0,
+                                 trusted=['station'], operators=['operator-one'])
+        worker._operator_send_back(REPO, issue, comments)
+        self.assertEqual(worker.sent_back, set())
+        self.no_writes(replay)
+
     def test_an_outsiders_review_threads_alone_are_nothing_to_fix(self):
         # loom#1956: a stranger's thread is data, never a send-back's finding.
         from bus import factory

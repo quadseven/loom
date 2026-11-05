@@ -29,7 +29,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
-from bus import answer, notify, text
+from bus import answer, brain, notify, text
 from bus.labels import HUMAN_LABELS
 from bus.github import GitHubError
 
@@ -164,26 +164,41 @@ def _labels(issue: Mapping[str, Any]) -> List[str]:
 
 
 def _comments(gh: Any, repo: str, number: int, count: int) -> List[Dict[str, Any]]:
-    """The issue's last comment page (operators.ASK_COMMENTS), oldest first."""
+    """All issue comments, oldest first, including asks on earlier pages."""
     if count < 1:
         return []
-    page = (count - 1) // operators.ASK_COMMENTS + 1
-    data = gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d"
-                   % (quote(repo, safe="/"), number, operators.ASK_COMMENTS, page)).data
-    return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+    comments = []
+    for page in range(1, 101):
+        data = gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d"
+                       % (quote(repo, safe="/"), number, operators.ASK_COMMENTS, page)).data
+        if not isinstance(data, list):
+            raise Refused(502, "issue comments are unreadable; retry before answering")
+        comments.extend(c for c in data if isinstance(c, dict))
+        if len(data) < operators.ASK_COMMENTS:
+            return comments
+    raise Refused(502, "issue comment history is incomplete; answer on the issue")
 
 
 def _already(comments: List[Dict[str, Any]], choice: str) -> Optional[Dict[str, Any]]:
     """The newest answer comment when it already gives this choice and no
     ask came after it: answering again posts nothing."""
+    trusted, ops = brain.trusted_authors(), answer.operators()
     for comment in reversed(comments):
         body = str(comment.get("body") or "")
-        if body.startswith(answer.HUMAN_MARKER):
+        if body.startswith(answer.HUMAN_MARKER) and brain.trusted_comments([comment], trusted):
             return None
-        found = answer.parse(comment)
+        found = answer.trusted_answer(comment, trusted, ops)
         if found is not None:
             return comment if found.choice.lower() == choice.lower() else None
     return None
+
+
+def _existing_answer(comments: List[Dict[str, Any]], choice: str, target: str
+                     ) -> Optional[Dict[str, Any]]:
+    same = _already(comments, choice)
+    if same is not None and target and not str(same.get("body") or "").endswith(target):
+        return None
+    return same
 
 
 def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
@@ -201,20 +216,29 @@ def review_target(gh: Any, entry: Dict[str, Any], comments: List[Dict[str, Any]]
         if expected_pr is not None or expected_head is not None:
             raise Refused(409, "the current ask is not a held pull request")
         return ""
-    asks = [str(c.get("body") or "") for c in comments
+    _check_review_ask(comments, number, expected_pr)
+    repo = quote(str(entry['repo']), safe='/')
+    pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
+    head = _review_head(pr, expected_head)
+    return "Review target: #%d %s" % (number, head)
+
+
+def _check_review_ask(comments: List[Dict[str, Any]], number: int, expected_pr: Any) -> None:
+    asks = [str(c.get("body") or "") for c in brain.trusted_comments(comments)
             if str(c.get("body") or "").startswith(answer.HUMAN_MARKER)]
     if not asks or answer.held_pr(asks[-1]) != number:
         raise Refused(409, "the ask changed; reload before answering")
     if expected_pr is not None and expected_pr != number:
         raise Refused(409, "the held pull request changed; reload before answering")
-    repo = quote(str(entry['repo']), safe='/')
-    pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
+
+
+def _review_head(pr: Dict[str, Any], expected_head: Any) -> str:
     head = str((pr.get('head') or {}).get('sha') or '')
     if pr.get('state') != 'open' or pr.get('merged_at') or not re.fullmatch('[0-9a-f]{40}', head):
         raise Refused(409, "the pull request is not open with a readable head")
     if expected_head is not None and expected_head != head:
         raise Refused(409, "the pull request changed; reload and review its new head")
-    return "Review target: #%d %s" % (number, head)
+    return head
 
 
 def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any,
@@ -245,9 +269,7 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
         target = review_target(gh, entry, comments, expected_pr, expected_head)
         if target:
             body += "\n\n" + target
-        same = _already(comments, choice)
-        if same is not None and target and not str(same.get("body") or "").endswith(target):
-            same = None
+        same = _existing_answer(comments, choice, target)
         status = "already" if same is not None else "posted"
         if same is None:
             same = notify.post(gh, repo, number, body, notify.ANSWER).data or {}
