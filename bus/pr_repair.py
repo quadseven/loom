@@ -223,6 +223,20 @@ def _bugs(current_body: str, summary: str, repo: Optional[str], public: bool,
     return bug_refs.render(kept, repo, public), ""
 
 
+def public_refs(text: str, repo: str) -> str:
+    """The text with each [owner/]name#N that names another repo written as
+    "issue N of another repo"; refs to `repo` itself stay. A public repo's
+    pull request body passes the leak scan's cross-repo rule this way. The
+    runner's first build (lanes/run_lane.sh) and every fix round use it."""
+    from .factory import SCAN_REF_RE  # the factory imports this module
+    owner, name = repo.lower().split("/", 1)
+
+    def word(m: "re.Match[str]") -> str:
+        own = m.group(2).lower() == name and (m.group(1) or owner).lower() == owner
+        return m.group(0) if own else "issue %s of another repo" % m.group(3)
+    return SCAN_REF_RE.sub(word, text)
+
+
 def _render_generated(brief: str, lane: str, model: str, ticket: str,
                       acceptance: Optional[str] = None,
                       operator_steps: str = OPERATOR_NONE, bugs: str = "") -> str:
@@ -394,6 +408,11 @@ def reconcile_text(brief: str, current_title: str, current_body: str,
             brief, lane, model, ticket,
             _checklist(brief, _normalise(current_body), summary),
             _operator_steps(brief, _normalise(current_body), summary), bugs)
+        # The sections come from the ticket verbatim, and gh writes them past
+        # the public repo guard: another repo's ref failed the leak scan on
+        # every round (loom#2386).
+        if public and repo:
+            desired_generated = public_refs(desired_generated, repo)
         new_hash = _sha12(_normalise(desired_generated))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
