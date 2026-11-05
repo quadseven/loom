@@ -3762,6 +3762,37 @@ class EscalateTests(unittest.TestCase):
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertNotIn("nothing to fix", str(caught.exception))
 
+    def claimed_ticket(self):
+        """A failed ticket with three attempts that the operator login ccqw
+        claimed (loom#2003): one of this Loom's own logins, so the ticket is
+        not owned elsewhere."""
+        issue = stuck_ticket("failed")
+        issue["labels"] = issue["labels"] + [{"name": "claim:ccqw"}]
+        return issue
+
+    def test_status_says_who_claimed_a_failed_ticket_instead_of_stuck(self):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [self.claimed_ticket()]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/issues/9/comments"): reply(200, [claim("2030-01-01T00:11:00Z"),
+                                                             fixc("2030-01-01T00:50:00Z")]),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain ccqw"})
+        line = next(l for l in report.splitlines() if l.startswith("- #9 "))
+        self.assertIn("claimed by ccqw", line)
+        self.assertNotIn("REPEATEDLY STUCK", report)
+        self.assertNotIn("next rung", report)
+
+    def test_escalate_refuses_a_ticket_a_person_claimed_and_writes_nothing(self):
+        fake = Routed(ticket_routes(self.claimed_ticket(), TWICE,
+                                    [claim("2030-01-01T00:11:00Z"), fixc("2030-01-01T00:50:00Z")]))
+        with unittest.mock.patch.dict(os.environ,
+                                      {"LOOM_BRIEF_AUTHORS": "%s ccqw" % BRAIN}):
+            with self.assertRaisesRegex(ValueError, "claim:ccqw"):
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertFalse([c for c in fake.calls if c[0] != "GET"])
+
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")
         fake = Routed(ticket_routes(issue, [event("labeled", "loom:failed", "2999-01-01T00:00:00Z")], []))

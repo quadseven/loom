@@ -772,6 +772,17 @@ class PullRequests(Base):
         # The lane label changed before the fix brief went out.
         self.assertIn({"name": "lane:claude"}, self.fixed[0][2])
 
+    def test_a_stuck_pull_request_whose_ticket_a_person_claimed_never_climbs(self):
+        """loom#2003: a person's claimed work gets no rung and no send-back."""
+        self.gh.ticket(5, "pr", lane="opencode-go")
+        self.gh.issues[5]["labels"].append({"name": "claim:" + ME["login"]})
+        self.gh.comments[5].append({"body": FIX_ASKED, "user": ME})
+        self.gh.pull(50, 5, resolved=False)
+        self.go()
+        self.assertEqual((self.lane(5), self.model(5)), ("opencode-go", None))
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(self.fixed, [])
+
     def test_a_review_round_that_finds_new_things_stays_on_its_lane(self):
         self.gh.ticket(5, "pr", lane="codex")
         self.gh.comments[5].append({"body": FIX_ASKED.replace("PRRT_1", "PRRT_0").replace(
@@ -3173,6 +3184,27 @@ class Tickets(Base):
         self.assertEqual(self.moved, [])
         self.assertEqual(self.fixed, [])
         self.assertEqual(self.lane(6), "spark")
+
+    def test_a_failed_ticket_a_person_claimed_never_climbs_or_runs_away(self):
+        """loom#2003: the factory held three person-claimed tickets as
+        runaways an hour after a person claimed one."""
+        self.gh.ticket(6, "failed", lane="zai")
+        self.gh.issues[6]["labels"].append({"name": "claim:" + ME["login"]})
+        for _ in range(3):
+            self.ended(6, "Lane zai failed: [work] validation failed: the check exited 2")
+        self.gh.ticket(7, "failed", lane="zai")
+        self.gh.issues[7]["labels"].append({"name": "claim:" + ME["login"]})
+        self.gh.comments[7] = [{"id": n, "user": ME, "created_at": iso(3600),
+                                "body": "%s\nmoved" % brain.ESCALATE_MARKER} for n in range(6)]
+        before = {n: list(self.gh.comments[n]) for n in (6, 7)}
+        self.go()
+        self.assertEqual((self.moved, self.fixed), ([], []))
+        for n in (6, 7):
+            names = [x["name"] for x in self.gh.issues[n]["labels"]]
+            self.assertNotIn(factory.RUNAWAY, names, n)
+            self.assertNotIn("needs-brain", names, n)
+            self.assertIn("lane:zai", names, n)
+            self.assertEqual(self.gh.comments[n], before[n], n)
 
     def test_a_failed_ticket_without_a_pull_request_is_rebriefed_a_rung_up(self):
         self.gh.ticket(6, "failed", lane="zai")
