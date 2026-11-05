@@ -613,3 +613,94 @@ class PlanRepairTest(unittest.TestCase):
             "no Size: XS/S/M/L/XL in body", "## Why has 2 words; need >=5"]),
             ["## Acceptance criteria (three or more \"- [ ]\" lines)",
              "## Size (XS, S, M or L)", "## Why (five or more words)"])
+
+
+# Another repo's issue in the owner-qualified form, built here: the literal in
+# a fixture would fail this repo's own leak scan.
+OTHER_REF = "%s/%s#%d" % ("other-owner", "other-repo", 7)
+OWN_REF = "%s/%s#%d" % ("example-owner", "example-repo", 9)
+
+
+def _scan_refs(body: str, repo: str) -> list:
+    """The [owner/]name#N refs in body that the leak scan would flag with
+    --allow-repo-ref repo: every one but the repo's own."""
+    from bus.factory import SCAN_REF_RE
+    owner, name = repo.lower().split("/", 1)
+    return [m.group(0) for m in SCAN_REF_RE.finditer(body)
+            if not (m.group(2).lower() == name and (m.group(1) or owner).lower() == owner)]
+
+
+class PublicRefsTest(unittest.TestCase):
+    """A fix round copies the ticket's Why, Summary and Out of scope into the
+    body on every round, so another repo's ref there failed the leak scan
+    each time (loom#2386)."""
+
+    REPO = "example-owner/example-repo"
+    BRIEF = BRIEF.replace("The thing is broken for every user.",
+                          "The thing is broken for every user, as %s found." % OTHER_REF)
+
+    def test_public_refs_writes_another_repos_ref_in_words(self):
+        self.assertEqual(pr_repair.public_refs("see %s now" % OTHER_REF, self.REPO),
+                         "see issue 7 of another repo now")
+
+    def test_public_refs_keeps_the_repos_own_refs(self):
+        line = "see %s and %s#%d and #4" % (OWN_REF, "example-repo", 3)
+        self.assertEqual(pr_repair.public_refs(line, self.REPO), line)
+
+    def test_public_refs_rewrites_the_same_name_under_another_owner(self):
+        ref = "%s/%s#%d" % ("other-owner", "example-repo", 5)
+        self.assertEqual(pr_repair.public_refs(ref, self.REPO), "issue 5 of another repo")
+
+    def test_a_fix_round_body_on_a_public_repo_carries_no_other_repos_ref(self):
+        result = pr_repair.reconcile_text(self.BRIEF, "Fix the thing", RUNNER_BODY,
+                                          "codex", "gpt-test", "T42", repo=self.REPO,
+                                          public=True)
+        self.assertEqual(result["reason"], "")
+        self.assertTrue(result["changed"])
+        body = str(result["body"])
+        self.assertEqual(_scan_refs(body, self.REPO), [])
+        self.assertIn("as issue 7 of another repo found.", body)
+        self.assertIn("\nRefs %s#%d" % (self.REPO, 42), body)
+
+    def test_a_fix_round_keeps_a_ref_to_the_repo_itself(self):
+        brief = BRIEF.replace("The thing is broken for every user.",
+                              "The thing is broken for every user, as %s found." % OWN_REF)
+        result = pr_repair.reconcile_text(brief, "Fix the thing", RUNNER_BODY,
+                                          "codex", "gpt-test", "T42", repo=self.REPO,
+                                          public=True)
+        self.assertIn("as %s found." % OWN_REF, str(result["body"]))
+
+    def test_a_fix_round_body_is_stable_once_rewritten(self):
+        first = pr_repair.reconcile_text(self.BRIEF, "Fix the thing", RUNNER_BODY,
+                                         "codex", "gpt-test", "T42", repo=self.REPO)
+        again = pr_repair.reconcile_text(self.BRIEF, "Fix the thing", str(first["body"]),
+                                         "codex", "gpt-test", "T42", repo=self.REPO)
+        self.assertFalse(again["changed"])
+
+    def test_the_cli_rewrites_on_a_public_repo_and_keeps_refs_on_a_private_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brief = os.path.join(tmp, "brief.md")
+            pr_json = os.path.join(tmp, "pr.json")
+            with open(brief, "w", encoding="utf-8") as fh:
+                fh.write(self.BRIEF)
+            with open(pr_json, "w", encoding="utf-8") as fh:
+                json.dump({"title": "Fix the thing", "body": RUNNER_BODY}, fh)
+            bodies = {}
+            for flags in ([], ["--private"]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    rc = pr_repair.main([brief, "--pr-json", pr_json, "--repo", self.REPO]
+                                        + flags + ["codex", "gpt-test", "T42"])
+                self.assertEqual(rc, 0)
+                bodies[bool(flags)] = json.loads(out.getvalue())["body"]
+        self.assertEqual(_scan_refs(bodies[False], self.REPO), [])
+        self.assertIn(OTHER_REF, bodies[True])
+
+    def test_a_plan_repair_on_a_public_repo_carries_no_other_repos_ref(self):
+        # The factory's repair of a body that fails the plan check: a Why too
+        # short for the gate, rebuilt from the ticket.
+        body = RUNNER_BODY.replace("The thing is broken for every user.", "short")
+        result = pr_repair.plan_repair(self.BRIEF, "Fix the thing", body,
+                                       "codex", "gpt-test", "T42", repo=self.REPO)
+        self.assertTrue(result["changed"])
+        self.assertEqual(_scan_refs(str(result["body"]), self.REPO), [])
