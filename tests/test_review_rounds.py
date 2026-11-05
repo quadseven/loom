@@ -111,6 +111,10 @@ class ReviewRounds(unittest.TestCase):
         self.fake.routes[self.path("a")]["check_runs"][0]["output"] = ["malformed"]
         self.assertNotIn("rounds", self.merged())
 
+    def test_malformed_commit_row_does_not_drop_a_possible_failed_head(self):
+        self.fake.routes["/repos/%s/pulls/1/commits" % REPO].append({"missing_sha": True})
+        self.assertNotIn("rounds", self.merged())
+
     def test_complete_empty_check_history_has_no_failed_verdicts(self):
         for head in "abc":
             self.fake.routes[self.path(head)] = {"check_runs": []}

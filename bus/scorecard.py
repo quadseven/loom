@@ -366,7 +366,9 @@ class Scorecard:
         from . import factory
         commits = gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
         reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
-        heads = {c.get("sha") for c in commits if isinstance(c, dict)}
+        if any(not isinstance(c, dict) or not c.get("sha") for c in commits):
+            raise ValueError("the merged commit history cannot be read")
+        heads = {c["sha"] for c in commits}
         heads.update(r.get("commit_id") for r in reviews if isinstance(r, dict))
         heads.discard(None)
         if len(heads) > MAX_REVIEW_HEADS:
