@@ -38,7 +38,9 @@ them.
 Each merged record also gets a settled difficulty, scored blind from the
 merged diff, the send-backs and the review findings (bus/difficulty.py),
 beside the perceived one on the ticket's Difficulty: line, and the status
-comment compares the two per lane, model and kind.
+comment compares the two per lane, model and kind. Review-round cost is
+recorded independently after merge; unread history stays unknown and is
+retried without affecting routing or demotion.
 
 A read that fails keeps the last scorecard and every demotion: nothing is
 cleared by an error. A scorecard file that is there but cannot be read
@@ -340,6 +342,78 @@ class Scorecard:
                 self._settle(gh, repo, pr, record, bot)
             except (GitHubError, ValueError, KeyError, TypeError) as err:
                 _say("%s has no settled difficulty yet: %s" % (key, err))
+
+        if record["merged"] and record.get("settled") in difficulty.LEVELS and "rounds" not in record:
+            try:
+                rounds = self._review_rounds(gh, repo, int(pr["number"]), bot)
+            except (GitHubError, ValueError, KeyError, TypeError) as err:
+                _say("%s has no review-round score yet: %s" % (key, err))
+            else:
+                record["rounds"] = rounds
+                record["score"] = max(0, difficulty.LEVELS.index(record["settled"]) + 1 - rounds)
+
+    def _review_rounds(self, gh: Any, repo: str, number: int, bot: str) -> int:
+        """Failed Elder heads plus human change requests, after all reads succeed.
+
+        Reviews retain commit IDs after a force push removes a reviewed head
+        from the PR's current commit list. Reruns on one head count only once;
+        a successful check with a bot change request is not a failed head.
+        """
+        from . import factory
+        commits = gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+        reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+        if any(not isinstance(c, dict) or not c.get("sha") for c in commits):
+            raise ValueError("the merged commit history cannot be read")
+        heads = {c["sha"] for c in commits}
+        heads.update(r.get("commit_id") for r in reviews if isinstance(r, dict))
+        heads.discard(None)
+        if not heads or any(not isinstance(h, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", h)
+                            for h in heads):
+            raise ValueError("the merged review heads cannot be read")
+        check_name = self.env.get("LOOM_REVIEW_CHECK") or factory.DEFAULT_REVIEW_CHECK
+        return self._human_review_rounds(reviews, bot) + sum(
+            self._failed_review_head(gh, repo, h, check_name) for h in sorted(heads))
+
+    @staticmethod
+    def _human_review_rounds(reviews: Sequence[Any], bot: str) -> int:
+        """Count distinct human change requests after validating their authors."""
+        human = set()
+        for review in reviews:
+            if not isinstance(review, dict) or not isinstance(review.get("user"), dict):
+                raise ValueError("the merged review author cannot be read")
+            user = review["user"]
+            if (review.get("state") == "CHANGES_REQUESTED" and user.get("type") == "User"
+                    and str(user.get("login") or "").removesuffix("[bot]").lower()
+                    != bot.removesuffix("[bot]").lower()):
+                if type(review.get("id")) is not int:
+                    raise ValueError("the merged review identity cannot be read")
+                human.add(review["id"])
+        return len(human)
+
+    @staticmethod
+    def _failed_review_head(gh: Any, repo: str, head: str, check_name: str) -> bool:
+        """Read every check page, retaining only substantive failed verdicts."""
+        from . import factory
+        failed, page = False, 1
+        while True:
+            data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
+                           % (repo, head, page)).data
+            if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+                raise ValueError("the merged review checks cannot be read")
+            checks = data["check_runs"]
+            for run in checks:
+                if not isinstance(run, dict):
+                    raise ValueError("the merged review check cannot be read")
+                output = run.get("output") or {}
+                if not isinstance(output, dict):
+                    raise ValueError("the merged review output cannot be read")
+                if (run.get("name") == check_name and run.get("status") == "completed"
+                        and run.get("conclusion") == "failure"
+                        and not factory.degraded_review(output.get("title"), output.get("summary"))):
+                    failed = True
+            if len(checks) < 100:
+                return failed
+            page += 1
 
     def _first_read(self, gh: Any, repo: str, pr: Dict[str, Any], record: Dict[str, Any],
                     bot: str) -> None:
