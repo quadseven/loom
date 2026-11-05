@@ -1,4 +1,9 @@
 """Public write protection for the shared GitHub REST boundary."""
+import os
+from pathlib import Path
+import tempfile
+import subprocess
+import traceback
 import unittest
 from unittest import mock
 
@@ -56,6 +61,75 @@ class PublicWriteGuardTest(unittest.TestCase):
             with self.assertRaisesRegex(GitHubError, "deny-list"):
                 gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
                         {"body": "A harmless public note."})
+        self.assertFalse(any(c[0] == "POST" for c in calls))
+
+    def test_missing_aws_names_the_cli_and_configuration_without_writing(self):
+        gh, calls = self.client()
+        with mock.patch.dict(os.environ, {"PATH": ""}, clear=True):
+            with self.assertRaisesRegex(GitHubError, "aws.*LOOM_AWS_CLI"):
+                gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
+                        {"body": "A harmless public note."})
+        self.assertFalse(any(c[0] == "POST" for c in calls))
+
+    def test_configured_aws_outside_path_and_path_aws_preserve_scrubbing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "aws"
+            executable.write_text("#!/bin/sh\nprintf '%s\\n' 'denied-host.example.com'\n")
+            executable.chmod(0o700)
+            environments = (
+                {"PATH": "", "LOOM_AWS_CLI": str(executable)},
+                {"PATH": directory},
+            )
+            for environment in environments:
+                with self.subTest(configured="LOOM_AWS_CLI" in environment):
+                    gh, calls = self.client()
+                    with mock.patch.dict(os.environ, environment, clear=True):
+                        gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
+                                {"body": "Checked denied-host.example.com."})
+                    posted = [c[2]["body"] for c in calls if c[0] == "POST"]
+                    self.assertEqual(posted, ["Checked <private identifier>."])
+
+    def test_invalid_configured_aws_does_not_fall_back_or_reveal_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "aws"
+            executable.write_text("#!/bin/sh\nprintf '%s\\n' 'denied-host.example.com'\n")
+            executable.chmod(0o700)
+            private_path = str(Path(directory) / "private-cli-location")
+            gh, calls = self.client()
+            with mock.patch.dict(os.environ, {
+                    "PATH": directory, "LOOM_AWS_CLI": private_path}, clear=True):
+                with self.assertRaisesRegex(GitHubError, "LOOM_AWS_CLI") as caught:
+                    gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
+                            {"body": "A harmless public note."})
+            self.assertNotIn(private_path, str(caught.exception))
+            self.assertFalse(any(c[0] == "POST" for c in calls))
+
+    def test_aws_execution_error_is_actionable_without_private_path(self):
+        gh, calls = self.client()
+        with mock.patch("bus.github.shutil.which", return_value="/example/aws"), \
+                mock.patch("bus.github.subprocess.run",
+                           side_effect=PermissionError("private-executable-path")):
+            with self.assertRaisesRegex(GitHubError, "cannot execute aws") as caught:
+                gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
+                        {"body": "A harmless public note."})
+        self.assertNotIn("private-executable-path", str(caught.exception))
+        self.assertFalse(any(c[0] == "POST" for c in calls))
+
+    def test_aws_timeout_traceback_does_not_reveal_command_or_output(self):
+        gh, calls = self.client()
+        error = subprocess.TimeoutExpired(["private-cli-location"], 30,
+                                          output="private-output", stderr="private-error")
+        with mock.patch("bus.github.shutil.which", return_value="/example/aws"), \
+                mock.patch("bus.github.subprocess.run", side_effect=error):
+            try:
+                gh.rest("POST", "/repos/quadseven/loom/issues/12/comments",
+                        {"body": "A harmless public note."})
+            except GitHubError:
+                trace = traceback.format_exc()
+            else:
+                self.fail("timeout allowed a public write")
+        for private in ("private-cli-location", "private-output", "private-error"):
+            self.assertNotIn(private, trace)
         self.assertFalse(any(c[0] == "POST" for c in calls))
 
     def test_public_write_fails_closed_when_target_visibility_is_unknown(self):
