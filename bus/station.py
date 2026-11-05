@@ -111,6 +111,11 @@ OUTSIDE_EPIC_EVERY = 3600
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
+# The words that tell the release apart from the hold that stays.
+DEAD_LANE_RELEASED = "Runaway hold released"
+# How long a done brief whose pull request is not found is read again before
+# its run is reported as over with nothing to show (loom#2583).
+DONE_NO_PR_WAIT = 2 * 3600
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -1016,6 +1021,7 @@ class Settings:
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
                  pass_deadline: int = 0,
+                 decision_window_days: int = 3,
                  repo_pr_caps: Optional[Dict[str, int]] = None) -> None:
         self.home = home
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
@@ -1023,6 +1029,7 @@ class Settings:
         # stack and exits (PASS_DEADLINE). 0, the default for a Settings
         # built in code, arms nothing.
         self.pass_deadline = pass_deadline
+        self.decision_window_days = max(1, int(decision_window_days))
         # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
         # loom#1787). Off for a Settings built in code; from_env defaults to
         # shadow, which records scores and still routes by the label rules.
@@ -1248,7 +1255,8 @@ class Settings:
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
                    repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
-                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
+                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1498,6 +1506,14 @@ def _seconds(raw: str, default: int) -> int:
     """A whole number of seconds of at least 60, else default."""
     raw = raw.strip()
     return int(raw) if raw.isdigit() and int(raw) >= 60 else default
+
+
+def _decision_window_days(raw: str) -> int:
+    """A positive decision-default window in whole days, else three."""
+    return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+DECISION_DEFAULT_CHECK_EVERY = 3600
 
 
 def _pass_deadline(raw: str) -> int:
@@ -2111,6 +2127,18 @@ def rolled_commit(record: str, key: str) -> str:
     return shas.pop() if len(shas) == 1 else ""
 
 
+def _landed_at(path: str, default: float) -> float:
+    """When a brief landed where it is: the later of its mtime and ctime. A
+    lane moves its brief into done/ by rename, which keeps the mtime of when
+    the brief was written and moves the ctime; `default` when it cannot be
+    read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return default
+    return max(st.st_mtime, st.st_ctime)
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -2659,7 +2687,9 @@ class Station:
                                         + list(self.s.owners)),
                                     linked=self._linked_pulls(repo, number),
                                     demoted_models=self._brief_demoted_models(lane),
-                                    claim=self._lane_claim_label())
+                                    claim=self._lane_claim_label(),
+                                    defaults=answer.default_notes(comments, self.s.authors,
+                                                                  answer.operators(trusted=self.s.authors)))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -3033,6 +3063,14 @@ class Station:
             ok, reason = self._check_trust(repo, issue)
         except ValueError as err:
             ok, reason = False, "unusable brief: %s" % err
+        if self._target_reached():
+            # Not a refusal: the pass's request target is spent, so the
+            # half-done claim waits for the next pass, as _try_ticket's does.
+            # Refused here, untrusted.json skipped the ticket until an edit
+            # (loom#2583).
+            _say("finishing the claim of %s#%d waits for the next pass: request target reached"
+                 % (repo, number))
+            return
         if not ok:
             os.remove(path)
             self._refuse(repo, issue, reason)
@@ -3315,20 +3353,27 @@ class Station:
             return
         inv_number, inv_title = dead[lane]
         marker = DEAD_LANE_MARKER % lane
-        if any(str(c.get("body") or "").startswith(marker) for c in comments):
+        reviewed = [str(c.get("body") or "") for c in comments
+                    if str(c.get("body") or "").startswith(marker)]
+        # The marker starts both comments: only a release ends the review. A
+        # hold that stayed for want of a free tier lane is reviewed again each
+        # pass, and released once a lane of its tier is free (loom#2583).
+        if any(DEAD_LANE_RELEASED in body for body in reviewed):
             return
         if repo not in self._publics:
             self._publics[repo] = self._public(repo)
         tier = factory.tier_lanes(issue, not self._publics[repo])
         target = next((x for x in tier if x in free and x not in used), None)
         if target is None:
-            self._comment(repo, number,
-                          "%s\nRunaway hold reviewed: every attempt since the last brief ran "
-                          "on lane %s, which has an open runs-and-none-done invariant "
-                          "(#%d); but no lane of its difficulty tier is free, so the hold "
-                          "stays." % (marker, lane, inv_number), notify.RUNAWAY)
-            _say("%s#%d stays held: its dead lane %s has no free tier lane"
-                 % (repo, number, lane))
+            # Said once: a later pass with no free tier lane posts nothing.
+            if not reviewed:
+                self._comment(repo, number,
+                              "%s\nRunaway hold reviewed: every attempt since the last brief "
+                              "ran on lane %s, which has an open runs-and-none-done invariant "
+                              "(#%d); but no lane of its difficulty tier is free, so the hold "
+                              "stays." % (marker, lane, inv_number), notify.RUNAWAY)
+                _say("%s#%d stays held: its dead lane %s has no free tier lane"
+                     % (repo, number, lane))
             return
         names = self._drop_claim(n for n in names
                                  if n != RUNAWAY and n != RUNNING and not n.startswith("lane:"))
@@ -3338,10 +3383,11 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
         issue["labels"] = [{"name": n} for n in names]
         self._comment(repo, number,
-                      "%s\nRunaway hold released: every attempt since the last brief ran on "
+                      "%s\n%s: every attempt since the last brief ran on "
                       "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
                       "This is not a failure: the ticket is briefed to lane %s, in its "
-                      "difficulty tier." % (marker, lane, inv_number, inv_title, target),
+                      "difficulty tier." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
+                                            inv_title, target),
                       notify.RUNAWAY)
         used.add(target)
         _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
@@ -5152,6 +5198,34 @@ class Station:
                 _write_json(path, reported)
                 if kind == "done":
                     scorecard.Scorecard(self.state, self.now).clear_zero_done(lane)
+        if self._prune_reported(reported):
+            _write_json(path, reported)
+
+    def _prune_reported(self, reported: Dict[str, Any]) -> bool:
+        """Drop each reported.json key whose brief is gone from its lane's
+        done/ and failed/: the key is read only beside its brief, and the
+        ledger grew by one key per finished brief, never pruned (loom#2583).
+        A lane whose folders cannot be listed, or that is not in LANES, keeps
+        its keys. True when a key was dropped."""
+        on_disk: Dict[str, Set[str]] = {}
+        for lane in LANES:
+            names: Set[str] = set()
+            try:
+                for kind in ("done", "failed"):
+                    folder = os.path.join(self.inbox(lane), kind)
+                    if os.path.isdir(folder):
+                        names.update(e[:-3] for e in os.listdir(folder) if e.endswith(".md"))
+            except OSError:
+                continue
+            on_disk[lane] = names
+        stale = []
+        for key in reported:
+            lane, _, name = key.partition("/")
+            if lane in on_disk and name not in on_disk[lane]:
+                stale.append(key)
+        for key in stale:
+            del reported[key]
+        return bool(stale)
 
     @staticmethod
     def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
@@ -5378,27 +5452,6 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
-        # Also check contributor-linked tickets for merging
-        for pr in closed if isinstance(closed, list) else []:
-            if isinstance(pr, dict) and pr.get("state") == "closed":
-                merged = self._terminal_label(pr) == "loom:merged"
-                if not merged:
-                    continue
-                # Find tickets linked by this contributor PR
-                author = tickets._login(pr.get("user"))
-                if author in trusted_authors:
-                    continue
-                # Look for tickets this contributor owns and linked by this PR
-                number = self._pr_ticket_number(repo, pr)
-                if number is not None:
-                    ticket = tickets_by_number.get(number)
-                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
-                        # This is a contributor-linked ticket
-                        pool = tickets_by_number if merged else waiting
-                        self._reconcile_pr_ticket(repo, pr, pool, landed)
-                        # Check if it moved to merged
-                        if "loom:merged" in _label_names(ticket):
-                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
@@ -5620,7 +5673,7 @@ class Station:
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
-                     self.release_factory_held)
+                     self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -7605,8 +7658,7 @@ class Station:
                                % (repo, repo.split("/")[0], branch)).data
             url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
             if not url:
-                _say("no pull request found yet for %s (%s)" % (name, branch))
-                return False
+                return self._done_without_pr(repo, number, lane, path, name, branch)
             self._relabel(repo, number, "loom:pr")
             if self._field(text, "Fix-PR").isdigit():
                 self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
@@ -7632,6 +7684,22 @@ class Station:
             return True
         if not self._report_failure(repo, number, lane, text, name):
             return False
+        self._never_left_running(repo, number, lane)
+        return True
+
+    def _done_without_pr(self, repo: str, number: int, lane: str, path: str, name: str,
+                         branch: str) -> bool:
+        """A done brief whose pull request is not found: read again each pass
+        until DONE_NO_PR_WAIT after the brief landed in done/. Past that the
+        run is over with no pull request, so it is reported and takes the
+        failure path; it retried forever and held its ticket loom:running
+        (loom#2583)."""
+        age = self.now - _landed_at(path, self.now)
+        if age < DONE_NO_PR_WAIT:
+            _say("no pull request found yet for %s (%s)" % (name, branch))
+            return False
+        _say("no pull request found for %s (%s) %d minutes after its run; reported"
+             % (name, branch, age // 60))
         self._never_left_running(repo, number, lane)
         return True
 
@@ -8774,10 +8842,95 @@ class Station:
                 _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
                 return None
             found += [(repo, i) for i in items if isinstance(i, dict)
-                      and "pull_request" not in i and i.get("html_url") and "number" in i]
+                      and "pull_request" not in i and i.get("html_url") and "number" in i
+                      and not any(n.startswith("blocked:") for n in _label_names(i))]
         found.sort(key=lambda f: (str(f[1].get("created_at") or ""), int(f[1]["number"])),
                    reverse=True)
         return found
+
+    def apply_decision_defaults(self, force: bool = False) -> None:
+        """Apply overdue reversible decision defaults through the answer format."""
+        path = os.path.join(self.state, "decision-defaults.json")
+        state = _read_json(path, {}, strict=False)
+        checked = state.get("at") if isinstance(state, dict) else None
+        if not force and not isinstance(checked, (int, float)):
+            _write_json(path, {"at": self.now})
+            return
+        if (not force and isinstance(checked, (int, float))
+                and 0 <= self.now - checked < DECISION_DEFAULT_CHECK_EVERY):
+            return
+        operators = answer.operators(trusted=self.s.authors)
+        for repo in self.s.repos:
+            candidates = {}
+            for label in (HUMAN, NEEDS_HUMAN):
+                for issue in self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                            % (repo, quote(label, safe=""))):
+                    if isinstance(issue, dict) and "pull_request" not in issue:
+                        candidates[int(issue["number"])] = issue
+            for number in candidates:
+                live = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                if (not isinstance(live, dict) or live.get("state") != "open"
+                        or not needs_human(_label_names(live))
+                        or any(label.startswith("blocked:") for label in _label_names(live))):
+                    continue
+                self._apply_decision_default(repo, live, operators)
+        _write_json(path, {"at": self.now})
+
+    def _apply_decision_default(self, repo: str, issue: Dict[str, Any],
+                                operators: Sequence[str]) -> None:
+        """Record an overdue default without attributing it to any operator."""
+        number = int(issue["number"])
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        selected = self._overdue_decision_default(repo, number, comments)
+        if selected is None:
+            return
+        index, ask, choice = selected
+        later = comments[index + 1:]
+        if any(answer.trusted_answer(c, self.s.authors, operators)
+               or tickets._login(c.get("user")) in operators for c in later if isinstance(c, dict)):
+            return  # an operator answered; the existing answer path owns its labels
+        if not any(answer.trusted_default(c, ask, self.s.authors) for c in later):
+            note = ("Default applied after %d days without an answer. Reverse it by posting a new answer "
+                    "on the Needs-you page." % self.s.decision_window_days)
+            try:
+                record = answer.default_body(ask, choice, note)
+            except ValueError:
+                _say("decision default on %s#%d lacks a valid ask identity; left alone" % (repo, number))
+                return
+            notify.post(self.gh, repo, number, record, notify.RECORD)
+        self._clear_decision_wait(repo, issue, operators)
+
+    def _overdue_decision_default(self, repo: str, number: int, comments: Sequence[Any]
+                                  ) -> Optional[Tuple[int, Dict[str, Any], str]]:
+        """Validate the newest trusted ask and its unchanged waiting window."""
+        asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+                and str(c.get("body") or "").startswith(HUMAN_MARKER)
+                and tickets._login(c.get("user")) in {name.lower() for name in self.s.authors}]
+        if not asks:
+            return None
+        index, ask = asks[-1]
+        body = str(ask.get("body") or "")
+        asked_at = self._epoch(str(ask.get("updated_at") or ask.get("created_at") or ""))
+        try:
+            choice = answer.decision_default(body)
+        except ValueError:
+            _say("decision default on %s#%d is invalid; left for correction" % (repo, number))
+            return None
+        if not choice or asked_at is None or self.now - asked_at < self.s.decision_window_days * 86400:
+            return None
+        return index, ask, choice
+
+    def _clear_decision_wait(self, repo: str, issue: Dict[str, Any], operators: Sequence[str]) -> None:
+        """Remove only person-wait labels after an automated record is present."""
+        number = int(issue["number"])
+        removable = set(HUMAN_LABELS) | {"needs:" + login for login in operators}
+        for label in _label_names(issue):
+            if label in removable:
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s" %
+                             (repo, number, quote(label, safe="")), ok=(404,))
+        if answer.ANSWERED_LABEL not in _label_names(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [answer.ANSWERED_LABEL]})
 
     def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
         """The first line of the newest needs:human comment from an allowed
@@ -8837,7 +8990,8 @@ class Station:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
         # A needs:human issue waits in the digest's own list, never alone.
-        asks = [a for a in asks if HUMAN not in _label_names(a[1])]
+        asks = [a for a in asks if HUMAN not in _label_names(a[1])
+                and not any(n.startswith("blocked:") for n in _label_names(a[1]))]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
@@ -10797,6 +10951,21 @@ class Station:
         _say("settled the source of %s#%d: %s" % (repo, ticket, said))
         return 1
 
+    def _requests_sent(self) -> int:
+        """Every request this pass sent so far, 304s and refusals included."""
+        return int(getattr(self.gh, "requests", 0) or 0)
+
+    def _stamp_every(self, state: Dict[str, Any], mark: int) -> None:
+        """Stamp an EVERY step's state file with this run's time, from the
+        step's finally. A step ending on a RateLimited raised by its first
+        request (one request or none sent since `mark`) read nothing, so it
+        is not stamped and the pass after the reset runs it; stamped, it lost
+        a whole EVERY window (loom#2583)."""
+        refused = isinstance(sys.exc_info()[1], RateLimited)
+        if refused and self._requests_sent() - mark <= 1:
+            return
+        state["_at"] = self.now
+
     def settle_claimed_tickets(self) -> None:
         """Settle operator-claimed issues whose pull requests merged
         (bus/claimed.py): an issue with a claim:<login> label and no loom:
@@ -10818,7 +10987,9 @@ class Station:
         if not isinstance(state.get("rereview"), dict):
             state["rereview"] = {}
         self._claimed_rereviews = state["rereview"]
-        # Stamped however the run ends, as settle_orphan_sources is.
+        # Stamped however the run ends, as settle_orphan_sources is, unless
+        # its first request was refused for budget (_stamp_every).
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -10830,7 +11001,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not settle the claimed issues of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             _write_json(path, state)
 
     def queue_stateless_tickets(self) -> None:
@@ -10888,6 +11059,7 @@ class Station:
         if isinstance(last, (int, float)) and 0 <= self.now - last < stale_claims.EVERY:
             return
         left = stale_claims.PER_RUN
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -10900,7 +11072,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not read the claims of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             _write_json(path, state)
 
     def withdraw_held_pr_waits(self) -> None:
@@ -11029,6 +11201,7 @@ class Station:
             return
         notes = state.get("notes") if isinstance(state.get("notes"), dict) else {}
         left = label_pass.PER_RUN
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -11040,7 +11213,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not clean the labels of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             state["notes"] = notes
             _write_json(path, state)
 
@@ -11138,12 +11311,13 @@ class Station:
         whole = False
         due: List[Tuple[str, Dict[str, Any]]] = []
         start = 0
+        mark = self._requests_sent()
         try:
             due, listed = self._all_claims_due()
             ordered, start = claim_referee.in_turn(due, state.get("turn"))
             whole = self._referee_in_turn(ordered, first, budget) and listed
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             state["turn"] = (start + budget["spent"]) % len(due) if due else 0
             if first and whole and self.s.claim_referee == "on":
                 state["swept"] = True
@@ -13946,8 +14120,16 @@ class Station:
         card = scorecard.Scorecard(self.state, self.now)
         if not self.s.factory_on:
             return
+        # Pending notices go first: they read nothing from GitHub, and a
+        # refresh that carries over at the request target on every pass
+        # kept them from ever going out (loom#2445).
+        self._send_demotion_notices(card)
         if card.due():
             self._refresh_scorecard(card)
+            self._send_demotion_notices(card)
+
+    def _send_demotion_notices(self, card: scorecard.Scorecard) -> None:
+        """Post each demotion that has no delivered notice yet, once."""
         for lane, line in card.demotion_lines(pending_only=True).items():
             if self._digest_send(line):
                 card.notice_sent(lane)

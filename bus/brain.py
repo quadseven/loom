@@ -1920,9 +1920,10 @@ PRIORITIES_SHOWN = 10
 
 
 def open_human(issues: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """The open needs:human issues among `issues` (pull requests left out)."""
+    """The unblocked open needs:human issues among `issues` (pull requests left out)."""
     return [i for i in issues if isinstance(i, dict) and "pull_request" not in i
-            and i.get("state", "open") == "open" and needs_human(_labels(i))]
+            and i.get("state", "open") == "open" and needs_human(_labels(i))
+            and not any(label.startswith("blocked:") for label in _labels(i))]
 
 
 def goal_human_share(children: Sequence[Dict[str, Any]], issues: Sequence[Dict[str, Any]]) -> int:
@@ -4273,10 +4274,13 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     with "Kind: K" (HUMAN_KINDS) and one comment names the exact thing needed;
     loom:triage, if any, comes off."""
     kind, ask = human_kind(ask)
+    answer.decision_default("Kind: %s\n%s" % (kind, ask))
     if not ask:
         raise ValueError("the ask must name the exact thing a person has to do")
     _check_written_text(ask)
     names = _labels(_open_issue(gh, repo, number))
+    if any(label.startswith("blocked:") for label in names):
+        raise ValueError("#%d is blocked; do not ask a person while the block stands" % number)
     if needs_human(names):
         comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         if any(str((comment or {}).get("body") or "").startswith(HUMAN_MARKER)
