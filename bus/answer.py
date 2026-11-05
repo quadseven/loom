@@ -18,6 +18,7 @@ type the marker; nobody else's copy counts.
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
@@ -58,6 +59,74 @@ _REPLY_LETTERS_RE = re.compile(r"\breply (?:with )?\(?([a-d])\)?((?:\s*,\s*\(?[a
 _LETTER_OPTION_RE = re.compile(r"(?:^|[\s(])\(([a-d])\)\s", re.I | re.M)
 _DONE_RE = re.compile(r"\breply (?:with )?done\b", re.I)
 _KIND_RE = re.compile(r"^\s*Kind:\s*(\S+)\s*$", re.I | re.M)
+_DEFAULT_RE = re.compile(r"^\s*Default:\s*(.*?)\s*$", re.I | re.M)
+_REVERSIBLE_RE = re.compile(r"^\s*Reversible:\s*(\S+)\s*$", re.I | re.M)
+
+
+def decision_default(text: str) -> str:
+    """Return a validated default for a reversible decision ask, else empty."""
+    source = str(text or "")
+    found = _DEFAULT_RE.findall(source)
+    if not found:
+        return ""
+    if len(found) != 1 or _KIND_RE.findall(source) != ["decision"]:
+        raise ValueError("a Default line is only allowed once on a decision ask")
+    if not reversible_decision(source):
+        raise ValueError("a decision default requires Reversible: yes")
+    cleaned = _DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", source))
+    offered = options(cleaned)
+    if offered.kind != CHOICE:
+        raise ValueError("a decision default requires explicit choices in the ask")
+    if offered.choices == (MERGE, HOLD):
+        raise ValueError("merge and hold require an operator answer")
+    choice, _ = accept(offered, found[0])
+    return choice
+
+
+def default_body(ask: Mapping[str, Any], choice: str, note: str = "") -> str:
+    """An automated record bound to one exact ask; never an operator answer."""
+    ident = ask.get("id")
+    body = str(ask.get("body") or "")
+    if type(ident) is not int or ident <= 0 or not choice or decision_default(body) != choice:
+        raise ValueError("an automated default must match an identified reversible ask")
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return ("<!-- loom:default ask=%d sha=%s -->\nAutomated reversible decision default: %s. %s"
+            % (ident, digest, choice, _one_line(note, NOTE_MAX))).rstrip()
+
+
+def trusted_default(comment: Any, ask: Mapping[str, Any], trusted: Iterable[str]) -> bool:
+    """Whether a trusted automated record applies to this unchanged ask."""
+    if not isinstance(comment, dict) or _author(comment) not in {str(t).lower() for t in trusted}:
+        return False
+    try:
+        prefix = default_body(ask, decision_default(str(ask.get("body") or "")))
+    except ValueError:
+        return False
+    body = str(comment.get("body") or "")
+    return body == prefix or body.startswith(prefix + " ")
+
+
+def default_notes(comments: Iterable[Any], trusted: Iterable[str], ops: Iterable[str]) -> List[str]:
+    """The latest ask's automated decision, superseded by any later operator reply."""
+    comments, trusted, ops = list(comments), list(trusted), list(ops)
+    asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+            and _author(c) in {t.lower() for t in trusted}
+            and str(c.get("body") or "").startswith(HUMAN_MARKER)]
+    if not asks:
+        return []
+    index, ask = asks[-1]
+    later = comments[index + 1:]
+    if any(trusted_answer(c, trusted, ops) or _author(c) in ops
+           for c in later if isinstance(c, dict)):
+        return []
+    records = [str(c["body"]).split("\n", 1)[1] for c in later if trusted_default(c, ask, trusted)]
+    return records[-1:]
+
+
+def reversible_decision(text: str) -> bool:
+    """Whether an ask explicitly names itself as a reversible decision."""
+    source = str(text or "")
+    return ask_kind(source) == "decision" and _REVERSIBLE_RE.findall(source) == ["yes"]
 
 
 def ask_kind(text: str) -> str:
@@ -96,7 +165,8 @@ def options(ask: str, kind: str = "") -> Options:
     - "reply done", or Kind account, physical or hardware: Done or Not now;
     - anything else: free text.
     """
-    text = " ".join(str(ask or "").replace("**", "").split())
+    text = " ".join(_DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", str(ask or "")))
+                    .replace("**", "").split())
     kind = (kind or ask_kind(str(ask or ""))).lower()
     if _NUMBER_RE.search(text):
         return Options(NUMBER)

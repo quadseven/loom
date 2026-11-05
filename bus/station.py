@@ -1001,12 +1001,14 @@ class Settings:
                  agy_workdir: str = "",
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
-                 pass_deadline: int = 0) -> None:
+                 pass_deadline: int = 0,
+                 decision_window_days: int = 3) -> None:
         self.home = home
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
         # stack and exits (PASS_DEADLINE). 0, the default for a Settings
         # built in code, arms nothing.
         self.pass_deadline = pass_deadline
+        self.decision_window_days = max(1, int(decision_window_days))
         # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
         # loom#1787). Off for a Settings built in code; from_env defaults to
         # shadow, which records scores and still routes by the label rules.
@@ -1231,7 +1233,8 @@ class Settings:
                    agy_workdir=_agy_workdir(env),
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
                    urgency_config=urgency.Config.from_env(env),
-                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
+                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1481,6 +1484,14 @@ def _seconds(raw: str, default: int) -> int:
     """A whole number of seconds of at least 60, else default."""
     raw = raw.strip()
     return int(raw) if raw.isdigit() and int(raw) >= 60 else default
+
+
+def _decision_window_days(raw: str) -> int:
+    """A positive decision-default window in whole days, else three."""
+    return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+DECISION_DEFAULT_CHECK_EVERY = 3600
 
 
 def _pass_deadline(raw: str) -> int:
@@ -2640,7 +2651,9 @@ class Station:
                                         + list(self.s.owners)),
                                     linked=self._linked_pulls(repo, number),
                                     demoted_models=self._brief_demoted_models(lane),
-                                    claim=self._lane_claim_label())
+                                    claim=self._lane_claim_label(),
+                                    defaults=answer.default_notes(comments, self.s.authors,
+                                                                  answer.operators(trusted=self.s.authors)))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -5510,7 +5523,7 @@ class Station:
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
-                     self.release_factory_held)
+                     self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -8651,10 +8664,95 @@ class Station:
                 _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
                 return None
             found += [(repo, i) for i in items if isinstance(i, dict)
-                      and "pull_request" not in i and i.get("html_url") and "number" in i]
+                      and "pull_request" not in i and i.get("html_url") and "number" in i
+                      and not any(n.startswith("blocked:") for n in _label_names(i))]
         found.sort(key=lambda f: (str(f[1].get("created_at") or ""), int(f[1]["number"])),
                    reverse=True)
         return found
+
+    def apply_decision_defaults(self, force: bool = False) -> None:
+        """Apply overdue reversible decision defaults through the answer format."""
+        path = os.path.join(self.state, "decision-defaults.json")
+        state = _read_json(path, {}, strict=False)
+        checked = state.get("at") if isinstance(state, dict) else None
+        if not force and not isinstance(checked, (int, float)):
+            _write_json(path, {"at": self.now})
+            return
+        if (not force and isinstance(checked, (int, float))
+                and 0 <= self.now - checked < DECISION_DEFAULT_CHECK_EVERY):
+            return
+        operators = answer.operators(trusted=self.s.authors)
+        for repo in self.s.repos:
+            candidates = {}
+            for label in (HUMAN, NEEDS_HUMAN):
+                for issue in self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                            % (repo, quote(label, safe=""))):
+                    if isinstance(issue, dict) and "pull_request" not in issue:
+                        candidates[int(issue["number"])] = issue
+            for number in candidates:
+                live = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                if (not isinstance(live, dict) or live.get("state") != "open"
+                        or not needs_human(_label_names(live))
+                        or any(label.startswith("blocked:") for label in _label_names(live))):
+                    continue
+                self._apply_decision_default(repo, live, operators)
+        _write_json(path, {"at": self.now})
+
+    def _apply_decision_default(self, repo: str, issue: Dict[str, Any],
+                                operators: Sequence[str]) -> None:
+        """Record an overdue default without attributing it to any operator."""
+        number = int(issue["number"])
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        selected = self._overdue_decision_default(repo, number, comments)
+        if selected is None:
+            return
+        index, ask, choice = selected
+        later = comments[index + 1:]
+        if any(answer.trusted_answer(c, self.s.authors, operators)
+               or tickets._login(c.get("user")) in operators for c in later if isinstance(c, dict)):
+            return  # an operator answered; the existing answer path owns its labels
+        if not any(answer.trusted_default(c, ask, self.s.authors) for c in later):
+            note = ("Default applied after %d days without an answer. Reverse it by posting a new answer "
+                    "on the Needs-you page." % self.s.decision_window_days)
+            try:
+                record = answer.default_body(ask, choice, note)
+            except ValueError:
+                _say("decision default on %s#%d lacks a valid ask identity; left alone" % (repo, number))
+                return
+            notify.post(self.gh, repo, number, record, notify.RECORD)
+        self._clear_decision_wait(repo, issue, operators)
+
+    def _overdue_decision_default(self, repo: str, number: int, comments: Sequence[Any]
+                                  ) -> Optional[Tuple[int, Dict[str, Any], str]]:
+        """Validate the newest trusted ask and its unchanged waiting window."""
+        asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+                and str(c.get("body") or "").startswith(HUMAN_MARKER)
+                and tickets._login(c.get("user")) in {name.lower() for name in self.s.authors}]
+        if not asks:
+            return None
+        index, ask = asks[-1]
+        body = str(ask.get("body") or "")
+        asked_at = self._epoch(str(ask.get("updated_at") or ask.get("created_at") or ""))
+        try:
+            choice = answer.decision_default(body)
+        except ValueError:
+            _say("decision default on %s#%d is invalid; left for correction" % (repo, number))
+            return None
+        if not choice or asked_at is None or self.now - asked_at < self.s.decision_window_days * 86400:
+            return None
+        return index, ask, choice
+
+    def _clear_decision_wait(self, repo: str, issue: Dict[str, Any], operators: Sequence[str]) -> None:
+        """Remove only person-wait labels after an automated record is present."""
+        number = int(issue["number"])
+        removable = set(HUMAN_LABELS) | {"needs:" + login for login in operators}
+        for label in _label_names(issue):
+            if label in removable:
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s" %
+                             (repo, number, quote(label, safe="")), ok=(404,))
+        if answer.ANSWERED_LABEL not in _label_names(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [answer.ANSWERED_LABEL]})
 
     def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
         """The first line of the newest needs:human comment from an allowed
@@ -8714,7 +8812,8 @@ class Station:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
         # A needs:human issue waits in the digest's own list, never alone.
-        asks = [a for a in asks if HUMAN not in _label_names(a[1])]
+        asks = [a for a in asks if HUMAN not in _label_names(a[1])
+                and not any(n.startswith("blocked:") for n in _label_names(a[1]))]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
