@@ -3439,7 +3439,10 @@ class Factory:
             number = int(issue.get("number") or 0)
             comments = self._comments(repo, number)
             found = answer.newest(comments, self.trusted, self.operators)
-            if found is None:
+            defaults = answer.default_notes(comments, self.trusted, self.operators)
+            if found is None and defaults:
+                _say("%s#%d: read an automated reversible default; no operator approval" % (repo, number))
+            elif found is None:
                 _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
                      % (repo, number, answer.ANSWERED_LABEL))
             elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
