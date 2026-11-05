@@ -2401,7 +2401,8 @@ factory gives it no queued ticket, tier move or automatic retry (as a lane
 that is down; loom#2430), its briefed tickets step aside to other lanes with
 a status event naming the demotion and its counts, and it stays demoted until
 the operator runs
-`python3 -m bus.scorecard clear <lane>` (`show` prints the table). Clearing
+`python3 -m bus.scorecard clear <lane>` (`show` prints the table) or a
+completed refresh finds its bad outcomes in the window below the threshold. Clearing
 forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes

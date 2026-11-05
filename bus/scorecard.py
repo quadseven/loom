@@ -31,9 +31,10 @@ whose bad outcomes over the last LOOM_LANE_DEMOTE_DAYS days (default 7)
 reach LOOM_LANE_DEMOTE_AT (default 3) is demoted: it takes no build ticket,
 its briefed tickets step aside to other lanes with a status event saying
 why, and it stays demoted until the operator clears it
-(`python3 -m bus.scorecard clear <lane>`). Clearing forgets the outcomes
-before it. Verify runs are not build tickets: a demoted lane still takes
-them.
+(`python3 -m bus.scorecard clear <lane>`) or a completed refresh finds its
+bad outcomes in the window below the threshold again. Clearing forgets the
+outcomes before it. Verify runs are not build tickets: a demoted lane still
+takes them.
 
 Each merged record also gets a settled difficulty, scored blind from the
 merged diff, the send-backs and the review findings (bus/difficulty.py),
@@ -59,7 +60,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import change_class, difficulty, labels, merge_tier, revert
-from .github import GitHubError
+from .github import GitHubError, TargetReached
 
 FILE = "scorecard.json"
 NOTICE_FILE = "demotion-notices.json"
@@ -248,7 +249,8 @@ class Scorecard:
         self.now = now
         self.env = dict(os.environ if env is None else env)
         self.data: Dict[str, Any] = {"records": {}, "audits": {}, "demoted": {},
-                                     "cleared": {}, "refreshed": 0, "briefs": {}}
+                                     "cleared": {}, "refreshed": 0, "briefs": {},
+                                     "cycle": {}}
         # A file that is there but cannot be read: its demotions are unknown,
         # so every lane counts as demoted until the operator repairs or
         # removes it, and nothing is written over it.
@@ -264,8 +266,12 @@ class Scorecard:
         if not self.unreadable and not isinstance(kept, dict):
             self.unreadable = "%s does not hold an object" % FILE
         for key in self.data:
-            if isinstance(kept, dict) and isinstance(kept.get(key), type(self.data[key])):
-                self.data[key] = kept[key]
+            value = kept.get(key) if isinstance(kept, dict) else None
+            # The refresh time is saved as the pass's float time: an int-only
+            # check dropped it on every load, so the card was always due.
+            want = (int, float) if key == "refreshed" else type(self.data[key])
+            if isinstance(value, want) and not isinstance(value, bool):
+                self.data[key] = value
 
     def save(self) -> None:
         if self.unreadable:
@@ -296,13 +302,31 @@ class Scorecard:
         """Read each repo's closed lane pull requests into the records, the
         failed proof audits (lane -> when the hold ends) and the post-merge
         watch's ledger entries, then demote the lanes past the threshold. A
-        repo that cannot be read keeps its records."""
+        repo that cannot be read keeps its records.
+
+        A read that carries over at the pass's request target (TargetReached)
+        saves the records read so far and the repos this cycle finished, and
+        raises again; the next pass skips those repos and resumes, so a
+        refresh larger than one pass's budget still completes (loom#2651)."""
         allowed = {t.lower() for t in trusted}
+        cycle = self.data["cycle"]
+        if not isinstance(cycle.get("done"), list):
+            cycle.clear()
+            cycle.update({"started": self.now, "done": []})
         for repo in repos:
+            if repo in cycle["done"]:
+                continue
             try:
                 self._repo(gh, repo, allowed, bot)
             except (GitHubError, ValueError, KeyError, TypeError) as err:
                 _say("%s could not be read; its records stay: %s" % (repo, err))
+            except TargetReached:
+                if not self.unreadable:
+                    self.save()
+                _say("refresh carried over at %s; %d records kept"
+                     % (repo, len(self.data["records"])))
+                raise
+            cycle["done"].append(repo)
         for lane, until in (failed_audits or {}).items():
             at = float(until) - 86400
             self.data["audits"].setdefault("%s@%d" % (lane, int(at)), {"lane": lane, "at": at})
@@ -310,6 +334,9 @@ class Scorecard:
         self.scan_briefs()
         self.data["refreshed"] = self.now
         self.demote()
+        self.data["cycle"] = {}
+        _say("refresh completed at %s" % datetime.fromtimestamp(
+            self.now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     def _repo(self, gh: Any, repo: str, allowed: set, bot: str) -> None:
         data = gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc"
@@ -648,6 +675,14 @@ class Scorecard:
                     if done > 0:
                         self.data["demoted"].pop(lane, None)
                         _say("cleared zero-done demotion for lane %s: %d done briefs" % (lane, done))
+                elif isinstance(info, dict) and info.get("kind") == "bad-outcomes":
+                    # Re-scored on each completed refresh: once the bad
+                    # outcomes age out of the window, the demotion lifts.
+                    count, _ = self.bad(lane)
+                    if count < at:
+                        self.data["demoted"].pop(lane, None)
+                        _say("lifted demotion of lane %s: %d bad outcomes in %d days, below "
+                             "LOOM_LANE_DEMOTE_AT=%d" % (lane, count, days, at))
                 continue
             count, what = self.bad(lane)
             if count >= at:
