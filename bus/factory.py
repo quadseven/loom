@@ -206,7 +206,7 @@ NO_LANE_HANDOFF = 24 * 3600
 # with no free lane in its rung or tier.
 NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
                         r"|stalled on lane \S+: no other lane of its "
-                        r"|on lane \S+, .*: no free lane in its )")
+                        r"|on lane \S+, .*: no free lane in its |remote lane \S+ has not pulled it)")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
 HANDOFF_LABEL = labels.HANDOFF
 WAIT_SUPERSEDED = "wait:superseded"
@@ -4547,8 +4547,8 @@ class Factory:
         first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
         return next((candidate for candidate in model_lanes(model)
-                     if (self._takes_work(candidate) and self._serves(candidate, model)
-                         if busy_ok else self._free(candidate))
+                     if ((self._takes_work(candidate) and self._serves(candidate, model))
+                         if busy_ok else (self._free(candidate) and self._serves(candidate, model)))
                      and (not needs_public_repo(candidate, model)
                           or not self._is_private(repo))), None)
 
@@ -4595,10 +4595,8 @@ class Factory:
         if model_match:
             return self._assign_queued_model(repo, issue, model_match.group(1))
         assigned = _lane(issue)
-        if assigned in REMOTE_LANES and not self._is_private(repo) and self._takes_work(assigned):
-            # A live remote assignment stays queued for its pull worker.
-            self._waiting(repo, issue["number"], "remote lane %s has not pulled it" % assigned)
-            return "%s waits for remote lane %s to pull it" % (ref, assigned)
+        if assigned in REMOTE_LANES and not self._is_private(repo):
+            return self._assign_remote_queued(repo, issue, assigned, ref)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
         else:
@@ -4610,6 +4608,42 @@ class Factory:
         if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
+        return ""
+
+    def _assign_remote_queued(self, repo: str, issue: Dict[str, Any], assigned: str,
+                              ref: str) -> str:
+        """Keep a public ticket queued for a live remote lane, or reassign it
+        to a local lane after the remote lane stayed unavailable or did not
+        pull it within reroute_after."""
+        wait_key = "%s#%s" % (repo, issue["number"])
+        reason = "remote lane %s has not pulled it" % assigned
+        remote_age = self.now - self.no_lane_since.get(wait_key, self.now)
+        remote_up = self._takes_work(assigned)
+        if remote_up and remote_age < self.reroute_after:
+            self._waiting(repo, issue["number"], reason)
+            _say("%s waits: %s (remote lane up, %.1f h of %.1f h before reassignment)" % (
+                ref, reason, remote_age / 3600, self.reroute_after / 3600))
+            return "%s waits for remote lane %s to pull it" % (ref, assigned)
+        if remote_up:
+            _say("%s: remote lane %s did not pull it within %.1f h; reassigning to a local lane"
+                 % (ref, assigned, self.reroute_after / 3600))
+        else:
+            _say("%s: remote lane %s is unavailable; reassigning to a local lane" % (ref, assigned))
+        lane, fallback = self._tier_move(repo, issue, old=assigned, allow_remote=False)
+        if lane is None:
+            self._waiting(repo, issue["number"], reason)
+            _say("%s: remote lane %s not pulled and no local lane in tier %s is free"
+                 % (ref, assigned, difficulty_of(issue)))
+            return "%s waits: %s and no local lane in tier %s is free" % (
+                ref, reason, difficulty_of(issue))
+        tier = difficulty_of(issue) + (", " + fallback if fallback else "")
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            self._waiting(repo, issue["number"], "giving it a lane failed")
+            _say("%s: remote reassignment to lane %s failed" % (ref, lane))
+            return "%s: giving it lane %s failed" % (ref, lane)
+        self._status_note(repo, int(issue["number"]),
+                          "The factory reassigned this ticket from remote lane %s to local lane %s "
+                          "after the remote lane did not take it." % (assigned, lane))
         return ""
 
     def _move_queued_refs_pr(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -4742,12 +4776,14 @@ class Factory:
             lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
             why = "%s waits: no free lane takes model %s" % (ref, model)
-            self._waiting(repo, issue["number"], "no free lane takes model %s" % (
+            reason = "no free lane takes model %s" % (
                 model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
-                else "(its Model: line names no model id)"))
-            _say(why)
+                else "(its Model: line names no model id)")
+            self._waiting(repo, issue["number"], reason)
+            _say("%s (known lanes checked for availability, limits and model support)" % why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
+            _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
 
