@@ -228,7 +228,7 @@ class BrainTreesTest(unittest.TestCase):
         (broken / ".git" / "objects" / "info").mkdir(parents=True)
         fresh = self.work / "mo-fresh"
         (fresh / ".git" / "objects" / "info").mkdir(parents=True)
-        age(broken, (brain_trees.STALE_DAYS + 1) * DAY)
+        age(broken, (brain_trees.MIN_IDLE_HOURS + 1) * 3600)
         dirty = self.tree("roll-dirty", hours=24 * 30)
         (dirty / "README").write_text("changed\n")
         age(dirty, 30 * DAY)
@@ -239,6 +239,18 @@ class BrainTreesTest(unittest.TestCase):
         self.assertIn("keep mo-fresh reason=git-status-failed", out)
         self.assertTrue(dirty.exists(), out)
         self.assertIn("keep roll-dirty reason=dirty", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a folder whatever its mode")
+    def test_a_scratch_folder_that_cannot_be_read_is_kept(self):
+        folder = self.work / "t0151"
+        locked = folder / "locked"
+        locked.mkdir(parents=True)
+        age(folder, (brain_trees.STALE_DAYS + 1) * DAY)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o755)
+        out = self.prune()
+        self.assertTrue(locked.exists(), out)
+        self.assertIn("keep t0151 reason=not-a-git-tree", out)
 
     def test_a_git_dir_with_objects_is_not_broken_whatever_its_age(self):
         path = self.tree("roll-unborn", hours=24 * 30)

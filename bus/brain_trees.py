@@ -25,7 +25,7 @@ STALE_DAYS is removed and named; fresher scratch is only counted, under
 `scratch` in the closing line, with no line of its own. A folder whose .git
 is no repo and which holds no file at all (a clone that died before its
 first fetch, so git status fails every tick) is removed once idle for
-STALE_DAYS, reason broken-git-dir (loom#2564, loom#2563).
+MIN_IDLE_HOURS, reason broken-git-dir (loom#2564, loom#2563).
 
 A tree in use, changed in the last MIN_IDLE_HOURS, dirty, or a folder that
 holds a git checkout deeper down (not-a-git-tree) is kept and named. Of the idle clean trees with commits on no remote, the
@@ -156,20 +156,32 @@ def newest_mtime(path: str) -> float:
     return newest
 
 
+def _walk_error(err: OSError) -> None:
+    raise err
+
+
 def holds_git(path: str) -> bool:
     """Whether a .git sits anywhere under path: a checkout nested in a
-    folder, kept since its commits may be on no remote."""
-    for _top, dirs, files in os.walk(path):
-        if ".git" in dirs or ".git" in files:
-            return True
+    folder, kept since its commits may be on no remote. A folder that cannot
+    be read counts as holding one, so it is kept."""
+    try:
+        for _top, dirs, files in os.walk(path, onerror=_walk_error):
+            if ".git" in dirs or ".git" in files:
+                return True
+    except OSError:
+        return True
     return False
 
 
 def holds_files(path: str) -> bool:
-    """Whether anything but a folder sits anywhere under path."""
-    for _top, dirs, files in os.walk(path):
-        if files:
-            return True
+    """Whether anything but a folder sits anywhere under path. A folder that
+    cannot be read counts as holding files."""
+    try:
+        for _top, _dirs, files in os.walk(path, onerror=_walk_error):
+            if files:
+                return True
+    except OSError:
+        return True
     return False
 
 
@@ -329,8 +341,8 @@ class Pruner:
         return None
 
     def sweep_scratch(self, name: str, path: str) -> bool:
-        """Remove scratch or a broken git dir idle for STALE_DAYS; count fresh
-        scratch under `scratch` with no line of its own, since the brain
+        """Remove scratch idle for STALE_DAYS, or a broken git dir idle for
+        MIN_IDLE_HOURS; count fresh scratch under `scratch` with no line of its own, since the brain
         writes dozens of prompt bodies a day. A fresh broken git dir is left
         to held(). True when the entry is dealt with."""
         kind = self.scratch_kind(path)
@@ -344,7 +356,9 @@ class Pruner:
             idle_h = (self.now - (newest_mtime(path) if is_dir else os.lstat(path).st_mtime)) / 3600.0
         except OSError:
             return False
-        if idle_h < self.stale_days * 24:
+        # A clone still running writes objects, so a broken git dir idle for
+        # MIN_IDLE_HOURS is a dead one.
+        if idle_h < (self.stale_days * 24 if kind == "scratch" else self.min_idle_hours):
             if kind != "scratch":
                 return False
             self.keep_reasons["scratch"] += 1
