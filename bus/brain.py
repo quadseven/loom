@@ -1164,6 +1164,19 @@ def _ticket_prs(repo: str, prs: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any
     return found
 
 
+def _refs_ticket_pull(repo: str, pr: Dict[str, Any], tickets: Sequence[Dict[str, Any]]) -> bool:
+    """Whether a pull request names one of this repo's open Loom tickets."""
+    try:
+        association = _ticket_association(repo, pr)
+    except ValueError:
+        return False
+    if association is None or association[0] != repo:
+        return False
+    return any(int(issue.get("number") or 0) == association[1]
+               and issue.get("state", "open") == "open"
+               and "loom:ticket" in _labels(issue) for issue in tickets)
+
+
 def _trunk_warning(goals: List[Dict[str, Any]], data: Dict[str, Any]) -> Optional[str]:
     """Warn when more than half of the last 10 merged PRs target a branch that
     is neither the default branch nor a goal home's declared Trunk."""
@@ -1423,7 +1436,9 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     if into is not None:
         into[repo] = tickets
     pulls = list(gh.paginate("/repos/%s/pulls?state=open" % repo))
-    prs = [i for i in pulls if str(i.get("head", {}).get("ref", "")).startswith("loom/")]
+    prs = [i for i in pulls
+           if str(i.get("head", {}).get("ref", "")).startswith("loom/")
+           or _refs_ticket_pull(repo, i, tickets)]
     trusted = {a.lower() for a in (authors or ())}
     adoptable = [i for i in pulls
                  if not str(i.get("head", {}).get("ref", "")).startswith("loom/")
