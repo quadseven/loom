@@ -26,6 +26,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -341,14 +342,27 @@ def _proxy_env_for_aws() -> Dict[str, str]:
     return env
 
 
+class AwsCliUnavailable(OSError):
+    """An actionable CLI setup error containing no path or parameter value."""
+
+
 def read_ssm(name: str, region: str) -> str:
     """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
     The read is bounded by TIMEOUT, so a hung call cannot stall a pass. The
     error never carries the value."""
-    out = subprocess.run(
-        ["aws", "ssm", "get-parameter", "--region", region, "--name", name,
-         "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
-        capture_output=True, text=True, timeout=TIMEOUT, env=_proxy_env_for_aws())
+    configured = os.environ.get("LOOM_AWS_CLI", "").strip()
+    executable = shutil.which(configured or "aws")
+    if not executable:
+        raise AwsCliUnavailable("aws executable not found; set LOOM_AWS_CLI or fix PATH")
+    try:
+        out = subprocess.run(
+            [executable, "ssm", "get-parameter", "--region", region, "--name", name,
+             "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
+            capture_output=True, text=True, timeout=TIMEOUT, env=_proxy_env_for_aws())
+    except subprocess.TimeoutExpired:
+        raise OSError("SSM read timed out") from None
+    except OSError:
+        raise AwsCliUnavailable("cannot execute aws; check LOOM_AWS_CLI or PATH") from None
     if out.returncode != 0 or not out.stdout.strip():
         raise OSError("could not read the parameter from SSM")
     return out.stdout.strip()
@@ -709,6 +723,8 @@ class GitHub:
             try:
                 raw = read_ssm(parameter, region)
                 terms = _text.parse_deny_terms(raw)
+            except AwsCliUnavailable as err:
+                raise GitHubError("refusing public write: %s" % err) from err
             except Exception as err:
                 raise GitHubError("refusing public write: could not read the leak-scan deny-list") from err
             if not terms:
