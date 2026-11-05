@@ -28,6 +28,11 @@ STRANGER = {"login": "mallory-example"}
 NO_OPUS = ("claude",) + factory.ANTHROPIC
 
 
+# An acceptance criteria section with one box: a queued ticket without one
+# gets no lane (loom#2249).
+ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] x\n"
+
+
 def lane_models(**models):
     """The lanes' configured model settings (LOOM_<LANE>_MODEL) for a test,
     and no others."""
@@ -2947,7 +2952,10 @@ class Trust(Base):
 
 
 class Queued(Base):
-    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0):
+    def queued(self, number, body="Difficulty: medium\n\n## Why\nx\n", age=0, boxes=True):
+        # A queued ticket with no acceptance box gets no lane (loom#2249).
+        if boxes:
+            body += ACCEPTANCE
         self.gh.ticket(number, "queued", body=body)
         self.gh.issues[number]["labels"] = [
             {"name": "loom:ticket"}, {"name": "loom:queued"}]
@@ -2983,6 +2991,25 @@ class Queued(Base):
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertEqual(worker.waits["%s#7" % REPO], "waits for #5 to merge (After:)")
         self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+
+    def test_a_queued_ticket_with_no_acceptance_box_gets_no_lane_and_one_note(self):
+        # loom#2249: five box-less tickets were given lanes all night; each
+        # run was parked unrun by the runner and spent a slot and a rung.
+        self.queued(7, body="Difficulty: medium\n\n## Why\nx\n\n## Size\nS\n", boxes=False)
+        self.assign(available=["codex"])
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("queued", ""))
+        self.assertIn("needs-brain", factory._labels(issue))
+        (note,) = [c["body"] for c in self.gh.comments[7]]
+        self.assertIn("## Acceptance criteria", note)
+
+    def test_a_queued_ticket_with_an_acceptance_box_gets_a_lane(self):
+        self.queued(7)
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn("needs-brain", factory._labels(issue))
 
     def test_a_queued_ticket_whose_after_ticket_merged_gets_a_lane(self):
         self.gh.ticket(5, "merged")
@@ -3058,7 +3085,7 @@ class Queued(Base):
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3", "claude"])
         self.assertEqual(self.lane(7), "claude")
-        self.assertEqual(self.gh.issues[7]["body"], body)
+        self.assertEqual(self.gh.issues[7]["body"], body + ACCEPTANCE)
 
     def test_a_ticket_held_for_a_factory_incident_does_not_fill_its_lane(self):
         # 2026-10-18: tickets held for open factory incidents kept their
@@ -3084,7 +3111,7 @@ class Queued(Base):
         self.queued(7, body=body)
         self.assign(available=["opencode-go-3"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
-        self.assertEqual(self.gh.issues[7]["body"], body)
+        self.assertEqual(self.gh.issues[7]["body"], body + ACCEPTANCE)
 
     def test_private_medium_uses_the_least_loaded_available_tier_lane(self):
         self.queued(7)
@@ -4760,8 +4787,8 @@ class ForbiddenModels(unittest.TestCase):
 
 class NoLane(Base):
     """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
-    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n"
-    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n"
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
+    OPUS = "Model: claude-opus-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
 
     def queued(self, number, body):
         self.gh.ticket(number, "queued", body=body)
