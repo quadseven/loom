@@ -347,7 +347,7 @@ def _bind(found: Dict[str, str], target: ast.expr, value: Optional[ast.expr],
     elif isinstance(target, ast.Starred):
         _bind(found, target.value, None, whole)
     elif isinstance(target, (ast.Tuple, ast.List)):
-        for item, own in zip(target.elts, _tuple_values(target, value)):
+        for item, own in zip(target.elts, _tuple_values(target, value), strict=True):
             _bind(found, item, own, whole)
 
 
