@@ -333,6 +333,11 @@ def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
     return (int(found.group(1)), int(found.group(2))) if found else None
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
+# The codex lane and its seven slots, all on gpt-6-luna (labels.SLOTS). Every
+# tier and rung that names codex names them all: codex-3 to codex-8 were once
+# lanes only, beat available and sat idle while medium and hard tickets
+# waited "no free lane in tier" (tests/test_bus_codex_slots.py).
+CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 9))
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
 SHARED_CREDIT = ANTHROPIC
@@ -351,7 +356,7 @@ SHARED_CREDIT = ANTHROPIC
 # because a climb is the work that most needs the strong model.
 LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (("claude",), "claude-sonnet-5-5"),
-    (("codex", "codex-2"), "gpt-6-luna"),
+    (CODEX, "gpt-6-luna"),
     (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
 # The lanes a ticket may move to when its lane is at a limit, by its
@@ -388,13 +393,13 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # waited a median 18.5 hours for codex while these sat idle; a ticket a
     # free model fails still climbs the model ladder.
     "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
-              + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                 "codex", "codex-2") + ANTHROPIC,
+              + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+              + CODEX + ANTHROPIC,
     # agy takes hard work on public repos (agy stays public only); since
     # 2026-10-21 it runs its gemini-3.8-flash default there, as codex runs
     # gpt-6-luna (tickets.FORBIDDEN_MODELS).
     "hard": SPARKS + ANTHROPIC + ("claude", "agy", "opencode-go", "opencode-go-2",
-                                  "opencode-go-3", "opencode-go-4", "codex", "codex-2"),
+                                  "opencode-go-3", "opencode-go-4") + CODEX,
 }
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
 # own-hardware (the Sparks), free (a free provider's allowance), subscription

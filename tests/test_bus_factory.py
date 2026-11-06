@@ -854,7 +854,7 @@ class PullRequests(Base):
         self.gh.issues[5]["labels"].append({"name": "loom:ready"})
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM]
         self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.model(5), None)
         self.assertEqual((self.moved, self.closed), ([], []))
@@ -1001,7 +1001,7 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         posted = len(self.gh.comments[5])
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual((self.moved, self.fixed), ([], []))
         self.assertEqual(len(self.gh.comments[5]), posted)
         self.assertFalse([w for w in self.gh.writes if "tried every rung" in str(w)])
@@ -1029,14 +1029,14 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.answered_thread()
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         # It still waits for its rung, and the review bot is asked to judge the
         # answer instead.
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
         self.assertEqual(len(self.gh.comments[50]), 1)
         self.assertIn("/grug improve", self.gh.comments[50][0]["body"])
         # Once per head commit: the next pass asks no more.
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual(len(self.gh.comments[50]), 1)
 
     def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
@@ -1059,7 +1059,7 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.answered_thread(login="mallory-example")
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual(self.gh.comments.get(50, []), [])
 
     def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
@@ -3675,6 +3675,9 @@ class Tickets(Base):
         self.gh.ticket(8, "briefed", lane="codex", body=body)
         for number in (9, 10):
             self.gh.ticket(number, "briefed", lane="codex-2", body=body)
+        # The other codex slots wait as long as codex-2.
+        for number, lane in enumerate([x for x in factory.CODEX[2:] for _ in (1, 2)], 30):
+            self.gh.ticket(number, "briefed", lane=lane, body=body)
         self.go()
         self.assertEqual(self.lane(7), "codex")
         self.assertEqual(self.gh.comments[7], [])
@@ -3971,14 +3974,15 @@ class Tickets(Base):
         self.assertEqual(sorted((self.lane(7), self.lane(8))), ["spark", "spark-2"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
+        for n, lane in enumerate(factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3",
+                                                      "opencode-go-4"), 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
         # Next come the Sparks, and an anthropic slot only once they are busy.
         self.assertEqual(self.lane(7), "spark")
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        busy = (("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+        busy = (factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
                 + factory.SPARKS + factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai"))
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
@@ -4250,8 +4254,9 @@ class Tickets(Base):
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
-        for n in range(11, 19):  # codex and codex-2 hold 4 each: none holds 3 fewer
-            self.gh.ticket(n, "briefed", lane="codex" if n % 2 else "codex-2")
+        # Each codex slot holds 4: none holds 3 fewer.
+        for n in range(11, 11 + 4 * len(factory.CODEX)):
+            self.gh.ticket(n, "briefed", lane=factory.CODEX[n % len(factory.CODEX)])
         self.go(limited=factory.ANTHROPIC)
         self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
 
@@ -4398,7 +4403,7 @@ class Helpers(unittest.TestCase):
                          "Model: b\nDifficulty: hard\n\n## Why")
 
     def test_a_busy_rung_spills_to_the_next_untried(self):
-        busy = {"claude": 2, "codex": 2, "codex-2": 3}
+        busy = dict({lane: 2 for lane in factory.CODEX}, claude=2, **{"codex-2": 3})
         self.assertEqual(factory.next_rung(set(), {}), 1)
         self.assertEqual(factory.next_rung(set(), {"claude": 2}), 2)
         self.assertEqual(factory.next_rung(set(), busy), 3)
@@ -4747,7 +4752,7 @@ class ForbiddenModels(unittest.TestCase):
             self.assert_allowed(model, "factory.EQUIVALENTS[%s]" % pin)
         for model in factory.STRONG | station.STRONG_MODELS:
             self.assert_allowed(model, "the strong models")
-        self.assertEqual(dict(factory.LADDER[1:2]), {("codex", "codex-2"): "gpt-6-luna"})
+        self.assertEqual(dict(factory.LADDER[1:2]), {factory.CODEX: "gpt-6-luna"})
 
     def test_a_go_model_off_the_allow_list_reads_as_the_stand_in(self):
         # Kimi K2.7 Code (1,350 requests per 5 h) spent the Go allowance in
