@@ -8063,6 +8063,31 @@ exec /usr/bin/git "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uv=1 secret=unset", log.read_text())
 
+    def test_contract_run_marks_the_check_sandbox_for_the_repos_tests(self):
+        # Base checks failed only in the lane sandbox, which denies localhost,
+        # on unittest suites that loopback-connect (2026-11-06). The check
+        # sets LOOM_CHECK_SANDBOX=1 so such a test can skip there; the
+        # runner's own value never reaches the check.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        log = tmp / "log"
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
+               "LOOM_CHECK_SANDBOX": "runner"}
+        result = subprocess.run(["bash", "-c", script, "test",
+                                 "echo marker=${LOOM_CHECK_SANDBOX:-unset}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("marker=1", log.read_text())
 
     def test_contract_run_puts_uv_and_uvx_on_the_checks_path(self):
         # Every infra ticket held on the factory incident: the contract runs
