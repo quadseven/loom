@@ -7861,10 +7861,8 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
 def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     """The rungs a ticket ran on, from rung markers by a trusted login only,
     as in the factory: anyone can comment on a public repo."""
-    from . import factory  # factory imports this module
-    trusted = {a.lower() for a in authors}
-    return factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
-        (c.get("user") or {}).get("login") or "").lower() in trusted])
+    from . import history  # the trusted history reading (loom#2457)
+    return history.read_history(comments, authors).tried_rungs
 
 
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
@@ -7879,10 +7877,12 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
-    fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
+    from . import history  # the trusted history reading (loom#2457)
+    read = history.read_history(comments, authors or trusted_authors())
+    fixes = read.fixes
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
-    rungs = _trusted_rungs(comments, authors or trusted_authors())
+    rungs = read.tried_rungs
     return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
                    rungs, held)
 
