@@ -2083,6 +2083,37 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                       "Thread PRRT_1 (comment 11) at a.py:3", round_note)
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_run_whose_commits_net_to_no_change_opens_no_pull_request(self):
+        # loom#1637: a lane pull request with no changed files sat green in
+        # the review queue; there was nothing in it to check or merge.
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + (
+            "printf 'fixed\\n' > fix.txt\ngit add fix.txt\n"
+            "git -c user.name=t -c user.email=t@example.invalid commit -qm 'Fix the thing'\n"
+            "git -c user.name=t -c user.email=t@example.invalid revert --no-edit HEAD > /dev/null\n"))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_nothing_pushed()
+        self.assertIn("no change to push", self.failure_line())
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_fix_round_that_empties_its_pull_request_closes_it(self):
+        name, _ = self.fix_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "rm first.txt\n")
+        result = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        closes = [c for c in self.calls() if c.startswith("gh pr close 7 ")]
+        self.assertEqual(len(closes), 1, self.calls())
+        self.assertIn("no change to push", closes[0])
+        self.assertIn("no change to push", self.failure_line(ticket=name))
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_that_leaves_a_change_keeps_its_pull_request_open(self):
+        self.fix_brief()
+        self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertFalse([c for c in self.calls() if c.startswith("gh pr close")])
+
     def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
         # 2026-10-20: "Lane claude pushed fixes for: the findings on the
         # ticket" told the reader nothing about a round that merged main.
