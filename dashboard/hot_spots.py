@@ -138,7 +138,8 @@ def build_hot_spots(payload, waits_error, now, bot=DEFAULT_REVIEW_BOT):
     tickets = [row for rows in (payload.get("tickets") or {}).values() if rows for row in rows]
     comments = payload.get("issue_comments") or []
     waits = payload.get("wait_rows") or []
-    return {"waits": waits, "bottleneck": name_bottleneck(waits),
+    return {"waits": waits, "wait_causes": payload.get("wait_cause_rows") or [],
+            "bottleneck": name_bottleneck(waits),
             "waits_error": waits_error or "waits have not been read yet",
             "comments_error": payload.get("hot_spots_error") or "",
             "findings": finding_counts(payload.get("review_comments"), bot, now),
@@ -175,6 +176,36 @@ def render_waits(data):
         html.escape(data["bottleneck"]), by_state[data["bottleneck"]]["median_h"])
         if data["bottleneck"] in by_state else '<p>No bottleneck: no state has 3 samples yet.</p>')
     return '<ul class="wait-list">%s</ul>%s' % (rows, note)
+
+
+def render_wait_causes(rows, error=""):
+    """Show active wait reasons with ticket tier and model context."""
+    if not rows:
+        if error:
+            return '<p class="empty-state">Wait causes are missing: %s.</p>' % html.escape(error)
+        return '<p class="empty-state">No active ticket wait causes were read.</p>'
+    rendered = []
+    for row in rows:
+        median = "unknown" if row.get("median_h") is None else "%.1fh median" % row["median_h"]
+        worst = "" if row.get("worst_h") is None else " / %.1fh worst" % row["worst_h"]
+        ticket = ""
+        ref = str(row.get("worst_ticket") or "")
+        if "#" in ref:
+            repo, number = ref.rsplit("#", 1)
+            if number.isdigit():
+                ticket = ' <a href="%s">%s#%s</a>' % (
+                    html.escape(_ticket_href(repo, int(number)), quote=True),
+                    html.escape(repo), html.escape(number))
+        rendered.append('<li class="wait"><p class="bar-head machine-fact"><span class="state">%s</span>'
+                        '<span>%s%s</span></p><p class="stuck-meta">%s tier / %s model / %d tickets, '
+                        '%d timed</p>%s</li>' % (
+            html.escape(str(row.get("cause") or "unknown")), median, worst,
+            html.escape(str(row.get("tier") or "unknown")),
+            html.escape(str(row.get("model") or "unknown")),
+            row.get("n") or 0, row.get("known_waits") or 0, ticket))
+    warning = ('<p class="empty-state">Showing last successful wait causes; refresh failed: %s.</p>' %
+               html.escape(error)) if error else ""
+    return warning + '<ul class="wait-list wait-causes">%s</ul>' % "".join(rendered)
 
 
 def render_findings(data):
@@ -234,8 +265,11 @@ def render_hot_spots(data):
              if data["comments_error"] else render_failure_rates(data["rates"]))
     return ('<p class="page-lede">Where tickets wait, what keeps failing, and what is stuck. Last 7 days.</p>'
             '<div class="hot-grid">'
-            '<section class="card hot-spot"><h2 class="label">Where it slows / median wait, worst</h2>%s</section>'
+            '<section class="card hot-spot"><h2 class="label">Where it slows / median wait, worst</h2>%s'
+            '<h3 class="label">Active wait causes / tier / model</h3>%s</section>'
             '<section class="card hot-spot"><h2 class="label">What the review bot keeps sending back</h2>%s'
             '<h3 class="label">Lane failure rate</h3>%s</section></div>'
             '<section class="hot-stuck"><h2 class="label">Repeatedly stuck / up the ladder</h2>%s</section>') % (
-        render_waits(data), render_findings(data), rates, render_stuck(data))
+        render_waits(data), render_wait_causes(data["wait_causes"], data["waits_error"]),
+        render_findings(data), rates,
+        render_stuck(data))

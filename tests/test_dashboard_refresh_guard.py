@@ -64,9 +64,14 @@ class RefreshGuardTest(unittest.TestCase):
         self.assertIn("KeyError", self.store.response()["stale_reason"])
 
     def test_waits_survive_a_type_error(self):
+        previous = [{"cause": "wait:lane", "tier": "medium", "model": "gpt-6-luna",
+                     "n": 1, "known_waits": 0, "median_h": None,
+                     "worst_h": None, "worst_ticket": None}]
+        self.store._snapshot["wait_cause_rows"] = previous
         with mock.patch.object(dashboard_github, "waits_for_repos", side_effect=TypeError("bad row")):
             self.store.refresh()
         self.assertIn("bad row", self.store.waits_error)
+        self.assertEqual(self.store.response()["wait_cause_rows"], previous)
 
     def test_cache_is_pruned_each_refresh(self):
         with mock.patch.object(self.gh, "prune_cache", wraps=self.gh.prune_cache) as prune:

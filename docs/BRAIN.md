@@ -2016,6 +2016,30 @@ declares steps `blocked: held for the operator`.
 
 ### Operator answers
 
+The dashboard's Review queue (`/review-queue`) lists held pull requests with
+risk tier, hold reason, complete review findings, current-head check results,
+and the ticket's acceptance criteria. Checked boxes remain author claims;
+a matching trusted proof record is identified separately. Unreadable details
+remain visible with actions disabled, rather than disappearing from the queue.
+Reads are cached for five minutes and respect the dashboard's request budget.
+
+Merge, Hold and Send back use the same authenticated answer writer as Needs
+you. A review decision is bound to the displayed pull request, head, and
+trusted ask comment ID plus complete-body hash. The card shows the complete
+ask. The writer re-reads that ask and head before posting, and the station
+checks the same binding when consuming the answer. A stale card
+returns a reload refusal. Send back opens the existing fix-round path with the
+operator's note. A repeated round writes no duplicate brief. If the head or
+ask changes before the station applies Send back, the station records one
+visible rejection and continues processing other answers. No review action
+can become an automated reversible default. Approval lifts only the operator
+hold; every other merge gate still applies.
+
+Routine no-change fix-round explanations stay in the local lane log. Pull
+requests retain actionable review requests, findings, decisions and summaries,
+not the lane's raw working notes.
+
+
 The dashboard's Needs you page takes an answer to each ask in one tap
 (loom#1777, docs/DASHBOARD.md). It posts one comment as the Loom App,
 `<!-- loom:answer v1 --> Answer from <login> (via the dashboard): <choice>.
@@ -2034,7 +2058,7 @@ A reversible decision ask may also include `Default: <offered option>` and
 `LOOM_DECISION_WINDOW_DAYS`, then records an automated default through the shared answer module
 with a note explaining how to reverse it. The record is bound to the ask ID
 and body, appears in a separate Automated decision default brief section,
-and never counts as an operator answer or merge approval. Merge and Hold
+and never counts as an operator answer or merge approval. Merge, Hold and Send back
 cannot be defaults. Editing an ask restarts its waiting window. An answer given during the window
 is never overridden. Defaults are refused on every other kind, including
 money, account, credential, hardware and physical asks. An issue with a
@@ -2042,15 +2066,14 @@ money, account, credential, hardware and physical asks. An issue with a
 new `needs:human` ask until that label is gone. Reversible decision cards are
 available to every configured operator on Needs you.
 
-On a lane pull request held for the operator, the hold ask offers Merge or
-Hold. Merge lifts that hold only, in the factory and in `bus.brain merge`:
+On a lane pull request held for the operator, the hold ask offers Merge, Hold or Send back. Merge lifts that hold only, in the factory and in `bus.brain merge`:
 the risk tier's review check, open findings and hourly cap, the checks, the
 criteria and shadow mode still decide, so in shadow mode the merge is still
 only recorded. Hold keeps the pull request held with no new ask, and the
 factory puts `needs:human` back so it keeps waiting on a person. An answer
 counts only for the pull request the newest hold ask names, given after that
 ask and not before the head commit it would merge; a newer ask, or a newer
-head, asks again. Each Merge or Hold is written once to the shadow ledger as
+head, asks again. Each operator review verdict is written once to the shadow ledger as
 an `operator-verdict` entry (its label the verdict), beside the would-merge
 it pairs with; the ledger's counts and digest leave verdicts out.
 
@@ -2408,13 +2431,14 @@ scorecard, aggregated per lane and model.
 A bad outcome is a bad-work finding, a revert, a failed deploy, a failed
 proof audit or a damaging audit verdict. A lane (all its slots) whose bad
 outcomes over the last `LOOM_LANE_DEMOTE_DAYS` days (default 7) reach
-`LOOM_LANE_DEMOTE_AT` (default 3) is demoted: it claims no build ticket, the
+`LOOM_LANE_DEMOTE_AT` (default 3) and are at least `LOOM_LANE_DEMOTE_RATE`
+(default 0.1) of its pull requests in the window (loom#2683) is demoted: it claims no build ticket, the
 factory gives it no queued ticket, tier move or automatic retry (as a lane
 that is down; loom#2430), its briefed tickets step aside to other lanes with
 a status event naming the demotion and its counts, and it stays demoted until
 the operator runs
 `python3 -m bus.scorecard clear <lane>` (`show` prints the table) or a
-completed refresh finds its bad outcomes in the window below the threshold. Clearing
+completed refresh finds its bad outcomes in the window below the threshold or the rate. Clearing
 forgets the outcomes before it. A demoted lane still takes verify runs. A
 repo that cannot be read keeps its records, and nothing is cleared by an
 error. The table goes on the lane status comment, and the dashboard's Lanes

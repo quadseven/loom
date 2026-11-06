@@ -160,6 +160,11 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
+  repo's test that needs a loopback connection may skip when that variable
+  is `1`, and only then; CI and local runs never set it, so the test still
+  runs there. A unittest repo has no other way to drop such a test from a
+  lane check.
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
   (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
@@ -470,7 +475,9 @@ A new App is easiest made from
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
-down or demoted (bus/scorecard.py). The same test picks every tier move,
+down or demoted (bus/scorecard.py: `LOOM_LANE_DEMOTE_AT` bad outcomes in
+the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
+requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
@@ -1585,6 +1592,12 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- A run killed with SIGTERM (exit 143) is a `[transient]` ending, never a
+  `[limit]`: a limit phrase in its output came from what it read, so it writes
+  no provider limit and no hold. Only the runner's own watchdog, which kills a
+  run after the provider's limit line, holds the lane. A codex run killed this
+  way had read about a monthly limit and held the lane until the next month
+  (loom#2683).
 - Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
   reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
   drops what is deprecated or paused, probes each candidate, and takes the first

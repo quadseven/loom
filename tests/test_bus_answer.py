@@ -33,7 +33,7 @@ class Options(unittest.TestCase):
          ("a", "b", "c")),
         ("Kind: decision\nMerge #12 now or hold it until the window.", answer.CHOICE, ("Merge", "Hold")),
         (operator_hold.ask(8, ["it declares operator steps before merge: resize the disk"]),
-         answer.CHOICE, ("Merge", "Hold")),
+         answer.CHOICE, ("Merge", "Hold", "Send back")),
         ("Keep this ticket open or close it as done?", answer.CHOICE, ("Keep", "Close")),
         ("Sign in to the console and reply done.", answer.CHOICE, ("Done", "Not now")),
         ("Kind: account\nCreate the service account for the lane.", answer.CHOICE, ("Done", "Not now")),
