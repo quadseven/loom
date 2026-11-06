@@ -2875,12 +2875,32 @@ final_validation() {
 # whose branch already held the default branch sets no FIX_UPSTREAM, so the
 # fetched default branch is the other end.
 lane_changed_files() {
-  local range="$BASE..HEAD" upstream="${FIX_UPSTREAM:-}"
+  safe_git diff --name-only "$(lane_diff_range)"
+}
+
+# The range lane_changed_files reads: BASE..HEAD, or UPSTREAM...HEAD against
+# the fix round's default branch.
+lane_diff_range() {
+  local upstream="${FIX_UPSTREAM:-}"
   if [ -z "$upstream" ] && [ -n "${FIX_PR:-}" ] && [ -n "${FIX_DEFAULT:-}" ]; then
     upstream="$(safe_git rev-parse --verify -q "origin/$FIX_DEFAULT^{commit}")" || upstream=""
   fi
-  [ -z "$upstream" ] || range="$upstream...HEAD"
-  safe_git diff --name-only "$range"
+  if [ -n "$upstream" ]; then printf '%s...HEAD' "$upstream"; else printf '%s..HEAD' "$BASE"; fi
+}
+
+# Whether the pull request would change nothing (loom#1637): a lane pull
+# request with no changed files passed every check, since there was nothing
+# to check, and sat green in the review queue. Returns 0 when the diff
+# lane_changed_files reads is empty, 1 when it holds a change, and 2 when it
+# cannot say: git failed, or a fix round has no default branch to compare
+# with (its BASE..HEAD is only this round's commits, not the pull request).
+lane_diff_empty() {
+  local range rc
+  range="$(lane_diff_range)"
+  [ -z "${FIX_PR:-}" ] || [[ "$range" == *...HEAD ]] || return 2
+  safe_git diff --quiet "$range" -- 2>> "$LOG"
+  rc=$?
+  case "$rc" in 0|1) return "$rc" ;; *) return 2 ;; esac
 }
 
 # The contract's affected command after the check passed (loom#1773): the
@@ -4257,6 +4277,12 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
   fi
+  # A new run whose commits net to no change opens no pull request and pushes
+  # no branch for one (loom#1637). A fix round is checked after its push,
+  # where the pull request's own diff is known.
+  if [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
+    park "$BRIEF" "no change to push: the commits on $BRANCH net to no diff against ${BASE:0:12}"; continue
+  fi
   # A commit that adds files outside the brief is refused before validation
   # and push: nothing is pushed, and the reason names every stray file. A fix
   # round removes them instead (drop_stray_files) and checks again, so it
@@ -4519,6 +4545,19 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     # The station reads this marker, not the log, to say the round pushed.
     : > "$LOGDIR/$TICKET.pushed"
     note_answer_head "$(safe_git rev-parse HEAD 2>> "$LOG")"
+  fi
+  # A fix round that leaves its pull request with no diff against the default
+  # branch closes it (loom#1637): an empty pull request is never mergeable
+  # work. The push goes first, so the closed pull request shows the round
+  # that emptied it. A close that fails is logged and the brief still parks.
+  if [ -n "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
+    EMPTY_WHY="no change to push: #$FIX_PR has no diff against ${FIX_DEFAULT:-its base} after this round"
+    if ! timeout "$NET_TIMEOUT" gh pr close "$FIX_PR" -R "$REPO" \
+         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge." >> "$LOG" 2>&1; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: could not close the empty pull request #$FIX_PR" >> "$LOG"
+      EMPTY_WHY="$EMPTY_WHY; closing it failed"
+    fi
+    park "$BRIEF" "$EMPTY_WHY"; continue
   fi
   if [ -n "$FIX_PR" ]; then
     UNANSWERED="$(unanswered_threads)"

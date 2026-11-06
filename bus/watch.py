@@ -117,6 +117,14 @@ STAGE_RE = re.compile(r"^station: (?P<stage>[A-Za-z_][A-Za-z0-9_]*) failed: ")
 _HOLD_REF = r"[A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)?#[0-9]+ \([a-z-]+\)"
 HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for "
                      + _HOLD_REF + r"(?:, " + _HOLD_REF + r")*[ \t]*")
+# Station lines that name a designed outcome, not an error, though they say
+# "failed". bus/station.py _stop_fix_rounds ends a ticket's fix rounds, at the
+# top of the model ladder or at the round cap, and leaves it in loom:failed
+# for the hand-off pool (loom#1881, loom#1880 filed it twice).
+EXPECTED_RES = (
+    re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+: fix rounds stopped \(.+\); "
+               r"left failed for the hand-off pool[ \t]*"),
+)
 # The brain's own status output, read back into its log: it names stages,
 # states and outcomes ("failed"), so the error words match, but none of it is
 # an error (loom#871: one tick's report filed six issues, one per line).
@@ -496,9 +504,10 @@ def keep(line: str) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
     station's hold line is status, whatever state word it names, so is the
     brain's own status output (brain_status), the station's note of a failed
-    verify run (VERIFY_RUN_RE), and a relayed CI log line is the run's output
-    (CI_LOG_RE)."""
-    if HOLD_RE.fullmatch(_LEAD_RE.sub("", line).rstrip("\r\n")):
+    verify run (VERIFY_RUN_RE) and a designed station outcome (EXPECTED_RES).
+    A relayed CI log line is the run's output (CI_LOG_RE)."""
+    bare = _LEAD_RE.sub("", line).rstrip("\r\n")
+    if HOLD_RE.fullmatch(bare) or any(r.fullmatch(bare) for r in EXPECTED_RES):
         return False
     if brain_status(line):
         return False
