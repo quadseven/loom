@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -507,9 +508,11 @@ def review(rid, body, state="COMMENTED", when="2030-01-02T09:30:00Z", bot=True):
                      "type": "Bot" if bot else "User"}}
 
 
-def pr_comment(body, when="2030-01-02T09:45:00Z"):
+def pr_comment(body, when="2030-01-02T09:45:00Z", login="loom-station[bot]"):
+    """A pull-request comment; by default the Loom account's, which the
+    tests' LOOM_BRIEF_AUTHORS trusts. A stranger passes login="alice"."""
     return {"body": body, "created_at": when,
-            "user": {"login": "alice", "type": "User"}}
+            "user": {"login": login, "type": "User"}}
 
 
 class StubGH:
@@ -559,11 +562,24 @@ class ReviewBodies(unittest.TestCase):
                              review(45, Findings.STYLE)],
                     comments=[pr_comment("Answering review 43: "
                                          "https://example.test/x#pullrequestreview-43")])
-        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [settled], HEAD_AT, by_bot)
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [settled], HEAD_AT, by_bot,
+                                              ["loom-station[bot]"])
         self.assertEqual([b["review"]["id"] for b in bodies], [45])
         self.assertTrue(bodies[0]["settled"])
         self.assertEqual(bodies[0]["findings"],
                          [(merge_tier.finding(Findings.STYLE), "addressed", "")])
+
+    def test_a_strangers_link_does_not_answer_a_review_body(self):
+        link = "Answered: https://example.test/x#pullrequestreview-47"
+        gh = StubGH(reviews=[review(47, Findings.STYLE)],
+                    comments=[pr_comment(link, login="mallory")])
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [], HEAD_AT, by_bot,
+                                              ["loom-station[bot]"])
+        self.assertEqual([b["review"]["id"] for b in bodies], [47])
+        gh = StubGH(reviews=[review(47, Findings.STYLE)],
+                    comments=[pr_comment(link, login="Loom-Station[bot]")])
+        self.assertEqual(merge_tier.unanswered_bodies(gh, REPO, 8, [], HEAD_AT, by_bot,
+                                                      ["loom-station[bot]"]), [])
 
     def test_a_body_finding_with_no_thread_reads_open(self):
         gh = StubGH(reviews=[review(46, Findings.STYLE)])
@@ -605,9 +621,22 @@ class ReviewBodies(unittest.TestCase):
         self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=runner(0)), False)
         self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=runner(2)), None)
 
+        seen = []
+
+        def spy(cmd, **k):
+            seen.append(cmd)
+            return Done(0)
+        merge_tier.run_ruff("s110", "a.py", "x", runner=spy)
+        self.assertIn("--ignore-noqa", seen[0])
+
         def missing(*a, **k):
             raise OSError("no ruff")
         self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=missing), None)
+
+    @unittest.skipUnless(shutil.which("ruff"), "ruff is not installed")
+    def test_a_noqa_comment_does_not_silence_the_recheck(self):
+        text = "try:\n    pass\nexcept Exception:  # noqa: S110\n    pass\n"
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", text), True)
 
 
 class ReviewBodyGate(BrainMerge):
@@ -721,6 +750,16 @@ class ReviewBodyGate(BrainMerge):
         self.assertEqual(refused, "")
         self.assertTrue(self.merged(fake))
         self.assertEqual(self.answers(fake), [])
+
+    def test_a_strangers_link_does_not_answer_the_body_through_the_gate(self):
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[],
+            pages=[[thread(Findings.STYLE, resolved=False)]],
+            reviews=[review(43, Findings.STYLE)],
+            comments=[pr_comment("https://example.test/x#pullrequestreview-43",
+                                 login="mallory")])
+        self.assertIn("unanswered review bodies hold the merge", refused)
+        self.assertFalse(self.merged(fake))
 
     def test_a_new_duplicate_thread_holds_the_merge_until_it_is_settled(self):
         # Criterion 4 (the PR #1996 fixture): the older duplicate thread is

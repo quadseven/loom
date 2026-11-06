@@ -5438,7 +5438,7 @@ class AbandonedReview(Base):
         self.gh.ticket(5, "merged")
         self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
         self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
-                                 "user": {"login": "grug-tribe[bot]"},
+                                 "user": {"login": "grug-tribe[bot]", "type": "Bot"},
                                  "html_url": "https://example.test/pull/51#issuecomment-777"}]
         self.gh.details[51]["reviewThreads"] = {"nodes": [{
             "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
@@ -5482,6 +5482,29 @@ class AbandonedReview(Base):
         self.go(lint_run=lambda rule, path, text: True)
         self.assertEqual(len(self.follow_ups()), 1)
         self.assertEqual(self.answers(), [])
+
+    def test_a_human_named_like_the_bot_or_a_stranger_does_not_count(self):
+        self.noticed()
+        notice = self.gh.comments[51][0]
+        human = dict(notice, user={"login": "grug-tribe[bot]", "type": "User"})
+        plain = dict(notice, user={"login": "grug-tribe", "type": "User"})
+        self.assertTrue(factory.abandoned_notice(notice, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(human, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(plain, "grug-tribe"))
+        later = {"body": "%s %s" % (factory.ABANDONED_ANSWER_MARKER, "#issuecomment-777"),
+                 "created_at": iso(95), "user": {"login": "mallory", "type": "User"}}
+        self.assertFalse(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+        later["user"] = {"login": "Alice-Example", "type": "User"}
+        self.assertTrue(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+
+    def test_a_strangers_answer_marker_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.gh.comments[51].append({
+            "id": 778, "body": factory.ABANDONED_ANSWER_MARKER, "created_at": iso(95),
+            "user": {"login": "mallory", "type": "User"}})
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 2)
 
     def test_no_notice_no_follow_up(self):
         self.gh.ticket(5, "merged")
