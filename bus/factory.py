@@ -184,7 +184,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -460,8 +460,9 @@ CLIMB = _climb_rungs()
 # to another of these, never back down to a weaker model (climb_rungs).
 STRONG = frozenset({LADDER[-1][1]} | set(HARD_MODELS.values())
                    | {model for _, model, _ in EQUIVALENTS.values()})
-EQUIVALENT_MARKER = "<!-- loom:equivalent %s -->"
-EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
+# The equivalent-move marker format is owned by bus/history.py (loom#2457).
+EQUIVALENT_MARKER = history.EQUIVALENT_MARKER
+EQUIVALENT_RE = history.EQUIVALENT_RE
 # When no lane of a ticket's tier is up (each at a limit or down), a tier move
 # takes a free lane of these tiers instead, in order: the next harder tier,
 # then the easier one (docs/MUSE.md, Lane choice). On 2026-10-14 every medium
@@ -499,12 +500,13 @@ RUNG_LIMIT_WAIT = 2 * 3600
 LIMIT_REQUEUE = 2 * 3600
 # A running ticket on a lane with no live heartbeat for this long moves off it.
 SILENT_MAX = 30 * 60
-RUNG_MARKER = "<!-- loom:rung %d -->"
-RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
+# The rung marker format is owned by bus/history.py (loom#2457).
+RUNG_MARKER = history.RUNG_MARKER
+RUNG_RE = history.RUNG_RE
 # The thread and check headings bus.brain.fix writes into a loom:fix comment.
 FIX_THREAD_RE = re.compile(r"^### Thread (\S+) ", re.M)
 FIX_CHECK_RE = re.compile(r"^### Check: ", re.M)
-CLAIM_RE = re.compile(r"^Claimed for lane ")
+CLAIM_RE = history.CLAIM_RE
 # The factory's own note when it moves a stalled ticket to another lane.
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
@@ -514,30 +516,19 @@ NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 NO_CHANGE_LIMIT = 2
 # bus/station.py's note on a failed run, and the runner's reason when a run
 # committed nothing and its agent wrote no reason why (lanes/run_lane.sh).
-FAILED_RE = re.compile(r"^Lane \S+ failed: ")
-# Other endings of a claim, each read as a classed reason (loom#572): since
-# status events (loom#866) these lines do not start "Lane X failed:". An
-# automatic retry carries the failed lane's classed reason after its move; a
-# factory-incident hold is a [factory] ending; and bus/station.py's limit,
-# auth and branch-moved paths record "Lane X stopped: [class] ...", worded so
-# that no reader of FAILED_RE counts it as a failure.
-RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): moved from lane "
-                            r"\S+ to lane \S+\. Lane \S+ failed: ")
-HELD_RE = re.compile(r"^Lane \S+ held: ")
-STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
-CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
+# The claim-ending patterns are owned by bus/history.py (loom#2457): since
+# status events (loom#866) these lines do not all start "Lane X failed:".
+FAILED_RE = history.FAILED_RE
+RETRY_ENDED_RE = history.RETRY_ENDED_RE
+HELD_RE = history.HELD_RE
+STOPPED_RE = history.STOPPED_RE
+CLAIMED_RE = history.CLAIMED_RE
 # The runner's footer on a lane pull request (lanes/run_lane.sh pr_body,
 # rewritten by bus/pr_repair.py on each fix round): the lane and the model the
 # newest run used.
 RUN_FOOTER_RE = re.compile(r"^Loom ticket \S+, lane ([A-Za-z0-9_.-]+), model (\S+?)\.(?:\s|$)", re.M)
-# The comments that assign the ticket to a lane: a brief. Claims after the
-# newest of these ran on the lane the ticket was last briefed to (loom#565).
-BRIEF_RES = (
-    re.compile(r"^The station gave this queued ticket lane ([a-z0-9-]+) \(tier [a-z]+\)\.$"),
-    re.compile(r"the factory moved this ticket to lane ([a-z0-9-]+),"),
-    re.compile(r"moved from lane [a-z0-9-]+ to lane ([a-z0-9-]+)\."),
-    re.compile(r"the factory moved this ticket up the model ladder to rung \d+, \S+ on lane ([a-z0-9-]+)\."),
-)
+# The brief patterns are owned by bus/history.py (loom#2457).
+BRIEF_RES = history.BRIEF_RES
 RUNAWAY = "loom:runaway"
 
 
@@ -768,11 +759,7 @@ def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
 
 
 def _ts(value: Any) -> float:
-    try:
-        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc).timestamp()
-    except ValueError:
-        return 0.0
+    return history.ts_of(value)
 
 
 ts_of = _ts
@@ -820,18 +807,14 @@ def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) 
 
 
 def rung_of(comments: Sequence[Dict[str, Any]]) -> int:
-    """The rung of the ticket's latest rung marker, 0 when none. A marker of
-    0 (posted by the brain or the operator) starts the ladder again."""
-    found = [int(m.group(1)) for c in comments
-             for m in RUNG_RE.finditer(str(c.get("body") or ""))]
-    return found[-1] if found else 0
+    """The rung of the ticket's latest rung marker, 0 when none
+    (bus/history.py, loom#2457)."""
+    return history.rung_of(comments)
 
 
 def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
-    """When the ticket last moved on the ladder (its newest rung marker), 0
-    when never."""
-    return max((_ts(c.get("created_at")) for c in comments
-                if RUNG_RE.search(str(c.get("body") or ""))), default=0.0)
+    """When the ticket last moved on the ladder (bus/history.py)."""
+    return history.last_climb(comments)
 
 
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
@@ -1026,7 +1009,7 @@ def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
-    return sum(1 for c in comments if str(c.get("body") or "").startswith(FIX_MARKER))
+    return history.fixes_of(comments)
 
 
 def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
@@ -1035,35 +1018,9 @@ def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
 
 
 def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
-    """The rungs the ticket has run on since its ladder last started (the
-    newest rung 0 marker). A rung counts once a claim follows its marker: a
-    rung skipped because its lanes were busy, or one the ticket sat briefed
-    on with no lane claiming it, is not tried (on 2026-10-13 a restart wave
-    filled the claude and codex lanes, tickets spilled straight to rung 3 and
-    gave up after one more round; on 2026-10-14 a ticket that never ran
-    climbed past the last rung). An equivalent move (EQUIVALENT_MARKER)
-    leaves its rung untried: the claim after it runs the equivalent model."""
-    tried: set = set()
-    pending: set = set()
-    just_claimed: set = set()
-    for c in comments:
-        body = str(c.get("body") or "")
-        if CLAIM_RE.match(body):
-            just_claimed = set(pending)
-            tried |= pending
-            pending = set()
-        for m in RUNG_RE.finditer(body):
-            rung = int(m.group(1))
-            if rung == 0:
-                tried, pending, just_claimed = set(), set(), set()
-            else:
-                pending = pending | {rung}
-        if EQUIVALENT_RE.search(body):
-            pending = set()
-        if re.search(r"^Lane \S+ stopped: \[limit\]", body):
-            tried -= just_claimed
-            just_claimed = set()
-    return tried
+    """The rungs the ticket has run on since its ladder last started
+    (bus/history.py, loom#2457)."""
+    return history.tried_rungs(comments)
 
 
 def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
@@ -1177,53 +1134,25 @@ def issue_model(issue: Dict[str, Any]) -> str:
 
 
 def _ending(body: str) -> Optional[str]:
-    """The classed reason a comment ends the attempt before it with, or None
-    when it ends none: a "Lane X failed:" line or one of the other endings
-    (RETRY_ENDED_RE, HELD_RE, STOPPED_RE)."""
-    for rx in (FAILED_RE, RETRY_ENDED_RE, STOPPED_RE):
-        match = rx.match(body)
-        if match:
-            return body[match.end():]
-    held = HELD_RE.match(body)
-    return "[factory] " + body[held.end():] if held else None
+    """The classed reason a comment ends the attempt before it with
+    (bus/history.py)."""
+    return history._ending(body)
 
 
 def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
-    """Each claim as [epoch, time, lane, reason it failed], oldest first, from
-    the claim comments and the endings that followed them (_ending). An
-    attempt takes the first ending after it, or "" when none was recorded.
-    With `reset_at` given, a comment it matches starts a new segment: only the
-    last segment's claims are returned."""
-    found: List[List[Any]] = []
-    for comment in comments:
-        body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
-        if reset_at is not None and reset_at(body):
-            found = []
-            continue
-        claim = CLAIMED_RE.fullmatch(body)
-        at = _ts(comment.get("created_at")) if claim else 0.0
-        if claim and at:
-            found.append([int(at), str(comment["created_at"]), claim.group(1), ""])
-        ending = _ending(body)
-        if ending and found and not found[-1][3]:
-            found[-1][3] = ending
-    return found
+    """Each claim as [epoch, time, lane, reason it failed] (bus/history.py)."""
+    return history._attempt_rows(comments, reset_at)
 
 
 def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
-    """Each claim as (epoch, time, lane, reason it failed), oldest first, from
-    the claim comments and their endings (_attempt_rows). An attempt takes the
-    ending that followed it, or "" when none was recorded; with `current` given, the last
-    attempt is the one being reported and takes that reason."""
-    found = _attempt_rows(comments)
-    if found and current:
-        found[-1][3] = current
-    return [(a[0], a[1], a[2], a[3]) for a in found]
+    """Each claim as (epoch, time, lane, reason it failed), oldest first
+    (bus/history.py, loom#2457)."""
+    return history.attempts(comments, current)
 
 
 def _is_brief(body: str) -> bool:
-    """Whether the comment assigns the ticket to a lane: a brief."""
-    return any(rx.search(body) for rx in BRIEF_RES)
+    """Whether the comment assigns the ticket to a lane (bus/history.py)."""
+    return history._is_brief(body)
 
 
 # The head of the note _give_up leaves when a ticket is past the last rung.
@@ -1267,17 +1196,14 @@ def newest_ending_class(comments: Sequence[Any]) -> str:
 
 
 def attempts_since_brief(comments: Sequence[Any]) -> List[Tuple[int, str, str, str]]:
-    """The attempts after the ticket's last brief (its last lane assignment),
-    oldest first, each with the failure that followed it. A ticket briefed
-    with no assignment comment keeps every claim."""
-    return [(a[0], a[1], a[2], a[3]) for a in _attempt_rows(comments, reset_at=_is_brief)]
+    """The attempts after the ticket's last brief (bus/history.py)."""
+    return history.attempts_since_brief(comments)
 
 
 def dead_lane(comments: Sequence[Any]) -> Optional[str]:
     """The one lane every attempt since the ticket's last brief ran on, or
-    None when the attempts spread across lanes or there are none (loom#565)."""
-    lanes = {lane for _, _, lane, _ in attempts_since_brief(comments)}
-    return next(iter(lanes)) if len(lanes) == 1 else None
+    None (bus/history.py, loom#2457)."""
+    return history.dead_lane(comments)
 
 
 def _cell(text: str) -> str:
@@ -2280,7 +2206,7 @@ class Factory:
         issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
                           "model ladder to rung %d, %s on lane %s." % (
-                              RUNG_MARKER % rung, head, why, rung, model, lane))
+                              history.rung_marker(rung), head, why, rung, model, lane))
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
@@ -4834,7 +4760,7 @@ class Factory:
         self._status_note(repo, number,
                           "%s\nThe station gave this queued ticket lane %s with model %s in "
                           "place of %s (equivalent: %s)." % (
-                              EQUIVALENT_MARKER % model, lane, model, pinned, why))
+                              history.equivalent_marker(model), lane, model, pinned, why))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         issue["body"] = with_model(str(issue.get("body") or ""), model)
@@ -4934,7 +4860,7 @@ class Factory:
         issue["body"] = body
         self._status_note(repo, number, "%s\nNot a failure (no lane took it for %.0f hours: %s): "
                           "the factory rerouted this ticket to rung %d, %s on lane %s." % (
-                              RUNG_MARKER % rung, age / 3600, reason, rung, model, lane))
+                              history.rung_marker(rung), age / 3600, reason, rung, model, lane))
         if state == "queued":
             self._assign_queued_one(repo, issue, lane, "%s, rerouted to model %s" % (
                 difficulty_of(issue), model))
