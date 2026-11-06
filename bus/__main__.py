@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -68,9 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
     s.add_argument("--lock-repo", type=_repo,
-                   default=os.environ.get("LOOM_STATUS_REPO") or None,
+                   default=brain.lock_repo_default() or None,
                    metavar="OWNER/NAME",
-                   help="where the tick record lives (default LOOM_STATUS_REPO); "
+                   help="where the tick record lives (default LOOM_STATUS_REPO, else "
+                   "LOOM_SELF_REPO, else this checkout's origin); "
                    "the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
     s = sub.add_parser("app", help="set up the Loom's own GitHub App")

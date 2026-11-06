@@ -25,6 +25,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
 from .labels import HANDOFF, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import tick_clock
+from . import home_repo
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # A comment the brain posts to cancel a pending brain fix (loom#1998): the
@@ -8222,16 +8223,16 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
 
 def lock_repo_default(env: Optional[Dict[str, str]] = None) -> str:
     """The repo the brain lock lives in, from the deployment's settings:
-    LOOM_STATUS_REPO, else LOOM_SELF_REPO, else no repo (loom#2584)."""
-    values = os.environ if env is None else env
-    return (values.get("LOOM_STATUS_REPO") or values.get("LOOM_SELF_REPO") or "").strip()
+    LOOM_STATUS_REPO, else LOOM_SELF_REPO, else this checkout's origin
+    (bus/home_repo.py, loom#2584); "" only when none of them says."""
+    return home_repo.status_repo(env)
 
 
 def lanes_repo_default(env: Optional[Dict[str, str]] = None) -> str:
     """The repo the lanes' journals live in, from the deployment's
-    settings: LOOM_SELF_REPO, else LOOM_STATUS_REPO, else no repo."""
-    values = os.environ if env is None else env
-    return (values.get("LOOM_SELF_REPO") or values.get("LOOM_STATUS_REPO") or "").strip()
+    settings: LOOM_SELF_REPO, else LOOM_STATUS_REPO, else this checkout's
+    origin; "" only when none of them says."""
+    return home_repo.home_repo(env)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -8469,6 +8470,15 @@ COMMANDS["step"] = _cmd_step
 COMMANDS["sweep"] = _cmd_sweep
 
 
+def _guard_write(gh: GitHub, lock_repo: str) -> None:
+    """Run the acting-brain guard for a write command. With no lock repo
+    the guard cannot read the lock, so the write is refused, never let
+    through unguarded."""
+    if not lock_repo:
+        raise ValueError("no lock repo: set LOOM_STATUS_REPO or pass --lock-repo")
+    check_acting_brain(gh, lock_repo)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     gh: Optional[GitHub] = None
     try:
@@ -8480,9 +8490,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
         if args.command not in READ_COMMANDS:
-            lock_repo = getattr(args, "lock_repo", None) or lock_repo_default()
-            if lock_repo:
-                check_acting_brain(gh, lock_repo)
+            _guard_write(gh, getattr(args, "lock_repo", None) or lock_repo_default())
         code = COMMANDS[args.command](gh, args)
         return code if isinstance(code, int) else 0
     except (ValueError, OSError, GitHubError) as exc:

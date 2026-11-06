@@ -34,11 +34,12 @@ from .github import GitHubError
 
 
 def sweep_repos(env: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
-    """The repos the sweep may act on: LOOM_SWEEP_REPOS, else the fleet
-    list LOOM_REPOS, else none, so a fresh clone never sweeps the
-    original owner's repos by default (loom#2584)."""
+    """The repos the sweep may act on: LOOM_SWEEP_REPOS, else none, so a
+    fresh clone never sweeps the original owner's repos by default
+    (loom#2584). Never the fleet list LOOM_REPOS: the sweep claims, closes
+    and rewrites issues, and LOOM_REPOS names every repo the fleet serves."""
     values = os.environ if env is None else env
-    raw = values.get("LOOM_SWEEP_REPOS") or values.get("LOOM_REPOS") or ""
+    raw = values.get("LOOM_SWEEP_REPOS") or ""
     return tuple(raw.replace(",", " ").split())
 
 

@@ -16,20 +16,21 @@ count reads them through the page's own parser. They are never the second
 field, which is a category such as stability.
 """
 
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 from dashboard import hot_spots
 
+from . import home_repo
+
 
 def repo(env: Optional[Mapping[str, str]] = None) -> str:
     """The home repo the comparison ticket lives in: the deployment's own
-    repo (LOOM_SELF_REPO, else LOOM_STATUS_REPO), never a literal, so a
-    fresh clone does not act on the original owner's repo (loom#2584).
-    Empty when neither setting is set, and the comparison does not run."""
-    values = os.environ if env is None else env
-    return (values.get("LOOM_SELF_REPO") or values.get("LOOM_STATUS_REPO") or "").strip()
+    repo (LOOM_SELF_REPO, else LOOM_STATUS_REPO, else this checkout's
+    origin: bus/home_repo.py), never a literal, so a fresh clone does not
+    act on the original owner's repo (loom#2584). Empty when none of them
+    says, and the comparison does not run."""
+    return home_repo.home_repo(env)
 
 
 def __getattr__(name: str) -> Any:

@@ -63,6 +63,12 @@ decides who acts:
   `loom:goal`. The repos the brain and the station watch are configured on
   each side (`LOOM_REPOS`, space separated `owner/name`), never written into
   this repo, so private repo names stay private.
+- The Muse sweep (step 9) acts on `LOOM_SWEEP_REPOS` only, also space
+  separated `owner/name`, set beside `LOOM_REPOS` in the brain's environment.
+  It never falls back to `LOOM_REPOS`: the sweep claims, closes and rewrites
+  issues, so it reaches only the repos named for it, and unset means no
+  sweep. Set it in every environment a brain runs in; an installed job keeps
+  it only when the installer's environment carries it.
 - Lane status lives in this repo, on one issue labelled `loom:lanes`.
 
 ## Labels

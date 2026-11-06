@@ -89,7 +89,9 @@ LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check
 # The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
 # ticket repos the lane clones. Override it on a machine without network.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}${LOOM_INFRA_PUBLIC_REPO:-your-owner/infra-public}"
+# LOOM_INFRA_PUBLIC_REPO names it; the default is the public repo that
+# holds the shared scanner, which any clone can read.
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}${LOOM_INFRA_PUBLIC_REPO:-quadseven/infra-public}"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
@@ -2274,7 +2276,20 @@ base_verdict_write() {  # key, exit
 # updates one incident issue on the factory repo and prints "factory
 # incident <owner>/<repo>#<number>". The record names the repo, the exact
 # failing line or command, and the exit code.
+# The factory repo is LOOM_FACTORY_REPO, else LOOM_SELF_REPO, else
+# LOOM_STATUS_REPO, else this checkout's origin (bus/home_repo.py has the
+# same order): most lane services set none of the three, and an empty
+# --repo would fail every filing into the log alone.
 FACTORY_REPO="${LOOM_FACTORY_REPO:-${LOOM_SELF_REPO:-${LOOM_STATUS_REPO:-}}}"
+if [ -z "$FACTORY_REPO" ]; then
+  FACTORY_REPO="$(git -C "$LOOM_ROOT" remote get-url origin 2>/dev/null |
+    sed -E 's#/$##; s#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)"
+fi
+case "$FACTORY_REPO" in
+  */*) ;;
+  *) echo "[factory] FACTORY_REPO unset: set LOOM_FACTORY_REPO (no setting and no origin remote names it)" >&2
+     FACTORY_REPO="" ;;
+esac
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
 # The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
