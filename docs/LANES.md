@@ -1749,7 +1749,11 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zai` lane (Z.ai free Flash models),
 - the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
-  models); other Go models keep 0 to 30 days and take any repo.
+  models); other Go models keep 0 to 30 days and take any repo,
+- the `openrouter` and `workersai` lanes: the station's claim refuses a
+  private repo for every free lane (`bus/station.py` `needs_public_repo`),
+  and the factory reads the same rule (`bus/factory.py` `public_only`), so it
+  never offers them a private ticket (loom#2358).
 
 ## API lanes: zen, zai
 

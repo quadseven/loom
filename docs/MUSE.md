@@ -923,15 +923,15 @@ on hard work):
   `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
-  free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
+  free lane: opencode-go, or openrouter, workersai, zen, zai, agy,
   opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
-  lanes, openrouter and workersai, or on a public repo zen and zai (the
+  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then on a public
+  repo the other free lanes, openrouter, workersai, zen and zai (the
   operator wants every free tier used up, 2026-10-19); then opencode-go (its strong tier; opencode-go-4 on public repos only) or codex; an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
