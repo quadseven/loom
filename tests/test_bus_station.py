@@ -1045,6 +1045,25 @@ class ReconcilePullRequestTest(Base):
         self.assertIn("Third works.", note)
         self.assertNotIn("First works", note)
 
+    def test_a_merged_partial_change_drops_lane_when_requeued(self):
+        # A partial merge returns the remaining criteria to the unassigned
+        # queue. Keeping the old lane strands a ticket with no brief headers.
+        body = "## Why\nA partial ticket.\n\n## Acceptance criteria\n- [ ] First works.\n- [ ] Second works.\n"
+        self.fake.add(12, state="pr", lane="muse", body=body)
+        pull = {
+            "number": 99,
+            "state": "closed",
+            "merged_at": "2030-01-02T00:00:00Z",
+            "body": "Refs %s#12\n\n## Acceptance criteria\n- [x] First works.\n" % REPO,
+            "head": {"ref": "loom/12-partial-fix"},
+        }
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+
+        runner._reconcile_pr_ticket(REPO, pull, {12: self.fake.issues[12]})
+
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("lane:muse", self.fake.names(12))
+
     def test_a_criterion_marked_not_built_is_left_unbuilt(self):
         # loom#2026: "not built: <reason>" answers the lane's gate, but the
         # box is still unbuilt, so the merge sends the ticket back for it.
