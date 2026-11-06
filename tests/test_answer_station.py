@@ -76,7 +76,7 @@ class FactoryVerdict(Base):
     def held(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, body=PR_BODY)
-        self.go()
+        self.last_factory = self.go()
         self.assertEqual(len(self.humans), 1)
         self.assertEqual(self.merged, [])
 
@@ -120,6 +120,72 @@ class FactoryVerdict(Base):
         self.assertEqual((self.merged, len(self.humans)), ([], 1))
         verdicts = [e for e in ledger() if e["action"] == shadow.VERDICT and e["number"] == 50]
         self.assertEqual([e["label"] for e in verdicts], ["hold"])
+
+    def test_send_back_opens_one_fix_round_and_never_merges(self):
+        self.held()
+        self.gh.pulls[50]["head"]["sha"] = "a" * 40
+        self.answer("Send back")
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(self.merged, [])
+        self.assertEqual(len(self.fixed), 1)
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_send_back_budget_exhaustion_stops_the_batch_and_keeps_pending(self):
+        from bus.github import RateLimited
+        self.held()
+        self.answer('Send back')
+        error = RateLimited('budget exhausted', 429, '', 123)
+        with mock.patch.object(self.last_factory, '_operator_send_back', side_effect=error):
+            with self.assertRaises(RateLimited):
+                self.last_factory._settle_answers(REPO)
+        self.assertIn(answer.ANSWERED_LABEL, self.labels())
+
+    def test_a_send_back_the_fix_path_refuses_is_rejected_visibly_once(self):
+        # A refusal (ValueError from the fix writer) is not transient: left
+        # pending, the answer would be retried every pass forever with only a
+        # log line. It is rejected on the ticket once, and the batch settles.
+        self.held()
+        self.gh.pulls[50]["head"]["sha"] = "a" * 40
+        self.answer("Send back")
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
+        refusal = ValueError("the ticket is not waiting on its pull request")
+        with mock.patch.object(self.last_factory, "_open_round", side_effect=refusal):
+            self.last_factory._settle_answers(REPO)
+            self.last_factory._settle_answers(REPO)
+        self.assertEqual(self.fixed, [])
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.assertIn("needs:human", self.labels())
+        notes = [c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("not waiting on its pull request", notes[0]["body"])
+
+    def test_stale_send_back_is_recorded_once_without_poisoning_later_answers(self):
+        self.held()
+        self.answer("Send back")
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
+        self.gh.ticket(6, "pr")
+        self.gh.issues[6]["labels"].append({"name": answer.ANSWERED_LABEL})
+        self.gh.comments[6] = [given("Yes")]
+        self.last_factory._settle_answers(REPO)
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.assertNotIn(answer.ANSWERED_LABEL, [x["name"] for x in self.gh.issues[6]["labels"]])
+        self.assertEqual(self.fixed, [])
+        notes = [c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.last_factory._settle_answers(REPO)
+        self.assertEqual(len([c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]), 1)
 
     def test_an_answer_by_someone_who_is_no_operator_changes_nothing(self):
         self.held()
