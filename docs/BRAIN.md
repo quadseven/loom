@@ -95,7 +95,7 @@ decides who acts:
 | `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section names an issue still open, its brief says another issue supersedes it (the factory gives neither a lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
-| `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither any more. The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; taking the label off returns the ticket to this Loom. |
+| `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither, with one exception: an unclaimed queued ticket in the pool takes a lane left free after every other queued ticket had its turn, and loses the label (see Tickets no lane takes). The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; a claimed ticket stays in the pool, and taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs:human` | An ask for the operator (see Asks). |
@@ -1667,6 +1667,12 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 - By 24 hours, with no reroute allowed, it goes to the hand-off pool
   (`handoff:claude`): back to `loom:queued` with no lane, out of the goal's
   in-flight count, and one note on its status comment, edited in place.
+- A queued ticket in the hand-off pool with no `claim:` label goes back to a
+  lane once one of its model or tier is free after every other queued ticket
+  had its turn: the factory gives it the lane, takes `handoff:claude` off,
+  and adds one event to its status comment. With no lane free it is left as
+  it is, with no wait or note. On 2026-11-06, 120 unclaimed pool tickets
+  waited while lanes of their tiers sat idle.
 - The rewrite skip line names how many of a goal's in-flight tickets wait with
   no lane, and says `goal stuck at its cap for N hours` past 6 hours; the
   station sends the stuck goals to the dashboard (`POST /api/goal-caps`),
