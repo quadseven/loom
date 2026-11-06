@@ -101,6 +101,13 @@ def _backlog_home(gh: GitHub, repo: str, number: int) -> bool:
     return isinstance(issue, dict) and naming.is_backlog_home(issue)
 
 
+def _journal_steps(gh: GitHub, args: argparse.Namespace, repo: str,
+                   text: str) -> Optional[str]:
+    """The journal's steps footer: the tick record lives in the lock repo
+    when one is configured, else in the journal's own repo."""
+    return _steps_footer(gh, args.lock_repo or repo, args.holder, text)
+
+
 def _steps_footer(gh: GitHub, lock_repo: str, holder: Optional[str],
                   text: str = "") -> Optional[str]:
     """The holder's tick step durations for its journal (loom#2104), or None
@@ -159,7 +166,7 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         journal.post(gh, repo, int(num), text, args.holder, authors,
                      quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
                      backlog=lambda: _backlog_home(gh, repo, int(num)),
-                     steps=_steps_footer(gh, args.lock_repo or repo, args.holder, text))
+                     steps=_journal_steps(gh, args, repo, text))
     except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.
