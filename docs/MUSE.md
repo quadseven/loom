@@ -1004,7 +1004,7 @@ rather than a wait behind a busy lane that is up), never the model that
 already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane (or codex-2) with `gpt-6-luna`;
+2. the codex lane or one of its slots, codex-2 to codex-8, with `gpt-6-luna`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 A rung with one lane up holds a bounded few waiting tickets: past
