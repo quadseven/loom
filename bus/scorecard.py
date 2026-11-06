@@ -28,11 +28,13 @@ choice, are the fix.
 A bad outcome the station sees is a bad-work finding, a revert, a failed
 deploy or a failed proof audit. A lane (all its numbered slots)
 whose bad outcomes over the last LOOM_LANE_DEMOTE_DAYS days (default 7)
-reach LOOM_LANE_DEMOTE_AT (default 3) is demoted: it takes no build ticket,
+reach LOOM_LANE_DEMOTE_AT (default 3) and are at least LOOM_LANE_DEMOTE_RATE
+(default 0.1) of its pull requests in that window is demoted, so a busy lane
+is not benched for a few findings (loom#2683): it takes no build ticket,
 its briefed tickets step aside to other lanes with a status event saying
 why, and it stays demoted until the operator clears it
 (`python3 -m bus.scorecard clear <lane>`) or a completed refresh finds its
-bad outcomes in the window below the threshold again. Clearing forgets the
+bad outcomes in the window below the threshold or the rate again. Clearing forgets the
 outcomes before it. Verify runs are not build tickets: a demoted lane still
 takes them.
 
@@ -71,6 +73,9 @@ MODEL_KEY = "model:"
 REFRESH = 3600
 DEFAULT_DAYS = 7
 DEFAULT_AT = 3
+# A lane is demoted at DEFAULT_AT bad outcomes only when they are also at
+# least this share of its runs in the window (loom#2683).
+DEFAULT_RATE = 0.1
 DEFAULT_ZERO_DONE = 20
 PROBE_INTERVAL = 3600
 KEEP = 2000
@@ -146,6 +151,17 @@ def window(env: Optional[Mapping[str, str]] = None) -> int:
 
 def threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_DEMOTE_AT", DEFAULT_AT)
+
+
+def rate(env: Optional[Mapping[str, str]] = None) -> float:
+    """LOOM_LANE_DEMOTE_RATE: the share of a lane's runs that must be bad
+    for it to be demoted, a fraction above 0 and at most 1."""
+    raw = str((os.environ if env is None else env).get("LOOM_LANE_DEMOTE_RATE", "")).strip()
+    try:
+        got = float(raw)
+    except ValueError:
+        return DEFAULT_RATE
+    return got if 0 < got <= 1 else DEFAULT_RATE
 
 
 def zero_done_threshold(env: Optional[Mapping[str, str]] = None) -> int:
@@ -536,18 +552,41 @@ class Scorecard:
             got["audit damaging"] += damaging
         return rows
 
+    def _since(self, lane: str) -> float:
+        return max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
+
+    def _ours(self, lane: str) -> List[Mapping[str, Any]]:
+        """The window's records of a lane or a model (MODEL_KEY) since the
+        later of the window's start and its last clear."""
+        model = lane[len(MODEL_KEY):] if lane.startswith(MODEL_KEY) else None
+        since = self._since(lane)
+        return [record for record in self.data["records"].values()
+                if (record.get("model") == model if model
+                    else record.get("lane") == lane and not _model_bound(record))
+                and float(record.get("at") or 0) >= since]
+
+    def runs(self, lane: str) -> int:
+        """How many pull requests of a lane or a model the window holds."""
+        return len(self._ours(lane))
+
+    def over(self, lane: str) -> Tuple[bool, int, int, List[str]]:
+        """Whether a lane's bad outcomes reach both LOOM_LANE_DEMOTE_AT and
+        LOOM_LANE_DEMOTE_RATE of its runs; the count, the runs and what
+        they were. Bad outcomes with no run behind them (failed proof
+        audits) count as runs, so the rate never divides by fewer."""
+        count, what = self.bad(lane)
+        total = max(self.runs(lane), count)
+        hit = count >= threshold(self.env) and count >= rate(self.env) * total
+        return hit, count, total, what
+
     def bad(self, lane: str) -> Tuple[int, List[str]]:
         """The bad outcomes of a lane or a model (MODEL_KEY) since the later
         of the window's start and its last clear, and what they were."""
         model = lane[len(MODEL_KEY):] if lane.startswith(MODEL_KEY) else None
-        since = max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
+        since = self._since(lane)
         counts = {"bad-work findings": 0, "reverts": 0, "failed deploys": 0,
                   "failed proof audits": 0}
-        for record in self.data["records"].values():
-            ours = (record.get("model") == model if model
-                    else record.get("lane") == lane and not _model_bound(record))
-            if not ours or float(record.get("at") or 0) < since:
-                continue
+        for record in self._ours(lane):
             counts["bad-work findings"] += int(record.get("review") == BAD_WORK)
             counts["reverts"] += int(bool(record.get("reverted")))
             counts["failed deploys"] += int(bool(record.get("deploy_failed")))
@@ -660,10 +699,12 @@ class Scorecard:
         return False
 
     def demote(self) -> List[str]:
-        """Demote each lane whose bad outcomes reach the threshold; the
+        """Demote each lane whose bad outcomes reach the threshold and the
+        rate of its runs (over); the
         lanes newly demoted. Also demote lanes with zero done briefs when
         finished briefs reach the zero-done threshold."""
         at = threshold(self.env)
+        share = rate(self.env)
         days = window(self.env) // 86400
         zero_thresh = zero_done_threshold(self.env)
         newly = []
@@ -678,16 +719,18 @@ class Scorecard:
                 elif isinstance(info, dict) and info.get("kind") == "bad-outcomes":
                     # Re-scored on each completed refresh: once the bad
                     # outcomes age out of the window, the demotion lifts.
-                    count, _ = self.bad(lane)
-                    if count < at:
+                    hit, count, total, _ = self.over(lane)
+                    if not hit:
                         self.data["demoted"].pop(lane, None)
-                        _say("lifted demotion of lane %s: %d bad outcomes in %d days, below "
-                             "LOOM_LANE_DEMOTE_AT=%d" % (lane, count, days, at))
+                        _say("lifted demotion of lane %s: %d bad outcomes in %d runs in %d days, "
+                             "below LOOM_LANE_DEMOTE_AT=%d or LOOM_LANE_DEMOTE_RATE=%g"
+                             % (lane, count, total, days, at, share))
                 continue
-            count, what = self.bad(lane)
-            if count >= at:
-                why = ("%d bad outcomes in %d days (%s), at or past LOOM_LANE_DEMOTE_AT=%d"
-                       % (count, days, ", ".join(what), at))
+            hit, count, total, what = self.over(lane)
+            if hit:
+                why = ("%d bad outcomes in %d runs in %d days (%s), at or past "
+                       "LOOM_LANE_DEMOTE_AT=%d and LOOM_LANE_DEMOTE_RATE=%g"
+                       % (count, total, days, ", ".join(what), at, share))
                 self.data["demoted"][lane] = {"at": self.now, "why": why, "kind": "bad-outcomes"}
                 newly.append(lane)
                 _say("demoted lane %s: %s" % (lane, why))

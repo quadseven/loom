@@ -64,6 +64,10 @@ _Avoid_: heartbeat, dashboard
 The usage a lane's inference source still allows before its limit, window or credit runs out.
 _Avoid_: budget, allowance
 
+**Demotion**:
+A lane or model the scorecard benches from build tickets: its bad outcomes in the last `LOOM_LANE_DEMOTE_DAYS` days reach `LOOM_LANE_DEMOTE_AT` (default 3) and are at least `LOOM_LANE_DEMOTE_RATE` (default 0.1) of its pull requests in that window; it lifts when a completed refresh finds either below again.
+_Avoid_: ban, disable
+
 **Validation contract**:
 A repo's `.loom/validation.conf`: the interpreter, submodules, setup and check its CI uses, which the runner prepares before the agent and runs again on the agent's commit; only a passing check opens the pull request.
 _Avoid_: test config, CI file
