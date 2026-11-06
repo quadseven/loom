@@ -1668,10 +1668,13 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
 
 
 def public_only(lane: str) -> bool:
-    """Whether the lane takes public repos only: PUBLIC_ONLY, or a slot sent to
-    cluster runners (LOOM_RUNNER_SLOTS), whose inputs and logs live in this
-    public repository's Actions, so the dispatch refuses a private repo."""
-    return lane in PUBLIC_ONLY or lane in runners.runner_slots()
+    """Whether the lane takes public repos only, by the station's claim rule
+    (station.needs_public_repo): PUBLIC_ONLY, a slot sent to cluster runners
+    (LOOM_RUNNER_SLOTS), or a free, remote or agy lane. One rule for both: the
+    factory once offered openrouter and workersai to private repos, the claim
+    refused each, and those tickets cycled every pass (loom#2358)."""
+    from .station import needs_public_repo
+    return needs_public_repo(lane, "")
 
 
 def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:

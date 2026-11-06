@@ -3904,11 +3904,12 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["easy"][4:6], ("muse", "agy"))
         self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
         # Then the free provider slots: on a private repo only the two allowed
-        # private code (infra#5617), then codex.
+        # private code, then opencode-go: the free lanes
+        # openrouter and workersai take public repos only (loom#2358).
         self.assertEqual(factory.TIERS["easy"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.TIERS["medium"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
-                         ("free-ollama", "free-gemma", "openrouter"))
+                         ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
         # A runner's inputs and logs live in the public repo's Actions, so the
@@ -3926,9 +3927,10 @@ class Tickets(Base):
         medium = factory.TIERS["medium"]
         for lane in ("openrouter", "workersai", "zen", "zai"):
             self.assertLess(medium.index(lane), medium.index("codex"))
-        # On a private repo the public-only ones are skipped.
-        self.assertEqual(factory.lanes_of("medium", True)[4:9],
-                         ("free-ollama", "free-gemma", "openrouter", "workersai", "opencode-go"))
+        # On a private repo the public-only ones are skipped, the free lanes
+        # among them (the station's claim rule, loom#2358).
+        self.assertEqual(factory.lanes_of("medium", True)[4:7],
+                         ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
@@ -3940,6 +3942,25 @@ class Tickets(Base):
         # Never on hard work, and never counted as a Spark.
         self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
         self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))
+
+    def test_every_lane_the_factory_gives_a_private_repo_passes_the_station_check(self):
+        # The factory once offered openrouter and workersai to private repos,
+        # and the station's claim refused each one ("takes public repos only;
+        # back to the queue"): 1029 such refusals in the station log, the
+        # same private tickets cycling every pass and never run (loom#2358).
+        from bus import station
+        for difficulty in factory.TIERS:
+            for lane in factory.lanes_of(difficulty, True):
+                self.assertFalse(station.needs_public_repo(lane, ""), (difficulty, lane))
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            for lane in factory.lanes_of("medium", True):
+                self.assertFalse(station.needs_public_repo(lane, ""), lane)
+
+    def test_free_gemma_and_free_ollama_stay_private_capable(self):
+        from bus import station
+        for lane in ("free-gemma", "free-ollama"):
+            self.assertIn(lane, factory.lanes_of("medium", True))
+            self.assertFalse(station.needs_public_repo(lane, ""), lane)
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
@@ -3960,6 +3981,7 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "agy")
 
     def test_a_lane_without_an_available_heartbeat_is_not_free(self):
+        self.gh.private = False  # openrouter is a free lane: public repos only
         self.limited_easy(available=["openrouter"])
         self.assertEqual(self.lane(7), "openrouter")
 
