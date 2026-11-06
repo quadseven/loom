@@ -3484,10 +3484,13 @@ class LoadRouted(Routed):
 class EscalateTests(unittest.TestCase):
     def setUp(self):
         # escalate counts lane load once per process over LOOM_REPOS: start
-        # each test from no count and the ticket's own repo only.
+        # each test from no count and the ticket's own repo only. The lanes
+        # repo escalate reads is the LOOM_SELF_REPO setting (loom#2584);
+        # this module's fake serves it under quadseven/loom (lanes_routes).
         brain._LANE_LOAD.clear()
         self.addCleanup(brain._LANE_LOAD.clear)
-        env = unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": ""})
+        env = unittest.mock.patch.dict(os.environ, {"LOOM_REPOS": "",
+                                                    "LOOM_SELF_REPO": "quadseven/loom"})
         env.start()
         self.addCleanup(env.stop)
 
@@ -3497,7 +3500,8 @@ class EscalateTests(unittest.TestCase):
         # The fixtures' claim, fix and lane comments are the brain's (BRAIN):
         # escalate reads trusted comments only (loom#1956).
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
-        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors}):
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors,
+                                                   "LOOM_SELF_REPO": "quadseven/loom"}):
             return fake, brain.escalate(gh, REPO, 9)
 
     def test_runaway_tickets_have_a_dedicated_status_section(self):

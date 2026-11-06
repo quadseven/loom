@@ -16,8 +16,27 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, sweep  # noqa: E402
-from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from shadow_env import setUpModule as _shadow_set_up  # noqa: E402
+from shadow_env import tearDownModule as _shadow_tear_down  # noqa: E402
 from bus.github import GitHubError  # noqa: E402
+
+# The sweep acts only on configured repos (loom#2584): this module's fake
+# serves quadseven/loom and quadseven/grug, so it configures exactly those.
+_sweep_env = None
+
+
+def setUpModule():  # noqa: N802 - the unittest hook name
+    global _sweep_env
+    _shadow_set_up()
+    _sweep_env = unittest.mock.patch.dict(
+        os.environ, {"LOOM_SWEEP_REPOS": "quadseven/loom quadseven/grug"})
+    _sweep_env.start()
+
+
+def tearDownModule():  # noqa: N802
+    if _sweep_env is not None:
+        _sweep_env.stop()
+    _shadow_tear_down()
 
 LOCK_REPO = "quadseven/loom"
 REPO = "quadseven/loom"

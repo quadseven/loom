@@ -65,6 +65,18 @@ from . import watch
 from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
 
+def person_claim(labels: Iterable[str], repo: str) -> bool:
+    """Whether a claim label on an issue of `repo` is a person's claim.
+
+    The repo owner's own claim label (claim:<owner of the repo the issue
+    lives in>) is the station's lane claim, not a person's (AGENTS.md,
+    Claims). The owner comes from the repo the filer already serves, so
+    no deployment's login is a literal here (loom#2584)."""
+    owner = repo.split("/", 1)[0] if repo else ""
+    own = "claim:%s" % owner if owner else None
+    return any(label.startswith("claim:") and label != own for label in labels)
+
+
 DAY = 24 * 3600
 CLEAR_AFTER = 6 * 3600
 RECURRING_AFTER = 7 * DAY
@@ -1859,16 +1871,15 @@ class Filer:
                 continue
             ticket = number in self._ticketed
             labels = self._label_names(self._issue(number) or {}) if ticket else []
-            person_claim = any(label.startswith("claim:") and label != "claim:quadseven"
-                               for label in labels)
+            person = person_claim(labels, self.repo)
             ticket_state = tickets.ticket_state({"labels": [{"name": n} for n in labels]})
             rewritten_idle = (ticket_state in ("queued", "briefed", "failed", "answered")
                               and not any(label.startswith("needs:") for label in labels))
-            if person_claim:
+            if person:
                 self.say("invariants: left rewritten ticket %s#%d open: held by a person"
                          % (self.repo, number))
             if number in self._busy and not (ticket and invariant == "lane-pr-stalled"
-                                              and rewritten_idle and not person_claim):
+                                              and rewritten_idle and not person):
                 # Rewritten into work something has in hand: its own path
                 # closes it. An idle one settles like the issue it was
                 # (loom#2506: five whose pull requests had closed held goal

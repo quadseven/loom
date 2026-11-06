@@ -16,14 +16,32 @@ count reads them through the page's own parser. They are never the second
 field, which is a category such as stability.
 """
 
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Mapping
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 from dashboard import hot_spots
 
+
+def repo(env: Optional[Mapping[str, str]] = None) -> str:
+    """The home repo the comparison ticket lives in: the deployment's own
+    repo (LOOM_SELF_REPO, else LOOM_STATUS_REPO), never a literal, so a
+    fresh clone does not act on the original owner's repo (loom#2584).
+    Empty when neither setting is set, and the comparison does not run."""
+    values = os.environ if env is None else env
+    return (values.get("LOOM_SELF_REPO") or values.get("LOOM_STATUS_REPO") or "").strip()
+
+
+def __getattr__(name: str) -> Any:
+    # REPO stays readable for callers that imported it before loom#2584,
+    # resolved from the settings at each access instead of at import.
+    if name == "REPO":
+        return repo()
+    raise AttributeError(name)
+
+
 # The ticket is an issue of the home repo, so only a station that serves that
 # repo runs the comparison: elsewhere number 2162 is some other issue.
-REPO = "quadseven/loom"
 TICKET = 2162
 # The squash merge of #2170 (245b0354163b), which put bus/weakened.py on main.
 LANDED_AT = "2026-11-01T09:08:45Z"

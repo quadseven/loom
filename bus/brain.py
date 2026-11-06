@@ -1715,7 +1715,7 @@ def lightest_first(repos: Sequence[str], weights: Dict[str, int]) -> List[str]:
     return sorted(dict.fromkeys(repos), key=lambda repo: weights.get(repo, 0))
 
 
-def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
+def status(gh: GitHub, repos: Sequence[str], lanes_repo: Optional[str] = None,
            env: Optional[Dict[str, str]] = None, now: Optional[datetime] = None,
            authors: Optional[Sequence[str]] = None,
            emit: Optional[Callable[[str], None]] = None,
@@ -1738,6 +1738,8 @@ def status(gh: GitHub, repos: Sequence[str], lanes_repo: str = "quadseven/loom",
     to stderr: a line before each repo, and one before every wait."""
     from . import factory  # factory imports this module
     env = os.environ if env is None else env
+    if lanes_repo is None:
+        lanes_repo = lanes_repo_default(env)
     bot = env.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     now = now or datetime.now(timezone.utc)
     seconds = per_repo.budget(env, budget)
@@ -8108,11 +8110,13 @@ def hold_unclaimed(gh: GitHub, repo: str, number: int, names: Sequence[str],
 
 
 def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
-             lanes_repo: str = "quadseven/loom") -> str:
+             lanes_repo: Optional[str] = None) -> str:
     """Move a repeatedly stuck ticket to the lowest untried rung of the model
     ladder whose lane is available, and return a one-line outcome. A ticket
     whose open pull request has nothing to fix is refused: fix rounds that
     already landed a green, reviewed head are not a stuck ticket."""
+    if lanes_repo is None:
+        lanes_repo = lanes_repo_default()
     _check_written_text(notes)
     _check_decision_claim(gh, repo, number, notes)
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
@@ -8216,10 +8220,24 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     return "rung %d %s on %s" % (rung + 1, model, lane)
 
 
+def lock_repo_default(env: Optional[Dict[str, str]] = None) -> str:
+    """The repo the brain lock lives in, from the deployment's settings:
+    LOOM_STATUS_REPO, else LOOM_SELF_REPO, else no repo (loom#2584)."""
+    values = os.environ if env is None else env
+    return (values.get("LOOM_STATUS_REPO") or values.get("LOOM_SELF_REPO") or "").strip()
+
+
+def lanes_repo_default(env: Optional[Dict[str, str]] = None) -> str:
+    """The repo the lanes' journals live in, from the deployment's
+    settings: LOOM_SELF_REPO, else LOOM_STATUS_REPO, else no repo."""
+    values = os.environ if env is None else env
+    return (values.get("LOOM_SELF_REPO") or values.get("LOOM_STATUS_REPO") or "").strip()
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python3 -m bus.brain")
     sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom"); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
+    s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default=lanes_repo_default()); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
     b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
@@ -8235,14 +8253,14 @@ def parser() -> argparse.ArgumentParser:
     ac = sub.add_parser("audit-close", help="the facts a close audit line carries: cited hash, merge commit, on the default branch or not; exit 0 only when sound"); ac.add_argument("ticket")
     cl = sub.add_parser("close"); cl.add_argument("ticket"); cl.add_argument("--reason", choices=("completed", "not_planned"), default="completed"); cl.add_argument("--note")
     fx = sub.add_parser("fix"); fx.add_argument("pull_request"); fx.add_argument("--ticket", required=True); fx.add_argument("--file", required=True); fx.add_argument("--lane"); fx.add_argument("--model")
-    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default="quadseven/loom")
+    df = sub.add_parser("defer"); df.add_argument("item"); df.add_argument("--stage", choices=handoff.STAGES, required=True); df.add_argument("--holder", required=True); df.add_argument("--note"); df.add_argument("--lock-repo", default=lock_repo_default())
     dn = sub.add_parser("done"); dn.add_argument("item"); dn.add_argument("--stage", choices=handoff.STAGES, required=True); dn.add_argument("--holder", required=True); dn.add_argument("--resolves", help="brief defer key this done finishes")
-    sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default="quadseven/loom")
-    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default="quadseven/loom"); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
-    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default="quadseven/loom"); st.add_argument("--show", action="store_true"); st.add_argument("--tick-minutes", type=int, help="with lock: the tick's own length when shorter than %d minutes (a bounded lane machine tick)" % tick_clock.TICK_MINUTES)
-    sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default="quadseven/loom")
+    sb = sub.add_parser("step-budget", help="the tick's elapsed minutes and whether a step may be deferred on budget"); sb.add_argument("--lock-repo", default=lock_repo_default())
+    rs = sub.add_parser("resume"); rs.add_argument("repos", nargs="+"); rs.add_argument("--holder", required=True); rs.add_argument("--lock-repo", default=lock_repo_default()); rs.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); rs.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (RESUME_DEADLINE_MINUTES, RESUME_PARTIAL_EXIT))
+    st = sub.add_parser("step"); st.add_argument("name", nargs="?", choices=TICK_STEPS); st.add_argument("--note"); st.add_argument("--holder"); st.add_argument("--lock-repo", default=lock_repo_default()); st.add_argument("--show", action="store_true"); st.add_argument("--tick-minutes", type=int, help="with lock: the tick's own length when shorter than %d minutes (a bounded lane machine tick)" % tick_clock.TICK_MINUTES)
+    sw = sub.add_parser("sweep"); sw.add_argument("--file", required=True, help="JSON list of sweep actions (docs/MUSE.md, step 9)"); sw.add_argument("--holder", required=True); sw.add_argument("--lock-repo", default=lock_repo_default())
     ob = sub.add_parser("onboard"); ob.add_argument("repo"); ob.add_argument("--review-check"); ob.add_argument("--operator")
-    es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default="quadseven/loom")
+    es = sub.add_parser("escalate"); es.add_argument("ticket"); es.add_argument("--file"); es.add_argument("--lanes-repo", default=lanes_repo_default())
     rp = sub.add_parser("reply"); rp.add_argument("pull_request"); rp.add_argument("--comment", type=int, required=True); rp.add_argument("--file", required=True); rp.add_argument("--resolve", action="store_true")
     return p
 
@@ -8462,8 +8480,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # The station's fix-rounds comments read as their rounds (loom#1640).
         gh.fix_ledger = fixrounds.ledger_from_env()
         if args.command not in READ_COMMANDS:
-            check_acting_brain(gh, getattr(args, "lock_repo", None)
-                               or os.environ.get("LOOM_STATUS_REPO") or "quadseven/loom")
+            lock_repo = getattr(args, "lock_repo", None) or lock_repo_default()
+            if lock_repo:
+                check_acting_brain(gh, lock_repo)
         code = COMMANDS[args.command](gh, args)
         return code if isinstance(code, int) else 0
     except (ValueError, OSError, GitHubError) as exc:

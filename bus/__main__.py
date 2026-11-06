@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -66,8 +67,11 @@ def _parser() -> argparse.ArgumentParser:
     s.add_argument("target", type=_issue, metavar="OWNER/NAME#N")
     s.add_argument("--file", required=True)
     s.add_argument("--holder", help="the brain posting a journal; adds its Tick line when missing")
-    s.add_argument("--lock-repo", type=_repo, default="quadseven/loom", metavar="OWNER/NAME",
-                   help="where the tick record lives; the holder's step times go in the journal")
+    s.add_argument("--lock-repo", type=_repo,
+                   default=os.environ.get("LOOM_STATUS_REPO") or None,
+                   metavar="OWNER/NAME",
+                   help="where the tick record lives (default LOOM_STATUS_REPO); "
+                   "the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
     s = sub.add_parser("app", help="set up the Loom's own GitHub App")
     app_sub = s.add_subparsers(dest="app_command", required=True)
@@ -102,7 +106,7 @@ def _steps_footer(gh: GitHub, lock_repo: str, holder: Optional[str],
     """The holder's tick step durations for its journal (loom#2104), or None
     outside that holder's tick. A failed read is said on stderr and the
     journal goes out without them."""
-    if not holder or text.startswith(journal.REPORT_MARKER) or journal.REPLY_RE.match(text):
+    if not holder or not lock_repo or text.startswith(journal.REPORT_MARKER) or journal.REPLY_RE.match(text):
         # A report or reply carries no Steps line, so nothing is read for it.
         return None
     try:
@@ -155,7 +159,7 @@ def _run(args: argparse.Namespace, gh: GitHub) -> int:
         journal.post(gh, repo, int(num), text, args.holder, authors,
                      quiet=lambda: brain.goal_quiet(gh, repo, int(num), authors),
                      backlog=lambda: _backlog_home(gh, repo, int(num)),
-                     steps=_steps_footer(gh, args.lock_repo, args.holder, text))
+                     steps=_steps_footer(gh, args.lock_repo or repo, args.holder, text))
     except (journal.ReportTooSoon, journal.ReportQuiet, journal.ReportBacklog) as held:
         # The goal is already reported, or quiet since its last report
         # (loom#1534): not a failed step, so exit 0.

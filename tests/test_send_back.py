@@ -62,6 +62,12 @@ class CountsTest(unittest.TestCase):
 
 class StationStepTest(unittest.TestCase):
     def setUp(self):
+        # The comparison's home repo is a setting now (loom#2584): this
+        # module's station serves one configured home repo.
+        self._env = mock.patch.dict(os.environ,
+                                    {"LOOM_SELF_REPO": "example-owner/loom"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
         self.state = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.state)
         self.posted, self.patched = [], []

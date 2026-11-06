@@ -527,8 +527,11 @@ CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
-# FACTORY_REPO), and the marker and ticket line their bodies carry.
-FACTORY_REPO = "quadseven/loom"
+# FACTORY_REPO, from LOOM_FACTORY_REPO or the deployment's own repo
+# settings, never a literal: loom#2584), and the marker and ticket line
+# their bodies carry.
+FACTORY_REPO = (os.environ.get("LOOM_FACTORY_REPO") or os.environ.get("LOOM_SELF_REPO")
+                or os.environ.get("LOOM_STATUS_REPO") or "")
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 # The note that says the station unticked a decision box a lane ticked.
 DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
@@ -1731,7 +1734,9 @@ def discord_call(method: str, path: str, token: str,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bot " + token,
                  "Content-Type": "application/json",
-                 "User-Agent": "DiscordBot (https://github.com/quadseven/loom, 1)"})
+                 "User-Agent": "DiscordBot (%s, 1)" % (
+                     "https://github.com/" + FACTORY_REPO if FACTORY_REPO
+                     else "https://example.com/loom")})
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status, raw = resp.status, resp.read()
@@ -15438,7 +15443,7 @@ class Station:
         """Run the one seven-day comparison of bus/send_back.py, at most
         hourly until it is done; it never runs a second time."""
         from . import send_back
-        repo = send_back.REPO
+        repo = send_back.repo()
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)

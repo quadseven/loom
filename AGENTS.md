@@ -132,7 +132,7 @@ Loom is a software factory: it turns goals into tickets, has AI lanes build them
 Layout:
 
 - `bus/`: the station, brain, factory and every gate. `python3 -m bus <command>` is the entry point.
-- `dispatch/`: the goal loop scripts: metrics, reports, ship, verify.
+- `dispatch/`: design notes for the goal loop, not the loop itself. Six of its seven modules (`dispatch.py`, `metrics.py`, `report.py`, `ship.py`, `usage_watch.py`, `verify.py`) are docstring-only and hold no code; only `dispatcher.py` carries code, and only `tests/test_dispatcher.py` calls it. The running loop lives in `bus/`.
 - `dashboard/`: the live view. Run it with `python3 -m dashboard`.
 - `lanes/`: the lane runner `run_lane.sh`, the agent sandbox, the Mac installer `mac/install.sh` and the cluster job `k8s/lane_job.py`.
 - `tests/`: unittest modules.

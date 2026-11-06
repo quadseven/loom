@@ -748,6 +748,11 @@ print('leak guard: clean (shape patterns only)')
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
+            # The factory and infra-public repos are settings now
+            # (loom#2584): this harness's fakes serve them under these
+            # names, so it configures exactly those.
+            "LOOM_FACTORY_REPO": "quadseven/loom",
+            "LOOM_INFRA_PUBLIC_REPO": "quadseven/infra-public",
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",

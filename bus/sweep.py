@@ -5,7 +5,7 @@ what it decided, inside the goal's rules:
 
 - only after the triage step, and only while the tick has used under
   BUDGET_MINUTES of its TICK_MINUTES (sweep_allowed);
-- at most MAX_ACTIONS actions a tick, in SWEEP_REPOS only;
+- at most MAX_ACTIONS actions a tick, in the configured sweep repos only;
 - an issue with a claim:* label, a wait:* label, an active Loom state or an
   open pull request naming it is skipped (skip_reason);
 - CLAIM_LABEL goes on before an issue is touched, at most MAX_CLAIMS are
@@ -22,16 +22,32 @@ The sweep never opens a pull request: building stays with the lanes.
 """
 from __future__ import annotations
 
+import os
 import re
 import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from . import closing, shadow, text
 from .github import GitHubError
 
-SWEEP_REPOS = ("quadseven/loom", "quadseven/grug")
+
+def sweep_repos(env: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
+    """The repos the sweep may act on: LOOM_SWEEP_REPOS, else the fleet
+    list LOOM_REPOS, else none, so a fresh clone never sweeps the
+    original owner's repos by default (loom#2584)."""
+    values = os.environ if env is None else env
+    raw = values.get("LOOM_SWEEP_REPOS") or values.get("LOOM_REPOS") or ""
+    return tuple(raw.replace(",", " ").split())
+
+
+def __getattr__(name: str) -> Any:
+    # SWEEP_REPOS stays readable for callers that imported it before
+    # loom#2584, resolved from the settings at each access.
+    if name == "SWEEP_REPOS":
+        return sweep_repos()
+    raise AttributeError(name)
 TICK_MINUTES = 25
 BUDGET_MINUTES = 20
 MAX_ACTIONS = 10
@@ -355,7 +371,7 @@ def release_leftovers(gh: Any, repos: Sequence[str], result: Result) -> None:
 def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
         steps: Sequence[str], rewrite: Rewrite,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-        repos: Sequence[str] = SWEEP_REPOS) -> Result:
+        repos: Optional[Sequence[str]] = None) -> Result:
     """Run the brain's planned sweep actions under the guard and the caps.
 
     Claims at most MAX_CLAIMS issues at a time, acts on each, and releases
@@ -363,6 +379,8 @@ def run(gh: Any, plan: Sequence[Dict[str, Any]], record: Dict[str, Any],
     leaves no claim:muse behind, and the error goes on to the caller. An
     action a gate refuses (ValueError, a GitHub refusal) is counted skipped.
     """
+    if repos is None:
+        repos = sweep_repos()
     result = Result()
     release_leftovers(gh, repos, result)
     result.stopped = sweep_allowed(record, steps, clock())
@@ -454,7 +472,7 @@ def _evidence(issue: Dict[str, Any], merged: Dict[int, str], titles: Dict[str, L
     return None
 
 
-def candidates(gh: Any, repos: Sequence[str] = SWEEP_REPOS, limit: int = MAX_CANDIDATES,
+def candidates(gh: Any, repos: Optional[Sequence[str]] = None, limit: int = MAX_CANDIDATES,
                now: Optional[datetime] = None) -> List[Dict[str, Any]]:
     """The oldest `limit` open issues the sweep may touch that already carry
     evidence: kind "merged" (a pull request merged into the default branch
@@ -463,6 +481,8 @@ def candidates(gh: Any, repos: Sequence[str] = SWEEP_REPOS, limit: int = MAX_CAN
     evidence is its number) or "quiet" (no update for QUIET_DAYS days).
     The first two are hints to read, never proof. Held issues are left out
     by skip_reason. Each entry: repo, number, title, kind, evidence."""
+    if repos is None:
+        repos = sweep_repos()
     now = now or datetime.now(timezone.utc)
     trusted = _trusted_logins()
     out: List[Dict[str, Any]] = []

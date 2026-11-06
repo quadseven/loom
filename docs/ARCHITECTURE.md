@@ -7,7 +7,11 @@ subscriptions are the crew. Nobody shares credentials across lanes.
 
 ## Components
 
+Six of the seven modules in `dispatch/` are docstring-only design notes (`dispatch.py`, `metrics.py`, `report.py`, `ship.py`, `usage_watch.py`, `verify.py`); only `dispatch/dispatcher.py` carries code, and only the tests call it. Sections below that name a `dispatch/` file describe the role that file's docstring specifies; the running implementation lives in `bus/`.
+
 ### 1. Goal + scoreboard (`dispatch/metrics.py`)
+
+As shipped today, `dispatch/metrics.py` is a docstring-only design note with no code; the running metric collection lives in `bus/` (notably `bus/metrics.py`). The text below describes the role, not that file's contents.
 
 Every 30 minutes, per active goal, measure the north-star metric and write it
 to `state/metrics/<goal>.jsonl` (append-only). Each goal defines its metric
@@ -67,6 +71,8 @@ Model names are discovered at runtime, never hardcoded.
 
 ### 5. Shipper (`dispatch/ship.py`)
 
+As shipped today, `dispatch/ship.py` is a docstring-only design note with no code; the running shipper is the factory in `bus/`. The text below describes the role, not that file's contents.
+
 One shipper (Muse). Squash merges, answers every bot comment, batches ships.
 Every PR is reviewed by grug (Grug - Chief) before merge - no exceptions.
 Per-goal ship rules (deploy caps, windows when nothing may roll, pins that
@@ -74,10 +80,14 @@ move together) live on each goal's home issue in the project's own repo.
 
 ### 6. Verifier (`dispatch/verify.py`)
 
+As shipped today, `dispatch/verify.py` is a docstring-only design note with no code; the running verifier is the station's live proof in `bus/`. The text below describes the role, not that file's contents.
+
 Tickets close only on live proof: the fix's proof log line AND the metric it
 targets moved. No green CI alone.
 
 ### 7. Reporter (`dispatch/report.py`)
+
+As shipped today, `dispatch/report.py` is a docstring-only design note with no code; the running reporter is the brain in `bus/`. The text below describes the role, not that file's contents.
 
 Every 2 hours, five lines to the owner: metric deltas, cleared in order, top
 blocker, shipped and verified, next. Decisions indexed daily per goal doc.
