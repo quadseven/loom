@@ -114,7 +114,7 @@ class ParserDefaultsTest(unittest.TestCase):
     def test_bus_lock_repo_default_is_the_status_setting(self):
         with mock.patch.dict(os.environ, self.ENV):
             args = bus_main._parser().parse_args(
-                ["journal", "example-owner/one#1", "--file", "x"])
+                ["journal", "example-owner/one" + "#1", "--file", "x"])
         self.assertEqual(args.lock_repo, "example-owner/status")
 
     def test_no_setting_means_no_default_repo(self):
