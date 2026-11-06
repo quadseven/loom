@@ -160,6 +160,47 @@ class AuditCounts(unittest.TestCase):
                                  "opencode-go-3": "z"})
 
 
+def runs(lane, total, bad, at, model="gpt-6-luna"):
+    """`total` lane pull requests in the window, `bad` of them bad-work."""
+    return {"%s-%d" % (lane, n): {"lane": lane, "model": model, "at": at, "merged": True,
+                                  "review": scorecard.BAD_WORK if n < bad else scorecard.CLEAN}
+            for n in range(total)}
+
+
+class DemoteRate(unittest.TestCase):
+    """loom#2683: a lane is demoted on a bad-outcome rate with a minimum
+    count, so a busy lane is not benched for a few findings."""
+
+    def test_three_bad_in_ninety_runs_is_not_demoted_and_three_in_five_is(self):
+        got = card()
+        got.data["records"] = {**runs("busy", 90, 3, NOW - 60), **runs("sloppy", 5, 3, NOW - 60)}
+        newly = quiet(got.demote)
+        self.assertIn("sloppy", newly)
+        self.assertNotIn("busy", newly)
+        self.assertIn("3 bad outcomes in 5 runs", got.demoted()["sloppy"])
+
+    def test_the_rate_is_set_by_the_environment(self):
+        got = card(env={"LOOM_LANE_DEMOTE_RATE": "0.03"})
+        got.data["records"] = runs("busy", 90, 3, NOW - 60)
+        self.assertIn("busy", quiet(got.demote))
+
+    def test_a_count_demotion_under_the_rate_lifts_on_the_next_refresh(self):
+        got = card()
+        got.data["records"] = runs("codex", 90, 3, NOW - 60)
+        got.data["demoted"]["codex"] = {"at": NOW - 3600, "why": "3 bad outcomes",
+                                        "kind": "bad-outcomes"}
+        quiet(got.demote)
+        self.assertNotIn("codex", got.demoted())
+
+    def test_a_model_is_rated_on_its_own_runs(self):
+        got = card()
+        got.data["records"] = {**runs("opencode-go", 90, 3, NOW - 60, model="go/a"),
+                               **runs("opencode-go-2", 4, 3, NOW - 60, model="go/b")}
+        newly = quiet(got.demote)
+        self.assertIn("model:go/b", newly)
+        self.assertNotIn("model:go/a", newly)
+
+
 def finding(rule, severity="medium"):
     return {"isResolved": True, "comments": {"nodes": [{
         "author": {"__typename": "Bot", "login": BOT}, "createdAt": iso(NOW),
