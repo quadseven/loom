@@ -5239,6 +5239,23 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     blocking = merge_tier.blocking_findings(threads, committed, is_bot, env, held)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
+    _refuse_review_bodies(gh, repo, number, sha, threads, committed, is_bot, lint_run)
+    capped = merge_tier.cap_refusal(gh, repo, env)
+    if capped:
+        raise ValueError("the auto-merge cap holds the merge: %s" % capped)
+    return tier
+
+
+def _refuse_review_bodies(gh: GitHub, repo: str, number: int, sha: str,
+                          threads: List[Dict[str, Any]], committed: str,
+                          is_bot: Callable[[Dict[str, Any]], bool],
+                          lint_run: Optional[Callable[..., Optional[bool]]]) -> None:
+    """The review-body half of the merge gate (bus/merge_tier.py,
+    loom#1933): an unanswered review body with a finding still open, and
+    an addressed high lint finding that still hits or cannot be
+    re-checked on the head, refuse the merge; a body whose findings all
+    read settled is answered with one record comment, and the merge
+    proceeds."""
     bodies = merge_tier.unanswered_bodies(gh, repo, number, threads, committed, is_bot)
     refusal = merge_tier.body_refusal(bodies)
     if refusal:
@@ -5249,10 +5266,6 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         raise ValueError(refusal)
     if bodies:
         notify.post(gh, repo, number, merge_tier.answer_comment(bodies), notify.RECORD)
-    capped = merge_tier.cap_refusal(gh, repo, env)
-    if capped:
-        raise ValueError("the auto-merge cap holds the merge: %s" % capped)
-    return tier
 
 
 # A failing check a loom:fix comment names, the line its page shows.

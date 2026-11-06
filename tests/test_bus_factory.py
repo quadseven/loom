@@ -344,7 +344,7 @@ class Base(unittest.TestCase):
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
                             no_lane_since=no_lane_since, review_brief=review_brief,
-                            lint_run=lint_run)
+                            lint_run=lint_run or merge_tier.run_ruff)
         f.run()
         return f
 

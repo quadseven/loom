@@ -1827,7 +1827,7 @@ class Factory:
                  operators: Optional[Sequence[str]] = None,
                  no_lane_since: Optional[Dict[str, float]] = None,
                  reroute_after: Optional[float] = None,
-                 lint_run: Optional[Callable[..., Optional[bool]]] = None) -> None:
+                 lint_run: Callable[..., Optional[bool]] = merge_tier.run_ruff) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1838,7 +1838,7 @@ class Factory:
         self.review_check = review_check
         self.review_bot = review_bot
         # The lint re-check for settled findings (merge_tier.run_ruff).
-        self.lint_run = lint_run if lint_run is not None else merge_tier.run_ruff
+        self.lint_run = lint_run
         self.merge, self.fix, self.move = merge, fix, move
         self.human = human
         # Puts a ticket that sits under no epic under one (brain.place_under_epic).
@@ -2350,7 +2350,7 @@ class Factory:
             pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
             branch = str((pr.get("base") or {}).get("ref") or "")
             data = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
-                                % (repo, quote(path, safe="/"), branch)).data
+                                % (repo, quote(path, safe="/"), quote(branch, safe=""))).data
             if not branch or not isinstance(data, dict) or not data.get("content"):
                 return None
             text = base64.b64decode(str(data["content"])).decode("utf-8", "replace")
