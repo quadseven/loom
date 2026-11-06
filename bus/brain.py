@@ -5426,20 +5426,28 @@ def _luna_degraded_only(runs: Sequence[Dict[str, Any]], check: str) -> bool:
 
 def _clean_luna_verdict(gh: GitHub, repo: str, number: int, sha: str,
                         env: Optional[Dict[str, str]], author: str = "") -> bool:
-    """Whether the newest trusted Luna verdict for this exact head on this
-    pull request is clean (factory.parse_luna_verdict). The verdict is the
-    station's word, posted by its review reporter after the Luna slot's run;
-    a verdict the pull request's own author posted never counts, and a newer
-    verdict for the head replaces an older one, clean or blocking."""
+    """Whether the newest Luna verdict the station posted for this exact head
+    on this pull request is clean (factory.parse_luna_verdict). The verdict
+    is the station's word, posted by its review reporter after the Luna
+    slot's run with the same client that calls this merge, so only a
+    verdict by writer_login(gh, env) counts; any other trusted login's
+    marker is not that verdict. A client with no known login reads no
+    verdict at all. A verdict the pull request's own author posted never
+    counts, and a newer verdict for the head replaces an older one, clean
+    or blocking."""
     from . import factory  # factory imports this module
+    station = writer_login(gh, env).lower()
+    if not station:
+        return False  # no known writer: no verdict can be the station's
     try:
         comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     except GitHubError:
         return False  # an unreadable verdict proves nothing: the gate stands
     newest: Optional[Tuple[int, int]] = None
     for comment in trusted_comments(comments, trusted_authors(env)):
-        if author and comment_login(comment).lower() == author.lower():
-            continue  # the author's own verdict on its own change proves nothing
+        login = comment_login(comment).lower()
+        if login != station or (author and login == author.lower()):
+            continue  # only the station's verdict counts, never the author's
         verdict = factory.parse_luna_verdict(comment.get("body"), sha)
         if verdict is not None:
             newest = verdict

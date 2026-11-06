@@ -2606,7 +2606,11 @@ class LunaMergeTests(unittest.TestCase):
     the rollup is still FAILURE. These tests run the real merge, risk tier
     included; nothing on the merge path is stood in for."""
 
-    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane", "LOOM_MERGE_SETTLE_SECONDS": "0"}
+    # The merging client writes as example-station (LOOM_GITHUB_LOGIN on a
+    # personal-token client): the station posts the Luna verdict and calls
+    # brain.merge with the same client, so only that login's verdict counts.
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane example-station",
+           "LOOM_GITHUB_LOGIN": "example-station", "LOOM_MERGE_SETTLE_SECONDS": "0"}
     DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
                 "conclusion": "failure", "id": 2, "started_at": "2030-01-01T00:00:00Z",
                 "output": {"title": "WARN Grug eyes clouded",
@@ -2623,7 +2627,7 @@ class LunaMergeTests(unittest.TestCase):
         self.runs = [dict(self.GREEN), dict(self.DEGRADED)]
         self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
                         "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
-        self.verdict_user = "example-brain"
+        self.verdict_user = "example-station"
         self.pr_comments = None
         self.combined = {"state": "success", "total_count": 0, "statuses": []}
         self.merges = []
@@ -2686,9 +2690,9 @@ class LunaMergeTests(unittest.TestCase):
             return reply(201, {})
         raise AssertionError("unexpected %s %s" % (method, path))
 
-    def merge(self):
+    def merge(self, **env):
         return brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
-                           env=dict(self.ENV))
+                           env=dict(self.ENV, **env))
 
     def test_a_clean_luna_verdict_merges_through_the_real_merge(self):
         result = self.merge()
@@ -2739,10 +2743,35 @@ class LunaMergeTests(unittest.TestCase):
 
     def test_a_newer_blocking_verdict_replaces_an_older_clean_one(self):
         self.pr_comments = [
-            {"body": self.verdict, "user": {"login": "example-brain"}},
+            {"body": self.verdict, "user": {"login": "example-station"}},
             {"body": factory.LUNA_REVIEW_MARKER % "checked" +
                      "\nElder markings - 1 blocking, 2 total\n\nOne finding blocks.",
-             "user": {"login": "example-brain"}}]
+             "user": {"login": "example-station"}}]
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_verdict_from_another_trusted_login_still_refuses(self):
+        # Only the station that ran the Luna slot posts its verdict: a clean
+        # marker from any other trusted login (the brain App, another fleet
+        # agent) is not that verdict and never stands in.
+        self.verdict_user = "example-brain"
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_no_known_writer_login_refuses_every_verdict(self):
+        # A client whose own login is unknown cannot tell the station's
+        # verdict from anyone else's, so the Luna path fails closed.
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge(LOOM_GITHUB_LOGIN="")
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_verdict_for_an_older_head_still_refuses(self):
+        # The verdict is bound to the head it reviewed: a clean verdict for
+        # an earlier head says nothing about the commits pushed since.
+        self.verdict = (factory.LUNA_REVIEW_MARKER % "older" +
+                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
