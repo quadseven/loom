@@ -2980,6 +2980,42 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def test_an_unclaimed_hand_off_ticket_returns_when_a_lane_of_its_tier_is_free(self):
+        # 128 of 200 queued tickets sat in the hand-off pool, 120 of them
+        # unclaimed, while lanes of their tiers beat available and idle: the
+        # pool had no way back but a person taking the label off.
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(issue))
+
+    def test_a_hand_off_ticket_waits_behind_every_other_queued_ticket(self):
+        self.queued(7, age=7200)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.queued(8, age=0)
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_claimed_hand_off_ticket_stays_in_the_pool(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": "claim:someone"}]
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_hand_off_ticket_with_no_free_lane_stays_in_the_pool_quietly(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        worker = self.assign(available=[])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(self.gh.comments.get(7, []), [])
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+
     def test_a_queued_ticket_held_by_after_gets_no_lane_and_the_next_one_does(self):
         # The factory briefed a queued ticket whose After: ticket had not
         # merged; the station never claimed it, and the lane it reserved sat
@@ -4878,11 +4914,17 @@ class NoLane(Base):
         self.assertIn("%s#7" % REPO, worker.settled)
         self.assertFalse(brain._in_flight(self.gh.issues[7]))
         comments = [dict(c) for c in self.gh.comments[7]]
-        # The next pass leaves it alone: no second note, no lane, no wait.
-        again = self.assign(26 * 3600, ["claude"])
+        # The next pass with no lane free leaves it alone: no second note, no
+        # lane, no wait.
+        again = self.assign(26 * 3600, [])
         self.assertEqual(self.gh.comments[7], comments)
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertNotIn("%s#7" % REPO, again.waits)
+        # A pass with a lane of its model free takes it back from the pool.
+        self.assign(27 * 3600, ["claude"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "claude"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertIn("Back from the hand-off pool", self.notes(7))
 
     def test_a_ticket_with_no_reroute_waits_until_its_day_is_out(self):
         self.queued(7, self.OPUS)

@@ -137,7 +137,9 @@ Neither needs a model:
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
   climb rules allow with a free lane in its tier; with none, by
   NO_LANE_HANDOFF it goes to the hand-off pool (HANDOFF_LABEL), out of its
-  goal's in-flight count, with one note (loom#1831, docs/BRAIN.md).
+  goal's in-flight count, with one note (loom#1831, docs/BRAIN.md). An
+  unclaimed queued pool ticket takes a lane left free after the rest of the
+  queue, and leaves the pool (_return_hand_offs).
 - A needs-brain hold older than a day that Loom set (bus/brain_hold.py,
   brain_holds; the station runs it at most every half hour, 5 a run) is
   resolved: a loom:pr ticket whose pull request fails only the plan check on
@@ -4590,7 +4592,39 @@ class Factory:
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
         if waits and all(waits):
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+        self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
+
+    def _return_hand_offs(self, found_by_repo: Dict[str, Dict[int, Dict[str, Any]]]) -> None:
+        """Give a lane left free after every other queued ticket had its turn
+        to an unclaimed queued ticket in the hand-off pool, in work order, and
+        take HANDOFF_LABEL off it: the pool is for work no lane takes, and on
+        2026-11-06 120 unclaimed pool tickets waited while lanes of their tiers
+        sat idle, with no way back but a person taking the label off. A ticket
+        with no free lane is left as it is, with no wait recorded or note."""
+        pool = [(repo, issue) for repo, found in found_by_repo.items() for issue in found.values()
+                if _state(issue) == "queued" and HANDOFF_LABEL in _labels(issue)
+                and not any(x.startswith("claim:") for x in _labels(issue))]
+        for repo, issue in sorted(pool, key=lambda item: tickets.work_order(*item)):
+            if self.actions >= MAX_ACTIONS:
+                return
+            if self._free_lane_for(repo, issue) is None or self._assign_queued_ticket(repo, issue):
+                continue
+            self._relabel(repo, issue, [x for x in _labels(issue) if x != HANDOFF_LABEL])
+            self._status_note(repo, int(issue["number"]),
+                              "Back from the hand-off pool (%s): lane %s was free after every "
+                              "other queued ticket had its turn." % (HANDOFF_LABEL, _lane(issue)))
+            self.actions += 1
+            _say("returned %s#%s from the hand-off pool to lane %s"
+                 % (repo, issue["number"], _lane(issue)))
+
+    def _free_lane_for(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+        """A free lane a queued ticket could take this pass, by its Model:
+        line or its tier; reads nothing and records nothing."""
+        match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
+        if match:
+            return self._queued_model_lane(repo, match.group(1))
+        return self._tier_move(repo, issue)[0]
 
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
@@ -4910,8 +4944,9 @@ class Factory:
         """Put a ticket no lane took for NO_LANE_HANDOFF, with no reroute
         allowed, in the hand-off pool: queued with no lane and HANDOFF_LABEL,
         so it leaves its goal's in-flight count (brain._in_flight) and the
-        factory moves it no more. One note on its status comment, edited in
-        place; a handed-off ticket is never handed off again."""
+        factory moves it no more until a lane is free for it after the rest
+        of the queue (_return_hand_offs). One note on its status comment,
+        edited in place; a ticket in the pool is never handed off again."""
         number, old = int(issue["number"]), _lane(issue)
         if _state(issue) not in ("queued", "briefed"):
             return
