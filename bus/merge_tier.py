@@ -43,7 +43,26 @@ review-bot finding, and no finding from a BAD_WORK rule (the review bot's
 unmet-criterion and intent detectors, at any severity), is open or was
 resolved with no commit after it. Every review thread is read, all pages; a
 list that cannot be read in full refuses the merge.
-Such a finding is never deferred as minor (bus/factory.py). Auto-merges are
+Such a finding is never deferred as minor (bus/factory.py).
+
+The gate reads review bodies as well as threads (loom#1933). A review
+body is the verdict comment's sibling: the bot's findings also live in the
+body of the review it submitted, and a merge that answers every thread can
+still leave that body unanswered, which the bot's Sentinel later reports
+as an abandoned review. So a bot review whose body carries findings and
+that no pull-request comment answers holds the merge while any finding it
+names is still open (its newest thread unresolved, or no thread at all).
+When every finding it names reads resolved or addressed, the gate posts
+one answer naming each finding's state and merges. The newest thread per
+rule sets the state: an answer to an older duplicate thread is no answer
+to the thread the bot opened last (the PR #1996 fixture). A high or
+critical lint finding that reads addressed is not taken on its mark
+either: its ruff rule is re-run on the head's version of its file, and a
+finding that still hits, or whose check cannot run, holds the merge. A
+Sentinel abandoned-review notice already left on a merged pull request is
+settled by the factory (bus/factory.py settle_abandoned), which files one
+follow-up and answers the notice only when the same re-check passes on
+the merged branch. Auto-merges are
 also capped: at most LOOM_AUTO_MERGE_PER_HOUR (default 4) loom/ pull
 requests merged in the last hour across the owner, and at most
 LOOM_AUTO_MERGE_PER_REPO_HOUR (default 2) in one repo. The counts come from
@@ -52,9 +71,11 @@ a loom/ branch counts too. A count GitHub will not give refuses the merge.
 """
 from __future__ import annotations
 
+import base64
 import fnmatch
 import os
 import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Container, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
@@ -377,7 +398,7 @@ THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!,$after:String) {"
     " repository(owner:$owner,name:$name) { pullRequest(number:$number) {"
     " reviewThreads(first:100,after:$after) { pageInfo { hasNextPage endCursor }"
-    " nodes { id isResolved comments(first:1) { nodes {"
+    " nodes { id isResolved path comments(first:1) { nodes {"
     " author { __typename login } body createdAt } } } } } } }")
 THREAD_PAGES = 20
 
@@ -450,6 +471,279 @@ def blocking_findings(threads: Sequence[Mapping[str, Any]], committed: str,
         if not thread.get("isResolved") or not committed or not created or created >= committed:
             out.append("%s %s" % (found[0], found[2]))
     return out
+
+
+# -- review bodies and the lint re-check (loom#1933) ----------------------
+REVIEW_ANSWER_MARKER = "<!-- loom:review-answer v1 -->"
+_STATE_WORDS = {
+    "addressed": "addressed (its thread is resolved, and a commit on this "
+                 "pull request follows it)",
+    "resolved": "resolved (its thread is resolved)",
+    "open": "still open",
+}
+_LINT_RULE_RE = re.compile(r"^[a-z]{1,7}[0-9]+$")
+
+
+def body_findings(body: str) -> List[Tuple[str, str, str]]:
+    """The findings a review body carries, one per finding header line.
+    Prose names no finding: a header line needs the severity, the category
+    and the backticked rule of FINDING_RE, as a thread's root does."""
+    out = []
+    for line in str(body or "").splitlines():
+        found = finding(line)
+        if found:
+            out.append(found)
+    return out
+
+
+def _thread_root(thread: Mapping[str, Any]) -> Mapping[str, Any]:
+    comments = (thread.get("comments") or {}).get("nodes") or []
+    return (comments[0] if comments else None) or {}
+
+
+def thread_states(threads: Sequence[Mapping[str, Any]], committed: str,
+                  by_bot: Callable[[Mapping[str, Any]], bool]) -> Dict[str, Tuple[str, str]]:
+    """{rule: (state, path)} for the review bot's findings, the state set
+    by the newest thread per rule: "open" (that thread is unresolved),
+    "addressed" (resolved, and a commit on the pull request follows it:
+    the thread opened before `committed`, the newest non-merge commit),
+    or "resolved" (resolved, with no such commit read). A newer duplicate
+    thread replaces an older one's state: an answer to a duplicate is no
+    answer to the thread the bot opened last (loom#1933)."""
+    states: Dict[str, Tuple[str, str]] = {}
+    seen: Dict[str, str] = {}
+    for thread in threads:
+        root = _thread_root(thread)
+        found = finding(str(root.get("body") or ""))
+        if not found or not by_bot(root):
+            continue
+        created = str(root.get("createdAt") or "")
+        if found[2] in seen and seen[found[2]] > created:
+            continue
+        seen[found[2]] = created
+        if not thread.get("isResolved"):
+            state = "open"
+        elif committed and created and created < committed:
+            state = "addressed"
+        else:
+            state = "resolved"
+        states[found[2]] = (state, str(thread.get("path") or ""))
+    return states
+
+
+def pull_reviews(gh: Any, repo: str, number: int) -> List[Mapping[str, Any]]:
+    """Every review on the pull request. Raises ValueError when the list
+    cannot be read: a review the gate never saw is one it cannot answer."""
+    try:
+        data = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("could not read the pull request's reviews (%s)" % err) from err
+    if not isinstance(data, list):
+        raise ValueError("could not read the pull request's reviews")
+    return [r for r in data if isinstance(r, dict)]
+
+
+def pull_comments(gh: Any, repo: str, number: int) -> List[Mapping[str, Any]]:
+    """Every comment on the pull request. Raises ValueError when the list
+    cannot be read: an answer the gate never saw would be posted twice.
+    The refusal carries the fleet hold's phrase for the same read
+    (bus/brain.py _hold_blocker): one root cause, one wording."""
+    try:
+        data = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("pull request comments unreadable, so an unanswered "
+                         "review body cannot be ruled out (%s)" % err) from err
+    if not isinstance(data, list):
+        raise ValueError("pull request comments unreadable, so an unanswered "
+                         "review body cannot be ruled out")
+    return [c for c in data if isinstance(c, dict)]
+
+
+def _review_author(review: Mapping[str, Any]) -> Dict[str, Any]:
+    """A REST review in the comment shape by_bot reads, its author the
+    login without the "[bot]" suffix the REST API adds, the type as a
+    typename."""
+    user = review.get("user") or {}
+    login = str(user.get("login") or "")
+    if login.endswith("[bot]"):
+        login = login[:-len("[bot]")]
+    return {"author": {"__typename": "Bot" if user.get("type") == "Bot" else "User",
+                       "login": login}}
+
+
+def _body_answered(review: Mapping[str, Any],
+                   comments: Sequence[Mapping[str, Any]]) -> bool:
+    """A pull-request comment answers a review body when it links the
+    review: its #pullrequestreview-<id> anchor or its URL. A reply inside
+    a thread answers the thread, not the body, so only comments count."""
+    marks = ["#pullrequestreview-%s" % review.get("id")]
+    if review.get("html_url"):
+        marks.append(str(review["html_url"]))
+    return any(mark in str(c.get("body") or "")
+               for c in comments for mark in marks)
+
+
+def unanswered_bodies(gh: Any, repo: str, number: int,
+                      threads: Sequence[Mapping[str, Any]], committed: str,
+                      by_bot: Callable[[Mapping[str, Any]], bool]) -> List[Dict[str, Any]]:
+    """The review bot's reviews on the pull request whose body carries
+    findings and that no pull-request comment answers, each as
+    {"review", "findings", "settled"}: findings a list of
+    (finding, state, path) with the state from thread_states, and settled
+    when no finding reads open. A finding with no thread reads open: only
+    an answer settles it. A dismissed review is not outstanding, and
+    neither is a person's review."""
+    reviews = pull_reviews(gh, repo, number)
+    comments = pull_comments(gh, repo, number)
+    states = thread_states(threads, committed, by_bot)
+    out = []
+    for review in reviews:
+        if str(review.get("state") or "").upper() == "DISMISSED":
+            continue
+        if not by_bot(_review_author(review)):
+            continue
+        found = body_findings(str(review.get("body") or ""))
+        if not found or _body_answered(review, comments):
+            continue
+        rows = [(f,) + states.get(f[2], ("open", "")) for f in found]
+        out.append({"review": review, "findings": rows,
+                    "settled": all(state != "open" for _, state, _ in rows)})
+    return out
+
+
+def body_refusal(bodies: Sequence[Dict[str, Any]]) -> str:
+    """Why unanswered review bodies hold the merge, or "" when every
+    finding named in them reads settled."""
+    out = []
+    for body in bodies:
+        if body["settled"]:
+            continue
+        review = body["review"]
+        for found, state, _ in body["findings"]:
+            if state == "open":
+                out.append("%s %s in the review of %s is still open"
+                           % (found[0], found[2],
+                              review.get("submitted_at") or "an unknown time"))
+    if not out:
+        return ""
+    return "unanswered review bodies hold the merge: %s" % "; ".join(out)
+
+
+def answer_comment(bodies: Sequence[Dict[str, Any]]) -> str:
+    """The gate's one answer to settled review bodies: it links each
+    review (so the body reads answered from here on) and says how each
+    finding it names reads on the head."""
+    parts = [REVIEW_ANSWER_MARKER]
+    for body in bodies:
+        review = body["review"]
+        lines = ["Answering the review of %s (%s): every finding in its body "
+                 "reads settled on this head, so the merge gate answers it "
+                 "here rather than leave the review body unanswered."
+                 % (review.get("submitted_at") or "an unknown time",
+                    review.get("html_url") or "")]
+        for found, state, path in body["findings"]:
+            where = " on `%s`" % path if path else ""
+            lines.append("- %s `%s`%s: %s"
+                         % (found[0], found[2], where, _STATE_WORDS[state]))
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts) + "\n"
+
+
+def lint_rule(rule: str) -> bool:
+    """Whether a finding's rule is a ruff code (S110, E501), which a
+    re-check can run, rather than one of the review bot's own word rules
+    (dead-code, intent-mismatch), which no tool re-checks."""
+    return bool(_LINT_RULE_RE.match(rule or ""))
+
+
+def lint_targets(threads: Sequence[Mapping[str, Any]], committed: str,
+                 by_bot: Callable[[Mapping[str, Any]], bool]) -> List[Tuple[str, str, str]]:
+    """(severity, rule, path) for each high or critical lint finding whose
+    thread reads addressed: resolved, with a commit on the pull request
+    after it. Those findings are the ones a merge most trusts on a mark,
+    so those are the ones the gate re-checks on the head (loom#1933)."""
+    out = []
+    seen = set()
+    for thread in threads:
+        root = _thread_root(thread)
+        found = finding(str(root.get("body") or ""))
+        if not found or not by_bot(root) or found[0] not in HIGH_SEVERITIES:
+            continue
+        if not lint_rule(found[2]) or not thread.get("isResolved"):
+            continue
+        created = str(root.get("createdAt") or "")
+        if not committed or not created or created >= committed:
+            continue
+        key = (found[2], str(thread.get("path") or ""))
+        if key not in seen:
+            seen.add(key)
+            out.append((found[0], found[2], str(thread.get("path") or "")))
+    return out
+
+
+def run_ruff(rule: str, path: str, text: str,
+             runner: Optional[Callable[..., Any]] = None) -> Optional[bool]:
+    """Run one ruff rule over `text` as the file at `path`: True when the
+    rule still hits, False when it passes, None when the check could not
+    run (no ruff, or ruff answered with an error): a check that cannot
+    run proves nothing. `runner` is subprocess.run, injectable."""
+    run = runner or subprocess.run
+    try:
+        done = run(["ruff", "check", "--select", rule.upper(), "--isolated",
+                    "--no-cache", "--stdin-filename", path, "-"],
+                   input=text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return False
+    if done.returncode == 1:
+        return True
+    return None
+
+
+def _head_text(gh: Any, repo: str, sha: str, path: str) -> Optional[str]:
+    """The head's version of one file, or None when GitHub will not
+    send it."""
+    if not path:
+        return None
+    try:
+        data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                       % (repo, quote(path, safe="/"), quote(sha, safe=""))).data
+    except GitHubError:
+        return None
+    if not isinstance(data, dict) or data.get("encoding") != "base64":
+        return None
+    try:
+        return base64.b64decode(str(data.get("content") or "")).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return None
+
+
+def lint_recheck_refusal(gh: Any, repo: str, sha: str,
+                         threads: Sequence[Mapping[str, Any]], committed: str,
+                         by_bot: Callable[[Mapping[str, Any]], bool],
+                         run: Optional[Callable[..., Optional[bool]]] = None) -> str:
+    """Why addressed high lint findings hold the merge, or "": each is
+    re-checked with its own ruff rule on the head's version of its file
+    (lint_targets). One that still hits, or whose check could not run,
+    holds the merge: "addressed" was a mark on a thread, never a
+    verification (loom#1933). `run` is run_ruff, injectable."""
+    check = run or run_ruff
+    hits, unknown = [], []
+    for severity, rule, path in lint_targets(threads, committed, by_bot):
+        text = _head_text(gh, repo, sha, path)
+        verdict = None if text is None else check(rule, path, text)
+        if verdict is True:
+            hits.append("%s %s on %s" % (severity, rule, path))
+        elif verdict is None:
+            unknown.append("%s %s on %s" % (severity, rule, path))
+    out = []
+    if hits:
+        out.append("addressed findings still hit on the head: %s" % "; ".join(hits))
+    if unknown:
+        out.append("addressed findings could not be re-checked on the head: %s"
+                   % "; ".join(unknown))
+    return "; ".join(out)
 
 
 # -- caps ------------------------------------------------------------------
