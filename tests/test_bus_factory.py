@@ -73,6 +73,7 @@ class FakeGitHub:
         # Pull request number to what its merge raises, and whether the merge
         # had already happened when it did (an error while settling).
         self.merge_refused = {}
+        self.compare_files = {}
         self.head_date = "2020-01-01T00:00:00Z"
         self.attempts = {}
         self.update_status = 202
@@ -187,6 +188,9 @@ class FakeGitHub:
         m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
         if m:
             return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
+        m = re.search(r"/compare/sha(\d+)\.\.\.main$", path)
+        if m:
+            return Response(200, {"files": self.compare_files.get(int(m.group(1)), [])})
         if path == "/repos/%s" % REPO:
             return Response(200, {"private": self.private})
         m = re.search(r"/contents/(.+?)\?ref=", path)
@@ -1289,6 +1293,59 @@ class PullRequests(Base):
         self.assertTrue(f._may_land_behind(REPO, dict(full, mergeable=True)))
         self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=False)))
         self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=None)))
+
+    def land_behind_overlap(self, patch, compare_files):
+        """A behind pull request on a non-strict base whose own hunk in
+        bus/a.py is `patch`, against the base files `compare_files`."""
+        self.gh.patches["bus/a.py"] = patch
+        self.gh.compare_files[50] = compare_files
+        with mock.patch("bus.factory._say") as say:
+            updates = self.land_behind(self.NOT_STRICT)
+        said = " ".join(str(c.args[0]) for c in say.call_args_list if c.args)
+        return updates, said
+
+    def test_an_overlapping_behind_pull_request_is_updated_and_locked_not_merged(self):
+        # loom#2622: the missed base commits changed lines inside the pull
+        # request's own hunk, so CI never ran on the combination.
+        updates, said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py", "patch": "@@ -11,2 +11,2 @@\n-old\n+new"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.lock_holder, 50)
+        self.assertIn("overlaps its base", said)
+
+    def test_a_disjoint_hunk_in_the_same_file_merges_as_it_stands(self):
+        # loom#2622: a distant hunk of the same file is not an overlap.
+        updates, said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py", "patch": "@@ -40,3 +40,3 @@\n-old\n+new"}])
+        self.assertEqual(updates, [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertNotIn("overlaps its base", said)
+
+    def test_a_missing_patch_on_a_shared_path_is_updated_not_merged(self):
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_renamed_shared_path_is_updated_not_merged(self):
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/b.py", "status": "renamed",
+              "previous_filename": "bus/a.py", "patch": "@@ -1 +1 @@\n-x\n+y"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_compare_at_the_file_cap_is_updated_not_merged(self):
+        big = [{"filename": "bus/f%d.py" % n, "patch": "@@ -1 +1 @@\n-x\n+y"}
+               for n in range(300)]
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new", big)
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
 
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")

@@ -968,6 +968,55 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_merge_passes_the_same_hold_box_ticked(self):
         self.assertTrue(self._merged_with(self._held_issue(self.HOLD_BOX, ticked=True))["merged"])
 
+    def test_merge_of_a_stacked_pull_request_uses_merge_async_and_settles_after_it_reports_merged(self):
+        # loom#2622: a stacked pull request merges through merge-async, and
+        # the ticket is settled only once the async result reports merged.
+        body = self._criteria_pr("built")
+        pr, query = self._merge_replies({"pr": {
+            "body": body, "stack": {"id": 3},
+            "base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                             {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue),
+                    reply(200, {"behind_by": 0}),
+                    reply(202, {"id": 7, "status": "pending"}),
+                    reply(200, {"status": "merged", "merged": True}),
+                    reply(204), reply(200, []), reply(200, issue), reply(200, {}))
+        with unittest.mock.patch.object(brain, "_sleep", lambda seconds: None):
+            result = brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertTrue(result["merged"])
+        puts = [i for i, c in enumerate(fake.calls)
+                if c[0] == "PUT" and "/pulls/8/" in c[1]]
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(fake.calls[puts[0]][1].endswith("/pulls/8/merge-async"))
+        polled = [i for i, c in enumerate(fake.calls)
+                  if c[0] == "GET" and "/pulls/8/merge-async/7" in c[1]]
+        deleted = [i for i, c in enumerate(fake.calls) if c[0] == "DELETE"]
+        self.assertTrue(polled and deleted)
+        # Settlement (the branch delete and the ticket move after it) waits
+        # for the poll that reports merged.
+        self.assertLess(puts[0], polled[0])
+        self.assertLess(polled[0], deleted[0])
+
+    def test_merge_refuses_a_behind_pull_request_whose_hunks_overlap_its_base(self):
+        # loom#2622: bus.brain merge applies the same hunk-overlap test as
+        # the factory before its merge call.
+        body = self._criteria_pr("built")
+        pr, query = self._merge_replies({"pr": {
+            "body": body, "base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                             {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue),
+                    reply(200, {"behind_by": 2}),
+                    reply(200, {"files": [{"filename": "bus/a.py",
+                                            "patch": "@@ -11,2 +11,2 @@\n-x\n+y"}]}),
+                    reply(200, [{"filename": "bus/a.py",
+                                 "patch": "@@ -10,3 +10,3 @@\n-x\n+y"}]))
+        with self.assertRaisesRegex(ValueError, "overlaps its base"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any(c[0] == "PUT" and "/pulls/8/" in c[1]
+                             for c in fake.calls))
+
     def test_merge_passes_a_live_or_after_deploy_box(self):
         for box in ("Live: the endpoint answers before and after the merge",
                     "Recheck the counter after the deploy, before the next merge"):

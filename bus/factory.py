@@ -28,8 +28,9 @@ Neither needs a model:
   round before this pass sees the pull request, applies the same test.
 - Landing keeps the default branch green and nothing stale. A ready pull
   request behind its base lands as it stands when GitHub reports it
-  mergeable and no rule on the base requires up-to-date branches (loom#2482,
-  the fleet merge gate's rule). Any other, or one GitHub refuses as behind,
+  mergeable, no rule on the base requires up-to-date branches (loom#2482,
+  the fleet merge gate's rule), and none of the base changes it lacks
+  overlap its own hunks (loom#2622). Any other, or one GitHub refuses as behind,
   is brought up to date first (GitHub's update-branch), and lands only once
   its checks and review pass again on the new head. No update runs while a
   fleet hold stands: its commit would be newer than the hold and lift it.
@@ -182,7 +183,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, hunk_overlap, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -3807,7 +3808,7 @@ class Factory:
         if held is not None and held != number:
             return  # another pull request holds the repo's landing lock
         behind = bool(self._behind(repo, full))
-        if behind and not self._may_land_behind(repo, full):
+        if behind and not self._may_land_behind(repo, full, number):
             if repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
@@ -3822,12 +3823,36 @@ class Factory:
             # GitHub enforces a rule the reads did not show; update as for a strict base.
             self._update_to_land(repo, number, full, issue, comments, held)
 
-    def _may_land_behind(self, repo: str, full: Dict[str, Any]) -> bool:
+    def _may_land_behind(self, repo: str, full: Dict[str, Any],
+                         number: Optional[int] = None) -> bool:
         """The fleet merge gate's rule for a behind pull request (loom#2482):
-        it merges when GitHub says it merges cleanly and nothing on the base
-        requires up-to-date branches."""
-        return full.get("mergeable") is True and not self._base_is_strict(
-            repo, str((full.get("base") or {}).get("ref") or ""))
+        it merges when GitHub says it merges cleanly, nothing on the base
+        requires up-to-date branches, and none of the base changes it lacks
+        overlap its own hunks (loom#2622, bus/hunk_overlap.py). A pull
+        request the overlap read cannot judge is updated first, as a strict
+        base is; one read with no number or head to compare by keeps the
+        #2482 rule alone."""
+        if full.get("mergeable") is not True:
+            return False
+        base = str((full.get("base") or {}).get("ref") or "")
+        if self._base_is_strict(repo, base):
+            return False
+        if number is None:
+            number = full.get("number")
+        head = str((full.get("head") or {}).get("sha") or "")
+        if not isinstance(number, int) or not head or not base:
+            return True
+        try:
+            overlap = hunk_overlap.pr_overlaps_base(self.gh, repo, number, base, head)
+        except GitHubError as err:
+            _say("could not read the hunk overlap of %s#%d, so it is updated "
+                 "first: %s" % (repo, number, err))
+            return False
+        if overlap:
+            _say("%s#%d overlaps its base; it is brought up to date before "
+                 "it lands" % (repo, number))
+            return False
+        return True
 
     def _base_is_strict(self, repo: str, base: str) -> bool:
         """Whether a ruleset or classic protection on the base requires
