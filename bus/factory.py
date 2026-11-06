@@ -66,6 +66,14 @@ Neither needs a model:
   (2026-10-14: 64% of 361 fix rounds were review threads, most of them
   medium). High and critical findings, and threads a person opened, still
   go back to the lane.
+- A merged pull request the review bot's Sentinel marked with an
+  abandoned-review notice (high or critical findings from an earlier
+  review never got a reply) is settled once its ticket reads merged,
+  shipped or verified (loom#1933): one loom:triage follow-up names the
+  findings, each lint finding is re-checked with its ruff rule on the
+  merged branch, and the notice is answered only when every re-check
+  passes. A finding that still hits leaves the notice unanswered and
+  the follow-up standing.
 - The merge rule follows the pull request's class:<name> label
   (bus/change_class.py; docs/MUSE.md, Merge by change class). docs and tests
   defer a minor finding at once; logic is the rule above; a sensitive change
@@ -616,6 +624,15 @@ DEFERRED_MARKER = "<!-- loom:deferred pr=%d sha=%s rounds=%d ids=%s -->"
 DEFERRED_RE = re.compile(r"<!-- loom:deferred pr=(\d+) sha=(\w*) rounds=(\d+) ids=([^ ]*) -->")
 DEFERRED_FILED_MARKER = "<!-- loom:deferred-filed pr=%d -->"
 DEFER_TITLE_RE = re.compile(r"^Settle the review findings left from PR #(\d+)$")
+# The review bot's Sentinel marks a review it calls abandoned with this
+# comment marker (loom#1933): the pull request merged while high or
+# critical findings from an earlier review had never got a reply. The pass
+# that finds the ticket merged settles the notice (settle_abandoned): one
+# follow-up issue, and an answer on the pull request once the findings
+# re-check clean on the merged branch.
+ABANDONED_MARKER = "<!-- grug-sentinel:abandoned-review -->"
+ABANDONED_TITLE = "Settle the abandoned-review findings left from PR #%d"
+ABANDONED_ANSWER_MARKER = "<!-- loom:abandoned-answer v1 -->"
 # A file a pull request changes is code by its extension, and a test by a
 # test or tests folder in its path or by its name.
 CODE_EXTS = (".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".cpp", ".h", ".hpp",
@@ -988,6 +1005,56 @@ def finding_line(thread: Dict[str, Any]) -> str:
     words = " ".join(first.encode("ascii", "ignore").decode().split())
     return "- %s in `%s`: %s" % (words or "finding", thread.get("path") or "?",
                                  root.get("url") or thread.get("id"))
+
+
+def abandoned_notice(comment: Dict[str, Any], bot: str) -> bool:
+    """Whether a pull-request comment is the review bot's Sentinel
+    abandoned-review notice: its marker, from the bot's own login. The
+    notice is the bot's record that a merged pull request left high or
+    critical findings from an earlier review unanswered (loom#1933)."""
+    login = str((comment.get("user") or {}).get("login") or "").lower()
+    return (login in (bot.lower(), bot.lower() + "[bot]")
+            and ABANDONED_MARKER in str(comment.get("body") or ""))
+
+
+def abandoned_answered(comments: Sequence[Dict[str, Any]],
+                       notice: Dict[str, Any]) -> bool:
+    """Whether a comment after the notice answers it: it carries the
+    factory's answer marker, or it links the notice (its #issuecomment
+    anchor or its URL)."""
+    marks = [ABANDONED_ANSWER_MARKER]
+    if notice.get("id"):
+        marks.append("#issuecomment-%s" % notice["id"])
+    if notice.get("html_url"):
+        marks.append(str(notice["html_url"]))
+    after = False
+    for comment in comments:
+        if comment is notice:
+            after = True
+            continue
+        if after and any(m in str(comment.get("body") or "") for m in marks):
+            return True
+    return False
+
+
+def abandoned_answer(notice: Dict[str, Any],
+                     findings: Sequence[Tuple[str, str, str]],
+                     follow: Optional[int]) -> str:
+    """The factory's answer to an abandoned-review notice, posted once
+    every finding it names re-checks clean on the merged branch: it links
+    the notice, names each finding and its re-check, and points at the
+    follow-up issue that carries the settle."""
+    lines = [ABANDONED_ANSWER_MARKER,
+             "Answering the abandoned-review notice above (%s): the findings it "
+             "names were re-checked on the merged branch, and each one passes "
+             "now, so they read fixed rather than only addressed."
+             % (notice.get("html_url") or "#issuecomment-%s" % notice.get("id"))]
+    for severity, rule, path in findings:
+        lines.append("- %s `%s` on `%s`: `ruff check --select %s` passes on the "
+                     "merged branch" % (severity, rule.upper(), path, rule.upper()))
+    if follow:
+        lines.append("Follow-up: #%d carries the settle." % follow)
+    return "\n".join(lines) + "\n"
 
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
@@ -1759,7 +1826,8 @@ class Factory:
                  demoted: Optional[Dict[str, str]] = None,
                  operators: Optional[Sequence[str]] = None,
                  no_lane_since: Optional[Dict[str, float]] = None,
-                 reroute_after: Optional[float] = None) -> None:
+                 reroute_after: Optional[float] = None,
+                 lint_run: Optional[Callable[..., Optional[bool]]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -1769,6 +1837,8 @@ class Factory:
         self.briefers = {b.lower() for b in briefers}
         self.review_check = review_check
         self.review_bot = review_bot
+        # The lint re-check for settled findings (merge_tier.run_ruff).
+        self.lint_run = lint_run if lint_run is not None else merge_tier.run_ruff
         self.merge, self.fix, self.move = merge, fix, move
         self.human = human
         # Puts a ticket that sits under no epic under one (brain.place_under_epic).
@@ -2173,6 +2243,120 @@ class Factory:
             self.actions += 1
             _say("settled the deferred findings of %s#%d (%d filed)"
                  % (repo, pr_number, len(standing)))
+
+    def settle_merged(self, repo: str, issue: Dict[str, Any]) -> None:
+        """The settles of a merged, shipped or verified ticket: the
+        deferred findings' follow-up (settle_deferred) and any
+        abandoned-review notice on its merged pull request
+        (settle_abandoned)."""
+        self.settle_deferred(repo, issue)
+        self.settle_abandoned(repo, issue)
+
+    def settle_abandoned(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Settle a Sentinel abandoned-review notice on a ticket's merged
+        pull request (loom#1933): file one loom:triage follow-up naming
+        the findings, re-check each high or critical lint finding on the
+        merged branch with its own ruff rule, and answer the notice once
+        every re-check passes. A finding that still hits, or that cannot
+        be re-checked, leaves the notice unanswered and the follow-up
+        standing for a lane or the operator. Once per notice."""
+        number = int(issue["number"])
+        pr_number = self._merged_pull(repo, number)
+        if pr_number is None:
+            return
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, pr_number))
+        notices = [c for c in comments if isinstance(c, dict)
+                   and abandoned_notice(c, self.review_bot)]
+        for notice in notices:
+            if abandoned_answered(comments, notice):
+                continue
+            findings = self._abandoned_findings(repo, pr_number)
+            follow = self._abandoned_follow_up(repo, pr_number, notice, findings)
+            if not findings or self.actions >= MAX_ACTIONS:
+                continue
+            verdicts = [self._recheck_on_main(repo, pr_number, rule, path)
+                        for _, rule, path in findings]
+            if any(v is not False for v in verdicts):
+                continue
+            body = abandoned_answer(notice, findings, follow)
+            brain._check_written_text(body)
+            notify.post(self.gh, repo, pr_number, body, notify.RECORD)
+            self.actions += 1
+            _say("answered the abandoned-review notice on %s#%d" % (repo, pr_number))
+
+    def _abandoned_follow_up(self, repo: str, pr_number: int,
+                             notice: Dict[str, Any],
+                             findings: Sequence[Tuple[str, str, str]]) -> Optional[int]:
+        """The open follow-up issue for a merged pull request's
+        abandoned-review notice, filed now unless an earlier pass already
+        filed it (the title search mirrors _follow_up)."""
+        title = ABANDONED_TITLE % pr_number
+        for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
+            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
+                return int(found["number"])
+        if self.actions >= MAX_ACTIONS:
+            return None
+        named = ("\n".join("- %s `%s` on `%s`" % (severity, rule.upper(), path)
+                           for severity, rule, path in findings)
+                 or "- the findings could not be read from the review threads this pass")
+        body = ("The review bot's Sentinel left an abandoned-review notice on #%d "
+                "(%s): the pull request merged while high or critical findings from "
+                "an earlier review had never got a reply. Settle it by re-checking "
+                "each finding on the merged branch; the factory answers the notice "
+                "itself once every re-check passes.\n\n%s\n"
+                % (pr_number, notice.get("html_url") or "no link read", named))
+        brain._check_written_text(title + "\n" + body)
+        made = self.gh.rest("POST", "/repos/%s/issues" % repo,
+                            {"title": title, "body": body, "labels": [DEFER_LABEL]}).data or {}
+        self.actions += 1
+        return int(made.get("number") or 0) or None
+
+    def _abandoned_findings(self, repo: str,
+                            pr_number: int) -> List[Tuple[str, str, str]]:
+        """(severity, rule, path) for the review bot's high or critical
+        lint findings on the pull request, read from its review threads:
+        the findings a re-check can settle. A thread list that cannot be
+        read settles nothing."""
+        try:
+            threads = self._threads(repo, pr_number)
+        except (GitHubError, ValueError):
+            return []
+        found: Dict[Tuple[str, str], str] = {}
+        for thread in threads:
+            root = _end(thread, "root", 0)
+            author = root.get("author") or {}
+            if (author.get("__typename") != "Bot"
+                    or str(author.get("login") or "").lower() != self.review_bot.lower()):
+                continue
+            hit = merge_tier.finding(str(root.get("body") or ""))
+            if not hit or hit[0] not in merge_tier.HIGH_SEVERITIES:
+                continue
+            if not merge_tier.lint_rule(hit[2]):
+                continue
+            path = str(thread.get("path") or "")
+            if path:
+                found[(hit[2], path)] = hit[0]
+        return sorted((severity, rule, path)
+                      for (rule, path), severity in found.items())
+
+    def _recheck_on_main(self, repo: str, pr_number: int, rule: str,
+                         path: str) -> Optional[bool]:
+        """One abandoned finding re-checked on the merged branch (the
+        pull request's base, as it now stands), with merge_tier.run_ruff's
+        answer: True still hits, False passes, None could not be read or
+        run."""
+        import base64
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
+            branch = str((pr.get("base") or {}).get("ref") or "")
+            data = self.gh.rest("GET", "/repos/%s/contents/%s?ref=%s"
+                                % (repo, quote(path, safe="/"), branch)).data
+            if not branch or not isinstance(data, dict) or not data.get("content"):
+                return None
+            text = base64.b64decode(str(data["content"])).decode("utf-8", "replace")
+        except (GitHubError, ValueError, TypeError, KeyError, AttributeError):
+            return None
+        return self.lint_run(rule, path, text)
 
     def _close_unmerged_follow_ups(self, repo: str) -> None:
         """Close, as not planned, each open follow-up issue of a pull request
@@ -5162,8 +5346,8 @@ class Factory:
             if brain_hold.LABEL in _labels(issue):
                 self._guarded(self._escalate_brain_stall, repo, issue)
         steps = {"failed": lambda r, i: self.failed(r, i, linked), "briefed": self.briefed,
-                 "running": self.running, "merged": self.settle_deferred,
-                 "shipped": self.settle_deferred, "verified": self.settle_deferred}
+                 "running": self.running, "merged": self.settle_merged,
+                 "shipped": self.settle_merged, "verified": self.settle_merged}
         for issue in list(tickets.values()):
             step = steps.get(_state(issue))
             if self.actions >= MAX_ACTIONS:

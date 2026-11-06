@@ -9,6 +9,7 @@ replacement ran nowhere, and a dev-world config override a release retired.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -339,6 +340,9 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
               "labels": [{"name": n} for n in ("loom:ticket", "loom:pr") + tuple(ticket_labels)]}
     return {
         "/repos/%s/pulls/8/files" % REPO: entries(files, patches),
+        # No reviews on the pull request unless a test adds its own route
+        # (this key must precede the pull request's: it is a prefix of it).
+        "/repos/%s/pulls/8/reviews" % REPO: [],
         "/repos/%s/pulls/8" % REPO: pr,
         "/graphql": {"data": {"repository": {"pullRequest": graph}}},
         "/repos/%s/issues/9/comments" % REPO: [],
@@ -490,6 +494,261 @@ class Unreadable(unittest.TestCase):
     def test_revert_refusal_reads_the_labelers_from_the_environment(self):
         with mock.patch.dict(os.environ, {"LOOM_REVERT_LABELERS": "a-bot[bot]"}):
             self.assertEqual(merge_tier.revert_labelers(None), ["a-bot[bot]"])
+
+
+S110 = "\U0001f534 high | _security_ | `S110` | trivial\n\ntry, except, pass detected."
+
+
+def review(rid, body, state="COMMENTED", when="2030-01-02T09:30:00Z", bot=True):
+    """A REST review on pull request 8, as the reviews endpoint sends it."""
+    return {"id": rid, "state": state, "body": body, "submitted_at": when,
+            "html_url": "https://example.test/pull/8#pullrequestreview-%d" % rid,
+            "user": {"login": BOT + "[bot]" if bot else "alice",
+                     "type": "Bot" if bot else "User"}}
+
+
+def pr_comment(body, when="2030-01-02T09:45:00Z"):
+    return {"body": body, "created_at": when,
+            "user": {"login": "alice", "type": "User"}}
+
+
+class StubGH:
+    """paginate() only: the reviews and the pull request's comments."""
+
+    def __init__(self, reviews=(), comments=()):
+        self._reviews, self._comments = list(reviews), list(comments)
+
+    def paginate(self, path):
+        return self._reviews if "/reviews" in path else self._comments
+
+
+class ReviewBodies(unittest.TestCase):
+    """loom#1933: the gate reads review bodies, not only review threads."""
+
+    def test_body_findings_reads_the_finding_lines_and_ignores_prose(self):
+        body = "Two things need work.\n\n%s\n\n%s\n" % (Findings.DEAD, Findings.STYLE)
+        found = merge_tier.body_findings(body)
+        self.assertEqual([f[2] for f in found], ["dead-code", "naming"])
+        self.assertEqual(merge_tier.body_findings("Nothing to see here."), [])
+        self.assertEqual(merge_tier.body_findings(""), [])
+
+    def test_thread_states_follow_the_newest_thread_for_a_rule(self):
+        older = thread(Findings.STYLE, resolved=True, created="2030-01-02T08:00:00Z")
+        newer = thread(Findings.STYLE, resolved=False, created="2030-01-02T09:00:00Z")
+        self.assertEqual(merge_tier.thread_states([older, newer], HEAD_AT, by_bot),
+                         {"naming": ("open", "")})
+        self.assertEqual(merge_tier.thread_states([newer, older], HEAD_AT, by_bot),
+                         {"naming": ("open", "")})
+        fixed = dict(thread(S110, resolved=True, created="2030-01-02T09:00:00Z"),
+                     path="dashboard.py")
+        self.assertEqual(merge_tier.thread_states([fixed], HEAD_AT, by_bot),
+                         {"s110": ("addressed", "dashboard.py")})
+        # Resolved with no fix commit read (committed unknown): resolved.
+        self.assertEqual(merge_tier.thread_states([fixed], "", by_bot),
+                         {"s110": ("resolved", "dashboard.py")})
+        # A person's thread and a finding-free body set no state.
+        self.assertEqual(merge_tier.thread_states(
+            [thread(Findings.STYLE, bot=False), thread("no finding")], HEAD_AT, by_bot), {})
+
+    def test_unanswered_bodies_skip_dismissed_people_and_answered_reviews(self):
+        settled = thread(Findings.STYLE, resolved=True)
+        gh = StubGH(reviews=[review(41, Findings.STYLE, state="DISMISSED"),
+                             review(42, Findings.STYLE, bot=False),
+                             review(43, Findings.STYLE),
+                             review(44, "No findings in this one."),
+                             review(45, Findings.STYLE)],
+                    comments=[pr_comment("Answering review 43: "
+                                         "https://example.test/x#pullrequestreview-43")])
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [settled], HEAD_AT, by_bot)
+        self.assertEqual([b["review"]["id"] for b in bodies], [45])
+        self.assertTrue(bodies[0]["settled"])
+        self.assertEqual(bodies[0]["findings"],
+                         [(merge_tier.finding(Findings.STYLE), "addressed", "")])
+
+    def test_a_body_finding_with_no_thread_reads_open(self):
+        gh = StubGH(reviews=[review(46, Findings.STYLE)])
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [], HEAD_AT, by_bot)
+        self.assertEqual(len(bodies), 1)
+        self.assertFalse(bodies[0]["settled"])
+        self.assertIn("naming", merge_tier.body_refusal(bodies))
+        self.assertIn("still open", merge_tier.body_refusal(bodies))
+
+    def test_lint_rules_are_ruff_codes_not_elder_words(self):
+        for rule, want in (("s110", True), ("e501", True), ("b905", True),
+                           ("dead-code", False), ("naming", False),
+                           ("intent-mismatch", False), ("s", False)):
+            with self.subTest(rule=rule):
+                self.assertEqual(merge_tier.lint_rule(rule), want)
+
+    def test_lint_targets_are_addressed_high_lint_threads_only(self):
+        addressed = dict(thread(S110, resolved=True, created="2030-01-02T09:00:00Z"),
+                         path="dashboard.py")
+        open_high = dict(thread(S110, resolved=False, created="2030-01-02T09:30:00Z"),
+                         path="other.py")
+        medium = dict(thread("\U0001f7e1 medium | _style_ | `E501` | trivial",
+                             resolved=True, created="2030-01-02T09:00:00Z"), path="dashboard.py")
+        elder = dict(thread(Findings.INTENT, resolved=True,
+                            created="2030-01-02T09:00:00Z"), path="dashboard.py")
+        self.assertEqual(merge_tier.lint_targets([addressed, open_high, medium, elder],
+                                                 HEAD_AT, by_bot),
+                         [("high", "s110", "dashboard.py")])
+
+    def test_run_ruff_maps_exit_codes_and_cannot_run_to_none(self):
+        class Done:
+            def __init__(self, returncode):
+                self.returncode = returncode
+
+        def runner(rc):
+            return lambda *a, **k: Done(rc)
+
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=runner(1)), True)
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=runner(0)), False)
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=runner(2)), None)
+
+        def missing(*a, **k):
+            raise OSError("no ruff")
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=missing), None)
+
+
+class ReviewBodyGate(BrainMerge):
+    """loom#1933 criteria 1, 2 and 4, through brain.merge itself."""
+
+    def gate_merge(self, reviews=(), comments=(), contents=None, lint_run=None, **kw):
+        base = routes(**kw)
+        # The reviews route comes first (the pull request's route is a
+        # prefix of it) and carries this test's reviews, not the default.
+        ordered = {"/repos/%s/pulls/8/reviews" % REPO: list(reviews)}
+        for key, value in base.items():
+            if key not in ordered:
+                ordered[key] = value
+        if comments:
+            ordered["/repos/%s/issues/8/comments" % REPO] = list(comments)
+        for path, text in (contents or {}).items():
+            ordered["/repos/%s/contents/%s" % (REPO, path)] = {
+                "encoding": "base64",
+                "content": base64.b64encode(text.encode()).decode()}
+        fake = Route(ordered)
+        try:
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                        env=dict(self.ENV), lint_run=lint_run)
+        except ValueError as err:
+            return fake, str(err)
+        return fake, ""
+
+    def answers(self, fake):
+        return [b for _, p, b in fake.writes
+                if p.endswith("/issues/8/comments") and b and "body" in b]
+
+    def test_settled_review_body_is_answered_once_then_the_pr_merges(self):
+        # Criterion 1: the finding's thread is resolved and a commit on the
+        # pull request follows it; the review body itself was never answered.
+        addressed = dict(thread(S110, resolved=True, created="2030-01-02T09:00:00Z"),
+                         path="dashboard.py")
+        calls = []
+
+        def clean(rule, path, text):
+            calls.append((rule, path, text))
+            return False
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[addressed],
+            reviews=[review(41, "One finding from the review.\n\n" + S110)],
+            contents={"dashboard.py": "def ok():\n    return 1\n"},
+            lint_run=clean)
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        # The addressed high lint finding was re-checked on the head's file.
+        self.assertEqual(calls, [("s110", "dashboard.py", "def ok():\n    return 1\n")])
+        answers = self.answers(fake)
+        self.assertEqual(len(answers), 1)
+        self.assertIn(merge_tier.REVIEW_ANSWER_MARKER, answers[0]["body"])
+        self.assertIn("#pullrequestreview-41", answers[0]["body"])
+        self.assertIn("s110", answers[0]["body"])
+        # The answer is posted before the merge.
+        posted = [i for i, (_, p, _) in enumerate(fake.writes)
+                  if p.endswith("/issues/8/comments")]
+        merged_at = [i for i, (_, p, _) in enumerate(fake.writes)
+                     if p.endswith("/pulls/8/merge")]
+        self.assertLess(posted[0], merged_at[0])
+
+    def test_a_high_lint_finding_that_still_hits_on_the_head_blocks(self):
+        # Criterion 2: the thread reads addressed, but the rule still hits
+        # on the head version of the file, so nothing merges or is answered.
+        addressed = dict(thread(S110, resolved=True, created="2030-01-02T09:00:00Z"),
+                         path="dashboard.py")
+        for run, why in ((lambda rule, path, text: True, "still hit on the head"),
+                         (lambda rule, path, text: None, "could not be re-checked")):
+            with self.subTest(why=why):
+                fake, refused = self.gate_merge(
+                    files=APP_CHANGE, threads=[addressed],
+                    reviews=[review(41, S110)],
+                    contents={"dashboard.py": "try:\n    pass\nexcept Exception:\n    pass\n"},
+                    lint_run=run)
+                self.assertIn("s110", refused)
+                self.assertIn(why, refused)
+                self.assertFalse(self.merged(fake))
+                self.assertEqual(self.answers(fake), [])
+
+    def test_an_unsettled_review_body_blocks_and_is_not_answered(self):
+        # The open thread sits past the first page of threads: the merge
+        # validation reads the first page only, the gate reads them all.
+        open_thread = thread(Findings.STYLE, resolved=False)
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[], pages=[[open_thread]],
+            reviews=[review(42, Findings.STYLE)])
+        self.assertIn("unanswered review", refused)
+        self.assertIn("naming", refused)
+        self.assertFalse(self.merged(fake))
+        self.assertEqual(self.answers(fake), [])
+        # The same body with its thread resolved merges, answered once,
+        # and no lint re-check runs for a non-lint rule.
+        calls = []
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[thread(Findings.STYLE, resolved=True)],
+            reviews=[review(42, Findings.STYLE)],
+            lint_run=lambda *a: calls.append(a) or False)
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.answers(fake)), 1)
+
+    def test_an_already_answered_body_needs_no_factory_answer(self):
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[],
+            pages=[[thread(Findings.STYLE, resolved=False)]],
+            reviews=[review(43, Findings.STYLE)],
+            comments=[pr_comment("Answering the review: "
+                                 "https://example.test/x#pullrequestreview-43")])
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        self.assertEqual(self.answers(fake), [])
+
+    def test_a_new_duplicate_thread_holds_the_merge_until_it_is_settled(self):
+        # Criterion 4 (the PR #1996 fixture): the older duplicate thread is
+        # answered and resolved; the identical newer thread is not. An
+        # answer to the older thread is no answer to the newer one.
+        older = dict(thread(S110, resolved=True, created="2030-01-02T08:00:00Z"),
+                     path="dashboard.py")
+        newer = dict(thread(S110, resolved=False, created="2030-01-02T09:30:00Z"),
+                     path="dashboard.py")
+        # The newer thread is past the first page: the first-page threads
+        # all read resolved, as they did when PR #1996 merged.
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[older], pages=[[older], [newer]],
+            reviews=[review(44, S110)],
+            contents={"dashboard.py": "def ok():\n    return 1\n"},
+            lint_run=lambda rule, path, text: False)
+        self.assertIn("high s110", refused)
+        self.assertFalse(self.merged(fake))
+        # Once the new thread is settled too, the gate answers and merges.
+        fake, refused = self.gate_merge(
+            files=APP_CHANGE, threads=[older],
+            pages=[[older], [dict(newer, isResolved=True)]],
+            reviews=[review(44, S110)],
+            contents={"dashboard.py": "def ok():\n    return 1\n"},
+            lint_run=lambda rule, path, text: False)
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        self.assertEqual(len(self.answers(fake)), 1)
 
 
 class FactoryHold(Base):

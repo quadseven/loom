@@ -305,7 +305,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None, now=NOW):
+           no_lane_since=None, review_brief=None, lint_run=None, now=NOW):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -343,7 +343,8 @@ class Base(unittest.TestCase):
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
-                            no_lane_since=no_lane_since, review_brief=review_brief)
+                            no_lane_since=no_lane_since, review_brief=review_brief,
+                            lint_run=lint_run)
         f.run()
         return f
 
@@ -5288,6 +5289,72 @@ class DegradedReviewAgain(Base):
                       "\n".join(str(call.args[0]) for call in said.call_args_list))
         self.go()
         self.assertEqual(sum(len(self.asks(50 + n)) for n in heads), len(heads))
+
+
+class AbandonedReview(Base):
+    """loom#1933 criterion 3: a Sentinel abandoned-review notice on a merged
+    pull request files one follow-up, and the notice is answered once the
+    findings it names re-check clean on the merged branch."""
+
+    S110 = "\U0001f534 high | _security_ | `S110` | trivial\n\ntry, except, pass detected."
+    NOTICE = (factory.ABANDONED_MARKER + "\n\nGrug Haunt notice: this PR was merged with 1 "
+              "high/critical Elder finding(s) from EARLIER in its review that never got a reply.")
+    PATH = "services/_shared/llm_client.py"
+
+    def noticed(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
+                                 "user": {"login": "grug-tribe[bot]"},
+                                 "html_url": "https://example.test/pull/51#issuecomment-777"}]
+        self.gh.details[51]["reviewThreads"] = {"nodes": [{
+            "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
+            "root": {"nodes": [{"author": {"__typename": "Bot", "login": "grug-tribe"},
+                                "body": self.S110, "url": "https://example.test/t9"}]},
+            "comments": {"nodes": []}}]}
+        self.gh.contents[self.PATH] = "def client():\n    return 1\n"
+
+    def follow_ups(self):
+        return [i for i in self.gh.filed if i.get("title") == factory.ABANDONED_TITLE % 51]
+
+    def answers(self):
+        return [c for c in self.gh.comments.get(51, [])
+                if factory.ABANDONED_ANSWER_MARKER in str(c.get("body") or "")]
+
+    def test_a_notice_files_one_follow_up_and_is_answered_when_the_recheck_passes(self):
+        self.noticed()
+        calls = []
+
+        def clean(rule, path, text):
+            calls.append((rule, path, text))
+            return False
+        self.go(lint_run=clean)
+        self.assertEqual(calls, [("s110", self.PATH, "def client():\n    return 1\n")])
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertIn("loom:triage", [x["name"] if isinstance(x, dict) else x
+                                      for x in self.follow_ups()[0]["labels"]])
+        self.assertEqual(len(self.answers()), 1)
+        body = self.answers()[0]["body"]
+        self.assertIn("S110", body)
+        self.assertIn(self.PATH, body)
+        self.assertIn("#issuecomment-777", body)
+        self.assertIn("#900", body)
+        # A second pass files nothing and answers nothing again.
+        self.go(lint_run=clean)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_a_finding_that_still_hits_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.go(lint_run=lambda rule, path, text: True)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(self.answers(), [])
+
+    def test_no_notice_no_follow_up(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(self.follow_ups(), [])
 
 
 if __name__ == "__main__":

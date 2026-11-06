@@ -4847,7 +4847,8 @@ def merge_completed(err: Exception) -> bool:
 
 def merge(gh: GitHub, repo: str, number: int,
           ticket: Optional[Tuple[str, int]] = None, adopt: bool = False,
-          env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+          env: Optional[Dict[str, str]] = None,
+          lint_run: Optional[Callable[..., Optional[bool]]] = None) -> Dict[str, Any]:
     if adopt and ticket is not None:
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
@@ -4892,7 +4893,7 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict,
-                                 held)
+                                 held, lint_run)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -5195,13 +5196,19 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       details: Dict[str, Any], ticket: Optional[Tuple[str, int]],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]],
                       verdict: Optional[Callable[[], Optional[answer.Answer]]] = None,
-                      held: Container[str] = ()) -> str:
+                      held: Container[str] = (),
+                      lint_run: Optional[Callable[..., Optional[bool]]] = None) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
     its ticket; an auto tier needs the review check to have succeeded on its
     head, no open high, critical or bad-work finding, and room under the
-    hourly caps. A revert ticket's own pull request is exempt only when
+    hourly caps. It also answers the review bot's review bodies
+    (bus/merge_tier.py, loom#1933): an unanswered body whose findings are
+    all resolved or addressed gets one answer comment and the merge
+    proceeds; a body with a finding still open, and an addressed high lint
+    finding that still hits on the head, hold the merge. A revert ticket's
+    own pull request is exempt only when
     merge_tier.revert_refusal finds nothing: the station applied loom:revert
     and the diff is the exact inverse of a commit the base carries. From
     2026-10-19, 16 of 22 lane pull requests the Apps merged unattended in the
@@ -5226,12 +5233,22 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     from . import factory
     bot = (env if env is not None else os.environ).get("LOOM_REVIEW_BOT", "").strip() \
         or factory.DEFAULT_REVIEW_BOT
-    blocking = merge_tier.blocking_findings(
-        merge_tier.review_threads(gh, repo, number),
-        merge_tier.fix_committed((details.get("commits") or {}).get("nodes") or []),
-        lambda c: by_bot(dict(c), bot), env, held)
+    is_bot = lambda c: by_bot(dict(c), bot)  # noqa: E731
+    threads = merge_tier.review_threads(gh, repo, number)
+    committed = merge_tier.fix_committed((details.get("commits") or {}).get("nodes") or [])
+    blocking = merge_tier.blocking_findings(threads, committed, is_bot, env, held)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
+    bodies = merge_tier.unanswered_bodies(gh, repo, number, threads, committed, is_bot)
+    refusal = merge_tier.body_refusal(bodies)
+    if refusal:
+        raise ValueError(refusal)
+    refusal = merge_tier.lint_recheck_refusal(gh, repo, sha, threads, committed,
+                                              is_bot, run=lint_run)
+    if refusal:
+        raise ValueError(refusal)
+    if bodies:
+        notify.post(gh, repo, number, merge_tier.answer_comment(bodies), notify.RECORD)
     capped = merge_tier.cap_refusal(gh, repo, env)
     if capped:
         raise ValueError("the auto-merge cap holds the merge: %s" % capped)
