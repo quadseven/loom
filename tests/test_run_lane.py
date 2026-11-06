@@ -2353,6 +2353,22 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertNotIn("limit", beat.get("reason") or "")
 
+    def test_a_run_killed_with_sigterm_writes_no_month_long_provider_limit(self):
+        # loom#2683: a codex run killed with exit 143 had read text about a
+        # monthly usage limit, and the lane was held until the next month
+        # while its sibling slots ran agents.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="143", FAKE_OUT=(
+            "docs/USAGE.md: a monthly usage limit holds the lane until the first of the month\n"
+            "Terminated"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient] agent exited 143", log)
+        self.assertFalse((self.loom / "state" / "usage" / "codex.provider-limit.json").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("provider limit reached", beat.get("reason") or "")
+        self.assertLess(int(beat.get("retry_at") or 0), time.time() + 86400)
+
     def test_a_limit_word_in_a_tool_result_is_not_a_limit(self):
         # Two Spark lanes were held an hour as "provider limit reached": each
         # agent read code about rate limits and timed out, and the only match

@@ -4063,6 +4063,14 @@ for BRIEF in "$INBOX"/*.md; do
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
   fi
+  # A run killed with SIGTERM (exit 143) ended because something stopped it,
+  # not because the provider refused it: a limit phrase in its output came
+  # from what it read. Only the watchdog's own limit kill holds the lane. A
+  # codex run killed this way had read about a monthly limit and held the
+  # lane until the next month (loom#2683).
+  if [ "$STATUS" -eq 143 ] && [ "$FAIL_CLASS" = limit ] && [ ! -f "$LOCK/watchdog-limit" ]; then
+    FAIL_CLASS=transient RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON="killed by SIGTERM"
+  fi
   [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
   # What ran and how it ended, so a green run that did nothing shows.
   if [ -n "$MODEL_PICKED" ]; then
