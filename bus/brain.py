@@ -7861,10 +7861,8 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
 def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     """The rungs a ticket ran on, from rung markers by a trusted login only,
     as in the factory: anyone can comment on a public repo."""
-    from . import factory  # factory imports this module
-    trusted = {a.lower() for a in authors}
-    return factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
-        (c.get("user") or {}).get("login") or "").lower() in trusted])
+    from . import history  # the trusted history reading (loom#2457)
+    return history.tried_rungs(history.trusted_comments(comments, authors))
 
 
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
