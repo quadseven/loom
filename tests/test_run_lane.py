@@ -84,6 +84,10 @@ if [ "$1" = api ]; then
   # starts with $MARKER; $FAKE_GH_COMMENTS_FAIL fails every comment read.
   store="$FAKE_LOG.comments"
   case "$*" in
+    # A commit's GitHub checks, one "status conclusion" line each, from
+    # $FAKE_GH_CHECKS (default none).
+    "api --paginate repos/"*"/check-runs"*)
+      printf '%s' "${FAKE_GH_CHECKS:-}"; exit 0 ;;
     "api --paginate repos/"*"/comments --jq "*)
       [ -z "${FAKE_GH_COMMENTS_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
       where="${3#repos/}"; where="${where%/comments}"; repo="${where%/issues/*}"; num="${where##*/}"
@@ -317,6 +321,7 @@ if [ -n "${FAKE_REPLIES:-}" ]; then mkdir -p .loom; printf '%s' "$FAKE_REPLIES" 
 if [ -n "${FAKE_SUMMARY:-}" ]; then mkdir -p .loom; printf '%s\n' "$FAKE_SUMMARY" > .loom/summary.md; fi
 if [ "${FAKE_AGENT:-commit}" = replies-only ]; then exit 0; fi
 if [ -n "${FAKE_MIGRATION:-}" ]; then mkdir -p migrations; echo 'select 1;' > migrations/0001_add.sql; fi
+if [ -n "${FAKE_TOUCH:-}" ]; then mkdir -p "$(dirname "$FAKE_TOUCH")"; echo touched >> "$FAKE_TOUCH"; fi
 if [ "${FAKE_AGENT:-commit}" = probes ]; then
   printf '# test\\n' > .test_write
   mkdir -p bin
@@ -7624,6 +7629,98 @@ exec /usr/bin/git "$@"
                                              "FACTORY_REPO": "quadseven/loom", "CHECK_TIMEOUT": "2",
                                              "LOG": str(self.log), "EVIDENCE": json.dumps(evidence)})
                 self.assertEqual(result.returncode == 0, evidence == valid, result.stderr)
+
+    # A base check red only inside the lane sandbox (no localhost, no
+    # network) or under the host's load held every ticket of eight repos
+    # behind incidents only a green lane base check closes: 76 tickets sat
+    # loom:running with no run while GitHub's checks were green on every one
+    # of those default branches (loom#1889, 2026-11-06).
+    # The check passes when pytest is told to deselect the host-red test
+    # (PYTEST_ADDOPTS), as a real pytest run with --deselect would.
+    DESELECTS = ('case "$PYTEST_ADDOPTS" in *"--deselect tests/test_net.py::test_localhost"*) '
+                 'exit 0 ;; esac; ')
+    HOST_RED = DESELECTS + "printf 'FAILED tests/test_net.py::test_localhost - denied\\n'; exit 1"
+    ANY_DESELECT = 'case "$PYTEST_ADDOPTS" in *--deselect*) exit 0 ;; esac; '
+    GREEN_CHECKS = "completed success\ncompleted skipped\n"
+
+    def run_host_red(self, check=HOST_RED, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract="interpreter: loom-test-python\ncheck: " + check + "\n")
+        marker = self.loom / "state" / "incidents" / "example_repo-base-check"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("41\n")
+        self.drop_brief()
+        return self.run_contract_lane(**env), marker
+
+    def test_a_base_red_only_on_the_lane_host_runs_the_agent_and_closes_its_incident(self):
+        result, marker = self.run_host_red(FAKE_GH_CHECKS=self.GREEN_CHECKS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+        self.assertIn("base check red only on this host", log)
+        self.assertIn("then 0 with the base's host-only failing tests deselected", log)
+        self.assertNotIn("failed: [factory]", log)
+        self.assertFalse(any(c.startswith("gh issue create") for c in self.calls()))
+        closes = [c for c in self.calls() if c.startswith("gh issue close")]
+        self.assertEqual(len(closes), 1, self.calls())
+        self.assertIn("--repo quadseven/loom 41", closes[0])
+        self.assertIn("red only on the lane host", closes[0])
+        self.assertFalse(marker.exists())
+
+    def assert_held_on_red_base(self, check=HOST_RED, checks=GREEN_CHECKS):
+        result, marker = self.run_host_red(check=check, FAKE_GH_CHECKS=checks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertIn("failed: [factory]", self.lane_log())
+        self.assertTrue(marker.exists())
+
+    def test_a_red_base_with_a_failed_github_check_is_still_a_factory_incident(self):
+        self.assert_held_on_red_base(checks="completed success\ncompleted failure\n")
+
+    def test_a_red_base_with_a_github_check_still_running_is_still_a_factory_incident(self):
+        self.assert_held_on_red_base(checks="in_progress null\n")
+
+    def test_a_red_base_with_no_github_checks_is_still_a_factory_incident(self):
+        self.assert_held_on_red_base(checks="")
+
+    def test_a_red_base_still_red_with_its_failing_tests_deselected_is_an_incident(self):
+        self.assert_held_on_red_base(
+            check="printf 'FAILED tests/test_net.py::test_localhost - denied\\n'; exit 1")
+
+    def test_a_red_base_with_an_unparsed_failure_line_is_an_incident(self):
+        self.assert_held_on_red_base(
+            check=self.DESELECTS + "printf 'ERROR tests/test_broken.py - ImportError\\n"
+                                   "FAILED tests/test_net.py::test_localhost - denied\\n'; exit 1")
+
+    def test_a_red_base_failing_more_than_the_bound_is_an_incident(self):
+        self.assert_held_on_red_base(
+            check=self.ANY_DESELECT + "for i in $(seq 1 21); do "
+                                      "printf 'FAILED tests/test_net.py::test_%s - x\\n' $i; done; exit 1")
+
+    def test_a_red_base_naming_tests_pytest_cannot_deselect_is_an_incident(self):
+        self.assert_held_on_red_base(
+            check=self.ANY_DESELECT + "printf 'FAIL: test_x (tests.test_net.NetTest.test_x)\\n'; exit 1")
+
+    def assert_no_pr_on_host_red(self, check, **env):
+        result, _ = self.run_host_red(check=check, FAKE_GH_CHECKS=self.GREEN_CHECKS, **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_host_red_base_lets_the_final_check_fail_no_new_test(self):
+        self.assert_no_pr_on_host_red(
+            "grep -sqx fixed fix.txt && { printf 'FAILED tests/test_new.py::test_new - x\\n'; exit 1; }; "
+            + self.HOST_RED)
+
+    def test_a_change_to_a_host_red_test_sets_none_aside(self):
+        # check.py is tracked in the fixture repo; a new file would be
+        # refused at commit for another reason.
+        self.assert_no_pr_on_host_red(
+            'case "$PYTEST_ADDOPTS" in *"--deselect check.py::test_localhost"*) exit 0 ;; esac; '
+            "printf 'FAILED check.py::test_localhost - denied\\n'; exit 1", FAKE_TOUCH="check.py")
+        self.assertIn("touches a host-red test", self.lane_log())
 
     def test_closed_repair_incident_does_not_bypass_red_baseline(self):
         self.repair_incident(state="closed")

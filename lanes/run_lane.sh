@@ -2230,6 +2230,92 @@ check_failures() {  # log offset
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
 }
+# Every test a check run names as failing since the log offset, one per
+# line and sorted: check_failures' test patterns with no cap and no
+# last-line fallback, so two runs compare as sets.
+check_failure_set() {  # log offset
+  tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null | LC_ALL=C sed -nE \
+    -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
+    -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
+    -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
+    -e 's/^--- FAIL: ([^ ]+).*/\1/p' | LC_ALL=C sort -u
+}
+# Whether GitHub's own checks passed on a commit: at least one check run,
+# and every one completed as success, neutral or skipped.
+github_checks_green() {  # sha
+  local runs
+  runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
+    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || return 1
+  [ -n "$runs" ] || return 1
+  ! printf '%s\n' "$runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'
+}
+# At most this many host-red tests may be set aside; a base red in more
+# places is not a sandbox quirk, and stays a factory incident.
+HOST_RED_MAX=20
+# The host-red tests of a base run since the log offset, one per line, or
+# status 1 when they cannot be set aside safely: no names, more than
+# HOST_RED_MAX, a name that is not a plain pytest node id (deselection goes
+# through pytest's own --deselect, so a unittest or go name cannot be set
+# aside), or a failure or error line the name patterns do not account for
+# (a collection error, a crashed runner).
+host_red_names() {  # log offset
+  local names unparsed
+  names="$(check_failure_set "$1")"
+  [ -n "$names" ] || return 1
+  [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" -le "$HOST_RED_MAX" ] || return 1
+  ! printf '%s\n' "$names" | LC_ALL=C grep -qvxE '[A-Za-z0-9_./-]+\.py::[A-Za-z0-9_.:-]+' || return 1
+  unparsed="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null |
+    LC_ALL=C grep -aE '^(FAIL:|ERROR:|FAILED |ERROR |--- FAIL)' |
+    LC_ALL=C grep -avE '^(FAIL|ERROR): [^ ]+ \([^)]+\)|^(FAIL|ERROR): [^ ]+$|^(FAILED|ERROR) [^ ]+::[^ ]+|^--- FAIL: [^ ]+')"
+  [ -z "$unparsed" ] || return 1
+  printf '%s\n' "$names"
+}
+# Whether the check exits 0, changing no tracked file, with the host-red
+# tests deselected (contract_run passes them to pytest as --deselect).
+host_red_deselected_passes() {
+  local rc
+  CHECK_DESELECT="$HOST_RED_BASE"
+  contract_run "$C_CHECK"; rc=$?
+  CHECK_DESELECT=""
+  [ "$rc" -eq 0 ] && [ -z "$(tracked_changes)" ]
+}
+# A base check red only on this lane host (loom#1889): GitHub's own checks
+# passed on the same commit, the failures are a few named pytest tests, and
+# the check exits 0 with exactly those deselected, so the default branch is
+# not broken; the check sandbox (no localhost, no network) or the host's
+# load is. 76 tickets sat held behind such incidents on 2026-11-06, which
+# only a green lane base check closes. The run goes on (final_validation
+# reruns a red final check with the same tests deselected and needs exit
+# 0), and the repo's base-check incident closes so the station re-queues
+# the tickets it held.
+host_red_base() {  # rev, log offset of the last base run
+  local names
+  [ "$BASELINE_EXIT" -gt 0 ] && [ "$BASELINE_EXIT" -lt 124 ] || return 1
+  names="$(host_red_names "$2")" || return 1
+  github_checks_green "$1" || return 1
+  HOST_RED_BASE="$names"
+  if ! host_red_deselected_passes; then
+    HOST_RED_BASE=""
+    echo "base check still red with its failing tests deselected; not a host-only red" >> "$LOG"
+    return 1
+  fi
+  echo "base check red only on this host: GitHub's checks passed at ${1:0:12}; passed with these deselected: $(printf '%s' "$names" | paste -sd ',' - | sed 's/,/, /g' | LC_ALL=C cut -c1-1000)" >> "$LOG"
+  record baseline-host-red "$C_CHECK" "$BASELINE_EXIT" "$1" true "GitHub's checks passed at ${1:0:12}; exit 0 with the failing tests deselected"
+  resolve_factory_incidents base-check \
+    "the base check is red only on the lane host; GitHub's checks passed on the same commit in $(incident_ticket)."
+  return 0
+}
+# The changed files that hold a host-red test, if any: such a change could
+# break or rewrite a test the final check sets aside.
+host_red_touched() {
+  local path test_file files
+  files="$(printf '%s\n' "$HOST_RED_BASE" | sed 's/::.*//' | LC_ALL=C sort -u)"
+  lane_changed_files 2>/dev/null | while IFS= read -r path; do
+    printf '%s\n' "$files" | while IFS= read -r test_file; do
+      case "$path" in "$test_file"|*/"$test_file") printf '%s\n' "$path" ;; esac
+    done
+  done | LC_ALL=C sort -u
+}
 # The non-empty arguments, joined for a record's detail.
 join_detail() {
   local part out=""
@@ -2296,9 +2382,12 @@ INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
 # Close this repo's environment, contract and base-check incidents once the
 # check has passed on the unmodified base; the station then releases tickets.
+# A host-only red base (host_red_base) closes only the base-check one, with
+# its own reason. Arguments: the kinds, then the reason after "Cleared:".
 resolve_factory_incidents() {
-  local kind file number
-  for kind in environment contract base-check; do
+  local kind file number kinds="${1:-environment contract base-check}"
+  local text="${2:-the check passed on the unmodified base in $(incident_ticket).}"
+  for kind in $kinds; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
@@ -2307,8 +2396,7 @@ resolve_factory_incidents() {
       # factory incident's close through; anything else it records and holds.
       PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
         issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
-      gh issue close --repo "$FACTORY_REPO" "$number" \
-        --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
+      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text" >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
@@ -2463,6 +2551,14 @@ contract_run() {
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
+    # Host-red tests to set aside (host_red_deselected_passes): node ids
+    # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
+    # names them for a check that reads them itself.
+    if [ -n "${CHECK_DESELECT:-}" ]; then
+      deselect_opts=""
+      for test_id in $CHECK_DESELECT; do deselect_opts="$deselect_opts --deselect $test_id"; done
+      export PYTEST_ADDOPTS="${deselect_opts# }" LOOM_DESELECT_TESTS="$CHECK_DESELECT"
+    fi
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then
       input="$changed_list"
@@ -2616,7 +2712,7 @@ sys.exit(0 if valid else 1)
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
   local check_start=0 failures=""
-  SETUP_REASON=""
+  SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
@@ -2763,6 +2859,15 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
+    # A fresh run's own log names its failures; a cached verdict or a fix
+    # round's default-branch check does not, so those still file.
+    if [ -z "$FIX_PR" ] && [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] &&
+       host_red_base "$baseline_rev" "$check_start"; then
+      # The next ticket reruns the check rather than reading this red verdict.
+      rm -f "$BASE_VERDICT_DIR/$verdict_key"
+      exclude_untracked
+      return $?
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -2806,7 +2911,7 @@ final_base_tests() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched=""
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -2850,6 +2955,22 @@ final_validation() {
   else
     first_exit=""
   fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -n "${HOST_RED_BASE:-}" ] &&
+     touched="$(host_red_touched)" && [ -n "$touched" ]; then
+    echo "final check red, and the change touches a host-red test, so none is set aside: $(printf '%s' "$touched" | paste -sd ' ' -)" >> "$LOG"
+  elif [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -n "${HOST_RED_BASE:-}" ] && host_red_deselected_passes; then
+    # The base-test gate still runs: it ran above only on a green check.
+    final_base_tests "$rev"; gate_rc=$?
+    if [ "$gate_rc" -ne 0 ]; then
+      [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 126 ] ||
+        [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
+      drop_check_home
+      return 1
+    fi
+    host_red="exited $rc, then 0 with the base's host-only failing tests deselected"
+    echo "final check $host_red" >> "$LOG"
+    rc=0
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -2866,13 +2987,14 @@ final_validation() {
       ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "${first_exit:+second run after exit $first_exit}${changed:+${first_exit:+; }changed tracked files: $changed}"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
+  [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
   [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
 }
 
