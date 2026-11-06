@@ -331,6 +331,25 @@ def revert_refusal(gh: Any, repo: str, pr: Mapping[str, Any], ticket: Mapping[st
     return ""
 
 
+def lasting_hold(labels: Sequence[str], head_ref: str, mergeable: Optional[bool],
+                 env: Optional[Mapping[str, str]] = None) -> str:
+    """Why no brain can merge a pull request until a person moves it, else "".
+    An operator tier label is the operator's to merge; a head outside loom/
+    that conflicts with its base is its author's to update, since
+    `bus.brain fix` sends only a loom/ head back to a lane. Such a merge is
+    not stage work, so it is never deferred to the next brain (loom#2667).
+    A mergeable GitHub has not computed yet (None) is no hold."""
+    auto = auto_tiers(env)
+    for name in labels:
+        tier = name[len("tier:"):] if name.startswith("tier:") else ""
+        if tier in TIERS and tier not in auto:
+            return "waits on the operator (tier:%s, which Loom never merges)" % tier
+    if mergeable is False and not head_ref.startswith("loom/"):
+        return ("its head %s is not a loom branch and conflicts with its base, so only "
+                "its author can update it" % (head_ref or "(unknown)"))
+    return ""
+
+
 def operator_why(tier: str, why: str, env: Optional[Mapping[str, str]] = None) -> str:
     """The hold reason for an operator tier, for operator_hold.ask."""
     return ("it is a %s change (%s), and Loom merges only %s changes on its own"

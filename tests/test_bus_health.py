@@ -1135,3 +1135,46 @@ class DeploymentStatusRevert(unittest.TestCase):
         self.assertEqual(found[0][0], 123)
         self.assertNotEqual(found[0][1], "deployed")
         self.assertEqual(found[1], (124, "deployed"))
+
+
+class CompareMemo(unittest.TestCase):
+    """A compare answer for a pair of commits never changes, so it is asked
+    once; a 404 or an error is asked again (loom#2357)."""
+
+    COMMIT, REVISION = "c" * 40, "d" * 40
+
+    def setUp(self):
+        health._COMPARES.clear()
+        self.addCleanup(health._COMPARES.clear)
+        self.asked = []
+        self.answers = []
+
+    def rest(self, method, path, data=None):
+        self.asked.append(path)
+        answer = self.answers.pop(0) if self.answers else (200, {"status": "identical"})
+        if isinstance(answer, Exception):
+            raise answer
+        reply = Reply(answer[1])
+        reply.status = answer[0]
+        return reply
+
+    def carries(self):
+        gh = unittest.mock.Mock(rest=self.rest)
+        return health._carries(gh, REPO, self.COMMIT, self.REVISION)
+
+    def test_a_repeated_triple_makes_one_request(self):
+        self.assertTrue(self.carries())
+        self.assertTrue(self.carries())
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_404_is_asked_again(self):
+        self.answers = [(404, {"message": "Not Found"})]
+        self.assertFalse(self.carries())
+        self.assertTrue(self.carries())
+        self.assertEqual(len(self.asked), 2)
+
+    def test_an_error_is_asked_again(self):
+        self.answers = [health.GitHubError("boom")]
+        self.assertFalse(self.carries())
+        self.assertTrue(self.carries())
+        self.assertEqual(len(self.asked), 2)
