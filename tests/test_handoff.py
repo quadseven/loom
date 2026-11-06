@@ -361,6 +361,39 @@ class ResumeCommandTests(unittest.TestCase):
                 self.assertIn("- dropped merge %s#7: %s since the defer" % (REPO, why), out)
                 self.assertIn("- resume failed %s#9" % REPO, out)
 
+    # loom#2667: a merge only the operator or the author can move is not
+    # stage work, so resume drops its defer with the reason and defer
+    # refuses a new one; no brain re-defers it every tick.
+    def held_routes(self, labels=(), ref="loom/7-x", mergeable=True):
+        routes = self.routes()
+        routes[("GET", "/repos/%s/issues/7" % REPO)] = (
+            200, {"state": "open", "pull_request": {}, "labels": [{"name": x} for x in labels]})
+        routes[("GET", "/repos/%s/pulls/7" % REPO)] = (
+            200, {"state": "open", "head": {"sha": "abcdef1234567890", "ref": ref},
+                  "mergeable": mergeable})
+        return routes
+
+    def test_resume_drops_a_merge_defer_no_brain_can_make_with_the_reason(self):
+        for kw, why in (({"labels": ["class:sensitive", "tier:security"]}, "tier:security"),
+                        ({"ref": "codex/7-x", "mergeable": False}, "not a loom branch")):
+            with self.subTest(why=why):
+                out, _ = self.resume_out(self.held_routes(**kw))
+                self.assertNotIn("- resume merge", out)
+                self.assertRegex(out, r"- dropped merge %s#7: [^\n]*%s[^\n]*no brain can merge it"
+                                 % (re.escape(REPO), why))
+                self.assertIn("- resume failed %s#9" % REPO, out)
+
+    def test_resume_still_resumes_a_merge_defer_a_brain_can_make(self):
+        out, _ = self.resume_out(self.held_routes(labels=["tier:app-code"]))
+        self.assertIn("- resume merge %s#7 (deferred by muse at %s)" % (REPO, at(5)), out)
+
+    def test_defer_refuses_a_merge_no_brain_can_make_and_keeps_review(self):
+        routes = self.held_routes(labels=["tier:security"])
+        with self.assertRaisesRegex(ValueError, "tier:security"):
+            brain.defer(GitHub("t", transport=Routes(routes)), "merge", PR, "muse")
+        line = brain.defer(GitHub("t", transport=Routes(routes)), "review", PR, "muse")
+        self.assertIn("stage=review", line)
+
     def test_defer_prints_the_marker_with_the_revision_now(self):
         routes = self.routes()
         line = brain.defer(GitHub("t", transport=Routes(routes)), "merge", PR, "muse")

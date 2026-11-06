@@ -854,7 +854,7 @@ class PullRequests(Base):
         self.gh.issues[5]["labels"].append({"name": "loom:ready"})
         self.gh.comments[5] += [{"body": factory.RUNG_MARKER % 1, "user": ME}, CLAIM]
         self.gh.pull(50, 5, mergeable=False, created=factory.STUCK_AGE * 3)
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
         self.assertEqual(self.model(5), None)
         self.assertEqual((self.moved, self.closed), ([], []))
@@ -1001,7 +1001,7 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         posted = len(self.gh.comments[5])
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual((self.moved, self.fixed), ([], []))
         self.assertEqual(len(self.gh.comments[5]), posted)
         self.assertFalse([w for w in self.gh.writes if "tried every rung" in str(w)])
@@ -1029,14 +1029,14 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.answered_thread()
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         # It still waits for its rung, and the review bot is asked to judge the
         # answer instead.
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
         self.assertEqual(len(self.gh.comments[50]), 1)
         self.assertIn("/grug improve", self.gh.comments[50][0]["body"])
         # Once per head commit: the next pass asks no more.
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual(len(self.gh.comments[50]), 1)
 
     def test_a_lane_up_for_the_next_rung_climbs_and_the_review_bot_is_not_asked(self):
@@ -1059,7 +1059,7 @@ class PullRequests(Base):
                                 {"body": FIX_ASKED, "user": ME}]
         self.gh.pull(50, 5, resolved=False)
         self.answered_thread(login="mallory-example")
-        self.go(limited=("codex", "codex-2") + NO_OPUS)
+        self.go(limited=factory.CODEX + NO_OPUS)
         self.assertEqual(self.gh.comments.get(50, []), [])
 
     def test_a_runaway_ticket_is_not_climbed_or_given_up_on(self):
@@ -2980,6 +2980,54 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def test_an_unclaimed_hand_off_ticket_returns_when_a_lane_of_its_tier_is_free(self):
+        # 128 of 200 queued tickets sat in the hand-off pool, 120 of them
+        # unclaimed, while lanes of their tiers beat available and idle: the
+        # pool had no way back but a person taking the label off.
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(issue))
+        # The note names the lane the assignment just gave it.
+        self.assertIn("lane codex was free", self.gh.comments[7][-1]["body"])
+
+    def test_a_held_hand_off_ticket_stays_in_the_pool_though_a_lane_is_free(self):
+        # A free lane is not enough: the queued checks (here a person's ask)
+        # still hold it, and it keeps the label.
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": labels.NEEDS_HUMAN}]
+        worker = self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", ""))
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(worker.waits["%s#7" % REPO], "waits for a person (needs:human)")
+
+    def test_a_hand_off_ticket_waits_behind_every_other_queued_ticket(self):
+        self.queued(7, age=7200)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.queued(8, age=0)
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_claimed_hand_off_ticket_stays_in_the_pool(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": "claim:someone"}]
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_hand_off_ticket_with_no_free_lane_stays_in_the_pool_quietly(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        worker = self.assign(available=[])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(self.gh.comments.get(7, []), [])
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+
     def test_a_queued_ticket_held_by_after_gets_no_lane_and_the_next_one_does(self):
         # The factory briefed a queued ticket whose After: ticket had not
         # merged; the station never claimed it, and the lane it reserved sat
@@ -3675,6 +3723,9 @@ class Tickets(Base):
         self.gh.ticket(8, "briefed", lane="codex", body=body)
         for number in (9, 10):
             self.gh.ticket(number, "briefed", lane="codex-2", body=body)
+        # The other codex slots wait as long as codex-2.
+        for number, lane in enumerate([x for x in factory.CODEX[2:] for _ in (1, 2)], 30):
+            self.gh.ticket(number, "briefed", lane=lane, body=body)
         self.go()
         self.assertEqual(self.lane(7), "codex")
         self.assertEqual(self.gh.comments[7], [])
@@ -3904,11 +3955,12 @@ class Tickets(Base):
         self.assertEqual(factory.TIERS["easy"][4:6], ("muse", "agy"))
         self.assertEqual(factory.TIERS["medium"][4:6], ("muse", "agy"))
         # Then the free provider slots: on a private repo only the two allowed
-        # private code (infra#5617), then codex.
+        # private code, then opencode-go: the free lanes
+        # openrouter and workersai take public repos only (loom#2358).
         self.assertEqual(factory.TIERS["easy"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.TIERS["medium"][6:12], factory.FREE_POOL)
         self.assertEqual(factory.lanes_of("medium", True)[4:7],
-                         ("free-ollama", "free-gemma", "openrouter"))
+                         ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_a_slot_on_cluster_runners_never_takes_a_private_repos_ticket(self):
         # A runner's inputs and logs live in the public repo's Actions, so the
@@ -3926,9 +3978,10 @@ class Tickets(Base):
         medium = factory.TIERS["medium"]
         for lane in ("openrouter", "workersai", "zen", "zai"):
             self.assertLess(medium.index(lane), medium.index("codex"))
-        # On a private repo the public-only ones are skipped.
-        self.assertEqual(factory.lanes_of("medium", True)[4:9],
-                         ("free-ollama", "free-gemma", "openrouter", "workersai", "opencode-go"))
+        # On a private repo the public-only ones are skipped, the free lanes
+        # among them (the station's claim rule, loom#2358).
+        self.assertEqual(factory.lanes_of("medium", True)[4:7],
+                         ("free-ollama", "free-gemma", "opencode-go"))
 
     def test_free_provider_slots_that_may_train_take_public_repos_only(self):
         for lane in ("free-nvidia", "free-kilo", "free-groq", "free-openrouter"):
@@ -3940,6 +3993,25 @@ class Tickets(Base):
         # Never on hard work, and never counted as a Spark.
         self.assertFalse(set(factory.FREE_POOL) & set(factory.TIERS["hard"]))
         self.assertFalse(set(factory.FREE_POOL) & set(factory.SPARKS))
+
+    def test_every_lane_the_factory_gives_a_private_repo_passes_the_station_check(self):
+        # The factory once offered openrouter and workersai to private repos,
+        # and the station's claim refused each one ("takes public repos only;
+        # back to the queue"): 1029 such refusals in the station log, the
+        # same private tickets cycling every pass and never run (loom#2358).
+        from bus import station
+        for difficulty in factory.TIERS:
+            for lane in factory.lanes_of(difficulty, True):
+                self.assertFalse(station.needs_public_repo(lane, ""), (difficulty, lane))
+        with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):
+            for lane in factory.lanes_of("medium", True):
+                self.assertFalse(station.needs_public_repo(lane, ""), lane)
+
+    def test_free_gemma_and_free_ollama_stay_private_capable(self):
+        from bus import station
+        for lane in ("free-gemma", "free-ollama"):
+            self.assertIn(lane, factory.lanes_of("medium", True))
+            self.assertFalse(station.needs_public_repo(lane, ""), lane)
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
@@ -3960,6 +4032,7 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "agy")
 
     def test_a_lane_without_an_available_heartbeat_is_not_free(self):
+        self.gh.private = False  # openrouter is a free lane: public repos only
         self.limited_easy(available=["openrouter"])
         self.assertEqual(self.lane(7), "openrouter")
 
@@ -3971,14 +4044,15 @@ class Tickets(Base):
         self.assertEqual(sorted((self.lane(7), self.lane(8))), ["spark", "spark-2"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        for n, lane in enumerate(("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4"), 20):
+        for n, lane in enumerate(factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3",
+                                                      "opencode-go-4"), 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
         # Next come the Sparks, and an anthropic slot only once they are busy.
         self.assertEqual(self.lane(7), "spark")
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        busy = (("codex-2", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+        busy = (factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
                 + factory.SPARKS + factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai"))
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
@@ -4250,8 +4324,9 @@ class Tickets(Base):
         for n in range(1, 6):
             self.gh.ticket(n, "briefed", lane="claude", body=body)
             self.gh.comments[n].append({"body": factory.RUNG_MARKER % 1, "user": ME})
-        for n in range(11, 19):  # codex and codex-2 hold 4 each: none holds 3 fewer
-            self.gh.ticket(n, "briefed", lane="codex" if n % 2 else "codex-2")
+        # Each codex slot holds 4: none holds 3 fewer.
+        for n in range(11, 11 + 4 * len(factory.CODEX)):
+            self.gh.ticket(n, "briefed", lane=factory.CODEX[n % len(factory.CODEX)])
         self.go(limited=factory.ANTHROPIC)
         self.assertEqual([self.lane(n) for n in range(1, 6)], ["claude"] * 5)
 
@@ -4398,7 +4473,7 @@ class Helpers(unittest.TestCase):
                          "Model: b\nDifficulty: hard\n\n## Why")
 
     def test_a_busy_rung_spills_to_the_next_untried(self):
-        busy = {"claude": 2, "codex": 2, "codex-2": 3}
+        busy = dict({lane: 2 for lane in factory.CODEX}, claude=2, **{"codex-2": 3})
         self.assertEqual(factory.next_rung(set(), {}), 1)
         self.assertEqual(factory.next_rung(set(), {"claude": 2}), 2)
         self.assertEqual(factory.next_rung(set(), busy), 3)
@@ -4747,7 +4822,7 @@ class ForbiddenModels(unittest.TestCase):
             self.assert_allowed(model, "factory.EQUIVALENTS[%s]" % pin)
         for model in factory.STRONG | station.STRONG_MODELS:
             self.assert_allowed(model, "the strong models")
-        self.assertEqual(dict(factory.LADDER[1:2]), {("codex", "codex-2"): "gpt-6-luna"})
+        self.assertEqual(dict(factory.LADDER[1:2]), {factory.CODEX: "gpt-6-luna"})
 
     def test_a_go_model_off_the_allow_list_reads_as_the_stand_in(self):
         # Kimi K2.7 Code (1,350 requests per 5 h) spent the Go allowance in
@@ -4878,11 +4953,17 @@ class NoLane(Base):
         self.assertIn("%s#7" % REPO, worker.settled)
         self.assertFalse(brain._in_flight(self.gh.issues[7]))
         comments = [dict(c) for c in self.gh.comments[7]]
-        # The next pass leaves it alone: no second note, no lane, no wait.
-        again = self.assign(26 * 3600, ["claude"])
+        # The next pass with no lane free leaves it alone: no second note, no
+        # lane, no wait.
+        again = self.assign(26 * 3600, [])
         self.assertEqual(self.gh.comments[7], comments)
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertNotIn("%s#7" % REPO, again.waits)
+        # A pass with a lane of its model free takes it back from the pool.
+        self.assign(27 * 3600, ["claude"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "claude"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertIn("Back from the hand-off pool", self.notes(7))
 
     def test_a_ticket_with_no_reroute_waits_until_its_day_is_out(self):
         self.queued(7, self.OPUS)

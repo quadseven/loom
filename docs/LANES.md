@@ -99,6 +99,11 @@ against the exact base commit's code in the check sandbox. It copies each
 changed test file into a temporary base tree, then runs each changed test by
 name: a `unittest.TestCase` method through unittest, a module-level
 `test_*` function through pytest when the tree has it, else by calling it.
+A changed test is one whose body differs from the base file's, or one that
+uses a module or helper-class name whose own value differs (`A, B = 1, 2` to
+`A, B, C = 1, 2, 3` changes only `C`). On a fix round that merged the
+default branch, what the head shares with that branch's file came in with
+the merge and is not the round's own.
 A test that passes on base, one that times out, or a module-level test that
 takes fixtures with no pytest to run it, blocks validation and names the
 test for the lane to fix. The archive and test run have bounded
@@ -1749,7 +1754,11 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zai` lane (Z.ai free Flash models),
 - the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
-  models); other Go models keep 0 to 30 days and take any repo.
+  models); other Go models keep 0 to 30 days and take any repo,
+- the `openrouter` and `workersai` lanes: the station's claim refuses a
+  private repo for every free lane (`bus/station.py` `needs_public_repo`),
+  and the factory reads the same rule (`bus/factory.py` `public_only`), so it
+  never offers them a private ticket (loom#2358).
 
 ## API lanes: zen, zai
 
