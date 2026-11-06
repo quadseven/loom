@@ -160,6 +160,11 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
+  repo's test that needs a loopback connection may skip when that variable
+  is `1`, and only then; CI and local runs never set it, so the test still
+  runs there. A unittest repo has no other way to drop such a test from a
+  lane check.
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
   (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
