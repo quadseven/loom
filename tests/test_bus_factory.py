@@ -4860,6 +4860,85 @@ class ForbiddenModels(unittest.TestCase):
             self.assertFalse(station.lane_takes_model("agy", model), model)
 
 
+class RemoteQueued(Base):
+    """A public ticket queued for a remote lane that has not pulled it moves
+    to a free local tier lane after reroute_after, or at once when the remote
+    lane is down (loom#2245)."""
+    EASY = "Difficulty: easy\n\n## Why\nx\n" + ACCEPTANCE
+    KEY = "%s#7" % REPO
+
+    def queued_for_muse(self, private=False):
+        self.gh.private = private
+        self.gh.ticket(7, "queued", lane="muse", body=self.EASY)
+        self.gh.issues[7]["created_at"] = iso(0)
+
+    def assign(self, waited, available, **kwargs):
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=available, no_lane_since={self.KEY: NOW - waited},
+                                 reroute_after=6 * 3600, **kwargs)
+        worker.assign_queued()
+        return worker
+
+    def notes(self):
+        return self.gh.issues[7]["body"] + "".join(c["body"] for c in self.gh.comments.get(7, []))
+
+    def test_a_live_remote_lane_keeps_the_ticket_within_reroute_after(self):
+        self.queued_for_muse()
+        worker = self.assign(2 * 3600, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(worker.waits[self.KEY], "remote lane muse has not pulled it")
+        # A no-lane wait, so the station keeps its no_lane_since across passes.
+        self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
+
+    def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
+        self.queued_for_muse()
+        worker = self.assign(7 * 3600, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertNotIn(self.KEY, worker.waits)
+        self.assertIn("reassigned this ticket from remote lane muse to local lane spark",
+                      self.notes())
+
+    def test_a_down_remote_lane_reassigns_at_once(self):
+        self.queued_for_muse()
+        self.assign(0, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertIn("reassigned this ticket from remote lane muse to local lane spark",
+                      self.notes())
+
+    def test_no_free_local_lane_keeps_it_waiting_with_the_remote_reason(self):
+        # Up past reroute_after or down at once: either way, with every local
+        # lane busy it waits under the remote reason, a no-lane wait whose
+        # clock leads on to the hand-off pool.
+        local = [x for x in factory.lanes_of("easy", False) if x not in factory.REMOTE_LANES]
+        for remote in (["muse"], []):
+            with self.subTest(remote=remote):
+                self.setUp()
+                self.queued_for_muse()
+                for n, other in enumerate(local, 20):
+                    self.gh.ticket(n, "briefed", lane=other)
+                worker = self.assign(7 * 3600, remote + local)
+                self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)),
+                                 ("queued", "muse"))
+                self.assertEqual(worker.waits[self.KEY], "remote lane muse has not pulled it")
+                self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
+                self.assertNotIn("reassigned", self.notes())
+
+    def test_a_private_repo_ticket_is_moved_by_tier_without_a_remote_wait(self):
+        self.queued_for_muse(private=True)
+        worker = self.assign(0, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertNotIn(self.KEY, worker.waits)
+        self.assertNotIn("reassigned this ticket from remote lane", self.notes())
+
+    def test_a_free_lane_that_does_not_serve_the_model_is_skipped(self):
+        model = "claude-sonnet-5-5"
+        first, second = station.model_lanes(model)[:2]
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=[first, second],
+                                 model_limits={first: {model: NOW + 3600}})
+        self.assertEqual(worker._queued_model_lane(REPO, model, busy_ok=False), second)
+
+
 class NoLane(Base):
     """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
     SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
