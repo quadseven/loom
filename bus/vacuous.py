@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import time
 from io import BytesIO
-from typing import Dict, List, NamedTuple, Optional, Sequence, Set
+from typing import Dict, List, NamedTuple, Optional, Sequence, Set, Tuple
 from pathlib import PurePosixPath, PureWindowsPath
 from urllib.parse import quote
 
@@ -304,6 +304,124 @@ def _added_lines(patch: str) -> Set[int]:
     return added
 
 
+def _is_test_class(node: ast.stmt) -> bool:
+    return isinstance(node, ast.ClassDef) and any(
+        isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and member.name.startswith("test") for member in node.body)
+
+
+def _test_nodes(tree: ast.Module) -> List[Tuple[str, ast.AST]]:
+    """Module-level test functions and test methods of top-level classes."""
+    found: List[Tuple[str, ast.AST]] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and node.name.startswith("test"):
+            found.append((node.name, node))
+        elif isinstance(node, ast.ClassDef):
+            found.extend(("%s.%s" % (node.name, member.name), member)
+                         for member in node.body
+                         if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and member.name.startswith("test"))
+    return found
+
+
+def _bind_name(found: Dict[str, str], name: str, dump: str) -> None:
+    found[name] = found.get(name, "") + "\n" + dump
+
+
+def _tuple_values(target: ast.expr, value: Optional[ast.expr]) -> List[Optional[ast.expr]]:
+    """Each element of a tuple target paired with its own value, or None."""
+    elts = getattr(target, "elts", [])
+    items = value.elts if isinstance(value, (ast.Tuple, ast.List)) else []
+    if len(items) != len(elts) or any(isinstance(item, ast.Starred)
+                                      for item in items + elts):
+        return [None] * len(elts)
+    return list(items)
+
+
+def _bind(found: Dict[str, str], target: ast.expr, value: Optional[ast.expr],
+          whole: str) -> None:
+    """Record each name a target binds, with its own value where one pairs."""
+    if isinstance(target, ast.Name):
+        _bind_name(found, target.id, ast.dump(value) if value is not None else whole)
+    elif isinstance(target, ast.Starred):
+        _bind(found, target.value, None, whole)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for item, own in zip(target.elts, _tuple_values(target, value), strict=True):
+            _bind(found, item, own, whole)
+
+
+def _bind_scope(found: Dict[str, str], body: Sequence[ast.stmt]) -> None:
+    """Record the names one module or class scope declares."""
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("test") and not _is_test_class(node):
+                _bind_name(found, node.name, ast.dump(node))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                _bind(found, target, node.value, ast.dump(node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _bind(found, node.target, None, ast.dump(node))
+
+
+def _declarations(source: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Fixture names and test functions of a file, each with its AST.
+
+    Fixtures are the names a module or non-test class scope binds, keyed by
+    bare name; a tuple assignment binds each name to its own element, so
+    ``A, B = 1, 2`` -> ``A, B, C = 1, 2, 3`` changes only ``C``. Tests are
+    keyed ``Class.test_name`` or ``test_name``. Dumps carry no line numbers,
+    so moved code is unchanged.
+    """
+    fixtures: Dict[str, str] = {}
+    tree = ast.parse(source)
+    _bind_scope(fixtures, tree.body)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and not _is_test_class(node):
+            _bind_scope(fixtures, node.body)
+    tests = {key: ast.dump(node) for key, node in _test_nodes(tree)}
+    return fixtures, tests
+
+
+def _changed_keys(head: Dict[str, str], base: Dict[str, str],
+                  upstream: Optional[Dict[str, str]]) -> Set[str]:
+    """Keys whose head value differs from base and, if given, from upstream."""
+    return {key for key, value in head.items()
+            if base.get(key) != value
+            and (upstream is None or upstream.get(key) != value)}
+
+
+def own_changed_test_names(path: str, source: str, base_source: str,
+                           upstream_source: Optional[str] = None) -> List[str]:
+    """Tests the change made or edited, and tests using a fixture it changed.
+
+    Compares declarations with the base file (empty when the change adds
+    it). On a fix round that merged the default branch, a declaration the
+    head shares with that branch's file came in with the merge and is not
+    counted.
+    """
+    module = _module_name(path)
+    if not module:
+        return []
+    head_fixtures, head_tests = _declarations(source)
+    base_fixtures, base_tests = _declarations(base_source) if base_source else ({}, {})
+    upstream_fixtures: Optional[Dict[str, str]] = None
+    upstream_tests: Optional[Dict[str, str]] = None
+    if upstream_source is not None:
+        upstream_fixtures, upstream_tests = (_declarations(upstream_source)
+                                             if upstream_source else ({}, {}))
+    names = {"%s.%s" % (module, key)
+             for key in _changed_keys(head_tests, base_tests, upstream_tests)}
+    changed = _changed_keys(head_fixtures, base_fixtures, upstream_fixtures)
+    if changed:
+        for key, node in _test_nodes(ast.parse(source)):
+            refs = {item.id for item in ast.walk(node) if isinstance(item, ast.Name)}
+            refs.update(item.arg for item in ast.walk(node) if isinstance(item, ast.arg))
+            if refs & changed:
+                names.add("%s.%s" % (module, key))
+    return sorted(names)
+
+
 def changed_test_names(path: str, source: str, patch: str) -> List[str]:
     """Name changed tests and tests that use a changed fixture in a file."""
     module = path[:-3].replace("/", ".")
@@ -343,8 +461,16 @@ def _overlay(root: str, sources: Dict[str, str]) -> List[str]:
 
 def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                       timeout: int = 120,
-                      test_patches: Optional[Dict[str, str]] = None) -> BaseTestResults:
-    """Overlay PR test files onto base code and run each test independently."""
+                      test_patches: Optional[Dict[str, str]] = None,
+                      base_sources: Optional[Dict[str, str]] = None,
+                      upstream_sources: Optional[Dict[str, str]] = None) -> BaseTestResults:
+    """Overlay PR test files onto base code and run each test independently.
+
+    With base_sources (each changed file's base text, empty when added), the
+    tests run are those own_changed_test_names picks; upstream_sources adds
+    the default branch's text on a fix round. Otherwise test_patches picks
+    them by changed lines, and with neither every test in the files runs.
+    """
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     for path in changed_tests:
@@ -361,9 +487,8 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                         ignore=shutil.ignore_patterns(".git", "__pycache__"))
         _overlay(checkout, changed_tests)
         names = sorted({name for path, source in changed_tests.items()
-                        for name in (changed_test_names(path, source,
-                                     (test_patches or {}).get(path, ""))
-                                     if test_patches is not None else _test_names(path, source))})
+                        for name in _names_to_run(path, source, test_patches,
+                                                  base_sources, upstream_sources)})
         deadline = time.monotonic() + timeout
         for index, name in enumerate(names):
             if name in top_level:
@@ -383,6 +508,18 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
             else:
                 (failed if run.returncode else passed).append(name)
     return BaseTestResults(passed, failed, timed_out, not_run)
+
+
+def _names_to_run(path: str, source: str, test_patches: Optional[Dict[str, str]],
+                  base_sources: Optional[Dict[str, str]],
+                  upstream_sources: Optional[Dict[str, str]]) -> List[str]:
+    if base_sources is not None:
+        return own_changed_test_names(
+            path, source, base_sources.get(path, ""),
+            None if upstream_sources is None else upstream_sources.get(path, ""))
+    if test_patches is not None:
+        return changed_test_names(path, source, test_patches.get(path, ""))
+    return _test_names(path, source)
 
 
 def _git(tree: str, *args: str, timeout: int = 30) -> bytes:
@@ -422,18 +559,32 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
                 shutil.copyfileobj(stream, output)
 
 
+def _source_at(tree: str, revision: str, path: str) -> str:
+    """A file's text at a commit, or empty when the commit lacks it."""
+    if not _git(tree, "ls-tree", "-z", revision, "--", path):
+        return ""
+    return _git(tree, "show", revision + ":" + path).decode("utf-8", "replace")
+
+
 def git_base_test_results(tree: str, base: str, head: str,
-                          timeout: int = 120) -> BaseTestResults:
-    """Run only changed PR tests on base code, with each test isolated by name."""
+                          timeout: int = 120,
+                          upstream: Optional[str] = None) -> BaseTestResults:
+    """Run only changed PR tests on base code, with each test isolated by name.
+
+    upstream is the default branch commit a fix round merged after base was
+    taken; what the head shares with it is not the change's own.
+    """
     if timeout <= 0:
         raise ValueError("timeout must be positive")
     base_sha, head_sha = _commit(tree, base), _commit(tree, head)
+    upstream_sha = _commit(tree, upstream) if upstream else ""
     raw_paths = _git(tree, "diff", "--no-ext-diff", "--name-only", "-z",
                      "--diff-filter=ACMRT", base_sha, head_sha)
     paths = [safe_test_path(raw.decode("utf-8", "surrogateescape"))
              for raw in raw_paths.split(b"\0") if raw]
     changed_tests: Dict[str, str] = {}
-    patches: Dict[str, str] = {}
+    base_sources: Dict[str, str] = {}
+    upstream_sources: Dict[str, str] = {}
     for path in paths:
         if not path.endswith(".py") or not is_test_path(path):
             continue
@@ -443,16 +594,18 @@ def git_base_test_results(tree: str, base: str, head: str,
             raise ValueError("changed test path is not a regular file at the head")
         changed_tests[path] = _git(tree, "show", head_sha + ":" + path).decode(
             "utf-8", "strict")
-        patches[path] = _git(tree, "diff", "--no-ext-diff", "--no-color",
-                             "--unified=0", base_sha, head_sha, "--", path).decode(
-                                 "utf-8", "replace")
+        base_sources[path] = _source_at(tree, base_sha, path)
+        if upstream_sha:
+            upstream_sources[path] = _source_at(tree, upstream_sha, path)
     if not changed_tests:
         return BaseTestResults([], [], [], [])
     with tempfile.TemporaryDirectory(prefix="loom-vacuous-base-") as scratch:
         checkout = os.path.join(scratch, "base")
         os.mkdir(checkout)
         _archive(checkout, tree, base_sha)
-        return base_test_results(checkout, changed_tests, timeout, patches)
+        return base_test_results(checkout, changed_tests, timeout,
+                                 base_sources=base_sources,
+                                 upstream_sources=upstream_sources if upstream_sha else None)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -463,8 +616,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("base")
     parser.add_argument("head")
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--upstream", default="")
     args = parser.parse_args(argv)
-    result = git_base_test_results(args.tree, args.base, args.head, args.timeout)
+    result = git_base_test_results(args.tree, args.base, args.head, args.timeout,
+                                   args.upstream or None)
     for name in result.passed_on_base:
         print("base-pass: " + name)
     for name in result.timed_out:
