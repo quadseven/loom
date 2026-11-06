@@ -179,6 +179,62 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(by_state["pr"], {"state": "pr", "median_h": None,
                                            "worst_h": None, "worst_ticket": None, "n": 0})
 
+    def test_wait_causes_group_by_reason_tier_and_model(self):
+        rows = metrics.summarize_wait_causes([
+            {"ticket": "r#1", "cause": "wait:lane", "tier": "medium",
+             "model": "gpt-6-luna", "wait_h": 8},
+            {"ticket": "r#2", "cause": "wait:lane", "tier": "medium",
+             "model": "gpt-6-luna", "wait_h": 12},
+            {"ticket": "r#3", "cause": "wait:model-limit", "tier": "hard",
+             "model": "claude-opus", "wait_h": None},
+        ])
+        self.assertEqual(rows, [
+            {"cause": "wait:lane", "tier": "medium", "model": "gpt-6-luna",
+             "median_h": 10, "worst_h": 12, "worst_ticket": "r#2", "known_waits": 2, "n": 2},
+            {"cause": "wait:model-limit", "tier": "hard", "model": "claude-opus",
+             "median_h": None, "worst_h": None, "worst_ticket": None, "known_waits": 0, "n": 1},
+        ])
+
+    def test_active_wait_causes_use_current_labels_and_event_time(self):
+        events = [
+            {"event": "labeled", "label": label("wait:lane"), "created_at": iso(NOW - 6 * 3600)},
+            {"event": "unlabeled", "label": label("wait:lane"), "created_at": iso(NOW - 4 * 3600)},
+            {"event": "labeled", "label": label("wait:model-limit"), "created_at": iso(NOW - 3 * 3600)},
+        ]
+        self.assertEqual(metrics.active_waits(events, {"wait:model-limit"}, NOW),
+                         [("wait:model-limit", 3)])
+        self.assertEqual(metrics.active_waits(events, {"wait:incident"}, NOW),
+                         [("wait:incident", None)])
+
+    def test_waits_read_causes_for_open_tickets_only(self):
+        class WaitCauseGitHub:
+            def paginate(self, path):
+                if "/issues?" in path:
+                    if "state=open" in path:
+                        return [{"number": 7, "state": "open", "updated_at": iso(NOW - 8 * 86400),
+                                 "labels": [label("loom:ticket"), label("loom:queued"), label("wait:lane")],
+                                 "body": "Difficulty: medium\nModel: gpt-6-luna"}]
+                    return [
+                        {"number": 8, "state": "closed", "updated_at": iso(NOW),
+                         "labels": [label("loom:ticket"), label("wait:model-limit")],
+                         "body": "Difficulty: hard\nModel: claude-opus"},
+                    ]
+                if path.endswith("/issues/7/events?per_page=100"):
+                    return [{"event": "labeled", "label": label("loom:queued"),
+                             "created_at": iso(NOW - 8 * 3600)},
+                            {"event": "labeled", "label": label("wait:lane"),
+                             "created_at": iso(NOW - 6 * 3600)}]
+                if path.endswith("/issues/8/events?per_page=100"):
+                    return [{"event": "labeled", "label": label("wait:model-limit"),
+                             "created_at": iso(NOW - 9 * 3600)}]
+                raise AssertionError(path)
+
+        causes = []
+        metrics.waits_for_repos(WaitCauseGitHub(), [REPO], NOW, cause_rows=causes)
+        self.assertEqual(causes, [{"cause": "wait:lane", "tier": "medium", "model": "gpt-6-luna",
+                                   "median_h": 6, "worst_h": 6, "worst_ticket": "%s#7" % REPO,
+                                   "known_waits": 1, "n": 1}])
+
     def test_state_with_fewer_than_three_tickets_cannot_be_bottleneck(self):
         rows, bottleneck = metrics.summarize_waits([
             ("r#1", {"queued": 1, "running": 100}),

@@ -305,7 +305,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None, now=NOW):
+           no_lane_since=None, review_brief=None, lint_run=None, now=NOW):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -343,7 +343,8 @@ class Base(unittest.TestCase):
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
-                            no_lane_since=no_lane_since, review_brief=review_brief)
+                            no_lane_since=no_lane_since, review_brief=review_brief,
+                            lint_run=lint_run or merge_tier.run_ruff)
         f.run()
         return f
 
@@ -2980,6 +2981,54 @@ class Queued(Base):
             "%s#8" % REPO: "no free lane in tier medium",
             "%s#10" % REPO: "no free lane takes model (its Model: line names no model id)"})
 
+    def test_an_unclaimed_hand_off_ticket_returns_when_a_lane_of_its_tier_is_free(self):
+        # 128 of 200 queued tickets sat in the hand-off pool, 120 of them
+        # unclaimed, while lanes of their tiers beat available and idle: the
+        # pool had no way back but a person taking the label off.
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.assign(available=["codex"])
+        issue = self.gh.issues[7]
+        self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(issue))
+        # The note names the lane the assignment just gave it.
+        self.assertIn("lane codex was free", self.gh.comments[7][-1]["body"])
+
+    def test_a_held_hand_off_ticket_stays_in_the_pool_though_a_lane_is_free(self):
+        # A free lane is not enough: the queued checks (here a person's ask)
+        # still hold it, and it keeps the label.
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": labels.NEEDS_HUMAN}]
+        worker = self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", ""))
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(worker.waits["%s#7" % REPO], "waits for a person (needs:human)")
+
+    def test_a_hand_off_ticket_waits_behind_every_other_queued_ticket(self):
+        self.queued(7, age=7200)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.queued(8, age=0)
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[8]), self.lane(8)), ("briefed", "codex"))
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_claimed_hand_off_ticket_stays_in_the_pool(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": "claim:someone"}]
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def test_a_hand_off_ticket_with_no_free_lane_stays_in_the_pool_quietly(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        worker = self.assign(available=[])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(self.gh.comments.get(7, []), [])
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+
     def test_a_queued_ticket_held_by_after_gets_no_lane_and_the_next_one_does(self):
         # The factory briefed a queued ticket whose After: ticket had not
         # merged; the station never claimed it, and the lane it reserved sat
@@ -4812,6 +4861,85 @@ class ForbiddenModels(unittest.TestCase):
             self.assertFalse(station.lane_takes_model("agy", model), model)
 
 
+class RemoteQueued(Base):
+    """A public ticket queued for a remote lane that has not pulled it moves
+    to a free local tier lane after reroute_after, or at once when the remote
+    lane is down (loom#2245)."""
+    EASY = "Difficulty: easy\n\n## Why\nx\n" + ACCEPTANCE
+    KEY = "%s#7" % REPO
+
+    def queued_for_muse(self, private=False):
+        self.gh.private = private
+        self.gh.ticket(7, "queued", lane="muse", body=self.EASY)
+        self.gh.issues[7]["created_at"] = iso(0)
+
+    def assign(self, waited, available, **kwargs):
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=available, no_lane_since={self.KEY: NOW - waited},
+                                 reroute_after=6 * 3600, **kwargs)
+        worker.assign_queued()
+        return worker
+
+    def notes(self):
+        return self.gh.issues[7]["body"] + "".join(c["body"] for c in self.gh.comments.get(7, []))
+
+    def test_a_live_remote_lane_keeps_the_ticket_within_reroute_after(self):
+        self.queued_for_muse()
+        worker = self.assign(2 * 3600, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(worker.waits[self.KEY], "remote lane muse has not pulled it")
+        # A no-lane wait, so the station keeps its no_lane_since across passes.
+        self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
+
+    def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
+        self.queued_for_muse()
+        worker = self.assign(7 * 3600, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertNotIn(self.KEY, worker.waits)
+        self.assertIn("reassigned this ticket from remote lane muse to local lane spark",
+                      self.notes())
+
+    def test_a_down_remote_lane_reassigns_at_once(self):
+        self.queued_for_muse()
+        self.assign(0, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertIn("reassigned this ticket from remote lane muse to local lane spark",
+                      self.notes())
+
+    def test_no_free_local_lane_keeps_it_waiting_with_the_remote_reason(self):
+        # Up past reroute_after or down at once: either way, with every local
+        # lane busy it waits under the remote reason, a no-lane wait whose
+        # clock leads on to the hand-off pool.
+        local = [x for x in factory.lanes_of("easy", False) if x not in factory.REMOTE_LANES]
+        for remote in (["muse"], []):
+            with self.subTest(remote=remote):
+                self.setUp()
+                self.queued_for_muse()
+                for n, other in enumerate(local, 20):
+                    self.gh.ticket(n, "briefed", lane=other)
+                worker = self.assign(7 * 3600, remote + local)
+                self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)),
+                                 ("queued", "muse"))
+                self.assertEqual(worker.waits[self.KEY], "remote lane muse has not pulled it")
+                self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
+                self.assertNotIn("reassigned", self.notes())
+
+    def test_a_private_repo_ticket_is_moved_by_tier_without_a_remote_wait(self):
+        self.queued_for_muse(private=True)
+        worker = self.assign(0, ["muse", "spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "spark"))
+        self.assertNotIn(self.KEY, worker.waits)
+        self.assertNotIn("reassigned this ticket from remote lane", self.notes())
+
+    def test_a_free_lane_that_does_not_serve_the_model_is_skipped(self):
+        model = "claude-sonnet-5-5"
+        first, second = station.model_lanes(model)[:2]
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=[first, second],
+                                 model_limits={first: {model: NOW + 3600}})
+        self.assertEqual(worker._queued_model_lane(REPO, model, busy_ok=False), second)
+
+
 class NoLane(Base):
     """Tickets no lane takes are rerouted, then handed off (loom#1831)."""
     SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
@@ -4905,11 +5033,17 @@ class NoLane(Base):
         self.assertIn("%s#7" % REPO, worker.settled)
         self.assertFalse(brain._in_flight(self.gh.issues[7]))
         comments = [dict(c) for c in self.gh.comments[7]]
-        # The next pass leaves it alone: no second note, no lane, no wait.
-        again = self.assign(26 * 3600, ["claude"])
+        # The next pass with no lane free leaves it alone: no second note, no
+        # lane, no wait.
+        again = self.assign(26 * 3600, [])
         self.assertEqual(self.gh.comments[7], comments)
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertNotIn("%s#7" % REPO, again.waits)
+        # A pass with a lane of its model free takes it back from the pool.
+        self.assign(27 * 3600, ["claude"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("briefed", "claude"))
+        self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertIn("Back from the hand-off pool", self.notes(7))
 
     def test_a_ticket_with_no_reroute_waits_until_its_day_is_out(self):
         self.queued(7, self.OPUS)
@@ -5288,6 +5422,72 @@ class DegradedReviewAgain(Base):
                       "\n".join(str(call.args[0]) for call in said.call_args_list))
         self.go()
         self.assertEqual(sum(len(self.asks(50 + n)) for n in heads), len(heads))
+
+
+class AbandonedReview(Base):
+    """loom#1933 criterion 3: a Sentinel abandoned-review notice on a merged
+    pull request files one follow-up, and the notice is answered once the
+    findings it names re-check clean on the merged branch."""
+
+    S110 = "\U0001f534 high | _security_ | `S110` | trivial\n\ntry, except, pass detected."
+    NOTICE = (factory.ABANDONED_MARKER + "\n\nGrug Haunt notice: this PR was merged with 1 "
+              "high/critical Elder finding(s) from EARLIER in its review that never got a reply.")
+    PATH = "services/_shared/llm_client.py"
+
+    def noticed(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
+                                 "user": {"login": "grug-tribe[bot]"},
+                                 "html_url": "https://example.test/pull/51#issuecomment-777"}]
+        self.gh.details[51]["reviewThreads"] = {"nodes": [{
+            "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
+            "root": {"nodes": [{"author": {"__typename": "Bot", "login": "grug-tribe"},
+                                "body": self.S110, "url": "https://example.test/t9"}]},
+            "comments": {"nodes": []}}]}
+        self.gh.contents[self.PATH] = "def client():\n    return 1\n"
+
+    def follow_ups(self):
+        return [i for i in self.gh.filed if i.get("title") == factory.ABANDONED_TITLE % 51]
+
+    def answers(self):
+        return [c for c in self.gh.comments.get(51, [])
+                if factory.ABANDONED_ANSWER_MARKER in str(c.get("body") or "")]
+
+    def test_a_notice_files_one_follow_up_and_is_answered_when_the_recheck_passes(self):
+        self.noticed()
+        calls = []
+
+        def clean(rule, path, text):
+            calls.append((rule, path, text))
+            return False
+        self.go(lint_run=clean)
+        self.assertEqual(calls, [("s110", self.PATH, "def client():\n    return 1\n")])
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertIn("loom:triage", [x["name"] if isinstance(x, dict) else x
+                                      for x in self.follow_ups()[0]["labels"]])
+        self.assertEqual(len(self.answers()), 1)
+        body = self.answers()[0]["body"]
+        self.assertIn("S110", body)
+        self.assertIn(self.PATH, body)
+        self.assertIn("#issuecomment-777", body)
+        self.assertIn("#900", body)
+        # A second pass files nothing and answers nothing again.
+        self.go(lint_run=clean)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_a_finding_that_still_hits_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.go(lint_run=lambda rule, path, text: True)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(self.answers(), [])
+
+    def test_no_notice_no_follow_up(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(self.follow_ups(), [])
 
 
 if __name__ == "__main__":

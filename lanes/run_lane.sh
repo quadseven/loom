@@ -2459,6 +2459,10 @@ contract_run() {
     # the scratch home, where agent_uv_cache copies them for a codex agent.
     export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
+    # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
+    # which denies localhost, so a test that needs a loopback connection can
+    # skip here and still run on CI (docs/LANES.md, "Validation").
+    export LOOM_CHECK_SANDBOX=1
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then
       input="$changed_list"
@@ -2777,6 +2781,9 @@ final_base_tests() {
   }
   printf -v command '%q %q %q %q %q --timeout 120' \
     python3 "$helper" "$TREE" "$BASE" "$rev"
+  # A fix round merged the default branch after BASE was taken: tests and
+  # fixtures that came in with that merge are not the round's own.
+  [ -z "${FIX_UPSTREAM:-}" ] || printf -v command '%s --upstream %q' "$command" "$FIX_UPSTREAM"
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
@@ -4059,6 +4066,14 @@ for BRIEF in "$INBOX"/*.md; do
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
+  fi
+  # A run killed with SIGTERM (exit 143) ended because something stopped it,
+  # not because the provider refused it: a limit phrase in its output came
+  # from what it read. Only the watchdog's own limit kill holds the lane. A
+  # codex run killed this way had read about a monthly limit and held the
+  # lane until the next month (loom#2683).
+  if [ "$STATUS" -eq 143 ] && [ "$FAIL_CLASS" = limit ] && [ ! -f "$LOCK/watchdog-limit" ]; then
+    FAIL_CLASS=transient RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON="killed by SIGTERM"
   fi
   [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
   # What ran and how it ended, so a green run that did nothing shows.

@@ -128,7 +128,6 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "repo": repo, "number": issue.get("number"), "title": issue.get("title"),
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
-        "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
                         and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
         # The issue the ticket names: an epic or, before tickets moved under
@@ -301,6 +300,7 @@ class TicketStore:
                           "improving": {"journals": [], "metrics_comments": []},
                           "improving_built": None,
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "wait_cause_rows": [],
                           "goal_context": {},
                           "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
@@ -1203,15 +1203,18 @@ class TicketStore:
     def _refresh_waits(self, snapshot: Dict[str, Any], now: float) -> None:
         if now - self._waits_refreshed_at < 3600 or self._below_floor():
             snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_cause_rows"] = self._snapshot.get("wait_cause_rows", [])
             snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
             snapshot["state_entered"] = self._snapshot.get("state_entered", {})
             return
         try:
             entered = {}
-            rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
+            causes = []
+            rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered, cause_rows=causes)
             self.waits = {row["state"]: [row["median_h"]] * row["n"]
                           for row in rows if row.get("median_h") is not None and row.get("n")}
             snapshot["wait_rows"] = rows
+            snapshot["wait_cause_rows"] = causes
             snapshot["wait_bottleneck"] = bottleneck
             snapshot["state_entered"] = entered
             self.waits_error = ""
@@ -1220,6 +1223,7 @@ class TicketStore:
         except Exception as exc:  # noqa: BLE001
             self.waits_error = self._error_reason(exc) or type(exc).__name__
             snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_cause_rows"] = self._snapshot.get("wait_cause_rows", [])
             snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
             snapshot["state_entered"] = self._snapshot.get("state_entered", {})
         self._waits_refreshed_at = now
@@ -1340,6 +1344,7 @@ class TicketStore:
                 "latest_runs": snapshot.get("latest_runs", {}),
                 "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),
+                "wait_cause_rows": snapshot.get("wait_cause_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "goal_context": snapshot.get("goal_context", {}),

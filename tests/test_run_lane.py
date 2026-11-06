@@ -2353,6 +2353,22 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertNotIn("limit", beat.get("reason") or "")
 
+    def test_a_run_killed_with_sigterm_writes_no_month_long_provider_limit(self):
+        # loom#2683: a codex run killed with exit 143 had read text about a
+        # monthly usage limit, and the lane was held until the next month
+        # while its sibling slots ran agents.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="143", FAKE_OUT=(
+            "docs/USAGE.md: a monthly usage limit holds the lane until the first of the month\n"
+            "Terminated"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient] agent exited 143", log)
+        self.assertFalse((self.loom / "state" / "usage" / "codex.provider-limit.json").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("provider limit reached", beat.get("reason") or "")
+        self.assertLess(int(beat.get("retry_at") or 0), time.time() + 86400)
+
     def test_a_limit_word_in_a_tool_result_is_not_a_limit(self):
         # Two Spark lanes were held an hour as "provider limit reached": each
         # agent read code about rate limits and timed out, and the only match
@@ -8047,6 +8063,31 @@ exec /usr/bin/git "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uv=1 secret=unset", log.read_text())
 
+    def test_contract_run_marks_the_check_sandbox_for_the_repos_tests(self):
+        # Base checks failed only in the lane sandbox, which denies localhost,
+        # on unittest suites that loopback-connect (2026-11-06). The check
+        # sets LOOM_CHECK_SANDBOX=1 so such a test can skip there; the
+        # runner's own value never reaches the check.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        log = tmp / "log"
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
+               "LOOM_CHECK_SANDBOX": "runner"}
+        result = subprocess.run(["bash", "-c", script, "test",
+                                 "echo marker=${LOOM_CHECK_SANDBOX:-unset}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("marker=1", log.read_text())
 
     def test_contract_run_puts_uv_and_uvx_on_the_checks_path(self):
         # Every infra ticket held on the factory incident: the contract runs
