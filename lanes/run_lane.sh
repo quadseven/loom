@@ -2558,6 +2558,10 @@ contract_run() {
       deselect_opts=""
       for test_id in $CHECK_DESELECT; do deselect_opts="$deselect_opts --deselect $test_id"; done
       export PYTEST_ADDOPTS="${deselect_opts# }" LOOM_DESELECT_TESTS="$CHECK_DESELECT"
+    else
+      # This subshell already dropped every inherited export; say so for the
+      # two names a deselected run sets, so a plain check never sees them.
+      unset PYTEST_ADDOPTS LOOM_DESELECT_TESTS
     fi
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then

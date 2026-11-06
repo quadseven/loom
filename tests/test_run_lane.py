@@ -7714,6 +7714,18 @@ exec /usr/bin/git "$@"
             "grep -sqx fixed fix.txt && { printf 'FAILED tests/test_new.py::test_new - x\\n'; exit 1; }; "
             + self.HOST_RED)
 
+    def test_a_plain_check_after_a_deselected_run_inherits_no_deselect(self):
+        # Elder asked whether the deselect mark outlives its trial: the final
+        # check of a host-red run is a plain one and must see neither name.
+        result, _ = self.run_host_red(
+            check="grep -sqx fixed fix.txt && { echo \"ADDOPTS=[$PYTEST_ADDOPTS][$LOOM_DESELECT_TESTS]\"; exit 0; }; "
+            + self.HOST_RED,
+            FAKE_GH_CHECKS=self.GREEN_CHECKS, PYTEST_ADDOPTS="--deselect leaked")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertIn("ADDOPTS=[][]", log)
+        self.assertNotIn("leaked", log)
+
     def test_a_change_to_a_host_red_test_sets_none_aside(self):
         # check.py is tracked in the fixture repo; a new file would be
         # refused at commit for another reason.
