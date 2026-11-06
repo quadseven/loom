@@ -470,7 +470,9 @@ A new App is easiest made from
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
-down or demoted (bus/scorecard.py). The same test picks every tier move,
+down or demoted (bus/scorecard.py: `LOOM_LANE_DEMOTE_AT` bad outcomes in
+the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
+requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
@@ -1585,6 +1587,12 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- A run killed with SIGTERM (exit 143) is a `[transient]` ending, never a
+  `[limit]`: a limit phrase in its output came from what it read, so it writes
+  no provider limit and no hold. Only the runner's own watchdog, which kills a
+  run after the provider's limit line, holds the lane. A codex run killed this
+  way had read about a monthly limit and held the lane until the next month
+  (loom#2683).
 - Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
   reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
   drops what is deprecated or paused, probes each candidate, and takes the first
