@@ -2714,6 +2714,14 @@ class LunaMergeTests(unittest.TestCase):
             self.merge()
         self.assertEqual(self.merges, [])
 
+    def test_a_trusted_comment_without_a_verdict_still_refuses(self):
+        # Ordinary trusted text is not a verdict: no marker and no markings
+        # line, so nothing stands in for the degraded check.
+        self.verdict = "Looked at this head myself; it reads fine to me."
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
 
 class FixTests(unittest.TestCase):
     def refused(self, pr, ticket=None, ref=(REPO, 9)):
