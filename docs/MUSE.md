@@ -423,7 +423,11 @@ line for that stage and ticket retires it).
   brief records nothing.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
-  state), so no brain repeats finished work. `status` shows, per goal and
+  state), so no brain repeats finished work. A merge no brain can make is
+  not stage work: an operator tier label, or a head outside `loom/` that
+  conflicts with its base. `resume` drops its defer with that reason, and
+  `defer --stage merge` refuses it, so it never counts as deferred; the
+  operator or the pull request's author moves it. `status` shows, per goal and
   stage, the brain that last held it and its last done action.
 - Only the lock holder acts: `resume` refuses for anyone else.
 

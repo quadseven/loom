@@ -6624,6 +6624,33 @@ def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
     return "%s-c%d" % (state.replace("loom:", ""), int(data.get("comments") or 0))
 
 
+def merge_hold(gh: GitHub, repo: str, number: int) -> str:
+    """merge_tier.lasting_hold for an open pull request as it reads now."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    return merge_tier.lasting_hold(_labels(issue), str((pr.get("head") or {}).get("ref") or ""),
+                                   pr.get("mergeable"))
+
+
+def _merge_holds(gh: GitHub, items: Sequence[handoff.Mark]) -> Dict[Tuple[str, int], str]:
+    """The merge items no brain can merge, with why (merge_hold), read side
+    by side. An item whose read fails is left as a resume item, as before."""
+    wanted = list(dict.fromkeys(m.item for m in items if m.stage == "merge"))
+
+    def read(item: Tuple[str, int]) -> str:
+        try:
+            return merge_hold(gh, *item)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            print("brain: merge hold of %s unread: %s" % (handoff.item_ref(item),
+                                                          _one_line(str(err), 200)),
+                  file=sys.stderr)
+            return ""
+
+    return {item: why for item, why in zip(wanted, _read_each(read, wanted), strict=True) if why}
+
+
 def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
@@ -6659,6 +6686,10 @@ def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str,
     rev = item_revision(gh, *item)
     if rev is None:
         raise ValueError("only an open item is deferred")
+    held = merge_hold(gh, *item) if stage == "merge" else ""
+    if held:
+        raise ValueError("%s %s; no brain can merge it, so it is not deferred: leave it out "
+                         "of the deferred count" % (handoff.item_ref(item), held))
     key = (hashlib.sha256(" ".join(note.split()).encode("utf-8")).hexdigest()[:8]
            if stage == "brief" and note else None)
     return handoff.defer_marker(stage, item, rev, holder, note=note, key=key)
@@ -7097,6 +7128,7 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
     current, gone = _item_revisions(gh, items, unread or {}, faults)
     items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
+    held = _merge_holds(gh, [m for m in alive if latest[_mark_key(m)] == m])
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     if skipped:
@@ -7104,7 +7136,8 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                    % " ".join(skipped))
     out += [_skip_line(handoff.item_ref(item), reason) for item, reason in sorted(gone.items())]
     for m in items:
-        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item])
+        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item],
+                                 held.get(m.item, "") if m.stage == "merge" else "")
         if line:
             out.append(line)
     return out
@@ -7116,14 +7149,18 @@ def _mark_key(m: handoff.Mark) -> Tuple[str, Tuple[str, int], str]:
 
 
 def _resume_item_line(m: handoff.Mark, newest: handoff.Mark, alive: bool,
-                      revision: Optional[str]) -> Optional[str]:
+                      revision: Optional[str], hold: str = "") -> Optional[str]:
     """One standing defer's resume line: resumed while live, dropped once
-    done, closed or changed, and None when a newer defer replaced it."""
+    done, closed or changed, or held where no brain can merge it (`hold`,
+    merge_hold), and None when a newer defer replaced it."""
     if newest.kind == "defer" and newest != m:
         return None
     if newest.kind == "done":
         return "- dropped %s %s: finished or closed since the defer" % (
             m.stage, handoff.item_ref(m.item))
+    if alive and hold:
+        return "- dropped %s %s: %s; no brain can merge it, so do not defer it again" % (
+            m.stage, handoff.item_ref(m.item), hold)
     if alive:
         item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
         return "- resume %s %s (deferred by %s at %s)" % (m.stage, item_text, m.holder, m.at)
