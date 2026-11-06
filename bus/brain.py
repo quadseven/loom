@@ -4865,7 +4865,7 @@ def merge(gh: GitHub, repo: str, number: int,
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         # _luna_stands_in reads more only on a FAILURE rollup, the one shape
         # a degraded review check leaves; every other refusal reads no more.
-        luna = _luna_stands_in(gh, repo, number, details, env)
+        luna = _luna_stands_in(gh, repo, number, details, env, _pr_author(pr))
         _validate_merge_pr(repo, pr, details, env, luna=luna)
         _refuse_person_change_request(details)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
@@ -5425,28 +5425,50 @@ def _luna_degraded_only(runs: Sequence[Dict[str, Any]], check: str) -> bool:
 
 
 def _clean_luna_verdict(gh: GitHub, repo: str, number: int, sha: str,
-                        env: Optional[Dict[str, str]]) -> bool:
-    """Whether a trusted comment on this pull request carries a Luna verdict
-    for this exact head with no blocking finding (factory.parse_luna_verdict,
-    the factory's _luna_verdict rule)."""
+                        env: Optional[Dict[str, str]], author: str = "") -> bool:
+    """Whether the newest trusted Luna verdict for this exact head on this
+    pull request is clean (factory.parse_luna_verdict). The verdict is the
+    station's word, posted by its review reporter after the Luna slot's run;
+    a verdict the pull request's own author posted never counts, and a newer
+    verdict for the head replaces an older one, clean or blocking."""
     from . import factory  # factory imports this module
     try:
         comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
     except GitHubError:
         return False  # an unreadable verdict proves nothing: the gate stands
+    newest: Optional[Tuple[int, int]] = None
     for comment in trusted_comments(comments, trusted_authors(env)):
+        if author and comment_login(comment).lower() == author.lower():
+            continue  # the author's own verdict on its own change proves nothing
         verdict = factory.parse_luna_verdict(comment.get("body"), sha)
-        if verdict is not None and verdict[0] == 0:
-            return True
-    return False
+        if verdict is not None:
+            newest = verdict
+    return newest is not None and newest[0] == 0
+
+
+def _head_status_clear(gh: GitHub, repo: str, sha: str) -> bool:
+    """Whether this head's combined commit status is clear: its state is
+    success, or it carries no statuses at all. A FAILURE rollup can come
+    from a failing commit status beside the check runs, and a Luna verdict
+    stands in for the review check only, never for a red status. An
+    unreadable read is not clear."""
+    try:
+        data = gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data
+    except GitHubError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("state") == "success" or data.get("total_count") == 0
 
 
 def _luna_stands_in(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
-                    env: Optional[Dict[str, str]] = None) -> bool:
+                    env: Optional[Dict[str, str]] = None, author: str = "") -> bool:
     """Whether a clean Luna verdict stands in for this head's review check
     in the merge gate (loom#2575, the factory's loom#2142 fallback): the
     rollup is FAILURE, the review check is the head's only non-green run and
-    failed degraded, and a trusted Luna verdict for this head is clean. The
+    failed degraded, the head's combined commit status is clear, and the
+    newest trusted Luna verdict for this head, not the pull request author's
+    own, is clean. The
     factory already clears its fault on that verdict and calls merge; without
     this the real merge refused the head on every pass, because the degraded
     check keeps the rollup FAILURE. Any doubt (an unreadable run, another
@@ -5459,7 +5481,9 @@ def _luna_stands_in(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
     runs = _head_check_runs(gh, repo, sha)
     if runs is None or not _luna_degraded_only(runs, review_check_name(env)):
         return False
-    return _clean_luna_verdict(gh, repo, number, sha, env)
+    if not _head_status_clear(gh, repo, sha):
+        return False
+    return _clean_luna_verdict(gh, repo, number, sha, env, author)
 
 
 def _threads_resolved(details: Dict[str, Any]) -> bool:

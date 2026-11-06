@@ -2606,7 +2606,7 @@ class LunaMergeTests(unittest.TestCase):
     the rollup is still FAILURE. These tests run the real merge, risk tier
     included; nothing on the merge path is stood in for."""
 
-    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain", "LOOM_MERGE_SETTLE_SECONDS": "0"}
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane", "LOOM_MERGE_SETTLE_SECONDS": "0"}
     DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
                 "conclusion": "failure", "id": 2, "started_at": "2030-01-01T00:00:00Z",
                 "output": {"title": "WARN Grug eyes clouded",
@@ -2624,6 +2624,8 @@ class LunaMergeTests(unittest.TestCase):
         self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
                         "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
         self.verdict_user = "example-brain"
+        self.pr_comments = None
+        self.combined = {"state": "success", "total_count": 0, "statuses": []}
         self.merges = []
         self.labels = []
 
@@ -2650,11 +2652,16 @@ class LunaMergeTests(unittest.TestCase):
                                "head": {"ref": "loom/9-work", "sha": "checked",
                                         "repo": {"full_name": REPO}},
                                "base": {"ref": "main", "repo": {"full_name": REPO}},
-                               "mergeable": True, "user": {"login": "example-brain"}})
+                               "mergeable": True, "user": {"login": "example-lane"}})
         if method == "GET" and path.startswith("/repos/%s/commits/checked/check-runs" % REPO):
             return reply(200, {"check_runs": self.runs})
+        if method == "GET" and path == "/repos/%s/commits/checked/status" % REPO:
+            return reply(200, self.combined)
         if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
-            return reply(200, [{"body": self.verdict, "user": {"login": self.verdict_user}}])
+            comments = self.pr_comments
+            if comments is None:
+                comments = [{"body": self.verdict, "user": {"login": self.verdict_user}}]
+            return reply(200, comments)
         if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
             return reply(200, [])
         if method == "GET" and path == "/repos/%s/issues/9" % REPO:
@@ -2718,6 +2725,33 @@ class LunaMergeTests(unittest.TestCase):
         # Ordinary trusted text is not a verdict: no marker and no markings
         # line, so nothing stands in for the degraded check.
         self.verdict = "Looked at this head myself; it reads fine to me."
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_verdict_from_the_pull_requests_own_author_still_refuses(self):
+        # The verdict is the station's word: a clean verdict the change's own
+        # author posted for its own head never stands in, trusted or not.
+        self.verdict_user = "example-lane"
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_newer_blocking_verdict_replaces_an_older_clean_one(self):
+        self.pr_comments = [
+            {"body": self.verdict, "user": {"login": "example-brain"}},
+            {"body": factory.LUNA_REVIEW_MARKER % "checked" +
+                     "\nElder markings - 1 blocking, 2 total\n\nOne finding blocks.",
+             "user": {"login": "example-brain"}}]
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_failing_commit_status_beside_the_degraded_check_still_refuses(self):
+        # The rollup reads commit statuses too: a red status beside the
+        # degraded review check is not the review check's to excuse.
+        self.combined = {"state": "failure", "total_count": 1,
+                         "statuses": [{"context": "legacy-ci", "state": "failure"}]}
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
