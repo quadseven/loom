@@ -405,6 +405,26 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_CLAUDE_MODEL</key><string>claude-test</string>", plist)
         self.assertIn("<key>LOOM_CODEX_MODEL</key><string>codex-test</string>", plist)
 
+    def test_multiline_settings_survive_in_lane_brain_and_dashboard_plists(self):
+        setting = "first-value\nsecond-value"
+        models = "small-model\nlarge-model"
+        result = self.run_install(LOOM_CUSTOM_MULTILINE=setting,
+                                  LOOM_DB_CUSTOM_MULTILINE=setting,
+                                  LOOM_CODEX_MODELS=models,
+                                  LOOM_DASHBOARD="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        lane = (agents / "com.loom.codex.plist").read_text()
+        brain = (agents / "com.loom.brain.plist").read_text()
+        dashboard = (agents / "com.loom.dashboard.plist").read_text()
+        setting_entry = "<key>LOOM_CUSTOM_MULTILINE</key><string>%s</string>" % setting
+        for plist in (lane, brain, dashboard):
+            self.assertIn(setting_entry, plist)
+        self.assertIn("<key>LOOM_DB_CUSTOM_MULTILINE</key><string>%s</string>" % setting,
+                      dashboard)
+        self.assertIn("<key>LOOM_CODEX_MODELS</key><string>%s</string>" % models,
+                      (agents / "com.loom.station.plist").read_text())
+
     def station_plist_with(self, **env):
         # KUBECONFIG and the allow-list come only from the test, never from
         # the operator's own environment.
