@@ -2777,6 +2777,9 @@ final_base_tests() {
   }
   printf -v command '%q %q %q %q %q --timeout 120' \
     python3 "$helper" "$TREE" "$BASE" "$rev"
+  # A fix round merged the default branch after BASE was taken: tests and
+  # fixtures that came in with that merge are not the round's own.
+  [ -z "${FIX_UPSTREAM:-}" ] || printf -v command '%s --upstream %q' "$command" "$FIX_UPSTREAM"
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
