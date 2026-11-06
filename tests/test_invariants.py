@@ -676,6 +676,10 @@ class StationTest(StationBase):
             "closed-epic-open-tickets": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [epic(40, state="closed")], (REPO, 40): [ticket(7)]}),
                 "Closed epic #40 holds 1 open tickets"),
+            "closed-epic-open-tickets": (lambda: self.gh.subs.update({
+                (REPO, GOAL): [epic(40, state="closed")],
+                (REPO, 40): [ticket(n) for n in range(50, 60)]}),
+                "Closed epic #40 holds 10 open tickets"),
             # loom#2030: two open epics in one repo with one title.
             "epic-title-shared": (lambda: self.gh.subs.update({
                 (REPO, GOAL): [dict(epic(40), title="Epic: one name"),
