@@ -262,6 +262,34 @@ class Caps(unittest.TestCase):
         self.assertIn("could not count", why)
 
 
+class LastingHolds(unittest.TestCase):
+    """A merge no brain can make, so no brain defers it to the next one
+    (loom#2667): every tick on 11-05 deferred 9 to 11 items, four of them
+    merges only the operator or the pull request's author could move."""
+
+    def test_an_operator_tier_label_is_a_lasting_hold(self):
+        why = merge_tier.lasting_hold(["class:sensitive", "tier:security"], "loom/1-x", True,
+                                      env={})
+        self.assertIn("tier:security", why)
+        self.assertIn("operator", why)
+
+    def test_an_auto_tier_label_is_no_hold(self):
+        self.assertEqual("", merge_tier.lasting_hold(["tier:app-code"], "loom/1-x", True, env={}))
+        self.assertEqual("", merge_tier.lasting_hold(
+            ["tier:security"], "loom/1-x", True, env={"LOOM_AUTO_MERGE_TIERS": "security"}))
+
+    def test_a_conflicting_head_outside_loom_is_a_lasting_hold(self):
+        why = merge_tier.lasting_hold([], "codex/1-review-queue", False, env={})
+        self.assertIn("not a loom branch", why)
+        self.assertIn("conflicts", why)
+
+    def test_a_conflicting_loom_head_or_an_unknown_mergeable_is_no_hold(self):
+        # bus.brain fix sends a loom/ head back to its lane, and GitHub may
+        # still be computing mergeable (None).
+        self.assertEqual("", merge_tier.lasting_hold([], "loom/1-x", False, env={}))
+        self.assertEqual("", merge_tier.lasting_hold([], "codex/1-x", None, env={}))
+
+
 class Route:
     """GitHub by method and path prefix; writes are recorded."""
 

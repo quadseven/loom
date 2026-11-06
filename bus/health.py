@@ -245,16 +245,32 @@ def _next_link(link_header: str) -> Optional[str]:
     return None
 
 
+# Compare answers by (repo, commit, revision) for two full commit SHAs. The
+# answer for a pair never changes, so each is asked once a process; a 404 or
+# an error is never kept, since an unknown commit can appear later (loom#2357).
+_COMPARES: Dict[Tuple[str, str, str], bool] = {}
+_COMPARES_MAX = 2000
+_COMPARE_STATUSES = ("ahead", "identical", "behind", "diverged")
+
+
 def _carries(gh: GitHub, repo: str, commit: str, revision: str) -> bool:
     """Check if commit is ancestor of revision (or identical)."""
+    key = (repo, commit, revision)
+    if key in _COMPARES:
+        return _COMPARES[key]
     try:
         resp = gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision))
     except (GitHubError, ValueError, TypeError, AttributeError):
         return False
     if resp.status == 404:
         return False
-    data = resp.data if isinstance(resp.data, dict) else {}
-    return data.get("status") in ("ahead", "identical")
+    status = (resp.data if isinstance(resp.data, dict) else {}).get("status")
+    if status in _COMPARE_STATUSES and COMMIT_RE.fullmatch(commit) \
+            and COMMIT_RE.fullmatch(revision):
+        if len(_COMPARES) >= _COMPARES_MAX:
+            _COMPARES.pop(next(iter(_COMPARES)))
+        _COMPARES[key] = status in ("ahead", "identical")
+    return status in ("ahead", "identical")
 
 
 def _deploy_runs(gh: GitHub, repo: str, workflow: str, branch: str) -> List[Dict[str, Any]]:

@@ -5626,7 +5626,8 @@ class ClaimTest(Base):
         self.settings.factory_on = True
         self.heartbeat("spark")
         self.fake.add(12)
-        self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n", state="queued")
+        self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n"
+                      "\n## Acceptance criteria\n\n- [ ] x\n", state="queued")
         self.fake.issues[13]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time() - 300)
@@ -9201,11 +9202,13 @@ class StatusTest(Base):
         self.fake.edits.clear()
         self.heartbeat("codex", age=0)
         self.go(3601 - 0)
-        # The overdue heartbeat publishes before optional PR reads; the
-        # normal pass then replaces pending with the observed counts.
+        # The overdue heartbeat publishes before optional PR reads and carries
+        # the last read counts (loom#2652); the normal pass then replaces them
+        # with the counts it observed.
         self.assertEqual(len(self.fake.edits), 2)
-        self.assertIn("Open pull requests: pending this pass", self.fake.edits[0])
-        self.assertNotIn("pending this pass", self.fake.edits[1])
+        self.assertIn("Open pull requests (read ", self.fake.edits[0])
+        self.assertNotIn("pending this pass", self.fake.edits[0])
+        self.assertNotIn("(read ", self.fake.edits[1])
         self.assertIn("Open pull requests:", self.fake.edits[1])
 
     def test_a_pass_stopped_at_the_target_still_publishes_an_old_table(self):

@@ -28,12 +28,15 @@ choice, are the fix.
 A bad outcome the station sees is a bad-work finding, a revert, a failed
 deploy or a failed proof audit. A lane (all its numbered slots)
 whose bad outcomes over the last LOOM_LANE_DEMOTE_DAYS days (default 7)
-reach LOOM_LANE_DEMOTE_AT (default 3) is demoted: it takes no build ticket,
+reach LOOM_LANE_DEMOTE_AT (default 3) and are at least LOOM_LANE_DEMOTE_RATE
+(default 0.1) of its pull requests in that window is demoted, so a busy lane
+is not benched for a few findings (loom#2683): it takes no build ticket,
 its briefed tickets step aside to other lanes with a status event saying
 why, and it stays demoted until the operator clears it
-(`python3 -m bus.scorecard clear <lane>`). Clearing forgets the outcomes
-before it. Verify runs are not build tickets: a demoted lane still takes
-them.
+(`python3 -m bus.scorecard clear <lane>`) or a completed refresh finds its
+bad outcomes in the window below the threshold or the rate again. Clearing forgets the
+outcomes before it. Verify runs are not build tickets: a demoted lane still
+takes them.
 
 Each merged record also gets a settled difficulty, scored blind from the
 merged diff, the send-backs and the review findings (bus/difficulty.py),
@@ -53,14 +56,16 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from . import change_class, difficulty, labels, merge_tier, revert
-from .github import GitHubError
+from .github import GitHubError, TargetReached
 
 FILE = "scorecard.json"
+NOTICE_FILE = "demotion-notices.json"
 # Slots of these lanes pick their model per run (bus/model_pick.py, which reads
 # the demoted models), so demotion binds to a model named after MODEL_KEY.
 PICKED_LANES = ("opencode-go", "zen")
@@ -68,6 +73,9 @@ MODEL_KEY = "model:"
 REFRESH = 3600
 DEFAULT_DAYS = 7
 DEFAULT_AT = 3
+# A lane is demoted at DEFAULT_AT bad outcomes only when they are also at
+# least this share of its runs in the window (loom#2683).
+DEFAULT_RATE = 0.1
 DEFAULT_ZERO_DONE = 20
 PROBE_INTERVAL = 3600
 KEEP = 2000
@@ -143,6 +151,17 @@ def window(env: Optional[Mapping[str, str]] = None) -> int:
 
 def threshold(env: Optional[Mapping[str, str]] = None) -> int:
     return _setting(os.environ if env is None else env, "LOOM_LANE_DEMOTE_AT", DEFAULT_AT)
+
+
+def rate(env: Optional[Mapping[str, str]] = None) -> float:
+    """LOOM_LANE_DEMOTE_RATE: the share of a lane's runs that must be bad
+    for it to be demoted, a fraction above 0 and at most 1."""
+    raw = str((os.environ if env is None else env).get("LOOM_LANE_DEMOTE_RATE", "")).strip()
+    try:
+        got = float(raw)
+    except ValueError:
+        return DEFAULT_RATE
+    return got if 0 < got <= 1 else DEFAULT_RATE
 
 
 def zero_done_threshold(env: Optional[Mapping[str, str]] = None) -> int:
@@ -246,7 +265,8 @@ class Scorecard:
         self.now = now
         self.env = dict(os.environ if env is None else env)
         self.data: Dict[str, Any] = {"records": {}, "audits": {}, "demoted": {},
-                                     "cleared": {}, "refreshed": 0, "briefs": {}}
+                                     "cleared": {}, "refreshed": 0, "briefs": {},
+                                     "cycle": {}}
         # A file that is there but cannot be read: its demotions are unknown,
         # so every lane counts as demoted until the operator repairs or
         # removes it, and nothing is written over it.
@@ -262,8 +282,12 @@ class Scorecard:
         if not self.unreadable and not isinstance(kept, dict):
             self.unreadable = "%s does not hold an object" % FILE
         for key in self.data:
-            if isinstance(kept, dict) and isinstance(kept.get(key), type(self.data[key])):
-                self.data[key] = kept[key]
+            value = kept.get(key) if isinstance(kept, dict) else None
+            # The refresh time is saved as the pass's float time: an int-only
+            # check dropped it on every load, so the card was always due.
+            want = (int, float) if key == "refreshed" else type(self.data[key])
+            if isinstance(value, want) and not isinstance(value, bool):
+                self.data[key] = value
 
     def save(self) -> None:
         if self.unreadable:
@@ -294,13 +318,31 @@ class Scorecard:
         """Read each repo's closed lane pull requests into the records, the
         failed proof audits (lane -> when the hold ends) and the post-merge
         watch's ledger entries, then demote the lanes past the threshold. A
-        repo that cannot be read keeps its records."""
+        repo that cannot be read keeps its records.
+
+        A read that carries over at the pass's request target (TargetReached)
+        saves the records read so far and the repos this cycle finished, and
+        raises again; the next pass skips those repos and resumes, so a
+        refresh larger than one pass's budget still completes (loom#2651)."""
         allowed = {t.lower() for t in trusted}
+        cycle = self.data["cycle"]
+        if not isinstance(cycle.get("done"), list):
+            cycle.clear()
+            cycle.update({"started": self.now, "done": []})
         for repo in repos:
+            if repo in cycle["done"]:
+                continue
             try:
                 self._repo(gh, repo, allowed, bot)
             except (GitHubError, ValueError, KeyError, TypeError) as err:
                 _say("%s could not be read; its records stay: %s" % (repo, err))
+            except TargetReached:
+                if not self.unreadable:
+                    self.save()
+                _say("refresh carried over at %s; %d records kept"
+                     % (repo, len(self.data["records"])))
+                raise
+            cycle["done"].append(repo)
         for lane, until in (failed_audits or {}).items():
             at = float(until) - 86400
             self.data["audits"].setdefault("%s@%d" % (lane, int(at)), {"lane": lane, "at": at})
@@ -308,6 +350,9 @@ class Scorecard:
         self.scan_briefs()
         self.data["refreshed"] = self.now
         self.demote()
+        self.data["cycle"] = {}
+        _say("refresh completed at %s" % datetime.fromtimestamp(
+            self.now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     def _repo(self, gh: Any, repo: str, allowed: set, bot: str) -> None:
         data = gh.rest("GET", "/repos/%s/pulls?state=closed&sort=updated&direction=desc"
@@ -507,18 +552,41 @@ class Scorecard:
             got["audit damaging"] += damaging
         return rows
 
+    def _since(self, lane: str) -> float:
+        return max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
+
+    def _ours(self, lane: str) -> List[Mapping[str, Any]]:
+        """The window's records of a lane or a model (MODEL_KEY) since the
+        later of the window's start and its last clear."""
+        model = lane[len(MODEL_KEY):] if lane.startswith(MODEL_KEY) else None
+        since = self._since(lane)
+        return [record for record in self.data["records"].values()
+                if (record.get("model") == model if model
+                    else record.get("lane") == lane and not _model_bound(record))
+                and float(record.get("at") or 0) >= since]
+
+    def runs(self, lane: str) -> int:
+        """How many pull requests of a lane or a model the window holds."""
+        return len(self._ours(lane))
+
+    def over(self, lane: str) -> Tuple[bool, int, int, List[str]]:
+        """Whether a lane's bad outcomes reach both LOOM_LANE_DEMOTE_AT and
+        LOOM_LANE_DEMOTE_RATE of its runs; the count, the runs and what
+        they were. Bad outcomes with no run behind them (failed proof
+        audits) count as runs, so the rate never divides by fewer."""
+        count, what = self.bad(lane)
+        total = max(self.runs(lane), count)
+        hit = count >= threshold(self.env) and count >= rate(self.env) * total
+        return hit, count, total, what
+
     def bad(self, lane: str) -> Tuple[int, List[str]]:
         """The bad outcomes of a lane or a model (MODEL_KEY) since the later
         of the window's start and its last clear, and what they were."""
         model = lane[len(MODEL_KEY):] if lane.startswith(MODEL_KEY) else None
-        since = max(self.now - window(self.env), float(self.data["cleared"].get(lane) or 0))
+        since = self._since(lane)
         counts = {"bad-work findings": 0, "reverts": 0, "failed deploys": 0,
                   "failed proof audits": 0}
-        for record in self.data["records"].values():
-            ours = (record.get("model") == model if model
-                    else record.get("lane") == lane and not _model_bound(record))
-            if not ours or float(record.get("at") or 0) < since:
-                continue
+        for record in self._ours(lane):
             counts["bad-work findings"] += int(record.get("review") == BAD_WORK)
             counts["reverts"] += int(bool(record.get("reverted")))
             counts["failed deploys"] += int(bool(record.get("deploy_failed")))
@@ -631,10 +699,12 @@ class Scorecard:
         return False
 
     def demote(self) -> List[str]:
-        """Demote each lane whose bad outcomes reach the threshold; the
+        """Demote each lane whose bad outcomes reach the threshold and the
+        rate of its runs (over); the
         lanes newly demoted. Also demote lanes with zero done briefs when
         finished briefs reach the zero-done threshold."""
         at = threshold(self.env)
+        share = rate(self.env)
         days = window(self.env) // 86400
         zero_thresh = zero_done_threshold(self.env)
         newly = []
@@ -646,11 +716,21 @@ class Scorecard:
                     if done > 0:
                         self.data["demoted"].pop(lane, None)
                         _say("cleared zero-done demotion for lane %s: %d done briefs" % (lane, done))
+                elif isinstance(info, dict) and info.get("kind") == "bad-outcomes":
+                    # Re-scored on each completed refresh: once the bad
+                    # outcomes age out of the window, the demotion lifts.
+                    hit, count, total, _ = self.over(lane)
+                    if not hit:
+                        self.data["demoted"].pop(lane, None)
+                        _say("lifted demotion of lane %s: %d bad outcomes in %d runs in %d days, "
+                             "below LOOM_LANE_DEMOTE_AT=%d or LOOM_LANE_DEMOTE_RATE=%g"
+                             % (lane, count, total, days, at, share))
                 continue
-            count, what = self.bad(lane)
-            if count >= at:
-                why = ("%d bad outcomes in %d days (%s), at or past LOOM_LANE_DEMOTE_AT=%d"
-                       % (count, days, ", ".join(what), at))
+            hit, count, total, what = self.over(lane)
+            if hit:
+                why = ("%d bad outcomes in %d runs in %d days (%s), at or past "
+                       "LOOM_LANE_DEMOTE_AT=%d and LOOM_LANE_DEMOTE_RATE=%g"
+                       % (count, total, days, ", ".join(what), at, share))
                 self.data["demoted"][lane] = {"at": self.now, "why": why, "kind": "bad-outcomes"}
                 newly.append(lane)
                 _say("demoted lane %s: %s" % (lane, why))
@@ -669,6 +749,63 @@ class Scorecard:
         """Each demoted lane and why."""
         return {lane: str(info.get("why") or "demoted") for lane, info in
                 self.data["demoted"].items() if isinstance(info, dict)}
+
+    def demotion_lines(self, pending_only: bool = False) -> Dict[str, str]:
+        """Uncleared demotions, optionally only those awaiting a delivered notice.
+
+        Keeping all active entries in each digest includes the next summary
+        and every later summary, even after the demotion is a day old.
+        """
+        if self.unreadable:
+            return {} if pending_only else {"": "needs-a-person: " + self.unreadable}
+        receipts = self._notice_receipts() if pending_only else {}
+        result = {}
+        for lane, info in sorted(self.data["demoted"].items()):
+            if not isinstance(info, dict):
+                continue
+            if pending_only and receipts.get(lane) == self._demotion_event(info):
+                continue
+            reason = " ".join(str(info.get("why") or "reason unavailable").split())
+            result[lane] = ("needs-a-person: demoted %s: %s; after review, clear with "
+                            "`python3 -m bus.scorecard clear %s`"
+                            % (lane, reason, shlex.quote(lane)))
+        return result
+
+    @staticmethod
+    def _demotion_event(info: Mapping[str, Any]) -> Dict[str, Any]:
+        return {key: info.get(key) for key in ("at", "why", "kind")}
+
+    def _notice_receipts(self) -> Dict[str, Any]:
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        try:
+            with open(path) as fh:
+                receipts = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as err:
+            raise ValueError("demotion notice receipts cannot be read (%s)" % type(err).__name__) from None
+        if not isinstance(receipts, dict):
+            raise ValueError("demotion notice receipts do not hold an object")
+        return receipts
+
+    def notice_sent(self, lane: str) -> None:
+        """Record delivery separately; never rewrite routing state after a send.
+
+        A send followed by a crash before this receipt can still be retried.
+        """
+        # AI-REVIEW 2026-11-05 [GPT-6 Astra] demotion-race:
+        # A clear or replacement during network delivery must remain authoritative.
+        current = Scorecard(os.path.dirname(self.path), self.now, self.env)
+        event = self._demotion_event(self.data["demoted"][lane])
+        active = current.data["demoted"].get(lane)
+        if current.unreadable or not isinstance(active, dict) or self._demotion_event(active) != event:
+            return
+        receipts = self._notice_receipts()
+        receipts[lane] = event
+        path = os.path.join(os.path.dirname(self.path), NOTICE_FILE)
+        with open(path + ".tmp", "w") as fh:
+            json.dump(receipts, fh, sort_keys=True)
+        os.replace(path + ".tmp", path)
 
     def clear(self, lane: str) -> bool:
         """The operator clears a lane: it takes build tickets again, and its

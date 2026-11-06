@@ -364,7 +364,7 @@ class SensitiveResumeTests(unittest.TestCase):
         os.environ.pop("LOOM_BRIEF_AUTHORS", None)
         os.environ.pop("LOOM_TRUSTED_BRIEFERS", None)
 
-    def make_gh(self, entries):
+    def make_gh(self, entries, closed=()):
         prs = []
         details = {}
         for n, age, checks, _ in entries:
@@ -391,7 +391,8 @@ class SensitiveResumeTests(unittest.TestCase):
                 return reply(200, {"check_runs": runs})
             if path.startswith("/repos/%s/issues/" % REPO):
                 n = int(path.rsplit("/", 1)[1])
-                return reply(200, {"title": "Ticket%d" % n})
+                return reply(200, {"title": "Ticket%d" % n,
+                                   **({"state": "closed"} if n in closed else {})})
             if path == "/graphql":
                 query = json.loads(body)["query"]
                 n = int(query.split("pullRequest(number:")[1].split(")")[0])
@@ -407,6 +408,16 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertIn("%s#1 ticket %s#1 Ticket1 - PR1 - 3h old - 1 open review threads" %
                       (REPO, REPO), items[0])
+
+    def test_sensitive_resume_leaves_out_a_pull_request_whose_ticket_is_closed(self):
+        # loom#1923: a closed ticket's pull request was listed first in every
+        # resume; the next oldest takes its place under the cap.
+        entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
+        lines = brain._sensitive_resume_lines(self.make_gh(entries, closed={7}), [REPO],
+                                              self.NOW, {})
+        numbers = [int(line.split("#")[1].split()[0]) for line in lines
+                   if line.startswith("- resume sensitive")]
+        self.assertEqual([6, 5, 4, 3, 2], numbers)
 
     def test_sensitive_resume_is_capped_at_five_oldest_first(self):
         entries = [(n, 2 + n, "SUCCESS", True) for n in range(1, 8)]
@@ -522,6 +533,26 @@ class SensitiveResumeTests(unittest.TestCase):
         lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
         at = lines.index("### Sensitive pull requests")
         self.assertEqual(lines[at + 1], "- #4 Sensitive")
+
+    def test_status_leaves_out_a_sensitive_pull_request_whose_ticket_is_closed(self):
+        # loom#1923: pull request 1130's ticket was closed as not planned,
+        # and status listed it as sensitive in every tick for days.
+        ticket_issue = {"number": 4, "state": "closed", "state_reason": "not_planned",
+                        "labels": [{"name": "loom:ticket"}], "body": ""}
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                         "created_at": "2030-01-01T00:00:00Z"}]),
+            reply(200, [{"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work"},
+                         "labels": [{"name": "class:sensitive"}]}]),
+            reply(200, {"data": {"repository": {"p4": ready_node(),
+                                                "g1": {"comments": {"nodes": []}}}}}),
+            reply(200, []),
+            reply(200, ticket_issue)))
+        lines = brain.status(gh, [REPO], REPO, env={}, authors=()).splitlines()
+        at = lines.index("### Sensitive pull requests")
+        self.assertEqual(lines[at + 1], "- none")
+        pr_line = next(line for line in lines if line.startswith("- #4 "))
+        self.assertFalse(pr_line.endswith("READY"), pr_line)
 
     def test_status_blocks_a_sensitive_pr_with_a_neutral_review(self):
         pr = {"number": 4, "title": "Sensitive", "head": {"ref": "loom/4-work", "sha": "head1"},
@@ -1371,6 +1402,45 @@ class SensitiveResumeTests(unittest.TestCase):
         made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
         self.assertEqual(tickets.priority_of(made), "P1")
+
+    def test_brief_repair_marker_survives_ticket_rendering(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
+                    difficulty="medium", repairs_incident=7)
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        made.update(number=7, title="Repair")
+        self.assertIn("Repairs incident: #7\n", tickets.render_brief(REPO, made, "codex"))
+
+    def test_brief_cli_passes_repair_incident(self):
+        argv = ["brief", REPO, "--epic", "2", "--title", "Repair", "--file", "unused",
+                "--lane", "codex", "--repairs-incident", "7"]
+        with unittest.mock.patch.object(brain, "_read", return_value=BODY), \
+                unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                unittest.mock.patch.object(brain, "_check_live_criterion"), \
+                unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = brain.main(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(make.call_args.kwargs["repairs_incident"], 7)
+
+    def test_brief_refuses_invalid_repair_incident_before_writing(self):
+        for number in (0, -1, True, "#7"):
+            with self.subTest(number=number):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "repairs-incident"):
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Repair", BODY,
+                                "codex", repairs_incident=number)
+                self.assertEqual(fake.calls, [])
+
+    def test_repair_header_rejects_invalid_or_hidden_values(self):
+        for body in ("Repairs incident: 7\n\n" + BODY,
+                     "Repairs incident: #0\n\n" + BODY,
+                     "Repairs incident: #7\nRepairs incident: #8\n\n" + BODY,
+                     BODY + "\nRepairs incident: #7\n"):
+            with self.subTest(body=body):
+                with self.assertRaises(ValueError):
+                    tickets.parse(body)
 
     def test_brief_refuses_a_priority_outside_p0_to_p3(self):
         for bad in ("P4", "high", "p1"):
@@ -3786,6 +3856,37 @@ class EscalateTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 brain.escalate(GitHub("t", transport=fake), REPO, 9)
         self.assertNotIn("nothing to fix", str(caught.exception))
+
+    def claimed_ticket(self):
+        """A failed ticket with three attempts that the operator login ccqw
+        claimed (loom#2003): one of this Loom's own logins, so the ticket is
+        not owned elsewhere."""
+        issue = stuck_ticket("failed")
+        issue["labels"] = issue["labels"] + [{"name": "claim:ccqw"}]
+        return issue
+
+    def test_status_says_who_claimed_a_failed_ticket_instead_of_stuck(self):
+        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [self.claimed_ticket()]),
+                  ("GET", "/issues/9/events"): reply(200, TWICE),
+                  ("GET", "/issues/9/comments"): reply(200, [claim("2030-01-01T00:11:00Z"),
+                                                             fixc("2030-01-01T00:50:00Z")]),
+                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
+        routes.update(lanes_routes(()))
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              env={"LOOM_BRIEF_AUTHORS": "example-brain ccqw"})
+        line = next(l for l in report.splitlines() if l.startswith("- #9 "))
+        self.assertIn("claimed by ccqw", line)
+        self.assertNotIn("REPEATEDLY STUCK", report)
+        self.assertNotIn("next rung", report)
+
+    def test_escalate_refuses_a_ticket_a_person_claimed_and_writes_nothing(self):
+        fake = Routed(ticket_routes(self.claimed_ticket(), TWICE,
+                                    [claim("2030-01-01T00:11:00Z"), fixc("2030-01-01T00:50:00Z")]))
+        with unittest.mock.patch.dict(os.environ,
+                                      {"LOOM_BRIEF_AUTHORS": "%s ccqw" % BRAIN}):
+            with self.assertRaisesRegex(ValueError, "claim:ccqw"):
+                brain.escalate(GitHub("t", transport=fake), REPO, 9)
+        self.assertFalse([c for c in fake.calls if c[0] != "GET"])
 
     def test_escalate_refuses_a_ticket_that_is_not_repeatedly_stuck(self):
         issue = dict(stuck_ticket("failed"), created_at="2999-01-01T00:00:00Z")

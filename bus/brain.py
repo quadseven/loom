@@ -1349,9 +1349,26 @@ def _add_blocker(line: str, blocker: str) -> str:
             if line.endswith(" - READY") else line + ", " + blocker)
 
 
-def _sensitive_pr_lines(prs: List[Dict[str, Any]]) -> List[str]:
-    """The sensitive pull requests section for status."""
-    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"]
+def _ticket_closed(gh: Optional[GitHub], repo: str, pr: Dict[str, Any]) -> bool:
+    """Whether the pull request's ticket in this repo reads as closed: the
+    station closes such a pull request as superseded on its next pass, so
+    status and resume do not list it for review (loom#1923)."""
+    ticket = _safe_ticket_association(repo, pr)
+    if gh is None or ticket is None or ticket[0] != repo:
+        return False
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+    except GitHubError:
+        return False
+    return isinstance(issue, dict) and issue.get("state") == "closed"
+
+
+def _sensitive_pr_lines(prs: List[Dict[str, Any]], gh: Optional[GitHub] = None,
+                        repo: str = "") -> List[str]:
+    """The sensitive pull requests section for status, without one whose
+    ticket is closed (_ticket_closed)."""
+    sensitive = [pr for pr in prs if change_class.class_of(pr) == "sensitive"
+                 and not _ticket_closed(gh, repo, pr)]
     lines = ["### Sensitive pull requests"]
     lines += ["- #%s %s" % (pr["number"], pr.get("title", "")) for pr in sensitive] or ["- none"]
     return lines
@@ -1455,11 +1472,12 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
         lines.append("warning: work merges into %s; set Trunk: %s on the goal home" % (warn, warn))
     lines += _goal_lines(goals, data, now, authors, gh, repo, issues, shares) + [""]
     lines += runaway_lines(tickets) + [""]
-    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped)) + [""]
+    lines += _ticket_lines(tickets, now, _stuck_marks(histories, skipped,
+                                                      person_claims(tickets))) + [""]
     lines += held_lines(held, tickets)
     lines += [""] + _pull_request_lines(gh, repo, prs, data, bot, authors or (), check, caps,
                                         now, hold)
-    lines += [""] + _sensitive_pr_lines(prs)
+    lines += [""] + _sensitive_pr_lines(prs, gh, repo)
     lines += [""] + _waiting_brain_lines(tickets, pr_of, data, now, bot)
     lines += [""] + _past_rung_lines(past, pr_of, data, bot)
     lines += ["", ADOPT_HEADING]
@@ -3669,9 +3687,11 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
 
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
-                 after: Optional[str] = None, priority: Optional[str] = None) -> str:
+                 after: Optional[str] = None, priority: Optional[str] = None,
+                 repairs_incident: Optional[int] = None) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
-               (("After", after), ("Not before", not_before),
+               (("Repairs incident", "#%d" % repairs_incident if repairs_incident is not None else None),
+                ("After", after), ("Not before", not_before),
                 ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
@@ -3706,7 +3726,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           regresses: Optional[int] = None, after: Optional[str] = None,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
-          resolves: Optional[str] = None, intake_of: Optional[int] = None) -> str:
+          resolves: Optional[str] = None, intake_of: Optional[int] = None,
+          repairs_incident: Optional[int] = None) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -3746,6 +3767,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
 
     When the goal home names a Trunk branch and no explicit --base is given,
     the ticket uses that branch as its base."""
+    if repairs_incident is not None and (type(repairs_incident) is not int or repairs_incident < 1):
+        raise ValueError("repairs-incident must be a positive issue number")
     if model:
         # A forbidden model is written as its stand-in (tickets.allowed_model).
         model = tickets.allowed_model(model)
@@ -3780,10 +3803,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
                                       "Model": model, "Base": base, "After": after,
-                                      "Not before": not_before})
+                                      "Not before": not_before,
+                                      "Repairs incident": "#%d" % repairs_incident if repairs_incident is not None else None})
     if regresses is not None:
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue, epic)
@@ -6600,6 +6624,33 @@ def item_revision(gh: GitHub, repo: str, number: int) -> Optional[str]:
     return "%s-c%d" % (state.replace("loom:", ""), int(data.get("comments") or 0))
 
 
+def merge_hold(gh: GitHub, repo: str, number: int) -> str:
+    """merge_tier.lasting_hold for an open pull request as it reads now."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    return merge_tier.lasting_hold(_labels(issue), str((pr.get("head") or {}).get("ref") or ""),
+                                   pr.get("mergeable"))
+
+
+def _merge_holds(gh: GitHub, items: Sequence[handoff.Mark]) -> Dict[Tuple[str, int], str]:
+    """The merge items no brain can merge, with why (merge_hold), read side
+    by side. An item whose read fails is left as a resume item, as before."""
+    wanted = list(dict.fromkeys(m.item for m in items if m.stage == "merge"))
+
+    def read(item: Tuple[str, int]) -> str:
+        try:
+            return merge_hold(gh, *item)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            print("brain: merge hold of %s unread: %s" % (handoff.item_ref(item),
+                                                          _one_line(str(err), 200)),
+                  file=sys.stderr)
+            return ""
+
+    return {item: why for item, why in zip(wanted, _read_each(read, wanted), strict=True) if why}
+
+
 def _check_stage_item(gh: GitHub, stage: str, repo: str, number: int) -> None:
     issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
     names = _labels(issue)
@@ -6635,6 +6686,10 @@ def defer(gh: GitHub, stage: str, item: Tuple[str, int], holder: str,
     rev = item_revision(gh, *item)
     if rev is None:
         raise ValueError("only an open item is deferred")
+    held = merge_hold(gh, *item) if stage == "merge" else ""
+    if held:
+        raise ValueError("%s %s; no brain can merge it, so it is not deferred: leave it out "
+                         "of the deferred count" % (handoff.item_ref(item), held))
     key = (hashlib.sha256(" ".join(note.split()).encode("utf-8")).hexdigest()[:8]
            if stage == "brief" and note else None)
     return handoff.defer_marker(stage, item, rev, holder, note=note, key=key)
@@ -7073,6 +7128,7 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
     current, gone = _item_revisions(gh, items, unread or {}, faults)
     items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
+    held = _merge_holds(gh, [m for m in alive if latest[_mark_key(m)] == m])
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
     if skipped:
@@ -7080,7 +7136,8 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
                    % " ".join(skipped))
     out += [_skip_line(handoff.item_ref(item), reason) for item, reason in sorted(gone.items())]
     for m in items:
-        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item])
+        line = _resume_item_line(m, latest[_mark_key(m)], m in alive, current[m.item],
+                                 held.get(m.item, "") if m.stage == "merge" else "")
         if line:
             out.append(line)
     return out
@@ -7092,14 +7149,18 @@ def _mark_key(m: handoff.Mark) -> Tuple[str, Tuple[str, int], str]:
 
 
 def _resume_item_line(m: handoff.Mark, newest: handoff.Mark, alive: bool,
-                      revision: Optional[str]) -> Optional[str]:
+                      revision: Optional[str], hold: str = "") -> Optional[str]:
     """One standing defer's resume line: resumed while live, dropped once
-    done, closed or changed, and None when a newer defer replaced it."""
+    done, closed or changed, or held where no brain can merge it (`hold`,
+    merge_hold), and None when a newer defer replaced it."""
     if newest.kind == "defer" and newest != m:
         return None
     if newest.kind == "done":
         return "- dropped %s %s: finished or closed since the defer" % (
             m.stage, handoff.item_ref(m.item))
+    if alive and hold:
+        return "- dropped %s %s: %s; no brain can merge it, so do not defer it again" % (
+            m.stage, handoff.item_ref(m.item), hold)
     if alive:
         item_text = handoff.item_ref(m.item) + (": " + m.note if m.note else "")
         return "- resume %s %s (deferred by %s at %s)" % (m.stage, item_text, m.holder, m.at)
@@ -7225,15 +7286,22 @@ def _sensitive_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
     ready = list(ready)
     ready.sort(key=lambda item: (item["created"], item["repo"], int(item["pr"]["number"])))
     out = ["", "## Sensitive pull requests (up to %d, oldest first)" % SENSITIVE_RESUME_MAX]
-    for item in ready[:SENSITIVE_RESUME_MAX]:
+    listed = 0
+    for item in ready:
+        if listed >= SENSITIVE_RESUME_MAX:
+            break
         pr, ticket = item["pr"], item["ticket"]
-        title = str((gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}).get("title") or "")
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        if issue.get("state") == "closed":
+            continue  # the station closes it as superseded (loom#1923)
+        listed += 1
+        title = str(issue.get("title") or "")
         threads = (item["details"].get("reviewThreads") or {}).get("nodes") or []
         open_threads = sum(1 for thread in threads if not thread.get("isResolved"))
         out.append("- resume sensitive %s#%s ticket %s#%s %s - %s - %dh old - %d open review threads" % (
             item["repo"], pr["number"], ticket[0], ticket[1], title,
             pr.get("title", ""), _age(pr, now), open_threads))
-    return out if ready else out + ["- none"]
+    return out if listed else out + ["- none"]
 
 
 # How long resume reads before it stops and names the repos it did not reach
@@ -7793,10 +7861,8 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
 def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     """The rungs a ticket ran on, from rung markers by a trusted login only,
     as in the factory: anyone can comment on a public repo."""
-    from . import factory  # factory imports this module
-    trusted = {a.lower() for a in authors}
-    return factory.tried_rungs([c for c in comments if isinstance(c, dict) and str(
-        (c.get("user") or {}).get("login") or "").lower() in trusted])
+    from . import history  # the trusted history reading (loom#2457)
+    return history.read_history(comments, authors).tried_rungs
 
 
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
@@ -7811,10 +7877,12 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
-    fixes = sum(1 for body, _ in bodies if body.startswith(FIX_MARKER))
+    from . import history  # the trusted history reading (loom#2457)
+    read = history.read_history(comments, authors or trusted_authors())
+    fixes = read.fixes
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
-    rungs = _trusted_rungs(comments, authors or trusted_authors())
+    rungs = read.tried_rungs
     return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
                    rungs, held)
 
@@ -7846,7 +7914,7 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
     candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
-                         and owned_elsewhere(i) is None),
+                         and owned_elsewhere(i) is None and not tickets.claimed_by(i)),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
     read = candidates[:STATUS_HISTORY_MAX]
@@ -7856,9 +7924,21 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
             [int(i["number"]) for i in candidates[STATUS_HISTORY_MAX:]])
 
 
-def _stuck_marks(histories: Dict[int, History], skipped: List[int]) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets, and for those status skipped."""
-    marks: Dict[int, str] = {}
+def person_claims(found: Sequence[Dict[str, Any]]) -> Dict[int, str]:
+    """The stuck-state tickets a person claimed (a claim:<login> label), by
+    number, with the first login a claim names. A claimed ticket is that
+    person's work, not lane work: status never marks it stuck and escalate
+    never moves it (loom#2003)."""
+    return {int(i["number"]): tickets.claimed_by(i)[0] for i in found
+            if tickets.claimed_by(i) and any("loom:" + x in _labels(i) for x in STUCK_STATES)}
+
+
+def _stuck_marks(histories: Dict[int, History], skipped: List[int],
+                 claimed: Optional[Dict[int, str]] = None) -> Dict[int, str]:
+    """Marks for repeatedly stuck tickets, for those status skipped, and for
+    those a person claimed (person_claims), which carry no next rung."""
+    marks: Dict[int, str] = {n: " - claimed by %s" % login
+                             for n, login in (claimed or {}).items()}
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
@@ -8040,6 +8120,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     owner = owned_elsewhere(issue)
     if owner is not None:
         raise ValueError("#%d is held by %s; the ladder leaves it alone" % (number, owner))
+    claimed = tickets.claimed_by(issue)
+    if claimed:
+        raise ValueError("#%d carries claim:%s; a person's claimed work is not lane work, "
+                         "and the ladder leaves it alone" % (number, claimed[0]))
     if RUNAWAY in names:
         raise ValueError("ticket is held for runaway review")
     if issue.get("state") != "open" or "loom:ticket" not in names:
@@ -8137,6 +8221,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default="quadseven/loom"); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")
+    b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -8208,7 +8293,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
-                resolves=args.resolves))
+                resolves=args.resolves, repairs_incident=args.repairs_incident))
 
 
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:

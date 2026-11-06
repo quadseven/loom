@@ -1136,6 +1136,23 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertNotIn("repo-legacy-private", body)
         self.assertIn("issue 3 of another repo", body)
 
+    def test_a_first_build_body_writes_refs_through_the_fix_rounds_function(self):
+        # The first build and every fix round share bus/pr_repair.public_refs,
+        # so an owner-qualified ref to another repo reads the same in both
+        # (loom#2386). Built here: the literal fails this repo's leak scan.
+        other = "%s/%s#%d" % ("other", "repo", 5)
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user, as %s found." % other))
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertNotIn(other, body)
+        self.assertIn("as issue 5 of another repo found.", body)
+        script = RUNNER.read_text()
+        self.assertIn("from bus.pr_repair import public_refs", script)
+        self.assertNotIn("SCAN_REF_RE", script)
+
     def test_a_diff_naming_a_private_repo_with_this_repos_name_in_it_is_refused(self):
         # The body's own-repo Refs line is exempt, nothing else: private repos
         # named NAME-legacy-private exist beside public NAME repos.
@@ -2066,6 +2083,37 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                       "Thread PRRT_1 (comment 11) at a.py:3", round_note)
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
+    def test_a_run_whose_commits_net_to_no_change_opens_no_pull_request(self):
+        # loom#1637: a lane pull request with no changed files sat green in
+        # the review queue; there was nothing in it to check or merge.
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + (
+            "printf 'fixed\\n' > fix.txt\ngit add fix.txt\n"
+            "git -c user.name=t -c user.email=t@example.invalid commit -qm 'Fix the thing'\n"
+            "git -c user.name=t -c user.email=t@example.invalid revert --no-edit HEAD > /dev/null\n"))
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_nothing_pushed()
+        self.assertIn("no change to push", self.failure_line())
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_a_fix_round_that_empties_its_pull_request_closes_it(self):
+        name, _ = self.fix_brief()
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "rm first.txt\n")
+        result = self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        closes = [c for c in self.calls() if c.startswith("gh pr close 7 ")]
+        self.assertEqual(len(closes), 1, self.calls())
+        self.assertIn("no change to push", closes[0])
+        self.assertIn("no change to push", self.failure_line(ticket=name))
+        self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
+        self.assertFalse((self.inbox / "done" / (name + ".md")).exists())
+
+    def test_a_fix_round_that_leaves_a_change_keeps_its_pull_request_open(self):
+        self.fix_brief()
+        self.run_lane(FAKE_GH_EXISTING="7")
+        self.assertFalse([c for c in self.calls() if c.startswith("gh pr close")])
+
     def test_a_fix_round_comment_says_what_was_pushed_and_what_happens_next(self):
         # 2026-10-20: "Lane claude pushed fixes for: the findings on the
         # ticket" told the reader nothing about a round that merged main.
@@ -2304,6 +2352,22 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("[transient]", log)
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertNotIn("limit", beat.get("reason") or "")
+
+    def test_a_run_killed_with_sigterm_writes_no_month_long_provider_limit(self):
+        # loom#2683: a codex run killed with exit 143 had read text about a
+        # monthly usage limit, and the lane was held until the next month
+        # while its sibling slots ran agents.
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="say", FAKE_EXIT="143", FAKE_OUT=(
+            "docs/USAGE.md: a monthly usage limit holds the lane until the first of the month\n"
+            "Terminated"))
+        log = self.run_log()
+        self.assertNotIn("[limit]", log)
+        self.assertIn("[transient] agent exited 143", log)
+        self.assertFalse((self.loom / "state" / "usage" / "codex.provider-limit.json").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
+        self.assertNotIn("provider limit reached", beat.get("reason") or "")
+        self.assertLess(int(beat.get("retry_at") or 0), time.time() + 86400)
 
     def test_a_limit_word_in_a_tool_result_is_not_a_limit(self):
         # Two Spark lanes were held an hour as "provider limit reached": each
@@ -7481,6 +7545,91 @@ exec /usr/bin/git "$@"
         self.assertIn("Repo: example/repo", calls)
         self.assertIn("exit 2", calls)
 
+    def repair_incident(self, check="grep -qx fixed fix.txt", exit_code=1, **changes):
+        issue = {"state": "open", "labels": [{"name": "loom:factory"}],
+                 "body": "<!-- loom:factory-incident v1 -->\n\nRepo: example/repo\nKind: base-check\n"
+                         + "\ncheck: " + check + " (exit " + str(exit_code) + ")\n"}
+        issue.update(changes)
+        path = Path(self._tmp.name) / "repair-incident.json"
+        path.write_text(json.dumps(issue))
+        original = (self.bin / "gh").read_text()
+        self.write_tool(self.bin / "gh", original.replace(
+            'if [ "$1" = api ]; then',
+            'if [ "$1 $2" = "api repos/quadseven/loom/issues/7" ]; then cat "' + str(path) + '"; exit 0; fi\n'
+            'if [ "$1" = api ]; then', 1))
+
+    def run_red_repair(self, marker="Repairs incident: #7\n", fixed=True, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        check = "grep -qx fixed fix.txt" if fixed else "exit 2"
+        self.contract_repo(contract="interpreter: loom-test-python\ncheck: " + check + "\n")
+        self.drop_brief(text=BRIEF.replace("Difficulty: medium\n", "Difficulty: medium\n" + marker))
+        return self.run_contract_lane(**env)
+
+    def test_open_incident_repair_reaches_agent_and_requires_green_final_check(self):
+        self.repair_incident()
+        result = self.run_red_repair()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.lane_log())
+        self.assertIn("known baseline", self.lane_log())
+
+    def test_ordinary_ticket_remains_held_on_red_baseline(self):
+        self.repair_incident()
+        self.run_red_repair(marker="")
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertIn("failed: [factory]", self.lane_log())
+
+    def test_repair_with_red_final_check_fails_without_pr(self):
+        self.repair_incident(check="exit 2", exit_code=2)
+        self.run_red_repair(fixed=False)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def test_private_repair_uses_redacted_incident_alias(self):
+        aliases = self.loom / "state" / "incidents"
+        aliases.mkdir(parents=True, exist_ok=True)
+        (aliases / "example_repo.alias").write_text("1234abcd")
+        self.repair_incident(body="<!-- loom:factory-incident v1 -->\n\n"
+                             "Repo: private repo 1234abcd\nKind: base-check\n\n"
+                             "withheld: the lane log and the ticket have the detail")
+        result = self.run_red_repair(FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex") for c in self.calls()), self.lane_log())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.lane_log())
+
+    def test_repair_incident_guard_rejects_unrelated_or_unreadable_evidence(self):
+        function = re.search(r"^repair_baseline_allowed\(\) \{\n.*?^\}\n",
+                             RUNNER.read_text(), re.S | re.M).group(0)
+        valid = {"state": "open", "labels": [{"name": "loom:factory"}],
+                 "body": "<!-- loom:factory-incident v1 -->\nRepo: example/repo\nKind: base-check"}
+        cases = [valid, dict(valid, state="closed"), dict(valid, labels=[]),
+                 dict(valid, pull_request={}), dict(valid, body="unrelated"),
+                 dict(valid, body=valid["body"].replace("example/repo", "example/other")),
+                 dict(valid, body=valid["body"].replace("base-check", "environment")),
+                 dict(valid, body=valid["body"] + "\nKind: environment"),
+                 dict(valid, body=valid["body"] + "\nRepo: example/other"),
+                 [], None, "invalid"]
+        brief = Path(self._tmp.name) / "guard-brief"
+        brief.write_text("Repairs incident: #7\n")
+        script = (function + '\nfield() { echo "#7"; }\n'
+                  'incident_subject() { echo example/repo; }\n'
+                  'timeout() { shift; "$@"; }\n'
+                  'gh() { printf "%s" "$EVIDENCE"; }\n'
+                  'record() { :; }\nrepair_baseline_allowed\n')
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                result = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                                        env={**os.environ, "BRIEF": str(brief), "BASELINE_EXIT": "1",
+                                             "FACTORY_REPO": "quadseven/loom", "CHECK_TIMEOUT": "2",
+                                             "LOG": str(self.log), "EVIDENCE": json.dumps(evidence)})
+                self.assertEqual(result.returncode == 0, evidence == valid, result.stderr)
+
+    def test_closed_repair_incident_does_not_bypass_red_baseline(self):
+        self.repair_incident(state="closed")
+        self.run_red_repair()
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
     def test_a_base_check_red_once_and_green_on_a_second_run_files_no_incident(self):
         # Loom's own base check timed out once under a busy station's load,
         # held its ticket and filed a factory incident that the next ticket's
@@ -7914,6 +8063,31 @@ exec /usr/bin/git "$@"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("uv=1 secret=unset", log.read_text())
 
+    def test_contract_run_marks_the_check_sandbox_for_the_repos_tests(self):
+        # Base checks failed only in the lane sandbox, which denies localhost,
+        # on unittest suites that loopback-connect (2026-11-06). The check
+        # sets LOOM_CHECK_SANDBOX=1 so such a test can skip there; the
+        # runner's own value never reaches the check.
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run"))
+        tmp = Path(self._tmp.name)
+        fakes = tmp / "fakebin"
+        fakes.mkdir()
+        (fakes / "sandbox-exec").write_text('#!/bin/bash\nshift 2\nexec "$@"\n')
+        (fakes / "sandbox-exec").chmod(0o755)
+        (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
+        (fakes / "timeout").chmod(0o755)
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        log = tmp / "log"
+        env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
+               "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
+               "LOOM_CHECK_SANDBOX": "runner"}
+        result = subprocess.run(["bash", "-c", script, "test",
+                                 "echo marker=${LOOM_CHECK_SANDBOX:-unset}"],
+                                env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("marker=1", log.read_text())
 
     def test_contract_run_puts_uv_and_uvx_on_the_checks_path(self):
         # Every infra ticket held on the factory incident: the contract runs

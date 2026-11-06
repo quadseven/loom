@@ -2459,6 +2459,10 @@ contract_run() {
     # the scratch home, where agent_uv_cache copies them for a codex agent.
     export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
+    # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
+    # which denies localhost, so a test that needs a loopback connection can
+    # skip here and still run on CI (docs/LANES.md, "Validation").
+    export LOOM_CHECK_SANDBOX=1
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then
       input="$changed_list"
@@ -2570,6 +2574,40 @@ exclude_untracked() {
   done < <(safe_git ls-files -z --others --exclude-standard --directory)
 }
 
+# Only a named, open base-check incident for this repo admits a repair
+# past a red base. Private repos use the same opaque incident alias as
+# incident filing, without putting their name or check in public text.
+repair_baseline_allowed() {
+  local marker incident subject
+  [ "$BASELINE_EXIT" -gt 0 ] && [ "$BASELINE_EXIT" -lt 124 ] || return 1
+  [ "$(grep -c '^Repairs incident:' "$BRIEF")" = 1 ] || return 1
+  marker="$(sed -n 's/^Repairs incident: //p' "$BRIEF")"
+  [[ "$marker" =~ ^#[1-9][0-9]*$ ]] || return 1
+  subject="$(incident_subject)" || return 1
+  incident="$(timeout "$CHECK_TIMEOUT" gh api "repos/$FACTORY_REPO/issues/${marker#\#}" 2>>"$LOG")" || return 1
+  printf '%s' "$incident" | python3 -c '
+import json, sys
+try:
+    issue = json.load(sys.stdin)
+except (ValueError, TypeError):
+    sys.exit(1)
+if not isinstance(issue, dict):
+    sys.exit(1)
+body, labels = issue.get("body"), issue.get("labels")
+if not isinstance(body, str) or not isinstance(labels, list):
+    sys.exit(1)
+lines = body.splitlines()
+valid = (issue.get("state") == "open" and "pull_request" not in issue
+         and any(isinstance(label, dict) and label.get("name") == "loom:factory" for label in labels)
+         and "<!-- loom:factory-incident v1 -->" in lines
+         and [line for line in lines if line.startswith("Repo:")] == ["Repo: " + sys.argv[1]]
+         and [line for line in lines if line.startswith("Kind:")] == ["Kind: base-check"])
+sys.exit(0 if valid else 1)
+' "$subject" || return 1
+  echo "known baseline: repairing incident $marker; base check exited $BASELINE_EXIT; final check must pass" >> "$LOG"
+  record baseline-repair "$C_CHECK" "$BASELINE_EXIT" "$BASE" false "known baseline: incident $marker; final check must pass"
+}
+
 # Before the agent: interpreter, submodules, setup, then the check on the
 # current tree. A fix round checks the branch after merging the default
 # branch; a red result is compared with the default branch's own head.
@@ -2613,6 +2651,7 @@ prepare_validation() {
       return 1
     fi
     if [ "$BASELINE_EXIT" -ne 0 ]; then
+      repair_baseline_allowed && return 0
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
       note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
       return 1
@@ -2720,6 +2759,10 @@ prepare_validation() {
       fi
       BASELINE_EXIT="$DEFAULT_EXIT"
     fi
+    if [ -z "$changed" ] && [ -z "${DEFAULT_CHANGED:-}" ] && repair_baseline_allowed; then
+      exclude_untracked
+      return $?
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -2738,6 +2781,9 @@ final_base_tests() {
   }
   printf -v command '%q %q %q %q %q --timeout 120' \
     python3 "$helper" "$TREE" "$BASE" "$rev"
+  # A fix round merged the default branch after BASE was taken: tests and
+  # fixtures that came in with that merge are not the round's own.
+  [ -z "${FIX_UPSTREAM:-}" ] || printf -v command '%s --upstream %q' "$command" "$FIX_UPSTREAM"
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
@@ -2836,12 +2882,32 @@ final_validation() {
 # whose branch already held the default branch sets no FIX_UPSTREAM, so the
 # fetched default branch is the other end.
 lane_changed_files() {
-  local range="$BASE..HEAD" upstream="${FIX_UPSTREAM:-}"
+  safe_git diff --name-only "$(lane_diff_range)"
+}
+
+# The range lane_changed_files reads: BASE..HEAD, or UPSTREAM...HEAD against
+# the fix round's default branch.
+lane_diff_range() {
+  local upstream="${FIX_UPSTREAM:-}"
   if [ -z "$upstream" ] && [ -n "${FIX_PR:-}" ] && [ -n "${FIX_DEFAULT:-}" ]; then
     upstream="$(safe_git rev-parse --verify -q "origin/$FIX_DEFAULT^{commit}")" || upstream=""
   fi
-  [ -z "$upstream" ] || range="$upstream...HEAD"
-  safe_git diff --name-only "$range"
+  if [ -n "$upstream" ]; then printf '%s...HEAD' "$upstream"; else printf '%s..HEAD' "$BASE"; fi
+}
+
+# Whether the pull request would change nothing (loom#1637): a lane pull
+# request with no changed files passed every check, since there was nothing
+# to check, and sat green in the review queue. Returns 0 when the diff
+# lane_changed_files reads is empty, 1 when it holds a change, and 2 when it
+# cannot say: git failed, or a fix round has no default branch to compare
+# with (its BASE..HEAD is only this round's commits, not the pull request).
+lane_diff_empty() {
+  local range rc
+  range="$(lane_diff_range)"
+  [ -z "${FIX_PR:-}" ] || [[ "$range" == *...HEAD ]] || return 2
+  safe_git diff --quiet "$range" -- 2>> "$LOG"
+  rc=$?
+  case "$rc" in 0|1) return "$rc" ;; *) return 2 ;; esac
 }
 
 # The contract's affected command after the check passed (loom#1773): the
@@ -3991,7 +4057,7 @@ for BRIEF in "$INBOX"/*.md; do
   { [ -n "$TREE_STATUS" ] || [ "$TREE_HEAD" != "$BASE" ]; } && EDITED=edited
   # Only a run that failed or changed nothing is classed: a finished run's
   # summary may well mention rate limits.
-  FAIL_CLASS=work
+  FAIL_CLASS=work FAIL_REASON=""
   # The whole run output (from LOG_START), for the limit and credit patterns;
   # the short tail (its last five non-blank lines), kept for the reason shown
   # to people and for the auth/transient patterns (loom#934).
@@ -4000,6 +4066,14 @@ for BRIEF in "$INBOX"/*.md; do
   FAILURE_OUT="$(printf '%s\n' "$RUN_OUTPUT" | tail -n 5)"
   if [ "$STATUS" -ne 0 ] || [ -z "$EDITED" ]; then
     classify_failure "$STATUS" "$RUN_OUTPUT" "$EDITED" "$FAILURE_OUT"
+  fi
+  # A run killed with SIGTERM (exit 143) ended because something stopped it,
+  # not because the provider refused it: a limit phrase in its output came
+  # from what it read. Only the watchdog's own limit kill holds the lane. A
+  # codex run killed this way had read about a monthly limit and held the
+  # lane until the next month (loom#2683).
+  if [ "$STATUS" -eq 143 ] && [ "$FAIL_CLASS" = limit ] && [ ! -f "$LOCK/watchdog-limit" ]; then
+    FAIL_CLASS=transient RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON="killed by SIGTERM"
   fi
   [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
   # What ran and how it ended, so a green run that did nothing shows.
@@ -4037,7 +4111,7 @@ for BRIEF in "$INBOX"/*.md; do
     transient_clear
   elif REST_UNTIL="$(transient_strike)"; then
     heartbeat false "limit: $TRANSIENT_STRIKES transient failures in a row; lane rests until $(utc "$REST_UNTIL")" "$REST_UNTIL"
-    park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" transient
+    park "$BRIEF" "agent exited $STATUS${FAIL_REASON:+: $FAIL_REASON}$TIMEDOUT_NOTE" transient
     break
   fi
   if [ "$FAIL_CLASS" = limit ]; then
@@ -4107,7 +4181,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "agent exited $STATUS: $AUTH_WHY$TIMEDOUT_NOTE" auth
     break
   fi
-  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
+  if [ "$STATUS" -ne 0 ]; then park "$BRIEF" "agent exited $STATUS${FAIL_REASON:+: $FAIL_REASON}$TIMEDOUT_NOTE" "$FAIL_CLASS"; continue; fi
   if [ "$DELIVERABLE" = verify ]; then
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
@@ -4217,6 +4291,12 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   if [ "$BRANCH_HEAD" != "$BASE" ]; then
     COMMITTED=1
+  fi
+  # A new run whose commits net to no change opens no pull request and pushes
+  # no branch for one (loom#1637). A fix round is checked after its push,
+  # where the pull request's own diff is known.
+  if [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
+    park "$BRIEF" "no change to push: the commits on $BRANCH net to no diff against ${BASE:0:12}"; continue
   fi
   # A commit that adds files outside the brief is refused before validation
   # and push: nothing is pushed, and the reason names every stray file. A fix
@@ -4340,7 +4420,7 @@ for BRIEF in "$INBOX"/*.md; do
       fi
       compose_pr_body
       PR_BODY="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c \
-        'import sys; from bus.factory import SCAN_REF_RE; owner, name = sys.argv[1].lower().split("/", 1); f = lambda m: m.group(0) if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner else "issue %s of another repo" % m.group(3); print("\n".join(SCAN_REF_RE.sub(f, x) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
+        'import sys; from bus.pr_repair import public_refs; print("\n".join(public_refs(x, sys.argv[1]) for x in sys.stdin.read().splitlines()))' "$REPO")" || {
         park "$BRIEF" "could not prepare public repo PR text; nothing pushed" transient; continue
       }
       BODY_FILE="$(mktemp "$LOOM_HOME/run/$SLOT-leak-body.XXXXXX")"
@@ -4480,6 +4560,19 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     # The station reads this marker, not the log, to say the round pushed.
     : > "$LOGDIR/$TICKET.pushed"
     note_answer_head "$(safe_git rev-parse HEAD 2>> "$LOG")"
+  fi
+  # A fix round that leaves its pull request with no diff against the default
+  # branch closes it (loom#1637): an empty pull request is never mergeable
+  # work. The push goes first, so the closed pull request shows the round
+  # that emptied it. A close that fails is logged and the brief still parks.
+  if [ -n "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
+    EMPTY_WHY="no change to push: #$FIX_PR has no diff against ${FIX_DEFAULT:-its base} after this round"
+    if ! timeout "$NET_TIMEOUT" gh pr close "$FIX_PR" -R "$REPO" \
+         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge." >> "$LOG" 2>&1; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: could not close the empty pull request #$FIX_PR" >> "$LOG"
+      EMPTY_WHY="$EMPTY_WHY; closing it failed"
+    fi
+    park "$BRIEF" "$EMPTY_WHY"; continue
   fi
   if [ -n "$FIX_PR" ]; then
     UNANSWERED="$(unanswered_threads)"

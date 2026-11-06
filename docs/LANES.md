@@ -99,6 +99,11 @@ against the exact base commit's code in the check sandbox. It copies each
 changed test file into a temporary base tree, then runs each changed test by
 name: a `unittest.TestCase` method through unittest, a module-level
 `test_*` function through pytest when the tree has it, else by calling it.
+A changed test is one whose body differs from the base file's, or one that
+uses a module or helper-class name whose own value differs (`A, B = 1, 2` to
+`A, B, C = 1, 2, 3` changes only `C`). On a fix round that merged the
+default branch, what the head shares with that branch's file came in with
+the merge and is not the round's own.
 A test that passes on base, one that times out, or a module-level test that
 takes fixtures with no pytest to run it, blocks validation and names the
 test for the lane to fix. The archive and test run have bounded
@@ -155,6 +160,11 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
+  repo's test that needs a loopback connection may skip when that variable
+  is `1`, and only then; CI and local runs never set it, so the test still
+  runs there. A unittest repo has no other way to drop such a test from a
+  lane check.
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
   (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
@@ -465,7 +475,9 @@ A new App is easiest made from
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
-down or demoted (bus/scorecard.py). The same test picks every tier move,
+down or demoted (bus/scorecard.py: `LOOM_LANE_DEMOTE_AT` bad outcomes in
+the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
+requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
@@ -603,8 +615,11 @@ what it saw of the runner (its lock and the stamp's age).
 A failed or stalled
 ticket climbs, and past the last rung it is left `loom:failed` for the brain. Its
 open lane pull request is closed then, or on any later pass, as is one whose
-open ticket was rewritten as a newer ticket, each with one comment naming the
-ticket (loom#2027); a ticket still in a fix round keeps its pull request. Landing
+open ticket was rewritten as a newer ticket, or whose ticket was closed for any
+reason, each with one comment naming the ticket (loom#2027, loom#1923; a closed
+ticket's comment names its close reason); a ticket still in a fix round keeps
+its pull request. Until the station closes it, `bus.brain status` and `resume`
+leave a pull request whose ticket is closed out of their sensitive lists. Landing
 keeps the default branch green: a ready pull request behind its base lands as
 it stands when GitHub reports it mergeable and no rule on the base requires
 up-to-date branches; any other is brought up to date first (GitHub's
@@ -1211,6 +1226,20 @@ its ...s deadline without a clean finish`. The default sits above a daily
 metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
 its own (loom#1924).
 
+## Paused steps
+
+`LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
+of step method names, for example `triage_backlogs rewrite_triaged
+move_outside_tickets`. The station also reads names from
+`state/station/paused_steps.txt` (same form, any whitespace) and reads both
+again on every pass, so writing or emptying that file pauses or resumes a step
+with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
+comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
+pass and counts as done, so the rotation moves on and nothing carries over. A
+name that is not a pass step logs `unknown paused step <name>, ignored` and
+pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
+paused; the work a pass does before or after it always runs.
+
 ## Log watch
 
 Each station pass reads the lines each component added to its log since the
@@ -1563,6 +1592,12 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- A run killed with SIGTERM (exit 143) is a `[transient]` ending, never a
+  `[limit]`: a limit phrase in its output came from what it read, so it writes
+  no provider limit and no hold. Only the runner's own watchdog, which kills a
+  run after the provider's limit line, holds the lane. A codex run killed this
+  way had read about a monthly limit and held the lane until the next month
+  (loom#2683).
 - Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
   reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
   drops what is deprecated or paused, probes each candidate, and takes the first
@@ -1591,8 +1626,17 @@ cannot query the viewer or any other local service.
   `state/usage/go-budget.jsonl`.
 - A failed review on a Go or Zen slot demotes the model
   (`model:<id>` in the scorecard), not the slots: the picker skips it and the
-  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. Failed
-  proof audits and records with no model still demote the lane. Each brief for
+  slots go on. `python3 -m bus.scorecard clear model:<id>` clears it. The station
+  sends one `needs-a-person` notice per demotion with its findings and clear
+  command through the configured Discord report channel (bot or webhook).
+  Successful delivery is saved
+  separately in `demotion-notices.json`; failed delivery retries on the next
+  pass. A crash between delivery and saving the receipt can repeat the notice.
+  The existing `LOOM_REPORT_DIGEST_TIMES` digest lists uncleared demotions,
+  including those older than 24 hours. This does not publish a Buzz summary.
+  Clearing still requires the existing operator/peer approval; the notice
+  grants none. Failed proof audits and records with no model still demote the
+  lane. Each brief for
   these slots carries a `Demoted-Models:` line, so a runner without the
   scorecard file skips them too. An unreadable scorecard, or neither source,
   stops paid models and free models carry on.
@@ -1723,7 +1767,11 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zai` lane (Z.ai free Flash models),
 - the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
-  models); other Go models keep 0 to 30 days and take any repo.
+  models); other Go models keep 0 to 30 days and take any repo,
+- the `openrouter` and `workersai` lanes: the station's claim refuses a
+  private repo for every free lane (`bus/station.py` `needs_public_repo`),
+  and the factory reads the same rule (`bus/factory.py` `public_only`), so it
+  never offers them a private ticket (loom#2358).
 
 ## API lanes: zen, zai
 
