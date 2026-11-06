@@ -2990,6 +2990,18 @@ class Queued(Base):
         issue = self.gh.issues[7]
         self.assertEqual((factory._state(issue), self.lane(7)), ("briefed", "codex"))
         self.assertNotIn(factory.HANDOFF_LABEL, factory._labels(issue))
+        # The note names the lane the assignment just gave it.
+        self.assertIn("lane codex was free", self.gh.comments[7][-1]["body"])
+
+    def test_a_held_hand_off_ticket_stays_in_the_pool_though_a_lane_is_free(self):
+        # A free lane is not enough: the queued checks (here a person's ask)
+        # still hold it, and it keeps the label.
+        self.queued(7)
+        self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": labels.NEEDS_HUMAN}]
+        worker = self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", ""))
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+        self.assertEqual(worker.waits["%s#7" % REPO], "waits for a person (needs:human)")
 
     def test_a_hand_off_ticket_waits_behind_every_other_queued_ticket(self):
         self.queued(7, age=7200)
