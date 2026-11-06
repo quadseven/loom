@@ -5292,7 +5292,9 @@ class Station:
         state_names = ("queued", "briefed", "running", "pr", "ready", "answered", "failed",
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
-        kept = self._drop_claim(name for name in labels if name not in states)
+        kept = self._drop_claim(
+            name for name in labels
+            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
