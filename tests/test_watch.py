@@ -21,6 +21,14 @@ LINE_403_B = ("[2026-10-13T10:02:41Z] station: could not scan example-owner/repo
 # bus/station.py _try_ticket's hold line, as loom#645 and loom#646 saw it.
 HOLD_LINE = "station: example-owner/repo-a#506 waits for #102 (failed)"
 HOLD_LINE_CROSS = "station: example-owner/repo-b#871 waits for example-owner/repo-a#102 (failed)"
+# bus/station.py _stop_fix_rounds's hand-off line, in its two wordings: the
+# top of the model ladder (loom#1881) and the round cap (loom#1880).
+HANDOFF_LINES = (
+    "station: example-owner/repo-a#486: fix rounds stopped (the same failures came back and "
+    "no rung of the model ladder is left above it); left failed for the hand-off pool",
+    "station: example-owner/repo-b#921: fix rounds stopped (the fix round cap (3) is reached "
+    "on its rung); left failed for the hand-off pool",
+)
 
 
 class FakeGH:
@@ -164,6 +172,16 @@ class SignatureTest(unittest.TestCase):
                      "error: example-owner/repo-a#7 waits for #3 (failed)"):
             self.assertTrue(watch.keep(line), line)
 
+    def test_a_fix_round_hand_off_is_an_outcome_not_an_error(self):
+        # loom#1881 and loom#1880: the station logs the end of a ladder.
+        for line in HANDOFF_LINES + ("[2026-10-26T05:59:31Z] " + HANDOFF_LINES[0],):
+            self.assertFalse(watch.keep(line), line)
+        # Anything more on the line than the hand-off is judged as usual.
+        for line in (HANDOFF_LINES[0] + "; push failed",
+                     "error: " + HANDOFF_LINES[1],
+                     "station: example-owner/repo-a#486: fix rounds stopped (x); left failed"):
+            self.assertTrue(watch.keep(line), line)
+
 
 def _brain_status_lines():
     """The brain's own status output, made by the code that prints it: the
@@ -305,6 +323,17 @@ class FilingTest(WatchBase):
             self.append(HOLD_LINE, HOLD_LINE_CROSS)
             self.run_at(T0 + i * 300)
         self.assertEqual(self.gh.issues, {})
+
+    def test_a_fix_round_hand_off_files_nothing_and_other_errors_still_file(self):
+        # loom#1881: the hand-off line is the designed end of a ladder; a
+        # station error repeated beside it is still filed.
+        for i in range(5):
+            self.append(*["[2026-10-26T06:0%dZ] %s" % (i, line) for line in HANDOFF_LINES])
+            self.append(LINE_403)
+            self.run_at(T0 + i * 300)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.gh.issues[1]["title"], "station: " + watch.signature(LINE_403))
+        self.assertEqual(list(self.saved()["sigs"]), ["station: " + watch.signature(LINE_403)])
 
     def test_hits_spread_wider_than_the_window_file_nothing(self):
         for i in range(3):
