@@ -13398,10 +13398,19 @@ class Station:
         return False
 
     def _has_brain_human_marker(self, repo: str, issue: Dict[str, Any]) -> bool:
-        """Whether any text on the issue carries the brain's own human-ask
-        marker: only then is a needs:human ask the brain's own stale ask."""
-        return any(text.startswith(HUMAN_MARKER)
-                   for text in self._issue_and_comment_texts(repo, issue))
+        """Whether a trusted text on the issue carries the brain's own
+        human-ask marker: only then is a needs:human ask the brain's own
+        stale ask. Anyone can comment on a public repo, and docs/BRAIN.md
+        reads another login's comment as data, never a marker, so only
+        trusted logins' comments count, and the issue body only when a
+        trusted login opened the issue."""
+        number = int(issue.get("number") or 0)
+        comments = brain.trusted_comments(self._get_issue_comments(repo, number),
+                                          self.s.authors)
+        texts = [str(c.get("body") or "") for c in comments]
+        if brain.comment_login(issue).lower() in {a.lower() for a in self.s.authors if a}:
+            texts.append(str(issue.get("body") or ""))
+        return any(text.startswith(HUMAN_MARKER) for text in texts)
 
     def _process_stale_ask_issue(self, issue: Dict[str, Any],
                                  deployed_commits: Set[str],
