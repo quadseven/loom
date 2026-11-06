@@ -3417,7 +3417,13 @@ class Factory:
                     self._operator_send_back(repo, issue, comments)
                 except RateLimited:
                     raise
-                except (GitHubError, OSError, ValueError) as err:
+                except ValueError as err:
+                    # A refusal is not transient: retried every pass it would
+                    # wait forever with only a log line, so it is rejected
+                    # on the ticket once and the answer settles.
+                    self._reject_operator_review(repo, issue, comments,
+                                                 "the fix round was refused (%s)" % err)
+                except (GitHubError, OSError) as err:
                     _say("%s#%d: send back could not be applied; answer remains pending (%s)" %
                          (repo, number, type(err).__name__))
                     continue

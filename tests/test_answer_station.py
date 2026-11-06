@@ -146,6 +146,28 @@ class FactoryVerdict(Base):
                 self.last_factory._settle_answers(REPO)
         self.assertIn(answer.ANSWERED_LABEL, self.labels())
 
+    def test_a_send_back_the_fix_path_refuses_is_rejected_visibly_once(self):
+        # A refusal (ValueError from the fix writer) is not transient: left
+        # pending, the answer would be retried every pass forever with only a
+        # log line. It is rejected on the ticket once, and the batch settles.
+        self.held()
+        self.gh.pulls[50]["head"]["sha"] = "a" * 40
+        self.answer("Send back")
+        current = answer.latest_ask(self.gh.comments[5], [OP])
+        current['id'] = 1
+        self.gh.comments[5][-1]["body"] += (
+            "\n\nReview target: #50 " + "a" * 40 + " ask=" + answer.review_ask_key(current))
+        refusal = ValueError("the ticket is not waiting on its pull request")
+        with mock.patch.object(self.last_factory, "_open_round", side_effect=refusal):
+            self.last_factory._settle_answers(REPO)
+            self.last_factory._settle_answers(REPO)
+        self.assertEqual(self.fixed, [])
+        self.assertNotIn(answer.ANSWERED_LABEL, self.labels())
+        self.assertIn("needs:human", self.labels())
+        notes = [c for c in self.gh.comments[5] if "loom:review-rejected" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("not waiting on its pull request", notes[0]["body"])
+
     def test_stale_send_back_is_recorded_once_without_poisoning_later_answers(self):
         self.held()
         self.answer("Send back")
