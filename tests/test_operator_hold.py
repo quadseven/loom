@@ -432,6 +432,7 @@ def brain_routes(body, files, patches):
         # The pull request's own comments: no fleet hold on it (loom#2393).
         "/repos/%s/issues/8/comments" % BRAIN_REPO: [],
         "/repos/%s/issues/9" % BRAIN_REPO: ticket,
+        "/repos/%s/compare/main...checked" % BRAIN_REPO: {"behind_by": 0},
         "/repos/%s/contents/.github/workflows/sync.yml" % BRAIN_REPO: {
             "content": base64.b64encode(SYNC_WORKFLOW.encode()).decode()},
         "/repos/%s/contents/.github/workflows" % BRAIN_REPO: [{"name": "sync.yml"}],

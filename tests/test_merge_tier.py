@@ -321,6 +321,7 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
         "/repos/%s/issues/9" % REPO: ticket,
         "threads": pages if pages is not None else (None if threads is None
                                                      else [list(threads)]),
+        "/repos/%s/compare/main...checked" % REPO: {"behind_by": 0},
         "/repos/%s/compare/abc1234...main" % REPO: {"status": carried},
         "/repos/%s/compare/abc1234...checked" % REPO: {"status": "ahead"},
         "/repos/%s/commits/abc1234" % REPO: {"files": commit_files or []},

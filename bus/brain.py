@@ -4849,10 +4849,10 @@ def _refuse_behind_overlap(gh: GitHub, repo: str, number: int,
                            pr: Dict[str, Any]) -> None:
     """Refuse a behind pull request whose own hunks overlap the base
     changes it lacks (loom#2622), the factory's test in bus/hunk_overlap.py
-    applied before the merge call. A payload with no base ref or head to
-    compare by, and a compare that cannot be read, never hold the merge:
-    the factory's landing pass applies the same test with the full
-    payload, and a check that cannot read never holds a merge."""
+    applied before the merge call. A payload with no base ref or head has
+    nothing to compare by; a compare that cannot be read refuses the
+    merge, as the factory updates first when this read fails: an unknown
+    overlap is no ground for a merge."""
     base = str((pr.get("base") or {}).get("ref") or "")
     head = str((pr.get("head") or {}).get("sha") or "")
     if not base or not head:
@@ -4863,8 +4863,10 @@ def _refuse_behind_overlap(gh: GitHub, repo: str, number: int,
         if int(data.get("behind_by") or 0) <= 0:
             return
         overlap = hunk_overlap.pr_overlaps_base(gh, repo, number, base, head)
-    except GitHubError:
-        return
+    except GitHubError as err:
+        raise ValueError("blocked: the hunk overlap of #%d could not be "
+                         "read (%s); update it before merging"
+                         % (number, err)) from err
     if overlap:
         raise ValueError("blocked: #%d overlaps its base; update it before "
                          "merging" % number)

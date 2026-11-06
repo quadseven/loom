@@ -1017,6 +1017,21 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "PUT" and "/pulls/8/" in c[1]
                              for c in fake.calls))
 
+    def test_merge_refuses_when_the_overlap_compare_cannot_be_read(self):
+        # loom#2622: an unknown overlap is no ground for a merge; the
+        # factory updates first when this read fails, and so does merge.
+        body = self._criteria_pr("built")
+        pr, query = self._merge_replies({"pr": {
+            "body": body, "base": {"ref": "main", "repo": {"full_name": REPO}}}})
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                             {"name": "loom:pr"}]}
+        fake = Fake(pr, query, reply(200, issue),
+                    reply(500, {"message": "compare unavailable"}))
+        with self.assertRaisesRegex(ValueError, "could not be read"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any(c[0] == "PUT" and "/pulls/8/" in c[1]
+                             for c in fake.calls))
+
     def test_merge_passes_a_live_or_after_deploy_box(self):
         for box in ("Live: the endpoint answers before and after the merge",
                     "Recheck the counter after the deploy, before the next merge"):
