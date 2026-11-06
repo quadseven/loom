@@ -153,12 +153,16 @@ bwrap_profile() {
 
 # The ports an API-lane agent may connect to, space-separated: 443, its
 # provider's HTTPS API (and the CLI's own catalogue and package fetches, and
-# GitHub for the brain's spark rung), plus on the spark lane the port of
-# SPARK_URL (its scheme's default when the URL names none). A spark URL with
-# no usable port is refused, which refuses the sandbox.
+# GitHub for the brain's spark rung), plus on spark and free lanes the port of
+# SPARK_URL (its scheme's default when the URL names none). An endpoint URL
+# with no usable port is refused, which refuses the sandbox.
 provider_ports() {
-  local rest port=""
-  [ "$LANE" = spark ] || { printf '443'; return 0; }
+  local rest port="" endpoint=spark
+  case "$LANE" in
+    spark) ;;
+    free) endpoint="free endpoint" ;;
+    *) printf '443'; return 0 ;;
+  esac
   case "$SPARK_URL" in
     https://*) port=443 ;;
     http://*) port=80 ;;
@@ -167,7 +171,7 @@ provider_ports() {
   rest="${rest%%/*}"
   if [ -n "$port" ] && [ "${rest%:*}" != "$rest" ]; then port="${rest##*:}"; fi
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -le 65535 ] ||
-    { echo "refusing sandbox: no usable port in the spark URL $SPARK_URL" >&2; return 1; }
+    { echo "refusing sandbox: no usable port in the $endpoint URL" >&2; return 1; }
   [ "$port" = 443 ] && printf '443' || printf '443 %s' "$port"
 }
 

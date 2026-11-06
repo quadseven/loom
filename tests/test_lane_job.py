@@ -177,7 +177,8 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual((self.job / "app-key.pem").read_text(), "value-of/x/app\n")
         for path in (ssm / "x" / "oc", deny, self.job / "app-key.pem"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        masked = "".join(l for l in printed.splitlines(True) if not l.startswith("::add-mask::"))
+        masked = "".join(line for line in printed.splitlines(True)
+                          if not line.startswith("::add-mask::"))
         self.assertNotIn("/x/", masked)
         self.assertNotIn("value-of", masked)
         self.assertIn("::add-mask::value-of/x/oc", printed)
@@ -299,6 +300,27 @@ class LaneJobTest(unittest.TestCase):
         pub = subprocess.run(["openssl", "pkey", "-in", str(priv), "-pubout"], check=True,
                              capture_output=True, text=True).stdout
         (self.job / "report-key.pem").write_text(pub)
+
+    def test_report_secret_is_private_at_creation(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+        self.real_key()
+        job = self.load()
+        secret = self.job / "report-secret"
+        modes = []
+        original_open = os.open
+
+        def observe_open(path, flags, mode=0o777):
+            fd = original_open(path, flags, mode)
+            if os.fspath(path) == str(secret):
+                modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+
+        env = {"LOOM_JOB_DIR": str(self.job), "LOOM_JOB_EVENT": str(self.event),
+               "GITHUB_ACTIONS": "true"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(job.os, "open", side_effect=observe_open):
+            job.report()
+        self.assertEqual(modes, [0o600])
 
     def test_sealing_drops_the_runs_mac_key(self):
         self.assertEqual(self.step("prepare").returncode, 0)

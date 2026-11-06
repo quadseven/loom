@@ -155,6 +155,18 @@ class AgentSandboxTest(unittest.TestCase):
                            if line.startswith('(allow network-outbound (remote ip "*:')]
                 self.assertEqual(allowed, ports)
 
+    def test_a_free_lane_also_reaches_its_gateway_port(self):
+        cases = {"http://gateway.example.invalid:8080/v1": ["443", "8080"],
+                 "http://gateway.example.invalid/v1": ["443", "80"],
+                 "https://gateway.example.invalid:9443/v1": ["443", "9443"],
+                 "https://gateway.example.invalid/v1": ["443"]}
+        for url, ports in cases.items():
+            with self.subTest(url=url):
+                profile = self.profile("api", lane="free", SPARK_URL=url)
+                allowed = [line.split('"*:')[1].split('"')[0] for line in profile.splitlines()
+                           if line.startswith('(allow network-outbound (remote ip "*:')]
+                self.assertEqual(allowed, ports)
+
     def test_a_spark_url_without_a_usable_port_is_refused(self):
         for url in ("http://spark.example.invalid:0/v1", "http://spark.example.invalid:70000/v1",
                     "http://spark.example.invalid:/v1", "spark.example.invalid:8000"):
@@ -324,8 +336,9 @@ class AgentSandboxTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("codesign"), "needs codesign")
     def test_the_real_codesign_tells_a_hardened_binary_from_a_plain_one(self):
         agy = self.fake_agy()
-        sign = lambda *flags: subprocess.run(["codesign", "-f", "-s", "-", *flags, str(agy)],
-                                             check=True, capture_output=True)
+        def sign(*flags):
+            return subprocess.run(["codesign", "-f", "-s", "-", *flags, str(agy)],
+                                  check=True, capture_output=True)
         sign("-o", "runtime")
         ok = self.agy_profile_result(agy, codesign="real", **self.agent_env)
         self.assertEqual(ok.returncode, 0, ok.stderr)
