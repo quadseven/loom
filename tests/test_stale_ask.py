@@ -287,6 +287,130 @@ class TestStaleAskDetection(unittest.TestCase):
         )
         self.assertEqual(withdrawn, 1)
 
+    def test_needs_human_without_marker_survives_sweep(self):
+        """A person's needs:human request that carries no brain marker is
+        not the brain's own ask: the sweep must leave it, its labels and
+        its thread exactly as they were."""
+        issue = {
+            "number": 123,
+            "state": "open",
+            "title": "Test issue",
+            "body": "Kind: credential. Rotate the token and say when it is done.",
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "labels": [
+                {"name": "loom:ticket"},
+                {"name": "loom:failed"},
+                {"name": "needs:human"}
+            ],
+            "comments": 0,
+        }
+
+        self.gh.paginate.side_effect = None
+        self.gh.paginate.return_value = []
+
+        withdrawn = self.station._check_and_withdraw_stale_asks(
+            [issue], set(), set(), 0
+        )
+        self.assertEqual(withdrawn, 0)
+
+        write_calls = [call for call in self.station.gh.rest.call_args_list
+                       if call[0][0] in ("POST", "PATCH")]
+        self.assertEqual(write_calls, [])
+        labels = [label["name"] for label in issue["labels"]]
+        self.assertEqual(labels, ["loom:ticket", "loom:failed", "needs:human"])
+
+    def test_needs_human_with_brain_marker_stale_when_is_withdrawn(self):
+        """A needs:human ask that does carry the brain's own marker is a
+        brain-owned ask, so the sweep still withdraws it once its
+        stale-when condition is met."""
+        from bus.brain import HUMAN_MARKER
+        commit_sha = "7d7a163"
+        comment_body = "%s\nRotate the token\nstale-when: commit %s live" % (
+            HUMAN_MARKER, commit_sha)
+
+        issue = {
+            "number": 123,
+            "state": "open",
+            "title": "Test issue",
+            "body": comment_body,
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "labels": [
+                {"name": "needs:human"}
+            ],
+        }
+
+        self.gh.paginate.side_effect = lambda path, **kw: [
+            {"body": comment_body}
+        ] if "comments" in path else []
+
+        withdrawn = self.station._check_and_withdraw_stale_asks(
+            [issue], {commit_sha}, set(), 0
+        )
+        self.assertEqual(withdrawn, 1)
+        labels = [label["name"] for label in issue["labels"]]
+        self.assertNotIn("needs:human", labels)
+
+    def test_withdrawal_leaves_exactly_one_state_label(self):
+        """Withdrawing an eligible stale ask replaces the state label it
+        carried instead of adding a second one beside it."""
+        from bus import label_pass
+        issue = {
+            "number": 123,
+            "state": "open",
+            "title": "Test issue",
+            "body": "Just a random comment\nNo stale-when line",
+            "repository": {
+                "full_name": "owner/repo"
+            },
+            "labels": [
+                {"name": "loom:ticket"},
+                {"name": "loom:failed"},
+                {"name": "needs:login"}
+            ],
+            "comments": 0,
+        }
+
+        self.gh.paginate.side_effect = None
+        self.gh.paginate.return_value = []
+
+        withdrawn = self.station._check_and_withdraw_stale_asks(
+            [issue], set(), set(), 0
+        )
+        self.assertEqual(withdrawn, 1)
+
+        labels = [label["name"] for label in issue["labels"]]
+        self.assertNotIn("needs:login", labels)
+        states = [name for name in labels if name in label_pass.STATE_LABELS]
+        self.assertEqual(states, ["loom:queued"])
+
+    def test_forced_sweep_respects_24h_throttle(self):
+        """Both forced call sites run _check_stale_asks(0, force=True) on
+        every rotation; the persisted last-run time must still throttle
+        them to one sweep per 24 hours."""
+        self.station.state = os.path.join(self.state, "station_state")
+        calls = []
+
+        def deployed():
+            calls.append(1)
+            return set(), set()
+
+        self.station._get_deployed_items = deployed
+        self.station._open_needs_issues = lambda: []
+
+        self.station._check_stale_asks(0, force=True)
+        self.assertEqual(len(calls), 1)
+
+        self.station._check_stale_asks(0, force=True)
+        self.assertEqual(len(calls), 1)
+
+        self.station.now += 90000
+        self.station._check_stale_asks(0, force=True)
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
