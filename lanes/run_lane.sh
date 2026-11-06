@@ -2459,6 +2459,10 @@ contract_run() {
     # the scratch home, where agent_uv_cache copies them for a codex agent.
     export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
+    # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
+    # which denies localhost, so a test that needs a loopback connection can
+    # skip here and still run on CI (docs/LANES.md, "Validation").
+    export LOOM_CHECK_SANDBOX=1
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then
       input="$changed_list"
