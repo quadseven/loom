@@ -475,6 +475,12 @@ ROLL_SIGNAL_EVERY = 3600
 ROLL_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}")
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
+# Compare answers by "repo commit revision" for two full commit SHAs: whether
+# one carries the other never changes, so each pair is asked once (loom#2357).
+# A 404 or an answer with no status is never kept; the oldest go past the cap.
+COMPARES_FILE = "compares.json"
+COMPARES_MAX = 2000
+COMPARE_STATUSES = ("ahead", "identical", "behind", "diverged")
 SHIP_PATH_FILES = "ship_path_files.json"
 SHIP_PATH_MANUAL = "ship_path_manual.json"
 # The pull request files API returns at most this many files.
@@ -2198,6 +2204,8 @@ class Station:
         self._due: Optional[List[str]] = None
         self._scans: Dict[str, Any] = {}
         self._seen: Dict[str, set] = {}
+        # Compare answers kept across passes (_carries), read on first use.
+        self._compare_memo: Optional[Dict[str, Any]] = None
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, read once a pass.
@@ -6788,14 +6796,43 @@ class Station:
 
     def _carries(self, repo: str, commit: str, revision: str) -> bool:
         """The commit is the revision or one of its ancestors in the repo on
-        GitHub (the compare API); an unknown commit is not."""
+        GitHub (the compare API); an unknown commit is not. An answer for two
+        full commit SHAs is read from and kept in COMPARES_FILE."""
+        key = "%s %s %s" % (repo, commit, revision)
+        fixed = bool(COMMIT_RE.fullmatch(commit) and COMMIT_RE.fullmatch(revision))
+        known = self._compares().get(key) if fixed else None
+        if isinstance(known, bool):
+            return known
         resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
                             ok=(404,))
         data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
-        return data.get("status") in ("ahead", "identical")
+        status = data.get("status")
+        if fixed and status in COMPARE_STATUSES:
+            self._keep_compare(key, status in ("ahead", "identical"))
+        return status in ("ahead", "identical")
+
+    def _compares(self) -> Dict[str, Any]:
+        """The kept compare answers, read once a pass."""
+        if self._compare_memo is None:
+            saved = _read_json(os.path.join(self.state, COMPARES_FILE), {}, strict=False)
+            self._compare_memo = saved if isinstance(saved, dict) else {}
+        return self._compare_memo
+
+    def _keep_compare(self, key: str, carried: bool) -> None:
+        memo = self._compares()
+        memo[key] = carried
+        for old in list(memo)[:max(0, len(memo) - COMPARES_MAX)]:
+            del memo[old]
+        try:
+            _write_json(os.path.join(self.state, COMPARES_FILE), memo)
+        except OSError as err:
+            _say("could not save compare answers: %s" % err)
 
     def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
                         left: List[int]) -> bool:
+        # Nothing more moves this pass: read nothing for the pin (loom#2357).
+        if left[0] <= 0:
+            return False
         commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (source, short),
                               ok=(404, 422))
         revision = str((commit.data or {}).get("sha") or "") \

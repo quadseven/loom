@@ -283,6 +283,29 @@ class Bisect(Base):
         self.assertIn("fix-forward", later)
         self.assertIn("git revert --no-edit %s" % sha("m1"), self.revert_tickets()[0]["body"])
 
+    def test_a_runner_path_in_the_check_output_is_scrubbed_from_the_fix_forward(self):
+        """loom#2646: runner logs carry absolute paths; quoted raw, the brief
+        failed the written-text check and the repo's pass stopped."""
+        self.green_base()
+        failed = run("red", ago=2400)
+        failed["app"] = {"slug": "github-actions"}
+        failed["output"] = {"title": "1 failed", "summary": "see /home/runner/work/x/y.py:3"}
+        self.gh.annotations[1] = [{"annotation_level": "failure", "message":
+                                    "AssertionError in /Users/runner/work/loom/tests/t.py"}]
+        self.gh.logs["https://example.com/log/1"] = (
+            "Traceback\n  File \"/Users/runner/work/loom/loom/bus/x.py\", line 9\n"
+            "##[error]exit 1\n")
+        self.gh.merge("m1", 41, 4, failed, ago=2500)
+        out = self.go()
+        self.assertNotIn("absolute path", out)
+        self.assertIn("fix-forward", out)
+        (brief,) = [i["body"] for i in self.gh.filed]
+        self.assertIn("AssertionError in <path>", brief)
+        self.assertIn("File \"<path>", brief)
+        self.assertIn("see <path>", brief)
+        self.assertNotIn("/Users/", brief)
+        self.assertNotIn("/home/", brief)
+
     def test_check_also_red_before_merge_files_one_factory_ticket_without_revert(self):
         self.green_base()
         self.gh.commit("before", run("red", ago=4000, name="nightly invariants"), ago=4100)
