@@ -2199,7 +2199,7 @@ class Factory:
         issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
                           "model ladder to rung %d, %s on lane %s." % (
-                              RUNG_MARKER % rung, head, why, rung, model, lane))
+                              history.rung_marker(rung), head, why, rung, model, lane))
         self.load[lane] = self.load.get(lane, 0) + 1
         return lane
 
@@ -4721,7 +4721,7 @@ class Factory:
         self._status_note(repo, number,
                           "%s\nThe station gave this queued ticket lane %s with model %s in "
                           "place of %s (equivalent: %s)." % (
-                              EQUIVALENT_MARKER % model, lane, model, pinned, why))
+                              history.equivalent_marker(model), lane, model, pinned, why))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         issue["body"] = with_model(str(issue.get("body") or ""), model)
@@ -4821,7 +4821,7 @@ class Factory:
         issue["body"] = body
         self._status_note(repo, number, "%s\nNot a failure (no lane took it for %.0f hours: %s): "
                           "the factory rerouted this ticket to rung %d, %s on lane %s." % (
-                              RUNG_MARKER % rung, age / 3600, reason, rung, model, lane))
+                              history.rung_marker(rung), age / 3600, reason, rung, model, lane))
         if state == "queued":
             self._assign_queued_one(repo, issue, lane, "%s, rerouted to model %s" % (
                 difficulty_of(issue), model))
