@@ -325,6 +325,45 @@ def _test_nodes(tree: ast.Module) -> List[Tuple[str, ast.AST]]:
     return found
 
 
+def _bind_name(found: Dict[str, str], name: str, dump: str) -> None:
+    found[name] = found.get(name, "") + "\n" + dump
+
+
+def _tuple_values(target: ast.expr, value: Optional[ast.expr]) -> List[Optional[ast.expr]]:
+    """Each element of a tuple target paired with its own value, or None."""
+    elts = getattr(target, "elts", [])
+    items = value.elts if isinstance(value, (ast.Tuple, ast.List)) else []
+    if len(items) != len(elts) or any(isinstance(item, ast.Starred)
+                                      for item in items + elts):
+        return [None] * len(elts)
+    return list(items)
+
+
+def _bind(found: Dict[str, str], target: ast.expr, value: Optional[ast.expr],
+          whole: str) -> None:
+    """Record each name a target binds, with its own value where one pairs."""
+    if isinstance(target, ast.Name):
+        _bind_name(found, target.id, ast.dump(value) if value is not None else whole)
+    elif isinstance(target, ast.Starred):
+        _bind(found, target.value, None, whole)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for item, own in zip(target.elts, _tuple_values(target, value)):
+            _bind(found, item, own, whole)
+
+
+def _bind_scope(found: Dict[str, str], body: Sequence[ast.stmt]) -> None:
+    """Record the names one module or class scope declares."""
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("test") and not _is_test_class(node):
+                _bind_name(found, node.name, ast.dump(node))
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                _bind(found, target, node.value, ast.dump(node.value))
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            _bind(found, node.target, None, ast.dump(node))
+
+
 def _declarations(source: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Fixture names and test functions of a file, each with its AST.
 
@@ -335,42 +374,12 @@ def _declarations(source: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     so moved code is unchanged.
     """
     fixtures: Dict[str, str] = {}
-    tests: Dict[str, str] = {}
-
-    def add(name: str, dump: str) -> None:
-        fixtures[name] = fixtures.get(name, "") + "\n" + dump
-
-    def bind(target: ast.expr, value: Optional[ast.expr], whole: str) -> None:
-        if isinstance(target, ast.Name):
-            add(target.id, ast.dump(value) if value is not None else whole)
-        elif isinstance(target, ast.Starred):
-            bind(target.value, None, whole)
-        elif isinstance(target, (ast.Tuple, ast.List)):
-            items = value.elts if isinstance(value, (ast.Tuple, ast.List)) else None
-            paired = (items is not None and len(items) == len(target.elts)
-                      and not any(isinstance(item, ast.Starred)
-                                  for item in items + target.elts))
-            for index, item in enumerate(target.elts):
-                bind(item, items[index] if paired and items else None, whole)
-
-    def scope(body: Sequence[ast.stmt]) -> None:
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if not node.name.startswith("test") and not _is_test_class(node):
-                    add(node.name, ast.dump(node))
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    bind(target, node.value, ast.dump(node.value))
-            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-                bind(node.target, None, ast.dump(node))
-
     tree = ast.parse(source)
+    _bind_scope(fixtures, tree.body)
     for node in tree.body:
-        scope([node])
         if isinstance(node, ast.ClassDef) and not _is_test_class(node):
-            scope(node.body)
-    for key, node in _test_nodes(tree):
-        tests[key] = ast.dump(node)
+            _bind_scope(fixtures, node.body)
+    tests = {key: ast.dump(node) for key, node in _test_nodes(tree)}
     return fixtures, tests
 
 
