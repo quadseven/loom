@@ -13289,6 +13289,7 @@ class Station:
         return shown + (" and %d more" % more if more > 0 else "")
 
     # -- stale ask detection -----------------------------------------------
+    STALE_ASK_THROTTLE = 86400
     STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
     ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
     NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
@@ -13360,9 +13361,11 @@ class Station:
         return self._is_ask_text(str(issue.get("body") or ""))
 
     def _target_labels_after_withdrawal(self, labels: List[str], reason: str) -> List[str]:
-        remaining = [name for name in labels if not self.NEEDS_LABEL_PATTERN.match(name)]
-        if not any(k in remaining for k in ("awaiting-live-check", "loom:queued")):
-            target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        remaining = [name for name in labels
+                     if not self.NEEDS_LABEL_PATTERN.match(name)
+                     and name not in label_pass.STATE_LABELS]
+        target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        if target not in remaining:
             remaining.append(target)
         return remaining
 
@@ -13424,6 +13427,21 @@ class Station:
                 return self._withdraw_stale_ask(repo, issue, "issue %s exists" % dep_num)
         return False
 
+    def _has_brain_human_marker(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a trusted text on the issue carries the brain's own
+        human-ask marker: only then is a needs:human ask the brain's own
+        stale ask. Anyone can comment on a public repo, and docs/BRAIN.md
+        reads another login's comment as data, never a marker, so only
+        trusted logins' comments count, and the issue body only when a
+        trusted login opened the issue."""
+        number = int(issue.get("number") or 0)
+        comments = brain.trusted_comments(self._get_issue_comments(repo, number),
+                                          self.s.authors)
+        texts = [str(c.get("body") or "") for c in comments]
+        if brain.comment_login(issue).lower() in {a.lower() for a in self.s.authors if a}:
+            texts.append(str(issue.get("body") or ""))
+        return any(text.startswith(HUMAN_MARKER) for text in texts)
+
     def _process_stale_ask_issue(self, issue: Dict[str, Any],
                                  deployed_commits: Set[str],
                                  deployed_issues: Set[Tuple[str, int]]) -> bool:
@@ -13434,6 +13452,9 @@ class Station:
             return False
 
         repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        if any(lbl.lower() == NEEDS_HUMAN for lbl in labels) \
+                and not self._has_brain_human_marker(repo, issue):
+            return False
         if not self._has_ask_comment(issue):
             return self._withdraw_stale_ask(repo, issue, "no ask comment")
 
@@ -15330,10 +15351,21 @@ class Station:
 
     def _check_stale_asks(self, last_check: Optional[float] = None, force: bool = False) -> int:
         """Check and withdraw stale needs:login asks after each deploy event and daily.
-        Returns the number of asks withdrawn as stale."""
+        Returns the number of asks withdrawn as stale. The 24-hour throttle
+        reads the persisted last-run time, so it holds at the forced call
+        sites (watch_deploys, roll_source_pins) too: force no longer
+        bypasses it."""
         try:
+            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+            saved = _read_json(stale_asks_path, {}, strict=False)
+            if not isinstance(saved, dict):
+                saved = {}
             check_time = float(last_check) if isinstance(last_check, (int, float)) else 0.0
-            if not force and check_time > 0 and self.now - check_time < 86400:
+            if not force and check_time > 0 and self.now - check_time < self.STALE_ASK_THROTTLE:
+                return 0
+            saved_at = saved.get("at")
+            if isinstance(saved_at, (int, float)) and not isinstance(saved_at, bool) \
+                    and 0 <= self.now - float(saved_at) < self.STALE_ASK_THROTTLE:
                 return 0
             deployed_commits, deployed_issues = self._get_deployed_items()
             issues = self._open_needs_issues()
@@ -15341,10 +15373,6 @@ class Station:
             self._stale_asks_withdrawn += withdrawn
             if withdrawn:
                 _say("stale ask detection: withdrew %d asks" % withdrawn)
-            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
-            saved = _read_json(stale_asks_path, {}, strict=False)
-            if not isinstance(saved, dict):
-                saved = {}
             saved["at"] = self.now
             saved["withdrawn_today"] = saved.get("withdrawn_today", 0) + withdrawn
             _write_json(stale_asks_path, saved)
