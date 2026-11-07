@@ -748,6 +748,11 @@ print('leak guard: clean (shape patterns only)')
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
+            # The factory and infra-public repos are settings now
+            # (loom#2584): this harness's fakes serve them under these
+            # names, so it configures exactly those.
+            "LOOM_FACTORY_REPO": "quadseven/loom",
+            "LOOM_INFRA_PUBLIC_REPO": "quadseven/infra-public",
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
@@ -7398,6 +7403,24 @@ exec /usr/bin/git "$@"
         body = Path(f"{self.body}.issue").read_text()
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
+
+    def test_an_incident_with_no_factory_setting_files_on_the_checkouts_origin(self):
+        # Most lane services set only LOOM_REPOS: with none of
+        # LOOM_FACTORY_REPO, LOOM_SELF_REPO or LOOM_STATUS_REPO the
+        # incident goes to the repo this checkout runs from, never to an
+        # empty --repo that fails into the log alone.
+        origin = subprocess.run(["git", "-C", str(RUNNER.parent.parent), "remote", "get-url",
+                                 "origin"], capture_output=True, text=True).stdout.strip()
+        expected = re.sub(r"\.git$", "", origin).rstrip("/")
+        expected = "/".join(re.split(r"[:/]", expected)[-2:])
+        self.assertRegex(expected, r"^[^/]+/[^/]+$")
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_FACTORY_REPO="", LOOM_SELF_REPO="",
+                                        LOOM_STATUS_REPO="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh issue create --repo %s " % expected, self.log.read_text())
+        self.assertIn("factory incident %s#99" % expected, self.lane_log())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_parsing_contract_closes_its_open_incident(self):

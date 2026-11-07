@@ -59,11 +59,22 @@ from . import naming
 from . import notify
 from . import review_debt
 from . import shadow
+from . import stale_claims
 from . import text as _text
 from . import tickets
 from . import watch
 from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
+
+def person_claim(labels: Iterable[str], ours: Iterable[str]) -> bool:
+    """Whether a claim label is a person's claim: a claim:<login> label that
+    names none of `ours`, this Loom's own logins (the set stale_claims and
+    the station use). The station's own claim is its lane claim, not a
+    person's (AGENTS.md, Claims). Decided from the station's logins, never
+    from the owner of the repo the issue lives in: a repo owned by another
+    account must not make the station's claim foreign (loom#2584)."""
+    return bool(stale_claims.claim_labels_not_ours(labels, ours))
+
 
 DAY = 24 * 3600
 CLEAR_AFTER = 6 * 3600
@@ -1859,16 +1870,15 @@ class Filer:
                 continue
             ticket = number in self._ticketed
             labels = self._label_names(self._issue(number) or {}) if ticket else []
-            person_claim = any(label.startswith("claim:") and label != "claim:quadseven"
-                               for label in labels)
+            person = person_claim(labels, self.authors)
             ticket_state = tickets.ticket_state({"labels": [{"name": n} for n in labels]})
             rewritten_idle = (ticket_state in ("queued", "briefed", "failed", "answered")
                               and not any(label.startswith("needs:") for label in labels))
-            if person_claim:
+            if person:
                 self.say("invariants: left rewritten ticket %s#%d open: held by a person"
                          % (self.repo, number))
             if number in self._busy and not (ticket and invariant == "lane-pr-stalled"
-                                              and rewritten_idle and not person_claim):
+                                              and rewritten_idle and not person):
                 # Rewritten into work something has in hand: its own path
                 # closes it. An idle one settles like the issue it was
                 # (loom#2506: five whose pull requests had closed held goal

@@ -1,0 +1,256 @@
+"""Repository targets and settings are configuration (loom#2584).
+
+A fresh clone must not act on the original owner's repositories or labels
+because a literal in the code said so: every repository or label the code
+acts on is read from a setting, and every operator-facing LOOM_* setting
+the code reads is named in .env.example. These tests pin that at the
+public seams: the sweep's repo list, the send-back comparison's home
+repo, the brain's lock and lanes repo defaults, the dispatcher's default
+repo, the invariants person-claim rule, and the .env.example catalogue.
+"""
+
+import os
+import re
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "dispatch"))
+
+from bus import __main__ as bus_main  # noqa: E402
+from bus import brain, home_repo, invariants, send_back, sweep  # noqa: E402
+import dispatcher  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# The operator-facing settings the audit on #2584 found read by Python.
+PYTHON_SETTINGS = (
+    "LOOM_BACKLOG_SOURCE", "LOOM_DASHBOARD_TZ", "LOOM_DEPLOY_CHECK",
+    "LOOM_MUSE_BUILD_LOGIN", "LOOM_OPENCODE_GO_MODELS_URL",
+    "LOOM_RUNNER_REPO", "LOOM_VIEWER_PORT",
+)
+# The operator-facing settings the audit found read by the lane scripts.
+LANE_SETTINGS = (
+    "LOOM_AGENT_TIMEOUT", "LOOM_AGY_BIN", "LOOM_AGY_CODESIGN",
+    "LOOM_AGY_HOME", "LOOM_AGY_ONLY_MODEL", "LOOM_AGY_RUNAS",
+    "LOOM_AGY_USER", "LOOM_ANTHROPIC_MODEL", "LOOM_APP_TOKEN_CMD",
+    "LOOM_BRAIN_FABRIC_ASK", "LOOM_CLONE_BASE", "LOOM_CODEX_ONLY_MODEL",
+    "LOOM_DEPLOY_BRANCH", "LOOM_EGRESS_PROBE_SECONDS", "LOOM_MUSE_MODEL",
+    "LOOM_NET_TIMEOUT", "LOOM_OPENCODE_GO_MODEL", "LOOM_OPENCODE_GO_3_MODEL",
+    "LOOM_OPENCODE_GO_4_MODEL", "LOOM_OPENCODE_GO_PROBE_URL",
+    "LOOM_OPENROUTER_MODEL", "LOOM_REWRITE_FREE_COOLDOWN",
+    "LOOM_REWRITE_FREE_TIMEOUT", "LOOM_REWRITE_FREE_URL",
+    "LOOM_REWRITE_OPENCODE", "LOOM_REWRITE_TIMEOUT", "LOOM_SHA256SUM_DIRS",
+    "LOOM_SPARK_3_URL", "LOOM_STATION_WAIT", "LOOM_VIEWER",
+    "LOOM_WATCHDOG_POLL", "LOOM_WORKERSAI_MODEL", "LOOM_ZAI_MODEL",
+    "LOOM_ZEN_MODEL",
+)
+# Settings this change adds.
+NEW_SETTINGS = ("LOOM_SWEEP_REPOS", "LOOM_FACTORY_REPO", "LOOM_INFRA_PUBLIC_REPO",
+                "LOOM_SEND_BACK_REPO")
+# Set by one Loom script for another, or by tests: not operator settings,
+# so .env.example names them in a comment instead of as keys.
+INTERNAL_SETTINGS = ("LOOM_BRAIN_NOW", "LOOM_BRAIN_WAIT_STEP", "LOOM_POD_ONCE")
+
+
+class SweepReposTest(unittest.TestCase):
+    def test_sweep_repos_come_from_the_sweep_setting(self):
+        env = {"LOOM_SWEEP_REPOS": "example-owner/one, example-owner/two"}
+        self.assertEqual(sweep.sweep_repos(env),
+                         ("example-owner/one", "example-owner/two"))
+
+    def test_the_fleet_setting_does_not_widen_the_sweep(self):
+        # LOOM_REPOS is every repo the fleet serves; the sweep claims, closes
+        # and rewrites issues, so it acts only where LOOM_SWEEP_REPOS says.
+        env = {"LOOM_REPOS": "example-owner/one example-owner/two"}
+        self.assertEqual(sweep.sweep_repos(env), ())
+
+    def test_no_setting_means_no_sweep_repos(self):
+        self.assertEqual(sweep.sweep_repos({}), ())
+
+
+class SendBackRepoTest(unittest.TestCase):
+    def test_the_target_is_the_explicit_setting(self):
+        self.assertEqual(send_back.repo({"LOOM_SEND_BACK_REPO": " example-owner/target "}),
+                         "example-owner/target")
+
+    def test_no_setting_falls_back_to_nothing(self):
+        # The ticket number is one deployment's: neither the home repo nor
+        # the origin may stand in for an unset target.
+        env = {"LOOM_SELF_REPO": "example-owner/self",
+               "LOOM_STATUS_REPO": "example-owner/status"}
+        with mock.patch.object(home_repo, "origin_repo", return_value="example-owner/clone"):
+            self.assertEqual(send_back.repo(env), "")
+            self.assertEqual(send_back.repo({}), "")
+
+
+class PersonClaimTest(unittest.TestCase):
+    OURS = ["example-operator", "example-station[bot]"]
+
+    def test_a_station_login_claim_is_not_a_person_claim_in_any_repo(self):
+        # Decided from the station's own logins, never the repo's owner: a
+        # repo owned by someone else must not make the station's claim foreign.
+        self.assertFalse(invariants.person_claim(["claim:example-operator"], self.OURS))
+        self.assertFalse(invariants.person_claim(["claim:Example-Station[bot]"], self.OURS))
+
+    def test_a_claim_named_for_the_repo_owner_is_foreign_unless_it_is_ours(self):
+        self.assertTrue(invariants.person_claim(["claim:example-owner"], self.OURS))
+
+    def test_any_other_claim_is_a_person_claim(self):
+        self.assertTrue(invariants.person_claim(["claim:someone-else"], self.OURS))
+        self.assertTrue(invariants.person_claim(
+            ["claim:example-operator", "claim:someone-else"], self.OURS))
+
+    def test_no_claim_label_is_not_a_person_claim(self):
+        self.assertFalse(invariants.person_claim(["loom:ticket"], self.OURS))
+
+
+class ParserDefaultsTest(unittest.TestCase):
+    ENV = {"LOOM_STATUS_REPO": "example-owner/status",
+           "LOOM_SELF_REPO": "example-owner/self"}
+
+    def test_brain_lock_repo_default_is_the_status_setting(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            args = brain.parser().parse_args(["step", "--show"])
+        self.assertEqual(args.lock_repo, "example-owner/status")
+
+    def test_brain_lanes_repo_default_is_the_self_setting(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            args = brain.parser().parse_args(["status", "example-owner/one"])
+        self.assertEqual(args.lanes_repo, "example-owner/self")
+
+    def test_bus_lock_repo_default_is_the_status_setting(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            args = bus_main._parser().parse_args(
+                ["journal", "example-owner/one" + "#1", "--file", "x"])
+        self.assertEqual(args.lock_repo, "example-owner/status")
+
+    def test_no_setting_means_this_checkouts_origin(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(home_repo, "origin_repo", return_value="example-owner/clone"):
+            args = brain.parser().parse_args(["step", "--show"])
+            lanes = brain.parser().parse_args(["status", "example-owner/one"])
+        self.assertEqual(args.lock_repo, "example-owner/clone")
+        self.assertEqual(lanes.lanes_repo, "example-owner/clone")
+
+    def test_an_empty_setting_reads_as_unset(self):
+        # The installed plists carry LOOM_STATUS_REPO and LOOM_SELF_REPO
+        # as empty strings when the operator set neither.
+        with mock.patch.dict(os.environ, {"LOOM_STATUS_REPO": "", "LOOM_SELF_REPO": ""},
+                             clear=True), \
+                mock.patch.object(home_repo, "origin_repo", return_value="example-owner/clone"):
+            args = brain.parser().parse_args(["step", "--show"])
+        self.assertEqual(args.lock_repo, "example-owner/clone")
+
+    def test_no_setting_and_no_origin_means_no_default_repo(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(home_repo, "origin_repo", return_value=""):
+            args = brain.parser().parse_args(["step", "--show"])
+        self.assertEqual(args.lock_repo, "")
+
+
+class ActingBrainGuardTest(unittest.TestCase):
+    def test_a_write_with_no_lock_repo_is_refused_not_unguarded(self):
+        # check_acting_brain keeps a fleet brain from writing while another
+        # holds the lock; with no lock repo to read it from, the write is
+        # refused instead of going ahead unguarded.
+        ran = []
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(home_repo, "origin_repo", return_value=""), \
+                mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                mock.patch.object(brain, "check_acting_brain",
+                                  side_effect=lambda *a, **k: ran.append("guard")), \
+                mock.patch.dict(brain.COMMANDS, {"close": lambda gh, args: ran.append("close")}), \
+                mock.patch("sys.stderr") as err:
+            code = brain.main(["close", "example-owner/one#1"])  # leak-guard-allow: test target
+        self.assertEqual(code, 1)
+        self.assertEqual(ran, [])
+        said = "".join(c.args[0] for c in err.write.call_args_list if c.args)
+        self.assertIn("no lock repo", said)
+
+    def test_a_write_with_a_lock_repo_runs_the_guard_first(self):
+        ran = []
+        with mock.patch.dict(os.environ, {"LOOM_STATUS_REPO": "example-owner/status"},
+                             clear=True), \
+                mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                mock.patch.object(brain, "check_acting_brain",
+                                  side_effect=lambda gh, repo, *a, **k: ran.append(repo)), \
+                mock.patch.dict(brain.COMMANDS, {"close": lambda gh, args: ran.append("close")}), \
+                mock.patch("sys.stderr"):
+            code = brain.main(["close", "example-owner/one#1"])  # leak-guard-allow: test target
+        self.assertEqual(code, 0)
+        self.assertEqual(ran, ["example-owner/status", "close"])
+
+
+class DispatcherDefaultTest(unittest.TestCase):
+    def test_a_ticket_without_a_repo_uses_the_status_setting(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ticket = root / "T042-fix.md"
+            ticket.write_text("# T042: Fix\n\n## Why\nBroken.\n")
+            with mock.patch.dict(os.environ,
+                                 {"LOOM_STATUS_REPO": "example-owner/self"}):
+                with mock.patch.object(dispatcher, "BRIEFS", root / "briefs"):
+                    brief = dispatcher.render_brief(ticket, "codex").read_text()
+        self.assertIn("Repo: example-owner/self\n", brief)
+
+
+class EnvExampleTest(unittest.TestCase):
+    def setUp(self):
+        self.text = (ROOT / ".env.example").read_text()
+        self.keys = set(re.findall(r"^(LOOM_[A-Z0-9_]+)=", self.text, re.M))
+
+    def test_every_operator_facing_setting_is_a_key(self):
+        missing = [name for name in PYTHON_SETTINGS + LANE_SETTINGS + NEW_SETTINGS
+                   if name not in self.keys]
+        self.assertEqual(missing, [])
+
+    def test_internal_settings_are_named_as_internal_in_a_comment(self):
+        comments = "\n".join(line for line in self.text.splitlines()
+                             if line.lstrip().startswith("#"))
+        for name in INTERNAL_SETTINGS:
+            self.assertIn(name, comments)
+        self.assertIn("internal", comments.lower())
+
+
+class BrainRungSweepSettingTest(unittest.TestCase):
+    def test_the_brain_rung_receives_the_sweep_repos_setting(self):
+        # The sweep runs inside the brain's sandboxed rung, which sees only
+        # the names in BRAIN_SETTINGS: without LOOM_SWEEP_REPOS there the
+        # sweep reads no repos and silently stops.
+        text = (ROOT / "lanes" / "mac" / "brain.sh").read_text()
+        lines = [ln for ln in text.splitlines() if ln.strip().startswith("BRAIN_SETTINGS=")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("LOOM_SWEEP_REPOS", lines[0])
+
+
+class NoOwnerLiteralTest(unittest.TestCase):
+    """No code line in the touched modules carries the original owner's
+    repo as a string literal the code acts on."""
+
+    FILES = ("bus/invariants.py", "bus/send_back.py", "bus/sweep.py",
+             "bus/__main__.py", "bus/brain.py", "bus/app.py",
+             "bus/station.py", "dispatch/dispatcher.py")
+
+    def test_no_owner_repo_literal_in_code(self):
+        bad = []
+        for name in self.FILES:
+            for number, line in enumerate(
+                    (ROOT / name).read_text().splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                if re.search(r"""["']quadseven/""", line) or "github.com/quadseven" in line:
+                    bad.append("%s:%d" % (name, number))
+        self.assertEqual(bad, [])
+
+    def test_the_lane_script_factory_repo_is_a_setting(self):
+        text = (ROOT / "lanes" / "run_lane.sh").read_text()
+        self.assertNotIn("\nFACTORY_REPO=quadseven/", text)
+        self.assertIn("LOOM_FACTORY_REPO", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
