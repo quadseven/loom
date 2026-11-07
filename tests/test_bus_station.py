@@ -11710,6 +11710,19 @@ class TranscriptUploadTest(Base):
         self.go()
         self.assertEqual(len(self.sent), 1)
 
+    def test_an_oserror_reading_the_token_skips_the_pass_and_retries_next_pass(self):
+        def unreadable(name, region):
+            raise OSError("could not read %s with %s" % (name, UPLOAD_TOKEN))
+
+        self.go()
+        self.finish()
+        log = self.go(read_secret=unreadable)
+        self.assertIn("could not read the transcript token parameter (OSError)", log)
+        self.assertNotIn(UPLOAD_TOKEN, log)
+        self.assertNotIn("anthropic-2/T1", self.ledger())
+        self.go()
+        self.assertEqual(len(self.sent), 1)
+
     def test_the_token_is_read_only_when_there_is_something_to_send(self):
         self.go()
         self.go()
