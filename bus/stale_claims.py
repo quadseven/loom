@@ -162,6 +162,13 @@ def without_own_claim(names: Iterable[str], ours: Iterable[str]) -> list:
                     and str(n)[len(CLAIM_PREFIX):].strip().lower() in mine)]
 
 
+def claim_labels_not_ours(names: Iterable[str], ours: Iterable[str]) -> list:
+    """The claim:<login> labels in `names` that name none of `ours`: another
+    login's claim, which this Loom never takes for its own."""
+    kept = without_own_claim(names, ours)
+    return [n for n in kept if str(n).lower().startswith(CLAIM_PREFIX)]
+
+
 def own_claims(issue: Dict[str, Any], ours: Iterable[str]) -> Dict[str, str]:
     """{login: the claim label naming it} for each claim:<login> label on the
     issue naming one of `ours` (this Loom's own logins). Empty on outside
