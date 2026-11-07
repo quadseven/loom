@@ -39,6 +39,12 @@ Guards, in the order they apply:
   LOOM_LIVE_EVIDENCE_REPOS;
 - a SQL statement is one SELECT or SHOW (live_proof.sql_refusal), checked
   when the step is parsed and again here, just before it runs;
+- a repo with no manifest of its own may be lent another opted-in repo's LOG
+  command, never its sql, when the operator pairs them in
+  LOOM_LIVE_EVIDENCE_LENDS (`borrower=lender`, see `lends` and `logs_only`):
+  the lender's manifest and script are read from the lender's default branch,
+  and the pair counts only while the lender is itself in
+  LOOM_LIVE_EVIDENCE_REPOS; any other repo gets nothing;
 - the child gets a minimal environment (PATH, HOME, LANG, TMPDIR) plus only
   the variables the operator names in LOOM_LIVE_EVIDENCE_PASS_ENV, such as a
   read-only kubeconfig, never the station's GitHub or cloud credentials;
@@ -114,6 +120,33 @@ def opted_in(raw: str) -> List[str]:
     """LOOM_LIVE_EVIDENCE_REPOS: the owner/name repos, comma or space
     separated, whose adapters the station may run."""
     return [r for r in re.split(r"[\s,]+", raw or "") if re.match(r"^[\w.-]+/[\w.-]+$", r)]
+
+
+def lends(raw: str) -> Dict[str, str]:
+    """LOOM_LIVE_EVIDENCE_LENDS: `borrower=lender` pairs of owner/name repos,
+    comma or space separated; a malformed pair, or one naming a repo as its
+    own lender, is left out."""
+    pairs: Dict[str, str] = {}
+    for item in re.split(r"[\s,]+", raw or ""):
+        borrower, _, lender = item.partition("=")
+        if opted_in(borrower) and opted_in(lender) and borrower != lender:
+            pairs[borrower] = lender
+    return pairs
+
+
+def lender_of(repo: str, opted: Sequence[str], pairs: Mapping[str, str]) -> Optional[str]:
+    """The opted-in repo whose log adapter `repo` may read, or None."""
+    home = pairs.get(repo)
+    return home if home is not None and home in opted else None
+
+
+def logs_only(adapter: Adapter) -> Optional[Adapter]:
+    """The adapter with its sql command and scripts dropped, None when it has
+    no log command: what a borrower is lent."""
+    if adapter.log is None:
+        return None
+    scripts = {k: v for k, v in adapter.scripts.items() if k == adapter.log.argv[0]}
+    return Adapter(adapter.log, adapter.sources, None, scripts)
 
 
 def passed_env(raw: str, env: Mapping[str, str]) -> Dict[str, str]:

@@ -1043,6 +1043,7 @@ class Settings:
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
+                 live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -1145,6 +1146,9 @@ class Settings:
         # read-only kubeconfig) an adapter is handed. Empty is off.
         self.live_evidence_repos = list(live_evidence_repos)
         self.live_evidence_env = dict(live_evidence_env or {})
+        # LOOM_LIVE_EVIDENCE_LENDS: borrower -> lender repo; the borrower
+        # reads the lender's LOG adapter only (live_adapter.lends).
+        self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
@@ -1271,6 +1275,8 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_REPOS", "")),
                    live_evidence_env=live_adapter.passed_env(
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
+                   live_evidence_lends=live_adapter.lends(
+                       env.get("LOOM_LIVE_EVIDENCE_LENDS", "")),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    health_diagnose=_health_diagnose(env),
@@ -10884,13 +10890,19 @@ class Station:
         """The repo's live-evidence adapter, read once a pass from its default
         branch, for a repo in LOOM_LIVE_EVIDENCE_REPOS; None otherwise or when
         its manifest does not parse (said once a pass)."""
-        if repo not in self.s.live_evidence_repos:
+        home = (repo if repo in self.s.live_evidence_repos
+                else live_adapter.lender_of(repo, self.s.live_evidence_repos,
+                                            self.s.live_evidence_lends))
+        if home is None:
             return None
         cache = self.__dict__.setdefault("_live_adapters", {})
         if repo not in cache:
             def read(path: str) -> Optional[str]:
-                return self._contents_text(repo, path)
+                return self._contents_text(home, path)
             adapter, why = live_adapter.parse(read(live_adapter.MANIFEST), read)
+            if adapter is not None and home != repo:
+                adapter = live_adapter.logs_only(adapter)
+                why = "" if adapter is not None else "%s declares no log command to lend" % home
             if adapter is None:
                 _say("no live-evidence adapter for %s: %s" % (repo, why))
             cache[repo] = None if adapter is None else live_adapter.Runner(
