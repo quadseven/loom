@@ -5358,11 +5358,12 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.listing(), [])
         self.assertIn("loom:queued", self.fake.names(12))
-        # The dependency merges: the next pass gives the ticket a lane.
+        # The dependency merges: the next pass gives the ticket a lane, which
+        # now runs ahead of the claims, so the same pass claims it too.
         self.fake.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"},
                                           {"name": "lane:codex"}]
         self.run_pass()
-        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertIn("loom:running", self.fake.names(12))
         self.assertIn("lane:codex", self.fake.names(12))
 
     def test_a_ticket_already_briefed_waits_too(self):
