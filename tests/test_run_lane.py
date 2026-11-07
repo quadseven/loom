@@ -374,6 +374,13 @@ if [ "${FAKE_AGENT:-commit}" = manifest ]; then
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Place the thing"
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = source ]; then
+  mkdir -p "$(dirname "$FAKE_SOURCE_PATH")"
+  printf '%s\n' "$FAKE_SOURCE_TEXT" > "$FAKE_SOURCE_PATH"
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the source file"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = contract-edit ]; then
   mkdir -p .loom
   printf '%s' "$FAKE_CONTRACT_TEXT" > .loom/validation.conf
@@ -7334,6 +7341,48 @@ exec /usr/bin/git "$@"
         self.assertEqual([(r["phase"], r["ok"]) for r in records][-2:],
                          [("final", True), ("affected", True)])
         self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_kotlin_only_round_is_not_called_validated_by_python_and_go_commands(self):
+        # Python and Go checks do not validate a Kotlin-only changed path.
+        contract = ("interpreter: python3\nsubmodules: yes\n"
+                    "setup: python3 -c 'open(\".prepared\", \"w\").write(\"ok\")'\n"
+                    "check: test -f .prepared && python3 check.py && go vet ./...\n")
+        self.contract_repo(contract=contract)
+        self.write_tool(self.bin / "go", "#!/bin/sh\nexit 0\n")
+        name, before = self.fix_brief()
+        brief = self.inbox / (name + ".md")
+        brief.write_text(brief.read_text() + "\nChange companion-android/src/main/kotlin/Main.kt.\n")
+        result = self.run_contract_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="source",
+                                        FAKE_SOURCE_PATH="companion-android/src/main/kotlin/Main.kt",
+                                        FAKE_SOURCE_TEXT="package example")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
+        changed = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "diff", "--name-only", "main", self.FIX_BRANCH],
+            capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertIn("companion-android/src/main/kotlin/Main.kt", changed)
+        comments = Path(str(self.log) + ".comments")
+        note = next(body for body in comments.iterdir()
+                    if body.is_file() and not body.name.endswith(".on")).read_text()
+        self.assertIn("not validated", note.lower())
+        self.assertIn("companion-android/src/main/kotlin/Main.kt", note)
+        self.assertIn("CI", note)
+        self.assertNotIn("repo's check passed", note)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_python_source_pr_keeps_execution_evidence_but_reports_unknown_coverage(self):
+        self.contract_repo(CONTRACT + "affected: true\n")
+        self.drop_brief(text=BRIEF + "\nChange service/main.py.\n")
+        result = self.run_contract_lane(FAKE_AGENT="source", FAKE_SOURCE_PATH="service/main.py",
+                                        FAKE_SOURCE_TEXT="value = 1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("Validation: check exited 0", body)
+        self.assertIn("affected check exited 0", body)
+        self.assertIn("not validated: contract path coverage unknown for `service/main.py`", body)
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-2:],
+                         [("final", True), ("affected", True)])
 
     def contract_edit_lane(self, text):
         self.contract_repo()
