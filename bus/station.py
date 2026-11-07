@@ -99,7 +99,8 @@ from .brain import HUMAN_MARKER, LANES_REPUBLISH
 from . import home_repo
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
-                     _OPENER, _next_link, read_ssm, rest_login, unreadable)
+                     _OPENER, _next_link, read_ssm, rest_login, secret_read_reason,
+                     unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -13100,10 +13101,10 @@ class Station:
         try:
             return self.read_secret(self.s.transcript_token_ssm, self.s.region)
         # Deliberately broad, as in _webhook: an error text must never carry
-        # the secret; only the type is logged.
+        # the secret; only the type, or an SSM read's safe reason, is logged.
         except Exception as err:  # noqa: BLE001
             _say("could not read the transcript token parameter (%s); next pass"
-                 % type(err).__name__)
+                 % secret_read_reason(err))
             return None
 
     def upload_transcripts(self) -> None:
