@@ -420,7 +420,8 @@ def _sentence(text: str) -> str:
 def _unknown_note(w: dict[str, Any], now: datetime) -> str:
     """Why a reading has no figure, in words."""
     if w["stale"]:
-        return "STALE: %s. %s" % (w["stale"], _sentence(w["note"]))
+        detail = _limit_note(w, now) if w["kind"] == "limit" else _sentence(w["note"])
+        return "STALE: %s. %s" % (w["stale"], detail)
     if w["kind"] == "last 429" and w["reset"] is not None:
         limit = w["note"].replace("limitName:", "").strip() or "a"
         return ("Last hit its %s limit; the provider said retry after %s (%s)."

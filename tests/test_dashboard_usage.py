@@ -188,7 +188,9 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertEqual(asks.count("<li"), 1)
         # A stale figure never names the tightest meter.
         self.assertNotIn("Tightest meter", body)
-        # Unknown rows also carry stale observation times and are surfaced.
+        # A fresh unknown provider remains in the quiet list.
+        quiet = usage.render(usage.build([reading("zen", ["zen"], "all")], NOW))
+        self.assertIn(">zen<", section(quiet, "usage-quiet"))
         self.assertIn("STALE: read 19h 0m ago", provider_row(body, "zen"))
 
     def test_one_stale_reading_in_a_fresh_snapshot_is_flagged_on_its_own(self):
@@ -295,7 +297,8 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn(">Limit<", claude)
         self.assertIn("claude limited until 2026-10-18 16:30 UTC (in 2h 0m): provider limit reached.", claude)
         agy = provider_row(body, "agy")
-        self.assertIn("STALE: read 5h 0m ago. Last limit: quota.", agy)
+        self.assertIn("STALE: read 5h 0m ago.", agy)
+        self.assertIn("agy last limited 5h 0m ago, lifted 2026-10-18 13:30 UTC (1h 0m ago): quota.", agy)
         self.assertIn("zai: no limit seen in its heartbeat.", provider_row(body, "zai"))
 
     def test_each_provider_names_the_machine_its_readings_came_from(self):
