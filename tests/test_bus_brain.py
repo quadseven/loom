@@ -6543,13 +6543,18 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(fake.issues[20]["state"], "closed")
         self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues/20")])
 
-    def test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open(self):
+    def test_a_closed_epic_reopens_when_no_intake_epic_may_open(self):
         url = "https://api.github.com/repos/%s/issues/20" % REPO
         fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
         self.epic_under_goal(fake, 20, state="closed",
                              tickets=[self.under(21, 20, parent_issue_url=url)])
-        self.assertEqual(self.move(fake), (0, 1))
-        self.assertEqual(fake.writes(), [])
+        self.assertEqual(self.move(fake), (1, 0))
+        self.assertEqual(fake.issues[20]["state"], "open")
+        self.assertEqual(fake.subs[20], [21])
+        self.assertEqual(fake.issues[21]["body"], "## Why\nwhy\n\nPart of #20\n")
+        self.assertEqual([call[2] for call in fake.writes()
+                          if call[0] == "PATCH" and call[1].endswith("/issues/20")],
+                         [{"state": "open"}])
 
     def test_open_epic_tickets_an_epic_an_ask_and_a_closed_ticket_never_move(self):
         closed_url = "https://api.github.com/repos/%s/issues/20" % REPO

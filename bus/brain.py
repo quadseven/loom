@@ -2882,10 +2882,9 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     opens one; otherwise the rest stay where they are. An epic, an ask and a
     closed issue are never moved.
 
-    An open ticket under an epic that is closed (a person's tool closes an
-    epic once its sub-issues are closed, but a ticket that names the epic by
-    its Part of line stays open under it) moves the same way, and its Part of
-    line then names the new epic; the closed epic stays closed (loom#1925).
+    An open ticket under an epic that is closed moves the same way. If no
+    open epic can accept it, the closed epic reopens so the ticket is not
+    left under a closed parent (loom#2229).
     A ticket that also sits under an open epic stays there.
 
     An open epic that holds more than EPIC_TICKET_CAP tickets has its excess
@@ -2896,12 +2895,26 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     if not tickets:
         return (0, 0)
     moved = 0
+    reopened = set()
     areas = _area_labels(gh, repo)
     epic, held = _intake_with_room(tree)
     for ticket, old in tickets:
+        if old in reopened:
+            moved += 1
+            continue
         target, (epic, held) = _move_target(
             gh, repo, goal, ticket, old, areas, (epic, held))
         if target is None:
+            closed = next((e for e, _ in tree
+                           if int(e.get("number") or 0) == old
+                           and e.get("state", "open") != "open"), None)
+            if closed is not None:
+                gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, old),
+                        {"state": "open"})
+                closed["state"] = "open"
+                reopened.add(old)
+                moved += 1
+                continue
             break
         if _move_to_epic(gh, repo, target, ticket, old):
             moved += 1
