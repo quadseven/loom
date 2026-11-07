@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, hold_boxes, journal, proof, station, text, tickets
+from bus import brain, factory, hold_boxes, journal, proof, station, text, tickets
 from bus.github import GitHub, GitHubError
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -2597,6 +2597,195 @@ def fix_pr(**changes):
 def fix_ticket(*states):
     names = ["loom:ticket", "lane:codex", "custom"] + ["loom:" + s for s in states or ("pr",)]
     return {"state": "open", "labels": [{"name": n} for n in names]}
+
+
+class LunaMergeTests(unittest.TestCase):
+    """A clean Luna verdict in the real brain.merge (loom#2575): the factory
+    clears the fault on a clean Luna verdict for a degraded review check and
+    calls brain.merge, which used to refuse the head on every pass because
+    the rollup is still FAILURE. These tests run the real merge, risk tier
+    included; nothing on the merge path is stood in for."""
+
+    # The merging client writes as example-station (LOOM_GITHUB_LOGIN on a
+    # personal-token client): the station posts the Luna verdict and calls
+    # brain.merge with the same client, so only that login's verdict counts.
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane example-station",
+           "LOOM_GITHUB_LOGIN": "example-station", "LOOM_MERGE_SETTLE_SECONDS": "0"}
+    DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                "conclusion": "failure", "id": 2, "started_at": "2030-01-01T00:00:00Z",
+                "output": {"title": "WARN Grug eyes clouded",
+                           "summary": "Degraded review (all_failed): not a verdict. "
+                                      "Comment /grug improve to re-run once the backend recovers."}}
+    FINDINGS = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+                "conclusion": "failure", "id": 2, "started_at": "2030-01-01T00:00:00Z",
+                "output": {"title": "Living Hunt a..b - Elder markings - 1 blocking, 1 total",
+                           "summary": "## Markings Board\n\n| high | `bus/a.py` | A finding. |"}}
+    GREEN = {"name": "unittest", "status": "completed", "conclusion": "success",
+             "id": 1, "started_at": "2030-01-01T00:00:00Z"}
+
+    def setUp(self):
+        self.runs = [dict(self.GREEN), dict(self.DEGRADED)]
+        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
+                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        self.verdict_user = "example-station"
+        self.pr_comments = None
+        self.combined = {"state": "success", "total_count": 0, "statuses": []}
+        self.merges = []
+        self.labels = []
+
+    def transport(self, method, url, headers, body):
+        path = url.split("api.github.com")[-1]
+        if method == "POST" and path == "/graphql":
+            sent = json.loads(body)
+            if "pageInfo" in sent["query"]:
+                page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+                return reply(200, {"data": {"repository": {"pullRequest": {"reviewThreads": page}}}})
+            details = {"isDraft": False, "mergeable": "MERGEABLE",
+                       "headRefName": "loom/9-work", "headRefOid": "checked",
+                       "headRepository": {"nameWithOwner": REPO},
+                       "commits": {"nodes": [{"commit": {
+                           "committedDate": "2030-01-01T12:45:00Z",
+                           "statusCheckRollup": {"state": "FAILURE"},
+                           "parents": {"totalCount": 1}}}]},
+                       "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+                       "files": {"totalCount": 1, "nodes": [
+                           {"path": "bus/a.py", "deletions": 0, "changeType": "MODIFIED"}]}}
+            return reply(200, {"data": {"repository": {"pullRequest": details}}})
+        if method == "GET" and path == "/repos/%s/pulls/8" % REPO:
+            return reply(200, {"state": "open", "draft": False, "body": "Refs %s#9" % REPO,
+                               "head": {"ref": "loom/9-work", "sha": "checked",
+                                        "repo": {"full_name": REPO}},
+                               "base": {"ref": "main", "repo": {"full_name": REPO}},
+                               "mergeable": True, "user": {"login": "example-lane"}})
+        if method == "GET" and path.startswith("/repos/%s/commits/checked/check-runs" % REPO):
+            return reply(200, {"check_runs": self.runs})
+        if method == "GET" and path == "/repos/%s/commits/checked/status" % REPO:
+            return reply(200, self.combined)
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/reviews" % REPO):
+            return reply(200, [])
+        if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
+            comments = self.pr_comments
+            if comments is None:
+                comments = [{"body": self.verdict, "user": {"login": self.verdict_user}}]
+            return reply(200, comments)
+        if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
+            return reply(200, [])
+        if method == "GET" and path == "/repos/%s/issues/9" % REPO:
+            return reply(200, {"state": "open", "body": "",
+                               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]})
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/files" % REPO):
+            return reply(200, [{"filename": "bus/a.py",
+                                "patch": "+def decide(x):\n+    return x\n+y = decide(1)"}])
+        if method == "GET" and path.startswith("/search/issues"):
+            return reply(200, {"total_count": 0})
+        if method == "GET" and path.startswith("/search/code"):
+            return reply(200, {"total_count": 0, "items": []})
+        if method == "PUT" and path == "/repos/%s/pulls/8/merge" % REPO:
+            self.merges.append(json.loads(body))
+            return reply(200, {"merged": True})
+        if method == "DELETE" and "/git/refs/heads/" in path:
+            return reply(204)
+        if method == "PUT" and path == "/repos/%s/issues/9/labels" % REPO:
+            self.labels.append(json.loads(body)["labels"])
+            return reply(200, {})
+        if method == "POST" and path == "/repos/%s/issues/9/comments" % REPO:
+            return reply(201, {})
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def merge(self, **env):
+        return brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
+                           env=dict(self.ENV, **env))
+
+    def test_a_clean_luna_verdict_merges_through_the_real_merge(self):
+        result = self.merge()
+        self.assertTrue(result["merged"])
+        self.assertEqual(self.merges, [{"merge_method": "squash", "sha": "checked"}])
+        self.assertEqual(self.labels[-1], ["loom:ticket", "loom:merged"])
+
+    def test_a_blocking_luna_verdict_still_refuses(self):
+        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
+                        "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_luna_verdict_does_not_excuse_a_real_review_failure(self):
+        self.runs = [dict(self.GREEN), dict(self.FINDINGS)]
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_luna_verdict_does_not_excuse_another_failing_check(self):
+        self.runs = [dict(self.GREEN, conclusion="failure"), dict(self.DEGRADED)]
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_an_untrusted_luna_verdict_still_refuses(self):
+        self.verdict_user = "mallory-example"
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_trusted_comment_without_a_verdict_still_refuses(self):
+        # Ordinary trusted text is not a verdict: no marker and no markings
+        # line, so nothing stands in for the degraded check.
+        self.verdict = "Looked at this head myself; it reads fine to me."
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_verdict_from_the_pull_requests_own_author_still_refuses(self):
+        # The verdict is the station's word: a clean verdict the change's own
+        # author posted for its own head never stands in, trusted or not.
+        self.verdict_user = "example-lane"
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_newer_blocking_verdict_replaces_an_older_clean_one(self):
+        self.pr_comments = [
+            {"body": self.verdict, "user": {"login": "example-station"}},
+            {"body": factory.LUNA_REVIEW_MARKER % "checked" +
+                     "\nElder markings - 1 blocking, 2 total\n\nOne finding blocks.",
+             "user": {"login": "example-station"}}]
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_verdict_from_another_trusted_login_still_refuses(self):
+        # Only the station that ran the Luna slot posts its verdict: a clean
+        # marker from any other trusted login (the brain App, another fleet
+        # agent) is not that verdict and never stands in.
+        self.verdict_user = "example-brain"
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_no_known_writer_login_refuses_every_verdict(self):
+        # A client whose own login is unknown cannot tell the station's
+        # verdict from anyone else's, so the Luna path fails closed.
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge(LOOM_GITHUB_LOGIN="")
+        self.assertEqual(self.merges, [])
+
+    def test_a_clean_verdict_for_an_older_head_still_refuses(self):
+        # The verdict is bound to the head it reviewed: a clean verdict for
+        # an earlier head says nothing about the commits pushed since.
+        self.verdict = (factory.LUNA_REVIEW_MARKER % "older" +
+                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_failing_commit_status_beside_the_degraded_check_still_refuses(self):
+        # The rollup reads commit statuses too: a red status beside the
+        # degraded review check is not the review check's to excuse.
+        self.combined = {"state": "failure", "total_count": 1,
+                         "statuses": [{"context": "legacy-ci", "state": "failure"}]}
+        with self.assertRaisesRegex(ValueError, "checks are not successful"):
+            self.merge()
+        self.assertEqual(self.merges, [])
 
 
 class FixTests(unittest.TestCase):

@@ -997,16 +997,20 @@ def abandoned_notice(comment: Dict[str, Any], bot: str) -> bool:
     abandoned-review notice: its marker, from the bot's own login. The
     notice is the bot's record that a merged pull request left high or
     critical findings from an earlier review unanswered (loom#1933)."""
-    login = str((comment.get("user") or {}).get("login") or "").lower()
-    return (login in (bot.lower(), bot.lower() + "[bot]")
+    user = comment.get("user") or {}
+    login = str(user.get("login") or "").lower()
+    return (user.get("type") == "Bot" and login == bot.lower() + "[bot]"
             and ABANDONED_MARKER in str(comment.get("body") or ""))
 
 
 def abandoned_answered(comments: Sequence[Dict[str, Any]],
-                       notice: Dict[str, Any]) -> bool:
+                       notice: Dict[str, Any],
+                       authors: Optional[Sequence[str]] = None) -> bool:
     """Whether a comment after the notice answers it: it carries the
     factory's answer marker, or it links the notice (its #issuecomment
-    anchor or its URL)."""
+    anchor or its URL), and a trusted login wrote it (LOOM_BRIEF_AUTHORS,
+    or `authors`): a stranger's comment on a public repo answers nothing."""
+    trusted = {id(c) for c in history.trusted_comments(comments, authors)}
     marks = [ABANDONED_ANSWER_MARKER]
     if notice.get("id"):
         marks.append("#issuecomment-%s" % notice["id"])
@@ -1017,7 +1021,8 @@ def abandoned_answered(comments: Sequence[Dict[str, Any]],
         if comment is notice:
             after = True
             continue
-        if after and any(m in str(comment.get("body") or "") for m in marks):
+        if (after and id(comment) in trusted
+                and any(m in str(comment.get("body") or "") for m in marks)):
             return True
     return False
 
@@ -2196,7 +2201,7 @@ class Factory:
         notices = [c for c in comments if isinstance(c, dict)
                    and abandoned_notice(c, self.review_bot)]
         for notice in notices:
-            if abandoned_answered(comments, notice):
+            if abandoned_answered(comments, notice, sorted(self.trusted)):
                 continue
             findings = self._abandoned_findings(repo, pr_number)
             follow = self._abandoned_follow_up(repo, pr_number, notice, findings)
