@@ -435,6 +435,27 @@ class AgentSandboxTest(unittest.TestCase):
                          ["tree=written", "scratch=written", "outside=denied", "devnull=written", "lo=denied"])
         self.assertFalse(outside.exists())
 
+    def test_free_provider_sandbox_allows_its_configured_gateway_port(self):
+        source = SANDBOX.read_text()
+        functions = []
+        for name in ("provider_ports", "api_rules"):
+            match = re.search(r"^%s\(\) \{.*?^}" % name, source, re.S | re.M)
+            self.assertIsNotNone(match, name)
+            functions.append(match.group(0))
+        script = "\n".join(functions) + "\napi_rules network"
+        result = subprocess.run(["bash", "-c", script],
+                                env=dict(os.environ, LANE="free",
+                                         LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid:8080/api"),
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('(allow network-outbound (remote ip "*:8080"))', result.stdout)
+        custom = subprocess.run(["bash", "-c", script],
+                                env=dict(os.environ, LANE="free", SLOT="free-kilo",
+                                         LOOM_FREE_KILO_URL="https://gateway.example.invalid:9443/v1"),
+                                capture_output=True, text=True)
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.assertIn('(allow network-outbound (remote ip "*:9443"))', custom.stdout)
+
 
 class BwrapSandboxTest(unittest.TestCase):
     """LOOM_SANDBOX=bwrap, the lane pod's sandbox (docs/LANES.md, "Lane pods"):

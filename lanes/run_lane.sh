@@ -185,10 +185,18 @@ stop_orphaned_agent() {
   for g in $groups; do kill -KILL -- "-$g" 2>/dev/null || true; done
 }
 
+# A lock is live only while its PID still belongs to this slot's runner.
+lane_pid_is_running() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+    && grep -q -- "run_lane.sh $SLOT\$" <<<"$(ps -o command= -p "$pid" 2>/dev/null)"
+}
+
 # One runner per lane. mkdir is atomic; a stale lock from a killed run is
 # cleared when its pid is gone.
 if ! mkdir "$LOCK" 2>/dev/null; then
-  if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+  lock_pid="$(cat "$LOCK/pid" 2>/dev/null)"
+  lane_pid_is_running "$lock_pid" && exit 0
   stop_orphaned_agent "$(cat "$LOCK/pgid" 2>/dev/null || true)"
   # The agent's watchdog and its tail reader run in a group of their own; a
   # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
@@ -1732,12 +1740,17 @@ key_digest() {
   fi
 }
 
-# Why a lane is unavailable for a key the provider refused: the SSM parameter
-# its value came from, or the lane's own sign-in for a lane that reads no key.
+# Why a lane is unavailable for a key the provider refused: its setting name,
+# or the lane's own sign-in for a lane that reads no key.
 key_renew_reason() {
-  local param
+  local name param
   param="$(lane_setting KEY_SSM)"
-  printf '%s %s' "$AUTH_WHY_PREFIX" "${param:-the $LANE lane sign-in}"
+  if [[ "$param" == /* ]]; then
+    name="$(setting_var "$SLOT" KEY_SSM)"
+  else
+    name="the $LANE lane sign-in"
+  fi
+  printf '%s %s' "$AUTH_WHY_PREFIX" "${name:-the $LANE lane sign-in}"
 }
 
 # Whether this lane reads its key from an SSM parameter (a name under a path,
@@ -1776,9 +1789,10 @@ hold_expired_key() {  # reason
 key_held() {
   local reason param want key
   reason="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
-  case "$reason" in "$AUTH_WHY_PREFIX "/*) ;; *) return 1 ;; esac
+  case "$reason" in "$AUTH_WHY_PREFIX "*) ;; *) return 1 ;; esac
+  param="$(lane_setting KEY_SSM)"
+  [ -n "$param" ] || return 1
   AUTH_HELD=1 AUTH_WHY="$reason" READY_REASON="$reason"
-  param="${reason#"$AUTH_WHY_PREFIX "}"
   want="$(cat "$(key_sha_file "$SLOT")" 2>/dev/null)"
   key="$(ssm_value "$param")"
   if [ -n "$want" ] && [ -n "$key" ] && [ "$(key_digest "$key")" != "$want" ]; then
@@ -1790,17 +1804,17 @@ key_held() {
 }
 
 # The operator's ask for an expired key: $1 is the failure's reason, whose
-# tail names what to renew (the SSM parameter the key came from, or the lane's
-# own sign-in). Filed once per parameter -- another lane that hits the same key
+# tail names what to renew (the setting name, or the lane's own sign-in).
+# Filed once per parameter: another lane that hits the same key
 # comments on the open ask instead of filing a second. The body names no agent
 # output, so nothing the provider said, or a run echoed, can reach a public
 # issue.
 ask_renew_key() {
-  local reason="$1" param title body
-  param="${reason#"$AUTH_WHY_PREFIX "}"
-  title="Provider key expired: renew $param"
+  local reason="$1" setting title body
+  setting="${reason#"$AUTH_WHY_PREFIX "}"
+  title="Provider key expired: renew $setting"
   body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads that parameter is unavailable until the value there changes.\n' \
-    "$KEY_ASK_MARKER" "$SLOT" "$param")"
+    "$KEY_ASK_MARKER" "$SLOT" "$setting")"
   file_ask "$title" "$body" "Could not use the key again"
 }
 

@@ -81,6 +81,11 @@ class HygieneLinter(unittest.TestCase):
         self.assertIn("workflow_hygiene.py", text)
         self.assertIn("- '.github/**'", text)
 
+    def test_workflow_hygiene_requires_the_current_workflow_file_count(self):
+        text = (WORKFLOWS / "check.workflow-hygiene.yml").read_text()
+        self.assertIn('"$n" -lt 4', text)
+        self.assertIn("expected at least 4", text)
+
 
 if __name__ == "__main__":
     unittest.main()

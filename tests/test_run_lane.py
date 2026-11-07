@@ -2633,6 +2633,24 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_live_unrelated_pid_does_not_own_a_lane_lock(self):
+        script = self.source_functions("lane_pid_is_running") + 'SLOT=codex; lane_pid_is_running "$1"'
+        result = subprocess.run(["bash", "-c", script, "bash", str(os.getpid())],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_key_renewal_ask_uses_the_setting_name_and_hides_the_parameter(self):
+        script = self.source_functions("setting_var", "lane_var", "lane_setting",
+                                       "key_renew_reason", "ask_renew_key") + (
+            'SLOT=opencode-go LANE=opencode-go; LOOM_OPENCODE_GO_KEY_SSM=/example/provider-key\n'
+            'AUTH_WHY_PREFIX="API key expired: renew"; KEY_ASK_MARKER=marker\n'
+            'file_ask() { printf "%s\\n%s\\n" "$1" "$2"; }\n'
+            'reason="$(key_renew_reason)"; ask_renew_key "$reason"\n')
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LOOM_OPENCODE_GO_KEY_SSM", result.stdout)
+        self.assertNotIn("/example/provider-key", result.stdout)
+
     def test_the_agy_run_may_write_its_file_secret_store_and_not_the_keychains(self):
         # 2026-10-24: agy reads its keychain sign-in by running
         # /usr/bin/security, which the lane sandbox denies (#1465), and falls
@@ -5783,15 +5801,15 @@ echo fixed > fix.txt
     def test_an_expired_key_is_auth_and_takes_every_lane_that_bills_it_offline(self):
         # Acceptance (loom#744): the expired-key error is [auth], not
         # [transient], and every slot billing that key is unavailable with the
-        # reason naming the parameter to renew.
+        # reason naming the setting to renew.
         inbox, result = self.expired_key_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("failed: [auth] agent exited 1: API key expired: renew /k/go", self.go_log())
+        self.assertIn("failed: [auth] agent exited 1: API key expired: renew LOOM_OPENCODE_GO_KEY_SSM", self.go_log())
         self.assertNotIn("transient", self.go_log())
         for slot in self.GROUP:
             beat = self.beat(slot)
             self.assertFalse(beat["available"], slot)
-            self.assertEqual(beat["reason"], "API key expired: renew /k/go", slot)
+            self.assertEqual(beat["reason"], "API key expired: renew LOOM_OPENCODE_GO_KEY_SSM", slot)
             # No retry time: only a renewed key lifts this hold.
             self.assertNotIn("retry_at", beat, slot)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -5806,7 +5824,7 @@ echo fixed > fix.txt
         # No run, and the waiting brief is handed on rather than left to fail.
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertFalse((inbox / "T043-next.md").exists())
-        self.assertIn("failed: [auth] API key expired: renew /k/go",
+        self.assertIn("failed: [auth] API key expired: renew LOOM_OPENCODE_GO_KEY_SSM",
                       (self.loom / "logs" / "opencode-go" / "T043-next.log").read_text())
         self.assertFalse(self.beat("opencode-go")["available"])
         # The operator renews the key: the lane is back, and its digest is gone
@@ -5819,12 +5837,17 @@ echo fixed > fix.txt
         usage = self.loom / "state" / "usage"
         self.assertFalse((usage / "opencode-go.key-sha").exists())
 
-    def test_an_expired_key_opens_one_needs_operator_ask_naming_the_parameter(self):
+    def test_an_expired_key_opens_one_needs_operator_ask_naming_the_setting(self):
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
         self.assertIn("--label needs:human", filed[0])
-        self.assertIn("renew /k/go", filed[0])
+        self.assertIn("renew LOOM_OPENCODE_GO_KEY_SSM", filed[0])
+        self.assertNotIn("/k/go", filed[0])
+        issue_body = Path(str(self.body) + ".issue").read_text()
+        self.assertIn("LOOM_OPENCODE_GO_KEY_SSM", issue_body)
+        self.assertNotIn("/k/go", issue_body)
+        self.assertNotIn("/k/go", self.go_log().split("failed: [auth]")[-1].splitlines()[0])
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
         # one comment per lane or per failure.

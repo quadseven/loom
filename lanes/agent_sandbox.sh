@@ -157,17 +157,25 @@ bwrap_profile() {
 # SPARK_URL (its scheme's default when the URL names none). A spark URL with
 # no usable port is refused, which refuses the sandbox.
 provider_ports() {
-  local rest port=""
-  [ "$LANE" = spark ] || { printf '443'; return 0; }
-  case "$SPARK_URL" in
+  local rest port="" url url_var provider="$LANE"
+  case "$LANE" in
+    spark) url="$SPARK_URL" ;;
+    free)
+      provider="free provider"
+      url_var="LOOM_$(printf '%s' "$SLOT" | tr '[:lower:]-' '[:upper:]_')_URL"
+      url="${!url_var:-${LOOM_FREE_GATEWAY_URL:-}}"
+      ;;
+    *) printf '443'; return 0 ;;
+  esac
+  case "$url" in
     https://*) port=443 ;;
     http://*) port=80 ;;
   esac
-  rest="${SPARK_URL#*://}"
+  rest="${url#*://}"
   rest="${rest%%/*}"
   if [ -n "$port" ] && [ "${rest%:*}" != "$rest" ]; then port="${rest##*:}"; fi
   [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$port" -le 65535 ] ||
-    { echo "refusing sandbox: no usable port in the spark URL $SPARK_URL" >&2; return 1; }
+    { echo "refusing sandbox: no usable port in the $provider URL" >&2; return 1; }
   [ "$port" = 443 ] && printf '443' || printf '443 %s' "$port"
 }
 

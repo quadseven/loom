@@ -701,6 +701,18 @@ class InstallScriptTest(unittest.TestCase):
         for plist in others:
             self.assertNotIn("LOOM_DB_", plist.read_text(), plist.name)
 
+    def test_multiline_loom_values_survive_in_lane_brain_and_dashboard_plists(self):
+        value = "first=one\nsecond=two"
+        result = self.run_install("codex", "claude", "dashboard", LOOM_WATCH=value,
+                                  LOOM_PIN_TARGETS='[\n  "one",\n  "two"\n]')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        for name in ("com.loom.codex.plist", "com.loom.brain.plist",
+                     "com.loom.dashboard.plist"):
+            plist = (agents / name).read_text()
+            self.assertIn("<key>LOOM_WATCH</key><string>first=one\nsecond=two</string>", plist)
+            self.assertIn('<key>LOOM_PIN_TARGETS</key><string>[\n  "one",\n  "two"\n]</string>', plist)
+
     def test_dashboard_zero_removes_an_installed_dashboard(self):
         self.assertEqual(self.run_dashboard_install(LOOM_DASHBOARD="1").returncode, 0)
         self.assertTrue(self.dashboard_plist().exists())

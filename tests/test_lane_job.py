@@ -309,6 +309,28 @@ class LaneJobTest(unittest.TestCase):
         self.assertTrue((self.job / "report" / "report.mac").exists())
         self.assertFalse((self.job / "report-mac-key").exists())
 
+    def test_report_secret_is_created_with_restrictive_permissions(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+        self.real_key()
+        spec = importlib.util.spec_from_file_location("lane_job", self.root / "lanes" / "k8s" / "lane_job.py")
+        job = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(job)
+        original_open = os.open
+        observed = []
+
+        def check_create_mode(path, flags, mode=0o777):
+            fd = original_open(path, flags, mode)
+            if os.path.basename(path) == "report-secret":
+                observed.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+
+        with mock.patch.object(job.os, "open", side_effect=check_create_mode), \
+                mock.patch.dict(os.environ, {"LOOM_JOB_DIR": str(self.job)}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            job.report()
+        self.assertEqual(observed, [0o600])
+
     def test_a_seal_that_fails_names_its_step(self):
         self.assertEqual(self.step("prepare").returncode, 0)
         self.assertEqual(self.step("run").returncode, 0)

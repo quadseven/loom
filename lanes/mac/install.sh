@@ -224,6 +224,11 @@ LANES=("$@")
 
 # XML-escape a value for a plist <string>.
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+plist_env_entry() {
+  printf '    <key>%s</key><string>' "$1"
+  xml "$2"
+  printf '</string>\n'
+}
 X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")"
 
 # Every LOOM_* setting in the environment, as plist entries, less the names
@@ -231,8 +236,8 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 # The dashboard's database settings (LOOM_DB_*, a password among them) go to
 # the dashboard plist through db_env only: no lane or brain reads them.
 loom_env() {
-  local skip=" $* "
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local skip=" $* " k v
+  for k in $(compgen -A variable | LC_ALL=C sort); do
     case "$k" in
       LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS|LOOM_DB_*) continue ;;
       # Each job gets its own writer's App from app_env, never another's.
@@ -240,17 +245,18 @@ loom_env() {
       LOOM_*) ;; *) continue ;;
     esac
     case "$skip" in *" $k "*) continue ;; esac
-    v="$(xml "$v")"
-    printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+    v="${!k}"
+    plist_env_entry "$k" "$v"
   done
 }
 
 # The LOOM_DB_* settings as plist entries, for the dashboard plist alone.
 db_env() {
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local k v
+  for k in $(compgen -A variable | LC_ALL=C sort); do
     case "$k" in LOOM_DB_*) ;; *) continue ;; esac
-    v="$(xml "$v")"
-    printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
+    v="${!k}"
+    plist_env_entry "$k" "$v"
   done
 }
 
@@ -271,9 +277,11 @@ app_env() {
 # the station: its factory reads what a lane ran from them when a claim had
 # no Model: line and no runner footer names it (bus/brain.py lane_model).
 model_env() {
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local k v
+  for k in $(compgen -A variable | LC_ALL=C sort); do
     case "$k" in LOOM_BRAIN_MODEL) continue ;; LOOM_*_MODEL|LOOM_*_MODELS) ;; *) continue ;; esac
-    printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
+    v="${!k}"
+    plist_env_entry "$k" "$v"
   done
 }
 
