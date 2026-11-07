@@ -62,10 +62,11 @@ class CountsTest(unittest.TestCase):
 
 class StationStepTest(unittest.TestCase):
     def setUp(self):
-        # The comparison's home repo is a setting now (loom#2584): this
-        # module's station serves one configured home repo.
+        # The comparison's target is an explicit opt-in setting (loom#2584):
+        # this module's station is configured with one.
         self._env = mock.patch.dict(os.environ,
-                                    {"LOOM_SELF_REPO": "example-owner/loom"})
+                                    {"LOOM_SEND_BACK_REPO": "example-owner/loom"},
+                                    clear=False)
         self._env.start()
         self.addCleanup(self._env.stop)
         self.state = tempfile.mkdtemp()
@@ -73,7 +74,7 @@ class StationStepTest(unittest.TestCase):
         self.posted, self.patched = [], []
         self.findings = [finding("weakened-test")] * 18
         self.shadow = False
-        self.repos = [send_back.REPO]
+        self.repos = ["example-owner/loom"]
         self.by_repo = {}
 
     def run_step(self, now=NOW):
@@ -105,6 +106,22 @@ class StationStepTest(unittest.TestCase):
     def saved(self):
         with open(os.path.join(self.state, send_back.STATE_FILE)) as fh:
             return json.load(fh)
+
+    def test_no_setting_means_no_write_and_one_visible_log(self):
+        # TICKET is one deployment's issue number: with no explicit target
+        # the comparison must not guess the home repo or origin, whose issue
+        # of that number is some other issue. It says so once and writes nothing.
+        said = []
+        with mock.patch.dict(os.environ, {"LOOM_SEND_BACK_REPO": "",
+                                          "LOOM_SELF_REPO": "example-owner/loom",
+                                          "LOOM_STATUS_REPO": "example-owner/loom"}), \
+                mock.patch.object(station, "_SEND_BACK_UNSET_SAID", False), \
+                mock.patch.object(station, "_say", side_effect=said.append):
+            self.run_step()
+            self.run_step(NOW + timedelta(days=1))
+        self.assertEqual((self.posted, self.patched), ([], []))
+        self.assertFalse(os.path.exists(os.path.join(self.state, send_back.STATE_FILE)))
+        self.assertEqual(len([m for m in said if "LOOM_SEND_BACK_REPO" in m]), 1)
 
     def test_nothing_runs_inside_the_seven_days_after_2170_merged(self):
         self.run_step(datetime(2026, 11, 8, 9, 8, tzinfo=timezone.utc))

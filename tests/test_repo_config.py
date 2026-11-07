@@ -48,7 +48,8 @@ LANE_SETTINGS = (
     "LOOM_ZEN_MODEL",
 )
 # Settings this change adds.
-NEW_SETTINGS = ("LOOM_SWEEP_REPOS", "LOOM_FACTORY_REPO", "LOOM_INFRA_PUBLIC_REPO")
+NEW_SETTINGS = ("LOOM_SWEEP_REPOS", "LOOM_FACTORY_REPO", "LOOM_INFRA_PUBLIC_REPO",
+                "LOOM_SEND_BACK_REPO")
 # Set by one Loom script for another, or by tests: not operator settings,
 # so .env.example names them in a comment instead of as keys.
 INTERNAL_SETTINGS = ("LOOM_BRAIN_NOW", "LOOM_BRAIN_WAIT_STEP", "LOOM_POD_ONCE")
@@ -71,38 +72,39 @@ class SweepReposTest(unittest.TestCase):
 
 
 class SendBackRepoTest(unittest.TestCase):
-    def test_the_home_repo_is_the_self_repo_setting(self):
+    def test_the_target_is_the_explicit_setting(self):
+        self.assertEqual(send_back.repo({"LOOM_SEND_BACK_REPO": " example-owner/target "}),
+                         "example-owner/target")
+
+    def test_no_setting_falls_back_to_nothing(self):
+        # The ticket number is one deployment's: neither the home repo nor
+        # the origin may stand in for an unset target.
         env = {"LOOM_SELF_REPO": "example-owner/self",
                "LOOM_STATUS_REPO": "example-owner/status"}
-        self.assertEqual(send_back.repo(env), "example-owner/self")
-
-    def test_the_home_repo_falls_back_to_the_status_repo(self):
-        self.assertEqual(send_back.repo({"LOOM_STATUS_REPO": "example-owner/status"}),
-                         "example-owner/status")
-
-    def test_no_setting_means_this_checkouts_origin(self):
-        # The same default the station's status repo has: a fresh clone
-        # names its own repo, the running deployment names the one it runs.
         with mock.patch.object(home_repo, "origin_repo", return_value="example-owner/clone"):
-            self.assertEqual(send_back.repo({}), "example-owner/clone")
-
-    def test_no_setting_and_no_origin_means_no_home_repo(self):
-        with mock.patch.object(home_repo, "origin_repo", return_value=""):
+            self.assertEqual(send_back.repo(env), "")
             self.assertEqual(send_back.repo({}), "")
 
 
 class PersonClaimTest(unittest.TestCase):
-    def test_the_repo_owners_claim_is_not_a_person_claim(self):
-        self.assertFalse(invariants.person_claim(["claim:example-owner"],
-                                                 "example-owner/factory"))
+    OURS = ["example-operator", "example-station[bot]"]
+
+    def test_a_station_login_claim_is_not_a_person_claim_in_any_repo(self):
+        # Decided from the station's own logins, never the repo's owner: a
+        # repo owned by someone else must not make the station's claim foreign.
+        self.assertFalse(invariants.person_claim(["claim:example-operator"], self.OURS))
+        self.assertFalse(invariants.person_claim(["claim:Example-Station[bot]"], self.OURS))
+
+    def test_a_claim_named_for_the_repo_owner_is_foreign_unless_it_is_ours(self):
+        self.assertTrue(invariants.person_claim(["claim:example-owner"], self.OURS))
 
     def test_any_other_claim_is_a_person_claim(self):
-        self.assertTrue(invariants.person_claim(["claim:someone-else"],
-                                                "example-owner/factory"))
+        self.assertTrue(invariants.person_claim(["claim:someone-else"], self.OURS))
+        self.assertTrue(invariants.person_claim(
+            ["claim:example-operator", "claim:someone-else"], self.OURS))
 
     def test_no_claim_label_is_not_a_person_claim(self):
-        self.assertFalse(invariants.person_claim(["loom:ticket"],
-                                                 "example-owner/factory"))
+        self.assertFalse(invariants.person_claim(["loom:ticket"], self.OURS))
 
 
 class ParserDefaultsTest(unittest.TestCase):

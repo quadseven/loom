@@ -59,22 +59,21 @@ from . import naming
 from . import notify
 from . import review_debt
 from . import shadow
+from . import stale_claims
 from . import text as _text
 from . import tickets
 from . import watch
 from .github import GitHubError, RateLimited
 from .labels import REMOTE_LANES
 
-def person_claim(labels: Iterable[str], repo: str) -> bool:
-    """Whether a claim label on an issue of `repo` is a person's claim.
-
-    The repo owner's own claim label (claim:<owner of the repo the issue
-    lives in>) is the station's lane claim, not a person's (AGENTS.md,
-    Claims). The owner comes from the repo the filer already serves, so
-    no deployment's login is a literal here (loom#2584)."""
-    owner = repo.split("/", 1)[0] if repo else ""
-    own = "claim:%s" % owner if owner else None
-    return any(label.startswith("claim:") and label != own for label in labels)
+def person_claim(labels: Iterable[str], ours: Iterable[str]) -> bool:
+    """Whether a claim label is a person's claim: a claim:<login> label that
+    names none of `ours`, this Loom's own logins (the set stale_claims and
+    the station use). The station's own claim is its lane claim, not a
+    person's (AGENTS.md, Claims). Decided from the station's logins, never
+    from the owner of the repo the issue lives in: a repo owned by another
+    account must not make the station's claim foreign (loom#2584)."""
+    return bool(stale_claims.claim_labels_not_ours(labels, ours))
 
 
 DAY = 24 * 3600
@@ -1871,7 +1870,7 @@ class Filer:
                 continue
             ticket = number in self._ticketed
             labels = self._label_names(self._issue(number) or {}) if ticket else []
-            person = person_claim(labels, self.repo)
+            person = person_claim(labels, self.authors)
             ticket_state = tickets.ticket_state({"labels": [{"name": n} for n in labels]})
             rewritten_idle = (ticket_state in ("queued", "briefed", "failed", "answered")
                               and not any(label.startswith("needs:") for label in labels))

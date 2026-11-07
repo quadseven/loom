@@ -533,6 +533,8 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
+# Whether this process has said the send-back comparison is off (unset target).
+_SEND_BACK_UNSET_SAID = False
 # Where the runner files its validation incidents (lanes/run_lane.sh
 # FACTORY_REPO, from LOOM_FACTORY_REPO or the deployment's own repo
 # settings, never a literal: loom#2584), and the marker and ticket line
@@ -15496,6 +15498,15 @@ class Station:
         hourly until it is done; it never runs a second time."""
         from . import send_back
         repo = send_back.repo()
+        if not repo:
+            # Opt-in: with no LOOM_SEND_BACK_REPO nothing is written, and
+            # the station says so once per process, not once per pass.
+            global _SEND_BACK_UNSET_SAID
+            if not _SEND_BACK_UNSET_SAID:
+                _SEND_BACK_UNSET_SAID = True
+                _say("send-back comparison off: set LOOM_SEND_BACK_REPO to the repo whose "
+                     "issue #%d it writes to" % send_back.TICKET)
+            return
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)
