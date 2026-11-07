@@ -1039,7 +1039,34 @@ class SensitiveResumeTests(unittest.TestCase):
         ]
         for node, want in cases:
             with self.subTest(want=want):
-                self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+                 self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_merge_ready_blocks_on_stacked_pr_with_open_base(self):
+        bot = {"__typename": "Bot", "login": "grug-tribe"}
+        node = ready_node()
+        
+        with self.subTest("stacked on open PR"):
+            pr = {"number": 5, "title": "Stacked PR", "body": "Stacked on PR 6", "head": {"ref": "loom/5-stacked"}}
+            open_prs = {6: {"number": 6, "state": "open", "body": "Base PR"}}
+            self.assertEqual(brain.merge_ready(node, "grug-tribe", None, "owner/repo", pr, open_prs=open_prs),
+                             "blocked: stacked on #6")
+        
+        with self.subTest("stacked on merged PR is not blocked"):
+            pr = {"number": 5, "title": "Stacked PR", "body": "Stacked on PR 6", "head": {"ref": "loom/5-stacked"}}
+            merged_pr = {"number": 6, "state": "merged", "body": "Base PR"}
+            open_prs = {6: merged_pr}
+            self.assertEqual(brain.merge_ready(node, "grug-tribe", None, "owner/repo", pr, open_prs=open_prs), "READY")
+        
+        with self.subTest("stacked on closed PR is not blocked"):
+            pr = {"number": 5, "title": "Stacked PR", "body": "Stacked on PR 7", "head": {"ref": "loom/5-stacked"}}
+            closed_pr = {"number": 7, "state": "closed", "body": "Base PR"}
+            open_prs = {7: closed_pr}
+            self.assertEqual(brain.merge_ready(node, "grug-tribe", None, "owner/repo", pr, open_prs=open_prs), "READY")
+        
+        with self.subTest("no stacked PR mentioned is not blocked"):
+            pr_no_stack = {"number": 5, "title": "Normal PR", "body": "Normal PR", "head": {"ref": "loom/5-normal"}}
+            open_prs = {7: {"number": 7, "state": "open", "body": "Not mentioned"}}
+            self.assertEqual(brain.merge_ready(node, "grug-tribe", None, "owner/repo", pr_no_stack, open_prs=open_prs), "READY")
 
     def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
