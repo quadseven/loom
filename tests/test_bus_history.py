@@ -111,6 +111,23 @@ class ReadHistory(unittest.TestCase):
         self.assertEqual(found.equivalent, "m-1")
         self.assertEqual([a[3] for a in found.attempts], ["[work] broke"])
 
+    def test_retry_chain_reads_station_retry_state(self):
+        comments = [
+            comment("Automatic retry 1 of 3 (limit): moved from lane codex to lane agy."),
+            comment("Claimed for lane agy (body sha256 0123456789ab)"),
+        ]
+        found = history.read_history(comments, TRUSTED)
+        self.assertEqual((found.retry_count, found.retry_lanes, found.pending_retry),
+                         (1, {"codex"}, None))
+        self.assertEqual(history.retry_chain(comments), (1, {"codex"}, None))
+
+    def test_retry_chain_resets_on_lane_outcome(self):
+        comments = [
+            comment("Automatic retry 1 of 3 (transient): moved from lane codex to lane agy."),
+            comment("Lane agy failed: [work] broke"),
+        ]
+        self.assertEqual(history.retry_chain(comments), (0, set(), None))
+
     def test_graphql_shaped_trusted_comments_count(self):
         comments = [{"body": "<!-- loom:rung 2 -->", "created_at": AT,
                      "author": {"login": "alice-example", "__typename": "User"}},
