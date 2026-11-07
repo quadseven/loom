@@ -8138,7 +8138,7 @@ exec /usr/bin/git "$@"
         # The guard sits at the bash -c call too, not only in load_contract.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         marker = tmp / "ran"
         fakes = tmp / "fakebin"
@@ -8147,7 +8147,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
         result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
@@ -8169,7 +8169,7 @@ exec /usr/bin/git "$@"
         # UV_MANAGED_PYTHON, and nothing else of the runner's leaks in.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         fakes = tmp / "fakebin"
         fakes.mkdir()
@@ -8177,7 +8177,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -8195,7 +8195,7 @@ exec /usr/bin/git "$@"
         # runner's own value never reaches the check.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         fakes = tmp / "fakebin"
         fakes.mkdir()
@@ -8203,7 +8203,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -8223,7 +8223,7 @@ exec /usr/bin/git "$@"
         # exits 0; it fails on main.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         localbin = tmp / "home" / ".local" / "bin"
         localbin.mkdir(parents=True)
@@ -8235,7 +8235,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
                "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",
