@@ -2728,6 +2728,11 @@ class LunaMergeTests(unittest.TestCase):
                                         "repo": {"full_name": REPO}},
                                "base": {"ref": "main", "repo": {"full_name": REPO}},
                                "mergeable": True, "user": {"login": "example-lane"}})
+        if method == "GET" and path.startswith("/repos/%s/compare/" % REPO):
+            # loom#2622: the merge reads how far the head is behind its base.
+            return reply(200, {"behind_by": 0})
+        if method == "GET" and path == "/repos/%s/stacks" % REPO:
+            return reply(200, [])
         if method == "GET" and path.startswith("/repos/%s/commits/checked/check-runs" % REPO):
             return reply(200, {"check_runs": self.runs})
         if method == "GET" and path == "/repos/%s/commits/checked/status" % REPO:
