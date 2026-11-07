@@ -597,5 +597,92 @@ class ReadSsmProxyTests(unittest.TestCase):
         self.assertNotIn("HTTPS_PROXY", passed_env)
 
 
+
+class ReadKeyFileTests(unittest.TestCase):
+    def test_missing_file_names_path_and_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing.pem")
+            with self.assertRaises(github.KeyFileReadError) as caught:
+                github.read_key_file(path)
+        msg = str(caught.exception)
+        self.assertIn(path, msg)
+        self.assertIn("not found", msg.lower())
+        self.assertNotIn(KEY_MARK, msg)
+
+    def test_permission_denied_names_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            try:
+                os.chmod(path, 0)
+                if os.access(path, os.R_OK):
+                    self.skipTest("file still readable after chmod 0")
+                with self.assertRaises(github.KeyFileReadError) as caught:
+                    github.read_key_file(path)
+            finally:
+                os.chmod(path, 0o600)
+        msg = str(caught.exception)
+        self.assertIn(path, msg)
+        self.assertIn("permission denied", msg.lower())
+        self.assertNotIn(KEY_MARK, msg)
+
+    def test_directory_is_not_a_regular_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(github.KeyFileReadError) as caught:
+                github.read_key_file(tmp)
+        msg = str(caught.exception)
+        self.assertIn(tmp, msg)
+        self.assertIn("not a regular file", msg.lower())
+
+    def test_reads_key_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            self.assertEqual(github.read_key_file(path), KEY)
+
+
+class KeyFileAuthFlowTests(KeyNeverLeaksTests):
+    def test_missing_key_file_reports_actionable_path_and_problem(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing.pem")
+            app = AppToken("123", "456", lambda: github.read_key_file(path),
+                           sign=fake_sign([]), clock=Clock())
+            gh = GitHub(app, transport=FakeGitHub(["t"]))
+            with self.assertRaises(GitHubError) as caught:
+                gh.rest("GET", "/rate_limit")
+        msg = str(caught.exception)
+        self.assertIn("could not read the GitHub App private key", msg)
+        self.assertIn(path, msg)
+        self.assertIn("not found", msg.lower())
+        self.assertNotIn(KEY_MARK, msg)
+
+    def test_unreadable_key_file_error_never_leaks_key_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            def broken():
+                raise OSError("read failed " + KEY)
+            app = AppToken("123", "456", broken, sign=fake_sign([]), clock=Clock())
+            gh = GitHub(app, transport=FakeGitHub(["t"]))
+            text = self._capture(lambda: gh.rest("GET", "/rate_limit"))
+        self.assertNotIn(KEY_MARK, text)
+
+    def test_key_file_auth_flow_mints_and_sends_installation_token(self):
+        clock = Clock()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            signed = []
+            app = AppToken("123", "456", lambda: github.read_key_file(path),
+                           sign=fake_sign(signed), clock=clock)
+            gh = GitHub(app, transport=FakeGitHub(["ghs_ok"]))
+            gh.rest("GET", "/rate_limit")
+        self.assertEqual(gh.transport.bearers("GET"), ["Bearer ghs_ok"])
+        self.assertEqual([k for _, k in signed], [KEY])
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from bus import answer, brain, fixrounds, handoff, labels, status, tickets
-from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
+from bus.github import (DEFAULT_API, AppToken, GitHub, GitHubError, KeyFileReadError,
+                        _next_link, read_key_file)
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
 from . import bench_store, free_view, goals, needs_you, operators, station_state, tiers_sources, transcripts, views
@@ -76,12 +77,10 @@ def app_from_env(env: Optional[Dict[str, str]] = None) -> Optional[AppToken]:
         return None
     if app.key_source == "file":
         try:
-            with open(app.key_file, "rb"):
-                pass
-        except OSError as exc:
-            # The file's name only: never its contents.
-            LOG.warning("GitHub App settings ignored: key file %s is unreadable (%s)",
-                        app.key_file, type(exc).__name__)
+            read_key_file(app.key_file)
+        except (KeyFileReadError, OSError, UnicodeError, ValueError) as exc:
+            # The file's name and problem only: never its contents.
+            LOG.warning("GitHub App settings ignored: %s", exc)
             return None
     tools = ("openssl",) if app.key_source == "file" else ("openssl", "aws")
     missing = [tool for tool in tools if shutil.which(tool) is None]

@@ -368,10 +368,34 @@ def read_ssm(name: str, region: str) -> str:
     return out.stdout.strip()
 
 
+class KeyFileReadError(OSError):
+    """A key file could not be read; its text names the file and the problem
+    and never the file's contents (loom#2691)."""
+
+
 def read_key_file(path: str) -> str:
     """The App's private key from a mounted file, read at each mint."""
-    with open(path, encoding="ascii") as fh:
-        return fh.read()
+    try:
+        with open(path, encoding="ascii") as fh:
+            return fh.read()
+    except (OSError, UnicodeError, ValueError) as err:
+        # The problem names the file and the kind only, never its contents.
+        raise KeyFileReadError(_key_file_problem(path, err)) from None
+
+
+def _key_file_problem(path: str, err: BaseException) -> str:
+    """Why a mounted key file could not be read, as one line naming the
+    file and never its contents: missing, not a regular file, not readable,
+    or the error kind. Makes a station log actionable (loom#2691)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "%s: file not found (%s)" % (path, type(err).__name__)
+    if not os.path.isfile(path):
+        return "%s: not a regular file (%s)" % (path, type(err).__name__)
+    if not os.access(path, os.R_OK):
+        return "%s: permission denied (%s)" % (path, type(err).__name__)
+    return "%s: %s" % (path, type(err).__name__)
 
 
 def _b64url(raw: bytes) -> str:
@@ -486,12 +510,15 @@ class AppToken:
         # Only the failures a key read or a signing can have are caught: the
         # reader's OSError (SSM unreadable, aws missing) or SubprocessError
         # (timeout), and the signer's SigningError, OSError or SubprocessError.
-        # They are reported by kind, since their text could carry the key, and
-        # raised outside the except blocks so none is chained as context. Any
-        # other exception is a bug and propagates as itself.
+        # A key read reports by kind for unknown errors (their text could
+        # carry the key); the read's own sanitized errors (KeyFileReadError,
+        # which names the file and never its contents, and AwsCliUnavailable)
+        # carry their safe text. Raised outside except so none is chained.
         failure = ""
         try:
             key = self._read_key()
+        except (KeyFileReadError, AwsCliUnavailable) as err:
+            failure = "could not read the GitHub App private key: %s" % err
         except (OSError, subprocess.SubprocessError) as err:
             failure = "could not read the GitHub App private key: %s" % type(err).__name__
         if failure:
