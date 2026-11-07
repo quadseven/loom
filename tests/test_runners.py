@@ -332,7 +332,7 @@ class RunnersTest(unittest.TestCase):
 
     def test_a_gateway_retry_after_keeps_the_runner_slot_undispatched_until_reset(self):
         run, run_id = self.dispatched()
-        reset = int(self.now + 12 * 3600)
+        reset = int(self.now + 24 * 3600)
         artifact = self.seal(run_id, {}, beat={
             "lane": "opencode-go-2", "at": 1, "available": False,
             "reason": "limit: free gateway route unavailable", "retry_at": reset,
@@ -342,6 +342,7 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(self.beat()["retry_at"], reset)
 
         self.drop_brief(name="owner.app-8")
+        # A one-day retry window blocks dispatch through its final second.
         self.runner(now=reset - 1).tend()
         self.assertEqual(len(self.gh.posts("/dispatches")), 1)
         self.runner(now=reset + 1).tend()
