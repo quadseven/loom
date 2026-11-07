@@ -4827,6 +4827,9 @@ class Factory:
             return self._assign_queued_model(repo, issue, model_match.group(1))
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo):
+            if not self._guarded(self._ensure_lane_headers, repo, issue):
+                self._waiting(repo, issue["number"], "brief headers could not be completed")
+                return "%s waits: brief headers could not be completed" % ref
             return self._assign_remote_queued(repo, issue, assigned, ref)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
@@ -5062,6 +5065,7 @@ class Factory:
                            tier: str) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
+            self._ensure_lane_headers(repo, issue)
             self.move(self.gh, repo, number, "queued", lane=lane)
             self._status_note(repo, number,
                               "The station reserved this queued ticket for remote lane %s (tier %s)."
@@ -5079,6 +5083,30 @@ class Factory:
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
+
+    def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Write the effective tier before reserving a remote lane.
+
+        A headerless ticket defaults to medium in the factory, but remote
+        lanes reject it because they cannot render a claim brief. Materialize
+        that tier before adding a lane label. Base: is optional; when absent,
+        the runner uses the repository's default branch.
+        """
+        body = str(issue.get("body") or "")
+        try:
+            headers, _ = tickets.parse(body)
+        except ValueError as err:
+            raise ValueError("cannot assign a lane to an unreadable brief: %s" % err) from err
+
+        updated = body
+        if "Difficulty" not in headers:
+            updated = tickets.with_header(updated, "Difficulty", difficulty_of(issue))
+        if updated == body:
+            return
+        tickets.parse(updated)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
+                     {"body": updated})
+        issue["body"] = updated
 
     # -- tickets no lane takes (loom#1831) --------------------------------
     def _no_lane_moves(self, found: Dict[str, Dict[int, Dict[str, Any]]],
