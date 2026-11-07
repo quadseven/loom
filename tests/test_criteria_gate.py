@@ -325,6 +325,28 @@ class LiveWaitAsk(tbs.Base):
         self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 2)
 
+    def test_a_failed_comment_read_defers_the_ask_to_the_next_pass(self):
+        # A transient read failure must not re-add a label a brain removed
+        # (the bug), so it holds without asking, says so, and the next pass asks.
+        from bus.github import GitHubError
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        real = GitHub.paginate
+
+        def flaky(gh, path, *a, **k):
+            if path.endswith("/issues/1/comments"):
+                raise GitHubError("HTTP 502 reading comments")
+            return real(gh, path, *a, **k)
+
+        with mock.patch.object(GitHub, "paginate", flaky), \
+                mock.patch.object(station, "_say") as said:
+            self.again()
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertTrue(any("could not read the comments" in str(c) for c in said.call_args_list))
+        self.again()
+        self.assertIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)
+
     def test_an_ask_made_before_the_station_kept_state_is_not_repeated(self):
         self.fake.private = False
         self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
