@@ -11696,6 +11696,19 @@ class TranscriptUploadTest(Base):
         self.assertFalse(os.path.exists(
             os.path.join(self.home, "state", "station", "transcripts.json")))
 
+    def test_a_failed_ssm_token_read_logs_its_safe_reason(self):
+        # loom#2692: logged by type alone, the cause stayed unknown for days.
+        from bus import github
+
+        def throttled(name, region):
+            raise github.SsmReadError("could not read the parameter from SSM: aws exited 255 "
+                                      "(ThrottlingException)")
+        self.go()
+        self.finish()
+        log = self.go(read_secret=throttled)
+        self.assertIn("could not read the transcript token parameter (could not read the "
+                      "parameter from SSM: aws exited 255 (ThrottlingException)); next pass", log)
+
     def test_an_unreadable_or_hung_token_read_skips_the_pass_without_the_secret(self):
         import subprocess
 

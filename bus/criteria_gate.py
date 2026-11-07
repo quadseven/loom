@@ -37,6 +37,12 @@ backticked or double-quoted strings must appear in the answer. The result is
 kept in the station's state and written to the ticket's status. A criterion
 with no runnable check, a check that keeps failing, and every operator
 criterion send the ticket to needs:human with one ask, once.
+
+A live wait is not a person's job (loom#2805): a ticket labelled wait:*, or
+whose only unmet criteria are live and that is labelled awaiting-live-check or
+states a `waiting:` line, gets no ask (`live_wait`). An ask is made once per
+set of criteria (`criteria_key`): a brain or operator that takes the label off
+with the criteria unchanged is not overruled on the next pass.
 """
 from __future__ import annotations
 
@@ -51,6 +57,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 from . import claimed, operator_hold, proof, tickets
 from .github import GitHubError
+from .labels import WAIT_PREFIX
 
 CODE = "code"
 LIVE = "live"
@@ -91,6 +98,12 @@ _KUBECTL_FORBIDDEN = re.compile(
     r"|--client-key|--client-certificate|\bexec\b|\bport-forward\b", re.I)
 CHECK_TIMEOUT = 30
 BODY_LIMIT = 1 << 20
+# A ticket that waits on a live event (loom#2805): a wait:* label
+# (WAIT_PREFIX), or awaiting-live-check, the same value as bus/brain.py
+# LIVE_CHECK_LABEL (not imported: bus/brain.py imports this module).
+LIVE_CHECK_LABEL = "awaiting-live-check"
+# A stated wait: `waiting: <what> until <time>` (the goal's claim rule).
+WAITING_LINE_RE = re.compile(r"^[ \t>*-]*waiting[ \t]*:[ \t]*\S", re.I | re.M)
 ASK_SHOWN = 4
 ASK_WIDTH = 160
 
@@ -186,6 +199,35 @@ def unverified(body: str, passed: Sequence[str]) -> List[Tuple[str, str]]:
     operator criterion is never verified by Loom."""
     done = set(passed)
     return [(k, t) for k, t in needing_evidence(body) if k == OPERATOR or key(t) not in done]
+
+
+def criteria_key(body: str) -> str:
+    """A short stable key for the ticket's acceptance criteria, ticks
+    included: it changes when a criterion is added, removed, reworded or
+    ticked, and not when another part of the body (a status line) does."""
+    lines = ["%s %s" % ("x" if checked else " ", " ".join(text.split()))
+             for checked, text in proof.criteria(body or "")]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
+def states_wait(text: Any) -> bool:
+    """`text` holds a stated `waiting:` line."""
+    return bool(WAITING_LINE_RE.search(str(text or "")))
+
+
+def live_wait(labels: Sequence[str], gaps: Sequence[Tuple[str, str]],
+              texts: Sequence[Any] = ()) -> bool:
+    """Whether a shipped ticket with these unverified criteria waits on a
+    live event rather than a person (loom#2805): a wait:* label, or every gap
+    is live and the ticket is labelled awaiting-live-check or one of `texts`
+    (its body, its trusted comments) states a `waiting:` line. An operator
+    criterion is a person's job, so it is still asked."""
+    names = [str(n) for n in labels]
+    if any(n.startswith(WAIT_PREFIX) for n in names):
+        return True
+    if not gaps or any(found != LIVE for found, _ in gaps):
+        return False
+    return LIVE_CHECK_LABEL in names or any(states_wait(t) for t in texts)
 
 
 def _spans(text: str) -> List[str]:
