@@ -94,6 +94,7 @@ from . import weakened
 from . import labels
 from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
+from . import home_repo
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
                      _OPENER, _next_link, read_ssm, rest_login, unreadable)
@@ -533,8 +534,11 @@ CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Where the runner files its validation incidents (lanes/run_lane.sh
-# FACTORY_REPO), and the marker and ticket line their bodies carry.
-FACTORY_REPO = "quadseven/loom"
+# FACTORY_REPO, from LOOM_FACTORY_REPO or the deployment's own repo
+# settings, never a literal: loom#2584), and the marker and ticket line
+# their bodies carry.
+FACTORY_REPO = (os.environ.get("LOOM_FACTORY_REPO", "").strip()
+                or home_repo.home_repo())
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 # The note that says the station unticked a decision box a lane ticked.
 DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
@@ -1615,14 +1619,7 @@ def _disarm_pass_deadline(path: Optional[str]) -> None:
 
 def _origin_repo() -> str:
     """owner/name of this checkout's origin remote, or "" when unknown."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    try:
-        out = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
-                             capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
-    return m.group(1) if m else ""
+    return home_repo.origin_repo()
 
 
 def _checkout_head() -> str:
@@ -1737,7 +1734,9 @@ def discord_call(method: str, path: str, token: str,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bot " + token,
                  "Content-Type": "application/json",
-                 "User-Agent": "DiscordBot (https://github.com/quadseven/loom, 1)"})
+                 "User-Agent": "DiscordBot (%s, 1)" % (
+                     "https://github.com/" + FACTORY_REPO if FACTORY_REPO
+                     else "https://example.com/loom")})
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status, raw = resp.status, resp.read()
@@ -15496,7 +15495,7 @@ class Station:
         """Run the one seven-day comparison of bus/send_back.py, at most
         hourly until it is done; it never runs a second time."""
         from . import send_back
-        repo = send_back.REPO
+        repo = send_back.repo()
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)

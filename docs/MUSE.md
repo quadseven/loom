@@ -26,7 +26,9 @@ agent-meta-muse is in `LOOM_BRIEF_AUTHORS`; until then, finish each stage
 in the tick that starts it. The :10 tick builds (Build).
 
 Set `LOOM_REPOS` (space separated `OWNER/NAME`
-values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+values), `LOOM_SWEEP_REPOS` (the subset the step 9 sweep may close or rewrite
+in, same format; unset means no sweep, and it never falls back to
+`LOOM_REPOS`) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
 `close`, verified moves and merges refuse every ticket as untrusted. Set
 `LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
