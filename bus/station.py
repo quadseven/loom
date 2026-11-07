@@ -623,6 +623,25 @@ UPLOAD_PER_PASS = 10
 # most this often (post_brain_memory), so a commitment another brain
 # finished closes without waiting for this machine's next tick.
 CLOSE_EVERY = 600
+# A refused done-marker upload retries on exponential back-off (_closings_delay):
+# it starts at CLOSE_BASE_DELAY seconds (one minute), doubles each consecutive
+# UploadRefused, and is capped at CLOSE_MAX_DELAY (the configured max delay).
+CLOSE_BASE_DELAY = 60
+CLOSE_MAX_DELAY = 600
+# After this many consecutive UploadRefused errors the station enters safe mode:
+# it keeps the markers in the local ledger cache until an upload succeeds.
+CLOSE_SAFE_AFTER = 3
+
+
+def _closings_delay(fails: int) -> int:
+    """The back-off before the next done-marker retry after `fails` consecutive
+    UploadRefused errors: CLOSE_BASE_DELAY doubled each time, capped at
+    CLOSE_MAX_DELAY."""
+    tries = fails if fails >= 1 else 1
+    delay = CLOSE_BASE_DELAY * (2 ** (tries - 1))
+    return delay if delay < CLOSE_MAX_DELAY else CLOSE_MAX_DELAY
+
+
 # The rules digest's source for docs/MUSE.md's Rules section.
 MUSE_RULES = "docs/MUSE.md"
 
@@ -13157,8 +13176,11 @@ class Station:
         the rules digest's sources that changed. A failed post is tried on
         the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
         that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
-        done markers written since the last send. Uses the transcript upload
-        settings and token."""
+        done markers written since the last send. A refused marker upload
+        retries on exponential back-off (_closings_delay), and after
+        CLOSE_SAFE_AFTER consecutive refusals it caches locally in safe mode
+        until an upload succeeds. Uses the transcript upload settings and
+        token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
             return
         path = os.path.join(self.state, "brain_memory.json")
@@ -13167,9 +13189,13 @@ class Station:
             raise StateError("state file %s does not hold an object" % path)
         last = self._finished_brain_tick()
         tries = self._tick_tries(ledger, last)
-        closed_at = ledger.get("closed_at")
-        close_due = self._num(ledger.get("since")) and not (
-            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        next_at = ledger.get("closings_next_at")
+        if self._num(next_at):
+            close_due = self._num(ledger.get("since")) and self.now >= next_at
+        else:
+            closed_at = ledger.get("closed_at")
+            close_due = self._num(ledger.get("since")) and not (
+                self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
         if tries is None and not close_due:
             return
         token = self._transcript_token()
@@ -13213,6 +13239,10 @@ class Station:
                         token, body)
             result: Any = "sent"
             ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+            ledger["closings_fails"] = 0
+            ledger.pop("closings_next_at", None)
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
         except UploadRefused as err:
             _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
             result = "refused"
@@ -13228,22 +13258,48 @@ class Station:
     def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
                              found: List[Dict[str, Any]]) -> None:
         """Send the done markers written since the last send, so the
-        commitments they finish close; a failed send is tried CLOSE_EVERY
-        seconds later."""
+        commitments they finish close. A refused upload is logged with its
+        status and retried after exponential back-off (_closings_delay);
+        after CLOSE_SAFE_AFTER consecutive refusals the markers stay in the
+        local ledger cache in safe mode until an upload succeeds. Any other
+        failure is retried CLOSE_EVERY seconds later."""
         ledger["closed_at"] = self.now
         closings = brain_memory.closings(found, ledger["since"])
         if not closings:
+            ledger.pop("closings_next_at", None)
+            ledger["closings_fails"] = 0
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
             return
         try:
             self.upload(brain_memory.dashboard_url(self.s.transcript_url,
                                                    brain_memory.COMMITMENTS_PATH),
                         token, {"commitments": [c for _, c in closings]})
+        except UploadRefused as err:
+            raw = ledger.get("closings_fails")
+            fails = int(raw) + 1 if self._num(raw) else 1
+            delay = _closings_delay(fails)
+            ledger["closings_fails"] = fails
+            ledger["closings_next_at"] = self.now + delay
+            ledger["closings_cache"] = [c for _, c in closings]
+            if fails >= CLOSE_SAFE_AFTER:
+                ledger["closings_safe"] = True
+            _say("could not send the brain's done markers (UploadRefused status %d); "
+                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
+                                           "; safe mode on, caching locally"
+                                           if ledger.get("closings_safe") else ""))
+            return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
+            ledger["closings_next_at"] = self.now + CLOSE_EVERY
             _say("could not send the brain's done markers (%s); next in %d minutes"
                  % (type(err).__name__, CLOSE_EVERY // 60))
             return
         ledger["since"] = closings[-1][0] + 1
+        ledger["closings_fails"] = 0
+        ledger.pop("closings_next_at", None)
+        ledger["closings_safe"] = False
+        ledger.pop("closings_cache", None)
 
     def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
                           homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
