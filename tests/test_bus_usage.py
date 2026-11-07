@@ -208,7 +208,7 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(by["claude"]["resets_at"], "2027-01-15T09:00:00+00:00")
         self.assertEqual(by["claude"]["note"], "limited: provider limit reached")
         self.assertEqual(by["claude"]["observed_at"], "2027-01-15T08:00:00+00:00")
-        self.assertEqual(by["agy"]["note"], "no limit seen")
+        self.assertEqual(by["agy"]["note"], "no CLI /usage reading yet; no limit seen")
         self.assertIsNone(by["agy"]["resets_at"])
         # The hold lifts: the reading keeps the last limit and when it was seen.
         self._beat("claude", at=now + 4000, available=True, reason="")
@@ -217,11 +217,25 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(row["resets_at"], "2027-01-15T09:00:00+00:00")
         self.assertEqual(row["observed_at"], "2027-01-15T08:00:00+00:00")
 
+    def test_claude_and_agy_use_their_latest_lane_meter(self):
+        state = Path(self.home) / "state" / "usage"
+        state.mkdir(parents=True)
+        (state / "agy.meter.json").write_text(json.dumps({
+            "at": 1_800_000_000, "source": "agy /usage", "windows": [{
+                "window": "weekly", "used_pct": 42, "remaining": 58,
+                "unit": "percent", "resets_at": "2027-01-22T08:00:00Z",
+                "window_minutes": 10080}]}))
+        row = usage.collect(self.home, now=1_800_000_000, lane_names=["agy"])[0]
+        self.assertEqual((row["used_pct"], row["remaining"], row["resets_at"]),
+                         (42, 58, "2027-01-22T08:00:00+00:00"))
+        self.assertEqual(row["observed_at"], "2027-01-15T08:00:00+00:00")
+        self.assertEqual(row["source"], "agy /usage")
+
     def test_a_hold_whose_retry_time_passed_is_not_a_current_limit(self):
         now = 1_800_000_000
         self._beat("agy", available=False, retry_at=now - 60, reason="limit: quota; lane waits until x")
         row = usage.collect(self.home, now=now, lane_names=["agy"], host="lanes")[0]
-        self.assertEqual(row["note"], "no limit seen")
+        self.assertEqual(row["note"], "no CLI /usage reading yet; no limit seen")
 
     def test_muse_says_it_reports_no_limit_and_how_old_its_heartbeat_is(self):
         station = Path(self.home) / "state" / "station"
