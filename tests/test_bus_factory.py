@@ -4891,6 +4891,30 @@ class RemoteQueued(Base):
         # A no-lane wait, so the station keeps its no_lane_since across passes.
         self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
 
+    def test_a_headerless_ticket_gets_claim_headers_before_remote_lane_reservation(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.gh.ticket(7, "queued", body=body)
+        self.gh.issues[7]["labels"] = [
+            {"name": "loom:ticket"}, {"name": "loom:queued"}]
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+        worker.assign_queued()
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
+    def test_an_existing_remote_reservation_repairs_missing_claim_headers(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.queued_for_muse()
+        self.gh.issues[7]["body"] = body
+        self.assign(0, ["muse"])
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
     def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
         self.queued_for_muse()
         worker = self.assign(7 * 3600, ["muse", "spark"])
