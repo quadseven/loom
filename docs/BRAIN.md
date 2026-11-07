@@ -2316,6 +2316,12 @@ adapter keep themselves read-only (a SELECT-only user, a reader that cannot
 exec). An adapter error, a timeout or too much output is no evidence, and the
 status line names it.
 
+A repo with no manifest of its own can read another opted-in repo's log
+command, and only that: `LOOM_LIVE_EVIDENCE_LENDS` pairs `borrower=lender`,
+the station reads the lender's manifest and log script from the lender's
+default branch, drops its `sql` command, and counts the pair only while the
+lender is in `LOOM_LIVE_EVIDENCE_REPOS`. A repo not paired gets no adapter.
+
 When an opted-in repo has a prose Live box with no runnable check, the
 station hands a shipped ticket to a verify lane before asking a person. The
 brief lists that adapter's log sources and whether its SQL route is available.
