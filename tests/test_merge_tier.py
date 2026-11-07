@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import shutil
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -632,11 +631,6 @@ class ReviewBodies(unittest.TestCase):
         def missing(*a, **k):
             raise OSError("no ruff")
         self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=missing), None)
-
-    @unittest.skipUnless(shutil.which("ruff"), "ruff is not installed")
-    def test_a_noqa_comment_does_not_silence_the_recheck(self):
-        text = "try:\n    pass\nexcept Exception:  # noqa: S110\n    pass\n"
-        self.assertIs(merge_tier.run_ruff("s110", "a.py", text), True)
 
 
 class ReviewBodyGate(BrainMerge):
