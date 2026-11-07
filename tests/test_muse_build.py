@@ -242,6 +242,53 @@ class PickTest(unittest.TestCase):
         gh = FakeGitHub(old + [issue("example/alpha", 999, created="2026-06-01T00:00:00Z")])
         self.assertEqual(muse_build.pick(gh, REPOS).number, 999)
 
+    def test_pick_scans_past_a_dozen_pr_covered_tickets(self):
+        covered = [issue("example/alpha", n, created="2026-01-01T00:00:%02dZ" % n)
+                   for n in range(1, 13)]
+        gh = FakeGitHub(covered + [issue("example/alpha", 13, created="2026-02-01T00:00:00Z")],
+                        timelines={("example/alpha", n): open_pr_naming(n) for n in range(1, 13)})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 13)
+
+    def test_pick_checks_each_ticket_for_a_pr_once_and_stops_at_the_cap(self):
+        many = [issue("example/alpha", n, created="2026-01-01T%02d:%02d:00Z" % (n // 60, n % 60))
+                for n in range(1, 201)]
+        gh = FakeGitHub(many, timelines={("example/alpha", n): open_pr_naming(n)
+                                         for n in range(1, 201)})
+        self.assertIsNone(muse_build.pick(gh, REPOS))
+        looked = [c[1] for c in gh.calls if "/timeline" in c[1]]
+        self.assertEqual(len(looked), len(set(looked)))
+        self.assertLessEqual(len(looked), muse_build.CHECKS)
+        self.assertGreaterEqual(muse_build.CHECKS, 100)
+
+    def test_a_for_muse_ticket_sorts_first_and_skips_the_soft_holds(self):
+        gh = FakeGitHub([issue("example/alpha", 1, labels=["P0"]),
+                         issue("example/alpha", 2, labels=["for-muse", "lane:claude",
+                                                           "loom:briefed", "loom:triage", "P3"],
+                               created="2026-05-01T00:00:00Z")])
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 2)
+
+    def test_for_muse_never_skips_a_hard_hold(self):
+        for labels in (["claim:quadseven"], ["needs:human"], ["wait:ci"], ["loom:human"],
+                       ["needs-brain"], ["awaiting-live-check"], ["epic"], ["loom:goal"],
+                       ["loom:running"], ["loom:pr"], ["blocked"], ["wontfix"],
+                       ["duplicate"], ["question"]):
+            with self.subTest(labels=labels):
+                gh = FakeGitHub([issue("example/alpha", 1, labels=["for-muse"] + labels)])
+                self.assertIsNone(muse_build.pick(gh, REPOS))
+
+    def test_for_muse_does_not_skip_a_pr_a_size_or_a_missing_checkbox(self):
+        gh = FakeGitHub([issue("example/alpha", 1, labels=["for-muse"]),
+                         issue("example/alpha", 2, labels=["for-muse"], size="L"),
+                         issue("example/alpha", 3, labels=["for-muse"], boxes=False)],
+                        timelines={("example/alpha", 1): open_pr_naming(1)})
+        self.assertIsNone(muse_build.pick(gh, REPOS))
+
+    def test_without_for_muse_the_soft_holds_still_exclude(self):
+        gh = FakeGitHub([issue("example/alpha", 1, labels=["lane:claude"]),
+                         issue("example/alpha", 2, labels=["loom:briefed"]),
+                         issue("example/alpha", 3, labels=["loom:triage"])])
+        self.assertIsNone(muse_build.pick(gh, REPOS))
+
     def test_pick_returns_none_when_nothing_is_buildable(self):
         gh = FakeGitHub([issue("example/alpha", 1, labels=["claim:dot"])])
         self.assertIsNone(muse_build.pick(gh, REPOS))

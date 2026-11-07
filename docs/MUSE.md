@@ -70,6 +70,8 @@ minutes on one ticket. The tick that starts at :40 is the brain tick
 (Tick). Any other Muse chat or task that builds (duty 10) uses the same
 commands, so every Muse run shares one claim and one open pull request.
 
+The operator hands Muse specific work with the label `for-muse`. Such a ticket sorts before every priority and skips the soft holds only (`lane:*`, `loom:briefed`, `loom:triage`); every other hold still applies (any claim other than Muse's own, `needs:*`, `wait:*`, `loom:human`, `needs-brain`, `awaiting-live-check`, an epic or goal, a running or pull-request state, `blocked`, `wontfix`, `duplicate`, `question`, a pull request naming it, a Size outside XS to M, no acceptance checkbox). The pick scans down the sorted list until one ticket has no open or merged pull request naming it, checking at most 120 tickets, and it searches only the repos in LOOM_REPOS.
+
 Build commands write as the agent-meta-muse App, like every Muse write (the
 top of this file); set its variables in the same shell call as each
 `bus.muse_build` command. With any other identity every command stops with
