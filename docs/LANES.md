@@ -99,6 +99,20 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+A successful contract command proves its exit status, not coverage of the
+changed paths. The contract has no path-to-check mapping. PR bodies and
+fix-round comments therefore keep the command result (including retries,
+host-red exceptions and `affected:` results) but also say `not validated:
+contract path coverage unknown` and name the changed paths. This applies to
+Python-only changes too: a Python command may check another directory. An
+arbitrary `affected:` hook, a language launcher or a filename mentioned in a
+command does not prove coverage. Documentation and configuration changes are
+not silently exempted. The path excerpt uses literal code spans, escapes
+control characters and backticks, and caps its size with an omitted count.
+If the diff cannot be read, coverage remains unknown.
+This is reporting only: existing check failures still block pushing, and the
+factory still waits for CI and review on the new head before landing it.
+
 After the repo check passes, the runner also checks each changed Python test
 against the exact base commit's code in the check sandbox. It copies each
 changed test file into a temporary base tree, then runs each changed test by

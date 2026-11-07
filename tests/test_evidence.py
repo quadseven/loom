@@ -115,8 +115,17 @@ class EvidenceEndpointTest(unittest.TestCase):
 
     def test_bearer_is_required_and_each_call_is_logged(self):
         calls = []
+
+        def record(*args):
+            # Each request runs on its own server thread and records its call
+            # after it has answered, so a later request can record first.
+            # Hold the unauthorized call back to force that order every run.
+            if args[0] == "unknown":
+                time.sleep(0.2)
+            calls.append(args)
+
         handler = make_handler(self.config, "test-bearer", logging.getLogger("evidence-audit"),
-                               audit_logger=lambda *args: calls.append(args))
+                               audit_logger=record)
         server = LocalHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -128,19 +137,17 @@ class EvidenceEndpointTest(unittest.TestCase):
             request = Request(url, headers={"Authorization": "Bearer test-bearer"})  # noqa: S310 - URL uses this test's local server.
             with urlopen(request) as response:  # noqa: S310 - URL uses this test's local server.
                 response.read()
-            # The handler records the call after it answers, on its own
-            # thread: wait for it rather than racing it under a loaded suite.
             deadline = time.monotonic() + 5
             while len(calls) < 2 and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(len(calls), 2)
-            self.assertEqual([call[0] for call in calls], ["unknown", "query"])
-            self.assertEqual(calls[0][1], "<invalid>")
-            self.assertEqual(calls[0][2], {})
-            self.assertEqual(calls[1][1], "runs")
-            self.assertEqual(calls[1][2], {"state": "stalled"})
-            self.assertGreater(calls[0][3], 0)
-            self.assertGreater(calls[1][3], 0)
+            # docs/EVIDENCE.md promises one audit line per request, not an
+            # order across concurrent requests: match calls by kind.
+            self.assertEqual(sorted(call[0] for call in calls), ["query", "unknown"])
+            by_kind = {call[0]: call for call in calls}
+            self.assertEqual(by_kind["unknown"][1:3], ("<invalid>", {}))
+            self.assertEqual(by_kind["query"][1:3], ("runs", {"state": "stalled"}))
+            self.assertGreater(by_kind["unknown"][3], 0)
+            self.assertGreater(by_kind["query"][3], 0)
         finally:
             server.shutdown()
             server.server_close()
