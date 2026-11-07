@@ -4864,6 +4864,17 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
+            if assigned in REMOTE_LANES and self._is_private(repo):
+                try:
+                    headers, _ = tickets.parse(issue.get("body"))
+                except ValueError:
+                    headers = None
+                # A remote lane renders its claim brief from Difficulty: (see
+                # _ensure_lane_headers); without it, as with no headers at all
+                # or an unreadable brief, no lane can claim the ticket.
+                if headers is None or "Difficulty" not in headers:
+                    self._relabel(repo, issue, [name for name in _labels(issue)
+                                                if not name.startswith("lane:")])
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
             return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
         tier = difficulty_of(issue) + (", " + fallback if fallback else "")
