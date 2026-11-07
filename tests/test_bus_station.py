@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
-from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
+from bus import answer, audit, brain, factory, fixrounds, history, invariants, proof, spend, station, status, tickets  # noqa: E402
 from bus import lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
@@ -4494,7 +4494,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
             self.round(n)
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 3)
-        self.assertEqual(factory.fixes_of(comments), 3)
+        self.assertEqual(history.fixes_of(comments), 3)
         self.assertEqual(factory.asked_threads(comments), {"PRRT_1", "PRRT_2", "PRRT_3"})
         fix, ident = self.station._fix_for(REPO, comments)
         self.assertEqual((fix.pr, fix.branch), (7, "loom/12-fix"))
@@ -4513,7 +4513,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
                                    "loom/12-fix\n<!-- loom:fix-head %s -->" % (REPO, str(n) * 40)})
         comments = self.gh.paginate("/repos/%s/issues/12/comments" % REPO)
         self.assertEqual(station.Station._fix_round_count(comments, self.authors), 3)
-        self.assertEqual(factory.fixes_of(comments), 3)
+        self.assertEqual(history.fixes_of(comments), 3)
         before = self.gh.new_comments
         self.round(4, rounds="5")
         self.assertEqual(self.gh.new_comments, before)
@@ -4575,7 +4575,7 @@ class FixRoundsInPlaceTest(unittest.TestCase):
         body = self.fixes()[0]["body"]
         stranger = [{"id": 5, "user": {"login": "mallory-example"}, "body": body,
                      "created_at": "2030-01-01T00:00:00Z", "updated_at": "2030-01-01T00:00:00Z"}]
-        self.assertEqual(factory.fixes_of(stranger), 1)
+        self.assertEqual(history.fixes_of(stranger), 1)
         self.assertEqual(factory.asked_threads(stranger), set())
 
     def test_a_round_body_round_trips_through_its_hidden_block(self):
@@ -7167,11 +7167,11 @@ class ExpiredKeyTest(Base):
             {"body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
              "created_at": at, "user": {"login": "alice-example"}}
             for lane in ("opencode-go", "opencode-go-2", "opencode-go-3")]
-        before = factory.attempts(self.fake.comments[12])
+        before = history.attempts(self.fake.comments[12])
         self.run_pass()
         self.assertNotIn("loom:runaway", self.fake.names(12))
         self.assertNotIn("loom:failed", self.fake.names(12))
-        self.assertEqual(factory.attempts(self.fake.comments[12]), before)
+        self.assertEqual(history.attempts(self.fake.comments[12]), before)
 
 
 class FactoryIncidentTest(Base):

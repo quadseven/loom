@@ -140,16 +140,19 @@ class ReadHistory(unittest.TestCase):
     def test_factory_names_delegate_to_the_same_reading(self):
         comments = [comment(history.rung_marker(1)), CLAIM,
                     comment("<!-- loom:fix v1 -->\nfix round")]
-        self.assertEqual(factory.rung_of(comments), history.rung_of(comments))
-        self.assertEqual(factory.tried_rungs(comments), history.tried_rungs(comments))
-        self.assertEqual(factory.fixes_of(comments), history.fixes_of(comments))
-        self.assertEqual(factory.attempts(comments), history.attempts(comments))
-        self.assertEqual(factory.dead_lane(comments), history.dead_lane(comments))
         self.assertIs(factory.RUNG_RE, history.RUNG_RE)
         self.assertIs(factory.RUNG_MARKER, history.RUNG_MARKER)
         # The fix marker string is defined in bus/tickets.py for the brief
         # writers; the history module's copy must never drift from it.
         self.assertEqual(factory.FIX_MARKER, history.FIX_MARKER)
+
+    def test_factory_no_longer_owns_history_reading(self):
+        # factory._ts stays as a private alias for factory's own call sites.
+        for name in ("rung_of", "tried_rungs", "fixes_of", "attempts",
+                     "attempts_since_brief", "dead_lane", "last_climb",
+                     "retry_chain", "ts_of", "_ending", "_attempt_rows",
+                     "_is_brief"):
+            self.assertFalse(hasattr(factory, name), name)
 
 
 if __name__ == "__main__":

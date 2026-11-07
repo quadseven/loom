@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import factory, status, tickets  # noqa: E402
+from bus import factory, history, status, tickets  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -194,7 +194,7 @@ class ReadBackTest(unittest.TestCase):
         self.assertEqual([c["body"] for c in listed], [
             "<!-- loom:rung 2 -->\nRepeatedly stuck (x): moved.", "A human note", CLAIM])
         self.assertEqual({c["user"]["login"] for c in listed}, {OPERATOR["login"]})
-        self.assertEqual(factory.tried_rungs(listed), {2})
+        self.assertEqual(history.tried_rungs(listed), {2})
         self.assertEqual(factory.CLAIMED_RE.match(listed[-1]["body"]).group(1), "codex")
 
     def test_an_event_read_from_the_body_names_no_comment_to_edit(self):

@@ -775,11 +775,7 @@ def _default_close(gh: GitHub, repo: str, number: int, comment: str) -> None:
     closing.close_pull(gh, repo, number, comment)
 
 
-def _ts(value: Any) -> float:
-    return history.ts_of(value)
-
-
-ts_of = _ts
+_ts = history.ts_of
 
 
 def _labels(issue: Dict[str, Any]) -> List[str]:
@@ -823,17 +819,6 @@ def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) 
     return count
 
 
-def rung_of(comments: Sequence[Dict[str, Any]]) -> int:
-    """The rung of the ticket's latest rung marker, 0 when none
-    (bus/history.py, loom#2457)."""
-    return history.rung_of(comments)
-
-
-def last_climb(comments: Sequence[Dict[str, Any]]) -> float:
-    """When the ticket last moved on the ladder (bus/history.py)."""
-    return history.last_climb(comments)
-
-
 def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
           checks_failing: bool, age: float, now: float = 0.0,
           no_test: bool = False, unticked: Sequence[str] = (),
@@ -846,7 +831,7 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     still has none, or when the
     pull request is older than STUCK_AGE and has not moved on the ladder for
     STUCK_AGE (age alone climbs once per window, not on every round)."""
-    if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
+    if age > STUCK_AGE and now - history.last_climb(comments) > STUCK_AGE:
         return True
     last = next((str(c.get("body") or "") for c in reversed(comments)
                  if str(c.get("body") or "").startswith(FIX_MARKER)), None)
@@ -1080,19 +1065,9 @@ def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
-def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
-    return history.fixes_of(comments)
-
-
 def pick_lane(lanes: Sequence[str], load: Dict[str, int]) -> str:
     """The least-loaded lane of a rung, the first listed on a tie."""
     return min(lanes, key=lambda lane: (load.get(lane, 0), lanes.index(lane)))
-
-
-def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
-    """The rungs the ticket has run on since its ladder last started
-    (bus/history.py, loom#2457)."""
-    return history.tried_rungs(comments)
 
 
 def _mark_model(body: str) -> Tuple[bool, Optional[str]]:
@@ -1205,28 +1180,6 @@ def issue_model(issue: Dict[str, Any]) -> str:
     return match.group(1) if match else "unspecified"
 
 
-def _ending(body: str) -> Optional[str]:
-    """The classed reason a comment ends the attempt before it with
-    (bus/history.py)."""
-    return history._ending(body)
-
-
-def _attempt_rows(comments: Sequence[Any], reset_at: Any = None) -> List[List[Any]]:
-    """Each claim as [epoch, time, lane, reason it failed] (bus/history.py)."""
-    return history._attempt_rows(comments, reset_at)
-
-
-def attempts(comments: Sequence[Any], current: str = "") -> List[Tuple[int, str, str, str]]:
-    """Each claim as (epoch, time, lane, reason it failed), oldest first
-    (bus/history.py, loom#2457)."""
-    return history.attempts(comments, current)
-
-
-def _is_brief(body: str) -> bool:
-    """Whether the comment assigns the ticket to a lane (bus/history.py)."""
-    return history._is_brief(body)
-
-
 # The head of the note _give_up leaves when a ticket is past the last rung.
 GAVE_UP = "The factory tried every rung of the model ladder"
 # The class bus/station.py's CLASS_RE reads off a reported reason.
@@ -1262,20 +1215,9 @@ def newest_ending_class(comments: Sequence[Any]) -> str:
     transient, factory, auth or work. A reason with no class, and a newest
     claim with no recorded ending, are work (the cautious reading: only an
     ending that says the lane did no work may keep a ticket from climbing)."""
-    rows = attempts(comments)
+    rows = history.attempts(comments)
     match = ENDING_CLASS_RE.match(rows[-1][3]) if rows else None
     return match.group(1) if match else "work"
-
-
-def attempts_since_brief(comments: Sequence[Any]) -> List[Tuple[int, str, str, str]]:
-    """The attempts after the ticket's last brief (bus/history.py)."""
-    return history.attempts_since_brief(comments)
-
-
-def dead_lane(comments: Sequence[Any]) -> Optional[str]:
-    """The one lane every attempt since the ticket's last brief ran on, or
-    None (bus/history.py, loom#2457)."""
-    return history.dead_lane(comments)
 
 
 def _cell(text: str) -> str:
@@ -2132,7 +2074,7 @@ class Factory:
         filed here: the pull request has not merged, and may never
         (settle_deferred files it once it does)."""
         threads = self._threads(repo, number)
-        rounds = fixes_of(comments)
+        rounds = history.fixes_of(comments)
         picked = deferrable(threads, self.review_bot, asked_threads(comments), rounds, immediate)
         if not picked:
             return False
@@ -2320,7 +2262,7 @@ class Factory:
         the one it failed on (`failed_here`), and every rung whose model one
         of its claims ran (ran_rungs). Only the ladder's own climbs make a
         lower rung a move down (climb_rungs)."""
-        climbed = tried_rungs(comments)
+        climbed = history.tried_rungs(comments)
         if failed_here:
             climbed |= {current_rung(issue)} - {0}
         return climbed | ran_rungs(issue, comments, footer), max(climbed, default=0)

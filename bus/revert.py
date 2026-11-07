@@ -44,7 +44,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import brain, naming, notify, text
-from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
+from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state
+from .history import ts_of as _ts
 from .github import GitHub, GitHubError
 from .tickets import DIFFICULTIES
 

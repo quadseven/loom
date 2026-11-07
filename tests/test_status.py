@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import factory, status  # noqa: E402
+from bus import factory, history, status  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
@@ -99,7 +99,7 @@ class ExpandTest(unittest.TestCase):
         self.assertEqual(listed[0]["created_at"], "2030-01-01T01:00:00Z")
         # The factory's ladder reads the climb and the claim after it from the
         # status comment: rung 2 was tried.
-        self.assertEqual(factory.tried_rungs(listed), {2})
+        self.assertEqual(history.tried_rungs(listed), {2})
 
 
     def test_a_strangers_status_looking_comment_is_never_expanded(self):

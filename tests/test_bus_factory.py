@@ -11,7 +11,7 @@ from unittest import mock
 
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
-from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, factory, history, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
@@ -402,7 +402,7 @@ class PullRequests(Base):
         self.assertNotIn("A1 the cache is read once", f.notes)
         self.assertNotIn("Live: observed", f.notes)
         self.assertIn("not built: <reason>", f.notes)
-        self.assertEqual((self.lane(5), factory.rung_of(self.gh.comments[5])), ("codex", 0))
+        self.assertEqual((self.lane(5), history.rung_of(self.gh.comments[5])), ("codex", 0))
 
     def test_a_criterion_the_text_check_refuses_still_goes_back_with_the_plain_note(self):
         body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
@@ -419,7 +419,7 @@ class PullRequests(Base):
                                     "\n\n- A2 a stale entry is dropped", "user": ME})
         self.go()
         self.assertEqual(self.merged, [])
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
 
     def test_a_pull_request_with_every_non_live_criterion_ticked_lands(self):
         criteria = ["A%d" % n for n in range(1, 6)] + ["Live: observed after deploy"]
@@ -629,7 +629,7 @@ class PullRequests(Base):
         self.assertEqual([x[:2] for x in self.fixed], [(50, (REPO, 5))])
         self.assertIn("fails without the change", f.notes)
         # A finding round: the first one stays on its lane.
-        self.assertEqual((self.lane(5), factory.rung_of(self.gh.comments[5])), ("codex", 0))
+        self.assertEqual((self.lane(5), history.rung_of(self.gh.comments[5])), ("codex", 0))
 
     def test_a_second_round_still_without_a_test_climbs(self):
         self.gh.ticket(5, "pr", lane="opencode-go")
@@ -637,7 +637,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, files=("src/main.cpp",))
         self.go()
         self.assertEqual(self.merged, [])
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
 
     def blocked_by(self, login, user_type="Bot", submitted=600):
         self.gh.ticket(5, "pr")
@@ -747,7 +747,7 @@ class PullRequests(Base):
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
         self.assertEqual((self.lane(5), self.model(5)), ("codex", None))
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 0)
 
     def test_a_fix_round_on_a_remote_lane_moves_to_a_local_lane(self):
         self.gh.ticket(5, "pr", lane="muse")
@@ -774,7 +774,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual((self.lane(5), self.model(5)), ("claude", "claude-sonnet-5-5"))
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
         # The lane label changed before the fix brief went out.
         self.assertIn({"name": "lane:claude"}, self.fixed[0][2])
 
@@ -786,7 +786,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, resolved=False)
         self.go()
         self.assertEqual((self.lane(5), self.model(5)), ("opencode-go", None))
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 0)
         self.assertEqual(self.fixed, [])
 
     def test_a_review_round_that_finds_new_things_stays_on_its_lane(self):
@@ -2456,7 +2456,7 @@ class ReviewBotThreads(Base):
         self.go()
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+        self.assertEqual((self.fixed, history.rung_of(self.gh.comments[5])), ([], 0))
 
     def test_a_thread_whose_bot_root_comment_starts_with_fixed_in_and_has_no_later_comment_is_resolved(self):
         self.gh.ticket(5, "pr", lane="codex")
@@ -2467,7 +2467,7 @@ class ReviewBotThreads(Base):
         self.go()
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual((self.fixed, factory.rung_of(self.gh.comments[5])), ([], 0))
+        self.assertEqual((self.fixed, history.rung_of(self.gh.comments[5])), ([], 0))
 
     def test_an_edited_bot_root_comment_with_a_later_person_comment_stays_open(self):
         self.gh.ticket(5, "pr")
@@ -2526,7 +2526,7 @@ class ReviewBotThreads(Base):
 
     def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
         self.stuck_case(BOT)
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
 
     def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
         self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")
@@ -2538,7 +2538,7 @@ class ReviewBotThreads(Base):
         # On a public repo anyone can open a thread: one copying a finding's
         # path, line and rule must not climb the ticket or stop its rounds.
         self.stuck_case({"__typename": "User", "login": "a-stranger"})
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 0)
         self.assertEqual(self.lane(5), "codex")
 
     def test_a_no_change_round_waits_for_the_review_it_asked_for(self):
@@ -2549,7 +2549,7 @@ class ReviewBotThreads(Base):
         self.gh.runs["sha50"][1]["completed_at"] = iso(900)
         self.go()
         self.assertEqual((self.fixed, self.merged), ([], []))
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 0)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 0)
 
     def test_a_no_change_round_is_judged_once_the_review_answered(self):
         self.gh.ticket(5, "pr", lane="claude")
@@ -2558,7 +2558,7 @@ class ReviewBotThreads(Base):
         self.gh.pull(50, 5, resolved=False, green=False)
         self.gh.runs["sha50"][1]["completed_at"] = iso(30)
         self.go()
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
 
     def test_a_no_change_round_with_no_review_is_judged_after_the_grace(self):
         self.gh.ticket(5, "pr", lane="claude")
@@ -2602,7 +2602,7 @@ class NoChangeRounds(Base):
         self.rounds("fix", "none")
         self.go()
         self.assertEqual((len(self.fixed), self.humans), (1, []))
-        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertEqual(history.rung_of(self.gh.comments[5]), 1)
 
     def test_a_round_that_changed_something_resets_the_count(self):
         self.rounds("fix", "none", "fix", "fix", "none")
@@ -4385,12 +4385,12 @@ class SilentLane(Base):
         self.silent_ticket()
         self.go(silent={"codex": 31 * 60})
         comments = self.gh.comments[7]
-        self.assertEqual(station.retry_chain(comments), (0, set(), None))
-        self.assertEqual(factory.rung_of(comments), 0)
+        self.assertEqual(history.retry_chain(comments), (0, set(), None))
+        self.assertEqual(history.rung_of(comments), 0)
         self.assertFalse(any(factory.FAILED_RE.match(c["body"]) for c in comments))
         self.assertEqual(self.moved, [])
         # Its claim is no attempt on the new lane: the move is a new brief.
-        self.assertEqual(factory.attempts_since_brief(comments), [])
+        self.assertEqual(history.attempts_since_brief(comments), [])
 
     def test_a_model_ticket_moves_to_a_free_lane_that_takes_its_model(self):
         self.silent_ticket(body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
@@ -4429,7 +4429,7 @@ class SilentLane(Base):
         self.assertIn("loom:queued", self.labels())
         self.assertNotIn("lane:codex", self.labels())
         self.assertIn("Not a failure", self.gh.comments[7][-1]["body"])
-        self.assertEqual(station.retry_chain(self.gh.comments[7]), (0, set(), None))
+        self.assertEqual(history.retry_chain(self.gh.comments[7]), (0, set(), None))
         self.assertEqual(f.silent_running, {"codex": [(REPO, 7)]})
 
     def test_a_ticket_moved_off_a_silent_lane_drops_our_claim_and_keeps_theirs(self):
@@ -4553,16 +4553,16 @@ class Helpers(unittest.TestCase):
 
     def test_tried_rungs_start_again_at_a_rung_zero_marker(self):
         comments = ALL_RUNGS + [{"body": factory.RUNG_MARKER % 0}, {"body": factory.RUNG_MARKER % 2}, CLAIM]
-        self.assertEqual(factory.tried_rungs(comments), {2})
+        self.assertEqual(history.tried_rungs(comments), {2})
 
     def test_a_rung_with_no_claim_is_not_tried(self):
         comments = [{"body": factory.RUNG_MARKER % 1}, CLAIM, {"body": factory.RUNG_MARKER % 2}]
-        self.assertEqual(factory.tried_rungs(comments), {1})
+        self.assertEqual(history.tried_rungs(comments), {1})
 
     def test_a_limit_park_does_not_charge_a_rung(self):
         comments = [{"body": factory.RUNG_MARKER % 1}, CLAIM,
                     {"body": "Lane zen stopped: [limit] provider at usage limit"}]
-        self.assertEqual(factory.tried_rungs(comments), set())
+        self.assertEqual(history.tried_rungs(comments), set())
 
     def test_pick_lane_takes_the_least_loaded(self):
         self.assertEqual(factory.pick_lane(("codex", "codex-2"), {"codex": 2, "codex-2": 1}), "codex-2")
@@ -4714,19 +4714,19 @@ class DeadLane(unittest.TestCase):
             "Claimed for lane codex-2 (body sha256 0123456789ab)",
             "Claimed for lane codex-2 (body sha256 0123456789ab)",
             "Runaway: three attempts within six hours.")
-        self.assertEqual(factory.attempts_since_brief(comments),
+        self.assertEqual(history.attempts_since_brief(comments),
                          [(a[0], a[1], "codex-2", "") for a in
-                          factory.attempts(comments)[-2:]])
-        self.assertEqual(factory.dead_lane(comments), "codex-2")
+                          history.attempts(comments)[-2:]])
+        self.assertEqual(history.dead_lane(comments), "codex-2")
 
     def test_attempts_on_two_lanes_are_not_one_dead_lane(self):
         comments = self.comments(
             "Claimed for lane codex (body sha256 0123456789ab)",
             "Claimed for lane codex-2 (body sha256 0123456789ab)")
-        self.assertIsNone(factory.dead_lane(comments))
+        self.assertIsNone(history.dead_lane(comments))
 
     def test_no_claims_is_not_one_dead_lane(self):
-        self.assertIsNone(factory.dead_lane(self.comments("Runaway: three attempts.")))
+        self.assertIsNone(history.dead_lane(self.comments("Runaway: three attempts.")))
 
     def test_a_retry_and_a_ladder_move_are_briefs(self):
         comments = self.comments(
@@ -4734,13 +4734,13 @@ class DeadLane(unittest.TestCase):
             "Automatic retry 1 of 2 (transient): moved from lane codex to lane "
             "codex-2. Lane codex failed: [transient] agent exited 1",
             "Claimed for lane codex-2 (body sha256 0123456789ab)")
-        self.assertEqual(factory.dead_lane(comments), "codex-2")
+        self.assertEqual(history.dead_lane(comments), "codex-2")
         comments = self.comments(
             "Claimed for lane codex (body sha256 0123456789ab)",
             "<!-- loom:rung 2 -->\nRepeatedly stuck (x): the factory moved this ticket "
             "up the model ladder to rung 2, gpt-6-luna on lane codex.",
             "Claimed for lane codex (body sha256 0123456789ab)")
-        self.assertEqual(factory.dead_lane(comments), "codex")
+        self.assertEqual(history.dead_lane(comments), "codex")
 
     def test_a_retry_a_hold_and_a_stop_end_their_attempts_with_their_class(self):
         # Since status events (loom#866) these endings do not start "Lane X
@@ -4758,7 +4758,7 @@ class DeadLane(unittest.TestCase):
             "Claimed for lane codex (body sha256 0123456789ab)",
             "Lane codex stopped: [auth] the provider refused the key",
             "Claimed for lane codex (body sha256 0123456789ab)")
-        reasons = [a[3] for a in factory.attempts(comments)]
+        reasons = [a[3] for a in history.attempts(comments)]
         self.assertEqual(reasons[0], "[transient] agent exited 1")
         self.assertTrue(reasons[1].startswith("[factory] setup failed:"), reasons[1])
         self.assertEqual(reasons[2:], ["[limit] provider limit reached",
@@ -4768,7 +4768,7 @@ class DeadLane(unittest.TestCase):
         comments = self.comments(
             "Claimed for lane codex (body sha256 0123456789ab)",
             "Lane codex stopped: [work] something else")
-        self.assertEqual([a[3] for a in factory.attempts(comments)], [""])
+        self.assertEqual([a[3] for a in history.attempts(comments)], [""])
 
 
 class LaneKinds(unittest.TestCase):

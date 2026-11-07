@@ -8038,7 +8038,6 @@ def _stuck_reasons(issue: Dict[str, Any], labelled: Labelled, failed: int, fixes
 def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     """The rungs a ticket ran on, from rung markers by a trusted login only,
     as in the factory: anyone can comment on a public repo."""
-    from . import history  # the trusted history reading (loom#2457)
     return history.read_history(comments, authors).tried_rungs
 
 

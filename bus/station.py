@@ -2018,14 +2018,6 @@ def needs_public_repo(lane: str, model: str) -> bool:
             or (lane == "opencode-go" and fnmatch.fnmatchcase(model, "*muse-spark*contributor*")))
 
 
-def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]]]:
-    """(automatic retries since the ticket last went to the brain or opened a
-    pull request, the lanes those retries left, and (from, to) of the latest
-    retry when no claim has followed it: a retry whose relabel did not
-    happen yet)."""
-    return history.retry_chain(comments)
-
-
 def scrub(reason: str) -> str:
     text = _text.scrub_paths(" ".join(reason.split()))
     return text[:REASON_MAX]
@@ -3387,7 +3379,7 @@ class Station:
             return
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict)]
-        lane = factory.dead_lane(comments)
+        lane = history.dead_lane(comments)
         if lane is None or lane not in dead:
             return
         inv_number, inv_title = dead[lane]
@@ -7799,10 +7791,10 @@ class Station:
         """The fix rounds sent since the ticket last moved on the model ladder
         (its newest rung marker): a climb gives the stronger model rounds of
         its own. Every round counts when it never climbed."""
-        since = factory.last_climb(comments)
+        since = history.last_climb(comments)
         return Station._fix_round_count(
             [c for c in comments if not since
-             or (isinstance(c, dict) and factory.ts_of(c.get("created_at")) > since)], authors)
+             or (isinstance(c, dict) and history.ts_of(c.get("created_at")) > since)], authors)
 
     def _climb_stuck(self, repo: str, number: int, pr_number: int, detail: Dict[str, Any],
                      comments: List[Any], persisted: List[str]) -> Optional[str]:
@@ -8094,7 +8086,7 @@ class Station:
         Each one was a new comment, an email apiece (an infra ticket,
         2026-10-19). The GitHub client expands status events, so the attempt
         table still reads each "Lane X failed:", "held:" and "stopped:" line
-        as the ending of the claim before it (factory.attempts)."""
+        as the ending of the claim before it (history.attempts)."""
         status.add(self.gh, repo, number, text, self.now, self.s.authors)
 
     def _timed_out_again(self, repo: str, number: int, reason: str) -> bool:
@@ -8106,7 +8098,7 @@ class Station:
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
         # The newest claim is the run being reported: the ones before it ended.
-        earlier = factory.attempts(comments, reason)[:-1]
+        earlier = history.attempts(comments, reason)[:-1]
         return factory.timeouts_in_a_row(earlier) + 1 >= factory.TIMEOUT_STRIKES
 
     def _flag_repeated_failure(self, repo: str, number: int, lane: str, reason: str) -> bool:
@@ -8118,7 +8110,7 @@ class Station:
             # none did the ticket's work, so none may flag it or cost it a rung
             # (loom#572, loom#744). Earlier claims that ended so are left out
             # by the ending each recorded: a failure, a retry, a hold or a
-            # stop (factory.attempts).
+            # stop (history.attempts).
             return False
         issue = self._issue(repo, number)
         if tickets.ticket_state(issue) in tickets.MERGED_STATES:
@@ -8129,7 +8121,7 @@ class Station:
         authors = {author.lower() for author in self.s.authors}
         comments = [c for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
                     if isinstance(c, dict) and tickets._login(c.get("user")).lower() in authors]
-        attempts = factory.attempts(comments, reason)
+        attempts = history.attempts(comments, reason)
         def is_work(reason: str) -> bool:
             return not reason or failure_class(reason) not in NOT_WORK
         work = [a for a in attempts if is_work(a[3])]
@@ -8163,7 +8155,7 @@ class Station:
         if RUNNING not in names:
             return "the ticket is no longer running"
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        used, left, pending = retry_chain(comments)
+        used, left, pending = history.retry_chain(comments)
         if pending and pending[0] == lane:
             # An earlier pass commented this retry but did not relabel.
             target = pending[1]
@@ -8420,7 +8412,7 @@ class Station:
         if tickets.ticket_state(self._issue(repo, number)) not in tickets.MERGED_STATES:
             self._relabel(repo, number, "loom:pr")
         # A stop, never "failed:": the claim did no work, so it is not an
-        # attempt toward a runaway (factory.attempts).
+        # attempt toward a runaway (history.attempts).
         self._stopped(repo, number, lane, "transient",
                       "pull request #%d merged before lane %s ran its fix round; nothing "
                       "ran, which is not a failure" % (pr, lane))
