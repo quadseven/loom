@@ -9047,6 +9047,40 @@ class OutcomeTest(Base):
         self.limited(fix_body=FIX_BODY)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:spark", "loom:pr"])
 
+    def test_repeated_limit_logs_once_but_keeps_each_claim_ending(self):
+        self.fake.add(12, state="running", lane="spark",
+                      body=BODY.replace("Model: model-x", "Model: spark/test"))
+        gh = GitHub("token", transport=self.fake)
+        gh.status_in_body = True
+        gh.status_authors.update(AUTHORS)
+        runner = station.Station(gh, self.settings)
+        lines = []
+        with mock.patch.object(station, "_say", lines.append):
+            runner._limited(REPO, 12, False, "spark", "limit: monthly usage 22 is ahead of pace")
+            self.fake.issues[12]["labels"] = [
+                {"name": name} for name in ("loom:ticket", "lane:spark", "loom:running")]
+            status.add(gh, REPO, 12, "Claimed for lane spark (body sha256 abcdef012345)",
+                       time.time(), AUTHORS)
+            runner._limited(REPO, 12, False, "spark", "limit: monthly usage 23 is ahead of pace")
+
+        reports = [line for line in lines if line.startswith("reported ")]
+        events = status.body_events(self.fake.issues[12]["body"])
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(sum("stopped: [limit]" in text for _, text in events), 2)
+
+    def test_new_limit_after_a_different_lane_outcome_is_logged(self):
+        self.fake.add(12, state="running", lane="spark",
+                      body=BODY.replace("Model: model-x", "Model: spark/test"))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        lines = []
+        prior_work = ["Lane spark failed: build failed"]
+        with mock.patch.object(station, "_say", lines.append), \
+                mock.patch.object(runner, "_status_texts", return_value=prior_work), \
+                mock.patch.object(runner, "_stopped"):
+            runner._limited(REPO, 12, False, "spark", "limit: a new provider limit")
+
+        self.assertEqual(len([line for line in lines if line.startswith("reported ")]), 1)
+
     def test_limited_lanes_are_those_with_a_fresh_limit_heartbeat(self):
         d = os.path.join(self.home, "state", "usage")
         for lane, available, reason, age in (
