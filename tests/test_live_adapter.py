@@ -337,6 +337,16 @@ class StationManifestTest(tbs.Base):
         self.files[live_adapter.MANIFEST] = "{not json"
         self.assertIsNone(self.station([REPO])._proof_sources(REPO).source_log)
 
+    def test_the_station_reads_and_parses_a_repo_manifest_once(self):
+        st = self.station([REPO])
+        with mock.patch.object(st, "_contents_text", wraps=st._contents_text) as read:
+            first = st._live_adapter(REPO)
+            second = st._live_adapter(REPO)
+        self.assertIs(first, second)
+        self.assertEqual([call.args[1] for call in read.call_args_list],
+                         [live_adapter.MANIFEST, ".loom/live-evidence/log",
+                          ".loom/live-evidence/sql"])
+
 
 
 LENDER = "owner/lender"
@@ -470,6 +480,15 @@ class ManifestTest(unittest.TestCase):
                                                  "{needle}"]))
         self.assertEqual(why, "")
         self.assertEqual(adapter.scripts, {})
+
+    def test_a_sql_only_manifest_parses_without_log_sources(self):
+        manifest = {"version": 1,
+                    "sql": {"argv": [".loom/live-evidence/sql", "{sql}"]}}
+        adapter, why = self.parse(manifest)
+        self.assertEqual(why, "")
+        self.assertIsNone(adapter.log)
+        self.assertEqual(adapter.sources, ())
+        self.assertIsNotNone(adapter.sql)
 
 
 class RunnerTest(unittest.TestCase):
