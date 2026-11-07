@@ -6544,8 +6544,10 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues/20")])
 
     def test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open(self):
+        # Past the cap by the one rescue epic: no intake epic may open.
         url = "https://api.github.com/repos/%s/issues/20" % REPO
-        fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP) for n in range(6)])
+        fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP)
+                                for n in range(brain.GOAL_EPIC_CAP + brain.RESCUE_EPIC_EXTRA)])
         self.epic_under_goal(fake, 20, state="closed",
                              tickets=[self.under(21, 20, parent_issue_url=url)])
         self.assertEqual(self.move(fake), (0, 1))
