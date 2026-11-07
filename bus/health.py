@@ -793,6 +793,15 @@ def evidence_comment(f: Finding, checked_at: str) -> str:
                _count(f.affected), _count(f.hours), _count(f.impact), f.priority, quoted(f)))
 
 
+def _returning(open_by_digest: Dict[str, Dict[str, Any]], ledger: Dict[str, Any]) -> set:
+    """Open tickets whose every finding was absent before this pass."""
+    owned: Dict[int, List[str]] = {}
+    for digest, issue in open_by_digest.items():
+        owned.setdefault(int(issue["number"]), []).append(digest)
+    return {number for number, digests in owned.items()
+            if all(ledger.get(d, {}).get("absent") for d in digests)}
+
+
 def rolling_evidence(body: str, observed: List[Finding], checked: str) -> str:
     """Replace only the owned block; its totals survive loss of local state.
 
@@ -1028,7 +1037,11 @@ class Intake:
                     and self.now - float(rec.setdefault("gone", self.now)) < RETAIN:
                 continue
             del ledger[digest]
-        prefix = source.repo + "#"
+        self._forget_notes(source.repo, issues)
+
+    def _forget_notes(self, repo: str, issues: Dict[int, Dict[str, Any]]) -> None:
+        """Drop absent and return notes for tickets that are no longer open."""
+        prefix = repo + "#"
         for notes in (self.absent_noted, self.return_pending):
             for key in [k for k in notes if k.startswith(prefix)]:
                 if not key[len(prefix):].isdigit() or int(key[len(prefix):]) not in issues:
@@ -1043,11 +1056,7 @@ class Intake:
         # pass, once the issue list carries it.
         briefed: set = set()
         observed: Dict[int, Tuple[Dict[str, Any], List[Finding]]] = {}
-        owned: Dict[int, List[str]] = {}
-        for digest, issue in open_by_digest.items():
-            owned.setdefault(int(issue["number"]), []).append(digest)
-        returning = {number for number, digests in owned.items()
-                     if all(ledger.get(d, {}).get("absent") for d in digests)}
+        returning = _returning(open_by_digest, ledger)
         for f in found:
             rec = ledger.setdefault(f.digest, {})
             issue = open_by_digest.get(f.digest)
@@ -1066,14 +1075,21 @@ class Intake:
                 briefed.add(named)
             if issue is not None:
                 observed.setdefault(int(issue["number"]), (issue, []))[1].append(f)
+        self._flush_evidence(source.repo, observed, checked or self.stamp)
+        return open_by_digest
+
+    def _flush_evidence(self, repo: str,
+                        observed: Dict[int, Tuple[Dict[str, Any], List[Finding]]],
+                        checked: str) -> None:
+        """Rewrite each observed ticket's evidence block; one comment for a
+        ticket whose problem came back."""
         for number, (issue, present) in observed.items():
-            self._write_evidence(source.repo, issue, present, checked or self.stamp)
-            key = "%s#%d" % (source.repo, number)
+            self._write_evidence(repo, issue, present, checked)
+            key = "%s#%d" % (repo, number)
             if key in self.return_pending:
-                self._comment(source.repo, issue, reseen_comment(self.return_pending[key]),
+                self._comment(repo, issue, reseen_comment(self.return_pending[key]),
                               notify.EVIDENCE)
                 del self.return_pending[key]
-        return open_by_digest
 
     def _absent(self, repo: str, open_by_digest: Dict[str, Dict[str, Any]], current: set,
                 ledger: Dict[str, Any], when: str) -> Dict[int, Dict[str, Any]]:
