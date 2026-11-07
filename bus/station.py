@@ -901,6 +901,27 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     return evidence.needles(live)
 
 
+def _adapter_live_criterion(body: str) -> Optional[str]:
+    """Return the live criterion an adapter verify run can read, if any."""
+    explicit = brain.live_criterion(body, limit=None)
+    if explicit != "(no Live criterion on the ticket)":
+        if criteria_gate.check_of(explicit) is None \
+                and live_proof.step_of(explicit)[0] is None:
+            return explicit
+        return None
+    for checked, criterion in proof.criteria(body):
+        if checked or criteria_gate.kind(criterion) != criteria_gate.LIVE:
+            continue
+        if not re.search(r"`[^`\n]+`", criterion) or not evidence.needles(criterion):
+            continue
+        step, why = live_proof.step_of(criterion)
+        if (criteria_gate.check_of(criterion) is not None or why
+                or (step is not None and not (step.kind == live_proof.LOG and not step.source))):
+            continue
+        return criterion
+    return None
+
+
 def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
     """Get the log file path for a repo and evidence command, or None.
 
@@ -3801,11 +3822,8 @@ class Station:
     def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether this opted-in repo can send a prose Live box to a verify
         lane for an adapter step proposed by that lane."""
-        body = str(issue.get("body") or "")
-        live = brain.live_criterion(body, limit=None)
-        if (live == "(no Live criterion on the ticket)"
-                or criteria_gate.check_of(live) is not None
-                or live_proof.step_of(live)[0] is not None):
+        live = _adapter_live_criterion(str(issue.get("body") or ""))
+        if live is None:
             return False
         return self._live_adapter(repo) is not None
 
@@ -4170,8 +4188,12 @@ class Station:
         if brain.WAIT_LIVE_EVENT in _label_names(issue):
             self._clear_live_event(repo, number)
         stamp = int(self.now)
+        adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
+                        if self._adapter_can_verify(repo, issue) else None)
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp,
+            adapter_live or brain.live_criterion(issue.get("body")),
+            live_criteria=[adapter_live] if adapter_live else None)
         text += self._verify_github_data(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:

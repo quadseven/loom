@@ -10,6 +10,7 @@ operator has not opted in runs nothing.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -132,13 +133,14 @@ class StationAdapterProofTest(tbs.Base):
 
     def test_a_failing_read_stays_open_with_the_reason(self):
         self.ship(SQL_BODY, hours_ago=2)
-        self.adapter_pass(FakeAdapter(error="the adapter exited 2"))
+        self.adapter_pass(FakeAdapter(error="the adapter exited 2 (kubeconfig refused)"))
         issue = self.fake.issues[self.NUMBER]
         self.assertEqual(issue["state"], "open")
         self.assertNotIn("loom:verified", self.fake.names(self.NUMBER))
         text = self.status_text()
         self.assertIn("Live proof missing:", text)
-        self.assertIn("the repo's SQL adapter gave no answer (the adapter exited 2)", text)
+        self.assertIn("the repo's SQL adapter gave no answer "
+                      "(the adapter exited 2 (kubeconfig refused))", text)
         self.assertIn("next check %s" % stamp(self.now + live_proof.RETRY), text)
 
     def test_prose_live_box_is_sent_to_verify_when_repo_has_adapter(self):
@@ -160,6 +162,28 @@ class StationAdapterProofTest(tbs.Base):
         with open(os.path.join(self.inbox("codex"), names[0]), encoding="utf-8") as fh:
             brief = fh.read()
         self.assertIn("adapter_step", brief)
+
+    def test_live_gate_box_with_backticked_log_string_uses_adapter_verify(self):
+        criterion = "the bridge log shows `bridge status:` lines"
+        body = HEAD + "- [ ] " + criterion + "\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        self.settings.live_evidence_repos = [REPO]
+        runner = live_adapter.Runner(live_adapter.Adapter(
+            live_adapter.Command(("grep", "-F", "{needle}", "{source}"), 20),
+            ("worker",), None, {}))
+        with mock.patch.object(station.Station, "_live_adapter", return_value=runner):
+            self.assertTrue(st._adapter_can_verify(REPO, self.fake.issues[self.NUMBER]))
+            st._write_verify_brief(REPO, "codex", self.fake.issues[self.NUMBER])
+        names = os.listdir(self.inbox("codex"))
+        with open(os.path.join(self.inbox("codex"), names[0]), encoding="utf-8") as fh:
+            brief = fh.read()
+        self.assertIn("Live criterion: " + criterion, brief)
+        self.assertIn("exact criterion text", brief)
+        template = json.loads(brief.split("```json\n", 1)[1].split("\n```", 1)[0])
+        evidence_by_criterion = {item["criterion"]: item["evidence"]
+                                 for item in template["criteria"]}
+        self.assertIn("UTC time you saw it", evidence_by_criterion[criterion])
 
     def test_prose_live_box_without_adapter_still_asks_for_a_person(self):
         body = HEAD + "- [ ] Live: the production levels and cleared runs remain correct\n"
@@ -489,6 +513,18 @@ class RunnerTest(unittest.TestCase):
         self.assertLess(time.time() - started, 15)
         self.assertIn("more than", self.runner("#!/bin/sh\nyes boat\n").log(
             "worker", "boat leg taken", 0).error)
+
+    def test_exit_two_reports_a_safe_reason_from_its_first_stderr_line(self):
+        answer = self.runner("#!/bin/sh\necho 'kubeconfig refused: permission denied' >&2\nexit 2\n").log(
+            "worker", "boat leg taken", 0)
+        self.assertIn("kubeconfig refused", answer.error)
+        self.assertNotIn("permission denied", answer.error)
+
+    def test_stderr_capture_stays_bounded_without_a_newline(self):
+        found = []
+        live_adapter._read_first_stderr_line(io.BytesIO(b"x" * 100_000), found)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]), live_adapter.MAX_ERROR_LINE)
 
     def test_exit_one_is_nothing_matched_and_a_count_is_read(self):
         answer = self.runner("#!/bin/sh\necho 'loom-evidence-count: 0'\nexit 1\n").log(
