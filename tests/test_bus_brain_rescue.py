@@ -90,6 +90,20 @@ class ClosedEpicRescueTests(unittest.TestCase):
         self.assertEqual(self.move(fake), (0, 2))
         self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
 
+    def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
+        fake = self.cap_repo()
+        loose = item(10, body="## Why\nwhy\n\nPart of #1\n", labels=("loom:ticket",),
+                     created_at="2029-01-01T00:00:00Z",
+                     parent_issue_url="https://api.github.com/repos/%s/issues/1" % REPO)
+        fake.issues[10] = loose
+        fake.subs[1].append(10)
+        fake.open_tickets = [loose, fake.issues[21], fake.issues[22]]
+        self.assertEqual(self.move(fake), (2, 1))
+        self.assertIn(10, fake.subs[1])
+        opened = [n for n in fake.subs[1] if n not in (1, 10, 20, 31, 32, 33, 34, 35, 60)]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(sorted(fake.subs[opened[0]]), [21, 22])
+
     def test_a_goal_at_the_cap_with_room_in_its_intake_epic_opens_nothing(self):
         fake = self.cap_repo(intake_full=False)
         before = set(fake.issues)

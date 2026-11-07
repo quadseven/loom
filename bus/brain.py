@@ -2914,8 +2914,10 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     for ticket, old in tickets:
         target, (epic, held) = _move_target(
             gh, repo, goal, ticket, old, areas, (epic, held), rescue=old in closed)
+        # Do not stop at a ticket that cannot move: a rescue ticket behind it
+        # may still open the one epic past the cap.
         if target is None:
-            break
+            continue
         if _move_to_epic(gh, repo, target, ticket, old):
             moved += 1
             if target == epic:
