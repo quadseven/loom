@@ -3990,7 +3990,8 @@ class EscalateTests(unittest.TestCase):
 
 def item(number, body=BODY, labels=(), **extra):
     out = {"number": number, "id": 1000 + number, "state": "open", "body": body,
-           "labels": [{"name": name} for name in labels]}
+           "labels": [{"name": name} for name in labels],
+           "user": {"login": "example-brain"}}
     out.update(extra)
     return out
 
@@ -4272,6 +4273,12 @@ INTAKE = 3
 
 
 class TriageTests(unittest.TestCase):
+    def setUp(self):
+        patcher = unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain",
+                                                        "LOOM_TRUSTED_BRIEFERS": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_triage(self, routes, limit=25):
         # The goal's intake epic is #3 (intake_epic has its own tests).
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
@@ -4286,14 +4293,26 @@ class TriageTests(unittest.TestCase):
             self.assertTrue(path.endswith(("/labels", "/comments", "/sub_issues")), path)
 
     def test_ready_issue_becomes_a_queued_ticket_under_the_goal(self):
-        routes = Routes([item(5)])
-        lines = self.run_triage(routes)
+        routes = Routes([item(5, user={"login": "example-brain"})])
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain",
+                                                   "LOOM_TRUSTED_BRIEFERS": ""}):
+            lines = self.run_triage(routes)
         self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
         self.assertIn(("POST", "/repos/%s/issues/3/sub_issues" % REPO, {"sub_issue_id": 1005}),
                       routes.calls)
         self.assertFalse(any(c[1].endswith("/comments") for c in routes.calls))
         self.assertEqual(lines, ["#5 queued under #3"])
         self.assert_never_edited(routes)
+
+    def test_ready_issue_by_untrusted_author_stays_in_triage(self):
+        routes = Routes([item(5, user={"login": "outside-author"})])
+        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain",
+                                                   "LOOM_TRUSTED_BRIEFERS": ""}):
+            lines = self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {5: ["loom:triage"]})
+        self.assertEqual(lines, ["#5 loom:triage, untrusted author"])
+        self.assertFalse(any(c[1].endswith("/sub_issues") and c[0] == "POST"
+                             for c in routes.calls))
 
     def test_not_ready_issue_gets_triage_and_names_what_is_missing(self):
         # 2026-10-20: a "not a ticket yet" comment on each one emailed the
@@ -5984,6 +6003,12 @@ class MoveFromGoalTests(unittest.TestCase):
     an epic. The link now replaces the goal as the parent."""
 
     GOAL_URL = "https://api.github.com/repos/%s/issues/1" % REPO
+
+    def setUp(self):
+        patcher = unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-brain",
+                                                        "LOOM_TRUSTED_BRIEFERS": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def sub_issue_posts(self, calls):
         return [c for c in calls if c[0] == "POST" and c[1].endswith("/sub_issues")]

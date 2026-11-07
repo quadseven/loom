@@ -4220,6 +4220,12 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         skip = _triage_skip(issue, authors, briefers, journals)
         if skip:
             continue
+        if not tickets.brief_author_trusted(issue, authors, briefers):
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:triage"]})
+            lines.append("#%d loom:triage, untrusted author" % number)
+            done += 1
+            continue
         missing = missing_sections(issue.get("body"))
         if not missing:
             if in_flight >= cap:

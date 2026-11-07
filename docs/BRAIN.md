@@ -90,7 +90,7 @@ decides who acts:
 | `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
 | `loom:mutation` | The one rolling report of the weekly spot mutation run (`bus/mutation_run.py`). Never a ticket; a survivor to fix gets its own. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
-| `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
+| `loom:triage` | An open issue triage found not ready as a ticket, or its author is outside `LOOM_BRIEF_AUTHORS` and `LOOM_TRUSTED_BRIEFERS`; the station log line names the missing sections or untrusted author, and no comment is posted. Untrusted issues stay here for a person and never enter the goal cap. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
@@ -462,6 +462,10 @@ repo for Loom in one step, and a second run changes nothing:
 
 `python3 -m bus.brain triage <owner/name> --goal N [--limit 25]` walks the
 repo's open issues oldest first and labels at most `--limit` of them. It
+queues ready issues only when the author is in `LOOM_BRIEF_AUTHORS` or
+`LOOM_TRUSTED_BRIEFERS`; an untrusted author's issue receives
+`loom:triage` even when its brief is complete, so it cannot consume a goal
+slot and remains for a person. Trusted authors retain the normal triage path.
 skips pull requests, epics (an `epic` label or sub-issues), `needs:human`
 asks, `wayfinder:*` planning issues, factory incidents, issues labelled
 `awaiting-live-check` (finished work waiting to be seen live, not new work)
