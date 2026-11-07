@@ -91,7 +91,7 @@ today is capped at 4 pods of 500m CPU and 2Gi, pinned to one build node.
 |---|---|---|---|---|
 | Build node (pool today) | 12 / 34.6Gi | 69% / 73% | 3.7 CPU, 9.4Gi | 2 heavy pods |
 | Large x86 storage worker | 16 / 50.4Gi | 45% / 19% | 8.7 CPU, 40Gi | 5 heavy pods; it also holds the registry and stateful services, so lower priority and disk re-measured |
-| Second small x86 node | 8 / 26.9Gi | 41% / 41% | 4.7 CPU, 15.7Gi | 2 heavy pods; it holds a game realm |
+| Second small x86 node | 8 / 26.9Gi | 41% / 41% | 4.7 CPU, 15.7Gi | 2 heavy pods; it holds a live game service |
 | Smallest x86 node, arm64 Macs, OCI nodes, GPU worker | small, arm64, or NotReady | | | not used |
 
 Heavy pod: requests 1500m CPU, 3Gi memory, 8Gi ephemeral storage; limits 4
