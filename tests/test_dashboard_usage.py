@@ -50,6 +50,14 @@ class UsageDashboardTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    def test_unknown_usage_with_an_old_observation_is_labeled_stale(self):
+        row = reading("claude", ["claude"], "all", age=timedelta(minutes=5),
+                      observed_at=(NOW - timedelta(days=7)).isoformat(),
+                      note="no CLI usage reading yet")
+        page = usage.render(usage.build([row], NOW))
+        self.assertIn("STALE: read 7d 0h ago", page)
+        self.assertIn("up-status up-warn\">stale", provider_row(page, "claude"))
+
     def test_authenticated_upload_renders_the_usage_page_worst_first(self):
         class State:
             pass
@@ -180,8 +188,8 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertEqual(asks.count("<li"), 1)
         # A stale figure never names the tightest meter.
         self.assertNotIn("Tightest meter", body)
-        # zen has no figure, so staleness does not move it out of the quiet list.
-        self.assertIn(">zen<", section(body, "usage-quiet"))
+        # Unknown rows also carry stale observation times and are surfaced.
+        self.assertIn("STALE: read 19h 0m ago", provider_row(body, "zen"))
 
     def test_one_stale_reading_in_a_fresh_snapshot_is_flagged_on_its_own(self):
         rows = [reading("codex", ["codex"], "weekly", 40, (NOW + timedelta(days=2)).isoformat(),
@@ -287,7 +295,7 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn(">Limit<", claude)
         self.assertIn("claude limited until 2026-10-18 16:30 UTC (in 2h 0m): provider limit reached.", claude)
         agy = provider_row(body, "agy")
-        self.assertIn("agy last limited 5h 0m ago, lifted 2026-10-18 13:30 UTC (1h 0m ago): quota.", agy)
+        self.assertIn("STALE: read 5h 0m ago. Last limit: quota.", agy)
         self.assertIn("zai: no limit seen in its heartbeat.", provider_row(body, "zai"))
 
     def test_each_provider_names_the_machine_its_readings_came_from(self):
