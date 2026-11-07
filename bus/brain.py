@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -726,7 +726,7 @@ def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
                             *_person_blockers(node), _threads_blocker(threads),
                             _unfixed_blocker(threads, head, bot)) if b]
-    return "blocked: " + ", ".join(blockers) if blockers else "READY"
+    return merge_verdict.decide(node, blockers=blockers).text
 
 
 _NOT_BUILT = re.compile(r";\s*not built:", re.I)
@@ -1335,13 +1335,15 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     try:
         tier, _ = _risk_tier(gh, repo, number, pr, issue, None)
     except ValueError as err:
-        return found + [str(err)]
+        found.append(str(err))
+        return list(merge_verdict.decide(pr, issue, found, ("operator",)).blockers)
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
-    return found
+    return list(merge_verdict.decide(pr, issue, found,
+                                     ("operator",) if found else ()).blockers)
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -5610,9 +5612,11 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
         (_checks_green(details) or luna, "pull request checks are not successful"),
         (_threads_resolved(details), "pull request has unresolved review threads"),
     ]
-    for ok, reason in rules:
-        if not ok:
-            raise ValueError(reason)
+    decision = merge_verdict.decide(pr, None,
+                                   (reason for ok, reason in rules if not ok),
+                                   ("operator", "brain"))
+    if not decision.ready:
+        raise ValueError(decision.blockers[0])
 
 
 UNRESOLVE_MUTATION = ('mutation($id:ID!) { unresolveReviewThread(input:{threadId:$id})'
