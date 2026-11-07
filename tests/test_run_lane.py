@@ -511,11 +511,18 @@ printf '%s\\n' "$val"
 FAKE_CURL = """#!/usr/bin/env bash
 printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
 n="$(grep -c '^curl ' "$FAKE_LOG")"
+header_dump=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -D ] && [ "$#" -gt 1 ]; then header_dump="$2"; shift 2; else shift; fi
+done
 set -- ${FAKE_CURL:-200}
 [ "$n" -le "$#" ] || n="$#"
 answer="${!n}"
 if [ "$answer" = refused ]; then printf '000'; exit 7; fi
 if [ "$answer" = timeout ]; then printf '000'; exit 28; fi
+if [ "$header_dump" = - ] && [ -n "${FAKE_CURL_RETRY_AFTER:-}" ]; then
+  printf 'HTTP/1.1 %s Fake\\r\\nRetry-After: %s\\r\\n\\r\\n' "$answer" "$FAKE_CURL_RETRY_AFTER"
+fi
 printf '%s' "$answer"
 """
 
@@ -5207,6 +5214,40 @@ fi
         self.assertFalse(self.spark_beat()["available"])
         self.assertTrue((inbox / "failed" / "T043-next.md").exists())
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_retry_after_sets_the_cluster_slot_hold(self):
+        inbox, result = self.api_lane(
+            "free-openrouter", FAKE_CURL="503", FAKE_CURL_RETRY_AFTER="43200",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertEqual(beat["retry_at"] - beat["at"], 43200)
+        limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
+        self.assertEqual(int(limit[0]), beat["retry_at"])
+        probes = sum(c.startswith("curl ") for c in self.calls())
+        (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: free-openrouter"))
+        # A fresh cluster pod has the shared heartbeat but not this local marker.
+        (self.loom / "state" / "usage" / "free-openrouter.limit").unlink()
+        self.run_lane("free-openrouter", LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid",
+                      FAKE_CURL="200")
+        self.assertEqual(sum(c.startswith("curl ") for c in self.calls()), probes)
+        self.assertTrue((inbox / "failed" / "T043-next.md").exists())
+        held = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(held["available"])
+        self.assertEqual(held["retry_at"], beat["retry_at"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_503_without_retry_after_uses_the_fallback(self):
+        _, result = self.api_lane(
+            "free-openrouter", FAKE_CURL="503",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):

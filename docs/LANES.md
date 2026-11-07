@@ -1907,8 +1907,11 @@ separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
 `free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
-holds only that slot for 15 minutes as a limit, so the station can assign the
-ticket elsewhere without counting it as a work failure. Ollama and Gemma
+holds only that slot as a limit, using the gateway's numeric `Retry-After`
+(capped at one day); when that header is absent or invalid, the slot uses its
+15-minute fallback. The heartbeat preserves that reset across passes, so the
+station avoids dispatching while the route remains held and assigns any
+already-queued ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
 
@@ -1941,7 +1944,8 @@ unchanged for a run that did not end on a described step.
   answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
   first, and asks again after a run that failed. A refused connection or a
   503 is a limit, not a failure: the heartbeat says unavailable, with a
-  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  reason starting `limit:`, for 15 minutes by default or for the gateway's
+  `Retry-After` on a 503; every brief in the inbox is
   parked with that reason; the station puts its ticket back to briefed (a
   fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
   limited lane to the next rung of the model ladder at once. Any other
