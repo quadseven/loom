@@ -641,7 +641,7 @@ pr_body() {
   size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
     section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
-  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
+  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$(validation_summary)" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
@@ -784,6 +784,8 @@ fix_contract_line() {
   [ -n "$checks" ] || return 0
   if [ -z "$HAS_CONTRACT" ]; then
     printf 'no validation contract check maps to the failing checks (%s): the repo has no %s, so CI is the first to run them on the new head' "$checks" "$CONTRACT_FILE"
+  elif [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'changed paths are not validated by a known contract mapping for checks (%s): %s; CI must check the new head' "$checks" "$(validation_summary)"
   elif grep -q "so the lane's own validation never ran it" "$1"; then
     printf 'no validation contract check maps to some failing checks (%s): the brief names CI jobs %s does not run; the contract check %s' "$checks" "$CONTRACT_FILE" "${VALIDATED:-did not pass}"
   else
@@ -3179,6 +3181,39 @@ final_validation() {
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
   [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  assess_validation_paths
+}
+
+# A successful shell command proves its exit status, not which changed paths
+# it validated. The contract has no path-to-check mapping, even for affected:
+# hooks. Keep execution evidence separate and leave path validation to CI.
+assess_validation_paths() {
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
+  UNVALIDATED_PATHS="$(validation_changed_paths | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.validation_paths)" || COVERAGE_UNKNOWN=true
+}
+
+validation_changed_paths() {
+  local range
+  range="$(lane_diff_range)" || return 1
+  safe_git diff --name-only -z "$range"
+}
+
+validation_summary() {
+  printf '%s' "$VALIDATED"
+  if [ "$COVERAGE_UNKNOWN" = true ]; then
+    printf '; not validated: changed paths could not be read; contract path coverage unknown'
+  elif [ -n "$UNVALIDATED_PATHS" ]; then
+    printf '; not validated: contract path coverage unknown for %s' "$UNVALIDATED_PATHS"
+  fi
+}
+
+validation_round_note() {
+  if [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'Contract command result: %s. CI must validate the changed paths on the new head. ' "$(validation_summary)"
+  elif [ -n "$VALIDATED" ]; then
+    printf 'Contract command result: %s. ' "$VALIDATED"
+  fi
+  printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
@@ -4299,6 +4334,7 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
@@ -4905,8 +4941,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
       # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
       # reader nothing; the comment says what went up and what happens next.
       PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
-      CHECKED="CI and review run again on the new head; the factory lands the pull request once they pass."
-      [ -n "$VALIDATED" ] && CHECKED="The repo's check passed at ${VALIDATED##* }. $CHECKED"
+      CHECKED="$(validation_round_note)"
       COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
 
 $(pushed_commits)
