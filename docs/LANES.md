@@ -134,6 +134,22 @@ unset variables.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
+- A base check red only on the lane host is not a broken default branch.
+  The runner treats a fresh red base run (exit 1 to 123, after its second
+  run) as host-only red when all of these hold: GitHub's own check runs on
+  the same commit all completed as success, neutral or skipped; the output
+  names at most 20 failing tests, each a plain pytest node id; every failure
+  or error line in the output is one of those names; and the check exits 0
+  when rerun with exactly those tests deselected (`PYTEST_ADDOPTS` carries
+  `--deselect`, and `LOOM_DESELECT_TESTS` lists them). Then it files no
+  incident, the agent runs, and the repo's open base-check incident closes
+  so the station re-queues the tickets it held. A red final check passes
+  only if its rerun with the same tests deselected exits 0, and never when
+  the change touches a file holding one of them. The check sandbox denies
+  localhost and the network, so tests that need either fail only here; a
+  repo fixes that by skipping them when a localhost probe fails. Anything
+  else, including a fix round, a cached red verdict and unittest or go
+  failures, still files the incident.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
