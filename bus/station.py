@@ -2256,6 +2256,8 @@ class Station:
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
         self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        # This pass's briefed tickets _repo_pr_held refused, "owner/repo#n".
+        self._cap_held: set = set()
         self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
@@ -3294,6 +3296,7 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
@@ -3550,9 +3553,13 @@ class Station:
 
     def _gate_held(self) -> List[str]:
         """The tickets the unproven-work gate refused this pass, "owner/repo#n":
-        the factory neither counts them as lane load nor moves them."""
-        return ["%s#%d" % (hold["repo"], int(number))
-                for hold in self._gate_holds.values() for number in hold["tickets"]]
+        the factory neither counts them as lane load nor moves them. The
+        tickets of a repo held at its open pull request cap are here too: the
+        station will not claim them, and counted, each kept its lane busy for
+        every other repo's queued tickets (2026-11-06, six idle lanes)."""
+        return (["%s#%d" % (hold["repo"], int(number))
+                 for hold in self._gate_holds.values() for number in hold["tickets"]]
+                + sorted(self._cap_held))
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
                          counts: Dict[Tuple[str, int], int]) -> None:
@@ -5204,6 +5211,7 @@ class Station:
         if self._last_repo_pr_hold(repo, int(issue["number"])) != reason:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
+        self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
