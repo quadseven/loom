@@ -75,7 +75,8 @@ def local_push_check(test_dir: Path) -> str | None:
     """Check that the test environment can push to a local bare repository."""
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="loom-local-push-") as directory:
+    with tempfile.TemporaryDirectory(prefix="loom-local-push-",
+                                     dir=os.environ.get("TMPDIR") or None) as directory:
         root = Path(directory)
         remote = root / "remote.git"
         work = root / "work"

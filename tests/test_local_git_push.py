@@ -13,6 +13,31 @@ SPEC.loader.exec_module(_test_runner)
 
 
 class LocalGitPushTest(unittest.TestCase):
+    def test_preflight_uses_the_sandbox_writable_tmpdir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tmpdir = Path(directory) / "scratch-tmp"
+            tmpdir.mkdir()
+            fake_bin = Path(directory) / "bin"
+            fake_bin.mkdir()
+            git = fake_bin / "git"
+            git.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GIT_CALLS\"\n"
+                           "case \"$*\" in *init*) exit 1 ;; esac\n")
+            git.chmod(0o755)
+            calls = Path(directory) / "calls"
+            old = {key: os.environ.get(key) for key in ("PATH", "TMPDIR", "GIT_CALLS")}
+            os.environ.update(PATH=str(fake_bin), TMPDIR=str(tmpdir), GIT_CALLS=str(calls))
+            try:
+                error = _test_runner.local_push_check(Path(__file__).parent)
+            finally:
+                for key, value in old.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+            self.assertIn("could not initialize its bare origin", error)
+            remote = calls.read_text().split()[-1]
+            self.assertTrue(Path(remote).is_relative_to(tmpdir), remote)
+
     def test_preflight_ignores_injected_git_hooks_and_allows_local_push(self):
         with tempfile.TemporaryDirectory() as directory:
             hooks = Path(directory) / "hooks"
