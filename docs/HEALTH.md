@@ -104,14 +104,22 @@ Per finding, on each read:
   Two new findings of one cause in one pass file one ticket, and the second
   joins it on the next pass. So one cause keeps one rolling ticket, also
   when a key changes shape (from one per member to one per step, say).
-- A finding joins its cause's ticket, or comes back after its ticket was told
-  it went absent: the problem was seen again. The ticket gets a "Seen again
-  N times so far, last seen <time>" comment, at most once a day; the count
-  keeps growing in between and the next comment carries it.
-- An open ticket carries it: when the impact moves the finding to another
-  band, the ticket's `Priority:` line moves with it (a priority the brain
-  set by hand stands until the band changes). When the numbers or the
-  evidence change, it posts them, at most once every 6 hours.
+- Each successful pass that observes a ticket's problem rewrites one health
+  evidence block in the ticket body with First seen, Last seen, Count and the
+  current numbers and quoted descriptions. Count is the number of observing
+  passes, not the number of keys: several findings on one ticket count once.
+  New tickets start at one; existing tickets start on their first observation
+  after upgrade. The block preserves its totals across a station restart,
+  including loss of local state. Unknown or refused reads add no evidence.
+- A finding joins its cause's ticket, or its numbers or evidence change: the
+  body updates without a comment. When the impact moves it to another band,
+  the ticket's `Priority:` line moves with it (a priority the brain set by
+  hand stands until the band changes).
+- A ticket's problem comes back after it was absent: one return comment,
+  even when several keys return together. Continued observations do not post
+  more comments, and pending seen-again counts from the old ledger are dropped
+  on upgrade. The first report creates the ticket; the absent note, proof and
+  settlement behavior below are unchanged.
 - An open ticket carries it, the ticket is shipped or verified, and the
   finding is still reported 24 hours after `loom:shipped` was applied: the
   fix did not work. The station re-briefs that ticket as a regression
