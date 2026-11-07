@@ -343,11 +343,11 @@ def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
     return (int(found.group(1)), int(found.group(2))) if found else None
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
-# The codex lane and its seven slots, all on gpt-6-luna (labels.SLOTS). Every
+# The codex lane and its fifteen slots, all on gpt-6-luna (labels.SLOTS). Every
 # tier and rung that names codex names them all: codex-3 to codex-8 were once
 # lanes only, beat available and sat idle while medium and hard tickets
 # waited "no free lane in tier" (tests/test_bus_codex_slots.py).
-CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 9))
+CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 17))
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
 SHARED_CREDIT = ANTHROPIC
