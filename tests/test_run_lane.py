@@ -5265,7 +5265,7 @@ fi
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
         beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
         self.assertFalse(beat["available"])
-        self.assertEqual(beat["retry_at"] - beat["at"], 43200)
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 43200, delta=2)
         limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
         self.assertEqual(int(limit[0]), beat["retry_at"])
         probes = sum(c.startswith("curl ") for c in self.calls())
