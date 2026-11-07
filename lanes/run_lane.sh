@@ -124,6 +124,22 @@ leak_scan() {
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
 }
+
+# A refused public repo scan's hits as one line a public ticket may carry:
+# each hit's rule and path:line, never its text (bus/leak_hits.py). The
+# scanner's whole output, LEAK_OUT, goes to the lane log only: the reason
+# once held just its first line, the counts of rules loaded, and the next
+# lane repeated the refusal blind (loom#2804). $1 is --diff RANGE (run in the
+# tree) or --text NAME.
+leak_hits() {
+  local named
+  printf '%s\n' "$LEAK_OUT" >> "$LOG"
+  named="$(cd "$TREE" && printf '%s\n' "$LEAK_OUT" |
+    PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.leak_hits "$@" 2>> "$LOG")" ||
+    named="the hits could not be located; the scanner output is in the lane log"
+  printf '%s' "$named"
+}
+
 # Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
 # leak scanner a public-repo push needs is present before any lane scans.
 # The first lane that needs it clones it; a later run fetches at most hourly,
@@ -625,7 +641,7 @@ pr_body() {
   size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
     section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
-  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
+  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$(validation_summary)" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
@@ -768,6 +784,8 @@ fix_contract_line() {
   [ -n "$checks" ] || return 0
   if [ -z "$HAS_CONTRACT" ]; then
     printf 'no validation contract check maps to the failing checks (%s): the repo has no %s, so CI is the first to run them on the new head' "$checks" "$CONTRACT_FILE"
+  elif [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'changed paths are not validated by a known contract mapping for checks (%s): %s; CI must check the new head' "$checks" "$(validation_summary)"
   elif grep -q "so the lane's own validation never ran it" "$1"; then
     printf 'no validation contract check maps to some failing checks (%s): the brief names CI jobs %s does not run; the contract check %s' "$checks" "$CONTRACT_FILE" "${VALIDATED:-did not pass}"
   else
@@ -1373,14 +1391,19 @@ $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" <
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
 # one stream at a time behind a thermal guard that refuses new connections
 # (or answers 503) while the box is hot. That is a limit, not a failure: the
-# lane says unavailable for LIMIT_HOLD seconds, and every brief it holds is
-# parked with a "limit:" reason, which the station hands to the next lane.
+# lane says unavailable for LIMIT_HOLD seconds by default, or honors a
+# gateway Retry-After on 503. Every held brief is parked with a "limit:"
+# reason, which the station hands to the next lane.
 LIMIT_HOLD=900
+# The free gateway caps Retry-After at a day. Keep that value intact across
+# lane passes so a cluster slot does not probe again while its route is held.
+LIMIT_MAX_HOLD=86400
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
 # A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
 SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
+LIMIT_RETRY_AFTER=""
 LIMIT_WHY=""
 # Whether the provider answered the last probe at all (provider_at_limit).
 PROBE_ANSWERED=0
@@ -1393,11 +1416,30 @@ AUTH_WHY_PREFIX="API key expired: renew"
 # Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
 # LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
 spark_probe() {
-  local code status
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  local response code status retry_after
+  LIMIT_RETRY_AFTER=""
+  response="$(curl -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
+  code="${response##*$'\n'}"
   if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
+  if [ "$code" = 503 ]; then
+    retry_after="$(printf '%s\n' "$response" | awk '
+      tolower($1) == "retry-after:" {
+        value = $2
+        gsub(/\r/, "", value)
+        if (value ~ /^[0-9]+$/) retry = value
+      }
+      END { if (retry != "") print retry }
+    ' | tail -1)"
+    if [[ "$retry_after" =~ ^[0-9]{1,5}$ ]] && [ "$retry_after" -gt 0 ] &&
+       [ "$retry_after" -le "$LIMIT_MAX_HOLD" ]; then
+      LIMIT_RETRY_AFTER="$retry_after"
+      LIMIT_WHY="the $LANE endpoint answered 503; gateway retry after ${retry_after}s"
+    else
+      LIMIT_WHY="the $LANE endpoint answered 503"
+    fi
+    return 1
+  fi
   [ "$status" -eq 0 ] && return 0
   READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
@@ -1405,7 +1447,12 @@ spark_probe() {
 
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
 mark_limit() {
-  LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
+  local hold="$LIMIT_HOLD"
+  if [[ "${LIMIT_RETRY_AFTER:-}" =~ ^[0-9]{1,5}$ ]] &&
+     [ "$LIMIT_RETRY_AFTER" -gt 0 ] && [ "$LIMIT_RETRY_AFTER" -le "$LIMIT_MAX_HOLD" ]; then
+    hold="$LIMIT_RETRY_AFTER"
+  fi
+  LIMIT_UNTIL=$(( $(date +%s) + hold ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
   LIMITED=1
@@ -1414,13 +1461,13 @@ mark_limit() {
 }
 
 # A limit recorded by an earlier pass that has not run out. A time further
-# ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
+# ahead than the gateway's maximum Retry-After (a clock that was wrong) is ignored.
 limit_held() {
   local ends why now
   [ -f "$LIMIT_FILE" ] || return 1
   read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
-  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
+  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_MAX_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
 }
@@ -2234,6 +2281,92 @@ check_failures() {  # log offset
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
 }
+# Every test a check run names as failing since the log offset, one per
+# line and sorted: check_failures' test patterns with no cap and no
+# last-line fallback, so two runs compare as sets.
+check_failure_set() {  # log offset
+  tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null | LC_ALL=C sed -nE \
+    -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
+    -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
+    -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
+    -e 's/^--- FAIL: ([^ ]+).*/\1/p' | LC_ALL=C sort -u
+}
+# Whether GitHub's own checks passed on a commit: at least one check run,
+# and every one completed as success, neutral or skipped.
+github_checks_green() {  # sha
+  local runs
+  runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
+    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || return 1
+  [ -n "$runs" ] || return 1
+  ! printf '%s\n' "$runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'
+}
+# At most this many host-red tests may be set aside; a base red in more
+# places is not a sandbox quirk, and stays a factory incident.
+HOST_RED_MAX=20
+# The host-red tests of a base run since the log offset, one per line, or
+# status 1 when they cannot be set aside safely: no names, more than
+# HOST_RED_MAX, a name that is not a plain pytest node id (deselection goes
+# through pytest's own --deselect, so a unittest or go name cannot be set
+# aside), or a failure or error line the name patterns do not account for
+# (a collection error, a crashed runner).
+host_red_names() {  # log offset
+  local names unparsed
+  names="$(check_failure_set "$1")"
+  [ -n "$names" ] || return 1
+  [ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" -le "$HOST_RED_MAX" ] || return 1
+  ! printf '%s\n' "$names" | LC_ALL=C grep -qvxE '[A-Za-z0-9_./-]+\.py::[A-Za-z0-9_.:-]+' || return 1
+  unparsed="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null |
+    LC_ALL=C grep -aE '^(FAIL:|ERROR:|FAILED |ERROR |--- FAIL)' |
+    LC_ALL=C grep -avE '^(FAIL|ERROR): [^ ]+ \([^)]+\)|^(FAIL|ERROR): [^ ]+$|^(FAILED|ERROR) [^ ]+::[^ ]+|^--- FAIL: [^ ]+')"
+  [ -z "$unparsed" ] || return 1
+  printf '%s\n' "$names"
+}
+# Whether the check exits 0, changing no tracked file, with the host-red
+# tests deselected (contract_run passes them to pytest as --deselect).
+host_red_deselected_passes() {
+  local rc
+  CHECK_DESELECT="$HOST_RED_BASE"
+  contract_run "$C_CHECK"; rc=$?
+  CHECK_DESELECT=""
+  [ "$rc" -eq 0 ] && [ -z "$(tracked_changes)" ]
+}
+# A base check red only on this lane host (loom#1889): GitHub's own checks
+# passed on the same commit, the failures are a few named pytest tests, and
+# the check exits 0 with exactly those deselected, so the default branch is
+# not broken; the check sandbox (no localhost, no network) or the host's
+# load is. 76 tickets sat held behind such incidents on 2026-11-06, which
+# only a green lane base check closes. The run goes on (final_validation
+# reruns a red final check with the same tests deselected and needs exit
+# 0), and the repo's base-check incident closes so the station re-queues
+# the tickets it held.
+host_red_base() {  # rev, log offset of the last base run
+  local names
+  [ "$BASELINE_EXIT" -gt 0 ] && [ "$BASELINE_EXIT" -lt 124 ] || return 1
+  names="$(host_red_names "$2")" || return 1
+  github_checks_green "$1" || return 1
+  HOST_RED_BASE="$names"
+  if ! host_red_deselected_passes; then
+    HOST_RED_BASE=""
+    echo "base check still red with its failing tests deselected; not a host-only red" >> "$LOG"
+    return 1
+  fi
+  echo "base check red only on this host: GitHub's checks passed at ${1:0:12}; passed with these deselected: $(printf '%s' "$names" | paste -sd ',' - | sed 's/,/, /g' | LC_ALL=C cut -c1-1000)" >> "$LOG"
+  record baseline-host-red "$C_CHECK" "$BASELINE_EXIT" "$1" true "GitHub's checks passed at ${1:0:12}; exit 0 with the failing tests deselected"
+  resolve_factory_incidents base-check \
+    "the base check is red only on the lane host; GitHub's checks passed on the same commit in $(incident_ticket)."
+  return 0
+}
+# The changed files that hold a host-red test, if any: such a change could
+# break or rewrite a test the final check sets aside.
+host_red_touched() {
+  local path test_file files
+  files="$(printf '%s\n' "$HOST_RED_BASE" | sed 's/::.*//' | LC_ALL=C sort -u)"
+  lane_changed_files 2>/dev/null | while IFS= read -r path; do
+    printf '%s\n' "$files" | while IFS= read -r test_file; do
+      case "$path" in "$test_file"|*/"$test_file") printf '%s\n' "$path" ;; esac
+    done
+  done | LC_ALL=C sort -u
+}
 # The non-empty arguments, joined for a record's detail.
 join_detail() {
   local part out=""
@@ -2313,9 +2446,12 @@ INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
 # Close this repo's environment, contract and base-check incidents once the
 # check has passed on the unmodified base; the station then releases tickets.
+# A host-only red base (host_red_base) closes only the base-check one, with
+# its own reason. Arguments: the kinds, then the reason after "Cleared:".
 resolve_factory_incidents() {
-  local kind file number
-  for kind in environment contract base-check; do
+  local kind file number kinds="${1:-environment contract base-check}"
+  local text="${2:-the check passed on the unmodified base in $(incident_ticket).}"
+  for kind in $kinds; do
     file="$(incident_file "$kind")"
     [ -f "$file" ] || continue
     number="$(tr -cd '0-9' < "$file")"
@@ -2324,8 +2460,7 @@ resolve_factory_incidents() {
       # factory incident's close through; anything else it records and holds.
       PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
         issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
-      gh issue close --repo "$FACTORY_REPO" "$number" \
-        --comment "Cleared: the check passed on the unmodified base in $(incident_ticket)." >>"$LOG" 2>&1 || continue
+      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text" >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
@@ -2574,6 +2709,18 @@ contract_run_sandboxed() {
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
+    # Host-red tests to set aside (host_red_deselected_passes): node ids
+    # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
+    # names them for a check that reads them itself.
+    if [ -n "${CHECK_DESELECT:-}" ]; then
+      deselect_opts=""
+      for test_id in $CHECK_DESELECT; do deselect_opts="$deselect_opts --deselect $test_id"; done
+      export PYTEST_ADDOPTS="${deselect_opts# }" LOOM_DESELECT_TESTS="$CHECK_DESELECT"
+    else
+      # This subshell already dropped every inherited export; say so for the
+      # two names a deselected run sets, so a plain check never sees them.
+      unset PYTEST_ADDOPTS LOOM_DESELECT_TESTS
+    fi
     input=/dev/null
     if [ -n "${changed_list:-}" ]; then
       input="$changed_list"
@@ -2727,7 +2874,7 @@ sys.exit(0 if valid else 1)
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
   local check_start=0 failures=""
-  SETUP_REASON=""
+  SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
@@ -2888,6 +3035,15 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
+    # A fresh run's own log names its failures; a cached verdict or a fix
+    # round's default-branch check does not, so those still file.
+    if [ -z "$FIX_PR" ] && [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] &&
+       host_red_base "$baseline_rev" "$check_start"; then
+      # The next ticket reruns the check rather than reading this red verdict.
+      rm -f "$BASE_VERDICT_DIR/$verdict_key"
+      exclude_untracked
+      return $?
+    fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
     note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
     return 1
@@ -2932,7 +3088,7 @@ final_base_tests() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched=""
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -2976,10 +3132,33 @@ final_validation() {
   else
     first_exit=""
   fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -n "${HOST_RED_BASE:-}" ] &&
+     touched="$(host_red_touched)" && [ -n "$touched" ]; then
+    echo "final check red, and the change touches a host-red test, so none is set aside: $(printf '%s' "$touched" | paste -sd ' ' -)" >> "$LOG"
+  elif [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -n "${HOST_RED_BASE:-}" ] && host_red_deselected_passes; then
+    # The base-test gate still runs: it ran above only on a green check.
+    final_base_tests "$rev"; gate_rc=$?
+    if [ "$gate_rc" -ne 0 ]; then
+      [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 126 ] ||
+        [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
+      drop_check_home
+      return 1
+    fi
+    host_red="exited $rc, then 0 with the base's host-only failing tests deselected"
+    echo "final check $host_red" >> "$LOG"
+    rc=0
+  fi
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
-    124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    124)
+      # The base check passed, so a timeout here is host load as often as a
+      # hung test: transient once, and the station counts a second check
+      # timeout in a row on the ticket as work (factory.TIMEOUT_RE). Six
+      # tickets went to loom:failed on one loaded afternoon (2026-11-07).
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s"
+      ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
@@ -2993,14 +3172,48 @@ final_validation() {
       ;;
     *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "${first_exit:+second run after exit $first_exit}${changed:+${first_exit:+; }changed tracked files: $changed}"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
+  [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
   [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  assess_validation_paths
+}
+
+# A successful shell command proves its exit status, not which changed paths
+# it validated. The contract has no path-to-check mapping, even for affected:
+# hooks. Keep execution evidence separate and leave path validation to CI.
+assess_validation_paths() {
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
+  UNVALIDATED_PATHS="$(validation_changed_paths | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.validation_paths)" || COVERAGE_UNKNOWN=true
+}
+
+validation_changed_paths() {
+  local range
+  range="$(lane_diff_range)" || return 1
+  safe_git diff --name-only -z "$range"
+}
+
+validation_summary() {
+  printf '%s' "$VALIDATED"
+  if [ "$COVERAGE_UNKNOWN" = true ]; then
+    printf '; not validated: changed paths could not be read; contract path coverage unknown'
+  elif [ -n "$UNVALIDATED_PATHS" ]; then
+    printf '; not validated: contract path coverage unknown for %s' "$UNVALIDATED_PATHS"
+  fi
+}
+
+validation_round_note() {
+  if [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'Contract command result: %s. CI must validate the changed paths on the new head. ' "$(validation_summary)"
+  elif [ -n "$VALIDATED" ]; then
+    printf 'Contract command result: %s. ' "$VALIDATED"
+  fi
+  printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
@@ -3063,7 +3276,7 @@ final_affected() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true ||
          VALIDATION_REASON="validation failed: the affected check changed tracked files ($changed)" ;;
-    124) VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
+    124) PARK_CLASS=transient; VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
@@ -3788,6 +4001,7 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+PREHELD=""
 # A Go allowance hold never binds a slot on a free model (limit_group): a
 # hold written before the slot moved to one, or by an older runner, is
 # dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
@@ -3798,7 +4012,8 @@ if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_mode
   rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   LIMIT_UNTIL=""
 fi
-if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] &&
+   [ "$LIMIT_UNTIL" -gt "$(date +%s)" ] && [ ! -f "$LIMIT_FILE" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
   # The provider's allowance refills while the lane sleeps, so the lane asks
@@ -3810,7 +4025,16 @@ if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt 
     NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
     [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
     heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-    exit 0
+    # The cluster OpenRouter slot loses its local .limit file on pod restart,
+    # so rehydrate the shared hold and hand off any queued brief. Other lanes
+    # keep their provider-limit behavior: their queued brief stays in place.
+    if [ "$SLOT" = free-openrouter ]; then
+      LIMITED=1
+      LIMIT_WHY="${HELD_REASON#limit: }"
+      PREHELD=1
+    else
+      exit 0
+    fi
   fi
 fi
 
@@ -3832,8 +4056,14 @@ CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
-if ! lane_ready; then
-  heartbeat false "$READY_REASON"
+if [ -n "$PREHELD" ]; then
+  READY_REASON="$HELD_REASON"
+elif ! lane_ready; then
+  if [ -n "$LIMITED" ]; then
+    heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
+  else
+    heartbeat false "$READY_REASON"
+  fi
   # A limited lane, or one whose key expired, still passes over its inbox, to
   # hand every brief on.
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
@@ -4104,6 +4334,7 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
@@ -4530,7 +4761,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan could not run; nothing pushed: $LEAK_OUT" transient
       continue
     elif [ "$LEAK_RC" -ne 0 ]; then
-      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $(leak_hits --diff "$SCAN_RANGE")"
       continue
     fi
     printf '%s\n' "$LEAK_OUT" >> "$LOG"
@@ -4559,7 +4790,7 @@ for BRIEF in "$INBOX"/*.md; do
       printf '%s\n' "$PR_BODY" > "$BODY_FILE"
       if ! LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
-        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $(leak_hits --text "PR body")"
         continue
       fi
       rm -f "$BODY_FILE"
@@ -4710,8 +4941,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
       # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
       # reader nothing; the comment says what went up and what happens next.
       PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
-      CHECKED="CI and review run again on the new head; the factory lands the pull request once they pass."
-      [ -n "$VALIDATED" ] && CHECKED="The repo's check passed at ${VALIDATED##* }. $CHECKED"
+      CHECKED="$(validation_round_note)"
       COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
 
 $(pushed_commits)

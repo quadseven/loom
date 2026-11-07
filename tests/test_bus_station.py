@@ -897,6 +897,36 @@ class ReconcilePullRequestTest(Base):
         self.assertNotIn("loom:pr", self.fake.names(12))
         self.assertEqual(len(self.fake.comments[12]), 1)
 
+    def test_a_retry_branch_pull_request_promotes_its_briefed_ticket(self):
+        # loom#2611: a lane pull request on a retry branch (the -r3 suffix
+        # branch_for adds) links its ticket the same as a first attempt's.
+        self.fake.add(12, state="briefed", lane="codex-2")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": tickets.branch_for(12, "Fix the thing", 3),
+                                     "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+
+    def test_a_retry_branch_pull_request_in_a_fix_round_stays_briefed(self):
+        # The loom#2611 refusal: ticket 2592 sat at loom:briefed because a
+        # fix round sent a lane to fix its r3 pull request, not because the
+        # retry branch went unlinked.
+        branch = tickets.branch_for(12, "Fix the thing", 3)
+        self.fake.add(12, state="briefed", lane="codex-2")
+        self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
+                                   "body": "%s\nPull request: %s#99, branch %s\n\nFix the test."
+                                           % (tickets.FIX_MARKER, REPO, branch),
+                                   "created_at": "2030-01-01T00:00:00Z",
+                                   "updated_at": "2030-01-01T00:00:00Z"}]
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": branch, "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
     def test_a_briefed_ticket_whose_fix_names_another_pull_request_is_linked(self):
         self.fake.add(12, state="briefed", lane="codex")
         self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
@@ -6354,6 +6384,33 @@ class RetryTest(Base):
         self.assertEqual(tickets.timedout_branch([failed[0]]), "loom/12-fix-the-thing-timedout-1234")
         self.assertNotIn("loom:runaway", self.fake.names(12))
 
+    def test_a_first_check_timeout_is_transient_and_costs_no_rung(self):
+        # loom#2799: the check after the agent timing out under host load sent
+        # six tickets to loom:failed in one afternoon while base checks passed.
+        self.failed(body=BODY_WITH_CRITERIA,
+                    reason="[transient] validation failed: the check timed out after 1800s at "
+                           "e992b44d7458 (base check exited 0)")
+        self.timeout_history([])
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_second_check_timeout_in_a_row_counts_as_a_failure(self):
+        # A check that times out twice running is the ticket's (a hung test).
+        self.failed(body=BODY_WITH_CRITERIA,
+                    reason="[transient] validation failed: the check timed out after 1800s at "
+                           "e992b44d7458 (base check exited 0)")
+        self.timeout_history([
+            "Lane a stopped: [transient] validation failed: the check timed out after 1800s at "
+            "c49d384fec50 (base check exited 0)"])
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        failed = [b for b in self.bodies() if b.startswith("Lane codex failed:")]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0].startswith(
+            "Lane codex failed: [work] validation failed: the check timed out after 1800s"), failed[0])
+        self.assertIn("timed out again on this ticket", failed[0])
+
     def test_a_timeout_after_another_kind_of_ending_stays_transient(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[transient] agent exited 124")
         self.timeout_history(["Lane codex stopped: [transient] could not mint a GitHub App token",
@@ -11695,6 +11752,19 @@ class TranscriptUploadTest(Base):
         self.assertEqual((self.sent, self.reads), ([], 0))
         self.assertFalse(os.path.exists(
             os.path.join(self.home, "state", "station", "transcripts.json")))
+
+    def test_a_failed_ssm_token_read_logs_its_safe_reason(self):
+        # loom#2692: logged by type alone, the cause stayed unknown for days.
+        from bus import github
+
+        def throttled(name, region):
+            raise github.SsmReadError("could not read the parameter from SSM: aws exited 255 "
+                                      "(ThrottlingException)")
+        self.go()
+        self.finish()
+        log = self.go(read_secret=throttled)
+        self.assertIn("could not read the transcript token parameter (could not read the "
+                      "parameter from SSM: aws exited 255 (ThrottlingException)); next pass", log)
 
     def test_an_unreadable_or_hung_token_read_skips_the_pass_without_the_secret(self):
         import subprocess

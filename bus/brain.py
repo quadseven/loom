@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -1318,9 +1318,12 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     if ticket is not None:
         issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
         reason = _ticket_refusal(issue, "pr")
-        if reason == "ticket is not loom:pr":
+        if reason.startswith("ticket is not loom:pr"):
             at = [x for x in _labels(issue) if x.startswith("loom:") and x[5:] in STATES]
-            reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+            # The same fix-round note merge raises, so status and merge speak
+            # one wording for a ticket a fix round holds (loom#2611).
+            reason = ("ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+                      + _mid_round_note(at, "pr"))
         if reason:
             found.append(reason)
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
@@ -4867,6 +4870,104 @@ def merge_completed(err: Exception) -> bool:
     return getattr(err, "merge_completed", False) is True
 
 
+def _refuse_behind_overlap(gh: GitHub, repo: str, number: int,
+                           pr: Dict[str, Any]) -> None:
+    """Refuse a behind pull request whose own hunks overlap the base
+    changes it lacks (loom#2622), the factory's test in bus/hunk_overlap.py
+    applied before the merge call. A payload with no base ref or head has
+    nothing to compare by; a compare that cannot be read refuses the
+    merge, as the factory updates first when this read fails: an unknown
+    overlap is no ground for a merge."""
+    base = str((pr.get("base") or {}).get("ref") or "")
+    head = str((pr.get("head") or {}).get("sha") or "")
+    if not base or not head:
+        return
+    try:
+        data = gh.rest("GET", "/repos/%s/compare/%s...%s"
+                       % (repo, quote(base, safe=""), quote(head, safe=""))).data or {}
+        if int(data.get("behind_by") or 0) <= 0:
+            return
+        overlap = hunk_overlap.pr_overlaps_base(gh, repo, number, base, head)
+    except GitHubError as err:
+        raise ValueError("blocked: the hunk overlap of #%d could not be "
+                         "read (%s); update it before merging"
+                         % (number, err)) from err
+    if overlap:
+        raise ValueError("blocked: #%d overlaps its base; update it before "
+                         "merging" % number)
+
+
+def _is_stacked(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> bool:
+    """Whether the pull request belongs to a stack (loom#2622): the pull
+    request payload carries a `stack`, or the repo's stack list names it.
+    A payload with no base ref gives no way to ask, and a stack list that
+    cannot be read counts as no stack, as an unreadable check never holds
+    a merge."""
+    if "stack" in pr:
+        return bool(pr.get("stack"))
+    if not str((pr.get("base") or {}).get("ref") or ""):
+        return False
+    try:
+        data = gh.rest("GET", "/repos/%s/stacks" % repo).data
+    except GitHubError:
+        return False
+    if not isinstance(data, list):
+        return False
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("number") == number:
+            return True
+        for item in entry.get("pull_requests") or []:
+            if (item.get("number") if isinstance(item, dict) else item) == number:
+                return True
+    return False
+
+
+# The asynchronous merge of a stacked pull request: GitHub answers the
+# merge-async call with a pending attempt, and the result is polled until
+# it reports merged before the ticket is settled (loom#2622).
+MERGE_ASYNC_POLL = 5
+MERGE_ASYNC_SECONDS = 180
+
+
+def _async_done(result: Dict[str, Any]) -> bool:
+    # Only an explicit merged result settles the ticket: a "complete"
+    # status without merged true has not proved the merge, so it keeps
+    # polling until the deadline raises.
+    return result.get("merged") is True or str(result.get("status") or "") == "merged"
+
+
+def _async_failed(result: Dict[str, Any]) -> bool:
+    return str(result.get("status") or "") in ("failed", "error")
+
+
+def _merge_stacked(gh: GitHub, repo: str, number: int, sha: str,
+                   env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Merge a stacked pull request through the asynchronous merge
+    endpoint and poll its result until it reports merged; a failed or
+    unfinished attempt raises, so the ticket is settled only after a
+    merged result."""
+    result = gh.rest("PUT", "/repos/%s/pulls/%d/merge-async" % (repo, number),
+                     {"merge_method": "squash", "sha": sha}).data or {}
+    path = "/repos/%s/pulls/%d/merge-async" % (repo, number)
+    if result.get("id") is not None:
+        path += "/%s" % result["id"]
+    raw = (env if env is not None else os.environ).get(
+        "LOOM_MERGE_ASYNC_SECONDS", "")
+    limit = int(raw) if raw.strip().isdigit() else MERGE_ASYNC_SECONDS
+    deadline = _clock() + limit
+    while not _async_done(result):
+        if _async_failed(result):
+            raise ValueError("GitHub's asynchronous merge of #%d failed" % number)
+        if _clock() >= deadline:
+            raise ValueError("GitHub's asynchronous merge of #%d did not "
+                             "finish" % number)
+        _sleep(MERGE_ASYNC_POLL)
+        result = gh.rest("GET", path).data or {}
+    return result
+
+
 def merge(gh: GitHub, repo: str, number: int,
           ticket: Optional[Tuple[str, int]] = None, adopt: bool = False,
           env: Optional[Dict[str, str]] = None,
@@ -4930,10 +5031,16 @@ def merge(gh: GitHub, repo: str, number: int,
         _shadow_merge(repo, number, str(sha), association, adopt,
                       "" if adopt else tier,
                       change_class.class_of(pr) == "sensitive")
-    result = gh.rest("PUT", "/repos/%s/pulls/%d/merge" % (repo, number),
-                     {"merge_method": "squash", "sha": sha}).data or {}
-    if result.get("merged") is not True:
-        raise ValueError("GitHub did not confirm the merge")
+    _refuse_behind_overlap(gh, repo, number, pr)
+    if _is_stacked(gh, repo, number, pr):
+        # A stack merges only through the asynchronous endpoint, and the
+        # ticket below is settled only once it reports merged (loom#2622).
+        result = _merge_stacked(gh, repo, number, str(sha), env)
+    else:
+        result = gh.rest("PUT", "/repos/%s/pulls/%d/merge" % (repo, number),
+                         {"merge_method": "squash", "sha": sha}).data or {}
+        if result.get("merged") is not True:
+            raise ValueError("GitHub did not confirm the merge")
     branch = pr["head"]["ref"]
     try:
         if cancellation is not None and association:
@@ -6566,8 +6673,23 @@ def _ticket_refusal(issue: Dict[str, Any], expected_state: str) -> str:
     if issue.get("state") != "open" or "loom:ticket" not in names:
         return "ticket is not an open loom:ticket"
     if "loom:" + expected_state not in names:
-        return "ticket is not loom:" + expected_state
+        return "ticket is not loom:" + expected_state + _mid_round_note(names, expected_state)
     return ""
+
+
+# The refusal for a ticket a fix round holds. A retry-branch pull request is
+# linked the same as a first attempt's (the station matches loom/<n>-...), so
+# a lane pull request whose ticket sits at loom:briefed or loom:running is
+# mid fix round, not missing a reconciliation (loom#2611).
+MID_ROUND_NOTE = (" (at %s: a fix round has a lane pushing a new head; the station moves the "
+                  "ticket back to loom:pr when that lane reports, so wait for it, do not relabel)")
+
+
+def _mid_round_note(names: List[str], expected_state: str) -> str:
+    if expected_state != "pr":
+        return ""
+    at = [x for x in ("loom:briefed", "loom:running") if x in names]
+    return MID_ROUND_NOTE % at[0] if at else ""
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],

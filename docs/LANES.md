@@ -53,7 +53,12 @@ and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
 script's path when using another checkout. A scanner that is still missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
-another reason parks the brief `[transient]`. A lane pod or cluster runner
+another reason parks the brief `[transient]`. A hit parks the brief with
+one line naming each hit's rule class and place, up to five (for example
+`[deny-list] docs/LANDING.md:12`, or `PR body line 4`), never the matched
+text, and never the name of a file whose name itself hit
+(`bus/leak_hits.py`); the scanner's full output goes to the lane log only.
+A lane pod or cluster runner
 (`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
@@ -93,6 +98,20 @@ parks the brief as `validation failed: the affected check exited N` and
 pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
+
+A successful contract command proves its exit status, not coverage of the
+changed paths. The contract has no path-to-check mapping. PR bodies and
+fix-round comments therefore keep the command result (including retries,
+host-red exceptions and `affected:` results) but also say `not validated:
+contract path coverage unknown` and name the changed paths. This applies to
+Python-only changes too: a Python command may check another directory. An
+arbitrary `affected:` hook, a language launcher or a filename mentioned in a
+command does not prove coverage. Documentation and configuration changes are
+not silently exempted. The path excerpt uses literal code spans, escapes
+control characters and backticks, and caps its size with an omitted count.
+If the diff cannot be read, coverage remains unknown.
+This is reporting only: existing check failures still block pushing, and the
+factory still waits for CI and review on the new head before landing it.
 
 After the repo check passes, the runner also checks each changed Python test
 against the exact base commit's code in the check sandbox. It copies each
@@ -134,6 +153,22 @@ unset variables.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
+- A base check red only on the lane host is not a broken default branch.
+  The runner treats a fresh red base run (exit 1 to 123, after its second
+  run) as host-only red when all of these hold: GitHub's own check runs on
+  the same commit all completed as success, neutral or skipped; the output
+  names at most 20 failing tests, each a plain pytest node id; every failure
+  or error line in the output is one of those names; and the check exits 0
+  when rerun with exactly those tests deselected (`PYTEST_ADDOPTS` carries
+  `--deselect`, and `LOOM_DESELECT_TESTS` lists them). Then it files no
+  incident, the agent runs, and the repo's open base-check incident closes
+  so the station re-queues the tickets it held. A red final check passes
+  only if its rerun with the same tests deselected exits 0, and never when
+  the change touches a file holding one of them. The check sandbox denies
+  localhost and the network, so tests that need either fail only here; a
+  repo fixes that by skipping them when a localhost probe fails. Anything
+  else, including a fix round, a cached red verdict and unittest or go
+  failures, still files the incident.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
@@ -166,7 +201,10 @@ unset variables.
   up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
   its keepalive stamp stays fresh while it waits. A wait that runs out, or a
   base check that times out (exit 124), parks the brief `[transient]` and
-  files no base-check incident: both mean host load, not a red base. The
+  files no base-check incident: both mean host load, not a red base. A
+  final or affected check after the agent that times out also parks
+  `[transient]` once; the station counts a second check timeout in a row on
+  the same ticket as `[work]`, as it does for agent timeouts. The
   runner passes no worker cap to a test runner, because no runner reads an
   env var for one.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
@@ -1154,6 +1192,10 @@ sent (and from the tick's start), each closing the commitment for the same
 stage, item and brief key. Between ticks, at most every 10 minutes, the
 station sends the new done markers to `/api/brain/commitments`, so work
 another brain finished closes without waiting for this machine's next tick.
+A refused upload is logged with its status and retried after exponential
+back-off (one minute, doubling to ten minutes at most); after three
+consecutive refusals the station keeps the markers in its local ledger in
+safe mode until an upload succeeds.
 After a tick posts, the station loads the rules digest's sources that
 changed: the Rules section of `docs/MUSE.md`, keyed by the commit that last
 changed it, and each goal home's rules, keyed by its newest rules comment
@@ -1884,8 +1926,11 @@ separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
 `free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
-holds only that slot for 15 minutes as a limit, so the station can assign the
-ticket elsewhere without counting it as a work failure. Ollama and Gemma
+holds only that slot as a limit, using the gateway's numeric `Retry-After`
+(capped at one day); when that header is absent or invalid, the slot uses its
+15-minute fallback. The heartbeat preserves that reset across passes, so the
+station avoids dispatching while the route remains held and assigns any
+already-queued ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
 
@@ -1918,7 +1963,8 @@ unchanged for a run that did not end on a described step.
   answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
   first, and asks again after a run that failed. A refused connection or a
   503 is a limit, not a failure: the heartbeat says unavailable, with a
-  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  reason starting `limit:`, for 15 minutes by default or for the gateway's
+  `Retry-After` on a 503; every brief in the inbox is
   parked with that reason; the station puts its ticket back to briefed (a
   fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
   limited lane to the next rung of the model ladder at once. Any other

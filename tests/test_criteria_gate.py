@@ -255,6 +255,109 @@ class DoneClose(tbs.Base):
         self.assertEqual(len(asked), station.LIVE_ASKS_PER_HOUR)
 
 
+class LiveWaitAsk(tbs.Base):
+    """loom#2805: the done close does not send a live wait back to a person,
+    nor re-add a person label a brain removed while the criteria stand."""
+
+    close = DoneClose.close
+    asks = DoneClose.asks
+
+    LIVE = "Live: the daily line shows the roll"
+
+    def label(self, number, *names):
+        self.fake.issues[number]["labels"] += [{"name": n} for n in names]
+
+    def unlabel(self, number, name):
+        self.fake.issues[number]["labels"] = [
+            x for x in self.fake.issues[number]["labels"] if x["name"] != name]
+
+    def again(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(criteria_gate, "_fetch", lambda u, t: (200, "ok", "")):
+            st.close_done_tickets()
+
+    def test_the_wait_label_is_the_one_the_station_sets(self):
+        from bus import brain
+        self.assertEqual(criteria_gate.LIVE_CHECK_LABEL, brain.LIVE_CHECK_LABEL)
+
+    def test_a_ticket_awaiting_a_live_check_gets_no_person_label(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_CODE[1], AUDIT_LIVE[0]), state="shipped")
+        self.label(1, "awaiting-live-check")
+        self.again()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertEqual(self.asks(1), [])
+
+    def test_a_wait_label_or_a_waiting_line_holds_the_ask_too(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        self.label(1, "wait:live-event")
+        self.fake.add(2, lane="codex", body=body(AUDIT_LIVE[0]) + "\nwaiting: the next roll",
+                      state="shipped")
+        self.again()
+        for n in (1, 2):
+            self.assertNotIn("needs:human", self.fake.names(n))
+            self.assertEqual(self.asks(n), [])
+
+    def test_an_operator_box_is_still_asked_on_a_ticket_awaiting_a_live_check(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0], AUDIT_OPERATOR[0]),
+                      state="shipped")
+        self.label(1, "awaiting-live-check")
+        self.again()
+        self.assertIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)
+
+    def test_a_removed_label_is_not_re_added_until_the_criteria_change(self):
+        text = body(AUDIT_CODE[1], AUDIT_LIVE[0])
+        self.close(text)
+        self.assertIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)
+        # A brain records a decision and takes the label off; the body is unchanged.
+        self.unlabel(1, "needs:human")
+        self.again()
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)
+        # The criteria change: the gate may ask again.
+        self.fake.issues[1]["body"] = body(AUDIT_CODE[1], AUDIT_LIVE[0], AUDIT_LIVE[5])
+        self.again()
+        self.assertIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 2)
+
+    def test_a_failed_comment_read_defers_the_ask_to_the_next_pass(self):
+        # A transient read failure must not re-add a label a brain removed
+        # (the bug), so it holds without asking, says so, and the next pass asks.
+        from bus.github import GitHubError
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        real = GitHub.paginate
+
+        def flaky(gh, path, *a, **k):
+            if path.endswith("/issues/1/comments"):
+                raise GitHubError("HTTP 502 reading comments")
+            return real(gh, path, *a, **k)
+
+        with mock.patch.object(GitHub, "paginate", flaky), \
+                mock.patch.object(station, "_say") as said:
+            self.again()
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertTrue(any("could not read the comments" in str(c) for c in said.call_args_list))
+        self.again()
+        self.assertIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)
+
+    def test_an_ask_made_before_the_station_kept_state_is_not_repeated(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        self.fake.comments[1].append({
+            "body": "<!-- loom:human v1 -->\n%s: x\nKind: decision" % criteria_gate.ASK_OPENING,
+            "user": {"login": self.fake.bot}})
+        self.again()
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertEqual(len(self.asks(1)), 1)  # the earlier ask alone
+
+
 class LaneProof(tbs.Base):
     """A verify lane's proof may not pass a live criterion the station never checked."""
 

@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from bus import brain_trees
@@ -92,6 +93,23 @@ class BrainTreesTest(unittest.TestCase):
         out = self.prune()
         self.assertFalse((self.work / "roll-squashed").exists(), out)
         self.assertIn("remove roll-squashed reason=squash-merged", out)
+
+    def test_failed_fetch_keeps_tree_and_logs_only_sanitized_reason_class(self):
+        path = self.tree("roll-squashed", commit=("pin.txt", "v2\n"))
+        self.land("pin.txt", "v2\n")
+        real_git = brain_trees.git
+
+        def failing_fetch(args, cwd, extra_env=None):
+            if args and args[0] == "fetch":
+                return subprocess.CompletedProcess(
+                    args, 1, "", "fatal: Authentication failed for 'https://secret.example.invalid/repo'\n")
+            return real_git(args, cwd, extra_env)
+
+        with mock.patch.object(brain_trees, "git", side_effect=failing_fetch):
+            out = self.prune()
+        self.assertTrue(path.exists(), out)
+        self.assertIn("fetch-failed roll-squashed reason=auth", out)
+        self.assertNotIn("secret.example.invalid", out)
 
     def test_a_tree_with_a_commit_on_no_remote_is_kept_and_named(self):
         path = self.tree("roll-unpushed", commit=("pin.txt", "v3\n"))

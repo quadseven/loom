@@ -346,6 +346,42 @@ class AwsCliUnavailable(OSError):
     """An actionable CLI setup error containing no path or parameter value."""
 
 
+class SsmReadError(OSError):
+    """An SSM read that failed, with a reason safe to log: built only from
+    fixed text, the CLI's exit status and one AWS error name picked from a
+    fixed list. It never carries the value, the parameter name or stderr.
+    Logged by type alone ("OSError"), three station errors stayed
+    undiagnosable for two days (loom#2693)."""
+
+
+# The AWS error names a failed read reports by name. The CLI's stderr is
+# matched against these only; nothing else of it is ever kept.
+SSM_ERROR_NAMES = (
+    "ExpiredTokenException", "ExpiredToken", "ThrottlingException",
+    "AccessDeniedException", "ParameterNotFound", "UnrecognizedClientException",
+    "InvalidSignatureException", "RequestExpired", "ServiceUnavailable",
+    "InternalServerError", "Could not connect to the endpoint URL",
+    "Unable to locate credentials", "Error when retrieving token from sso",
+    "Token has expired", "Read timeout on endpoint URL",
+)
+
+
+def ssm_error_name(stderr: str) -> str:
+    """The first of SSM_ERROR_NAMES that stderr names, or "" for none."""
+    for name in SSM_ERROR_NAMES:
+        if name in (stderr or ""):
+            return name
+    return ""
+
+
+def secret_read_reason(err: BaseException) -> str:
+    """What a failed secret read may log: the safe reason of an SsmReadError
+    or AwsCliUnavailable, else the exception's type name alone."""
+    if isinstance(err, (SsmReadError, AwsCliUnavailable)) and str(err):
+        return str(err)
+    return type(err).__name__
+
+
 def read_ssm(name: str, region: str) -> str:
     """A SecureString parameter, read the way lanes/run_lane.sh reads keys.
     The read is bounded by TIMEOUT, so a hung call cannot stall a pass. The
@@ -360,11 +396,15 @@ def read_ssm(name: str, region: str) -> str:
              "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
             capture_output=True, text=True, timeout=TIMEOUT, env=_proxy_env_for_aws())
     except subprocess.TimeoutExpired:
-        raise OSError("SSM read timed out") from None
+        raise SsmReadError("SSM read timed out after %ds" % TIMEOUT) from None
     except OSError:
         raise AwsCliUnavailable("cannot execute aws; check LOOM_AWS_CLI or PATH") from None
-    if out.returncode != 0 or not out.stdout.strip():
-        raise OSError("could not read the parameter from SSM")
+    if out.returncode != 0:
+        name = ssm_error_name(out.stderr or "")
+        raise SsmReadError("could not read the parameter from SSM: aws exited %d%s"
+                           % (out.returncode, " (%s)" % name if name else ""))
+    if not out.stdout.strip():
+        raise SsmReadError("could not read the parameter from SSM: empty value")
     return out.stdout.strip()
 
 
@@ -499,7 +539,7 @@ class AppToken:
                     detail += " (errno %d)" % err.errno
                 failure = "could not read the GitHub App private key: %s" % detail
             else:
-                failure = "could not read the GitHub App private key: %s" % type(err).__name__
+                failure = "could not read the GitHub App private key: %s" % secret_read_reason(err)
         if failure:
             raise GitHubError(failure)
         try:

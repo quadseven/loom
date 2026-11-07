@@ -614,3 +614,61 @@ class ReadSsmProxyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SsmReadReasonTests(unittest.TestCase):
+    """A failed SSM read says why, from fixed text only (loom#2693)."""
+
+    def _read(self, completed=None, raises=None):
+        def fake_run(argv, **kwargs):
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(argv, *completed)
+
+        with mock.patch.object(github.shutil, "which", return_value="/example/aws"), \
+                mock.patch.object(github.subprocess, "run", fake_run), \
+                self.assertRaises(github.SsmReadError) as raised:
+            github.read_ssm("/example/param", "us-east-1")
+        return str(raised.exception)
+
+    def test_a_failed_read_names_the_exit_and_the_aws_error_name_only(self):
+        stderr = ("An error occurred (ThrottlingException) when calling the GetParameter "
+                  "operation: Rate exceeded for /example/param " + KEY)
+        reason = self._read(completed=(255, "", stderr))
+        self.assertEqual(reason, "could not read the parameter from SSM: aws exited 255 "
+                                 "(ThrottlingException)")
+        self.assertNotIn("/example/param", reason)
+        self.assertNotIn(KEY_MARK, reason)
+
+    def test_an_unknown_stderr_gives_the_exit_alone(self):
+        reason = self._read(completed=(1, "", "something new " + KEY))
+        self.assertEqual(reason, "could not read the parameter from SSM: aws exited 1")
+
+    def test_an_empty_value_and_a_timeout_say_so(self):
+        self.assertIn("empty value", self._read(completed=(0, "  \n", "")))
+        timeout = subprocess.TimeoutExpired(["aws"], 30, output=KEY.encode())
+        reason = self._read(raises=timeout)
+        self.assertIn("timed out", reason)
+        self.assertNotIn(KEY_MARK, reason)
+
+    def test_the_app_key_read_failure_carries_the_ssm_reason(self):
+        def fail_read():
+            raise github.SsmReadError("could not read the parameter from SSM: aws exited 255 "
+                                      "(ExpiredTokenException)")
+
+        app = AppToken("123", "456", fail_read, clock=Clock())
+        with self.assertRaises(GitHubError) as raised:
+            app.jwt()
+        self.assertEqual(str(raised.exception),
+                         "could not read the GitHub App private key: could not read the "
+                         "parameter from SSM: aws exited 255 (ExpiredTokenException)")
+
+    def test_any_other_os_error_is_still_reported_by_type_alone(self):
+        def fail_read():
+            raise OSError("bad parameter " + KEY)
+
+        app = AppToken("123", "456", fail_read, clock=Clock())
+        with self.assertRaises(GitHubError) as raised:
+            app.jwt()
+        self.assertEqual(str(raised.exception),
+                         "could not read the GitHub App private key: OSError")
