@@ -100,8 +100,11 @@ COPILOT_ALLOWANCE_RE='exceeded your [a-z ]*allowance|you have no quota'
 # for this model" ended two runs while about 30 others on the same model
 # finished (2026-10-25). The fault is the provider's, so the run is transient
 # and names it, and the ticket does not climb the model ladder (loom#1749).
+# Cohere's "missing required parameter: messages[X].content" (statusCode 400,
+# isRetryable false) also ends runs (2026-11-07). The provider fault is the
+# work's, so the run is transient, and the ticket does not climb the model ladder.
 # It is no limit: the lane and model stay available.
-PROVIDER_FAULT_RE='prompt_rendering_failed'
+PROVIDER_FAULT_RE='prompt_rendering_failed|missing required parameter: ''messages\['
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -199,7 +202,7 @@ classify_failure() {
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
   elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_FAULT_RE ]]; then
-    FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt (prompt_rendering_failed)"
+    FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt"
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
   elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then
