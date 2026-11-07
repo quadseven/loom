@@ -1373,14 +1373,19 @@ $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" <
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
 # one stream at a time behind a thermal guard that refuses new connections
 # (or answers 503) while the box is hot. That is a limit, not a failure: the
-# lane says unavailable for LIMIT_HOLD seconds, and every brief it holds is
-# parked with a "limit:" reason, which the station hands to the next lane.
+# lane says unavailable for LIMIT_HOLD seconds by default, or honors a
+# gateway Retry-After on 503. Every held brief is parked with a "limit:"
+# reason, which the station hands to the next lane.
 LIMIT_HOLD=900
+# The free gateway caps Retry-After at a day. Keep that value intact across
+# lane passes so a cluster slot does not probe again while its route is held.
+LIMIT_MAX_HOLD=86400
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
 # A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
 SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
+LIMIT_RETRY_AFTER=""
 LIMIT_WHY=""
 # Whether the provider answered the last probe at all (provider_at_limit).
 PROBE_ANSWERED=0
@@ -1393,11 +1398,30 @@ AUTH_WHY_PREFIX="API key expired: renew"
 # Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
 # LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
 spark_probe() {
-  local code status
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  local response code status retry_after
+  LIMIT_RETRY_AFTER=""
+  response="$(curl -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
+  code="${response##*$'\n'}"
   if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
+  if [ "$code" = 503 ]; then
+    retry_after="$(printf '%s\n' "$response" | awk '
+      tolower($1) == "retry-after:" {
+        value = $2
+        gsub(/\r/, "", value)
+        if (value ~ /^[0-9]+$/) retry = value
+      }
+      END { if (retry != "") print retry }
+    ' | tail -1)"
+    if [[ "$retry_after" =~ ^[0-9]{1,5}$ ]] && [ "$retry_after" -gt 0 ] &&
+       [ "$retry_after" -le "$LIMIT_MAX_HOLD" ]; then
+      LIMIT_RETRY_AFTER="$retry_after"
+      LIMIT_WHY="the $LANE endpoint answered 503; gateway retry after ${retry_after}s"
+    else
+      LIMIT_WHY="the $LANE endpoint answered 503"
+    fi
+    return 1
+  fi
   [ "$status" -eq 0 ] && return 0
   READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
@@ -1405,7 +1429,12 @@ spark_probe() {
 
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
 mark_limit() {
-  LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
+  local hold="$LIMIT_HOLD"
+  if [[ "${LIMIT_RETRY_AFTER:-}" =~ ^[0-9]{1,5}$ ]] &&
+     [ "$LIMIT_RETRY_AFTER" -gt 0 ] && [ "$LIMIT_RETRY_AFTER" -le "$LIMIT_MAX_HOLD" ]; then
+    hold="$LIMIT_RETRY_AFTER"
+  fi
+  LIMIT_UNTIL=$(( $(date +%s) + hold ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
   LIMITED=1
@@ -1414,13 +1443,13 @@ mark_limit() {
 }
 
 # A limit recorded by an earlier pass that has not run out. A time further
-# ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
+# ahead than the gateway's maximum Retry-After (a clock that was wrong) is ignored.
 limit_held() {
   local ends why now
   [ -f "$LIMIT_FILE" ] || return 1
   read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
-  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
+  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_MAX_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
 }
@@ -3921,6 +3950,7 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+PREHELD=""
 # A Go allowance hold never binds a slot on a free model (limit_group): a
 # hold written before the slot moved to one, or by an older runner, is
 # dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
@@ -3931,7 +3961,8 @@ if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_mode
   rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   LIMIT_UNTIL=""
 fi
-if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] &&
+   [ "$LIMIT_UNTIL" -gt "$(date +%s)" ] && [ ! -f "$LIMIT_FILE" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
   # The provider's allowance refills while the lane sleeps, so the lane asks
@@ -3943,7 +3974,16 @@ if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt 
     NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
     [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
     heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-    exit 0
+    # The cluster OpenRouter slot loses its local .limit file on pod restart,
+    # so rehydrate the shared hold and hand off any queued brief. Other lanes
+    # keep their provider-limit behavior: their queued brief stays in place.
+    if [ "$SLOT" = free-openrouter ]; then
+      LIMITED=1
+      LIMIT_WHY="${HELD_REASON#limit: }"
+      PREHELD=1
+    else
+      exit 0
+    fi
   fi
 fi
 
@@ -3965,8 +4005,14 @@ CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
-if ! lane_ready; then
-  heartbeat false "$READY_REASON"
+if [ -n "$PREHELD" ]; then
+  READY_REASON="$HELD_REASON"
+elif ! lane_ready; then
+  if [ -n "$LIMITED" ]; then
+    heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
+  else
+    heartbeat false "$READY_REASON"
+  fi
   # A limited lane, or one whose key expired, still passes over its inbox, to
   # hand every brief on.
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0

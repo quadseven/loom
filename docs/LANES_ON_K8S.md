@@ -19,8 +19,10 @@ Only two slots run on the pool. `free-gemma` succeeded 7 times on 2026-11-02
 and failed 37 times since. `free-openrouter` failed all 56 of its runs from
 2026-11-02 to 2026-11-04, each with `the agent did not run (limit)`: the slot
 held on a provider limit before the agent started, and a pod has no memory of
-the hold, so each dispatch only costs a pod start. #2781 finds the cause from
-the sealed reports; #2782 does the same for `free-gemma`. Nothing else moves
+the hold. The gateway's 503 includes `Retry-After`, but the lane discarded it
+and applied a 15-minute fallback; the station then dispatched again before
+the gateway's hold expired. #2781 fixes reset propagation from the sealed
+heartbeat; #2782 does the same for `free-gemma`. Nothing else moves
 until one slot runs end to end.
 
 ## Credential path per subscription
