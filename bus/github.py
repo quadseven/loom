@@ -370,7 +370,7 @@ def read_ssm(name: str, region: str) -> str:
 
 def read_key_file(path: str) -> str:
     """The App's private key from a mounted file, read at each mint."""
-    with open(path, encoding="ascii") as fh:
+    with open(os.path.expanduser(path), encoding="ascii") as fh:
         return fh.read()
 
 

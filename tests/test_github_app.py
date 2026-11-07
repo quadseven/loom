@@ -88,6 +88,20 @@ def app_client(tokens, clock, signed=None, lifetime=3600, mint_status=201):
 
 
 class AppTokenClientTests(unittest.TestCase):
+    def test_app_key_file_path_expands_home_before_authentication(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = os.path.join(home, "app-key.pem")
+            with open(path, "w") as fh:
+                fh.write(KEY)
+            env = {"LOOM_GITHUB_APP_ID": "123",
+                   "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+                   "LOOM_GITHUB_APP_KEY_FILE": "~/app-key.pem"}
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                app = AppToken.from_env(env)
+                self.assertIsNotNone(app)
+                app._sign = fake_sign([])
+                self.assertEqual(len(app.jwt().split(".")), 3)
+
     def test_the_app_client_sends_the_installation_token_and_refreshes_before_expiry(self):
         clock, signed = Clock(), []
         gh, fake, app = app_client(["ghs_first", "ghs_second"], clock, signed)
