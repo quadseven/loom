@@ -513,8 +513,14 @@ class AppToken:
         try:
             key = self._read_key()
         except (OSError, subprocess.SubprocessError) as err:
+            if self.key_source == "file" and isinstance(err, OSError):
+                detail = "key file read failed"
+                if err.errno is not None:
+                    detail += " (errno %d)" % err.errno
+            else:
+                detail = type(err).__name__
             failure = ("could not read the GitHub App private key from %s: %s"
-                       % (self._key_where(), type(err).__name__))
+                       % (self._key_where(), detail))
         if failure:
             raise GitHubError(failure)
         try:

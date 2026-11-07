@@ -912,10 +912,12 @@ A runtime proof template with every required key and these criteria filled in
 LIVE_CRITERION_RE = re.compile(r"^\s*live\b", re.I)
 
 
-def verify_template(criteria: List[str]) -> str:
+def verify_template(criteria: List[str], live_criteria: Optional[Sequence[str]] = None) -> str:
     """The runtime proof skeleton a verify brief shows (loom#714): lanes that
     built the record from prose alone left out observed or environment, and
-    bus/proof.py refused the proof for its shape, not its evidence."""
+    bus/proof.py refused the proof for its shape, not its evidence. The
+    station may name a prose criterion that criteria_gate classified live."""
+    live = set(live_criteria or ())
     return json.dumps({
         "kind": "runtime",
         "revision": "<the commit SHA on the default branch that carries the change>",
@@ -926,7 +928,8 @@ def verify_template(criteria: List[str]) -> str:
         "sources": ["<a reference to each piece of evidence>"],
         "criteria": [{"criterion": text, "result": "pass",
                       "evidence": ("<what you saw, quoted, and the UTC time you saw it>"
-                                   if LIVE_CRITERION_RE.match(text) else "<what shows it>")}
+                                   if LIVE_CRITERION_RE.match(text) or text in live
+                                   else "<what shows it>")}
                      for text in criteria],
         "measure": {"name": "<what you measured>", "baseline": "<before>",
                     "target": "<the goal>", "after": "<after>"},
@@ -953,7 +956,7 @@ def merged_first_section(pulls: Iterable[int]) -> str:
 
 
 def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
-                        live: str) -> str:
+                        live: str, live_criteria: Optional[Sequence[str]] = None) -> str:
     """The brief that hands a lane slot one shipped ticket to verify: no
     branch is pushed (the Branch: line only names the work directory) and the
     result is verify.json, not a pull request."""
@@ -965,7 +968,8 @@ def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
             "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane,
             "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
             "# T%d: Verify %s" % (number, title), ""]
-    return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted, verify_template(texts))
+    return "\n".join(head) + "\n" + VERIFY_BRIEF % (
+        live, wanted, verify_template(texts, live_criteria))
 
 
 REVIEW_BRIEF = """\

@@ -102,6 +102,11 @@ COPILOT_ALLOWANCE_RE='exceeded your [a-z ]*allowance|you have no quota'
 # and names it, and the ticket does not climb the model ladder (loom#1749).
 # It is no limit: the lane and model stay available.
 PROVIDER_FAULT_RE='prompt_rendering_failed'
+# The same kind of fault in another form: the openrouter lane's Cohere model
+# answers some requests with a non-retryable 400 naming a message the provider
+# itself dropped, "[Cohere] missing required parameter: 'messages[60].content'".
+# Eight run logs ended on it from 2026-10-31, five parked as work (loom#2754).
+PROVIDER_PARAM_FAULT_RE="missing required parameter: 'messages\\[[0-9]+\\]"
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -200,6 +205,8 @@ classify_failure() {
     FAIL_CLASS=auth
   elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_FAULT_RE ]]; then
     FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt (prompt_rendering_failed)"
+  elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_PARAM_FAULT_RE ]]; then
+    FAIL_CLASS=transient FAIL_REASON="provider fault: the provider rejected its own request (missing required parameter in messages)"
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
   elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then

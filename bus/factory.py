@@ -192,7 +192,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -3979,17 +3979,29 @@ class Factory:
         A pull request that cannot be brought up to date cleanly goes back for a fix round, as a conflict
         does. The one brought up to date takes the repo's landing lock; while
         another holds it, this does neither."""
+        blockers = []
         if repo in self.landed:
-            return
+            blockers.append("repository already landed this pass")
         held = self._lock(repo)
         if held is not None and held != number:
-            return  # another pull request holds the repo's landing lock
+            blockers.append("another pull request holds the landing lock")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
+            return
         behind = bool(self._behind(repo, full))
-        if behind and not self._may_land_behind(repo, full):
-            if repo not in self.updated:
+        needs_update = behind and not self._may_land_behind(repo, full)
+        if needs_update:
+            blockers.append("pull request must be brought up to date")
+            decision = merge_verdict.decide(full, issue, blockers, ("factory",))
+            if not decision.ready and repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
         if self._scope_holds(repo, number, full, issue):
+            blockers.append("scope check holds for the brain")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
             return
         merged = self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or ""))
         if merged == MERGE_DONE:
@@ -4815,6 +4827,9 @@ class Factory:
             return self._assign_queued_model(repo, issue, model_match.group(1))
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo):
+            if not self._guarded(self._ensure_lane_headers, repo, issue):
+                self._waiting(repo, issue["number"], "brief headers could not be completed")
+                return "%s waits: brief headers could not be completed" % ref
             return self._assign_remote_queued(repo, issue, assigned, ref)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
@@ -5050,6 +5065,7 @@ class Factory:
                            tier: str) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
+            self._ensure_lane_headers(repo, issue)
             self.move(self.gh, repo, number, "queued", lane=lane)
             self._status_note(repo, number,
                               "The station reserved this queued ticket for remote lane %s (tier %s)."
@@ -5067,6 +5083,30 @@ class Factory:
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
+
+    def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Write the effective tier before reserving a remote lane.
+
+        A headerless ticket defaults to medium in the factory, but remote
+        lanes reject it because they cannot render a claim brief. Materialize
+        that tier before adding a lane label. Base: is optional; when absent,
+        the runner uses the repository's default branch.
+        """
+        body = str(issue.get("body") or "")
+        try:
+            headers, _ = tickets.parse(body)
+        except ValueError as err:
+            raise ValueError("cannot assign a lane to an unreadable brief: %s" % err) from err
+
+        updated = body
+        if "Difficulty" not in headers:
+            updated = tickets.with_header(updated, "Difficulty", difficulty_of(issue))
+        if updated == body:
+            return
+        tickets.parse(updated)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
+                     {"body": updated})
+        issue["body"] = updated
 
     # -- tickets no lane takes (loom#1831) --------------------------------
     def _no_lane_moves(self, found: Dict[str, Dict[int, Dict[str, Any]]],

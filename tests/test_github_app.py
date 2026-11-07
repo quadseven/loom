@@ -88,6 +88,21 @@ def app_client(tokens, clock, signed=None, lifetime=3600, mint_status=201):
 
 
 class AppTokenClientTests(unittest.TestCase):
+    def test_key_file_read_errors_report_errno_without_key_contents(self):
+        def fail_read():
+            raise PermissionError(13, "permission denied")
+
+        app = AppToken("123", "456", fail_read, clock=Clock())
+        app.key_source, app.key_file = "file", "/example/app-key.pem"
+
+        with self.assertRaises(GitHubError) as raised:
+            app.jwt()
+
+        self.assertIn("key file", str(raised.exception))
+        self.assertIn("errno 13", str(raised.exception))
+        self.assertNotIn("permission denied", str(raised.exception))
+        self.assertNotIn(KEY_MARK, str(raised.exception))
+
     def test_the_app_client_sends_the_installation_token_and_refreshes_before_expiry(self):
         clock, signed = Clock(), []
         gh, fake, app = app_client(["ghs_first", "ghs_second"], clock, signed)

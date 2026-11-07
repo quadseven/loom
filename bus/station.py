@@ -60,6 +60,7 @@ from . import brief_check
 from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
+from . import merge_verdict
 from . import history
 from . import friction_intake
 from . import review_debt
@@ -619,6 +620,25 @@ UPLOAD_PER_PASS = 10
 # most this often (post_brain_memory), so a commitment another brain
 # finished closes without waiting for this machine's next tick.
 CLOSE_EVERY = 600
+# A refused done-marker upload retries on exponential back-off (_closings_delay):
+# it starts at CLOSE_BASE_DELAY seconds (one minute), doubles each consecutive
+# UploadRefused, and is capped at CLOSE_MAX_DELAY (the configured max delay).
+CLOSE_BASE_DELAY = 60
+CLOSE_MAX_DELAY = 600
+# After this many consecutive UploadRefused errors the station enters safe mode:
+# it keeps the markers in the local ledger cache until an upload succeeds.
+CLOSE_SAFE_AFTER = 3
+
+
+def _closings_delay(fails: int) -> int:
+    """The back-off before the next done-marker retry after `fails` consecutive
+    UploadRefused errors: CLOSE_BASE_DELAY doubled each time, capped at
+    CLOSE_MAX_DELAY."""
+    tries = fails if fails >= 1 else 1
+    delay = CLOSE_BASE_DELAY * (2 ** (tries - 1))
+    return delay if delay < CLOSE_MAX_DELAY else CLOSE_MAX_DELAY
+
+
 # The rules digest's source for docs/MUSE.md's Rules section.
 MUSE_RULES = "docs/MUSE.md"
 
@@ -899,6 +919,27 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     if live == "(no Live criterion on the ticket)":
         return None
     return evidence.needles(live)
+
+
+def _adapter_live_criterion(body: str) -> Optional[str]:
+    """Return the live criterion an adapter verify run can read, if any."""
+    explicit = brain.live_criterion(body, limit=None)
+    if explicit != "(no Live criterion on the ticket)":
+        if criteria_gate.check_of(explicit) is None \
+                and live_proof.step_of(explicit)[0] is None:
+            return explicit
+        return None
+    for checked, criterion in proof.criteria(body):
+        if checked or criteria_gate.kind(criterion) != criteria_gate.LIVE:
+            continue
+        if not re.search(r"`[^`\n]+`", criterion) or not evidence.needles(criterion):
+            continue
+        step, why = live_proof.step_of(criterion)
+        if (criteria_gate.check_of(criterion) is not None or why
+                or (step is not None and not (step.kind == live_proof.LOG and not step.source))):
+            continue
+        return criterion
+    return None
 
 
 def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
@@ -3801,11 +3842,8 @@ class Station:
     def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether this opted-in repo can send a prose Live box to a verify
         lane for an adapter step proposed by that lane."""
-        body = str(issue.get("body") or "")
-        live = brain.live_criterion(body, limit=None)
-        if (live == "(no Live criterion on the ticket)"
-                or criteria_gate.check_of(live) is not None
-                or live_proof.step_of(live)[0] is not None):
+        live = _adapter_live_criterion(str(issue.get("body") or ""))
+        if live is None:
             return False
         return self._live_adapter(repo) is not None
 
@@ -4170,8 +4208,12 @@ class Station:
         if brain.WAIT_LIVE_EVENT in _label_names(issue):
             self._clear_live_event(repo, number)
         stamp = int(self.now)
+        adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
+                        if self._adapter_can_verify(repo, issue) else None)
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp,
+            adapter_live or brain.live_criterion(issue.get("body")),
+            live_criteria=[adapter_live] if adapter_live else None)
         text += self._verify_github_data(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:
@@ -7738,6 +7780,10 @@ class Station:
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
                     ready: Optional[str]) -> None:
+        decision = merge_verdict.decide({"head_sha": sha})
+        if not decision.ready:
+            self._remove_ready_if_present(repo, number, names)
+            return
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
         # Routine, so an event in the status comment rather than a comment of
@@ -13081,8 +13127,11 @@ class Station:
         the rules digest's sources that changed. A failed post is tried on
         the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
         that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
-        done markers written since the last send. Uses the transcript upload
-        settings and token."""
+        done markers written since the last send. A refused marker upload
+        retries on exponential back-off (_closings_delay), and after
+        CLOSE_SAFE_AFTER consecutive refusals it caches locally in safe mode
+        until an upload succeeds. Uses the transcript upload settings and
+        token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
             return
         path = os.path.join(self.state, "brain_memory.json")
@@ -13091,9 +13140,13 @@ class Station:
             raise StateError("state file %s does not hold an object" % path)
         last = self._finished_brain_tick()
         tries = self._tick_tries(ledger, last)
-        closed_at = ledger.get("closed_at")
-        close_due = self._num(ledger.get("since")) and not (
-            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        next_at = ledger.get("closings_next_at")
+        if self._num(next_at):
+            close_due = self._num(ledger.get("since")) and self.now >= next_at
+        else:
+            closed_at = ledger.get("closed_at")
+            close_due = self._num(ledger.get("since")) and not (
+                self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
         if tries is None and not close_due:
             return
         token = self._transcript_token()
@@ -13137,6 +13190,10 @@ class Station:
                         token, body)
             result: Any = "sent"
             ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+            ledger["closings_fails"] = 0
+            ledger.pop("closings_next_at", None)
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
         except UploadRefused as err:
             _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
             result = "refused"
@@ -13152,22 +13209,48 @@ class Station:
     def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
                              found: List[Dict[str, Any]]) -> None:
         """Send the done markers written since the last send, so the
-        commitments they finish close; a failed send is tried CLOSE_EVERY
-        seconds later."""
+        commitments they finish close. A refused upload is logged with its
+        status and retried after exponential back-off (_closings_delay);
+        after CLOSE_SAFE_AFTER consecutive refusals the markers stay in the
+        local ledger cache in safe mode until an upload succeeds. Any other
+        failure is retried CLOSE_EVERY seconds later."""
         ledger["closed_at"] = self.now
         closings = brain_memory.closings(found, ledger["since"])
         if not closings:
+            ledger.pop("closings_next_at", None)
+            ledger["closings_fails"] = 0
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
             return
         try:
             self.upload(brain_memory.dashboard_url(self.s.transcript_url,
                                                    brain_memory.COMMITMENTS_PATH),
                         token, {"commitments": [c for _, c in closings]})
+        except UploadRefused as err:
+            raw = ledger.get("closings_fails")
+            fails = int(raw) + 1 if self._num(raw) else 1
+            delay = _closings_delay(fails)
+            ledger["closings_fails"] = fails
+            ledger["closings_next_at"] = self.now + delay
+            ledger["closings_cache"] = [c for _, c in closings]
+            if fails >= CLOSE_SAFE_AFTER:
+                ledger["closings_safe"] = True
+            _say("could not send the brain's done markers (UploadRefused status %d); "
+                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
+                                           "; safe mode on, caching locally"
+                                           if ledger.get("closings_safe") else ""))
+            return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
+            ledger["closings_next_at"] = self.now + CLOSE_EVERY
             _say("could not send the brain's done markers (%s); next in %d minutes"
                  % (type(err).__name__, CLOSE_EVERY // 60))
             return
         ledger["since"] = closings[-1][0] + 1
+        ledger["closings_fails"] = 0
+        ledger.pop("closings_next_at", None)
+        ledger["closings_safe"] = False
+        ledger.pop("closings_cache", None)
 
     def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
                           homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
