@@ -6354,6 +6354,33 @@ class RetryTest(Base):
         self.assertEqual(tickets.timedout_branch([failed[0]]), "loom/12-fix-the-thing-timedout-1234")
         self.assertNotIn("loom:runaway", self.fake.names(12))
 
+    def test_a_first_check_timeout_is_transient_and_costs_no_rung(self):
+        # loom#2799: the check after the agent timing out under host load sent
+        # six tickets to loom:failed in one afternoon while base checks passed.
+        self.failed(body=BODY_WITH_CRITERIA,
+                    reason="[transient] validation failed: the check timed out after 1800s at "
+                           "e992b44d7458 (base check exited 0)")
+        self.timeout_history([])
+        self.run_pass()
+        self.assertNotIn("loom:failed", self.fake.names(12))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_second_check_timeout_in_a_row_counts_as_a_failure(self):
+        # A check that times out twice running is the ticket's (a hung test).
+        self.failed(body=BODY_WITH_CRITERIA,
+                    reason="[transient] validation failed: the check timed out after 1800s at "
+                           "e992b44d7458 (base check exited 0)")
+        self.timeout_history([
+            "Lane a stopped: [transient] validation failed: the check timed out after 1800s at "
+            "c49d384fec50 (base check exited 0)"])
+        self.run_pass()
+        self.assertIn("loom:failed", self.fake.names(12))
+        failed = [b for b in self.bodies() if b.startswith("Lane codex failed:")]
+        self.assertEqual(len(failed), 1)
+        self.assertTrue(failed[0].startswith(
+            "Lane codex failed: [work] validation failed: the check timed out after 1800s"), failed[0])
+        self.assertIn("timed out again on this ticket", failed[0])
+
     def test_a_timeout_after_another_kind_of_ending_stays_transient(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[transient] agent exited 124")
         self.timeout_history(["Lane codex stopped: [transient] could not mint a GitHub App token",

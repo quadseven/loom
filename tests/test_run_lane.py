@@ -8293,6 +8293,16 @@ exec /usr/bin/git "$@"
         self.assertEqual(finals[1]["detail"], "second run after exit 1")
         self.assertIn("validation failed: the check exited 1", self.lane_log())
 
+    def test_a_final_check_timeout_after_a_green_base_parks_transient(self):
+        # loom#2799: host load, as often as a hung test; the station counts a
+        # second check timeout in a row on the ticket as work.
+        result = self.final_retry_lane([0, 124])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [transient] validation failed: the check timed out after", log)
+        self.assertNotIn("failed: [work]", log)
+
     def test_final_check_does_not_retry_timeout_environment_or_sigterm_exits(self):
         for code in (124, 125, 126, 127, 143):
             with self.subTest(exit=code):

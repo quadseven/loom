@@ -1233,10 +1233,14 @@ GAVE_UP = "The factory tried every rung of the model ladder"
 ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 
 
-# An agent run cut off at the agent timeout (lanes/agent_cli.sh classes exit 124
-# [transient]). The class may be missing (an older reason) or [work] (the
-# station's own reclassing of a repeated timeout, below), never [limit].
-TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?agent exited 124(?!\d)")
+# A run cut off at a timeout: the agent's (lanes/agent_cli.sh classes exit 124
+# [transient]) or the validation check's after the agent (lanes/run_lane.sh,
+# the final or affected check exiting 124 parks [transient]). The class may be
+# missing (an older reason) or [work] (the station's own reclassing of a
+# repeated timeout, below, or a check timeout parked before loom#2799), never
+# [limit].
+TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?(?:agent exited 124(?!\d)"
+                        r"|validation failed: the (?:affected )?check timed out after )")
 # Two runs in a row cut off on one ticket are the ticket's doing, not a lane's.
 TIMEOUT_STRIKES = 2
 
