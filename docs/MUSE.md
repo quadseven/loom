@@ -337,6 +337,20 @@ below; where the steps leave room, this is how to spend it.
     deferred N with their stages. A tick that moved nothing says so as its
     first line and names what stopped it; it never grades itself as
     succeeded.
+    The journal writer flags missing counts or a repeated unchanged stuck
+    list with no counted action using `- Journal check:`. It does not reject
+    the write or invent work. Use a footer such as `- Moved: merged 1,
+    briefed 0, escalated 1`, or explicit counted fields such as `- Merged: 1`.
+    A legitimate zero-work tick can instead state `- No work: <reason>` or
+    `- Standdown: <observed reason>`. Fenced examples are not evidence.
+    Repetition compares `Waiting:`, `Still stuck:` or `Stuck:` fields and
+    their indented list items with the immediately preceding tick by the same
+    author and holder in the comments read since the previous UTC day. Missing
+    older history is not proof of repetition. Changed stuck lists and positive
+    action counts do not get a repetition warning. Deferred counts establish
+    a counted footer but are not positive action for a repeated stuck list.
+    These checks concern journal
+    evidence only, not the runner's identity or permission to act.
 
 ## Improving Loom itself
 
