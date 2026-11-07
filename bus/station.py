@@ -83,6 +83,7 @@ from . import status
 from . import usage
 from . import verify_data
 from . import text as _text
+from . import ticket_move
 from . import tickets
 from . import transcripts
 from . import unmeetable
@@ -8897,11 +8898,8 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = self._drop_claim(n for n in names if n != RUNNING and not n.startswith(WAIT))
-        if new not in labels:
-            labels.append(new)
-        if wait:
-            labels.append(WAIT + wait)
+        labels = ticket_move.next_labels(names, new, wait=wait,
+                                         own_logins=self.s.authors)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
 
