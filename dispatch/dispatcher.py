@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,7 +127,9 @@ def render_brief(ticket_path: Path, lane: str) -> Path:
     ticket_text = ticket_path.read_text()
     # Parse frontmatter for repo/branch/model hints
     lines = ticket_text.splitlines()
-    repo = "quadseven/loom"  # default
+    # Default: the deployment's own repo from its settings, never the
+    # original owner's repo as a literal (loom#2584).
+    repo = os.environ.get("LOOM_STATUS_REPO", "")
     branch = None
     model = None
     difficulty = "medium"

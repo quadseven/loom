@@ -176,6 +176,15 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
+  run at once across all lanes, as `run/check-slots/slot-N` directories that
+  hold the runner's pid; a slot whose pid is gone is reclaimed. A lane waits
+  up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
+  its keepalive stamp stays fresh while it waits. A wait that runs out, or a
+  base check that times out (exit 124), parks the brief `[transient]` and
+  files no base-check incident: both mean host load, not a red base. The
+  runner passes no worker cap to a test runner, because no runner reads an
+  env var for one.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still
@@ -1161,6 +1170,10 @@ sent (and from the tick's start), each closing the commitment for the same
 stage, item and brief key. Between ticks, at most every 10 minutes, the
 station sends the new done markers to `/api/brain/commitments`, so work
 another brain finished closes without waiting for this machine's next tick.
+A refused upload is logged with its status and retried after exponential
+back-off (one minute, doubling to ten minutes at most); after three
+consecutive refusals the station keeps the markers in its local ledger in
+safe mode until an upload succeeds.
 After a tick posts, the station loads the rules digest's sources that
 changed: the Rules section of `docs/MUSE.md`, keyed by the commit that last
 changed it, and each goal home's rules, keyed by its newest rules comment

@@ -39,6 +39,12 @@ Guards, in the order they apply:
   LOOM_LIVE_EVIDENCE_REPOS;
 - a SQL statement is one SELECT or SHOW (live_proof.sql_refusal), checked
   when the step is parsed and again here, just before it runs;
+- a repo with no manifest of its own may be lent another opted-in repo's LOG
+  command, never its sql, when the operator pairs them in
+  LOOM_LIVE_EVIDENCE_LENDS (`borrower=lender`, see `lends` and `logs_only`):
+  the lender's manifest and script are read from the lender's default branch,
+  and the pair counts only while the lender is itself in
+  LOOM_LIVE_EVIDENCE_REPOS; any other repo gets nothing;
 - the child gets a minimal environment (PATH, HOME, LANG, TMPDIR) plus only
   the variables the operator names in LOOM_LIVE_EVIDENCE_PASS_ENV, such as a
   read-only kubeconfig, never the station's GitHub or cloud credentials;
@@ -73,6 +79,7 @@ MAX_TIMEOUT = 300
 MAX_BYTES = 64 * 1024
 MAX_LINES = 200
 MAX_SCRIPT_BYTES = 256 * 1024
+MAX_ERROR_LINE = 512
 COUNT_RE = re.compile(r"^loom-evidence-count:\s*([0-9]+)\s*$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
@@ -114,6 +121,33 @@ def opted_in(raw: str) -> List[str]:
     """LOOM_LIVE_EVIDENCE_REPOS: the owner/name repos, comma or space
     separated, whose adapters the station may run."""
     return [r for r in re.split(r"[\s,]+", raw or "") if re.match(r"^[\w.-]+/[\w.-]+$", r)]
+
+
+def lends(raw: str) -> Dict[str, str]:
+    """LOOM_LIVE_EVIDENCE_LENDS: `borrower=lender` pairs of owner/name repos,
+    comma or space separated; a malformed pair, or one naming a repo as its
+    own lender, is left out."""
+    pairs: Dict[str, str] = {}
+    for item in re.split(r"[\s,]+", raw or ""):
+        borrower, _, lender = item.partition("=")
+        if opted_in(borrower) and opted_in(lender) and borrower != lender:
+            pairs[borrower] = lender
+    return pairs
+
+
+def lender_of(repo: str, opted: Sequence[str], pairs: Mapping[str, str]) -> Optional[str]:
+    """The opted-in repo whose log adapter `repo` may read, or None."""
+    home = pairs.get(repo)
+    return home if home is not None and home in opted else None
+
+
+def logs_only(adapter: Adapter) -> Optional[Adapter]:
+    """The adapter with its sql command and scripts dropped, None when it has
+    no log command: what a borrower is lent."""
+    if adapter.log is None:
+        return None
+    scripts = {k: v for k, v in adapter.scripts.items() if k == adapter.log.argv[0]}
+    return Adapter(adapter.log, adapter.sources, None, scripts)
 
 
 def passed_env(raw: str, env: Mapping[str, str]) -> Dict[str, str]:
@@ -269,6 +303,41 @@ def _read_capped(stream, out: List[bytes], over: threading.Event) -> None:
         total += len(chunk)
 
 
+def _read_first_stderr_line(stream, out: List[bytes]) -> None:
+    """Capture only a bounded first line while draining stderr to avoid a full pipe."""
+    first = bytearray()
+    captured = False
+    try:
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                break
+            if captured:
+                continue
+            line, separator, _ = chunk.partition(b"\n")
+            remaining = MAX_ERROR_LINE - len(first)
+            first.extend(line[:remaining])
+            captured = bool(separator) or len(first) == MAX_ERROR_LINE
+    except (OSError, ValueError):
+        pass
+    out.append(bytes(first))
+
+
+def _exit_two_reason(raw: bytes) -> str:
+    """Map untrusted adapter diagnostics to a short, non-sensitive reason."""
+    line = raw[:MAX_ERROR_LINE].decode("ascii", "ignore").casefold()
+    if "kubeconfig" in line and re.search(
+            r"denied|refus|forbidden|unauthori[sz]ed|permission", line):
+        return "kubeconfig refused"
+    if "archive" in line and re.search(r"empty|no (?:matching )?(?:logs?|entries|records)", line):
+        return "archive empty"
+    if re.search(r"not found|no such file|missing (?:reader|command|executable)", line):
+        return "reader missing"
+    if not line.strip():
+        return "no stderr reason"
+    return "reader returned an unclassified error"
+
+
 def _kill(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -342,7 +411,7 @@ class Runner:
     def _spawn(self, argv: Sequence[str], timeout: int, workdir: str) -> live_proof.Answer:
         try:
             process = self.popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, env=dict(self.env), cwd=workdir,
+                                 stderr=subprocess.PIPE, env=dict(self.env), cwd=workdir,
                                  start_new_session=True)
         except OSError as err:
             return live_proof.Answer(None, error="the adapter could not start (%s)"
@@ -352,13 +421,19 @@ class Runner:
         finally:
             if process.stdout is not None:
                 process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
 
     def _answer(self, process: subprocess.Popen, timeout: int) -> live_proof.Answer:
         chunks: List[bytes] = []
+        stderr_lines: List[bytes] = []
         over = threading.Event()
         reader = threading.Thread(target=_read_capped, args=(process.stdout, chunks, over),
                                   daemon=True)
+        stderr_reader = threading.Thread(target=_read_first_stderr_line,
+                                         args=(process.stderr, stderr_lines), daemon=True)
         reader.start()
+        stderr_reader.start()
         reader.join(timeout)
         if reader.is_alive() or over.is_set():
             _kill(process)
@@ -374,9 +449,15 @@ class Runner:
         except subprocess.TimeoutExpired:
             _kill(process)
             process.wait()
+            stderr_reader.join(5)
             return live_proof.Answer(None, error="the adapter timed out after %d seconds"
                                      % timeout)
+        stderr_reader.join(5)
         if code not in (0, 1):
+            if code == 2:
+                raw = stderr_lines[0] if stderr_lines else b""
+                return live_proof.Answer(None, error="the adapter exited 2 (%s)"
+                                         % _exit_two_reason(raw))
             return live_proof.Answer(None, error="the adapter exited %d" % code)
         lines: List[str] = []
         hours: Optional[float] = None

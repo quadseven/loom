@@ -73,6 +73,7 @@ class FakeGitHub:
         # Pull request number to what its merge raises, and whether the merge
         # had already happened when it did (an error while settling).
         self.merge_refused = {}
+        self.compare_files = {}
         self.head_date = "2020-01-01T00:00:00Z"
         self.attempts = {}
         self.update_status = 202
@@ -187,6 +188,9 @@ class FakeGitHub:
         m = re.search(r"/compare/main\.\.\.sha(\d+)$", path)
         if m:
             return Response(200, {"behind_by": self.behind.get(int(m.group(1)), 0)})
+        m = re.search(r"/compare/sha(\d+)\.\.\.main$", path)
+        if m:
+            return Response(200, {"files": self.compare_files.get(int(m.group(1)), [])})
         if path == "/repos/%s" % REPO:
             return Response(200, {"private": self.private})
         m = re.search(r"/contents/(.+?)\?ref=", path)
@@ -305,7 +309,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None, now=NOW):
+           no_lane_since=None, review_brief=None, lint_run=None, now=NOW):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -343,7 +347,8 @@ class Base(unittest.TestCase):
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
-                            no_lane_since=no_lane_since, review_brief=review_brief)
+                            no_lane_since=no_lane_since, review_brief=review_brief,
+                            lint_run=lint_run or merge_tier.run_ruff)
         f.run()
         return f
 
@@ -1286,9 +1291,74 @@ class PullRequests(Base):
         self.gh.rules = self.NOT_STRICT
         f = self.go()
         full = {"base": {"ref": "main"}}
-        self.assertTrue(f._may_land_behind(REPO, dict(full, mergeable=True)))
-        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=False)))
-        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=None)))
+        with mock.patch.object(factory.hunk_overlap, "pr_overlaps_base", return_value=False):
+            judged = dict(full, number=50, head={"sha": "sha50"})
+            self.assertTrue(f._may_land_behind(REPO, dict(judged, mergeable=True)))
+            self.assertFalse(f._may_land_behind(REPO, dict(judged, mergeable=False)))
+            self.assertFalse(f._may_land_behind(REPO, dict(judged, mergeable=None)))
+
+    def test_a_behind_pull_request_with_no_head_to_compare_is_updated_first(self):
+        # loom#2622: an overlap the read cannot judge is updated first, and a
+        # read with no number or head sha cannot be judged.
+        self.gh.rules = self.NOT_STRICT
+        f = self.go()
+        full = {"base": {"ref": "main"}, "mergeable": True}
+        self.assertFalse(f._may_land_behind(REPO, full))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, number=50)))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, head={"sha": "sha50"})))
+
+    def land_behind_overlap(self, patch, compare_files):
+        """A behind pull request on a non-strict base whose own hunk in
+        bus/a.py is `patch`, against the base files `compare_files`."""
+        self.gh.patches["bus/a.py"] = patch
+        self.gh.compare_files[50] = compare_files
+        with mock.patch("bus.factory._say") as say:
+            updates = self.land_behind(self.NOT_STRICT)
+        said = " ".join(str(c.args[0]) for c in say.call_args_list if c.args)
+        return updates, said
+
+    def test_an_overlapping_behind_pull_request_is_updated_and_locked_not_merged(self):
+        # loom#2622: the missed base commits changed lines inside the pull
+        # request's own hunk, so CI never ran on the combination.
+        updates, said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py", "patch": "@@ -11,2 +11,2 @@\n-old\n+new"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.lock_holder, 50)
+        self.assertIn("overlaps its base", said)
+
+    def test_a_disjoint_hunk_in_the_same_file_merges_as_it_stands(self):
+        # loom#2622: a distant hunk of the same file is not an overlap.
+        updates, said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py", "patch": "@@ -40,3 +40,3 @@\n-old\n+new"}])
+        self.assertEqual(updates, [])
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertNotIn("overlaps its base", said)
+
+    def test_a_missing_patch_on_a_shared_path_is_updated_not_merged(self):
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/a.py"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_renamed_shared_path_is_updated_not_merged(self):
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new",
+            [{"filename": "bus/b.py", "status": "renamed",
+              "previous_filename": "bus/a.py", "patch": "@@ -1 +1 @@\n-x\n+y"}])
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
+
+    def test_a_compare_at_the_file_cap_is_updated_not_merged(self):
+        big = [{"filename": "bus/f%d.py" % n, "patch": "@@ -1 +1 @@\n-x\n+y"}
+               for n in range(300)]
+        updates, _said = self.land_behind_overlap(
+            "@@ -10,3 +10,3 @@\n ctx\n-old\n+new", big)
+        self.assertEqual(updates, ["/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual(self.merged, [])
 
     def test_a_ready_pull_request_behind_its_base_is_brought_up_to_date_not_merged(self):
         self.gh.ticket(5, "pr")
@@ -4890,6 +4960,30 @@ class RemoteQueued(Base):
         # A no-lane wait, so the station keeps its no_lane_since across passes.
         self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
 
+    def test_a_headerless_ticket_gets_claim_headers_before_remote_lane_reservation(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.gh.ticket(7, "queued", body=body)
+        self.gh.issues[7]["labels"] = [
+            {"name": "loom:ticket"}, {"name": "loom:queued"}]
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+        worker.assign_queued()
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
+    def test_an_existing_remote_reservation_repairs_missing_claim_headers(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.queued_for_muse()
+        self.gh.issues[7]["body"] = body
+        self.assign(0, ["muse"])
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
     def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
         self.queued_for_muse()
         worker = self.assign(7 * 3600, ["muse", "spark"])
@@ -5421,6 +5515,95 @@ class DegradedReviewAgain(Base):
                       "\n".join(str(call.args[0]) for call in said.call_args_list))
         self.go()
         self.assertEqual(sum(len(self.asks(50 + n)) for n in heads), len(heads))
+
+
+class AbandonedReview(Base):
+    """loom#1933 criterion 3: a Sentinel abandoned-review notice on a merged
+    pull request files one follow-up, and the notice is answered once the
+    findings it names re-check clean on the merged branch."""
+
+    S110 = "\U0001f534 high | _security_ | `S110` | trivial\n\ntry, except, pass detected."
+    NOTICE = (factory.ABANDONED_MARKER + "\n\nGrug Haunt notice: this PR was merged with 1 "
+              "high/critical Elder finding(s) from EARLIER in its review that never got a reply.")
+    PATH = "services/_shared/llm_client.py"
+
+    def noticed(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
+                                 "user": {"login": "grug-tribe[bot]", "type": "Bot"},
+                                 "html_url": "https://example.test/pull/51#issuecomment-777"}]
+        self.gh.details[51]["reviewThreads"] = {"nodes": [{
+            "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
+            "root": {"nodes": [{"author": {"__typename": "Bot", "login": "grug-tribe"},
+                                "body": self.S110, "url": "https://example.test/t9"}]},
+            "comments": {"nodes": []}}]}
+        self.gh.contents[self.PATH] = "def client():\n    return 1\n"
+
+    def follow_ups(self):
+        return [i for i in self.gh.filed if i.get("title") == factory.ABANDONED_TITLE % 51]
+
+    def answers(self):
+        return [c for c in self.gh.comments.get(51, [])
+                if factory.ABANDONED_ANSWER_MARKER in str(c.get("body") or "")]
+
+    def test_a_notice_files_one_follow_up_and_is_answered_when_the_recheck_passes(self):
+        self.noticed()
+        calls = []
+
+        def clean(rule, path, text):
+            calls.append((rule, path, text))
+            return False
+        self.go(lint_run=clean)
+        self.assertEqual(calls, [("s110", self.PATH, "def client():\n    return 1\n")])
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertIn("loom:triage", [x["name"] if isinstance(x, dict) else x
+                                      for x in self.follow_ups()[0]["labels"]])
+        self.assertEqual(len(self.answers()), 1)
+        body = self.answers()[0]["body"]
+        self.assertIn("S110", body)
+        self.assertIn(self.PATH, body)
+        self.assertIn("#issuecomment-777", body)
+        self.assertIn("#900", body)
+        # A second pass files nothing and answers nothing again.
+        self.go(lint_run=clean)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 1)
+
+    def test_a_finding_that_still_hits_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.go(lint_run=lambda rule, path, text: True)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(self.answers(), [])
+
+    def test_a_human_named_like_the_bot_or_a_stranger_does_not_count(self):
+        self.noticed()
+        notice = self.gh.comments[51][0]
+        human = dict(notice, user={"login": "grug-tribe[bot]", "type": "User"})
+        plain = dict(notice, user={"login": "grug-tribe", "type": "User"})
+        self.assertTrue(factory.abandoned_notice(notice, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(human, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(plain, "grug-tribe"))
+        later = {"body": "%s %s" % (factory.ABANDONED_ANSWER_MARKER, "#issuecomment-777"),
+                 "created_at": iso(95), "user": {"login": "mallory", "type": "User"}}
+        self.assertFalse(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+        later["user"] = {"login": "Alice-Example", "type": "User"}
+        self.assertTrue(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+
+    def test_a_strangers_answer_marker_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.gh.comments[51].append({
+            "id": 778, "body": factory.ABANDONED_ANSWER_MARKER, "created_at": iso(95),
+            "user": {"login": "mallory", "type": "User"}})
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 2)
+
+    def test_no_notice_no_follow_up(self):
+        self.gh.ticket(5, "merged")
+        self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(self.follow_ups(), [])
 
 
 if __name__ == "__main__":

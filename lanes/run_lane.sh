@@ -51,6 +51,8 @@
 # LOOM_NET_TIMEOUT (seconds per gh/git network call, default 120),
 # LOOM_CHECK_TIMEOUT (seconds per validation step, default 1800; see
 # load_contract for the repo's .loom/validation.conf),
+# LOOM_CHECK_SLOTS (check runs at once across all lanes on the host, default 3),
+# LOOM_CHECK_SLOT_WAIT (seconds a check waits for a slot, default 5400),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
 # from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
@@ -89,7 +91,9 @@ LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check
 # The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
 # ticket repos the lane clones. Override it on a machine without network.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}quadseven/infra-public"
+# LOOM_INFRA_PUBLIC_REPO names it; the default is the public repo that
+# holds the shared scanner, which any clone can read.
+INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}${LOOM_INFRA_PUBLIC_REPO:-quadseven/infra-public}"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
@@ -273,7 +277,7 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -2360,7 +2364,20 @@ base_verdict_write() {  # key, exit
 # updates one incident issue on the factory repo and prints "factory
 # incident <owner>/<repo>#<number>". The record names the repo, the exact
 # failing line or command, and the exit code.
-FACTORY_REPO=quadseven/loom
+# The factory repo is LOOM_FACTORY_REPO, else LOOM_SELF_REPO, else
+# LOOM_STATUS_REPO, else this checkout's origin (bus/home_repo.py has the
+# same order): most lane services set none of the three, and an empty
+# --repo would fail every filing into the log alone.
+FACTORY_REPO="${LOOM_FACTORY_REPO:-${LOOM_SELF_REPO:-${LOOM_STATUS_REPO:-}}}"
+if [ -z "$FACTORY_REPO" ]; then
+  FACTORY_REPO="$(git -C "$LOOM_ROOT" remote get-url origin 2>/dev/null |
+    sed -E 's#/$##; s#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)"
+fi
+case "$FACTORY_REPO" in
+  */*) ;;
+  *) echo "[factory] FACTORY_REPO unset: set LOOM_FACTORY_REPO (no setting and no origin remote names it)" >&2
+     FACTORY_REPO="" ;;
+esac
 INCIDENT_MARKER="<!-- loom:factory-incident v1 -->"
 # The marker on the body of the needs:human ask an expired key files.
 KEY_ASK_MARKER="<!-- loom:key-ask v1 -->"
@@ -2500,6 +2517,93 @@ note_base_check_failure() {  # kind, detail, reason_var_name
   note_factory_incident "$@"
 }
 
+# A host-wide counting semaphore around every check run (setup, base check,
+# final check, affected check, base-test gate). Fifteen lanes each started a
+# full parallel suite at once and drove a 12-core host to load 130 (loom#2751
+# repeated: a failed base check frees its lane, and the next claim starts
+# another suite). Slots are directories $LOOM_HOME/run/check-slots/slot-N,
+# N up to LOOM_CHECK_SLOTS (default 3), made with mkdir (atomic; the macOS
+# host has no flock) and holding the holder's pid. A slot whose pid is gone is
+# stale and any waiter reclaims it. A lane waits LOOM_CHECK_SLOT_WAIT seconds
+# (default 5400) polling every LOOM_CHECK_SLOT_POLL (default 5); waiting is
+# no failure and the lane's keepalive stamp keeps the station reading it as
+# alive. A wait that runs out returns 75, which callers class as transient.
+CHECK_SLOTS="${LOOM_CHECK_SLOTS:-3}"
+CHECK_SLOT_WAIT="${LOOM_CHECK_SLOT_WAIT:-5400}"
+CHECK_SLOT_POLL="${LOOM_CHECK_SLOT_POLL:-5}"
+CHECK_SLOT_DIR="$LOOM_HOME/run/check-slots"
+CHECK_SLOT_HELD=""
+[[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
+[[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
+[[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
+
+# Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
+try_check_slot() {
+  local n slot pid
+  mkdir -p "$CHECK_SLOT_DIR" 2>/dev/null || return 1
+  for n in $(seq 1 "$CHECK_SLOTS"); do
+    slot="$CHECK_SLOT_DIR/slot-$n"
+    if mkdir "$slot" 2>/dev/null; then
+      echo $$ > "$slot/pid"
+      CHECK_SLOT_HELD="$slot"
+      return 0
+    fi
+    pid="$(cat "$slot/pid" 2>/dev/null)"
+    # A slot with no pid yet is being taken this instant; leave it.
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$pid" 2>/dev/null && continue
+    # Stale: move it aside first (atomic), so a slot another waiter has just
+    # re-made is never the directory removed.
+    if mv "$slot" "$slot.stale.$$" 2>/dev/null; then
+      echo "check slot $n was held by pid $pid, which is gone; reclaimed" >> "$LOG"
+      rm -rf "$slot.stale.$$"
+      if mkdir "$slot" 2>/dev/null; then
+        echo $$ > "$slot/pid"
+        CHECK_SLOT_HELD="$slot"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+acquire_check_slot() {
+  local waited=0 next_note=0 start
+  start="$(date +%s)"
+  while ! try_check_slot; do
+    if [ "$waited" -ge "$next_note" ]; then
+      echo "[$(date -u +%FT%TZ)] waiting for a check slot: all $CHECK_SLOTS in use; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+      next_note=$((waited + 300))
+    fi
+    if [ "$waited" -ge "$CHECK_SLOT_WAIT" ]; then
+      echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s; the check did not run (transient)" >> "$LOG"
+      return 1
+    fi
+    sleep "$CHECK_SLOT_POLL"
+    waited=$(( $(date +%s) - start ))
+  done
+  [ "$waited" -eq 0 ] || echo "[$(date -u +%FT%TZ)] got check slot ${CHECK_SLOT_HELD##*-} after ${waited}s" >> "$LOG"
+  return 0
+}
+
+release_check_slot() {
+  [ -z "$CHECK_SLOT_HELD" ] || rm -rf "$CHECK_SLOT_HELD"
+  CHECK_SLOT_HELD=""
+}
+
+# A check that never ran for want of a slot (75) or that the timeout killed
+# (124) says the host is loaded, not that the repo's base is red: the lane
+# parks transient and files no incident.
+check_exit_is_load() { [ "$1" -eq 75 ] || [ "$1" -eq 124 ]; }
+note_load_failure() {  # exit, reason_var_name
+  PARK_CLASS=transient
+  if [ "$1" -eq 75 ]; then
+    printf -v "$2" '%s' "no check slot free within ${CHECK_SLOT_WAIT}s; the check did not run (host load, retry later)"
+  else
+    printf -v "$2" '%s' "check timed out after ${CHECK_TIMEOUT}s (exit 124, host load; retry later)"
+  fi
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2513,6 +2617,13 @@ note_base_check_failure() {  # kind, detail, reason_var_name
 # command's stdin and its text is LOOM_CHANGED_FILES; otherwise stdin is
 # /dev/null. The runner opens the file, so the sandbox never reads it.
 contract_run() {
+  local rc
+  acquire_check_slot || return 75
+  contract_run_sandboxed "$@"; rc=$?
+  release_check_slot
+  return "$rc"
+}
+contract_run_sandboxed() {
   local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
@@ -2751,6 +2862,7 @@ prepare_validation() {
       return 1
     fi
     if [ "$BASELINE_EXIT" -ne 0 ]; then
+      check_exit_is_load "$BASELINE_EXIT" && { note_load_failure "$BASELINE_EXIT" SETUP_REASON; return 1; }
       repair_baseline_allowed && return 0
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
       note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
@@ -2772,6 +2884,7 @@ prepare_validation() {
       SETUP_REASON="setup interrupted by SIGTERM"
       return 1
     fi
+    if check_exit_is_load "$rc"; then note_load_failure "$rc" SETUP_REASON; return 1; fi
     [ "$rc" -eq 0 ] || { SETUP_REASON="setup exited $rc"; return 1; }
   fi
   baseline_rev="$(safe_git rev-parse HEAD)"
@@ -2796,6 +2909,10 @@ prepare_validation() {
   if [ "$BASELINE_EXIT" -eq 143 ]; then
     PARK_CLASS=transient
     SETUP_REASON="base check interrupted by SIGTERM"
+    return 1
+  fi
+  if check_exit_is_load "$BASELINE_EXIT"; then
+    note_load_failure "$BASELINE_EXIT" SETUP_REASON
     return 1
   fi
   # A check that cannot run, or is already red, on the unmodified base is
@@ -2830,6 +2947,10 @@ prepare_validation() {
       SETUP_REASON="base check interrupted by SIGTERM"
       return 1
     fi
+    if check_exit_is_load "$BASELINE_EXIT"; then
+      note_load_failure "$BASELINE_EXIT" SETUP_REASON
+      return 1
+    fi
     [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
   fi
   if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
@@ -2858,6 +2979,10 @@ prepare_validation() {
         return 1
       fi
       BASELINE_EXIT="$DEFAULT_EXIT"
+      if check_exit_is_load "$BASELINE_EXIT"; then
+        note_load_failure "$BASELINE_EXIT" SETUP_REASON
+        return 1
+      fi
     fi
     if [ -z "$changed" ] && [ -z "${DEFAULT_CHANGED:-}" ] && repair_baseline_allowed; then
       exclude_untracked
@@ -2905,6 +3030,7 @@ final_base_tests() {
   case "$rc" in
     0) return 0 ;;
     124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
+    75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free for the base-test gate" ;;
     125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
     *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
   esac
@@ -2930,7 +3056,7 @@ final_validation() {
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
     if [ "$gate_rc" -ne 0 ]; then
-      [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 126 ] ||
+      [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 75 ] || [ "$gate_rc" -eq 126 ] ||
         [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
       drop_check_home
       return 1
@@ -2943,7 +3069,7 @@ final_validation() {
     drop_check_home
     return 1
   fi
-  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ] &&
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ] && [ "$rc" -ne 75 ] &&
      [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
     first_exit="$rc"
     record final "$C_CHECK" "$rc" "$rev" false
@@ -2979,6 +3105,7 @@ final_validation() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
       VALIDATION_REASON="validation interrupted by SIGTERM"
@@ -3063,6 +3190,7 @@ final_affected() {
     0) [ -z "$changed" ] && ok=true ||
          VALIDATION_REASON="validation failed: the affected check changed tracked files ($changed)" ;;
     124) VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
+    75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
       VALIDATION_REASON="validation interrupted by SIGTERM"

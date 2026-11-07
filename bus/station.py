@@ -60,6 +60,8 @@ from . import brief_check
 from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
+from . import merge_verdict
+from . import history
 from . import friction_intake
 from . import review_debt
 from . import evidence
@@ -94,6 +96,7 @@ from . import weakened
 from . import labels
 from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
+from . import home_repo
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
                      _OPENER, _next_link, read_ssm, rest_login, unreadable)
@@ -532,9 +535,14 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
+# Whether this process has said the send-back comparison is off (unset target).
+_SEND_BACK_UNSET_SAID = False
 # Where the runner files its validation incidents (lanes/run_lane.sh
-# FACTORY_REPO), and the marker and ticket line their bodies carry.
-FACTORY_REPO = "quadseven/loom"
+# FACTORY_REPO, from LOOM_FACTORY_REPO or the deployment's own repo
+# settings, never a literal: loom#2584), and the marker and ticket line
+# their bodies carry.
+FACTORY_REPO = (os.environ.get("LOOM_FACTORY_REPO", "").strip()
+                or home_repo.home_repo())
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 # The note that says the station unticked a decision box a lane ticked.
 DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
@@ -558,8 +566,6 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
-RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
-                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
 # claude is never chosen: it spends the operator's own subscription.
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
@@ -614,6 +620,25 @@ UPLOAD_PER_PASS = 10
 # most this often (post_brain_memory), so a commitment another brain
 # finished closes without waiting for this machine's next tick.
 CLOSE_EVERY = 600
+# A refused done-marker upload retries on exponential back-off (_closings_delay):
+# it starts at CLOSE_BASE_DELAY seconds (one minute), doubles each consecutive
+# UploadRefused, and is capped at CLOSE_MAX_DELAY (the configured max delay).
+CLOSE_BASE_DELAY = 60
+CLOSE_MAX_DELAY = 600
+# After this many consecutive UploadRefused errors the station enters safe mode:
+# it keeps the markers in the local ledger cache until an upload succeeds.
+CLOSE_SAFE_AFTER = 3
+
+
+def _closings_delay(fails: int) -> int:
+    """The back-off before the next done-marker retry after `fails` consecutive
+    UploadRefused errors: CLOSE_BASE_DELAY doubled each time, capped at
+    CLOSE_MAX_DELAY."""
+    tries = fails if fails >= 1 else 1
+    delay = CLOSE_BASE_DELAY * (2 ** (tries - 1))
+    return delay if delay < CLOSE_MAX_DELAY else CLOSE_MAX_DELAY
+
+
 # The rules digest's source for docs/MUSE.md's Rules section.
 MUSE_RULES = "docs/MUSE.md"
 
@@ -689,6 +714,8 @@ LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 VERIFY_REFUSAL_CAP = 3
 # Per ticket, the reasons its proofs were refused.
 VERIFY_REFUSED_FILE = "verify-refused.json"
+VERIFY_MISSING_FILE = "verify-missing.json"
+VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 # A shipped ticket still unverified this long after its ship takes a lane
 # ahead of build work (loom#964): verify used to run only on a lane with
 # nothing else to do, so a busy factory never verified. At most one lane is
@@ -815,27 +842,25 @@ NOTE_MAX = 1500
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                attempts: Dict[str, Any], now: float,
                refused: Optional[Dict[str, Any]] = None,
-               adapter_tickets: Sequence[str] = ()
+               adapter_tickets: Sequence[str] = (),
+               missing: Optional[Dict[str, Any]] = None,
+               check_live: bool = True
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
     (`refused`: ticket -> reasons) is left to the brain."""
     due = []
     for repo, issue in issues:
-        labels = _label_names(issue)
-        needles = live_needles(issue.get("body"))
         key = "%s#%s" % (repo, issue.get("number"))
-        if needles is not None and not needles and key not in adapter_tickets:
-            continue
-        if (issue.get("state") != "open" or "loom:ticket" not in labels
-                or "loom:shipped" not in labels or "loom:verified" in labels
-                or issue.get("has_proof")):
+        if not _verify_candidate(issue, key in adapter_tickets or not check_live):
             continue
         last = attempts.get(key)
         if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
             continue
         reasons = (refused or {}).get(key)
         if isinstance(reasons, list) and len(reasons) >= VERIFY_REFUSAL_CAP:
+            continue
+        if _missing_capped((missing or {}).get(key)):
             continue
         due.append((repo, issue))
     # A ticket the health pass has proved absent for 24 hours goes first: it
@@ -844,6 +869,32 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         not item[1].get("health_proof"),
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def _verify_body_known(issue: Dict[str, Any]) -> bool:
+    return "body" in issue and (issue["body"] is None or isinstance(issue["body"], str))
+
+
+def _verify_active(issue: Dict[str, Any]) -> bool:
+    names = _label_names(issue)
+    return (issue.get("state") == "open" and "loom:shipped" in names
+            and "loom:verified" not in names)
+
+
+def _verify_candidate(issue: Dict[str, Any], adapter: bool = False) -> bool:
+    names = _label_names(issue)
+    if (not _verify_body_known(issue) or issue.get("state") != "open" or "loom:ticket" not in names
+            or "loom:shipped" not in names or "loom:verified" in names
+            or issue.get("has_proof") or not proof.criteria(issue.get("body"))):
+        return False
+    return adapter or live_needles(issue.get("body")) != []
+
+
+def _missing_capped(reasons: Any) -> bool:
+    if isinstance(reasons, dict) and "reasons" in reasons:
+        reasons = reasons["reasons"]
+    return isinstance(reasons, dict) and any(
+        isinstance(count, int) and count >= VERIFY_REFUSAL_CAP for count in reasons.values())
 
 
 def verify_note_text(shipped_at: float, now: float) -> str:
@@ -868,6 +919,27 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     if live == "(no Live criterion on the ticket)":
         return None
     return evidence.needles(live)
+
+
+def _adapter_live_criterion(body: str) -> Optional[str]:
+    """Return the live criterion an adapter verify run can read, if any."""
+    explicit = brain.live_criterion(body, limit=None)
+    if explicit != "(no Live criterion on the ticket)":
+        if criteria_gate.check_of(explicit) is None \
+                and live_proof.step_of(explicit)[0] is None:
+            return explicit
+        return None
+    for checked, criterion in proof.criteria(body):
+        if checked or criteria_gate.kind(criterion) != criteria_gate.LIVE:
+            continue
+        if not re.search(r"`[^`\n]+`", criterion) or not evidence.needles(criterion):
+            continue
+        step, why = live_proof.step_of(criterion)
+        if (criteria_gate.check_of(criterion) is not None or why
+                or (step is not None and not (step.kind == live_proof.LOG and not step.source))):
+            continue
+        return criterion
+    return None
 
 
 def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
@@ -1012,6 +1084,7 @@ class Settings:
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
+                 live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -1114,6 +1187,9 @@ class Settings:
         # read-only kubeconfig) an adapter is handed. Empty is off.
         self.live_evidence_repos = list(live_evidence_repos)
         self.live_evidence_env = dict(live_evidence_env or {})
+        # LOOM_LIVE_EVIDENCE_LENDS: borrower -> lender repo; the borrower
+        # reads the lender's LOG adapter only (live_adapter.lends).
+        self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
@@ -1240,6 +1316,8 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_REPOS", "")),
                    live_evidence_env=live_adapter.passed_env(
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
+                   live_evidence_lends=live_adapter.lends(
+                       env.get("LOOM_LIVE_EVIDENCE_LENDS", "")),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    health_diagnose=_health_diagnose(env),
@@ -1615,14 +1693,7 @@ def _disarm_pass_deadline(path: Optional[str]) -> None:
 
 def _origin_repo() -> str:
     """owner/name of this checkout's origin remote, or "" when unknown."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    try:
-        out = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
-                             capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
-    return m.group(1) if m else ""
+    return home_repo.origin_repo()
 
 
 def _checkout_head() -> str:
@@ -1737,7 +1808,9 @@ def discord_call(method: str, path: str, token: str,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bot " + token,
                  "Content-Type": "application/json",
-                 "User-Agent": "DiscordBot (https://github.com/quadseven/loom, 1)"})
+                 "User-Agent": "DiscordBot (%s, 1)" % (
+                     "https://github.com/" + FACTORY_REPO if FACTORY_REPO
+                     else "https://example.com/loom")})
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status, raw = resp.status, resp.read()
@@ -1991,19 +2064,7 @@ def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]
     pull request, the lanes those retries left, and (from, to) of the latest
     retry when no claim has followed it: a retry whose relabel did not
     happen yet)."""
-    used, left, pending = 0, set(), None
-    for c in comments:
-        body = str(c.get("body") or "").strip() if isinstance(c, dict) else ""
-        m = RETRY_RE.match(body)
-        if m:
-            used += 1
-            left.add(m.group(1))
-            pending = (m.group(1), m.group(2))
-        elif body.startswith("Lane "):
-            used, left, pending = 0, set(), None
-        elif CLAIM_RE.fullmatch(body):
-            pending = None
-    return used, left, pending
+    return history.retry_chain(comments)
 
 
 def scrub(reason: str) -> str:
@@ -2229,6 +2290,8 @@ class Station:
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
         self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        # This pass's briefed tickets _repo_pr_held refused, "owner/repo#n".
+        self._cap_held: set = set()
         self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
@@ -2245,6 +2308,7 @@ class Station:
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_complete: Dict[str, bool] = {}
         # The claimed settle's re-review requests, by "repo#pull request", as
         # saved in claimed.json, and how many it has written this run.
         self._claimed_rereviews: Dict[str, Any] = {}
@@ -3266,6 +3330,7 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
@@ -3522,9 +3587,13 @@ class Station:
 
     def _gate_held(self) -> List[str]:
         """The tickets the unproven-work gate refused this pass, "owner/repo#n":
-        the factory neither counts them as lane load nor moves them."""
-        return ["%s#%d" % (hold["repo"], int(number))
-                for hold in self._gate_holds.values() for number in hold["tickets"]]
+        the factory neither counts them as lane load nor moves them. The
+        tickets of a repo held at its open pull request cap are here too: the
+        station will not claim them, and counted, each kept its lane busy for
+        every other repo's queued tickets (2026-11-06, six idle lanes)."""
+        return (["%s#%d" % (hold["repo"], int(number))
+                 for hold in self._gate_holds.values() for number in hold["tickets"]]
+                + sorted(self._cap_held))
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
                          counts: Dict[Tuple[str, int], int]) -> None:
@@ -3666,39 +3735,115 @@ class Station:
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
+        shipped = [(repo, issue) for repo, issue in shipped
+                   if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
                            if self._adapter_can_verify(repo, issue)}
-        unsearchable = sum(1 for repo, issue in shipped
-                           if "loom:shipped" in _label_names(issue)
-                           and live_needles(issue.get("body")) == []
-                           and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
-        if unsearchable:
-            _say("skipped %d shipped tickets whose Live criterion names no exact string" %
-                 unsearchable)
+        self._note_unsearchable(shipped, adapter_tickets)
         refused = self._verify_refused_ledger()
+        missing = self._verify_missing_ledger()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
-        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
+                                      missing, check_live=False):
+            issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
+            if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
+                continue
             if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
                     and self._unmeetable_live(repo, issue, reads)):
                 continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
-            issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused, adapter_tickets), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing), held
+
+    @staticmethod
+    def _note_unsearchable(shipped: Sequence[Tuple[str, Dict[str, Any]]],
+                           adapter_tickets: set) -> None:
+        count = sum(1 for repo, issue in shipped
+                    if "loom:shipped" in _label_names(issue)
+                    and live_needles(issue.get("body")) == []
+                    and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
+        if count:
+            _say("skipped %d shipped tickets whose Live criterion names no exact string" % count)
+
+    def _verify_criteria(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A shipped ticket without boxes belongs to rewrite, not a lane."""
+        if not _verify_body_known(issue):
+            return False
+        names = _label_names(issue)
+        if (issue.get("state") != "open" or "loom:ticket" not in names
+                or "loom:shipped" not in names or "loom:verified" in names
+                or proof.criteria(issue.get("body"))):
+            return True
+        if self._verify_proof_state(repo, int(issue["number"])) is False:
+            self._return_unverifiable(repo, issue, "triage", "no acceptance criteria checkboxes")
+        return False
+
+    def _verify_proof_state(self, repo: str, number: int) -> Optional[bool]:
+        """Read proof absence strictly before routing a shipped ticket away."""
+        path = "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)
+        url = path
+        comments = []
+        for page in range(SHIP_PAGES):
+            response = self.gh.rest("GET", url)
+            if not self._verify_comments_known(response.data):
+                return None
+            comments.extend(response.data)
+            url, known = self._verify_next_page(path, response, page)
+            if not known:
+                return None
+            if not url:
+                return audit.proven(status.resort(comments), self.s.authors)
+        return None
+
+    @staticmethod
+    def _verify_comments_known(data: Any) -> bool:
+        if not isinstance(data, list):
+            return False
+        for comment in data:
+            if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                return False
+            if "user" not in comment:
+                return False
+            user = comment["user"]
+            if user is not None and (not isinstance(user, dict)
+                                     or not isinstance(user.get("login"), str)):
+                return False
+        return True
+
+    def _verify_has_merge(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Unknown or truncated GitHub reads never prove that no PR merged."""
+        _, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return False
+        if pulls:
+            return True
+        if self._closed_complete.get(repo, False):
+            self._return_unverifiable(repo, issue, "queued", "no merged pull request")
+        return False
+
+    def _return_unverifiable(self, repo: str, issue: Dict[str, Any], state: str,
+                             reason: str) -> None:
+        names = _label_names(issue)
+        states = {"loom:" + value for value in brain.STATES + tickets.TICKET_STATES}
+        labels = [n for n in names if n not in states and not n.startswith("lane:")
+                  and n != brain.AWAITING_EVIDENCE]
+        labels.append("loom:" + state)
+        number = int(issue["number"])
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        issue["labels"] = [{"name": n} for n in labels]
+        self._forget_verify_attempt(repo, number)
+        _say("%s#%d left verify for %s: %s" % (repo, number, state, reason))
 
     def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether this opted-in repo can send a prose Live box to a verify
         lane for an adapter step proposed by that lane."""
-        body = str(issue.get("body") or "")
-        live = brain.live_criterion(body, limit=None)
-        if (live == "(no Live criterion on the ticket)"
-                or criteria_gate.check_of(live) is not None
-                or live_proof.step_of(live)[0] is not None):
+        live = _adapter_live_criterion(str(issue.get("body") or ""))
+        if live is None:
             return False
         return self._live_adapter(repo) is not None
 
@@ -4063,8 +4208,12 @@ class Station:
         if brain.WAIT_LIVE_EVENT in _label_names(issue):
             self._clear_live_event(repo, number)
         stamp = int(self.now)
+        adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
+                        if self._adapter_can_verify(repo, issue) else None)
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp,
+            adapter_live or brain.live_criterion(issue.get("body")),
+            live_criteria=[adapter_live] if adapter_live else None)
         text += self._verify_github_data(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:
@@ -4340,34 +4489,13 @@ class Station:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
-            klass = failure_class(self._failure_reason(lane, name))
-            if klass in ("transient", "limit"):
-                # The run never looked at the ticket: it costs the ticket no
-                # cooldown, and a lane failing this way twice sits out an hour
-                # (loom#714).
-                self._forget_verify_attempt(repo, number)
-                held = klass == "transient" and self._verify_strike(lane)
-                _say("verify run %s failed [%s]; %s#%d is due again now%s"
-                     % (name, klass, repo, number,
-                        "; lane %s takes no verify run for an hour after %d transient "
-                        "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
-                return True
-            self._verify_clear(lane)
-            # Status, not a fault: the ticket waits its cooldown. The line
-            # names the class and the reason the runner recorded, which it
-            # once left out, so a repeat could not be diagnosed (loom#463);
-            # the log watcher reads it as status (watch.VERIFY_RUN_RE).
-            reason = self._failure_reason(lane, name)
-            _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
-                 "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
-                                     VERIFY_INTERVAL // 3600))
-            return True
+            return self._report_verify_failed(lane, repo, number, name)
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
         issue = self._issue(repo, number)
-        active = (issue.get("state") == "open" and "loom:shipped" in _label_names(issue)
-                  and "loom:verified" not in _label_names(issue))
-        if active and self._adapter_can_verify(repo, issue) and not (
+        if not _verify_active(issue) or self._missing_handoff(repo, number, result, issue, lane + "/" + name):
+            return True
+        if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
             self._adapter_human_ask(repo, number, "no adapter_step was returned",
@@ -4386,6 +4514,30 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
+        klass = failure_class(self._failure_reason(lane, name))
+        if klass in ("transient", "limit"):
+            # The run never looked at the ticket: it costs the ticket no
+            # cooldown, and a lane failing this way twice sits out an hour
+            # (loom#714).
+            self._forget_verify_attempt(repo, number)
+            held = klass == "transient" and self._verify_strike(lane)
+            _say("verify run %s failed [%s]; %s#%d is due again now%s"
+                 % (name, klass, repo, number,
+                    "; lane %s takes no verify run for an hour after %d transient "
+                    "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
+            return True
+        self._verify_clear(lane)
+        # Status, not a fault: the ticket waits its cooldown. The line
+        # names the class and the reason the runner recorded, which it
+        # once left out, so a repeat could not be diagnosed (loom#463);
+        # the log watcher reads it as status (watch.VERIFY_RUN_RE).
+        reason = self._failure_reason(lane, name)
+        _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
+             "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
+                                 VERIFY_INTERVAL // 3600))
         return True
 
     def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
@@ -4602,6 +4754,46 @@ class Station:
         _say("%s#%d: the merged change does not meet its criteria; queued for a build (lane %s)"
              % (repo, number, lane))
 
+    def _verify_missing_ledger(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_MISSING_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _missing_handoff(self, repo: str, number: int, result: Any,
+                         issue: Dict[str, Any], run: str) -> bool:
+        """Count distinct runs, not retries of one partly applied result."""
+        data = self._verify_missing_ledger()
+        key = "%s#%d" % (repo, number)
+        record = data.get(key)
+        record = record if isinstance(record, dict) else {}
+        reasons = record.get("reasons", {})
+        reasons = reasons if isinstance(reasons, dict) else {}
+        runs = record.get("runs", [])
+        runs = runs if isinstance(runs, list) else []
+        if not isinstance(result, dict) or set(result) != {"missing"}:
+            return False
+        reason = self._note_text(result["missing"]).strip()
+        if not _missing_capped(reasons) and run not in runs:
+            count = reasons.get(reason, 0)
+            reasons[reason] = (count if isinstance(count, int) else 0) + 1
+            data[key] = {"reasons": reasons, "runs": runs + [run]}
+            _write_json(os.path.join(self.state, VERIFY_MISSING_FILE), data)
+        if not _missing_capped(reasons):
+            return False
+        self._handoff_missing(repo, number, issue, reason)
+        return True
+
+    def _handoff_missing(self, repo: str, number: int, issue: Dict[str, Any], reason: str) -> None:
+        if "needs-brain" in _label_names(issue):
+            return
+        if not any(text.startswith(VERIFY_MISSING_MARKER)
+                   for text in self._status_texts(repo, number)):
+            notify.post(self.gh, repo, number,
+                        VERIFY_MISSING_MARKER + "\n"
+                        "The station stops handing this ticket out to verify after %d "
+                        "missing answers with the same reason. The brain must prove or "
+                        "rewrite it.\n\n%s" % (VERIFY_REFUSAL_CAP, reason), notify.PROOF_REFUSED)
+        self._add_label(repo, number, "needs-brain")
+
     def _verify_refused_ledger(self) -> Dict[str, Any]:
         # One station pass runs at a time (run() holds station.lock) and applies
         # verify results one after another, and _write_json replaces the file
@@ -4610,9 +4802,10 @@ class Station:
         return data if isinstance(data, dict) else {}
 
     def _forget_refusals(self, repo: str, number: int) -> None:
-        data = self._verify_refused_ledger()
-        if data.pop("%s#%d" % (repo, number), None) is not None:
-            _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+        for filename in (VERIFY_REFUSED_FILE, VERIFY_MISSING_FILE):
+            data = _read_json(os.path.join(self.state, filename), {}, strict=False)
+            if isinstance(data, dict) and data.pop("%s#%d" % (repo, number), None) is not None:
+                _write_json(os.path.join(self.state, filename), data)
 
     def _proof_refused(self, repo: str, number: int, lane: str, names: List[str],
                        why: str) -> None:
@@ -4637,7 +4830,11 @@ class Station:
                     len(reasons), "\n".join("- " + self._note_text(x) for x in reasons)),
                 notify.PROOF_REFUSED)
             self._add_label(repo, number, "needs-brain")
-        _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
+        if "needs-brain" not in _label_names(self._issue(repo, number)):
+            _say("%s#%d verify queue exit was not tracked after %d refused proofs"
+                 % (repo, number, len(reasons)))
+            raise RuntimeError("verify queue exit was not tracked for %s#%d" % (repo, number))
+        _say("%s#%d verify queue exit tracked after %d refused proofs; handed to the brain"
              % (repo, number, len(reasons)))
 
     def _forget_verify_attempt(self, repo: str, number: int) -> None:
@@ -5053,6 +5250,7 @@ class Station:
         if self._last_repo_pr_hold(repo, int(issue["number"])) != reason:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
+        self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
@@ -5292,7 +5490,9 @@ class Station:
         state_names = ("queued", "briefed", "running", "pr", "ready", "answered", "failed",
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
-        kept = self._drop_claim(name for name in labels if name not in states)
+        kept = self._drop_claim(
+            name for name in labels
+            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -5991,19 +6191,62 @@ class Station:
         requests survives."""
         if repo not in self._closed_cache:
             pulls: List[Dict[str, Any]] = []
+            complete = True
             url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                                   "&direction=desc&per_page=100" % repo)
-            for _ in range(SHIP_PAGES):
+            for page in range(SHIP_PAGES):
                 resp = self.gh.rest("GET", url)
-                for pr in resp.data if isinstance(resp.data, list) else []:
-                    if isinstance(pr, dict) and pr.get("merged_at") \
-                            and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
-                        pulls.append(pr)
-                url = _next_link(resp.headers.get("link", ""))
+                merged, known = self._closed_page(resp.data)
+                pulls.extend(merged)
+                url, pagination_known = self._closed_next(repo, resp, page)
+                complete = complete and known and pagination_known
                 if not url:
                     break
+            self._closed_complete[repo] = complete and not url
             self._closed_cache[repo] = pulls
         return self._closed_cache[repo]
+
+    def _closed_page(self, data: Any) -> Tuple[List[Dict[str, Any]], bool]:
+        if not isinstance(data, list):
+            return [], False
+        merged = []
+        complete = True
+        for pr in data:
+            if not isinstance(pr, dict) or "merged_at" not in pr:
+                complete = False
+            elif pr["merged_at"] is not None:
+                if (isinstance(pr["merged_at"], str) and metrics.stamp(pr["merged_at"]) > 0
+                        and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
+                        and isinstance(pr.get("head") or {}, dict)):
+                    merged.append(pr)
+                    complete = complete and self._verify_link_fields(pr)
+                else:
+                    complete = False
+        return merged, complete
+
+    @staticmethod
+    def _closed_next(repo: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        path = "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % repo
+        return Station._verify_next_page(path, resp, page)
+
+    @staticmethod
+    def _verify_next_page(path: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        link = resp.headers.get("link", "")
+        following = _next_link(link)
+        if not following and "next" in link:
+            return None, False
+        if not following and isinstance(resp.data, list) and len(resp.data) >= 100:
+            # Cached full pages can lose their next link; probe one more page.
+            following = path + "&page=%d" % (page + 2)
+        return following, True
+
+    @staticmethod
+    def _verify_link_fields(pr: Dict[str, Any]) -> bool:
+        """Absent linkage fields are unknown, not evidence of no reference."""
+        head = pr.get("head")
+        return ("body" in pr and (pr["body"] is None or isinstance(pr["body"], str))
+                and isinstance(head, dict) and isinstance(head.get("ref"), str)
+                and bool(head["ref"]))
 
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""
@@ -7537,6 +7780,10 @@ class Station:
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
                     ready: Optional[str]) -> None:
+        decision = merge_verdict.decide({"head_sha": sha})
+        if not decision.ready:
+            self._remove_ready_if_present(repo, number, names)
+            return
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
         # Routine, so an event in the status comment rather than a comment of
@@ -8095,6 +8342,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
+        repeated = self._limit_already_reported(repo, number, lane)
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
                       wait="" if fix else "model-limit")
         # No new comment: a limit is not news, and one comment a bounce
@@ -8102,7 +8350,23 @@ class Station:
         # event is an edit, and it ends the claim as [limit], so the runaway
         # detector does not count it as work.
         self._stopped(repo, number, lane, "limit", reason)
-        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+        if not repeated:
+            _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _limit_already_reported(self, repo: str, number: int, lane: str) -> bool:
+        """Whether this lane's latest outcome for the ticket was already a limit.
+
+        Reclaims are routine while a provider limit persists. Keep each claim's
+        [limit] status event for the attempt ledger, but log the condition only
+        once until this lane later has a different outcome.
+        """
+        events = self._status_texts(repo, number)
+        prefix = "Lane %s stopped: [limit] " % lane
+        for event in reversed(events):
+            if event.startswith("Claimed for lane "):
+                continue
+            return event.startswith(prefix)
+        return False
 
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
@@ -8577,26 +8841,17 @@ class Station:
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
         found every thread already fixed (a stale review thread) and said
-        so. Its explanation goes on the pull request, the review bot is asked
+        so. Its explanation stays in the local lane log, the review bot is asked
         to review the head again (it resolves what it no longer raises), and
         the ticket returns to loom:pr. If the review still stands, the factory
         sends it back a rung up the model ladder (bus/factory.py), so this
         never loops on one lane."""
-        said = self._lane_said(lane, name)
-        body = "Lane %s made no change for this fix." % lane
-        if said:
-            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
-                lane, "\n".join("> " + line for line in said.splitlines()))
-        try:
-            _text.check(body)
-        except ValueError:
-            body = ("Lane %s made no change for this fix; its explanation did not "
-                    "pass the text checks and is in the lane log." % lane)
-        self._comment(repo, pr, body, notify.NOTE)
+        # Routine lane prose remains in the existing local run log. Only
+        # the review command reaches the PR; findings still use their threads.
         self._comment(repo, pr, factory.review_again(), notify.REVIEW_REQUEST)
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
-                      "on the pull request; the review bot was asked to review it again."
+                      "in its local run log; the review bot was asked to review it again."
                       % (lane, pr), notify.NOTE)
         _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
 
@@ -10685,13 +10940,19 @@ class Station:
         """The repo's live-evidence adapter, read once a pass from its default
         branch, for a repo in LOOM_LIVE_EVIDENCE_REPOS; None otherwise or when
         its manifest does not parse (said once a pass)."""
-        if repo not in self.s.live_evidence_repos:
+        home = (repo if repo in self.s.live_evidence_repos
+                else live_adapter.lender_of(repo, self.s.live_evidence_repos,
+                                            self.s.live_evidence_lends))
+        if home is None:
             return None
         cache = self.__dict__.setdefault("_live_adapters", {})
         if repo not in cache:
             def read(path: str) -> Optional[str]:
-                return self._contents_text(repo, path)
+                return self._contents_text(home, path)
             adapter, why = live_adapter.parse(read(live_adapter.MANIFEST), read)
+            if adapter is not None and home != repo:
+                adapter = live_adapter.logs_only(adapter)
+                why = "" if adapter is not None else "%s declares no log command to lend" % home
             if adapter is None:
                 _say("no live-evidence adapter for %s: %s" % (repo, why))
             cache[repo] = None if adapter is None else live_adapter.Runner(
@@ -12866,8 +13127,11 @@ class Station:
         the rules digest's sources that changed. A failed post is tried on
         the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
         that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
-        done markers written since the last send. Uses the transcript upload
-        settings and token."""
+        done markers written since the last send. A refused marker upload
+        retries on exponential back-off (_closings_delay), and after
+        CLOSE_SAFE_AFTER consecutive refusals it caches locally in safe mode
+        until an upload succeeds. Uses the transcript upload settings and
+        token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
             return
         path = os.path.join(self.state, "brain_memory.json")
@@ -12876,9 +13140,13 @@ class Station:
             raise StateError("state file %s does not hold an object" % path)
         last = self._finished_brain_tick()
         tries = self._tick_tries(ledger, last)
-        closed_at = ledger.get("closed_at")
-        close_due = self._num(ledger.get("since")) and not (
-            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        next_at = ledger.get("closings_next_at")
+        if self._num(next_at):
+            close_due = self._num(ledger.get("since")) and self.now >= next_at
+        else:
+            closed_at = ledger.get("closed_at")
+            close_due = self._num(ledger.get("since")) and not (
+                self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
         if tries is None and not close_due:
             return
         token = self._transcript_token()
@@ -12922,6 +13190,10 @@ class Station:
                         token, body)
             result: Any = "sent"
             ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+            ledger["closings_fails"] = 0
+            ledger.pop("closings_next_at", None)
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
         except UploadRefused as err:
             _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
             result = "refused"
@@ -12937,22 +13209,48 @@ class Station:
     def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
                              found: List[Dict[str, Any]]) -> None:
         """Send the done markers written since the last send, so the
-        commitments they finish close; a failed send is tried CLOSE_EVERY
-        seconds later."""
+        commitments they finish close. A refused upload is logged with its
+        status and retried after exponential back-off (_closings_delay);
+        after CLOSE_SAFE_AFTER consecutive refusals the markers stay in the
+        local ledger cache in safe mode until an upload succeeds. Any other
+        failure is retried CLOSE_EVERY seconds later."""
         ledger["closed_at"] = self.now
         closings = brain_memory.closings(found, ledger["since"])
         if not closings:
+            ledger.pop("closings_next_at", None)
+            ledger["closings_fails"] = 0
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
             return
         try:
             self.upload(brain_memory.dashboard_url(self.s.transcript_url,
                                                    brain_memory.COMMITMENTS_PATH),
                         token, {"commitments": [c for _, c in closings]})
+        except UploadRefused as err:
+            raw = ledger.get("closings_fails")
+            fails = int(raw) + 1 if self._num(raw) else 1
+            delay = _closings_delay(fails)
+            ledger["closings_fails"] = fails
+            ledger["closings_next_at"] = self.now + delay
+            ledger["closings_cache"] = [c for _, c in closings]
+            if fails >= CLOSE_SAFE_AFTER:
+                ledger["closings_safe"] = True
+            _say("could not send the brain's done markers (UploadRefused status %d); "
+                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
+                                           "; safe mode on, caching locally"
+                                           if ledger.get("closings_safe") else ""))
+            return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
+            ledger["closings_next_at"] = self.now + CLOSE_EVERY
             _say("could not send the brain's done markers (%s); next in %d minutes"
                  % (type(err).__name__, CLOSE_EVERY // 60))
             return
         ledger["since"] = closings[-1][0] + 1
+        ledger["closings_fails"] = 0
+        ledger.pop("closings_next_at", None)
+        ledger["closings_safe"] = False
+        ledger.pop("closings_cache", None)
 
     def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
                           homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
@@ -13296,6 +13594,7 @@ class Station:
         return shown + (" and %d more" % more if more > 0 else "")
 
     # -- stale ask detection -----------------------------------------------
+    STALE_ASK_THROTTLE = 86400
     STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
     ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
     NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
@@ -13367,9 +13666,11 @@ class Station:
         return self._is_ask_text(str(issue.get("body") or ""))
 
     def _target_labels_after_withdrawal(self, labels: List[str], reason: str) -> List[str]:
-        remaining = [name for name in labels if not self.NEEDS_LABEL_PATTERN.match(name)]
-        if not any(k in remaining for k in ("awaiting-live-check", "loom:queued")):
-            target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        remaining = [name for name in labels
+                     if not self.NEEDS_LABEL_PATTERN.match(name)
+                     and name not in label_pass.STATE_LABELS]
+        target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        if target not in remaining:
             remaining.append(target)
         return remaining
 
@@ -13431,6 +13732,21 @@ class Station:
                 return self._withdraw_stale_ask(repo, issue, "issue %s exists" % dep_num)
         return False
 
+    def _has_brain_human_marker(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a trusted text on the issue carries the brain's own
+        human-ask marker: only then is a needs:human ask the brain's own
+        stale ask. Anyone can comment on a public repo, and docs/BRAIN.md
+        reads another login's comment as data, never a marker, so only
+        trusted logins' comments count, and the issue body only when a
+        trusted login opened the issue."""
+        number = int(issue.get("number") or 0)
+        comments = brain.trusted_comments(self._get_issue_comments(repo, number),
+                                          self.s.authors)
+        texts = [str(c.get("body") or "") for c in comments]
+        if brain.comment_login(issue).lower() in {a.lower() for a in self.s.authors if a}:
+            texts.append(str(issue.get("body") or ""))
+        return any(text.startswith(HUMAN_MARKER) for text in texts)
+
     def _process_stale_ask_issue(self, issue: Dict[str, Any],
                                  deployed_commits: Set[str],
                                  deployed_issues: Set[Tuple[str, int]]) -> bool:
@@ -13441,6 +13757,9 @@ class Station:
             return False
 
         repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        if any(lbl.lower() == NEEDS_HUMAN for lbl in labels) \
+                and not self._has_brain_human_marker(repo, issue):
+            return False
         if not self._has_ask_comment(issue):
             return self._withdraw_stale_ask(repo, issue, "no ask comment")
 
@@ -15337,10 +15656,21 @@ class Station:
 
     def _check_stale_asks(self, last_check: Optional[float] = None, force: bool = False) -> int:
         """Check and withdraw stale needs:login asks after each deploy event and daily.
-        Returns the number of asks withdrawn as stale."""
+        Returns the number of asks withdrawn as stale. The 24-hour throttle
+        reads the persisted last-run time, so it holds at the forced call
+        sites (watch_deploys, roll_source_pins) too: force no longer
+        bypasses it."""
         try:
+            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+            saved = _read_json(stale_asks_path, {}, strict=False)
+            if not isinstance(saved, dict):
+                saved = {}
             check_time = float(last_check) if isinstance(last_check, (int, float)) else 0.0
-            if not force and check_time > 0 and self.now - check_time < 86400:
+            if not force and check_time > 0 and self.now - check_time < self.STALE_ASK_THROTTLE:
+                return 0
+            saved_at = saved.get("at")
+            if isinstance(saved_at, (int, float)) and not isinstance(saved_at, bool) \
+                    and 0 <= self.now - float(saved_at) < self.STALE_ASK_THROTTLE:
                 return 0
             deployed_commits, deployed_issues = self._get_deployed_items()
             issues = self._open_needs_issues()
@@ -15348,10 +15678,6 @@ class Station:
             self._stale_asks_withdrawn += withdrawn
             if withdrawn:
                 _say("stale ask detection: withdrew %d asks" % withdrawn)
-            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
-            saved = _read_json(stale_asks_path, {}, strict=False)
-            if not isinstance(saved, dict):
-                saved = {}
             saved["at"] = self.now
             saved["withdrawn_today"] = saved.get("withdrawn_today", 0) + withdrawn
             _write_json(stale_asks_path, saved)
@@ -15397,6 +15723,18 @@ class Station:
             synced.append(repo)
             _write_json(path, {"digest": digest, "repos": synced})
 
+    def _feed_lanes(self) -> None:
+        """Run assign_queued unless the pass is deferred; a GitHub or disk
+        failure is logged and the pass goes on."""
+        if self._deferred():
+            return
+        try:
+            self._timed(self.assign_queued)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("assign_queued failed: %s" % err)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -15418,6 +15756,11 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # Briefing a queued ticket onto a free lane comes before the heavy
+            # reads: reconcile_pull_requests and claim_new spend the pass's
+            # request target, and on 2026-11-07 assign_queued carried over
+            # behind them pass after pass, leaving free lanes idle.
+            self._feed_lanes()
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
@@ -15441,13 +15784,8 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
-            if not self._deferred():
-                try:
-                    self._timed(self.assign_queued)
-                except RateLimited:
-                    raise
-                except (GitHubError, OSError) as err:
-                    _say("assign_queued failed: %s" % err)
+            # Again after the claims, for a ticket claimed in this pass.
+            self._feed_lanes()
             try:
                 self.record_scans()
             except OSError as err:
@@ -15475,7 +15813,16 @@ class Station:
         """Run the one seven-day comparison of bus/send_back.py, at most
         hourly until it is done; it never runs a second time."""
         from . import send_back
-        repo = send_back.REPO
+        repo = send_back.repo()
+        if not repo:
+            # Opt-in: with no LOOM_SEND_BACK_REPO nothing is written, and
+            # the station says so once per process, not once per pass.
+            global _SEND_BACK_UNSET_SAID
+            if not _SEND_BACK_UNSET_SAID:
+                _SEND_BACK_UNSET_SAID = True
+                _say("send-back comparison off: set LOOM_SEND_BACK_REPO to the repo whose "
+                     "issue #%d it writes to" % send_back.TICKET)
+            return
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)

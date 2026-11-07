@@ -286,6 +286,32 @@ class HotSpotsTest(unittest.TestCase):
         self.assertEqual((data["bottleneck"], floor), ("pr", "pr"))
         self.assertNotIn("verified", [item["state"] for item in brain_view.rank_waits(rows, "")["items"]])
 
+    def test_hot_spots_show_wait_cause_tier_model_and_example_ticket(self):
+        repo = "example-owner/sample"
+        payload = {"tickets": {}, "wait_rows": [], "wait_cause_rows": [
+            {"cause": "wait:lane", "tier": "medium", "model": "gpt-6-luna",
+             "median_h": 7.5, "worst_h": 12, "worst_ticket": "%s#%d" % (repo, 42),
+             "known_waits": 3, "n": 4},
+        ]}
+        body = hot_spots.render_hot_spots(hot_spots.build_hot_spots(payload, "", NOW))
+        self.assertIn("Active wait causes / tier / model", body)
+        self.assertIn("wait:lane", body)
+        self.assertIn("7.5h median / 12.0h worst", body)
+        self.assertIn("medium tier / gpt-6-luna model / 4 tickets, 3 timed", body)
+        self.assertIn("%s#%d" % (repo, 42), body)
+        self.assertIn("/t/%s/%d" % (repo, 42), body)
+
+    def test_stale_wait_causes_are_marked_when_refresh_fails(self):
+        payload = {"tickets": {}, "wait_rows": [], "wait_cause_rows": [
+            {"cause": "wait:lane", "tier": "medium", "model": "gpt-6-luna",
+             "median_h": 7.5, "worst_h": 12, "worst_ticket": None,
+             "known_waits": 3, "n": 4},
+        ]}
+        body = hot_spots.render_hot_spots(hot_spots.build_hot_spots(
+            payload, "GitHub timeout", NOW))
+        self.assertIn("Showing last successful wait causes", body)
+        self.assertIn("refresh failed: GitHub timeout", body)
+
     def test_missing_sources_say_why(self):
         body = hot_spots.render_hot_spots(hot_spots.build_hot_spots(
             {"wait_rows": [], "tickets": {}, "hot_spots_error": "comments unreadable"},

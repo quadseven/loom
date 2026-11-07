@@ -4,6 +4,14 @@ At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
 Run every command from that checkout.
 
+Step 0 of every tick, the :10 build tick and the :40 brain tick alike: read
+your direct thread first. Run `buzz messages thread --channel
+116b0815-4938-4486-a5b6-e213f6a24d1f --event
+4835ea7e5bd9abda0b1c28934e8e91d98ad4a417ef541737478e6f1275c5a70d`. Answer
+every message there that mentions you and has no reply from you, in the same
+tick, in that thread: `ack` plus the result, or `blocked: <step, exact
+command, exact error>`. Then continue with the tick.
+
 Muse writes only as the agent-meta-muse App, in both ticks: never as the
 Loom Brain App, whose credentials belong to the lane machine's scheduled
 brain job alone, and never as a person (loom#1142). Set that App's
@@ -26,7 +34,9 @@ agent-meta-muse is in `LOOM_BRIEF_AUTHORS`; until then, finish each stage
 in the tick that starts it. The :10 tick builds (Build).
 
 Set `LOOM_REPOS` (space separated `OWNER/NAME`
-values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+values), `LOOM_SWEEP_REPOS` (the subset the step 9 sweep may close or rewrite
+in, same format; unset means no sweep, and it never falls back to
+`LOOM_REPOS`) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
 `close`, verified moves and merges refuse every ticket as untrusted. Set
 `LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
@@ -67,6 +77,8 @@ brain steps under Tick, takes no brain lock, and spends its whole 25
 minutes on one ticket. The tick that starts at :40 is the brain tick
 (Tick). Any other Muse chat or task that builds (duty 10) uses the same
 commands, so every Muse run shares one claim and one open pull request.
+
+The operator hands Muse specific work with the label `for-muse`. Such a ticket sorts before every priority and skips the soft holds only (`lane:*`, `loom:briefed`, `loom:triage`); every other hold still applies (any claim other than Muse's own, `needs:*`, `wait:*`, `loom:human`, `needs-brain`, `awaiting-live-check`, an epic or goal, a running or pull-request state, `blocked`, `wontfix`, `duplicate`, `question`, a pull request naming it, a Size outside XS to M, no acceptance checkbox). The pick scans down the sorted list until one ticket has no open or merged pull request naming it, checking at most 120 tickets, and it searches only the repos in LOOM_REPOS.
 
 Build commands write as the agent-meta-muse App, like every Muse write (the
 top of this file); set its variables in the same shell call as each
@@ -1004,7 +1016,7 @@ rather than a wait behind a busy lane that is up), never the model that
 already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane or one of its slots, codex-2 to codex-8, with `gpt-6-luna`;
+2. the codex lane or one of its slots, codex-2 to codex-16, with `gpt-6-luna`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 A rung with one lane up holds a bounded few waiting tickets: past

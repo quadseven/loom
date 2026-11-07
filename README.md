@@ -23,7 +23,7 @@ python3 -B -m unittest tests.test_merge_tier
 LOOM_REPOS=YOUR_OWNER/YOUR_REPO python3 -m dashboard
 ```
 
-To run the factory, set the keys from `.env.example` in the environment, including `LOOM_REPOS`, `LOOM_REPO_OWNERS`, `LOOM_STATUS_REPO` and `LOOM_BRIEF_AUTHORS`. Then run `bash lanes/mac/install.sh` and label one issue in each project `loom:goal`.
+To run the factory, set the keys from `.env.example` in the environment, including `LOOM_REPOS`, `LOOM_SWEEP_REPOS`, `LOOM_REPO_OWNERS`, `LOOM_STATUS_REPO` and `LOOM_BRIEF_AUTHORS`. Then run `bash lanes/mac/install.sh` and label one issue in each project `loom:goal`.
 
 ## How to test
 
