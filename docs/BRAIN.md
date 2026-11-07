@@ -1874,9 +1874,9 @@ block as `pull request comments unreadable`. Only the opener counts: no other
 comment text is read as a hold.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
-ticket not at `loom:pr` (`ticket at loom:running, not loom:pr (fix round under
-way)`; at `loom:briefed` or `loom:running` a fix round holds it and the lane's
-report moves it back, loom#2611), a REST
+ticket not at `loom:pr` (`ticket at loom:failed, not loom:pr`; at `loom:briefed`
+or `loom:running` it adds the same fix-round note merge raises: a lane is pushing
+a new head and its report moves the ticket back, loom#2611), a REST
 `mergeable_state` of `dirty` (`conflicts with the default branch`), and a
 risk tier outside `LOOM_AUTO_MERGE_TIERS` (`held for the operator: <tier>`).
 A ticked acceptance criterion that names another repo of the same owner

@@ -3455,8 +3455,9 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def test_a_ticket_not_at_pr_blocks(self):
         self.assertEqual(self.lines(state="running")[1],
-                         "- #9 Work - blocked: ticket at loom:running, not loom:pr "
-                         "(fix round under way)")
+                         "- #9 Work - blocked: ticket at loom:running, not loom:pr"
+                         + brain.MID_ROUND_NOTE % "loom:running")
+        self.assertIn("a fix round has a lane pushing a new head", self.lines(state="running")[1])
 
     def test_a_failed_ticket_blocks_without_the_fix_round_note(self):
         self.assertEqual(self.lines(state="failed")[1],

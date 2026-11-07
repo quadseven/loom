@@ -1320,9 +1320,10 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         reason = _ticket_refusal(issue, "pr")
         if reason.startswith("ticket is not loom:pr"):
             at = [x for x in _labels(issue) if x.startswith("loom:") and x[5:] in STATES]
-            reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
-            if {"loom:briefed", "loom:running"} & set(at):
-                reason += " (fix round under way)"
+            # The same fix-round note merge raises, so status and merge speak
+            # one wording for a ticket a fix round holds (loom#2611).
+            reason = ("ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+                      + _mid_round_note(at, "pr"))
         if reason:
             found.append(reason)
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
