@@ -58,6 +58,7 @@ class FakeGitHub:
         self.events = {}
         self.reviews = {}
         self.pulls = {}
+        self.stacks = []
         self.runs = {}
         self.details = {}
         self.writes = []
@@ -119,6 +120,12 @@ class FakeGitHub:
 
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
+        stack_match = re.search(r"/stacks\?pull_request=(\d+)$", path)
+        if stack_match:
+            number = int(stack_match.group(1))
+            return [stack for stack in self.stacks if any(
+                isinstance(pull, dict) and pull.get("number") == number
+                for pull in stack.get("pull_requests", []))]
         if re.search(r"/issues\?labels=loom:ticket", path):
             return [i for i in self.issues.values() if i.get("state") == "open"]
         if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
@@ -361,6 +368,54 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def stacked_pair(self, lower_merged=False):
+        body = ("Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n"
+                "- [ ] the upper pull waits for the lower\n")
+        self.gh.ticket(5, "pr", body=body)
+        pr_body = ("## Acceptance criteria\n- [x] the upper pull waits for the lower\n\n" +
+                   footer("codex", "gpt-6-luna", 5))
+        self.gh.pull(49, 4, state="closed", merged_at=iso(60) if lower_merged else None)
+        self.gh.pull(50, 5, body=pr_body)
+        self.gh.stacks = [{"number": 7, "pull_requests": [{"number": 49}, {"number": 50}]}]
+
+    def test_factory_waits_for_lower_stack_member_before_landing_upper(self):
+        self.stacked_pair()
+        with mock.patch.object(factory, "_say") as say:
+            self.go()
+        self.assertEqual(self.merged, [])
+        self.assertTrue(any("wait:gate" in call.args[0] and "#50" in call.args[0]
+                            for call in say.call_args_list))
+
+    def test_factory_lands_upper_after_lower_stack_member_is_merged(self):
+        self.stacked_pair(lower_merged=True)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_factory_does_not_land_a_pull_request_held_at_the_overlap_gate(self):
+        self.gh.ticket(5, "pr", body=("Difficulty: medium\n\n## Why\nx\n\n"
+                                       "## Acceptance criteria\n- [ ] works\n"))
+        self.gh.issues[5]["labels"].append({"name": "wait:gate"})
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] works\n\n" +
+                      footer("codex", "gpt-6-luna", 5))
+        with mock.patch.object(factory, "_say") as say:
+            self.go()
+        self.assertEqual(self.merged, [])
+        self.assertTrue(any("wait:gate" in call.args[0] for call in say.call_args_list))
+
+    def test_factory_releases_its_overlap_hold_when_the_older_pull_is_gone(self):
+        self.gh.ticket(5, "pr", body=("Difficulty: medium\n\n## Why\nx\n\n"
+                                       "## Acceptance criteria\n- [ ] works\n"))
+        self.gh.issues[5]["labels"].append({"name": "wait:gate"})
+        self.gh.pull(50, 5, body="## Acceptance criteria\n- [x] works\n\n" +
+                      footer("codex", "gpt-6-luna", 5))
+        with mock.patch.object(status, "find", return_value=(1, [
+                (iso(0), factory.stacking.OVERLAP_WAIT_STATUS + ": older pull #49")
+        ])), mock.patch.object(factory.stacking, "overlapping_open_pull_request",
+                               return_value=None), mock.patch.object(status, "add"):
+            self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+        self.assertNotIn("wait:gate", [label["name"] for label in self.gh.issues[5]["labels"]])
+
     def test_vacuous_builtin_lookup_override_sends_back_named_finding(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)

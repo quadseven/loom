@@ -14,6 +14,12 @@ it the runner uses the lane default (`LOOM_CODEX_MODEL` or
 pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
+A ticket may instead use `Builds on: #N` to name one open pull request in the
+same repository. Before claiming the ticket, the station resolves that pull
+request's head branch and writes it as `Base:` in the lane brief. Do not
+combine `Builds on:` with `Base:`. A missing, closed, or cross-repository pull
+request is refused rather than silently building from the default branch.
+
 `Repairs incident: #7` names an open base-check factory incident in the
 factory repository. `bus.brain brief --repairs-incident 7` writes this
 header, and the station preserves it in the lane brief. The runner verifies
@@ -52,7 +58,9 @@ value other than `answer`, `verify` or `review` parks the brief.
 
 The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
-are not written into the brief.
+are not written into the brief. `Builds on:` stays in the brief so the station
+can link the new pull request to its named lower pull request after the lane
+opens it.
 
 Right after the ticket body, a build brief carries a `## Proof checks`
 section: each acceptance criterion restated as the check that proves it

@@ -299,6 +299,23 @@ class AfterLineTest(unittest.TestCase):
         self.assertEqual((holds, released), ([], []))
         self.assertEqual(seen, ["%s#5" % REPO, "other/name#7"])
 
+
+class BuildsOnHeaderTest(unittest.TestCase):
+    def test_builds_on_names_one_pull_request_and_cannot_be_mixed_with_base(self):
+        headers, _ = parse("Builds on: #17\nDifficulty: hard\n\n## Why\nx\n")
+        self.assertEqual(headers["Builds on"], "#17")
+        for body in ("Builds on: #0\n\nbody", "Builds on: owner/name" + "#17\n\nbody",
+                     "Builds on: #17\nBase: main\n\nbody"):
+            with self.subTest(body=body), self.assertRaisesRegex(ValueError, "Builds on:"):
+                parse(body)
+
+    def test_builds_on_is_preserved_in_the_brief_and_resolved_base_is_added(self):
+        issue = {"number": 12, "title": "Stack this change",
+                 "body": "Builds on: #17\nDifficulty: hard\n\n## Why\nBecause.\n"}
+        brief = render_brief(REPO, issue, "codex", base_ref="loom/11-base")
+        self.assertIn("Builds on: #17\n", brief)
+        self.assertIn("Base: loom/11-base\n", brief)
+
     def test_dependency_state_reads_the_tickets_own_labels(self):
         self.assertEqual(dependency_state(ticket(1, "verified")), "verified")
         self.assertEqual(dependency_state(ticket(1, "briefed")), "briefed")

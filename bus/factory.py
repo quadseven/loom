@@ -193,7 +193,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, stacking, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -2820,6 +2820,33 @@ class Factory:
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
+            return
+        if "wait:gate" in _labels(issue):
+            found = status.find(self.gh, repo, int(issue["number"]), self.trusted)
+            events = found[1] if found is not None else []
+            overlap_wait = any(stacking.OVERLAP_WAIT_STATUS in text for _, text in events)
+            if not overlap_wait:
+                _say("wait:gate %s#%d: the ticket has an independent gate hold" % (repo, number))
+                return
+            try:
+                older = stacking.overlapping_open_pull_request(self.gh, repo, number)
+            except (GitHubError, ValueError) as err:
+                _say("wait:gate %s#%d: overlap remains unknown (%s)" % (repo, number, err))
+                return
+            if older is not None:
+                _say("wait:gate %s#%d: still overlaps older pull request #%d"
+                     % (repo, number, older))
+                return
+            names = [str(label.get("name")) for label in issue.get("labels") or []
+                     if isinstance(label, dict) and label.get("name") != "wait:gate"]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
+                         {"labels": names})
+            status.add(self.gh, repo, int(issue["number"]),
+                       "%s: no overlapping open pull request remains" % stacking.OVERLAP_CLEAR_STATUS,
+                       self.now, self.trusted)
+        if stacking.has_unmerged_lower(self.gh, repo, number):
+            _say("wait:gate %s#%d: an earlier pull request in its stack is still open"
+                 % (repo, number))
             return
         self._reclass(repo, number, sha, full)
         sensitive = class_of(full) == "sensitive"

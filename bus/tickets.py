@@ -161,7 +161,7 @@ def rewritten_source(body: Any) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Builds on|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -181,11 +181,12 @@ def _utc_time(value: str) -> bool:
 # "After: #5, owner/name#7": the ticket builds on those tickets, and is not
 # claimed until each of them is merged.
 _AFTER_ITEM = r"(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+"
+_BUILD_ON_RE = re.compile(r"#[1-9][0-9]*")
 AFTER_RE = re.compile(r"%s(?:[ \t]*,[ \t]*%s)*" % (_AFTER_ITEM, _AFTER_ITEM))
 _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable|Repairs incident):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Builds on|Fix-PR|Deliverable|Repairs incident):")
 SLUG_MAX = 40
 # An issue rewritten in place (brain.brief --refs, loom#1229) keeps its
 # original title and text under this last section, quoted line by line, so
@@ -253,6 +254,8 @@ _HEADER_RULES = {
               lambda v: "Model: %r is not a model id" % v),
     "Base": (lambda v: bool(BASE_RE.fullmatch(v)),
              lambda v: "Base: %r is not a branch name" % v),
+    "Builds on": (lambda v: bool(_BUILD_ON_RE.fullmatch(v)),
+                  lambda v: "Builds on: must name an open pull request like '#7'"),
     "Not before": (lambda v: _utc_time(v),
                    lambda v: "Not before: %r is not a UTC time like 2026-10-13T17:00:00Z" % v),
     "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
@@ -305,6 +308,8 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
         _check_header(key, value)
         headers[key] = value
         i += 1
+    if "Builds on" in headers and "Base" in headers:
+        raise ValueError("Builds on: cannot be combined with Base:")
     rest = lines[i:]
     while rest and not rest[0].strip():
         rest.pop(0)
@@ -762,7 +767,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
                   linked: Sequence[str] = (), demoted_models: str = "",
-                  claim: str = "", defaults: Sequence[str] = ()) -> str:
+                  claim: str = "", defaults: Sequence[str] = (),
+                  base_ref: str = "") -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -783,8 +789,11 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
             out.append("Finding-%s: %s" % (f.id, summary))
     if demoted_models:
         out.append("Demoted-Models: %s" % demoted_models)
-    out += ["%s: %s" % (k, v) for k, v in headers.items()
+    out += ["%s: %s" % (k, base_ref if k == "Base" and base_ref else v)
+            for k, v in headers.items()
             if k not in ("Not before", "After", "Priority")]
+    if base_ref and "Base" not in headers:
+        out.append("Base: %s" % base_ref)
     if "Model" not in headers and headers.get("Difficulty") == "hard":
         # A hard ticket runs the lane's strongest model, not its default.
         from .factory import HARD_MODELS  # factory imports this module

@@ -82,6 +82,7 @@ from . import usage
 from . import verify_data
 from . import text as _text
 from . import tickets
+from . import stacking
 from . import transcripts
 from . import unmeetable
 from . import brief_check
@@ -2668,6 +2669,31 @@ class Station:
             return posted + 1
         return self.now
 
+    def _build_on_base(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Resolve a ticket's Builds on PR to the open same-repo branch it
+        must build from. A missing or closed dependency never falls back to
+        the default branch."""
+        headers, _ = tickets.parse(issue.get("body"))
+        value = headers.get("Builds on")
+        if not value:
+            return ""
+        number = int(value[1:])
+        try:
+            pull = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+        except GitHubError as err:
+            if err.status == 404:
+                raise ValueError("Builds on: pull request #%d is not open" % number) from err
+            raise
+        head = pull.get("head") if isinstance(pull, dict) else None
+        head_repo = head.get("repo") if isinstance(head, dict) else None
+        branch = str(head.get("ref") or "") if isinstance(head, dict) else ""
+        if (not isinstance(pull, dict) or pull.get("state") != "open"
+                or not isinstance(head_repo, dict) or head_repo.get("full_name") != repo
+                or not tickets.BASE_RE.fullmatch(branch)):
+            raise ValueError("Builds on: pull request #%d is not open on a usable branch in %s"
+                             % (number, repo))
+        return branch
+
     def _claim(self, repo: str, lane: str, issue: Dict[str, Any]) -> bool:
         """Steps 2 and 3 for an issue already re-read and trusted. False when
         its fix comment cannot be used (refused, as an untrusted ticket is),
@@ -2694,6 +2720,11 @@ class Station:
             return False
         attempt = earlier + 1
         name = tickets.ticket_name(repo, number, attempt)
+        try:
+            base_ref = self._build_on_base(repo, issue)
+        except ValueError as err:
+            self._refuse(repo, issue, str(err))
+            return False
         has_contract, checks = self._validation_checks(repo)
         text = tickets.render_brief(repo, issue, lane, attempt, fix, checks, has_contract,
                                     self._timedout_branch(comments),
@@ -2704,7 +2735,8 @@ class Station:
                                     demoted_models=self._brief_demoted_models(lane),
                                     claim=self._lane_claim_label(),
                                     defaults=answer.default_notes(comments, self.s.authors,
-                                                                  answer.operators(trusted=self.s.authors)))
+                                                                  answer.operators(trusted=self.s.authors)),
+                                    base_ref=base_ref)
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -7724,9 +7756,41 @@ class Station:
             branch = self._field(text, "Branch")
             prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
                                % (repo, repo.split("/")[0], branch)).data
-            url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
+            builds_on = self._field(text, "Builds on")
+            upper = None
+            if isinstance(prs, list):
+                upper = next((pr for pr in prs if isinstance(pr, dict)
+                              and (not builds_on or (pr.get("state") == "open"
+                                   and (pr.get("head") or {}).get("ref") == branch))), None)
+            url = upper.get("html_url") if isinstance(upper, dict) else None
             if not url:
                 return self._done_without_pr(repo, number, lane, path, name, branch)
+            if builds_on:
+                upper_number = int(upper.get("number") or 0)
+                if upper_number < 1:
+                    _say("cannot stack %s#%d: the new pull request has no usable number"
+                         % (repo, number))
+                    return False
+                try:
+                    stacking.link_pull_requests(self.gh, repo, int(builds_on[1:]), upper_number)
+                except (GitHubError, ValueError) as err:
+                    _say("could not link stacked pull request %s#%d: %s"
+                         % (repo, upper_number, err))
+                    return False
+            else:
+                upper_number = int(upper.get("number") or 0)
+                if upper_number > 0:
+                    try:
+                        older = stacking.overlapping_open_pull_request(
+                            self.gh, repo, upper_number)
+                    except (GitHubError, ValueError) as err:
+                        self._hold_overlapping_pull(
+                            repo, number, lane, upper_number, "overlap scan failed: %s" % err)
+                        return True
+                    if older is not None:
+                        self._hold_overlapping_pull(repo, number, lane, upper_number,
+                                                    "overlaps older pull request #%d" % older)
+                        return True
             self._relabel(repo, number, "loom:pr")
             if self._field(text, "Fix-PR").isdigit():
                 self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
@@ -7754,6 +7818,17 @@ class Station:
             return False
         self._never_left_running(repo, number, lane)
         return True
+
+    def _hold_overlapping_pull(self, repo: str, number: int, lane: str, pull: int,
+                               reason: str) -> None:
+        """Keep an unstacked pull request at the gate until its overlap is resolved."""
+        self._relabel(repo, number, "loom:pr", "gate")
+        status.add(self.gh, repo, number,
+                   "%s: pull request #%d %s; set Builds on: #%d to restack it"
+                   % (stacking.OVERLAP_WAIT_STATUS, pull, reason, pull),
+                   self.now, self.s.authors)
+        _say("wait:gate %s#%d pull request #%d %s (lane %s)"
+             % (repo, number, pull, reason, lane))
 
     def _done_without_pr(self, repo: str, number: int, lane: str, path: str, name: str,
                          branch: str) -> bool:

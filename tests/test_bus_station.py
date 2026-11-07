@@ -75,6 +75,8 @@ class FakeGitHub:
         self.comments = {}
         self.editors = {}
         self.pulls = []
+        self.stacks = []
+        self.stack_posts = []
         self.search_items = []
         # Pull requests read as issues: number -> the live issue object.
         self.pull_issues = {}
@@ -260,6 +262,29 @@ class FakeGitHub:
         if method == "GET" and parts.path == "/search/code":
             return self._code_search(parts.query)
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
+        if rest.startswith("stacks"):
+            if method == "GET":
+                requested = re.search(r"(?:^|&)pull_request=(\d+)", parts.query)
+                stacks = self.stacks
+                if requested:
+                    number = int(requested.group(1))
+                    stacks = [stack for stack in stacks
+                              if any(int(p.get("number", -1)) == number
+                                     for p in stack.get("pull_requests", []))]
+                return reply(200, stacks)
+            if method == "POST" and rest == "stacks":
+                self.stack_posts.append(data)
+                stack = {"number": len(self.stacks) + 1,
+                         "pull_requests": [{"number": n} for n in data["pull_requests"]]}
+                self.stacks.append(stack)
+                return reply(201, stack)
+            add = re.fullmatch(r"stacks/(\d+)/add", rest)
+            if method == "POST" and add:
+                self.stack_posts.append(data)
+                stack = next(stack for stack in self.stacks
+                             if int(stack.get("number", -1)) == int(add.group(1)))
+                stack["pull_requests"].extend({"number": n} for n in data["pull_requests"])
+                return reply(200, stack)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
                                 "description": value["description"]}
@@ -5139,6 +5164,20 @@ class ClaimTest(Base):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
 
+    def test_a_ticket_building_on_an_open_pull_request_briefs_its_head_as_the_base(self):
+        body = BODY_WITH_CRITERIA.replace(
+            "Difficulty: hard", "Builds on: #99\nDifficulty: hard")
+        self.fake.add(12, body=body)
+        self.fake.pulls = [{"number": 99, "state": "open",
+                            "user": {"login": "alice-example", "type": "User"},
+                            "head": {"ref": "loom/11-lower-change",
+                                     "repo": {"full_name": REPO}}}]
+        self.run_pass()
+
+        self.assertEqual(self.listing("codex"), ["example-owner.example-repo-12.md"])
+        with open(self.inbox("codex", "example-owner.example-repo-12.md")) as brief:
+            self.assertIn("Base: loom/11-lower-change\n", brief.read())
+
     def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
         self.heartbeat("opencode-go-3")
         self.heartbeat("claude")
@@ -8302,6 +8341,13 @@ class AnswerTest(Base):
         self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
         self.assertEqual((len(self.fake.replies), self.fake.resolved), (1, []))
 
+    def test_done_without_pull_number_skips_the_overlap_scan(self):
+        self.thread()
+        with mock.patch("bus.station.stacking.overlapping_open_pull_request") as overlap:
+            self.finish({"PRRT_abcd1": "Not valid, this is already handled."})
+        overlap.assert_not_called()
+        self.assertEqual(len(self.fake.replies), 1)
+
     def dead_code(self):
         self.fake.head_files["bus/s.py"] = (
             "def _markings(s):\n    return []\n\n\n"
@@ -8980,6 +9026,83 @@ class OutcomeTest(Base):
         # reviews) and one page of recently closed ones, never all of them.
         self.assertEqual(pulls, ["/repos/%s/pulls?head=example-owner:loom/12-fix-the-thing&state=all" % REPO]
                          + ["/repos/%s/pulls?state=open&per_page=100" % REPO, CLOSED_PULLS % REPO] * 2)
+
+    def test_done_links_a_stacked_pull_request_bottom_to_top(self):
+        self.finished("done")
+        self.fake.issues[12]["body"] = BODY_WITH_CRITERIA.replace(
+            "Difficulty: hard", "Builds on: #99\nDifficulty: hard")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", base_ref="loom/11-base"))
+        self.fake.pulls = [
+            {"number": 100, "state": "open", "html_url": "https://example.com/pull/100",
+             "head": {"ref": "loom/12-fix-the-thing"}},
+            {"number": 99, "state": "open", "head": {"ref": "loom/11-base"}},
+        ]
+
+        self.run_pass()
+
+        self.assertIn(("POST", "/repos/%s/stacks" % REPO), self.fake.calls)
+        self.assertEqual(self.fake.stack_posts, [{"pull_requests": [99, 100]}])
+
+    def test_done_holds_an_overlapping_unstacked_pull_request_at_the_gate(self):
+        self.finished("done")
+        self.fake.pulls = [{"number": 100, "state": "open",
+                            "html_url": "https://example.com/pull/100",
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+        with mock.patch("bus.station.stacking.overlapping_open_pull_request", return_value=99), \
+                mock.patch("bus.station.status.add") as add_status:
+            self.run_pass()
+
+        self.assertIn("wait:gate", self.fake.names(12))
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertIn("pull request #99", add_status.call_args.args[3])
+
+    def test_done_appends_to_the_existing_stack_with_the_named_pull_request_at_its_top(self):
+        self.finished("done")
+        self.fake.issues[12]["body"] = BODY_WITH_CRITERIA.replace(
+            "Difficulty: hard", "Builds on: #99\nDifficulty: hard")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", base_ref="loom/11-base"))
+        self.fake.stacks = [{"number": 7, "pull_requests": [{"number": 98}, {"number": 99}]}]
+        self.fake.pulls = [{"number": 100, "state": "open", "html_url": "https://example.com/pull/100",
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+
+        self.run_pass()
+
+        self.assertIn(("POST", "/repos/%s/stacks/7/add" % REPO), self.fake.calls)
+        self.assertEqual(self.fake.stack_posts, [{"pull_requests": [100]}])
+
+    def test_done_does_not_link_a_pull_request_that_is_already_after_its_base(self):
+        self.finished("done")
+        self.fake.issues[12]["body"] = BODY_WITH_CRITERIA.replace(
+            "Difficulty: hard", "Builds on: #99\nDifficulty: hard")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", base_ref="loom/11-base"))
+        self.fake.stacks = [{"number": 7, "pull_requests": [{"number": 99}, {"number": 100}]}]
+        self.fake.pulls = [{"number": 100, "state": "open", "html_url": "https://example.com/pull/100",
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+
+        self.run_pass()
+
+        self.assertEqual(self.fake.stack_posts, [])
+
+    def test_done_does_not_append_when_both_pull_requests_are_already_linked(self):
+        self.finished("done")
+        self.fake.issues[12]["body"] = BODY_WITH_CRITERIA.replace(
+            "Difficulty: hard", "Builds on: #99\nDifficulty: hard")
+        name = tickets.ticket_name(REPO, 12, 1)
+        self.write(self.inbox("codex", "done", name + ".md"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", base_ref="loom/11-base"))
+        self.fake.stacks = [{"number": 7, "pull_requests": [{"number": 99}, {"number": 100}]}]
+        self.fake.pulls = [{"number": 100, "state": "open", "html_url": "https://example.com/pull/100",
+                            "head": {"ref": "loom/12-fix-the-thing"}}]
+
+        self.run_pass()
+
+        self.assertEqual(self.fake.stack_posts, [])
 
     def test_done_without_a_pull_request_is_retried_not_reported(self):
         self.finished("done")
