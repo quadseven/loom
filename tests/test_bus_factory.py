@@ -4974,6 +4974,44 @@ class RemoteQueued(Base):
         self.assertEqual(headers, {"Difficulty": "medium"})
         self.assertIn("## Why\nPreserve this text.", remainder)
 
+    def test_a_private_headerless_ticket_drops_remote_lane_when_no_local_lane_is_free(self):
+        self.gh.private = True
+        self.gh.ticket(7, "queued", lane="muse", body="## Why\nPreserve this text.\n" + ACCEPTANCE)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+
+        worker.assign_queued()
+
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        names = {label["name"] for label in self.gh.issues[7]["labels"]}
+        self.assertNotIn("lane:muse", names)
+        self.assertIn("loom:queued", names)
+
+    def test_a_private_ticket_with_headers_but_no_difficulty_drops_remote_lane(self):
+        self.gh.private = True
+        self.gh.ticket(7, "queued", lane="muse",
+                       body="Base: main\n\n## Why\nPreserve this text.\n" + ACCEPTANCE)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+
+        worker.assign_queued()
+
+        names = {label["name"] for label in self.gh.issues[7]["labels"]}
+        self.assertNotIn("lane:muse", names)
+        self.assertIn("loom:queued", names)
+
+    def test_a_private_ticket_with_difficulty_keeps_remote_lane_when_no_lane_is_free(self):
+        self.gh.private = True
+        self.gh.ticket(7, "queued", lane="muse",
+                       body="Difficulty: medium\n\n## Why\nPreserve this text.\n" + ACCEPTANCE)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+
+        worker.assign_queued()
+
+        names = {label["name"] for label in self.gh.issues[7]["labels"]}
+        self.assertIn("lane:muse", names)
+
     def test_an_existing_remote_reservation_repairs_missing_claim_headers(self):
         self.gh.private = False
         body = "## Why\nPreserve this text.\n" + ACCEPTANCE
