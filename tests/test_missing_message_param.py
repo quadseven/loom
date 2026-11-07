@@ -93,5 +93,15 @@ class MissingMessageParamRunTest(LaneRunnerTest):
         self.assertEqual(self.failure_line(), "[work] agent exited 1")
 
 
+def load_tests(loader, tests, pattern):
+    # Only this module's own runs: LaneRunnerTest's tests run in theirs.
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromTestCase(MissingMessageParamTest))
+    for name in MissingMessageParamRunTest.__dict__:
+        if name.startswith("test_"):
+            suite.addTest(MissingMessageParamRunTest(name))
+    return suite
+
+
 if __name__ == "__main__":
     unittest.main()
