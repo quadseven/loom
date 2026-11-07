@@ -1829,9 +1829,36 @@ class ShipDeployedTest(Base):
     def ancestor(self, commit, revision):
         return revision == DEPLOYED and commit in self.carried
 
-    def ship(self, transport=None):
+    def ship(self, transport=None, now=DEPLOYED_AT + 600):
         gh = GitHub("token", transport=transport or self.fake)
-        station.Station(gh, self.settings, ancestor=self.ancestor).ship_deployed()
+        station.Station(gh, self.settings, ancestor=self.ancestor, now=now).ship_deployed()
+
+    def test_a_bridge_ship_waits_for_two_hours_after_the_previous_ship(self):
+        self.merged(12, 99)
+        self.merged(13, 100)
+        self.record_deploy()
+        self.ship()
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertIn("loom:merged", self.fake.names(13))
+
+    def test_a_bridge_ship_proceeds_at_the_two_hour_boundary(self):
+        self.merged(12, 99)
+        self.merged(13, 100)
+        self.record_deploy()
+        self.ship()
+        self.ship(now=DEPLOYED_AT + 600 + 2 * 3600)
+        self.assertIn("loom:shipped", self.fake.names(13))
+
+    def test_an_urgent_bridge_ship_bypasses_the_hold_and_logs_why(self):
+        self.merged(12, 99)
+        self.merged(13, 100)
+        self.fake.issues[13]["labels"].append({"name": "loom:urgent"})
+        self.record_deploy()
+        with mock.patch("bus.station._say") as say:
+            self.ship()
+        self.assertIn("loom:shipped", self.fake.names(13))
+        self.assertTrue(any("loom:urgent bypasses the bridge ship hold" in call.args[0]
+                            for call in say.call_args_list))
 
     def test_an_adoption_ticket_ships_through_the_pull_request_its_title_names(self):
         # A "Land or supersede #N" ticket has no Refs line or loom branch on its

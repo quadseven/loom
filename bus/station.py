@@ -417,6 +417,8 @@ JOURNAL_LOOKBACK = 24 * 3600
 # merge first. Their pull requests are looked for in at most SHIP_PAGES pages
 # of the repo's most recently updated closed pull requests.
 DEPLOYED_FILE = "deployed.json"
+BRIDGE_SHIP_FILE = "bridge_ships.json"
+BRIDGE_SHIP_HOLD = 2 * 60 * 60
 SHIP_PER_PASS = 20
 SHIP_PAGES = 5
 # A merged ticket _merged_pulls did not match: at most this many of its
@@ -6413,17 +6415,46 @@ class Station:
                          if self.ancestor(str(pr["merge_commit_sha"]), revision)
                          and not self._all_reverted(groups.get(number) or [pr], hands,
                                                     revision, self.ancestor))
+        last_bridge_ship = self._last_bridge_ship()
         shipped = 0
         for _, number, pr in carried:
             if shipped >= SHIP_PER_PASS:
                 break
             if number in early and not self._early_ships(repo, early[number], pr):
                 continue
+            urgent = self._urgent_ticket(repo, number)
+            if not urgent and last_bridge_ship is not None:
+                elapsed = self.now - last_bridge_ship
+                if elapsed < BRIDGE_SHIP_HOLD:
+                    _say("holding bridge ship %s#%d: previous bridge ship was %d seconds ago; "
+                         "wait until two hours have passed" % (repo, number, max(0, int(elapsed))))
+                    continue
+            if urgent and last_bridge_ship is not None \
+                    and self.now - last_bridge_ship < BRIDGE_SHIP_HOLD:
+                _say("loom:urgent bypasses the bridge ship hold for %s#%d: urgent fix label" %
+                     (repo, number))
             how = "the station deployed revision %s at %s" % (revision[:12], self._utc(at))
             if self._ship_one(repo, number, pr, how, "deployed %s" % revision[:12]):
+                self._record_bridge_ship()
+                last_bridge_ship = self.now
                 shipped += 1
                 if number in early:
                     self._drop_triage(repo, number, early[number])
+
+    def _urgent_ticket(self, repo: str, number: int) -> bool:
+        """Whether the ticket carries the explicit loom:urgent bypass label."""
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        return "loom:urgent" in _label_names(issue)
+
+    def _last_bridge_ship(self) -> Optional[float]:
+        """When this station last moved a ticket through its bridge ship path."""
+        saved = _read_json(os.path.join(self.state, BRIDGE_SHIP_FILE), {}, strict=False)
+        at = saved.get("at") if isinstance(saved, dict) else None
+        return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+    def _record_bridge_ship(self) -> None:
+        """Persist a successful bridge ship so a process restart keeps the hold."""
+        _write_json(os.path.join(self.state, BRIDGE_SHIP_FILE), {"at": self.now})
 
     def _early_tickets(self, repo: str) -> Dict[int, Dict[str, Any]]:
         """The repo's open issues at a state before a pull request
