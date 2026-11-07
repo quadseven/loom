@@ -193,7 +193,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -344,11 +344,11 @@ def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
     return (int(found.group(1)), int(found.group(2))) if found else None
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
-# The codex lane and its seven slots, all on gpt-6-luna (labels.SLOTS). Every
+# The codex lane and its fifteen slots, all on gpt-6-luna (labels.SLOTS). Every
 # tier and rung that names codex names them all: codex-3 to codex-8 were once
 # lanes only, beat available and sat idle while medium and hard tickets
 # waited "no free lane in tier" (tests/test_bus_codex_slots.py).
-CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 9))
+CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 17))
 # The slots that draw on one API credit: an empty credit holds all of them.
 # run_lane.sh reads this set (`python3 -m bus.factory credit-slots`).
 SHARED_CREDIT = ANTHROPIC
@@ -998,16 +998,20 @@ def abandoned_notice(comment: Dict[str, Any], bot: str) -> bool:
     abandoned-review notice: its marker, from the bot's own login. The
     notice is the bot's record that a merged pull request left high or
     critical findings from an earlier review unanswered (loom#1933)."""
-    login = str((comment.get("user") or {}).get("login") or "").lower()
-    return (login in (bot.lower(), bot.lower() + "[bot]")
+    user = comment.get("user") or {}
+    login = str(user.get("login") or "").lower()
+    return (user.get("type") == "Bot" and login == bot.lower() + "[bot]"
             and ABANDONED_MARKER in str(comment.get("body") or ""))
 
 
 def abandoned_answered(comments: Sequence[Dict[str, Any]],
-                       notice: Dict[str, Any]) -> bool:
+                       notice: Dict[str, Any],
+                       authors: Optional[Sequence[str]] = None) -> bool:
     """Whether a comment after the notice answers it: it carries the
     factory's answer marker, or it links the notice (its #issuecomment
-    anchor or its URL)."""
+    anchor or its URL), and a trusted login wrote it (LOOM_BRIEF_AUTHORS,
+    or `authors`): a stranger's comment on a public repo answers nothing."""
+    trusted = {id(c) for c in history.trusted_comments(comments, authors)}
     marks = [ABANDONED_ANSWER_MARKER]
     if notice.get("id"):
         marks.append("#issuecomment-%s" % notice["id"])
@@ -1018,7 +1022,8 @@ def abandoned_answered(comments: Sequence[Dict[str, Any]],
         if comment is notice:
             after = True
             continue
-        if after and any(m in str(comment.get("body") or "") for m in marks):
+        if (after and id(comment) in trusted
+                and any(m in str(comment.get("body") or "") for m in marks)):
             return True
     return False
 
@@ -2197,7 +2202,7 @@ class Factory:
         notices = [c for c in comments if isinstance(c, dict)
                    and abandoned_notice(c, self.review_bot)]
         for notice in notices:
-            if abandoned_answered(comments, notice):
+            if abandoned_answered(comments, notice, sorted(self.trusted)):
                 continue
             findings = self._abandoned_findings(repo, pr_number)
             follow = self._abandoned_follow_up(repo, pr_number, notice, findings)
@@ -3560,7 +3565,8 @@ class Factory:
         lifted and the other gates decide), True (Hold: held, no new ask), or
         None (no answer: the hold asks as before). Each verdict is written to
         the shadow ledger as the operator's."""
-        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators)
+        verdict = answer.pr_verdict(list(comments), number, self.trusted, self.operators,
+                                    head=str((full.get("head") or {}).get("sha") or ""))
         if verdict is None:
             return None
         sha = str((full.get("head") or {}).get("sha") or "")
@@ -3570,7 +3576,8 @@ class Factory:
             _say("%s#%d: the operator %s answered merge; its operator hold is lifted and its "
                  "other gates decide" % (repo, number, verdict.login))
             return False
-        _say("%s#%d stays held: the operator %s answered hold" % (repo, number, verdict.login))
+        _say("%s#%d stays held: the operator %s answered %s" %
+             (repo, number, verdict.login, verdict.choice.lower()))
         return True
 
     def _settle_answers(self, repo: str) -> None:
@@ -3595,6 +3602,21 @@ class Factory:
             elif found is None:
                 _say("%s#%d is labelled %s, but no operator answer backs it; label removed"
                      % (repo, number, answer.ANSWERED_LABEL))
+            elif found.choice.lower() == answer.SEND_BACK.lower():
+                try:
+                    self._operator_send_back(repo, issue, comments)
+                except RateLimited:
+                    raise
+                except ValueError as err:
+                    # A refusal is not transient: retried every pass it would
+                    # wait forever with only a log line, so it is rejected
+                    # on the ticket once and the answer settles.
+                    self._reject_operator_review(repo, issue, comments,
+                                                 "the fix round was refused (%s)" % err)
+                except (GitHubError, OSError) as err:
+                    _say("%s#%d: send back could not be applied; answer remains pending (%s)" %
+                         (repo, number, type(err).__name__))
+                    continue
             elif answer.is_hold(found) and answer.held_pr(_last_ask(comments)) is not None:
                 if not needs_human(_labels(issue)):
                     self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -3607,6 +3629,42 @@ class Factory:
             self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
                          % (repo, number, quote(answer.ANSWERED_LABEL, safe="")), ok=(404,))
             self.actions += 1
+
+    def _operator_send_back(self, repo: str, issue: Dict[str, Any],
+                            comments: List[Dict[str, Any]]) -> None:
+        """An explicit operator decision opens the existing fix-round path."""
+        number = answer.newest_held_pr(comments, self.trusted)
+        if number is None:
+            return self._reject_operator_review(repo, issue, comments, "the held ask changed")
+        verdict = answer.pr_verdict(comments, number, self.trusted, self.operators)
+        if verdict is None or verdict.choice.lower() != answer.SEND_BACK.lower():
+            return self._reject_operator_review(repo, issue, comments, "the operator decision is no longer current")
+        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        if pr.get("state") != "open" or pr.get("merged_at"):
+            return self._reject_operator_review(repo, issue, comments, "the pull request is no longer open")
+        target = answer.review_target(verdict)
+        if target is None or target != (number, str((pr.get("head") or {}).get("sha") or "")):
+            return self._reject_operator_review(repo, issue, comments, "the reviewed head changed or was not recorded")
+        notes = "Operator requested another fix round."
+        if verdict.note:
+            notes += "\n\n" + verdict.note
+        opened = self._open_round(repo, number, issue, notes)
+        if opened is not False:
+            self.sent_back.add((repo, number))
+        else:
+            _say("%s#%d: operator fix round already exists; pending answer settled" % (repo, number))
+
+    def _reject_operator_review(self, repo: str, issue: Dict[str, Any],
+                                comments: List[Dict[str, Any]], reason: str) -> None:
+        """Keep the decision's evidence and one visible rejection, without poisoning the batch."""
+        given = answer.newest(comments, self.trusted, self.operators)
+        marker = "<!-- loom:review-rejected answer=%d -->" % (given.id if given else 0)
+        if not any(str(c.get("body") or "").startswith(marker) for c in comments):
+            notify.post(self.gh, repo, int(issue['number']), marker + "\nSend back was not applied: " +
+                        reason + ". Review the current pull request and answer again.", notify.RECORD)
+        if not needs_human(_labels(issue)):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue['number'])),
+                         {"labels": [NEEDS_HUMAN]})
 
     def _file_criterion_follow_up(self, repo: str, number: int,
                                   issue: Dict[str, Any], full: Dict[str, Any]) -> None:
@@ -3922,17 +3980,29 @@ class Factory:
         A pull request that cannot be brought up to date cleanly goes back for a fix round, as a conflict
         does. The one brought up to date takes the repo's landing lock; while
         another holds it, this does neither."""
+        blockers = []
         if repo in self.landed:
-            return
+            blockers.append("repository already landed this pass")
         held = self._lock(repo)
         if held is not None and held != number:
-            return  # another pull request holds the repo's landing lock
+            blockers.append("another pull request holds the landing lock")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
+            return
         behind = bool(self._behind(repo, full))
-        if behind and not self._may_land_behind(repo, full, number):
-            if repo not in self.updated:
+        needs_update = behind and not self._may_land_behind(repo, full, number)
+        if needs_update:
+            blockers.append("pull request must be brought up to date")
+            decision = merge_verdict.decide(full, issue, blockers, ("factory",))
+            if not decision.ready and repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
         if self._scope_holds(repo, number, full, issue):
+            blockers.append("scope check holds for the brain")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
             return
         merged = self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or ""))
         if merged == MERGE_DONE:
@@ -4781,6 +4851,9 @@ class Factory:
             return self._assign_queued_model(repo, issue, model_match.group(1))
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo):
+            if not self._guarded(self._ensure_lane_headers, repo, issue):
+                self._waiting(repo, issue["number"], "brief headers could not be completed")
+                return "%s waits: brief headers could not be completed" % ref
             return self._assign_remote_queued(repo, issue, assigned, ref)
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
@@ -5016,6 +5089,7 @@ class Factory:
                            tier: str) -> None:
         number = int(issue["number"])
         if lane in REMOTE_LANES:
+            self._ensure_lane_headers(repo, issue)
             self.move(self.gh, repo, number, "queued", lane=lane)
             self._status_note(repo, number,
                               "The station reserved this queued ticket for remote lane %s (tier %s)."
@@ -5033,6 +5107,30 @@ class Factory:
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
+
+    def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Write the effective tier before reserving a remote lane.
+
+        A headerless ticket defaults to medium in the factory, but remote
+        lanes reject it because they cannot render a claim brief. Materialize
+        that tier before adding a lane label. Base: is optional; when absent,
+        the runner uses the repository's default branch.
+        """
+        body = str(issue.get("body") or "")
+        try:
+            headers, _ = tickets.parse(body)
+        except ValueError as err:
+            raise ValueError("cannot assign a lane to an unreadable brief: %s" % err) from err
+
+        updated = body
+        if "Difficulty" not in headers:
+            updated = tickets.with_header(updated, "Difficulty", difficulty_of(issue))
+        if updated == body:
+            return
+        tickets.parse(updated)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
+                     {"body": updated})
+        issue["body"] = updated
 
     # -- tickets no lane takes (loom#1831) --------------------------------
     def _no_lane_moves(self, found: Dict[str, Dict[int, Dict[str, Any]]],

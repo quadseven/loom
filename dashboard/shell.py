@@ -22,6 +22,7 @@ VIEWS = (
     ("tiers", "Tiers and allowances", "/tiers"),
     ("operators", "Operators", "/operators"),
     ("needs-you", "Needs you", "/needs-you"),
+    ("review-queue", "Review queue", "/review-queue"),
     ("free", "Free to take", "/free"),
 )
 MOBILE_TABS = ("floor", "goals", "tickets", "brain")

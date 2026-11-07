@@ -80,7 +80,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Container, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import change_class, status
+from . import change_class, history, status
 from .github import GitHubError
 
 DOCS_TESTS = "docs-tests"
@@ -572,10 +572,14 @@ def _review_author(review: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _body_answered(review: Mapping[str, Any],
-                   comments: Sequence[Mapping[str, Any]]) -> bool:
+                   comments: Sequence[Mapping[str, Any]],
+                   authors: Optional[Sequence[str]] = None) -> bool:
     """A pull-request comment answers a review body when it links the
-    review: its #pullrequestreview-<id> anchor or its URL. A reply inside
+    review (its #pullrequestreview-<id> anchor or its URL) and a trusted
+    login wrote it (LOOM_BRIEF_AUTHORS, or `authors`): anyone can comment
+    on a public repo, so a stranger's link answers nothing. A reply inside
     a thread answers the thread, not the body, so only comments count."""
+    comments = history.trusted_comments(comments, authors)
     marks = ["#pullrequestreview-%s" % review.get("id")]
     if review.get("html_url"):
         marks.append(str(review["html_url"]))
@@ -585,7 +589,8 @@ def _body_answered(review: Mapping[str, Any],
 
 def unanswered_bodies(gh: Any, repo: str, number: int,
                       threads: Sequence[Mapping[str, Any]], committed: str,
-                      by_bot: Callable[[Mapping[str, Any]], bool]) -> List[Dict[str, Any]]:
+                      by_bot: Callable[[Mapping[str, Any]], bool],
+                      authors: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
     """The review bot's reviews on the pull request whose body carries
     findings and that no pull-request comment answers, each as
     {"review", "findings", "settled"}: findings a list of
@@ -603,7 +608,7 @@ def unanswered_bodies(gh: Any, repo: str, number: int,
         if not by_bot(_review_author(review)):
             continue
         found = body_findings(str(review.get("body") or ""))
-        if not found or _body_answered(review, comments):
+        if not found or _body_answered(review, comments, authors):
             continue
         rows = [(f,) + states.get(f[2], ("open", "")) for f in found]
         out.append({"review": review, "findings": rows,
@@ -690,7 +695,7 @@ def run_ruff(rule: str, path: str, text: str,
     run = runner or subprocess.run
     try:
         done = run(["ruff", "check", "--select", rule.upper(), "--isolated",
-                    "--no-cache", "--stdin-filename", path, "-"],
+                    "--ignore-noqa", "--no-cache", "--stdin-filename", path, "-"],
                    input=text, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None

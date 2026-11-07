@@ -10,6 +10,7 @@ operator has not opted in runs nothing.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -132,13 +133,14 @@ class StationAdapterProofTest(tbs.Base):
 
     def test_a_failing_read_stays_open_with_the_reason(self):
         self.ship(SQL_BODY, hours_ago=2)
-        self.adapter_pass(FakeAdapter(error="the adapter exited 2"))
+        self.adapter_pass(FakeAdapter(error="the adapter exited 2 (kubeconfig refused)"))
         issue = self.fake.issues[self.NUMBER]
         self.assertEqual(issue["state"], "open")
         self.assertNotIn("loom:verified", self.fake.names(self.NUMBER))
         text = self.status_text()
         self.assertIn("Live proof missing:", text)
-        self.assertIn("the repo's SQL adapter gave no answer (the adapter exited 2)", text)
+        self.assertIn("the repo's SQL adapter gave no answer "
+                      "(the adapter exited 2 (kubeconfig refused))", text)
         self.assertIn("next check %s" % stamp(self.now + live_proof.RETRY), text)
 
     def test_prose_live_box_is_sent_to_verify_when_repo_has_adapter(self):
@@ -160,6 +162,28 @@ class StationAdapterProofTest(tbs.Base):
         with open(os.path.join(self.inbox("codex"), names[0]), encoding="utf-8") as fh:
             brief = fh.read()
         self.assertIn("adapter_step", brief)
+
+    def test_live_gate_box_with_backticked_log_string_uses_adapter_verify(self):
+        criterion = "the bridge log shows `bridge status:` lines"
+        body = HEAD + "- [ ] " + criterion + "\n"
+        self.ship(body, hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        self.settings.live_evidence_repos = [REPO]
+        runner = live_adapter.Runner(live_adapter.Adapter(
+            live_adapter.Command(("grep", "-F", "{needle}", "{source}"), 20),
+            ("worker",), None, {}))
+        with mock.patch.object(station.Station, "_live_adapter", return_value=runner):
+            self.assertTrue(st._adapter_can_verify(REPO, self.fake.issues[self.NUMBER]))
+            st._write_verify_brief(REPO, "codex", self.fake.issues[self.NUMBER])
+        names = os.listdir(self.inbox("codex"))
+        with open(os.path.join(self.inbox("codex"), names[0]), encoding="utf-8") as fh:
+            brief = fh.read()
+        self.assertIn("Live criterion: " + criterion, brief)
+        self.assertIn("exact criterion text", brief)
+        template = json.loads(brief.split("```json\n", 1)[1].split("\n```", 1)[0])
+        evidence_by_criterion = {item["criterion"]: item["evidence"]
+                                 for item in template["criteria"]}
+        self.assertIn("UTC time you saw it", evidence_by_criterion[criterion])
 
     def test_prose_live_box_without_adapter_still_asks_for_a_person(self):
         body = HEAD + "- [ ] Live: the production levels and cleared runs remain correct\n"
@@ -314,6 +338,88 @@ class StationManifestTest(tbs.Base):
         self.assertIsNone(self.station([REPO])._proof_sources(REPO).source_log)
 
 
+
+LENDER = "owner/lender"
+HIT_SCRIPT = """#!/bin/sh
+echo "loom-evidence-window-hours: 48"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) worker: $3"
+"""
+MISS_SCRIPT = """#!/bin/sh
+echo "loom-evidence-window-hours: 48"
+exit 1
+"""
+
+
+class LentLogAdapterTest(tbs.Base):
+    """A repo with no manifest reads its lender's log command, never sql."""
+    NUMBER = 1
+
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        self.now = float(int(time.time()))
+        self.reads = []
+        self.files = {live_adapter.MANIFEST: json.dumps(MANIFEST),
+                      ".loom/live-evidence/log": HIT_SCRIPT, ".loom/live-evidence/sql": SCRIPT}
+
+    ship = tslp.StationLiveProofTest.ship
+
+    def station(self, repos=(LENDER,), lends=None):
+        self.settings.live_evidence_repos = list(repos)
+        self.settings.live_evidence_lends = {REPO: LENDER} if lends is None else lends
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+
+        def read(repo, path):
+            self.reads.append(repo)
+            return self.files.get(path) if repo == LENDER else None
+        st._contents_text = read
+        return st
+
+    def test_lends_parses_only_well_formed_pairs(self):
+        self.assertEqual(live_adapter.lends("a/b=c/d, junk e/f=e/f x/y=z"), {"a/b": "c/d"})
+
+    def test_a_paired_repo_reads_the_lender_log_and_gets_no_sql(self):
+        sources = self.station()._proof_sources(REPO)
+        self.assertIsNotNone(sources.source_log)
+        self.assertIsNone(sources.sql)
+        self.assertEqual(set(self.reads), {LENDER})
+        answer = sources.source_log("worker", "boat leg taken", self.now - HOUR)
+        self.assertEqual(answer.error, "")
+        self.assertIn("worker: boat leg taken", answer.lines[0])
+
+    def test_an_unpaired_repo_gets_no_adapter_and_reads_nothing(self):
+        st = self.station(lends={"owner/other": LENDER})
+        sources = st._proof_sources(REPO)
+        self.assertIsNone(sources.source_log)
+        self.assertIsNone(sources.sql)
+        self.assertEqual(self.reads, [])
+
+    def test_a_pair_whose_lender_is_not_opted_in_gets_no_adapter(self):
+        sources = self.station(repos=[])._proof_sources(REPO)
+        self.assertIsNone(sources.source_log)
+        self.assertEqual(self.reads, [])
+
+    def test_the_string_present_ticks_the_live_box(self):
+        self.ship(LOG_BODY, hours_ago=2)
+        self.station().close_done_tickets()
+        issue = self.fake.issues[self.NUMBER]
+        self.assertEqual(issue["state"], "closed")
+        self.assertIn("- [x] Live: after the ship", issue["body"])
+
+    def test_the_string_absent_leaves_the_live_box_unticked(self):
+        self.files[".loom/live-evidence/log"] = MISS_SCRIPT
+        self.ship(LOG_BODY, hours_ago=2)
+        self.station().close_done_tickets()
+        issue = self.fake.issues[self.NUMBER]
+        self.assertEqual(issue["state"], "open")
+        self.assertIn("- [ ] Live: after the ship", issue["body"])
+
+    def test_a_sql_box_is_not_answered_for_a_borrower(self):
+        self.ship(SQL_BODY, hours_ago=2)
+        self.station().close_done_tickets()
+        self.assertEqual(self.fake.issues[self.NUMBER]["state"], "open")
+
+
 class ManifestTest(unittest.TestCase):
 
     def parse(self, manifest, files=None):
@@ -407,6 +513,18 @@ class RunnerTest(unittest.TestCase):
         self.assertLess(time.time() - started, 15)
         self.assertIn("more than", self.runner("#!/bin/sh\nyes boat\n").log(
             "worker", "boat leg taken", 0).error)
+
+    def test_exit_two_reports_a_safe_reason_from_its_first_stderr_line(self):
+        answer = self.runner("#!/bin/sh\necho 'kubeconfig refused: permission denied' >&2\nexit 2\n").log(
+            "worker", "boat leg taken", 0)
+        self.assertIn("kubeconfig refused", answer.error)
+        self.assertNotIn("permission denied", answer.error)
+
+    def test_stderr_capture_stays_bounded_without_a_newline(self):
+        found = []
+        live_adapter._read_first_stderr_line(io.BytesIO(b"x" * 100_000), found)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]), live_adapter.MAX_ERROR_LINE)
 
     def test_exit_one_is_nothing_matched_and_a_count_is_read(self):
         answer = self.runner("#!/bin/sh\necho 'loom-evidence-count: 0'\nexit 1\n").log(

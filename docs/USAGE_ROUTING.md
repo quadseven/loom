@@ -21,10 +21,9 @@ Quota fields (models, budget, burn_rate_per_hour, rate_limited) are not written 
 
 - OpenRouter: `GET /api/v1/key` - exact quota and reset times.
 - Sparks: `nvidia-smi` - GPU load directly.
-- Claude / Codex subscriptions: no usage API, so we watch the official
- usage websites. A scheduled, logged-in browser check opens the owner's own
- account usage pages and reads the numbers into state. Their dashboard,
- official site, just looking.
+- Codex subscriptions: usage comes from its local session log. Claude and
+  agy lane usage can be supplied by the lane's own CLI meter file; no
+  provider API credentials are added to the station.
 - Everywhere else: self-reported burn from worker session logs, plus
  explicit rate-limit signals from the workers themselves.
 
@@ -38,11 +37,11 @@ Each reading names the machine that collected it (`host`).
   the collecting machine (`~/.codex/sessions`). A machine where codex never
   ran says "no codex session logs on this machine"; a figure read over two
   hours ago, or from a window that has reset since, is marked stale.
-- claude and agy: a "Limit" reading from the lane heartbeat. Neither CLI
-  leaves a usage figure on disk; the runner records each limit hold, with the
-  reset the CLI printed, as `retry_at`. While held the reading says "limited
-  until" the reset; after, the last limit and when it lifted
-  (`state/usage/<lane>.last-limit.json`).
+- claude and agy: the newest lane CLI meter in
+  `state/usage/<lane>.meter.json`, when present. The reading carries the
+  CLI's observation time, used percentage, remaining amount, and reset. Until
+  the lane reports one, the board says no CLI `/usage` reading is available
+  and continues to show limit holds from its heartbeat.
 - muse: the remote lane reports only a heartbeat, so its reading says no
   usage or limit reaches Loom and how old the heartbeat is.
 - anthropic: spend from `state/usage/spend.jsonl` against

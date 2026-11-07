@@ -28,6 +28,10 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # Six more codex slots, all on gpt-6-luna, so the Codex allowance is
          # used rather than left to reset (operator, 2026-10-25).
          "codex-3", "codex-4", "codex-5", "codex-6", "codex-7", "codex-8",
+         # Eight more, codex-9 to codex-16, the same model and the same reason
+         # (operator, 2026-11-07: way more Luna lanes).
+         "codex-9", "codex-10", "codex-11", "codex-12", "codex-13", "codex-14",
+         "codex-15", "codex-16",
          "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.

@@ -748,6 +748,11 @@ print('leak guard: clean (shape patterns only)')
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
+            # The factory and infra-public repos are settings now
+            # (loom#2584): this harness's fakes serve them under these
+            # names, so it configures exactly those.
+            "LOOM_FACTORY_REPO": "quadseven/loom",
+            "LOOM_INFRA_PUBLIC_REPO": "quadseven/infra-public",
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
@@ -7399,6 +7404,24 @@ exec /usr/bin/git "$@"
         self.assertIn("Repo: example/repo", body)
         self.assertIn("python: 3.12", body)
 
+    def test_an_incident_with_no_factory_setting_files_on_the_checkouts_origin(self):
+        # Most lane services set only LOOM_REPOS: with none of
+        # LOOM_FACTORY_REPO, LOOM_SELF_REPO or LOOM_STATUS_REPO the
+        # incident goes to the repo this checkout runs from, never to an
+        # empty --repo that fails into the log alone.
+        origin = subprocess.run(["git", "-C", str(RUNNER.parent.parent), "remote", "get-url",
+                                 "origin"], capture_output=True, text=True).stdout.strip()
+        expected = re.sub(r"\.git$", "", origin).rstrip("/")
+        expected = "/".join(re.split(r"[:/]", expected)[-2:])
+        self.assertRegex(expected, r"^[^/]+/[^/]+$")
+        self.contract_repo(contract=CONTRACT + "python: 3.12\n")
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_FACTORY_REPO="", LOOM_SELF_REPO="",
+                                        LOOM_STATUS_REPO="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh issue create --repo %s " % expected, self.log.read_text())
+        self.assertIn("factory incident %s#99" % expected, self.lane_log())
+
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_parsing_contract_closes_its_open_incident(self):
         self.contract_repo()
@@ -7646,6 +7669,108 @@ exec /usr/bin/git "$@"
         self.assertIn("base check exited 1, then passed on a second run", log)
         self.assertTrue(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+
+    def slot_script(self, body, **env):
+        """Run the runner's check-slot functions, as written in run_lane.sh,
+        in a bash of their own with LOG and LOOM_HOME set."""
+        text = RUNNER.read_text()
+        funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        return subprocess.Popen(
+            ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
+            env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
+                 **env},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_two_checks_at_once_run_one_at_a_time_with_one_slot(self):
+        # Fifteen lanes each started a full suite at once and drove the host
+        # to load 130 (2026-11-07). One slot makes two checks take turns.
+        tmp = Path(self._tmp.name)
+        marks = tmp / "marks"
+        body = ('acquire_check_slot || exit 3\n'
+                'echo "start" >> "$MARKS"\nsleep 1\n'
+                'echo "end" >> "$MARKS"\nrelease_check_slot\n')
+        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_POLL": "0.1", "MARKS": str(marks)}
+        procs = [self.slot_script(body, **env) for _ in range(2)]
+        for proc in procs:
+            out, err = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 0, err)
+        events = marks.read_text().split()
+        self.assertEqual(events, ["start", "end", "start", "end"])
+        self.assertIn("waiting for a check slot", (tmp / "slots.log").read_text())
+        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [])
+
+    def test_slots_default_to_three(self):
+        body = ('echo "$CHECK_SLOTS"\n')
+        proc = self.slot_script(body)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.strip(), "3", err)
+
+    def test_a_slot_held_by_a_dead_pid_is_reclaimed(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stale = self.loom / "run" / "check-slots" / "slot-1"
+        stale.mkdir(parents=True)
+        (stale / "pid").write_text(f"{dead.pid}\n")
+        proc = self.slot_script('acquire_check_slot || exit 3\ncat "$CHECK_SLOT_HELD/pid"\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="5")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotEqual(out.strip(), str(dead.pid))
+        self.assertIn("reclaimed", (Path(self._tmp.name) / "slots.log").read_text())
+
+    def test_a_slot_held_by_a_live_pid_is_not_taken_and_the_wait_ends(self):
+        live = self.loom / "run" / "check-slots" / "slot-1"
+        live.mkdir(parents=True)
+        (live / "pid").write_text(f"{os.getpid()}\n")
+        proc = self.slot_script('acquire_check_slot\necho "rc $?"\n', LOOM_CHECK_SLOTS="1",
+                                LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.2")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.strip(), "rc 1", err)
+        self.assertEqual((live / "pid").read_text().strip(), str(os.getpid()))
+        self.assertIn("no check slot after", (Path(self._tmp.name) / "slots.log").read_text())
+
+    def test_a_base_check_timeout_is_transient_without_an_incident(self):
+        # A timeout under host load is no red base: it filed loom#2751-style
+        # incidents for every lane on 2026-11-07.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract="interpreter: loom-test-python\ncheck: exit 124\n")
+        self.drop_brief()
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("failed: [factory]", log)
+        self.assertNotIn("then passed on a second run", log)
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+
+    def test_a_lane_that_gets_no_check_slot_parks_transient_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        held = self.loom / "run" / "check-slots" / "slot-1"
+        held.mkdir(parents=True)
+        (held / "pid").write_text(f"{os.getpid()}\n")
+        result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="0.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.lane_log()
+        self.assertIn("waiting for a check slot", log)
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("failed: [factory]", log)
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        self.assertEqual((held / "pid").read_text().strip(), str(os.getpid()))
+
+    def test_a_lane_run_releases_its_check_slot(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CHECK_SLOTS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((self.loom / "run" / "check-slots").iterdir()), [])
 
     def test_a_base_check_terminated_by_sigterm_is_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
@@ -8013,7 +8138,7 @@ exec /usr/bin/git "$@"
         # The guard sits at the bash -c call too, not only in load_contract.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         marker = tmp / "ran"
         fakes = tmp / "fakebin"
@@ -8022,7 +8147,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(tmp / "log"), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30"}
         result = subprocess.run(["bash", "-c", script, "test", f"true\x1b[2K; touch {marker}"],
@@ -8044,7 +8169,7 @@ exec /usr/bin/git "$@"
         # UV_MANAGED_PYTHON, and nothing else of the runner's leaks in.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         fakes = tmp / "fakebin"
         fakes.mkdir()
@@ -8052,7 +8177,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -8070,7 +8195,7 @@ exec /usr/bin/git "$@"
         # runner's own value never reaches the check.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         fakes = tmp / "fakebin"
         fakes.mkdir()
@@ -8078,7 +8203,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "LOG": str(log), "TREE": str(tmp),
                "CHECK_HOME": str(tmp), "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30",
@@ -8098,7 +8223,7 @@ exec /usr/bin/git "$@"
         # exits 0; it fails on main.
         text = RUNNER.read_text()
         funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
-                        for name in ("contract_command_ok", "contract_run"))
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
         tmp = Path(self._tmp.name)
         localbin = tmp / "home" / ".local" / "bin"
         localbin.mkdir(parents=True)
@@ -8110,7 +8235,7 @@ exec /usr/bin/git "$@"
         (fakes / "sandbox-exec").chmod(0o755)
         (fakes / "timeout").write_text('#!/bin/bash\nshift\nexec "$@"\n')
         (fakes / "timeout").chmod(0o755)
-        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run "$1"\n'
+        script = funcs + SANDBOX_HELPERS + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n'
         log = tmp / "log"
         env = {"PATH": f"{fakes}:/usr/bin:/bin", "HOME": str(tmp / "home"), "LOG": str(log),
                "TREE": str(tmp), "CHECK_HOME": str(tmp), "CHECK_CLI": "bash",

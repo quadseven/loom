@@ -51,7 +51,18 @@ def permissions(role: str = "station") -> Dict[str, str]:
     if role == "station":
         found["actions"] = "write"
     return found
-HOMEPAGE = "https://github.com/quadseven/loom"
+def homepage(env: Optional[Dict[str, str]] = None) -> str:
+    """The App manifest's homepage: the deployment's own repo
+    (LOOM_SELF_REPO, else LOOM_STATUS_REPO, else this checkout's origin:
+    bus/home_repo.py) on GitHub, never the original owner's repo as a
+    literal (loom#2584). With none of them, a placeholder that names no
+    one's repo."""
+    from . import home_repo
+    repo = home_repo.home_repo(env)
+    return "https://github.com/%s" % repo if repo else "https://example.com/loom"
+
+
+HOMEPAGE = homepage()
 
 
 def manifest(owner: str, name: Optional[str] = None, role: str = "station") -> Dict[str, Any]:

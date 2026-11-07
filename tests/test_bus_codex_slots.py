@@ -1,4 +1,4 @@
-"""Eight codex slots run gpt-6-luna side by side (operator, 2026-10-25: use
+"""Sixteen codex lanes run gpt-6-luna side by side (operator, 2026-10-25: use
 the Codex weekly allowance). Each slot is a lane the station claims for and
 maps back to the codex runner."""
 import unittest
@@ -7,8 +7,8 @@ from bus import factory, labels
 
 
 class CodexSlotsTest(unittest.TestCase):
-    def test_codex_three_to_eight_are_lanes_of_the_codex_runner(self):
-        for n in range(2, 9):
+    def test_codex_two_to_sixteen_are_lanes_of_the_codex_runner(self):
+        for n in range(2, 17):
             slot = "codex-%d" % n
             self.assertIn(slot, labels.LANES)
             self.assertEqual(labels.base_lane(slot), "codex")
@@ -18,7 +18,7 @@ class CodexSlotsTest(unittest.TestCase):
         # tier ever reached them: 35 medium and hard tickets waited "no free
         # lane in tier" while codex-3 to codex-8 beat available and idle.
         slots = [x for x in labels.LANES if labels.base_lane(x) == "codex"]
-        self.assertEqual(len(slots), 8)
+        self.assertEqual(len(slots), 16)
         for tier, lanes in factory.TIERS.items():
             if "codex" in lanes:
                 self.assertEqual([x for x in slots if x not in lanes], [], tier)

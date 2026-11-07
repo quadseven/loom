@@ -41,6 +41,8 @@ CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{1
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
 RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): moved from lane "
                             r"\S+ to lane \S+\. Lane \S+ failed: ")
+RETRY_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
+                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 HELD_RE = re.compile(r"^Lane \S+ held: ")
 STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
 # The comments that assign the ticket to a lane: a brief. Claims after the
@@ -222,6 +224,23 @@ def dead_lane(comments: Sequence[Any]) -> Optional[str]:
     return next(iter(lanes)) if len(lanes) == 1 else None
 
 
+def retry_chain(comments: Sequence[Any]) -> Tuple[int, set, Optional[Tuple[str, str]]]:
+    """Automatic retries since the last lane outcome and their pending move."""
+    used, left, pending = 0, set(), None
+    for comment in comments:
+        body = str(comment.get("body") or "").strip() if isinstance(comment, dict) else ""
+        match = RETRY_RE.match(body)
+        if match:
+            used += 1
+            left.add(match.group(1))
+            pending = (match.group(1), match.group(2))
+        elif body.startswith("Lane "):
+            used, left, pending = 0, set(), None
+        elif CLAIMED_RE.fullmatch(body):
+            pending = None
+    return used, left, pending
+
+
 class History(NamedTuple):
     """A ticket's history, read once from its trusted comments."""
 
@@ -233,12 +252,17 @@ class History(NamedTuple):
     dead_lane: Optional[str]
     last_climb: float
     equivalent: Optional[str]
+    retry_count: int
+    retry_lanes: set
+    pending_retry: Optional[Tuple[str, str]]
+    comments: List[Dict[str, Any]]
 
 
 def read_history(comments: Any, authors: Optional[Sequence[str]] = None) -> History:
     """The ticket's history from its raw comments: trust filtering is
     applied once here, on the way in, so no caller can skip it."""
     trusted = trusted_comments(comments, authors)
+    retries, retry_lanes, pending_retry = retry_chain(trusted)
     return History(
         rung=rung_of(trusted),
         tried_rungs=tried_rungs(trusted),
@@ -248,4 +272,8 @@ def read_history(comments: Any, authors: Optional[Sequence[str]] = None) -> Hist
         dead_lane=dead_lane(trusted),
         last_climb=last_climb(trusted),
         equivalent=equivalent_of(trusted),
+        retry_count=retries,
+        retry_lanes=retry_lanes,
+        pending_retry=pending_retry,
+        comments=trusted,
     )

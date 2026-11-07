@@ -4960,6 +4960,30 @@ class RemoteQueued(Base):
         # A no-lane wait, so the station keeps its no_lane_since across passes.
         self.assertTrue(factory.no_lane(worker.waits[self.KEY]))
 
+    def test_a_headerless_ticket_gets_claim_headers_before_remote_lane_reservation(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.gh.ticket(7, "queued", body=body)
+        self.gh.issues[7]["labels"] = [
+            {"name": "loom:ticket"}, {"name": "loom:queued"}]
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+        worker.assign_queued()
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
+    def test_an_existing_remote_reservation_repairs_missing_claim_headers(self):
+        self.gh.private = False
+        body = "## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.queued_for_muse()
+        self.gh.issues[7]["body"] = body
+        self.assign(0, ["muse"])
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
     def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
         self.queued_for_muse()
         worker = self.assign(7 * 3600, ["muse", "spark"])
@@ -5507,7 +5531,7 @@ class AbandonedReview(Base):
         self.gh.ticket(5, "merged")
         self.gh.pull(51, 5, state="closed", merged_at=iso(100), merged=True)
         self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
-                                 "user": {"login": "grug-tribe[bot]"},
+                                 "user": {"login": "grug-tribe[bot]", "type": "Bot"},
                                  "html_url": "https://example.test/pull/51#issuecomment-777"}]
         self.gh.details[51]["reviewThreads"] = {"nodes": [{
             "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
@@ -5551,6 +5575,29 @@ class AbandonedReview(Base):
         self.go(lint_run=lambda rule, path, text: True)
         self.assertEqual(len(self.follow_ups()), 1)
         self.assertEqual(self.answers(), [])
+
+    def test_a_human_named_like_the_bot_or_a_stranger_does_not_count(self):
+        self.noticed()
+        notice = self.gh.comments[51][0]
+        human = dict(notice, user={"login": "grug-tribe[bot]", "type": "User"})
+        plain = dict(notice, user={"login": "grug-tribe", "type": "User"})
+        self.assertTrue(factory.abandoned_notice(notice, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(human, "grug-tribe"))
+        self.assertFalse(factory.abandoned_notice(plain, "grug-tribe"))
+        later = {"body": "%s %s" % (factory.ABANDONED_ANSWER_MARKER, "#issuecomment-777"),
+                 "created_at": iso(95), "user": {"login": "mallory", "type": "User"}}
+        self.assertFalse(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+        later["user"] = {"login": "Alice-Example", "type": "User"}
+        self.assertTrue(factory.abandoned_answered([notice, later], notice, ["alice-example"]))
+
+    def test_a_strangers_answer_marker_leaves_the_notice_unanswered(self):
+        self.noticed()
+        self.gh.comments[51].append({
+            "id": 778, "body": factory.ABANDONED_ANSWER_MARKER, "created_at": iso(95),
+            "user": {"login": "mallory", "type": "User"}})
+        self.go(lint_run=lambda rule, path, text: False)
+        self.assertEqual(len(self.follow_ups()), 1)
+        self.assertEqual(len(self.answers()), 2)
 
     def test_no_notice_no_follow_up(self):
         self.gh.ticket(5, "merged")
