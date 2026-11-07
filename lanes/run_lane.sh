@@ -124,6 +124,22 @@ leak_scan() {
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
 }
+
+# A refused public repo scan's hits as one line a public ticket may carry:
+# each hit's rule and path:line, never its text (bus/leak_hits.py). The
+# scanner's whole output, LEAK_OUT, goes to the lane log only: the reason
+# once held just its first line, the counts of rules loaded, and the next
+# lane repeated the refusal blind (loom#2804). $1 is --diff RANGE (run in the
+# tree) or --text NAME.
+leak_hits() {
+  local named
+  printf '%s\n' "$LEAK_OUT" >> "$LOG"
+  named="$(cd "$TREE" && printf '%s\n' "$LEAK_OUT" |
+    PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.leak_hits "$@" 2>> "$LOG")" ||
+    named="the hits could not be located; the scanner output is in the lane log"
+  printf '%s' "$named"
+}
+
 # Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
 # leak scanner a public-repo push needs is present before any lane scans.
 # The first lane that needs it clones it; a later run fetches at most hourly,
@@ -4709,7 +4725,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan could not run; nothing pushed: $LEAK_OUT" transient
       continue
     elif [ "$LEAK_RC" -ne 0 ]; then
-      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $(leak_hits --diff "$SCAN_RANGE")"
       continue
     fi
     printf '%s\n' "$LEAK_OUT" >> "$LOG"
@@ -4738,7 +4754,7 @@ for BRIEF in "$INBOX"/*.md; do
       printf '%s\n' "$PR_BODY" > "$BODY_FILE"
       if ! LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
-        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $(leak_hits --text "PR body")"
         continue
       fi
       rm -f "$BODY_FILE"
