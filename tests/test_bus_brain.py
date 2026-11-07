@@ -968,6 +968,13 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_merge_passes_the_same_hold_box_ticked(self):
         self.assertTrue(self._merged_with(self._held_issue(self.HOLD_BOX, ticked=True))["merged"])
 
+    def test_an_async_result_that_says_complete_without_merged_does_not_settle(self):
+        # loom#2622: only an explicit merged result proves the merge.
+        self.assertFalse(brain._async_done({"status": "complete"}))
+        self.assertFalse(brain._async_done({"status": "completed", "merged": False}))
+        self.assertTrue(brain._async_done({"status": "merged"}))
+        self.assertTrue(brain._async_done({"status": "completed", "merged": True}))
+
     def test_merge_of_a_stacked_pull_request_uses_merge_async_and_settles_after_it_reports_merged(self):
         # loom#2622: a stacked pull request merges through merge-async, and
         # the ticket is settled only once the async result reports merged.

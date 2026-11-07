@@ -4907,8 +4907,10 @@ MERGE_ASYNC_SECONDS = 180
 
 
 def _async_done(result: Dict[str, Any]) -> bool:
-    return result.get("merged") is True or str(result.get("status") or "") in (
-        "merged", "complete", "completed")
+    # Only an explicit merged result settles the ticket: a "complete"
+    # status without merged true has not proved the merge, so it keeps
+    # polling until the deadline raises.
+    return result.get("merged") is True or str(result.get("status") or "") == "merged"
 
 
 def _async_failed(result: Dict[str, Any]) -> bool:

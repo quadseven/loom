@@ -1291,9 +1291,21 @@ class PullRequests(Base):
         self.gh.rules = self.NOT_STRICT
         f = self.go()
         full = {"base": {"ref": "main"}}
-        self.assertTrue(f._may_land_behind(REPO, dict(full, mergeable=True)))
-        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=False)))
-        self.assertFalse(f._may_land_behind(REPO, dict(full, mergeable=None)))
+        with mock.patch.object(factory.hunk_overlap, "pr_overlaps_base", return_value=False):
+            judged = dict(full, number=50, head={"sha": "sha50"})
+            self.assertTrue(f._may_land_behind(REPO, dict(judged, mergeable=True)))
+            self.assertFalse(f._may_land_behind(REPO, dict(judged, mergeable=False)))
+            self.assertFalse(f._may_land_behind(REPO, dict(judged, mergeable=None)))
+
+    def test_a_behind_pull_request_with_no_head_to_compare_is_updated_first(self):
+        # loom#2622: an overlap the read cannot judge is updated first, and a
+        # read with no number or head sha cannot be judged.
+        self.gh.rules = self.NOT_STRICT
+        f = self.go()
+        full = {"base": {"ref": "main"}, "mergeable": True}
+        self.assertFalse(f._may_land_behind(REPO, full))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, number=50)))
+        self.assertFalse(f._may_land_behind(REPO, dict(full, head={"sha": "sha50"})))
 
     def land_behind_overlap(self, patch, compare_files):
         """A behind pull request on a non-strict base whose own hunk in

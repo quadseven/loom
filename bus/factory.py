@@ -3950,8 +3950,7 @@ class Factory:
         requires up-to-date branches, and none of the base changes it lacks
         overlap its own hunks (loom#2622, bus/hunk_overlap.py). A pull
         request the overlap read cannot judge is updated first, as a strict
-        base is; one read with no number or head to compare by keeps the
-        #2482 rule alone."""
+        base is, and so is one read with no number or head to compare by."""
         if full.get("mergeable") is not True:
             return False
         base = str((full.get("base") or {}).get("ref") or "")
@@ -3961,7 +3960,7 @@ class Factory:
             number = full.get("number")
         head = str((full.get("head") or {}).get("sha") or "")
         if not isinstance(number, int) or not head or not base:
-            return True
+            return False
         try:
             overlap = hunk_overlap.pr_overlaps_base(self.gh, repo, number, base, head)
         except GitHubError as err:
