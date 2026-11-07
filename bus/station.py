@@ -15629,6 +15629,18 @@ class Station:
             synced.append(repo)
             _write_json(path, {"digest": digest, "repos": synced})
 
+    def _feed_lanes(self) -> None:
+        """Run assign_queued unless the pass is deferred; a GitHub or disk
+        failure is logged and the pass goes on."""
+        if self._deferred():
+            return
+        try:
+            self._timed(self.assign_queued)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("assign_queued failed: %s" % err)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -15650,6 +15662,11 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # Briefing a queued ticket onto a free lane comes before the heavy
+            # reads: reconcile_pull_requests and claim_new spend the pass's
+            # request target, and on 2026-11-07 assign_queued carried over
+            # behind them pass after pass, leaving free lanes idle.
+            self._feed_lanes()
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
@@ -15673,13 +15690,8 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
-            if not self._deferred():
-                try:
-                    self._timed(self.assign_queued)
-                except RateLimited:
-                    raise
-                except (GitHubError, OSError) as err:
-                    _say("assign_queued failed: %s" % err)
+            # Again after the claims, for a ticket claimed in this pass.
+            self._feed_lanes()
             try:
                 self.record_scans()
             except OSError as err:
