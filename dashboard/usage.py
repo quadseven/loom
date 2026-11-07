@@ -296,7 +296,7 @@ def _status(lanes: list[str], kinds: list[str], windows: list[dict[str, Any]]) -
         (any(w["used"] >= NEAR_LIMIT_PCT for w in metered), "near limit", 0),
         (any(w["runs_out"] for w in metered), "runs out early", 1),
         (any(w["error"] for w in windows), "error", 1),
-        (any(w["stale"] and w["used"] is not None for w in windows), "stale", 1),
+        (any(w["stale"] for w in windows), "stale", 1),
         (blocked, "partly down" if all_down else "partly held", 2),
         (metered, "ok", 3),
     )
@@ -348,7 +348,7 @@ def _window_ask(name: str, w: dict[str, Any], now: datetime) -> list[tuple[str, 
 
 
 def _stale_ask(p: dict[str, Any]) -> list[tuple[str, str]]:
-    stale = [w for w in p["windows"] if w["stale"] and w["used"] is not None]
+    stale = [w for w in p["windows"] if w["stale"]]
     if not stale:
         return []
     return [("warn", "%s %s: %s stale (%s)." % (
@@ -419,6 +419,9 @@ def _sentence(text: str) -> str:
 
 def _unknown_note(w: dict[str, Any], now: datetime) -> str:
     """Why a reading has no figure, in words."""
+    if w["stale"]:
+        detail = _limit_note(w, now) if w["kind"] == "limit" else _sentence(w["note"])
+        return "STALE: %s. %s" % (w["stale"], detail)
     if w["kind"] == "last 429" and w["reset"] is not None:
         limit = w["note"].replace("limitName:", "").strip() or "a"
         return ("Last hit its %s limit; the provider said retry after %s (%s)."
