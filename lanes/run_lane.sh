@@ -2854,7 +2854,7 @@ prepare_validation() {
     [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
   fi
   if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
-     [ "$BASELINE_EXIT" -ne 126 ] && [ "$BASELINE_EXIT" -ne 127 ]; then
+      [ "$BASELINE_EXIT" -ne 126 ] && [ "$BASELINE_EXIT" -ne 127 ] && [ "$BASELINE_EXIT" -ne 124 ]; then
     base_verdict_write "$verdict_key" "$BASELINE_EXIT" ||
       echo "could not store base check verdict for $baseline_rev" >> "$LOG"
   fi
