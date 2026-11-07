@@ -14,6 +14,12 @@ failed: <err>") also loses its stage name, so one error that every stage of a
 pass hits is one signature, not one per stage; the stages seen are kept on the
 record and listed in the issue and its count comment.
 
+A line naming an open factory incident in the watch repository counts there
+instead of filing a second issue. Its reference is extracted before redaction;
+only the issue number is kept, and its state and factory label are checked
+before each count. An unreadable lookup stays pending. Watch silence never
+closes an incident that the watcher only observed.
+
 A signature seen REPEAT times within WINDOW seconds, and not in the DAY before,
 files one loom:triage issue in the lanes repo titled "<component>: <signature>"
 with the count and the first and last example lines (redacted, then passed
@@ -75,6 +81,8 @@ ISSUES_MAX = 500
 READ_MAX = 1 << 20
 # Issues filed plus count comments posted in one pass.
 WRITES_MAX = 5
+# Bound incident validation reads too; remaining observations wait a pass.
+INCIDENT_LOOKUPS_MAX = 5
 SIGNATURE_MAX = 150
 TITLE_MAX = 200
 # An example line is kept whole up to this; a longer one keeps its start and
@@ -242,6 +250,10 @@ _IP_RE = re.compile(r"\b[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?::[0-9]+)?\b"
 # A host under a suffix that only resolves on a private network.
 _HOST_RE = re.compile(r"(?i)\b(?:[a-z0-9-]+\.)+(?:local|lan|home|internal|corp|intranet|ts\.net)\b")
 _REF_RE = re.compile(r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+\b")
+# The runner's explicit incident attribution, not any ticket mentioned in a
+# failure. Keep a bounded number only, never a foreign repository in state.
+_INCIDENT_RE = re.compile(r"\bfactory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
+                          r"#([1-9][0-9]{0,9})(?![A-Za-z0-9_])")
 # A ticket id such as owner.name-123 or owner.name-123-r2.
 _TICKET_RE = re.compile(r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+-[0-9]+(?:-r[0-9]+)?(?![A-Za-z0-9_.-])")
 # owner/name: two words around one slash, each with a letter.
@@ -315,6 +327,16 @@ def stage(line: str) -> Optional[str]:
     None for any other line."""
     m = STAGE_RE.match(_LEAD_RE.sub("", line))
     return m.group("stage") if m else None
+
+
+def incident_ref(line: str, repo: str) -> Optional[int]:
+    """One unambiguous incident in the allowed repo, before redaction."""
+    refs = {(m.group(1).lower(), int(m.group(2))) for m in _INCIDENT_RE.finditer(clean(line))}
+    if len(refs) == 1:
+        target, number = refs.pop()
+        if target == repo.lower():
+            return number
+    return None
 
 
 def signature(line: str) -> str:
@@ -586,6 +608,7 @@ class Watcher:
         self.say = say
         self.write = write
         self.writes = 0
+        self.incidents: Dict[int, Optional[bool]] = {}
         # Signature key -> the open issue it was filed or counted on.
         self.issues: Dict[str, int] = {}
         self.private = tuple(n for n in private if n)
@@ -802,10 +825,16 @@ class Watcher:
             rec["due"] = "file"
 
     def _hit(self, sigs: Dict[str, Any], name: str, line: str) -> None:
+        incident = incident_ref(line, self.repo)
         sig = signature(line)
         if not sig:
             return
         key = ("%s: %s" % (name, sig))[:TITLE_MAX]
+        title = key
+        if incident is not None:
+            # Redacted signatures alone would mix different incidents. This
+            # suffix is a state key, not part of a public title or example.
+            key += " [incident %d]" % incident
         rec = sigs.get(key)
         last = _num(rec.get("last")) if isinstance(rec, dict) else None
         if not isinstance(rec, dict) or last is None or self.now - last >= DAY:
@@ -815,6 +844,8 @@ class Watcher:
             rec = sigs[key] = {"first": self.now, "hits": [], "total": 0,
                                "first_line": redact(line), "issue": issue,
                                "told": 0, "told_total": 0}
+        if incident is not None:
+            rec.update(incident=incident, watch_title=title)
         hits = rec["hits"]
         if hits and hits[-1][0] == self.now:
             hits[-1][1] += 1
@@ -915,6 +946,95 @@ class Watcher:
         data = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, number)).data
         return isinstance(data, dict) and data.get("state") == "open"
 
+    def _factory_incident(self, number: int) -> bool:
+        """Validate the target; an unreadable lookup is unknown, not closed."""
+        if number in self.incidents:
+            known = self.incidents[number]
+            if known is None:
+                raise ValueError("factory incident lookup is unknown")
+            return known
+        if len(self.incidents) >= INCIDENT_LOOKUPS_MAX:
+            raise ValueError("factory incident lookup is unknown (pass read budget)")
+        self.incidents[number] = None
+        try:
+            data = self.gh.rest("GET", "/repos/%s/issues/%d" % (self.repo, number)).data
+        except (GitHubError, OSError) as err:
+            raise ValueError("factory incident lookup is unknown") from err
+        if (not isinstance(data, dict) or data.get("state") not in ("open", "closed")
+                or not isinstance(data.get("labels"), list)):
+            raise ValueError("factory incident lookup is unknown")
+        labels = [label.get("name") if isinstance(label, dict) else label
+                  for label in data["labels"]]
+        valid = (data["state"] == "open" and "pull_request" not in data
+                 and "loom:factory" in labels)
+        self.incidents[number] = valid
+        return valid
+
+    def _merge_observations(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        """Keep one count, timer and comment when observations share an issue."""
+        if self.now - target["last"] >= DAY:
+            target.update(first=source["first"], first_line=source["first_line"],
+                          hits=[], total=0, told=0, told_total=0)
+            target.pop("done", None)
+        if source["first"] < target["first"]:
+            target.update(first=source["first"], first_line=source["first_line"])
+        if source["last"] >= target["last"]:
+            target.update(last=source["last"], last_line=source["last_line"])
+        hits: Dict[float, int] = {}
+        for at, count in target["hits"] + source["hits"]:
+            if self.now - at < WINDOW:
+                hits[at] = hits.get(at, 0) + count
+        target["hits"] = sorted([at, count] for at, count in hits.items())
+        target["total"] += source["total"]
+        if not target.get("done") and source.get("due") == "file":
+            target["due"] = "file"
+        stages = set(target.get("stages") or []) | set(source.get("stages") or [])
+        if stages:
+            target["stages"] = sorted(stages)[:STAGES_MAX]
+
+    def _route_incidents(self, sigs: Dict[str, Any]) -> None:
+        """Fold candidates into one incident record, or the ordinary signature.
+
+        Resolve before quiet-close: two rejected references must not leave two
+        records that can close the same ordinary issue independently.
+        """
+        if not self.write:
+            return
+        # Oldest lookup first: a few unreadable incidents must not consume
+        # every pass's budget before a later candidate can be checked.
+        ordered = sorted(sigs.items(), key=lambda item: item[1].get("incident_checked", 0))
+        for key, rec in ordered:
+            incident = rec.get("incident")
+            linked = rec.get("incident_linked")
+            if not isinstance(incident, int) or (linked and self._due(rec) is None):
+                continue
+            try:
+                valid = self._factory_incident(incident)
+            except ValueError as err:
+                if not linked:
+                    self.say("watch: %s; observation pending" % err)
+                continue
+            finally:
+                if incident in self.incidents:
+                    rec["incident_checked"] = self.now
+            if linked:
+                continue  # _file reuses this lookup before the count.
+            title = rec.pop("watch_title")
+            target_key = "factory incident: #%d" % incident if valid else title
+            if not valid:
+                rec.pop("incident")
+            target = sigs.get(target_key)
+            if isinstance(target, dict):
+                self._merge_observations(target, rec)
+            else:
+                target = sigs[target_key] = rec
+            if valid:
+                target.update(incident=incident, incident_linked=True, issue=incident,
+                              incident_checked=self.now)
+                self.issues[target_key] = incident
+            del sigs[key]
+            self.issues.pop(key, None)
+
     def _open_titled(self, title: str) -> Optional[int]:
         for issue in self.gh.paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
                                       % (self.repo, LABEL)):
@@ -1014,6 +1134,8 @@ class Watcher:
         "count" (new hits on its issue, the last count an hour ago) or None."""
         if rec.get("due") in ("file", "count"):
             return str(rec["due"])
+        if rec.get("incident_linked") and not rec.get("done"):
+            return "file" if self._new_burst(rec) else None
         if rec.get("issue") is None and not rec.get("done") and self._new_burst(rec):
             return "file"
         told = _num(rec.get("told")) or 0.0
@@ -1027,6 +1149,14 @@ class Watcher:
         done: filed, counted, refused (the text check) or closed (its issue
         was closed, so this appearance is not told again)."""
         rec["done"] = True
+        incident = rec.get("incident")
+        if isinstance(incident, int) and not isinstance(incident, bool):
+            if self._factory_incident(incident):
+                return self._count(rec)
+            rec["issue"] = None
+            self.issues.pop(key, None)
+            self._told(rec)
+            return "closed"
         number = _num(rec.get("issue"))
         if number is None and key in self.issues:
             # Filed before this appearance (its record pruned since), maybe
@@ -1103,6 +1233,8 @@ class Watcher:
         unshipped ticket is left open. A signature that comes back files
         again as usual."""
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
+            if isinstance(rec, dict) and rec.get("incident_linked"):
+                continue  # Only observe it; its owner decides when it closes.
             number = _num(rec.get("issue")) if isinstance(rec, dict) else None
             last = _num(rec.get("last")) if isinstance(rec, dict) else None
             if number is None or last is None or self.now - last < DAY:
@@ -1135,6 +1267,10 @@ class Watcher:
 
     def _tell(self, sigs: Dict[str, Any], done: Dict[str, int]) -> None:
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
+            if rec.get("incident") is not None and not rec.get("incident_linked"):
+                if self._new_burst(rec):
+                    rec["due"] = "file"
+                continue  # Its lookup is still unknown; never file a twin.
             kind = self._due(rec)
             if kind is None:
                 continue
@@ -1156,6 +1292,7 @@ class Watcher:
         sigs = state["sigs"]
         self._remember(state)
         seen.update(self._apply_refusals(state))
+        self._route_incidents(sigs)
         self._close_quiet(sigs)
         self._prune(sigs)
         done: Dict[str, int] = {}

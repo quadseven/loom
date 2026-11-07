@@ -5358,11 +5358,12 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.listing(), [])
         self.assertIn("loom:queued", self.fake.names(12))
-        # The dependency merges: the next pass gives the ticket a lane.
+        # The dependency merges: the next pass gives the ticket a lane, which
+        # now runs ahead of the claims, so the same pass claims it too.
         self.fake.issues[5]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"},
                                           {"name": "lane:codex"}]
         self.run_pass()
-        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertIn("loom:running", self.fake.names(12))
         self.assertIn("lane:codex", self.fake.names(12))
 
     def test_a_ticket_already_briefed_waits_too(self):
@@ -8887,6 +8888,7 @@ class VerifyBeforeBuildTest(Base):
 
     def test_an_unmet_answer_on_a_ticket_never_sent_ahead_leaves_it_shipped(self):
         self.fake.add(12, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+        self.merged()
         self.result({"unmet": self.UNMET})
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(12))
@@ -9045,6 +9047,40 @@ class OutcomeTest(Base):
     def test_a_limited_fix_brief_goes_back_to_its_pull_request(self):
         self.limited(fix_body=FIX_BODY)
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:spark", "loom:pr"])
+
+    def test_repeated_limit_logs_once_but_keeps_each_claim_ending(self):
+        self.fake.add(12, state="running", lane="spark",
+                      body=BODY.replace("Model: model-x", "Model: spark/test"))
+        gh = GitHub("token", transport=self.fake)
+        gh.status_in_body = True
+        gh.status_authors.update(AUTHORS)
+        runner = station.Station(gh, self.settings)
+        lines = []
+        with mock.patch.object(station, "_say", lines.append):
+            runner._limited(REPO, 12, False, "spark", "limit: monthly usage 22 is ahead of pace")
+            self.fake.issues[12]["labels"] = [
+                {"name": name} for name in ("loom:ticket", "lane:spark", "loom:running")]
+            status.add(gh, REPO, 12, "Claimed for lane spark (body sha256 abcdef012345)",
+                       time.time(), AUTHORS)
+            runner._limited(REPO, 12, False, "spark", "limit: monthly usage 23 is ahead of pace")
+
+        reports = [line for line in lines if line.startswith("reported ")]
+        events = status.body_events(self.fake.issues[12]["body"])
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(sum("stopped: [limit]" in text for _, text in events), 2)
+
+    def test_new_limit_after_a_different_lane_outcome_is_logged(self):
+        self.fake.add(12, state="running", lane="spark",
+                      body=BODY.replace("Model: model-x", "Model: spark/test"))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        lines = []
+        prior_work = ["Lane spark failed: build failed"]
+        with mock.patch.object(station, "_say", lines.append), \
+                mock.patch.object(runner, "_status_texts", return_value=prior_work), \
+                mock.patch.object(runner, "_stopped"):
+            runner._limited(REPO, 12, False, "spark", "limit: a new provider limit")
+
+        self.assertEqual(len([line for line in lines if line.startswith("reported ")]), 1)
 
     def test_limited_lanes_are_those_with_a_fresh_limit_heartbeat(self):
         d = os.path.join(self.home, "state", "usage")
@@ -11769,7 +11805,7 @@ class VerifyDueTest(unittest.TestCase):
     def test_oldest_shipped_proofless_ticket_and_six_hour_cooldown(self):
         def item(number, shipped_at, **extra):
             return (REPO, {"number": number, "state": "open", "shipped_at": shipped_at,
-                           "body": "- [ ] Live: prints `status ready`",
+                           "body": "## Acceptance criteria\n- [ ] Live: prints `status ready`",
                            "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}],
                            **extra})
         tickets = [item(2, 200), item(1, 100), item(3, 50, has_proof=True)]
@@ -11779,6 +11815,7 @@ class VerifyDueTest(unittest.TestCase):
     def test_a_ticket_the_health_pass_proved_goes_first(self):
         def item(number, shipped_at, **extra):
             return (REPO, {"number": number, "state": "open", "shipped_at": shipped_at,
+                           "body": "## Acceptance criteria\n- [ ] A test passes",
                            "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}],
                            **extra})
         found = station.verify_due([item(1, 100), item(2, 200, health_proof="absent")], {}, 1)
@@ -11791,15 +11828,16 @@ class VerifyDueTest(unittest.TestCase):
 
     def test_verify_due_skips_live_lines_without_exact_strings(self):
         missing = {"number": 4, "state": "open", "shipped_at": 1,
-                   "body": "- [ ] Live: the status appears", "labels": [
+                   "body": "## Acceptance criteria\n- [ ] Live: the status appears", "labels": [
                        {"name": "loom:ticket"}, {"name": "loom:shipped"}]}
-        exact = dict(missing, number=5, body='- [ ] Live: prints `ready`')
+        exact = dict(missing, number=5, body='## Acceptance criteria\n- [ ] Live: prints `ready`')
         self.assertEqual([i["number"] for _, i in station.verify_due(
             [(REPO, missing), (REPO, exact)], {}, 99999)], [5])
 
     def test_a_ticket_whose_proof_was_refused_the_cap_times_is_not_due(self):
         def item(number):
             return (REPO, {"number": number, "state": "open", "shipped_at": number,
+                           "body": "## Acceptance criteria\n- [ ] A test passes",
                            "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]})
         refused = {"%s#1" % REPO: ["why"] * station.VERIFY_REFUSAL_CAP,
                    "%s#2" % REPO: ["why"] * (station.VERIFY_REFUSAL_CAP - 1)}
@@ -11821,6 +11859,13 @@ class StationLogTimeTest(unittest.TestCase):
 SHIPPED_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
                 "- [ ] A test passes\n- [ ] Live: prints `daily status ready`\n")
 HOUR = 3600
+
+
+def verify_merge(number):
+    """A merged change for a ticket whose verification behavior is under test."""
+    return {"number": 90 + number, "state": "closed",
+            "merged_at": "2029-12-31T00:00:00Z", "merge_commit_sha": "a" * 40,
+            "body": "Refs #%d" % number, "head": {"ref": "example-change"}}
 
 
 def shipped_at(age_hours):
@@ -12193,6 +12238,7 @@ class CloseDoneTest(Base):
         self.fake.private = False
         self.fake.add(1, lane="codex", body="Difficulty: easy\n\n## Acceptance criteria\n- [ ] x\n",
                       state="shipped")
+        self.fake.pulls = [verify_merge(1)]
         transport = self.fake
         def request(method, url, headers, body):
             if urlsplit(url).path == "/repos/" + second:
@@ -12409,6 +12455,9 @@ class VerifyDispatchTest(Base):
         self.fake.add(1, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(10))
         self.fake.add(2, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
 
+        # Verification needs a real merged change, not merely a shipped label.
+        self.fake.pulls = [verify_merge(number) for number in (1, 2)]
+
     def briefs(self, lane="codex"):
         try:
             return sorted(n for n in os.listdir(self.inbox(lane)) if n.endswith(".md"))
@@ -12568,6 +12617,7 @@ class VerifyDispatchTest(Base):
         body = SHIPPED_BODY.replace("prints `daily status ready`", "see `weekly sweep finished` in the log")
         self.fake.add(number, lane="codex", body=body, state="shipped",
                       events=shipped_at(age_days * 24))
+        self.fake.pulls.append(verify_merge(number))
         self.fake.issues[number]["labels"] += [{"name": x} for x in labels]
 
     def evidence_says(self, text):
@@ -12881,6 +12931,7 @@ class VerifyDispatchTest(Base):
 
     def merged(self, number, sha, merged_at="2030-01-02T00:00:00Z", body=None, head="x"):
         """A merged pull request for ticket 2, linked by a Refs line."""
+        self.fake.pulls = [pr for pr in self.fake.pulls if pr["number"] not in (91, 92)]
         self.fake.pulls.append({
             "number": number, "state": "closed", "title": "Fix the thing", "merged_at": merged_at,
             "merge_commit_sha": sha, "head": {"ref": head},
@@ -13013,21 +13064,20 @@ class VerifyDispatchTest(Base):
     def test_a_ticket_with_no_merged_pull_request_says_so_in_one_line(self):
         self.fake.pulls = [{"number": 70, "state": "closed", "merged_at": None,
                             "merge_commit_sha": "c" * 40, "body": "Refs %s#2\n" % REPO}]
-        self.run_pass()
-        data = self.github_data()
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        data = runner._verify_github_data(REPO, self.fake.issues[2])
         self.assertEqual(data.count("pull request"), 1)
         self.assertIn("- No merged pull request names this ticket.", data)
         self.assertIn("- [ ] Live: prints `daily status ready`", data)
 
-    def test_a_github_failure_is_one_line_and_the_brief_still_goes_out(self):
+    def test_a_github_failure_is_one_line_in_the_data_section(self):
         self.merged(77, "d" * 40)
         self.fake.check_runs_status = 500
-        self.run_pass()
-        data = self.github_data()
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        data = runner._verify_github_data(REPO, self.fake.issues[2])
         self.assertIn("- GitHub could not be read (status 500); pull request data may be "
                       "missing.", data)
         self.assertNotIn("Pull request #77", data)
-        self.assertIn("Issue: %s#2\n" % REPO, self.text())
 
     def test_a_ticket_is_verified_at_most_once_per_six_hours(self):
         self.run_pass()
@@ -13217,6 +13267,8 @@ class VerifyNoteTest(Base):
         # reserved lane can reach, and the step rotation held on a step that
         # carries over each pass (2026-11-02). After one real pass every
         # overdue ticket has a note or an attempt on the ledger.
+        self.fake.pulls = [verify_merge(n) for n in (1, 2, 3, 4, 5, 6)]
+
         def carried(_station):
             raise TargetReached("other read carried over at request target")
 
@@ -13523,6 +13575,7 @@ class VerifyResultTest(Base):
         self.assertNotIn(5, [issue["number"] for _, issue in pool])
 
     def test_a_ticket_refused_fewer_times_stays_due(self):
+        self.fake.pulls = [verify_merge(5)]
         st = self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
         st.now = time.time() + 10 * station.VERIFY_INTERVAL
         with mock.patch.object(st, "_shipped_stamp", return_value=1), \
@@ -13531,6 +13584,7 @@ class VerifyResultTest(Base):
         self.assertIn(5, [issue["number"] for _, issue in pool])
 
     def test_an_invalid_proof_leaves_the_ticket_shipped_with_no_comment(self):
+        self.fake.pulls = [verify_merge(5)]
         self.result(self.good(criteria=[]))
         self.run_pass()
         self.run_pass()
@@ -13583,6 +13637,7 @@ class VerifyResultTest(Base):
         self.assertNotIn("loom:awaiting-evidence", self.fake.names(5))
 
     def test_a_proof_holding_a_credential_is_refused_with_no_comment(self):
+        self.fake.pulls = [verify_merge(5)]
         self.result(self.good(sources=["token=abcdef0123456789"]))
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
@@ -13590,6 +13645,7 @@ class VerifyResultTest(Base):
         self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
 
     def test_no_verify_json_leaves_it_shipped_with_no_comment(self):
+        self.fake.pulls = [verify_merge(5)]
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(self.fake.comments[5], [])  # a log line, not an email (2026-10-18)
@@ -13868,6 +13924,8 @@ class UnprovenGateTest(unittest.TestCase):
         self.over_limit()
         for n in self.fake.sub_issues[self.GOAL]:
             n["user"] = {"login": "alice-example"}
+            n["body"] = SHIPPED_BODY + "\nPart of #%d\n" % self.GOAL
+            self.fake.pulls.append(verify_merge(n["number"]))
         self.fake.issues[7] = {
             "number": 7, "title": "Fix the thing", "state": "open",
             "body": BODY + "\nPart of #%d\n" % self.GOAL,

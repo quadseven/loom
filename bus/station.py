@@ -694,6 +694,8 @@ LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 VERIFY_REFUSAL_CAP = 3
 # Per ticket, the reasons its proofs were refused.
 VERIFY_REFUSED_FILE = "verify-refused.json"
+VERIFY_MISSING_FILE = "verify-missing.json"
+VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 # A shipped ticket still unverified this long after its ship takes a lane
 # ahead of build work (loom#964): verify used to run only on a lane with
 # nothing else to do, so a busy factory never verified. At most one lane is
@@ -820,27 +822,25 @@ NOTE_MAX = 1500
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                attempts: Dict[str, Any], now: float,
                refused: Optional[Dict[str, Any]] = None,
-               adapter_tickets: Sequence[str] = ()
+               adapter_tickets: Sequence[str] = (),
+               missing: Optional[Dict[str, Any]] = None,
+               check_live: bool = True
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
     (`refused`: ticket -> reasons) is left to the brain."""
     due = []
     for repo, issue in issues:
-        labels = _label_names(issue)
-        needles = live_needles(issue.get("body"))
         key = "%s#%s" % (repo, issue.get("number"))
-        if needles is not None and not needles and key not in adapter_tickets:
-            continue
-        if (issue.get("state") != "open" or "loom:ticket" not in labels
-                or "loom:shipped" not in labels or "loom:verified" in labels
-                or issue.get("has_proof")):
+        if not _verify_candidate(issue, key in adapter_tickets or not check_live):
             continue
         last = attempts.get(key)
         if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
             continue
         reasons = (refused or {}).get(key)
         if isinstance(reasons, list) and len(reasons) >= VERIFY_REFUSAL_CAP:
+            continue
+        if _missing_capped((missing or {}).get(key)):
             continue
         due.append((repo, issue))
     # A ticket the health pass has proved absent for 24 hours goes first: it
@@ -849,6 +849,32 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         not item[1].get("health_proof"),
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def _verify_body_known(issue: Dict[str, Any]) -> bool:
+    return "body" in issue and (issue["body"] is None or isinstance(issue["body"], str))
+
+
+def _verify_active(issue: Dict[str, Any]) -> bool:
+    names = _label_names(issue)
+    return (issue.get("state") == "open" and "loom:shipped" in names
+            and "loom:verified" not in names)
+
+
+def _verify_candidate(issue: Dict[str, Any], adapter: bool = False) -> bool:
+    names = _label_names(issue)
+    if (not _verify_body_known(issue) or issue.get("state") != "open" or "loom:ticket" not in names
+            or "loom:shipped" not in names or "loom:verified" in names
+            or issue.get("has_proof") or not proof.criteria(issue.get("body"))):
+        return False
+    return adapter or live_needles(issue.get("body")) != []
+
+
+def _missing_capped(reasons: Any) -> bool:
+    if isinstance(reasons, dict) and "reasons" in reasons:
+        reasons = reasons["reasons"]
+    return isinstance(reasons, dict) and any(
+        isinstance(count, int) and count >= VERIFY_REFUSAL_CAP for count in reasons.values())
 
 
 def verify_note_text(shipped_at: float, now: float) -> str:
@@ -2217,6 +2243,8 @@ class Station:
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
         self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        # This pass's briefed tickets _repo_pr_held refused, "owner/repo#n".
+        self._cap_held: set = set()
         self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
@@ -2233,6 +2261,7 @@ class Station:
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_complete: Dict[str, bool] = {}
         # The claimed settle's re-review requests, by "repo#pull request", as
         # saved in claimed.json, and how many it has written this run.
         self._claimed_rereviews: Dict[str, Any] = {}
@@ -3254,6 +3283,7 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
@@ -3510,9 +3540,13 @@ class Station:
 
     def _gate_held(self) -> List[str]:
         """The tickets the unproven-work gate refused this pass, "owner/repo#n":
-        the factory neither counts them as lane load nor moves them."""
-        return ["%s#%d" % (hold["repo"], int(number))
-                for hold in self._gate_holds.values() for number in hold["tickets"]]
+        the factory neither counts them as lane load nor moves them. The
+        tickets of a repo held at its open pull request cap are here too: the
+        station will not claim them, and counted, each kept its lane busy for
+        every other repo's queued tickets (2026-11-06, six idle lanes)."""
+        return (["%s#%d" % (hold["repo"], int(number))
+                 for hold in self._gate_holds.values() for number in hold["tickets"]]
+                + sorted(self._cap_held))
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
                          counts: Dict[Tuple[str, int], int]) -> None:
@@ -3654,30 +3688,109 @@ class Station:
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
+        shipped = [(repo, issue) for repo, issue in shipped
+                   if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
                            if self._adapter_can_verify(repo, issue)}
-        unsearchable = sum(1 for repo, issue in shipped
-                           if "loom:shipped" in _label_names(issue)
-                           and live_needles(issue.get("body")) == []
-                           and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
-        if unsearchable:
-            _say("skipped %d shipped tickets whose Live criterion names no exact string" %
-                 unsearchable)
+        self._note_unsearchable(shipped, adapter_tickets)
         refused = self._verify_refused_ledger()
+        missing = self._verify_missing_ledger()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
-        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
+                                      missing, check_live=False):
+            issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
+            if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
+                continue
             if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
                     and self._unmeetable_live(repo, issue, reads)):
                 continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
-            issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused, adapter_tickets), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing), held
+
+    @staticmethod
+    def _note_unsearchable(shipped: Sequence[Tuple[str, Dict[str, Any]]],
+                           adapter_tickets: set) -> None:
+        count = sum(1 for repo, issue in shipped
+                    if "loom:shipped" in _label_names(issue)
+                    and live_needles(issue.get("body")) == []
+                    and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
+        if count:
+            _say("skipped %d shipped tickets whose Live criterion names no exact string" % count)
+
+    def _verify_criteria(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A shipped ticket without boxes belongs to rewrite, not a lane."""
+        if not _verify_body_known(issue):
+            return False
+        names = _label_names(issue)
+        if (issue.get("state") != "open" or "loom:ticket" not in names
+                or "loom:shipped" not in names or "loom:verified" in names
+                or proof.criteria(issue.get("body"))):
+            return True
+        if self._verify_proof_state(repo, int(issue["number"])) is False:
+            self._return_unverifiable(repo, issue, "triage", "no acceptance criteria checkboxes")
+        return False
+
+    def _verify_proof_state(self, repo: str, number: int) -> Optional[bool]:
+        """Read proof absence strictly before routing a shipped ticket away."""
+        path = "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)
+        url = path
+        comments = []
+        for page in range(SHIP_PAGES):
+            response = self.gh.rest("GET", url)
+            if not self._verify_comments_known(response.data):
+                return None
+            comments.extend(response.data)
+            url, known = self._verify_next_page(path, response, page)
+            if not known:
+                return None
+            if not url:
+                return audit.proven(status.resort(comments), self.s.authors)
+        return None
+
+    @staticmethod
+    def _verify_comments_known(data: Any) -> bool:
+        if not isinstance(data, list):
+            return False
+        for comment in data:
+            if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                return False
+            if "user" not in comment:
+                return False
+            user = comment["user"]
+            if user is not None and (not isinstance(user, dict)
+                                     or not isinstance(user.get("login"), str)):
+                return False
+        return True
+
+    def _verify_has_merge(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Unknown or truncated GitHub reads never prove that no PR merged."""
+        _, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return False
+        if pulls:
+            return True
+        if self._closed_complete.get(repo, False):
+            self._return_unverifiable(repo, issue, "queued", "no merged pull request")
+        return False
+
+    def _return_unverifiable(self, repo: str, issue: Dict[str, Any], state: str,
+                             reason: str) -> None:
+        names = _label_names(issue)
+        states = {"loom:" + value for value in brain.STATES + tickets.TICKET_STATES}
+        labels = [n for n in names if n not in states and not n.startswith("lane:")
+                  and n != brain.AWAITING_EVIDENCE]
+        labels.append("loom:" + state)
+        number = int(issue["number"])
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        issue["labels"] = [{"name": n} for n in labels]
+        self._forget_verify_attempt(repo, number)
+        _say("%s#%d left verify for %s: %s" % (repo, number, state, reason))
 
     def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether this opted-in repo can send a prose Live box to a verify
@@ -4328,34 +4441,13 @@ class Station:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
-            klass = failure_class(self._failure_reason(lane, name))
-            if klass in ("transient", "limit"):
-                # The run never looked at the ticket: it costs the ticket no
-                # cooldown, and a lane failing this way twice sits out an hour
-                # (loom#714).
-                self._forget_verify_attempt(repo, number)
-                held = klass == "transient" and self._verify_strike(lane)
-                _say("verify run %s failed [%s]; %s#%d is due again now%s"
-                     % (name, klass, repo, number,
-                        "; lane %s takes no verify run for an hour after %d transient "
-                        "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
-                return True
-            self._verify_clear(lane)
-            # Status, not a fault: the ticket waits its cooldown. The line
-            # names the class and the reason the runner recorded, which it
-            # once left out, so a repeat could not be diagnosed (loom#463);
-            # the log watcher reads it as status (watch.VERIFY_RUN_RE).
-            reason = self._failure_reason(lane, name)
-            _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
-                 "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
-                                     VERIFY_INTERVAL // 3600))
-            return True
+            return self._report_verify_failed(lane, repo, number, name)
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
         issue = self._issue(repo, number)
-        active = (issue.get("state") == "open" and "loom:shipped" in _label_names(issue)
-                  and "loom:verified" not in _label_names(issue))
-        if active and self._adapter_can_verify(repo, issue) and not (
+        if not _verify_active(issue) or self._missing_handoff(repo, number, result, issue, lane + "/" + name):
+            return True
+        if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
             self._adapter_human_ask(repo, number, "no adapter_step was returned",
@@ -4374,6 +4466,30 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
+        klass = failure_class(self._failure_reason(lane, name))
+        if klass in ("transient", "limit"):
+            # The run never looked at the ticket: it costs the ticket no
+            # cooldown, and a lane failing this way twice sits out an hour
+            # (loom#714).
+            self._forget_verify_attempt(repo, number)
+            held = klass == "transient" and self._verify_strike(lane)
+            _say("verify run %s failed [%s]; %s#%d is due again now%s"
+                 % (name, klass, repo, number,
+                    "; lane %s takes no verify run for an hour after %d transient "
+                    "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
+            return True
+        self._verify_clear(lane)
+        # Status, not a fault: the ticket waits its cooldown. The line
+        # names the class and the reason the runner recorded, which it
+        # once left out, so a repeat could not be diagnosed (loom#463);
+        # the log watcher reads it as status (watch.VERIFY_RUN_RE).
+        reason = self._failure_reason(lane, name)
+        _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
+             "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
+                                 VERIFY_INTERVAL // 3600))
         return True
 
     def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
@@ -4590,6 +4706,46 @@ class Station:
         _say("%s#%d: the merged change does not meet its criteria; queued for a build (lane %s)"
              % (repo, number, lane))
 
+    def _verify_missing_ledger(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_MISSING_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _missing_handoff(self, repo: str, number: int, result: Any,
+                         issue: Dict[str, Any], run: str) -> bool:
+        """Count distinct runs, not retries of one partly applied result."""
+        data = self._verify_missing_ledger()
+        key = "%s#%d" % (repo, number)
+        record = data.get(key)
+        record = record if isinstance(record, dict) else {}
+        reasons = record.get("reasons", {})
+        reasons = reasons if isinstance(reasons, dict) else {}
+        runs = record.get("runs", [])
+        runs = runs if isinstance(runs, list) else []
+        if not isinstance(result, dict) or set(result) != {"missing"}:
+            return False
+        reason = self._note_text(result["missing"]).strip()
+        if not _missing_capped(reasons) and run not in runs:
+            count = reasons.get(reason, 0)
+            reasons[reason] = (count if isinstance(count, int) else 0) + 1
+            data[key] = {"reasons": reasons, "runs": runs + [run]}
+            _write_json(os.path.join(self.state, VERIFY_MISSING_FILE), data)
+        if not _missing_capped(reasons):
+            return False
+        self._handoff_missing(repo, number, issue, reason)
+        return True
+
+    def _handoff_missing(self, repo: str, number: int, issue: Dict[str, Any], reason: str) -> None:
+        if "needs-brain" in _label_names(issue):
+            return
+        if not any(text.startswith(VERIFY_MISSING_MARKER)
+                   for text in self._status_texts(repo, number)):
+            notify.post(self.gh, repo, number,
+                        VERIFY_MISSING_MARKER + "\n"
+                        "The station stops handing this ticket out to verify after %d "
+                        "missing answers with the same reason. The brain must prove or "
+                        "rewrite it.\n\n%s" % (VERIFY_REFUSAL_CAP, reason), notify.PROOF_REFUSED)
+        self._add_label(repo, number, "needs-brain")
+
     def _verify_refused_ledger(self) -> Dict[str, Any]:
         # One station pass runs at a time (run() holds station.lock) and applies
         # verify results one after another, and _write_json replaces the file
@@ -4598,9 +4754,10 @@ class Station:
         return data if isinstance(data, dict) else {}
 
     def _forget_refusals(self, repo: str, number: int) -> None:
-        data = self._verify_refused_ledger()
-        if data.pop("%s#%d" % (repo, number), None) is not None:
-            _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+        for filename in (VERIFY_REFUSED_FILE, VERIFY_MISSING_FILE):
+            data = _read_json(os.path.join(self.state, filename), {}, strict=False)
+            if isinstance(data, dict) and data.pop("%s#%d" % (repo, number), None) is not None:
+                _write_json(os.path.join(self.state, filename), data)
 
     def _proof_refused(self, repo: str, number: int, lane: str, names: List[str],
                        why: str) -> None:
@@ -5041,6 +5198,7 @@ class Station:
         if self._last_repo_pr_hold(repo, int(issue["number"])) != reason:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
+        self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
@@ -5981,19 +6139,62 @@ class Station:
         requests survives."""
         if repo not in self._closed_cache:
             pulls: List[Dict[str, Any]] = []
+            complete = True
             url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                                   "&direction=desc&per_page=100" % repo)
-            for _ in range(SHIP_PAGES):
+            for page in range(SHIP_PAGES):
                 resp = self.gh.rest("GET", url)
-                for pr in resp.data if isinstance(resp.data, list) else []:
-                    if isinstance(pr, dict) and pr.get("merged_at") \
-                            and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
-                        pulls.append(pr)
-                url = _next_link(resp.headers.get("link", ""))
+                merged, known = self._closed_page(resp.data)
+                pulls.extend(merged)
+                url, pagination_known = self._closed_next(repo, resp, page)
+                complete = complete and known and pagination_known
                 if not url:
                     break
+            self._closed_complete[repo] = complete and not url
             self._closed_cache[repo] = pulls
         return self._closed_cache[repo]
+
+    def _closed_page(self, data: Any) -> Tuple[List[Dict[str, Any]], bool]:
+        if not isinstance(data, list):
+            return [], False
+        merged = []
+        complete = True
+        for pr in data:
+            if not isinstance(pr, dict) or "merged_at" not in pr:
+                complete = False
+            elif pr["merged_at"] is not None:
+                if (isinstance(pr["merged_at"], str) and metrics.stamp(pr["merged_at"]) > 0
+                        and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
+                        and isinstance(pr.get("head") or {}, dict)):
+                    merged.append(pr)
+                    complete = complete and self._verify_link_fields(pr)
+                else:
+                    complete = False
+        return merged, complete
+
+    @staticmethod
+    def _closed_next(repo: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        path = "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % repo
+        return Station._verify_next_page(path, resp, page)
+
+    @staticmethod
+    def _verify_next_page(path: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        link = resp.headers.get("link", "")
+        following = _next_link(link)
+        if not following and "next" in link:
+            return None, False
+        if not following and isinstance(resp.data, list) and len(resp.data) >= 100:
+            # Cached full pages can lose their next link; probe one more page.
+            following = path + "&page=%d" % (page + 2)
+        return following, True
+
+    @staticmethod
+    def _verify_link_fields(pr: Dict[str, Any]) -> bool:
+        """Absent linkage fields are unknown, not evidence of no reference."""
+        head = pr.get("head")
+        return ("body" in pr and (pr["body"] is None or isinstance(pr["body"], str))
+                and isinstance(head, dict) and isinstance(head.get("ref"), str)
+                and bool(head["ref"]))
 
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""
@@ -8085,6 +8286,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
+        repeated = self._limit_already_reported(repo, number, lane)
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
                       wait="" if fix else "model-limit")
         # No new comment: a limit is not news, and one comment a bounce
@@ -8092,7 +8294,23 @@ class Station:
         # event is an edit, and it ends the claim as [limit], so the runaway
         # detector does not count it as work.
         self._stopped(repo, number, lane, "limit", reason)
-        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+        if not repeated:
+            _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _limit_already_reported(self, repo: str, number: int, lane: str) -> bool:
+        """Whether this lane's latest outcome for the ticket was already a limit.
+
+        Reclaims are routine while a provider limit persists. Keep each claim's
+        [limit] status event for the attempt ledger, but log the condition only
+        once until this lane later has a different outcome.
+        """
+        events = self._status_texts(repo, number)
+        prefix = "Lane %s stopped: [limit] " % lane
+        for event in reversed(events):
+            if event.startswith("Claimed for lane "):
+                continue
+            return event.startswith(prefix)
+        return False
 
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
@@ -15406,6 +15624,18 @@ class Station:
             synced.append(repo)
             _write_json(path, {"digest": digest, "repos": synced})
 
+    def _feed_lanes(self) -> None:
+        """Run assign_queued unless the pass is deferred; a GitHub or disk
+        failure is logged and the pass goes on."""
+        if self._deferred():
+            return
+        try:
+            self._timed(self.assign_queued)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("assign_queued failed: %s" % err)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -15427,6 +15657,11 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # Briefing a queued ticket onto a free lane comes before the heavy
+            # reads: reconcile_pull_requests and claim_new spend the pass's
+            # request target, and on 2026-11-07 assign_queued carried over
+            # behind them pass after pass, leaving free lanes idle.
+            self._feed_lanes()
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
@@ -15450,13 +15685,8 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
-            if not self._deferred():
-                try:
-                    self._timed(self.assign_queued)
-                except RateLimited:
-                    raise
-                except (GitHubError, OSError) as err:
-                    _say("assign_queued failed: %s" % err)
+            # Again after the claims, for a ticket claimed in this pass.
+            self._feed_lanes()
             try:
                 self.record_scans()
             except OSError as err:
