@@ -10,11 +10,11 @@ station reads each endpoint and, per finding:
   (cause(): "Ana is stuck: X" and "3 members are stuck: X" are one problem):
   the finding's marker is added to that ticket, so one cause keeps one
   rolling ticket;
-- notes on the ticket, at most once every RESEEN_EVERY, how often its
-  problem was seen again (joined by another finding, or back after it went
-  absent) and when it was last seen;
-- on the open ticket, moves the Priority line when the band changes and
-  posts the new numbers at most every EVIDENCE_EVERY;
+- keeps one rolling evidence block in the body with first seen, last seen,
+  observation count and the current numbers, and moves Priority when the
+  band changes;
+- comments when an absent ticket's problem returns, never for routine
+  observations or changed numbers;
 - once the finding is gone, posts one "finding absent since" comment, the
   evidence the brain verifies against. A finding that flaps edits that one
   note (at most once every RESEEN_EVERY) and posts no second one. The note
@@ -70,13 +70,12 @@ from .github import GitHub, GitHubError, _OPENER
 
 EVERY = 900
 PER_PASS = 3
-EVIDENCE_EVERY = 6 * 3600
 # A finding still reported this long after its ticket shipped is a
 # regression of that ticket; one ticket is re-briefed at most every
 # REGRESS_EVERY (loom#484).
 REGRESS_AFTER = 24 * 3600
 REGRESS_EVERY = 48 * 3600
-# A ticket says at most once a day how often its problem was seen again.
+# A flapping ticket edits its one absent note at most once a day.
 RESEEN_EVERY = 24 * 3600
 # A finding's ledger record outlives its ticket and its last report by this
 # long, so a ticket closed as not planned while the finding was quiet is still
@@ -91,6 +90,10 @@ TITLE_MAX = 90
 MARKER = "<!-- loom:health key=%s -->"
 MARKER_RE = re.compile(r"<!-- loom:health key=([0-9a-f]{40}) -->")
 EVIDENCE_MARKER = "<!-- loom:health-evidence -->"
+EVIDENCE_END = "<!-- /loom:health-evidence -->"
+EVIDENCE_BLOCK_RE = re.compile(re.escape(EVIDENCE_MARKER) + r"\n.*?" +
+                               re.escape(EVIDENCE_END), re.S)
+EVIDENCE_TOTAL_RE = re.compile(r"First seen: ([0-9TZ:-]+)\nLast seen: [0-9TZ:-]+\nCount: ([0-9]+)\n")
 ABSENT_MARKER = "<!-- loom:health-absent -->"
 PROOF_MARKER = "<!-- loom:health-proof -->"
 # A finding absent this long since the later of its absent stamp and its
@@ -790,6 +793,25 @@ def evidence_comment(f: Finding, checked_at: str) -> str:
                _count(f.affected), _count(f.hours), _count(f.impact), f.priority, quoted(f)))
 
 
+def rolling_evidence(body: str, observed: List[Finding], checked: str) -> str:
+    """Replace only the owned block; its totals survive loss of local state.
+
+    Count successful passes observing this ticket, not keys or changed numbers.
+    Legacy tickets start counting with their first observed pass after upgrade.
+    """
+    old = EVIDENCE_BLOCK_RE.search(body)
+    totals = EVIDENCE_TOTAL_RE.search(old.group(0)) if old else None
+    first = totals.group(1) if totals else checked
+    count = int(totals.group(2)) + 1 if totals else 1
+    reports = [evidence_comment(f, checked).removeprefix(EVIDENCE_MARKER + "\n")
+               for f in observed]
+    block = ("%s\n## Health evidence\n\nFirst seen: %s\nLast seen: %s\nCount: %d\n\n%s\n%s"
+             % (EVIDENCE_MARKER, first, checked, count, "\n\n".join(reports), EVIDENCE_END))
+    if old:
+        return body[:old.start()] + block + body[old.end():]
+    return body.rstrip("\n") + "\n\n" + block + "\n"
+
+
 def regression_title(f: Finding) -> str:
     return "Health regression: " + f.title
 
@@ -829,10 +851,10 @@ def cause(title: str) -> str:
     return "%s: %s" % match.groups() if match else line
 
 
-def reseen_comment(count: int, last: str) -> str:
-    return ("%s\nSeen again %d time%s so far, last seen %s: the health endpoint reported "
-            "this ticket's problem again, and loom tracks it here instead of filing a new "
-            "ticket." % (RESEEN_MARKER, count, "" if count == 1 else "s", last))
+def reseen_comment(last: str) -> str:
+    return ("%s\nThe health endpoint reports this ticket's problem again after it was "
+            "absent; last seen %s. The rolling evidence is in the ticket body."
+            % (RESEEN_MARKER, last))
 
 
 def absent_comment(when: str, count: int = 1) -> str:
@@ -944,7 +966,6 @@ class Intake:
         self.brief = brief
         self.filed = 0
         self.regressed: Dict[str, Any] = {}
-        self.reseen: Dict[str, Any] = {}
 
     def run(self, sources: List[Source]) -> None:
         looked = self.state.setdefault("sources", {})
@@ -955,10 +976,12 @@ class Intake:
                                             else ())
                           if isinstance(v, (int, float)) and 0 <= self.now - v < REGRESS_EVERY}
         self.state["regressed"] = self.regressed
-        reseen = self.state.get("reseen")
-        self.reseen = {k: v for k, v in (reseen.items() if isinstance(reseen, dict) else ())
-                       if isinstance(v, dict)}
-        self.state["reseen"] = self.reseen
+        # Old pending seen-again counters must not emit comments on upgrade.
+        self.state.pop("reseen", None)
+        pending = self.state.get("return_pending")
+        self.return_pending = {k: v for k, v in (pending.items() if isinstance(pending, dict)
+                                                else ()) if _epoch(v) is not None}
+        self.state["return_pending"] = self.return_pending
         # "owner/name#N" -> {"noted": when its absent note was last written,
         # "id": that comment, "count": how often the finding went absent}.
         noted = self.state.get("absent_noted")
@@ -1005,11 +1028,11 @@ class Intake:
                     and self.now - float(rec.setdefault("gone", self.now)) < RETAIN:
                 continue
             del ledger[digest]
-        self._post_reseen(source.repo, issues)
         prefix = source.repo + "#"
-        for key in [k for k in self.absent_noted if k.startswith(prefix)]:
-            if not key[len(prefix):].isdigit() or int(key[len(prefix):]) not in issues:
-                del self.absent_noted[key]
+        for notes in (self.absent_noted, self.return_pending):
+            for key in [k for k in notes if k.startswith(prefix)]:
+                if not key[len(prefix):].isdigit() or int(key[len(prefix):]) not in issues:
+                    del notes[key]
 
     def _update(self, source: Source, found: List[Finding], ledger: Dict[str, Any],
                 checked: str) -> Dict[str, Dict[str, Any]]:
@@ -1019,6 +1042,12 @@ class Intake:
         # Causes briefed in this pass: their ticket is joined on the next
         # pass, once the issue list carries it.
         briefed: set = set()
+        observed: Dict[int, Tuple[Dict[str, Any], List[Finding]]] = {}
+        owned: Dict[int, List[str]] = {}
+        for digest, issue in open_by_digest.items():
+            owned.setdefault(int(issue["number"]), []).append(digest)
+        returning = {number for number, digests in owned.items()
+                     if all(ledger.get(d, {}).get("absent") for d in digests)}
         for f in found:
             rec = ledger.setdefault(f.digest, {})
             issue = open_by_digest.get(f.digest)
@@ -1026,12 +1055,24 @@ class Intake:
             if issue is None:
                 issue = _same_cause(by_cause, "%s|%s" % named)
                 if issue is not None:
-                    self._join(source, f, rec, issue, checked)
+                    self._join(source, f, rec, issue)
                     open_by_digest[f.digest] = issue
                 elif named in briefed:
                     continue
+            if issue is not None and int(issue["number"]) in returning:
+                key = "%s#%d" % (source.repo, int(issue["number"]))
+                self.return_pending.setdefault(key, checked or self.stamp)
             if self._finding(source, f, rec, issue, checked):
                 briefed.add(named)
+            if issue is not None:
+                observed.setdefault(int(issue["number"]), (issue, []))[1].append(f)
+        for number, (issue, present) in observed.items():
+            self._write_evidence(source.repo, issue, present, checked or self.stamp)
+            key = "%s#%d" % (source.repo, number)
+            if key in self.return_pending:
+                self._comment(source.repo, issue, reseen_comment(self.return_pending[key]),
+                              notify.EVIDENCE)
+                del self.return_pending[key]
         return open_by_digest
 
     def _absent(self, repo: str, open_by_digest: Dict[str, Dict[str, Any]], current: set,
@@ -1228,10 +1269,10 @@ class Intake:
         return out, by_cause
 
     def _join(self, source: Source, f: Finding, rec: Dict[str, Any],
-              issue: Dict[str, Any], checked: str) -> None:
+              issue: Dict[str, Any]) -> None:
         """Track the finding on the open ticket of its cause: add its marker
         to the body, raise the Priority line when the finding is more urgent
-        (never lower it), and count it as seen again."""
+        (never lower it), and include it in the rolling evidence."""
         number = int(issue["number"])
         body = str(issue.get("body") or "").rstrip("\n") + "\n" + MARKER % f.digest + "\n"
         raised = tickets.PRIORITIES.index(f.priority) \
@@ -1241,59 +1282,34 @@ class Intake:
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (source.repo, number), {"body": body})
         issue["body"] = body
         rec.clear()
-        rec.update(ticket=number, band=f.priority, posted=[f.affected, f.evidence],
-                   commented=self.now)
-        self._seen_again(source.repo, number, checked)
+        rec.update(ticket=number, band=f.priority)
         self.say("health %s: finding %s joined #%d, the open ticket of the same cause%s"
                  % (source.key, f.digest[:12], number,
                     "; priority now %s" % f.priority if raised else ""))
 
-    def _seen_again(self, repo: str, number: int, checked: str) -> None:
-        entry = self.reseen.setdefault("%s#%d" % (repo, number), {})
-        entry["count"] = int(entry.get("count") or 0) + 1
-        entry["last"] = checked or self.stamp
-
-    def _post_reseen(self, repo: str, issues: Dict[int, Dict[str, Any]]) -> None:
-        """Post each open ticket's seen-again count when it grew, at most once
-        every RESEEN_EVERY; forget the tickets of this repo that closed."""
-        prefix = repo + "#"
-        for key in [k for k in self.reseen if k.startswith(prefix)]:
-            number = key[len(prefix):]
-            if not number.isdigit() or int(number) not in issues:
-                del self.reseen[key]
-                continue
-            entry = self.reseen[key]
-            count = int(entry.get("count") or 0)
-            if count > int(entry.get("posted") or 0) \
-                    and self.now - float(entry.get("noted") or 0) >= RESEEN_EVERY:
-                self._comment(repo, issues[int(number)],
-                              reseen_comment(count, str(entry.get("last") or self.stamp)),
-                              notify.EVIDENCE)
-                entry.update(posted=count, noted=self.now)
+    def _write_evidence(self, repo: str, issue: Dict[str, Any],
+                        observed: List[Finding], checked: str) -> None:
+        body = rolling_evidence(str(issue.get("body") or ""), observed, checked)
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
+                     {"body": body})
+        issue["body"] = body
 
     def _finding(self, source: Source, f: Finding, rec: Dict[str, Any],
                  issue: Optional[Dict[str, Any]], checked: str) -> bool:
         """Update the finding's open ticket, or file one. True when a ticket
         was briefed."""
-        back = rec.pop("absent", None)
+        rec.pop("absent", None)
         rec.pop("proved", None)
         rec.pop("held", None)
         rec.pop("refused", None)
         rec.pop("gone", None)
         if issue is None:
-            return self._file(source, f, rec)
+            return self._file(source, f, rec, checked or self.stamp)
         rec["ticket"] = int(issue["number"])
-        if back:
-            self._seen_again(source.repo, int(issue["number"]), checked)
         if rec.get("band") != f.priority:
             if rec.get("band") is not None or tickets.priority_of(issue) != f.priority:
                 self._set_priority(source.repo, issue, f.priority)
             rec["band"] = f.priority
-        posted = [f.affected, f.evidence]
-        if rec.get("posted") != posted and self.now - float(rec.get("commented") or 0) \
-                >= EVIDENCE_EVERY:
-            self._comment(source.repo, issue, evidence_comment(f, checked), notify.EVIDENCE)
-            rec.update(posted=posted, commented=self.now)
         self._regression(source, f, rec, issue)
         return False
 
@@ -1378,14 +1394,15 @@ class Intake:
                 return max(stamps)
         return None
 
-    def _file(self, source: Source, f: Finding, rec: Dict[str, Any]) -> bool:
+    def _file(self, source: Source, f: Finding, rec: Dict[str, Any], checked: str) -> bool:
         if self._declined(source.repo, rec):
             return False
         if self.filed >= PER_PASS:
             return False
+        body = ticket_body(f, diagnosis(source.diagnose, f.key, self.clock))
         try:
             url = self.brief(self.gh, source.repo, source.goal, ticket_title(f),
-                             ticket_body(f, diagnosis(source.diagnose, f.key, self.clock)),
+                             rolling_evidence(body, [f], checked),
                              difficulty="medium", priority=f.priority)
         except ValueError as err:
             if rec.get("brief_error") != str(err):
@@ -1396,7 +1413,7 @@ class Intake:
         self.filed += 1
         number = url.rstrip("/").rpartition("/")[2]
         rec.clear()
-        rec.update(band=f.priority, posted=[f.affected, f.evidence], commented=self.now)
+        rec.update(band=f.priority)
         if number.isdigit():
             rec["ticket"] = int(number)
         self.say("health %s: briefed %s (%s)" % (source.key, url, f.priority))

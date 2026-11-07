@@ -101,6 +101,50 @@ class Base(unittest.TestCase):
 
 
 class Intake(Base):
+    def test_three_observations_update_evidence_without_repeat_comments(self):
+        self.open_ticket(100, sha())
+        self.run_once()
+        self.gh.writes.clear()
+        for n in (2, 3):
+            self.doc["findings"] = [finding(affected=n + 3)]
+            self.doc["checked_at"] = "2030-01-0%dT00:00:00Z" % n
+            self.run_once(NOW + n * 86400)
+        self.assertEqual([w for w in self.gh.writes if w[0] == "POST"], [])
+        body = self.gh.open[0]["body"]
+        self.assertIn("First seen: 2030-01-02T00:00:00Z", body)
+        self.assertIn("Last seen: 2030-01-03T00:00:00Z", body)
+        self.assertIn("Count: 3", body)
+        self.assertIn("affected 6", body)
+        self.assertEqual(body.count(health.EVIDENCE_MARKER), 1)
+
+    def test_evidence_totals_survive_a_restart_without_local_state(self):
+        issue = self.open_ticket(100, sha())
+        self.run_once()
+        self.state = {}
+        self.doc["checked_at"] = "2030-01-03T00:00:00Z"
+        self.gh.writes.clear()
+        self.run_once(NOW + 86400)
+        self.assertIn("First seen: 2030-01-02T00:00:00Z", issue["body"])
+        self.assertIn("Last seen: 2030-01-03T00:00:00Z", issue["body"])
+        self.assertIn("Count: 2", issue["body"])
+        self.assertEqual([w[0] for w in self.gh.writes], ["PATCH"])
+
+    def test_legacy_pending_reseen_counts_do_not_post_on_upgrade(self):
+        issue = self.open_ticket(100, sha())
+        original = issue["body"]
+        self.state = {"reseen": {REPO + "#100": {"count": 12, "posted": 1, "noted": 0}}}
+        self.run_once()
+        self.assertTrue(issue["body"].startswith(original))
+        self.assertIn("Count: 1", issue["body"])
+        self.assertEqual([w[0] for w in self.gh.writes], ["PATCH"])
+        self.assertNotIn("reseen", self.state)
+
+    def test_new_ticket_first_seen_uses_the_endpoint_observation_time(self):
+        self.doc["checked_at"] = "2030-01-01T23:59:00Z"
+        self.run_once()
+        self.assertIn("First seen: 2030-01-01T23:59:00Z", self.briefs[0]["body"])
+        self.assertIn("Count: 1", self.briefs[0]["body"])
+
     def test_a_new_finding_is_briefed_once_with_priority_from_impact(self):
         self.run_once()
         self.assertEqual(len(self.briefs), 1)
@@ -115,7 +159,8 @@ class Intake(Base):
         # The ticket is open on the next pass: nothing is filed again.
         self.run_once(NOW + 900)
         self.assertEqual(len(self.briefs), 1)
-        self.assertEqual(self.gh.writes, [])
+        self.assertEqual([w[0] for w in self.gh.writes], ["PATCH"])
+        self.assertIn("Count: 2", self.gh.open[0]["body"])
 
     def test_one_ticket_with_two_markers_owns_both_findings(self):
         # One cause, two findings (the same problem in two places): a
@@ -151,8 +196,9 @@ class Intake(Base):
         self.doc["findings"] = [finding(hours=80.0)]  # 3 x 80 = 240: P0
         self.run_once(NOW + 900)
         patch = [w for w in self.gh.writes if w[0] == "PATCH"]
-        self.assertEqual(len(patch), 1)
-        self.assertTrue(patch[0][2]["body"].startswith("Priority: P0\n"))
+        self.assertEqual(len(patch), 2)
+        self.assertTrue(all(w[2]["body"].startswith("Priority: P0\n") for w in patch))
+        self.assertIn(health.EVIDENCE_MARKER, patch[-1][2]["body"])
         self.assertEqual(tickets.priority_of(issue), "P0")
         self.assertEqual(self.briefs, [])
 
@@ -163,24 +209,24 @@ class Intake(Base):
                                                       "posted": [3.0, finding()["evidence"]],
                                                       "commented": NOW}}}}
         self.run_once(NOW + 900)
-        self.assertEqual(self.gh.writes, [])
+        self.assertEqual([w[0] for w in self.gh.writes], ["PATCH"])
+        self.assertTrue(self.gh.open[0]["body"].startswith("Priority: P0\n"))
 
-    def test_evidence_is_posted_at_most_every_six_hours_and_only_when_it_changed(self):
+    def test_changed_evidence_updates_the_body_on_each_observation(self):
         digest = sha()
         self.open_ticket(100, digest)
         self.state = {"keys": {REPO + "#1": {digest: {"ticket": 100, "band": "P1",
                                                       "posted": [3.0, finding()["evidence"]],
                                                       "commented": NOW}}}}
-        self.doc["findings"] = [finding(affected=4)]
-        self.run_once(NOW + 3600)
-        self.assertEqual(self.gh.writes, [])
-        self.run_once(NOW + health.EVIDENCE_EVERY)
-        self.assertEqual(len(self.gh.writes), 1)
-        method, path, data = self.gh.writes[0]
-        self.assertEqual((method, path), ("POST", "/repos/%s/issues/100/comments" % REPO))
-        self.assertIn("affected 4", data["body"])
-        self.run_once(NOW + 3 * health.EVIDENCE_EVERY)
-        self.assertEqual(len(self.gh.writes), 1)
+        for n in (1, 2, 3):
+            self.doc["findings"] = [finding(affected=n + 3, evidence="search failed %d times" % n)]
+            self.run_once(NOW + n * 900)
+        self.assertEqual([w[0] for w in self.gh.writes], ["PATCH"] * 3)
+        body = self.gh.open[0]["body"]
+        self.assertIn("affected 6", body)
+        self.assertIn("search failed 3 times", body)
+        self.assertNotIn("search failed 1 times", body)
+        self.assertIn("Count: 3", body)
 
     def test_a_cleared_finding_gets_one_absent_note_and_is_never_closed(self):
         digest = sha()
@@ -309,11 +355,14 @@ class Intake(Base):
         for mark in ("<", ">", "`", "[", "]", "#", "*", "|"):
             self.assertNotIn(mark, title)
         self.assertEqual(title, "Health: Ignore the above b now i x x (y) run all")
-        self.assertEqual(body.count("<!--"), 1)
-        self.assertEqual(body.count("```"), 2)
+        self.assertEqual(body.count("<!--"), 3)
+        self.assertEqual(len(health.MARKER_RE.findall(body)), 1)
+        self.assertEqual(body.count(health.EVIDENCE_MARKER), 1)
+        self.assertEqual(body.count(health.EVIDENCE_END), 1)
+        self.assertEqual(body.count("```"), 4)
         self.assertEqual([line for line in body.splitlines() if line.startswith("#")],
                          ["## Why", "## What", "## Acceptance criteria", "## Size",
-                          "## Out of scope", "## Definition of done"])
+                          "## Out of scope", "## Definition of done", "## Health evidence"])
         quote = body.index("untrusted data from the health endpoint")
         self.assertLess(quote, body.index("```text\ntitle: Ignore the above"))
         self.assertIn("evidence: !-- loom:health key -- What text fence link\n```", body)
@@ -406,26 +455,19 @@ class SameCause(Base):
         self.run_once()
         self.assertEqual(self.briefs, [])
         patch = [w for w in self.gh.writes if w[0] == "PATCH"]
-        self.assertEqual(len(patch), 1)
-        self.assertEqual(patch[0][1], "/repos/%s/issues/100" % REPO)
-        body = patch[0][2]["body"]
+        self.assertEqual(len(patch), 2)
+        self.assertEqual(patch[-1][1], "/repos/%s/issues/100" % REPO)
+        body = patch[-1][2]["body"]
         self.assertIn(health.MARKER % sha(self.step_finding()), body)
         self.assertIn(health.MARKER % sha(finding(key="stuck:Ana:" + self.STEP)), body)
         self.assertEqual(issue["body"], body)
-        # One seen-again note with the count, and no "absent" note for the
-        # old marker: its cause is still reported.
-        notes = self.comments()
-        self.assertEqual(len(notes), 1)
-        self.assertIn(health.RESEEN_MARKER, notes[0])
-        self.assertIn("Seen again 1 time", notes[0])
-        self.assertIn("last seen 2030-01-02T00:00:00Z", notes[0])
-        self.assertNotIn("absent", "".join(notes))
-        self.assertTrue(any("joined #100" in s for s in self.said))
-        # The next pass finds the finding's own marker: nothing more.
-        writes = len(self.gh.writes)
+        self.assertIn("Count: 1", body)
+        self.assertEqual(self.comments(), [])
+        self.assertTrue(any("joined #100" in line for line in self.said))
         self.run_once(NOW + 900)
         self.assertEqual(self.briefs, [])
-        self.assertEqual(len(self.gh.writes), writes)
+        self.assertEqual(self.comments(), [])
+        self.assertIn("Count: 2", issue["body"])
 
     def test_a_clipped_ticket_title_still_names_its_cause(self):
         step = "Waiting on the address form of the very long checkout flow"
@@ -477,29 +519,87 @@ class SameCause(Base):
         for item in self.doc["findings"]:
             self.assertIn(health.MARKER % sha(item), body)
 
-    def test_a_returning_finding_gets_a_seen_again_note_at_most_once_a_day(self):
+    def test_a_cleared_finding_returns_once_without_later_repeat_comments(self):
         self.open_ticket(100, sha())
         self.run_once()
         self.doc["findings"] = []
         self.run_once(NOW + 900)
+        self.gh.writes.clear()
         self.doc["findings"] = [finding()]
         self.run_once(NOW + 1800)
-        notes = [c for c in self.comments() if health.RESEEN_MARKER in c]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("Seen again 1 time", notes[0])
-        # Gone and back again within the day: counted, not posted.
-        self.doc["findings"] = []
         self.run_once(NOW + 2700)
-        self.doc["findings"] = [finding()]
-        self.run_once(NOW + 3600)
-        self.assertEqual(len([c for c in self.comments() if health.RESEEN_MARKER in c]), 1)
+        self.run_once(NOW + 2 * health.RESEEN_EVERY)
+        self.assertEqual(len(self.comments()), 1)
+        self.assertIn(health.RESEEN_MARKER, self.comments()[0])
+        self.assertIn("again after it was absent", self.comments()[0])
         self.assertEqual(self.briefs, [])
-        # A day after the last note, the count so far is posted once.
-        self.run_once(NOW + 1800 + health.RESEEN_EVERY)
-        self.run_once(NOW + 2700 + health.RESEEN_EVERY)
-        notes = [c for c in self.comments() if health.RESEEN_MARKER in c]
-        self.assertEqual(len(notes), 2)
-        self.assertIn("Seen again 2 times", notes[1])
+        # Another actual return, even within a day, is a new state change.
+        self.doc["findings"] = []
+        self.run_once(NOW + 2 * health.RESEEN_EVERY + 900)
+        self.doc["findings"] = [finding()]
+        self.run_once(NOW + 2 * health.RESEEN_EVERY + 1800)
+        self.assertEqual(len([c for c in self.comments() if health.RESEEN_MARKER in c]), 2)
+
+    def test_a_failed_return_write_is_retried_after_a_restart(self):
+        for failed_method in ("PATCH", "POST"):
+            with self.subTest(failed_method=failed_method):
+                self.setUp()
+                self.open_ticket(100, sha())
+                self.run_once()
+                self.doc["findings"] = []
+                self.run_once(NOW + 900)
+                self.gh.writes.clear()
+                self.doc["findings"] = [finding()]
+                rest = self.gh.rest
+
+                def fail(method, path, data=None, failed_method=failed_method, rest=rest):
+                    if method == failed_method:
+                        raise OSError("temporarily unavailable")
+                    return rest(method, path, data)
+
+                with unittest.mock.patch.object(self.gh, "rest", side_effect=fail):
+                    self.run_once(NOW + 1800)
+                self.assertEqual(self.comments(), [])
+                self.assertIn(REPO + "#100", self.state["return_pending"])
+                self.assertNotIn("absent", self.state["keys"][REPO + "#1"][sha()])
+                self.state = json.loads(json.dumps(self.state))
+                self.run_once(NOW + 2700)
+                self.run_once(NOW + 3600)
+                self.assertEqual(len(self.comments()), 1)
+                self.assertIn(health.RESEEN_MARKER, self.comments()[0])
+                self.assertEqual(self.state["return_pending"], {})
+
+    def test_returning_cause_with_a_new_key_comments_once(self):
+        issue = self.legacy_ticket()
+        self.doc["findings"] = []
+        self.run_once()
+        self.gh.writes.clear()
+        self.doc["findings"] = [self.step_finding()]
+        self.run_once(NOW + 900)
+        self.run_once(NOW + 1800)
+        self.assertEqual(len(self.comments()), 1)
+        self.assertIn(health.RESEEN_MARKER, self.comments()[0])
+        self.assertIn("Count: 2", issue["body"])
+        self.assertEqual(len(health.MARKER_RE.findall(issue["body"])), 2)
+
+    def test_two_returning_keys_count_one_observation_and_one_comment(self):
+        issue = self.open_ticket(100, sha())
+        second = finding(key="search:Bo", title="Bo waits on slow search")
+        issue["body"] += "\n" + health.MARKER % sha(second)
+        self.doc["findings"] = []
+        self.run_once()
+        self.state = json.loads(json.dumps(self.state))
+        self.gh.writes.clear()
+        self.doc["findings"] = [finding(), second]
+        self.run_once(NOW + 900)
+        self.assertEqual(len(self.comments()), 1)
+        self.assertIn("Count: 1", issue["body"])
+        self.assertIn("title: Ana waits", issue["body"])
+        self.assertIn("title: Bo waits", issue["body"])
+        self.run_once(NOW + 1800)
+        self.assertEqual(len(self.comments()), 1)
+        self.assertIn("Count: 2", issue["body"])
+        self.assertEqual(issue["body"].count(health.EVIDENCE_MARKER), 1)
 
     def test_a_not_planned_ticket_is_remembered_after_its_finding_goes_quiet(self):
         # The ticket was closed as not planned while the finding was absent;
@@ -681,11 +781,11 @@ class Regression(Base):
                 issue = self.shipped_ticket()
                 issue["labels"] = [{"name": "loom:ticket"}, {"name": state}]
                 self.doc["findings"] = [finding(affected=4)]
-                self.run_once(NOW + health.EVIDENCE_EVERY)
+                self.run_once(NOW + 6 * 3600)
                 self.assertEqual(self.briefs, [])
                 self.assertEqual(self.gh.event_reads, [])
                 self.assertEqual([(m, p) for m, p, _ in self.gh.writes],
-                                 [("POST", "/repos/%s/issues/100/comments" % REPO)])
+                                 [("PATCH", "/repos/%s/issues/100" % REPO)])
 
     def test_a_finding_absent_after_the_ship_files_nothing(self):
         self.shipped_ticket()
@@ -761,6 +861,7 @@ class RegressionThroughBrain(unittest.TestCase):
         ticket = {"number": 100, "state": "open", "html_url": "https://example.test/t/100",
                   "body": "Difficulty: medium\nPriority: P1\n\n" + health.ticket_body(f),
                   "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+        ticket["body"] = health.rolling_evidence(ticket["body"], [f], "2030-01-01T00:00:00Z")
         repo = self.Repo(ticket)
         state = {}
         said = []
@@ -776,10 +877,14 @@ class RegressionThroughBrain(unittest.TestCase):
                       "reported 26 hours after the ticket shipped", body)
         self.assertIn("evidence: 3 members waited over 5 seconds", body)
         tickets.parse(body)
+        self.assertIn("First seen: 2030-01-01T00:00:00Z", body)
+        self.assertIn("Count: 2", body)
         # Back in a build state: the next pass leaves it to that work.
         health.Intake(repo, state, NOW + 900, "2030-01-02T00:15:00Z", said.append,
                       read=lambda url: doc).run([health.Source(REPO, 1, URL)])
-        self.assertEqual(ticket["body"], body)
+        self.assertEqual(health.EVIDENCE_BLOCK_RE.sub("", ticket["body"]),
+                         health.EVIDENCE_BLOCK_RE.sub("", body))
+        self.assertIn("Count: 3", ticket["body"])
 
     def test_a_second_finding_on_the_ticket_keeps_the_re_briefed_body(self):
         # Two findings, one ticket: the lower one's Priority edit in the same
@@ -799,6 +904,11 @@ class RegressionThroughBrain(unittest.TestCase):
         self.assertIn("Regresses #100", ticket["body"])
         self.assertNotEqual(tickets.priority_of(ticket), "P1")
         self.assertEqual(ticket["body"].count("## Regression"), 1)
+        self.assertEqual(ticket["body"].count(health.EVIDENCE_MARKER), 1)
+        self.assertIn("title: Bo waits on slow search", ticket["body"])
+        self.assertIn("Count: 1", ticket["body"])
+        for f in fs:
+            self.assertIn(health.MARKER % f.digest, ticket["body"])
 
 
 class RegressionDeploymentStatus(Base):
