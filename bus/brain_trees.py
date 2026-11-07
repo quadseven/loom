@@ -105,6 +105,26 @@ def git_ok(args: Sequence[str], cwd: str) -> bool:
         return False
 
 
+def fetch_failure_reason(stderr: str) -> str:
+    """Map Git's private error text to a small, safe diagnostic category."""
+    detail = stderr.lower()
+    if any(term in detail for term in ("authentication failed", "could not read username",
+                                       "permission denied", "invalid username", "access denied",
+                                       "returned error: 401", "returned error: 403",
+                                       "repository not found")):
+        return "auth"
+    if any(term in detail for term in ("couldn't find remote ref", "could not find remote ref",
+                                       "not a valid ref", "bad config", "no such remote",
+                                       "invalid config", "does not appear to be a git repository")):
+        return "ref or config"
+    if any(term in detail for term in ("could not resolve host", "connection timed out",
+                                       "connection refused", "network is unreachable",
+                                       "operation timed out",
+                                       "failed to connect", "could not resolve proxy")):
+        return "transport"
+    return "unknown"
+
+
 def process_cwds() -> Optional[List[str]]:
     """Real paths of every visible process's cwd, or None when they cannot be
     listed (then every tree counts as in use)."""
@@ -237,11 +257,17 @@ class Pruner:
         key = (common or path).strip()
         if key in self.fetched:
             return
-        ok = git_ok(["fetch", "-q", "--no-tags", "origin"], path)
+        try:
+            result = git(["fetch", "-q", "--no-tags", "origin"], path)
+            ok = result.returncode == 0
+            detail = result.stderr
+        except (OSError, subprocess.SubprocessError) as err:
+            ok = False
+            detail = str(err)
         self.fetched[key] = ok
         if not ok:
-            self.say("fetch-failed %s: its landed check reads the refs it had"
-                     % os.path.basename(path))
+            self.say("fetch-failed %s reason=%s: its landed check reads the refs it had"
+                     % (os.path.basename(path), fetch_failure_reason(detail)))
 
     def content_landed(self, path: str, default: str) -> bool:
         """Whether merging HEAD into default changes nothing. The merge's objects
