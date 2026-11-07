@@ -1,6 +1,7 @@
 """lanes/run_lane.sh run as a process: a temp loom home, a local bare repo as
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
+import base64
 import hashlib
 import json
 import os
@@ -1120,6 +1121,39 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def failed_line(self, name="T042-fix-the-thing.log"):
+        """The one `failed:` line the station reads from a lane log."""
+        failed = [line for line in self.run_log(name).splitlines() if " failed: [" in line]
+        self.assertEqual(len(failed), 1, failed)
+        return failed[0]
+
+    def test_a_public_leak_refusal_parks_naming_each_hit_by_rule_and_line(self):
+        # The reason held only the counts of rules the scanner loaded, so the
+        # next lane could not tell what to remove and repeated the refusal
+        # (loom#2804).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="private-ip")
+        failed = self.failed_line()
+        self.assertTrue(failed.endswith(
+            "public repo leak scan failed; nothing pushed: 1 hit: [rfc1918-ip] fix.txt:2"), failed)
+        self.assertNotIn("BLOCKED", failed)
+        self.assertNotIn(base64.b64decode("MTAuMjMuNC41").decode(), failed)
+        # The scanner's whole output still goes to the lane log.
+        self.assertIn("BLOCKED: private identifier found", self.run_log())
+
+    def test_a_public_pr_body_leak_refusal_names_the_rule_and_line_only(self):
+        address = ".".join(["10", "23", "4", "5"])
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user at %s." % address))
+        self.run_lane()
+        failed = self.failed_line()
+        self.assertRegex(failed, r"public repo PR body leak scan failed; nothing pushed: "
+                                 r"1 hit: \[rfc1918-ip\] PR body line \d+$")
+        self.assertNotIn(address, failed)
+        self.assertNotIn("leak-body", failed)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_a_diff_citing_its_own_repos_issues_pushes(self):
         # A lane change citing its own ticket (NAME#N in code or a test) was

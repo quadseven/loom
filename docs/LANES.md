@@ -53,7 +53,12 @@ and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
 script's path when using another checkout. A scanner that is still missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
-another reason parks the brief `[transient]`. A lane pod or cluster runner
+another reason parks the brief `[transient]`. A hit parks the brief with
+one line naming each hit's rule class and place, up to five (for example
+`[deny-list] docs/LANDING.md:12`, or `PR body line 4`), never the matched
+text, and never the name of a file whose name itself hit
+(`bus/leak_hits.py`); the scanner's full output goes to the lane log only.
+A lane pod or cluster runner
 (`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
