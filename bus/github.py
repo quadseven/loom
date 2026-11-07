@@ -368,9 +368,14 @@ def read_ssm(name: str, region: str) -> str:
     return out.stdout.strip()
 
 
+def _key_file_path(value: str) -> str:
+    """The key file path with the shell's ~ and environment variables expanded."""
+    return os.path.expandvars(os.path.expanduser(value.strip()))
+
+
 def read_key_file(path: str) -> str:
     """The App's private key from a mounted file, read at each mint."""
-    with open(path, encoding="ascii") as fh:
+    with open(_key_file_path(path), encoding="utf-8-sig") as fh:
         return fh.read()
 
 
@@ -452,6 +457,16 @@ class AppToken:
         # Where the key is read from: "ssm" (the aws CLI) or "file".
         self.key_source = "ssm"
         self.key_file = ""
+        self.key_param = ""
+        self.key_region = ""
+
+    def _key_where(self) -> str:
+        """Where the key is read from, for a read failure line."""
+        if self.key_source == "file" and self.key_file:
+            return "file %s" % self.key_file
+        if self.key_param:
+            return "SSM parameter %s" % self.key_param
+        return "the configured source"
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None,
@@ -466,12 +481,17 @@ class AppToken:
         if not (app_id and installation_id and (key_ssm or key_file)):
             return None
         if key_file:
-            app = cls(app_id, installation_id, lambda: read_key_file(key_file))
-            app.key_source, app.key_file = "file", key_file
+            expanded = _key_file_path(key_file)
+            app = cls(app_id, installation_id,
+                      lambda expanded=expanded: read_key_file(expanded))
+            app.key_source, app.key_file = "file", expanded
             return app
         region = env.get("LOOM_AWS_REGION", "").strip() or "us-east-1"
         reader = read_key or read_ssm
-        return cls(app_id, installation_id, lambda: reader(key_ssm, region))
+        app = cls(app_id, installation_id,
+                  lambda key_ssm=key_ssm, region=region: reader(key_ssm, region))
+        app.key_source, app.key_param, app.key_region = "ssm", key_ssm, region
+        return app
 
     def jwt(self) -> str:
         """The App's RS256 JWT, signed with the key read just now."""
@@ -493,7 +513,8 @@ class AppToken:
         try:
             key = self._read_key()
         except (OSError, subprocess.SubprocessError) as err:
-            failure = "could not read the GitHub App private key: %s" % type(err).__name__
+            failure = ("could not read the GitHub App private key from %s: %s"
+                       % (self._key_where(), type(err).__name__))
         if failure:
             raise GitHubError(failure)
         try:

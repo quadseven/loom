@@ -597,5 +597,94 @@ class ReadSsmProxyTests(unittest.TestCase):
         self.assertNotIn("HTTPS_PROXY", passed_env)
 
 
+class KeyFilePathTests(unittest.TestCase):
+    DIR = "example-home"
+
+    def _app_from(self, env, signed):
+        auth = auth_from_env(dict(env))
+        self.assertIsInstance(auth, AppToken)
+        auth._sign = fake_sign(signed)
+        return auth
+
+    def test_tilde_key_file_path_is_expanded(self):
+        signed = []
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "app-key.pem")
+            with open(real, "w") as fh:
+                fh.write(KEY)
+            env = {"HOME": tmp,
+                   "LOOM_GITHUB_APP_ID": "123",
+                   "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+                   "LOOM_GITHUB_APP_KEY_FILE": "~/app-key.pem"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                auth = self._app_from(env, signed)
+                fake = FakeGitHub(["ghs_tilde"])
+                GitHub(auth, transport=fake).rest("GET", "/rate_limit")
+            self.assertEqual([key for _, key in signed], [KEY])
+            self.assertEqual(fake.bearers("GET"), ["Bearer ghs_tilde"])
+
+    def test_dollar_env_key_file_path_is_expanded(self):
+        signed = []
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "app-key.pem")
+            with open(real, "w") as fh:
+                fh.write(KEY)
+            env = {"LOOM_HOME": tmp,
+                   "LOOM_GITHUB_APP_ID": "123",
+                   "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+                   "LOOM_GITHUB_APP_KEY_FILE": "$LOOM_HOME/app-key.pem"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                auth = self._app_from(env, signed)
+                fake = FakeGitHub(["ghs_dollar"])
+                GitHub(auth, transport=fake).rest("GET", "/rate_limit")
+            self.assertEqual([key for _, key in signed], [KEY])
+            self.assertEqual(fake.bearers("GET"), ["Bearer ghs_dollar"])
+
+    def test_key_file_with_utf8_bom_is_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "app-key.pem")
+            with open(path, "wb") as fh:
+                fh.write(b"\xef\xbb\xbf")
+                fh.write(KEY.encode("ascii"))
+            self.assertEqual(github.read_key_file(path), KEY)
+
+    def test_unreadable_file_error_names_the_file_without_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = os.path.join(tmp, "missing.pem")
+            env = {"LOOM_GITHUB_APP_ID": "123",
+                   "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+                   "LOOM_GITHUB_APP_KEY_FILE": gone}
+            with mock.patch.dict(os.environ, env, clear=True):
+                auth = auth_from_env()
+            self.assertIsInstance(auth, AppToken)
+            auth._sign = fake_sign([])
+            gh = GitHub(auth, transport=FakeGitHub(["t"]))
+            with self.assertRaises(GitHubError) as caught:
+                gh.rest("GET", "/rate_limit")
+            text = str(caught.exception)
+            self.assertIn("could not read the GitHub App private key", text)
+            self.assertIn(gone, text)
+            self.assertNotIn(KEY_MARK, text)
+
+    def test_unreadable_ssm_error_names_the_parameter_without_key(self):
+        env = {"LOOM_GITHUB_APP_ID": "123",
+               "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+               "LOOM_GITHUB_APP_KEY_SSM": "/example/key",
+               "LOOM_AWS_REGION": "eu-west-1"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(github, "read_ssm",
+                                  side_effect=OSError("could not read the parameter from SSM")):
+            auth = auth_from_env()
+            self.assertIsInstance(auth, AppToken)
+            auth._sign = fake_sign([])
+            gh = GitHub(auth, transport=FakeGitHub(["t"]))
+            with self.assertRaises(GitHubError) as caught:
+                gh.rest("GET", "/rate_limit")
+        text = str(caught.exception)
+        self.assertIn("could not read the GitHub App private key", text)
+        self.assertIn("/example/key", text)
+        self.assertNotIn(KEY_MARK, text)
+
+
 if __name__ == "__main__":
     unittest.main()
