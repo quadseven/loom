@@ -519,7 +519,7 @@ CLAIM_RE = history.CLAIM_RE
 # The factory's own note when it moves a stalled ticket to another lane.
 STALL_MOVE_RE = re.compile(r"^Not a failure \(briefed \d+ hours on lane ")
 # bus/station.py's note when a fix round ended without a commit.
-NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+NO_CHANGE_RE = history.NO_CHANGE_RE
 # Fix rounds in a row that end with no commit on one failing check before the
 # ticket goes to a person.
 NO_CHANGE_LIMIT = 2
@@ -1049,36 +1049,11 @@ def abandoned_answer(notice: Dict[str, Any],
 
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
-    """When the last fix round ended with no commit, 0 when it did not."""
-    for c in reversed(comments):
-        body = str(c.get("body") or "")
-        if body.startswith(FIX_MARKER):
-            return 0.0
-        if NO_CHANGE_RE.match(body):
-            return _ts(c.get("created_at"))
-    return 0.0
+    return history.no_change_at(comments)
 
 
 def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
-    """Per check name, the fix rounds in a row that named it and ended with no
-    commit (a loom:fix comment, then a no-change note). A round that changed
-    something, or one that no longer names the check, ends its count."""
-    counts: Dict[str, int] = {}
-    asked: set = set()
-    answered = True
-    for c in comments:
-        body = str(c.get("body") or "")
-        if body.startswith(FIX_MARKER):
-            names = {n.strip() for n in re.findall(r"^### Check: (.*)$", body, re.M)}
-            if not answered:
-                counts = {}
-            counts = {n: v for n, v in counts.items() if n in names}
-            asked, answered = names, False
-        elif NO_CHANGE_RE.match(body) and not answered:
-            answered = True
-            for name in asked:
-                counts[name] = counts.get(name, 0) + 1
-    return counts
+    return history.no_change_rounds(comments)
 
 
 def fixes_of(comments: Sequence[Dict[str, Any]]) -> int:
@@ -1319,37 +1294,14 @@ def runaway_comment(trigger: str, rows: Sequence[Tuple[int, str, str, str]], mod
 
 
 def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
-    """Did the ticket's newest failure commit nothing and give no reason, as
-    an earlier one did since its ladder last started (the newest rung 0
-    marker)? The ladder already climbed for that reason once, and a stronger
-    model did not help: five tickets climbed 4 to 6 times on it on
-    2026-10-13."""
-    seen: List[bool] = []
-    for c in comments:
-        body = str(c.get("body") or "")
-        if any(m.group(1) == "0" for m in RUNG_RE.finditer(body)):
-            seen = []
-        if FAILED_RE.match(body):
-            seen.append(NO_REASON in body)
-    return bool(seen) and seen[-1] and sum(seen) >= 2
+    return history.repeated_no_reason(comments)
 
 
-# lanes/run_lane.sh's reason when the agent edited a submodule (loom#1316).
-SUBMODULE_EDIT_RE = re.compile(r"the change edits files inside submodule (\S+)")
+SUBMODULE_EDIT_RE = history.SUBMODULE_EDIT_RE
 
 
 def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
-    """The submodule the ticket's newest failure says needs the change, else
-    None. The change belongs in that submodule's own repo, which a push of
-    this one cannot carry, so a stronger model fails the same way: three
-    tickets needed such a split on 2026-10-21."""
-    newest = None
-    for c in comments:
-        body = str(c.get("body") or "")
-        if FAILED_RE.match(body):
-            newest = body
-    match = SUBMODULE_EDIT_RE.search(newest or "")
-    return match.group(1) if match else None
+    return history.needs_other_repo(comments)
 
 
 def current_rung(issue: Dict[str, Any]) -> int:

@@ -36,6 +36,8 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 EQUIVALENT_MARKER = "<!-- loom:equivalent %s -->"
 EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
 FIX_MARKER = "<!-- loom:fix v1 -->"
+NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
+NO_REASON = "agent made no commit and wrote no reason"
 CLAIM_RE = re.compile(r"^Claimed for lane ")
 CLAIMED_RE = re.compile(r"Claimed for lane ([a-z0-9-]+) \(body sha256 [0-9a-f]{12}\)")
 FAILED_RE = re.compile(r"^Lane \S+ failed: ")
@@ -239,6 +241,59 @@ def retry_chain(comments: Sequence[Any]) -> Tuple[int, set, Optional[Tuple[str, 
         elif CLAIMED_RE.fullmatch(body):
             pending = None
     return used, left, pending
+
+
+def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
+    for c in reversed(comments):
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            return 0.0
+        if NO_CHANGE_RE.match(body):
+            return _ts(c.get("created_at"))
+    return 0.0
+
+
+def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    asked: set = set()
+    answered = True
+    for c in comments:
+        body = str(c.get("body") or "")
+        if body.startswith(FIX_MARKER):
+            names = {n.strip() for n in re.findall(r"^### Check: (.*)$", body, re.M)}
+            if not answered:
+                counts = {}
+            counts = {n: v for n, v in counts.items() if n in names}
+            asked, answered = names, False
+        elif NO_CHANGE_RE.match(body) and not answered:
+            answered = True
+            for name in asked:
+                counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
+    seen: List[bool] = []
+    for c in comments:
+        body = str(c.get("body") or "")
+        if any(m.group(1) == "0" for m in RUNG_RE.finditer(body)):
+            seen = []
+        if FAILED_RE.match(body):
+            seen.append(NO_REASON in body)
+    return bool(seen) and seen[-1] and sum(seen) >= 2
+
+
+SUBMODULE_EDIT_RE = re.compile(r"the change edits files inside submodule (\S+)")
+
+
+def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    newest = None
+    for c in comments:
+        body = str(c.get("body") or "")
+        if FAILED_RE.match(body):
+            newest = body
+    match = SUBMODULE_EDIT_RE.search(newest or "")
+    return match.group(1) if match else None
 
 
 class History(NamedTuple):
