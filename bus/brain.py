@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, hold_boxes, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, issue_reads, landing, merge_tier, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -5239,7 +5239,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     blocking = merge_tier.blocking_findings(threads, committed, is_bot, env, held)
     if blocking:
         raise ValueError("open review findings hold the merge: %s" % ", ".join(blocking))
-    _refuse_review_bodies(gh, repo, number, sha, threads, committed, is_bot, lint_run)
+    _refuse_review_bodies(gh, repo, number, sha, threads, committed, is_bot, lint_run, env)
     capped = merge_tier.cap_refusal(gh, repo, env)
     if capped:
         raise ValueError("the auto-merge cap holds the merge: %s" % capped)
@@ -5249,14 +5249,17 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 def _refuse_review_bodies(gh: GitHub, repo: str, number: int, sha: str,
                           threads: List[Dict[str, Any]], committed: str,
                           is_bot: Callable[[Dict[str, Any]], bool],
-                          lint_run: Optional[Callable[..., Optional[bool]]]) -> None:
+                          lint_run: Optional[Callable[..., Optional[bool]]],
+                          env: Optional[Dict[str, str]] = None) -> None:
     """The review-body half of the merge gate (bus/merge_tier.py,
     loom#1933): an unanswered review body with a finding still open, and
     an addressed high lint finding that still hits or cannot be
     re-checked on the head, refuse the merge; a body whose findings all
     read settled is answered with one record comment, and the merge
     proceeds."""
-    bodies = merge_tier.unanswered_bodies(gh, repo, number, threads, committed, is_bot)
+    authors = history.trusted_authors(dict(env)) if env is not None else None
+    bodies = merge_tier.unanswered_bodies(gh, repo, number, threads, committed, is_bot,
+                                          authors)
     refusal = merge_tier.body_refusal(bodies)
     if refusal:
         raise ValueError(refusal)
