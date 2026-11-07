@@ -4788,7 +4788,11 @@ class Station:
                     len(reasons), "\n".join("- " + self._note_text(x) for x in reasons)),
                 notify.PROOF_REFUSED)
             self._add_label(repo, number, "needs-brain")
-        _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
+        if "needs-brain" not in _label_names(self._issue(repo, number)):
+            _say("%s#%d verify queue exit was not tracked after %d refused proofs"
+                 % (repo, number, len(reasons)))
+            raise RuntimeError("verify queue exit was not tracked for %s#%d" % (repo, number))
+        _say("%s#%d verify queue exit tracked after %d refused proofs; handed to the brain"
              % (repo, number, len(reasons)))
 
     def _forget_verify_attempt(self, repo: str, number: int) -> None:

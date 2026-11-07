@@ -13558,10 +13558,15 @@ class VerifyResultTest(Base):
         self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
         self.assertEqual(self.fake.comments[5], [])
         self.assertNotIn("needs-brain", self.fake.names(5))
-        st = self.refuse_n(1)
+        with mock.patch("bus.station._say") as say:
+            st = self.refuse_n(1)
         self.assertIn("needs-brain", self.fake.names(5))
         self.assertIn("loom:shipped", self.fake.names(5))
         self.assertEqual(len(self.fake.comments[5]), 1)
+        self.assertTrue(any("verify queue exit tracked" in str(call)
+                            for call in say.call_args_list))
+        self.assertFalse(any("left the verify queue after" in str(call)
+                             for call in say.call_args_list))
         note = self.fake.comments[5][0]["body"]
         self.assertEqual(note.count("- Its proof was refused"), station.VERIFY_REFUSAL_CAP)
         # A late result from a run already out does not say it again.
@@ -13573,6 +13578,13 @@ class VerifyResultTest(Base):
              mock.patch.object(st, "_proven", return_value=False):
             pool, _ = st._verify_pool({})
         self.assertNotIn(5, [issue["number"] for _, issue in pool])
+
+    def test_a_capped_refusal_fails_if_the_queue_exit_is_not_tracked(self):
+        st = self.refuse_n(station.VERIFY_REFUSAL_CAP - 1)
+        with mock.patch.object(st, "_add_label"):
+            with self.assertRaisesRegex(RuntimeError, "verify queue exit was not tracked"):
+                st._proof_refused("example-owner/example-repo", 5, "codex",
+                                  self.fake.names(5), "Its proof was refused: example.")
 
     def test_a_ticket_refused_fewer_times_stays_due(self):
         self.fake.pulls = [verify_merge(5)]
