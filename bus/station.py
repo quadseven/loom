@@ -8291,6 +8291,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
+        repeated = self._limit_already_reported(repo, number, lane)
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
                       wait="" if fix else "model-limit")
         # No new comment: a limit is not news, and one comment a bounce
@@ -8298,7 +8299,23 @@ class Station:
         # event is an edit, and it ends the claim as [limit], so the runaway
         # detector does not count it as work.
         self._stopped(repo, number, lane, "limit", reason)
-        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+        if not repeated:
+            _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _limit_already_reported(self, repo: str, number: int, lane: str) -> bool:
+        """Whether this lane's latest outcome for the ticket was already a limit.
+
+        Reclaims are routine while a provider limit persists. Keep each claim's
+        [limit] status event for the attempt ledger, but log the condition only
+        once until this lane later has a different outcome.
+        """
+        events = self._status_texts(repo, number)
+        prefix = "Lane %s stopped: [limit] " % lane
+        for event in reversed(events):
+            if event.startswith("Claimed for lane "):
+                continue
+            return event.startswith(prefix)
+        return False
 
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
