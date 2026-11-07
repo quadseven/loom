@@ -4841,7 +4841,10 @@ class Factory:
                     headers, _ = tickets.parse(issue.get("body"))
                 except ValueError:
                     headers = None
-                if headers == {}:
+                # A remote lane renders its claim brief from Difficulty: (see
+                # _ensure_lane_headers); without it, as with no headers at all
+                # or an unreadable brief, no lane can claim the ticket.
+                if headers is None or "Difficulty" not in headers:
                     self._relabel(repo, issue, [name for name in _labels(issue)
                                                 if not name.startswith("lane:")])
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
