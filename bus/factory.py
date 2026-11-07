@@ -192,7 +192,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunt_plan, labels, landing, merge_tier, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -3979,17 +3979,29 @@ class Factory:
         A pull request that cannot be brought up to date cleanly goes back for a fix round, as a conflict
         does. The one brought up to date takes the repo's landing lock; while
         another holds it, this does neither."""
+        blockers = []
         if repo in self.landed:
-            return
+            blockers.append("repository already landed this pass")
         held = self._lock(repo)
         if held is not None and held != number:
-            return  # another pull request holds the repo's landing lock
+            blockers.append("another pull request holds the landing lock")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
+            return
         behind = bool(self._behind(repo, full))
-        if behind and not self._may_land_behind(repo, full):
-            if repo not in self.updated:
+        needs_update = behind and not self._may_land_behind(repo, full)
+        if needs_update:
+            blockers.append("pull request must be brought up to date")
+            decision = merge_verdict.decide(full, issue, blockers, ("factory",))
+            if not decision.ready and repo not in self.updated:
                 self._update_to_land(repo, number, full, issue, comments, held)
             return
         if self._scope_holds(repo, number, full, issue):
+            blockers.append("scope check holds for the brain")
+        decision = merge_verdict.decide(full, issue, blockers,
+                                        ("factory",) if blockers else ())
+        if not decision.ready:
             return
         merged = self._merge(repo, number, issue, str((full.get("head") or {}).get("sha") or ""))
         if merged == MERGE_DONE:
