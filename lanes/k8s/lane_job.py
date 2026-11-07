@@ -377,8 +377,9 @@ def report() -> None:
         for rel in report_files(home, job["slot"], job["ticket"]):
             tar.add(os.path.join(home, rel), arcname=rel, recursive=False)
     secret = os.path.join(d, "report-secret")
-    with open(secret, "wb") as fh:
-        os.chmod(secret, 0o600)
+    fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        os.fchmod(fh.fileno(), 0o600)
         fh.write(os.urandom(32).hex().encode("ascii"))
     step = "encrypt the files"
     try:
