@@ -36,6 +36,32 @@ class RepoPrCapTest(Base):
         self.assertIn("9 open pull requests (cap 8)", notes)
         self.assertNotIn("loom:running", self.fake.names(12))
 
+    def test_cap_held_ticket_does_not_keep_its_lane_busy(self):
+        self.pulls(9)
+        runner, claimed = self.claim()
+        self.assertFalse(claimed)
+        self.assertEqual(runner._gate_held(), ["%s#12" % REPO])
+        counter = runner._factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 0)
+        self.assertTrue(counter._free("codex"))
+
+    def test_cap_held_list_resets_each_claim_pass(self):
+        self.pulls(9)
+        runner, _ = self.claim()
+        self.assertEqual(runner._gate_held(), ["%s#12" % REPO])
+        self.pulls(0)
+        runner._repo_pr_counts.clear()
+        with mock.patch.object(runner, "_heartbeat_ok", return_value=False):
+            runner.claim_new()
+        self.assertEqual(runner._gate_held(), [])
+
+    def test_ticket_under_cap_still_counts_as_load(self):
+        self.pulls(7)
+        runner, claimed = self.claim()
+        self.assertTrue(claimed)
+        self.assertEqual(runner._gate_held(), [])
+
     def test_fix_round_still_dispatches_over_cap(self):
         self.pulls(9)
         self.fake.add(12)
