@@ -1157,6 +1157,10 @@ sent (and from the tick's start), each closing the commitment for the same
 stage, item and brief key. Between ticks, at most every 10 minutes, the
 station sends the new done markers to `/api/brain/commitments`, so work
 another brain finished closes without waiting for this machine's next tick.
+A refused upload is logged with its status and retried after exponential
+back-off (one minute, doubling to ten minutes at most); after three
+consecutive refusals the station keeps the markers in its local ledger in
+safe mode until an upload succeeds.
 After a tick posts, the station loads the rules digest's sources that
 changed: the Rules section of `docs/MUSE.md`, keyed by the commit that last
 changed it, and each goal home's rules, keyed by its newest rules comment
