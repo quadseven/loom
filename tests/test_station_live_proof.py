@@ -26,14 +26,13 @@ import test_bus_station as tbs  # noqa: E402
 
 REPO = tbs.REPO
 HOUR = 3600
-LOG_BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
-            "- [ ] A test passes\n"
-            "- [ ] Live: within 24 hours of the deploy the log prints `daily status ready`\n")
-WRITE_BODY = LOG_BODY + "- [ ] Live: `kubectl delete pod web-0` brings the pod back ready\n"
-
-
 def stamp(at):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+LOG_BODY = ("Difficulty: easy\\n\\n## Why\\nBecause.\\n\\n## Acceptance criteria\\n"
+            "- [ ] A test passes\\n"
+            "- [ ] Live: within 24 hours of the deploy the log prints `daily status ready`\\n")
+WRITE_BODY = LOG_BODY + "- [ ] Live: `kubectl delete pod web-0` brings the pod back ready\\n"
 
 
 class FakeLog:
@@ -78,7 +77,7 @@ class StationLiveProofTest(tbs.Base):
         return st
 
     def status_text(self):
-        return "\n".join(c["body"] for c in self.fake.comments[self.NUMBER]
+        return "\\n".join(c["body"] for c in self.fake.comments[self.NUMBER]
                          if status.is_status(c.get("body")))
 
     def plain_comments(self):
