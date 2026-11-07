@@ -4864,7 +4864,10 @@ def merge(gh: GitHub, repo: str, number: int,
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
-        _validate_merge_pr(repo, pr, details, env)
+        # _luna_stands_in reads more only on a FAILURE rollup, the one shape
+        # a degraded review check leaves; every other refusal reads no more.
+        luna = _luna_stands_in(gh, repo, number, details, env, _pr_author(pr))
+        _validate_merge_pr(repo, pr, details, env, luna=luna)
         _refuse_person_change_request(details)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
@@ -4893,7 +4896,7 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict,
-                                 held, lint_run)
+                                 held, lint_run, luna=luna)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -5197,7 +5200,8 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]],
                       verdict: Optional[Callable[[], Optional[answer.Answer]]] = None,
                       held: Container[str] = (),
-                      lint_run: Optional[Callable[..., Optional[bool]]] = None) -> str:
+                      lint_run: Optional[Callable[..., Optional[bool]]] = None,
+                      luna: bool = False) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -5227,7 +5231,10 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         raise ValueError("held for the operator: %s%s" % (reason, asked))
     sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
     check = review_check_name(env)
-    if not sha or not _review_check_passed(gh, repo, sha, check):
+    # A clean Luna verdict for this head stands in for the review check's
+    # success here too (_luna_stands_in, loom#2575); the blocking-findings
+    # and cap rules below still apply as they are.
+    if not sha or (not luna and not _review_check_passed(gh, repo, sha, check)):
         raise ValueError("a %s change merges on its own only when the review check %s "
                          "succeeded on its head commit" % (tier, check))
     from . import factory
@@ -5400,10 +5407,125 @@ def _mergeable(pr: Dict[str, Any]) -> bool:
     return pr.get("mergeable") is True
 
 
-def _checks_green(details: Dict[str, Any]) -> bool:
+def _rollup_state(details: Dict[str, Any]) -> str:
     commits = (details.get("commits") or {}).get("nodes") or []
     rollup = commits[-1].get("commit", {}).get("statusCheckRollup") if commits else None
-    return (rollup or {}).get("state") == "SUCCESS"
+    return str((rollup or {}).get("state") or "")
+
+
+def _checks_green(details: Dict[str, Any]) -> bool:
+    return _rollup_state(details) == "SUCCESS"
+
+
+def _head_check_runs(gh: GitHub, repo: str, sha: str) -> Optional[List[Dict[str, Any]]]:
+    """Every check run on this head, all pages, or None when the read is
+    unreadable or too long to prove complete: a Luna verdict may stand in
+    only on a complete read (loom#2575)."""
+    runs: List[Dict[str, Any]] = []
+    try:
+        for page in range(1, 11):
+            data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
+                           % (repo, sha, page)).data or {}
+            batch = data.get("check_runs") if isinstance(data, dict) else None
+            if not isinstance(batch, list):
+                return None
+            runs += [run for run in batch if isinstance(run, dict)]
+            if len(batch) < 100:
+                return runs
+    except GitHubError:
+        return None
+    return None
+
+
+def _luna_degraded_only(runs: Sequence[Dict[str, Any]], check: str) -> bool:
+    """Whether the only non-green newest run on a head is the review check,
+    completed with failure, and its output is a degraded review rather than
+    a verdict: the factory's own test (factory._review_degraded), read from
+    the head's check runs instead of the factory's cache."""
+    from . import factory  # factory imports this module
+    failed = []
+    for run in newest_check_runs(runs):
+        if run.get("status") != "completed":
+            return False
+        if run.get("conclusion") not in factory.GREEN:
+            failed.append(run)
+    if len(failed) != 1 or failed[0].get("name") != check:
+        return False
+    output = failed[0].get("output")
+    if not isinstance(output, dict):
+        return False
+    return factory.degraded_review(str(output.get("title") or ""),
+                                   str(output.get("summary") or ""))
+
+
+def _clean_luna_verdict(gh: GitHub, repo: str, number: int, sha: str,
+                        env: Optional[Dict[str, str]], author: str = "") -> bool:
+    """Whether the newest Luna verdict the station posted for this exact head
+    on this pull request is clean (factory.parse_luna_verdict). The verdict
+    is the station's word, posted by its review reporter after the Luna
+    slot's run with the same client that calls this merge, so only a
+    verdict by writer_login(gh, env) counts; any other trusted login's
+    marker is not that verdict. A client with no known login reads no
+    verdict at all. A verdict the pull request's own author posted never
+    counts, and a newer verdict for the head replaces an older one, clean
+    or blocking."""
+    from . import factory  # factory imports this module
+    station = writer_login(gh, env).lower()
+    if not station:
+        return False  # no known writer: no verdict can be the station's
+    try:
+        comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    except GitHubError:
+        return False  # an unreadable verdict proves nothing: the gate stands
+    newest: Optional[Tuple[int, int]] = None
+    for comment in trusted_comments(comments, trusted_authors(env)):
+        login = comment_login(comment).lower()
+        if login != station or (author and login == author.lower()):
+            continue  # only the station's verdict counts, never the author's
+        verdict = factory.parse_luna_verdict(comment.get("body"), sha)
+        if verdict is not None:
+            newest = verdict
+    return newest is not None and newest[0] == 0
+
+
+def _head_status_clear(gh: GitHub, repo: str, sha: str) -> bool:
+    """Whether this head's combined commit status is clear: its state is
+    success, or it carries no statuses at all. A FAILURE rollup can come
+    from a failing commit status beside the check runs, and a Luna verdict
+    stands in for the review check only, never for a red status. An
+    unreadable read is not clear."""
+    try:
+        data = gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data
+    except GitHubError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    return data.get("state") == "success" or data.get("total_count") == 0
+
+
+def _luna_stands_in(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
+                    env: Optional[Dict[str, str]] = None, author: str = "") -> bool:
+    """Whether a clean Luna verdict stands in for this head's review check
+    in the merge gate (loom#2575, the factory's loom#2142 fallback): the
+    rollup is FAILURE, the review check is the head's only non-green run and
+    failed degraded, the head's combined commit status is clear, and the
+    newest trusted Luna verdict for this head, not the pull request author's
+    own, is clean. The
+    factory already clears its fault on that verdict and calls merge; without
+    this the real merge refused the head on every pass, because the degraded
+    check keeps the rollup FAILURE. Any doubt (an unreadable run, another
+    failing or running
+    check, a non-degraded failure, a blocking, untrusted or other-head
+    verdict) leaves the gate as it was."""
+    sha = str(details.get("headRefOid") or "")
+    if not sha or _rollup_state(details) != "FAILURE":
+        return False
+    runs = _head_check_runs(gh, repo, sha)
+    if runs is None or not _luna_degraded_only(runs, review_check_name(env)):
+        return False
+    if not _head_status_clear(gh, repo, sha):
+        return False
+    return _clean_luna_verdict(gh, repo, number, sha, env, author)
 
 
 def _threads_resolved(details: Dict[str, Any]) -> bool:
@@ -5450,7 +5572,7 @@ def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 
 def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
-                       env: Optional[Dict[str, str]] = None) -> None:
+                       env: Optional[Dict[str, str]] = None, luna: bool = False) -> None:
     head_ref = str((pr.get("head") or {}).get("ref") or details.get("headRefName") or "")
     trusted_lane_head = (
         _ticket_association(repo, pr) is not None
@@ -5463,7 +5585,9 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
         (_mergeable(pr),
          "pull request is not mergeable (GitHub may still be computing it)"),
-        (_checks_green(details), "pull request checks are not successful"),
+        # A clean Luna verdict stands in for the degraded review check that
+        # keeps the rollup red (_luna_stands_in, loom#2575).
+        (_checks_green(details) or luna, "pull request checks are not successful"),
         (_threads_resolved(details), "pull request has unresolved review threads"),
     ]
     for ok, reason in rules:
