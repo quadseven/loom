@@ -166,7 +166,10 @@ unset variables.
   up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
   its keepalive stamp stays fresh while it waits. A wait that runs out, or a
   base check that times out (exit 124), parks the brief `[transient]` and
-  files no base-check incident: both mean host load, not a red base. The
+  files no base-check incident: both mean host load, not a red base. A
+  final or affected check after the agent that times out also parks
+  `[transient]` once; the station counts a second check timeout in a row on
+  the same ticket as `[work]`, as it does for agent timeouts. The
   runner passes no worker cap to a test runner, because no runner reads an
   env var for one.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
