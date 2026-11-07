@@ -375,6 +375,9 @@ LIVE_PROOF_FILE = "live-proof.json"
 LIVE_PROOFS_PER_PASS = 5
 # Asks for unverified criteria are emails: at most this many an hour.
 LIVE_ASKS_PER_HOUR = 4
+# In LIVE_CHECKS_FILE: ticket -> the criteria_gate.criteria_key its
+# verification ask was made for. The ask is made once per set (loom#2805).
+LIVE_ASKED_KEY = "_asked"
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
@@ -11129,6 +11132,48 @@ class Station:
         _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
         return True
 
+    def _record_ask(self, repo: str, number: int, body: str) -> None:
+        """Keep which criteria the verification ask of the ticket was made
+        for (criteria_gate.criteria_key), so it is made once per set."""
+        state = self._live_checks()
+        asked = state.get(LIVE_ASKED_KEY)
+        asked = asked if isinstance(asked, dict) else {}
+        asked["%s#%d" % (repo, number)] = criteria_gate.criteria_key(body)
+        state[LIVE_ASKED_KEY] = asked
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+
+    def _asked_already(self, repo: str, number: int, body: str,
+                       gaps: Sequence[Tuple[str, str]]) -> bool:
+        """Whether the verification ask must not be made now (loom#2805):
+        it was made for these same criteria, and a brain or operator has
+        since taken the person label off; or a trusted comment states a
+        `waiting:` line on a ticket whose gaps are all live. An ask the
+        station made before it kept this record counts as made for the
+        criteria it finds now: re-adding the label a brain removed sent a
+        settled live wait back to the operator."""
+        asked = self._live_checks().get(LIVE_ASKED_KEY)
+        asked = asked if isinstance(asked, dict) else {}
+        made = asked.get("%s#%d" % (repo, number))
+        if made == criteria_gate.criteria_key(body):
+            return True
+        trusted = {a.lower() for a in list(self.s.authors)
+                   + answer.operators(trusted=self.s.authors)}
+        try:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the comments of %s#%d before asking: %s" % (repo, number, err))
+            return True
+        mine = [c for c in comments if isinstance(c, dict)
+                and brain.comment_login(c).lower() in trusted]
+        if criteria_gate.live_wait([], gaps, [c.get("body") for c in mine]):
+            return True
+        if made is None and any(criteria_gate.is_verification_ask(c.get("body")) for c in mine):
+            self._record_ask(repo, number, body)
+            return True
+        return False
+
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
@@ -11151,7 +11196,10 @@ class Station:
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
                    and criteria_gate.check_of(t) is not None
                    and criteria_gate.key(t) not in failed]
-        if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
+        names = _label_names(issue)
+        if waiting or needs_human(names) or criteria_gate.live_wait(names, gaps, [body]):
+            return True
+        if self._asked_already(repo, number, body, gaps) or not self._live_ask_room():
             return True
         try:
             brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
@@ -11160,6 +11208,7 @@ class Station:
         except (ValueError, GitHubError) as err:
             _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
             return True
+        self._record_ask(repo, number, body)
         _say("held done %s#%d for the operator: %d criteria have no evidence"
              % (repo, number, len(gaps)))
         return True
