@@ -3104,7 +3104,14 @@ final_validation() {
   changed="$(tracked_changes)"
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
-    124) VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s" ;;
+    124)
+      # The base check passed, so a timeout here is host load as often as a
+      # hung test: transient once, and the station counts a second check
+      # timeout in a row on the ticket as work (factory.TIMEOUT_RE). Six
+      # tickets went to loom:failed on one loaded afternoon (2026-11-07).
+      PARK_CLASS=transient
+      VALIDATION_REASON="validation failed: the check timed out after ${CHECK_TIMEOUT}s"
+      ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
@@ -3189,7 +3196,7 @@ final_affected() {
   case "$rc" in
     0) [ -z "$changed" ] && ok=true ||
          VALIDATION_REASON="validation failed: the affected check changed tracked files ($changed)" ;;
-    124) VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
+    124) PARK_CLASS=transient; VALIDATION_REASON="validation failed: the affected check timed out after ${CHECK_TIMEOUT}s" ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free within ${CHECK_SLOT_WAIT}s" ;;
     143)
       PARK_CLASS=transient
