@@ -9,6 +9,7 @@ from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional
 from . import answer as _answer
 from . import decision_claim as _decision_claim
 from . import handoff
+from . import journal_check
 from . import notify as _notify
 from . import quiet as _quiet
 from . import text as _text
@@ -275,21 +276,47 @@ def _self_login(gh: GitHub) -> str:
 
 def todays_journal(gh: GitHub, repo: str, issue_number: int,
                    text: str) -> Optional[Dict[str, Any]]:
-    """This client's journal comment for the same holder on the same UTC day
-    as `text`'s Tick line, the newest such; None when there is none. One read
-    of the day's comments (since= filters on the last edit)."""
+    """This client's journal for the same holder and UTC day as the new tick."""
+    return _journal_context(gh, repo, issue_number, text)[0]
+
+
+def _journal_context(gh: GitHub, repo: str, issue_number: int,
+                     text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Today's editable comment and the preceding own tick since yesterday.
+
+    One bounded-date read covers midnight without treating another author,
+    holder, a future tick or an unread older day as evidence of repetition.
+    """
     tick = re.search(r"^Tick (\d{4}-\d{2}-\d{2})T\S*, (\S+)\s*$", text, re.M)
     if not tick:
-        return None
+        return None, ""
     day, holder = tick.group(1), tick.group(2)
+    current = split_journal(text)[-1][0]
+    since = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     me = _self_login(gh).lower()
     found = None
+    previous = ("", "")
     for c in gh.paginate("/repos/%s/issues/%d/comments?since=%sT00:00:00Z&per_page=100"
-                         % (repo, int(issue_number), day)):
+                         % (repo, int(issue_number), since)):
         if _mine_today(c, me, day, holder) and (
                 found is None or str(c.get("created_at")) > str(found.get("created_at"))):
             found = c
-    return found
+        previous = _previous_tick(c, me, holder, current, previous)
+    return found, previous[1]
+
+
+def _previous_tick(c: Any, me: str, holder: str, current: str,
+                   previous: Tuple[str, str]) -> Tuple[str, str]:
+    """Choose the immediately preceding attributed tick, not a historical match."""
+    if not me or not isinstance(c, dict) or str((c.get("user") or {}).get("login") or "").lower() != me:
+        return previous
+    body = str(c.get("body") or "")
+    if not body.startswith(JOURNAL_MARKER):
+        return previous
+    for at, part in split_journal(body):
+        if previous[0] < at < current and journal_holder({"body": part}) == holder:
+            previous = (at, part)
+    return previous
 
 
 def _mine_today(c: Any, me: str, day: str, holder: str) -> bool:
@@ -330,9 +357,10 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     _decision_claim.check(gh, repo, issue_number, text, list(trusted),
                           _answer.operators(None, list(trusted) or None))
     if text.startswith(JOURNAL_MARKER):
-        text = with_steps(with_tick(text, holder, now), steps)
+        text = with_tick(text, holder, now)
         _text.check(text)
-        mine = todays_journal(gh, repo, issue_number, text)
+        mine, previous = _journal_context(gh, repo, issue_number, text)
+        text = with_steps(journal_check.annotate(text, previous), steps)
         if mine is not None:
             body = _public_refs(merged(text, str(mine.get("body") or "")), repo)
             _text.check(body)
