@@ -60,6 +60,7 @@ from . import brief_check
 from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
+from . import history
 from . import friction_intake
 from . import review_debt
 from . import evidence
@@ -564,8 +565,6 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
-RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
-                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
 # claude is never chosen: it spends the operator's own subscription.
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
@@ -1992,19 +1991,7 @@ def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]
     pull request, the lanes those retries left, and (from, to) of the latest
     retry when no claim has followed it: a retry whose relabel did not
     happen yet)."""
-    used, left, pending = 0, set(), None
-    for c in comments:
-        body = str(c.get("body") or "").strip() if isinstance(c, dict) else ""
-        m = RETRY_RE.match(body)
-        if m:
-            used += 1
-            left.add(m.group(1))
-            pending = (m.group(1), m.group(2))
-        elif body.startswith("Lane "):
-            used, left, pending = 0, set(), None
-        elif CLAIM_RE.fullmatch(body):
-            pending = None
-    return used, left, pending
+    return history.retry_chain(comments)
 
 
 def scrub(reason: str) -> str:

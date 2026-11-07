@@ -8032,13 +8032,12 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     number = int(issue["number"])
     events = gh.paginate("/repos/%s/issues/%d/events" % (repo, number))
     comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    # Fixes, tried models, claim times and rungs count trusted comments only.
-    bodies = _bodies(trusted_comments(comments, authors or trusted_authors()))
     labelled = [(str(e.get("event")), str((e.get("label") or {}).get("name") or ""), _when(e.get("created_at")))
                 for e in events if isinstance(e, dict)]
     failed = sum(1 for kind, name, _ in labelled if kind == "labeled" and name == "loom:failed")
-    from . import history  # the trusted history reading (loom#2457)
     read = history.read_history(comments, authors or trusted_authors())
+    # Fixes, tried models, claim times and rungs use the same trusted input.
+    bodies = _bodies(read.comments)
     fixes = read.fixes
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
