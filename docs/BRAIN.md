@@ -587,7 +587,10 @@ inferred from label names and descriptions. The
 epic's sub-issue link replaces the goal as the parent and the ticket's `Part
 of` line names the epic. When no intake epic has room and the goal is under
 its open epic cap, a new intake epic opens the way triage opens one; otherwise
-the rest stay where they are. An epic, an ask and a closed issue are never
+the rest stay where they are. A ticket under a closed epic is the exception: when
+the goal is at its cap and every intake epic is full, one new intake epic
+still opens for those tickets, one epic past the cap (`RESCUE_EPIC_EXTRA`), and
+no further epic opens past it. An epic, an ask and a closed issue are never
 moved. The station log names each goal: `outside-epic: moved N, left M`.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
