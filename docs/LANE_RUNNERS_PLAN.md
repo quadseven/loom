@@ -61,7 +61,7 @@ when the job ends.
 | viewer | stays on the Mac | none | none | Not a lane |
 
 The table covers all 36 plists. Of those, 28 were loaded on 2026-11-01:
-codex-4 to codex-8 and spark-2 to spark-4 are installed but not loaded.
+codex-4 to codex-16 and spark-2 to spark-4 are installed but not loaded.
 
 ## What cannot move yet
 
