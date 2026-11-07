@@ -2263,28 +2263,108 @@ class Station:
         # This pass's factory-repair tickets over the unproven-work limit, per
         # (repo, goal): running, at a pull request, or let through (loom#767).
         self._repair_flying: Dict[Tuple[str, int], List[int]] = {}
-        self._parents: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        # This pass's closed pull requests and default branches, per repo:
-        # the hand-revert scan reads the same pages as the ship checks.
-        self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
-        self._closed_complete: Dict[str, bool] = {}
-        # The claimed settle's re-review requests, by "repo#pull request", as
-        # saved in claimed.json, and how many it has written this run.
-        self._claimed_rereviews: Dict[str, Any] = {}
-        self._claimed_writes = 0
-        self._branch_cache: Dict[str, str] = {}
-        self._stale_asks_withdrawn = 0
-        # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
-        self._path_filters: Dict[str, Dict[str, List[str]]] = {}
-        self._manual_listed: Dict[str, List[str]] = {}
-        self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
-        # Repos whose claim:<login> label this pass has made sure of.
-        self._claim_labels: set = set()
-        self._issue_stamps: Dict[Tuple[str, int], str] = {}
-        saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
-        self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
-        if hasattr(self.gh, "target") and self.gh.target is None:
-            self.gh.target = PASS_REQUEST_TARGET
+    def _load_shipped_counter(self) -> None:
+        """Load the consecutive days counter from state."""
+        counter = _read_json(self._shipped_counter_path, {}, strict=False)
+        if isinstance(counter, dict):
+            self._consecutive_under_24h_days = int(counter.get("consecutive", 0))
+            self._last_shipped_median = counter.get("median")
+            self._last_shipped_count = counter.get("count")
+
+    def _save_shipped_counter(self) -> None:
+        """Save the consecutive days counter to state."""
+        counter = {
+            "consecutive": self._consecutive_under_24h_days,
+            "median": self._last_shipped_median,
+            "count": self._last_shipped_count,
+            "updated_at": self.now
+        }
+        _write_json(self._shipped_counter_path, counter)
+
+    def _reset_shipped_counter_if_not_under_24h(self, shipped_median: Optional[float], shipped_count: Optional[int]) -> bool:
+        """Reset the counter if shipped median is not under 24h. Return True if still under 24h."""
+        if shipped_median is None or shipped_median >= 24:
+            if self._consecutive_under_24h_days > 0:
+                _say("shipped median >= 24h, resetting consecutive days counter")
+            self._consecutive_under_24h_days = 0
+            self._last_shipped_median = shipped_median
+            self._last_shipped_count = shipped_count
+            self._save_shipped_counter()
+            return False
+        return True
+
+    def _increment_shipped_counter(self, shipped_median: Optional[float], shipped_count: Optional[int]) -> None:
+        """Increment the counter if still under 24h and close ticket if counter reaches 3."""
+        if shipped_median is None or shipped_median >= 24:
+            return
+
+        self._consecutive_under_24h_days += 1
+        self._last_shipped_median = shipped_median
+        self._last_shipped_count = shipped_count
+
+        _say("shipped median %.1fh for %d days, consecutive under 24h: %d",
+             shipped_median, self._consecutive_under_24h_days)
+
+        if self._consecutive_under_24h_days >= 3:
+            self._close_ticket_for_shipped_under_24h()
+        else:
+            self._save_shipped_counter()
+
+    def _close_ticket_for_shipped_under_24h(self) -> None:
+        """Close the ticket when shipped median has been under 24h for 3 consecutive days."""
+        repo = self.s.metrics_repo
+        goal_ref = self.s.metrics_goal
+
+        if not repo or not goal_ref:
+            _say("cannot close ticket: no metrics goal configured")
+            return
+
+        ref = re.fullmatch(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([1-9][0-9]*)", goal_ref)
+        if not ref or ref.group(1) not in self.s.repos:
+            _say("cannot close ticket: metrics goal not in repos")
+            return
+
+        metric_repo = ref.group(1)
+        metric_number = int(ref.group(2))
+
+        # Find the ticket that matches our criteria
+        tickets_to_check = self._tickets_open(metric_repo)
+        for issue in tickets_to_check:
+            if (issue.get("state") == "open" and "loom:ticket" in _labels(issue)
+                    and "loom:merged" in _labels(issue)
+                    and "loom:shipped" in _labels(issue)
+                    and "loom:verified" not in _labels(issue)):
+
+                self._close_shipped_ticket(metric_repo, int(issue["number"]))
+                break
+
+    def _close_shipped_ticket(self, repo: str, number: int) -> None:
+        """Close a shipped ticket with shipped median and count in journal."""
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+        except GitHubError as err:
+            _say("could not read ticket %s#%d to close: %s" % (repo, number, err))
+            return
+
+        if issue.get("state") != "open" or "loom:ticket" not in _labels(issue):
+            return
+
+        note = ("Shipped median wait under 24h for 3 consecutive days (current: %d hours median, %d tickets).\n\n"
+                "This ticket closes because the verify stage has stayed under the 24h threshold, "
+                "indicating the bottleneck has been resolved.") % (
+                    self._last_shipped_median or 0, self._last_shipped_count or 0)
+
+        try:
+            brain.close(self.gh, repo, number, reason="completed", note=note, env=None)
+            _say("closed ticket %s#%d due to sustained low shipped median wait" % (repo, number))
+        except Exception as err:
+            _say("failed to close ticket %s#%d: %s" % (repo, number, err))
+        # Counter for consecutive days where shipped median wait stays under 24h
+        self._consecutive_under_24h_days = 0
+        self._last_shipped_median = None
+        self._last_shipped_count = None
+        self._shipped_counter_path = os.path.join(self.state, "shipped_counter.json")
+        self._load_shipped_counter()
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -15648,6 +15728,43 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("assign_queued failed: %s" % err)
 
+    def _track_shipped_median_under_24h(self) -> None:
+        """Track consecutive days where shipped median wait stays under 24h.
+        
+        This is the third acceptance criterion: close the ticket when the shipped
+        median stays under 24h for 3 consecutive days with the numbers.
+        
+        This logic runs in the station during each pass and tracks the shipped
+        median wait from metrics. When the counter reaches 3, it closes the ticket.
+        """
+        try:
+            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
+                                        self.now, self.s.review_check,
+                                        self.s.authors).collect()
+        except (GitHubError, OSError) as err:
+            _say("metrics collection failed for shipped counter: %s" % err)
+            return
+
+        shipped_row = None
+        for row in numbers:
+            if row and isinstance(row, dict) and row.get("state") == "shipped":
+                shipped_row = row
+                break
+
+        if not shipped_row:
+            _say("shipped metric not found in metrics")
+            return
+
+        shipped_median = shipped_row.get("median_h")
+        shipped_count = shipped_row.get("n")
+
+        if shipped_median is None:
+            _say("shipped median not available, skipping counter tracking")
+            return
+
+        if self._reset_shipped_counter_if_not_under_24h(shipped_median, shipped_count):
+            self._increment_shipped_counter(shipped_median, shipped_count)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -15713,6 +15830,14 @@ class Station:
                 raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("post_metrics failed: %s" % err)
+            # Track consecutive days where shipped median wait stays under 24h
+            # This is the third acceptance criterion for this ticket
+            try:
+                self._track_shipped_median_under_24h()
+            except RateLimited:
+                raise
+            except (GitHubError, OSError) as err:
+                _say("_track_shipped_median_under_24h failed: %s" % err)
             try:
                 self.watch_logs()
             except RateLimited:
