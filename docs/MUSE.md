@@ -4,6 +4,14 @@ At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
 Run every command from that checkout.
 
+Step 0 of every tick, the :10 build tick and the :40 brain tick alike: read
+your direct thread first. Run `buzz messages thread --channel
+116b0815-4938-4486-a5b6-e213f6a24d1f --event
+4835ea7e5bd9abda0b1c28934e8e91d98ad4a417ef541737478e6f1275c5a70d`. Answer
+every message there that mentions you and has no reply from you, in the same
+tick, in that thread: `ack` plus the result, or `blocked: <step, exact
+command, exact error>`. Then continue with the tick.
+
 Muse writes only as the agent-meta-muse App, in both ticks: never as the
 Loom Brain App, whose credentials belong to the lane machine's scheduled
 brain job alone, and never as a person (loom#1142). Set that App's
