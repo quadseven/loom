@@ -489,8 +489,9 @@ def _opencode_records(home: str, slots: List[str], _env: Dict[str, str], now: fl
     for slot in slots:
         try:
             row = json.loads((p / (slot + ".provider-limit.json")).read_text())
-            samples.append(row)
-        except (OSError, ValueError):
+            if isinstance(row, dict) and "at" in row and row["at"]:
+                samples.append(row)
+        except (OSError, ValueError, json.JSONDecodeError):
             pass
     if not samples:
         return [_record("opencode-go", slots, "all", None, None, None, None,
@@ -568,7 +569,7 @@ def newest_heartbeat(home: str) -> Optional[float]:
     """The newest lane heartbeat time under home, or None."""
     newest = None
     for path in (Path(home) / "state" / "usage").glob("*.json"):
-        if path.name.endswith((".provider-limit.json", ".last-limit.json")) or path.name == "limits.json":
+        if path.name.endswith((".last-limit.json")) or path.name == "limits.json":
             continue
         try:
             beat = json.loads(path.read_text())
