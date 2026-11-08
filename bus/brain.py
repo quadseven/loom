@@ -2605,6 +2605,16 @@ REPAIRS_BODY = (
 # batch epics repairs roll over to once it holds GitHub's sub-issue limit.
 REPAIRS_PREFIX = "Epic: factory repairs"
 REPAIRS_BATCH_TITLE = "Epic: factory repairs for this goal, next batch"
+# A batch epic's title names the minute it opened, so no two open batches
+# share one title (the epic-title-shared invariant, loom#2650: seven batches
+# all titled REPAIRS_BATCH_TITLE). The prefix still marks it a batch.
+REPAIRS_BATCH_TITLE_AT = "Epic: factory repairs for this goal, batch opened %s"
+
+
+def repairs_batch_title(now: Optional[datetime] = None) -> str:
+    """The title of a new factory repairs batch epic, distinct per minute."""
+    now = now or datetime.now(timezone.utc)
+    return REPAIRS_BATCH_TITLE_AT % now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
 REPAIRS_BATCH_BODY = (
     "Done when: every ticket under this epic is closed. It holds at most %d tickets; "
     "the next factory repair past that opens a new batch.\n\n"
@@ -3255,7 +3265,7 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
             return number
     print("goal #%d: the factory repairs epic and every batch epic are full; opening the "
           "next batch" % goal, file=sys.stderr)
-    made = file_epic(gh, repo, goal, REPAIRS_BATCH_TITLE,
+    made = file_epic(gh, repo, goal, repairs_batch_title(),
                      REPAIRS_BATCH_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP), standing=True)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the next repairs batch epic of goal #%d"
