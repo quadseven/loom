@@ -74,6 +74,7 @@ from . import naming
 from . import notify
 from . import proof
 from . import quiet as quiet_rule
+from . import no_change
 from . import rewrite
 from . import operator_hold
 from . import ship_paths
@@ -8028,49 +8029,55 @@ class Station:
             return self._report_verify(lane, kind, repo, number, name)
         if self._field(text, "Deliverable") == "review":
             return self._report_review(lane, kind, repo, number, name, text)
+        self._reset_no_change(repo, number, lane, name)
         self._revert_decision_ticks(repo, number, lane, text)
         if kind == "done":
-            if self._field(text, "Deliverable") == "answer":
-                _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
-                return True
-            if not self._field(text, "Fix-PR") and self._answered(lane, name):
-                prs = {int(n) for n in NAMED_PR_RE.findall(text)}
-                self._post_thread_answers(repo, prs, lane, name, text, None)
-                self._settle_no_change(repo, number, lane, name, text)
-                _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
-                return True
-            branch = self._field(text, "Branch")
-            prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
-                               % (repo, repo.split("/")[0], branch)).data
-            url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
-            if not url:
-                return self._done_without_pr(repo, number, lane, path, name, branch)
-            self._relabel(repo, number, "loom:pr")
-            if self._field(text, "Fix-PR").isdigit():
-                self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
-            if self._field(text, "Fix-PR"):
-                # A fix round's push is routine (the pull request already
-                # exists and the lane comments on it): three of them emailed
-                # one ticket's author on 2026-10-20.
-                # Only a run that pushed a commit says so: a round that answered
-                # threads or repaired text, or whose check was stale, pushed
-                # nothing (zippie-style loop, 2026-10-19).
-                if self._pushed(lane, name):
-                    self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s"
-                                  % (lane, url))
-                else:
-                    self._routine(repo, number, "Lane %s made no code change for a fix to a "
-                                  "pull request: %s" % (lane, url))
-            else:
-                # The pull request's "Refs #N" already cross-references the
-                # ticket, which sends no email, and loom:pr is set above: a new
-                # comment said it again, 55 a day (loom#1390).
-                self._routine(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
-            _say("reported %s#%d done: %s" % (repo, number, url))
-            return True
+            return self._report_done(repo, number, lane, text, path, name)
         if not self._report_failure(repo, number, lane, text, name):
             return False
-        self._never_left_running(repo, number, lane)
+        if not self._no_change_finished(repo, number, lane, name):
+            self._never_left_running(repo, number, lane)
+        return True
+
+    def _report_done(self, repo: str, number: int, lane: str, text: str,
+                     path: str, name: str) -> bool:
+        if self._field(text, "Deliverable") == "answer":
+            _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
+            return True
+        if not self._field(text, "Fix-PR") and self._answered(lane, name):
+            prs = {int(n) for n in NAMED_PR_RE.findall(text)}
+            self._post_thread_answers(repo, prs, lane, name, text, None)
+            self._settle_no_change(repo, number, lane, name, text)
+            _say("reported %s#%d answered by lane %s: nothing to change" % (repo, number, lane))
+            return not self._no_change_pending(repo, number, lane, name)
+        branch = self._field(text, "Branch")
+        prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
+                           % (repo, repo.split("/")[0], branch)).data
+        url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
+        if not url:
+            return self._done_without_pr(repo, number, lane, path, name, branch)
+        self._relabel(repo, number, "loom:pr")
+        if self._field(text, "Fix-PR").isdigit():
+            self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
+        if self._field(text, "Fix-PR"):
+            # A fix round's push is routine (the pull request already
+            # exists and the lane comments on it): three of them emailed
+            # one ticket's author on 2026-10-20.
+            # Only a run that pushed a commit says so: a round that answered
+            # threads or repaired text, or whose check was stale, pushed
+            # nothing (zippie-style loop, 2026-10-19).
+            if self._pushed(lane, name):
+                self._routine(repo, number, "Lane %s pushed fixes to a pull request: %s"
+                              % (lane, url))
+            else:
+                self._routine(repo, number, "Lane %s made no code change for a fix to a "
+                              "pull request: %s" % (lane, url))
+        else:
+            # The pull request's "Refs #N" already cross-references the
+            # ticket, which sends no email, and loom:pr is set above: a new
+            # comment said it again, 55 a day (loom#1390).
+            self._routine(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
+        _say("reported %s#%d done: %s" % (repo, number, url))
         return True
 
     def _done_without_pr(self, repo: str, number: int, lane: str, path: str, name: str,
@@ -8112,6 +8119,9 @@ class Station:
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
+        no_change_result = self._report_box_no_change(repo, number, lane, text, name, bare)
+        if no_change_result is not None:
+            return no_change_result
         if klass == "transient" and self._timed_out_again(repo, number, reason):
             # One timeout is a slow provider; the run before it also timing
             # out is the ticket (too large, a hung test): counted as work, it
@@ -8137,36 +8147,16 @@ class Station:
             return True
         if fix_pr.isdigit() and bare.startswith(NO_COMMIT):
             self._post_answers(repo, int(fix_pr), lane, name, text)
-            self._nothing_to_fix(repo, number, int(fix_pr), lane, name)
-            return True
+            self._nothing_to_fix(repo, number, int(fix_pr), lane, name, text)
+            return not self._no_change_pending(repo, number, lane, name)
         if (klass == "factory" and lane in runners.runner_slots()
                 and CHECK_CANNOT_RUN_RE.search(bare)):
             # Held behind the incident, the ticket went back to the same
             # runner, which can never clear it: another lane runs the check.
-            note = self._retry(repo, number, lane, "transient", reason)
-            if note:
-                self._requeue_transient(repo, number, lane, reason, note)
+            self._retry_factory_check(repo, number, lane, reason)
             return True
         if klass == "factory":
-            # The validation environment the factory broke, not the ticket's
-            # work: the ticket stays running on its lane and keeps its rung.
-            # release_factory_held re-queues it when the incident closes, and
-            # releases a hold with no incident after HELD_NO_INCIDENT_FOR.
-            match = HELD_FOR_RE.search(bare)
-            incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
-            self._note_held(repo, number, incident_ref)
-            self._set_wait(repo, self._issue(repo, number), "incident")
-            if incident_ref is None:
-                self._routine(repo, number,
-                              "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
-                              "returns to the queue "
-                              "after %d hours." % (lane, bare,
-                                                   HELD_NO_INCIDENT_FOR // 3600))
-            else:
-                self._routine(repo, number,
-                              "Lane %s held: %s. The ticket keeps its rung and returns to the "
-                              "queue when the factory incident closes." % (lane, bare))
-            _say("held %s#%d for the factory: %s" % (repo, number, reason))
+            self._report_factory_hold(repo, number, lane, bare, reason)
             return True
         if klass == "auth":
             # The provider refused the key: no attempt of any lane can renew
@@ -8209,6 +8199,41 @@ class Station:
         self._routine(repo, number, "Lane %s failed: %s%s" % (lane, reason, note))
         _say("reported %s#%d failed: %s" % (repo, number, reason))
         return True
+
+    def _retry_factory_check(self, repo: str, number: int, lane: str, reason: str) -> None:
+        note = self._retry(repo, number, lane, "transient", reason)
+        if note:
+            self._requeue_transient(repo, number, lane, reason, note)
+
+    def _report_box_no_change(self, repo: str, number: int, lane: str, text: str,
+                              name: str, reason: str) -> Optional[bool]:
+        pr = self._field(text, "Fix-PR")
+        if not pr.isdigit() or not reason.startswith((NO_COMMIT, "fix round made no commit")):
+            return None
+        body = str(self._issue(repo, number).get("body") or "")
+        if not factory.unproven_criteria(body, self._no_change_said(lane, name)):
+            return None  # Check-only failures retain their existing policy.
+        self._post_answers(repo, int(pr), lane, name, text)
+        self._nothing_to_fix(repo, number, int(pr), lane, name, text)
+        return not self._no_change_pending(repo, number, lane, name)
+
+    def _report_factory_hold(self, repo: str, number: int, lane: str, bare: str, reason: str) -> None:
+        """Keep an environment failure on its rung until its incident clears."""
+        match = HELD_FOR_RE.search(bare)
+        incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
+        self._note_held(repo, number, incident_ref)
+        self._set_wait(repo, self._issue(repo, number), "incident")
+        if incident_ref is None:
+            self._routine(repo, number,
+                          "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
+                          "returns to the queue "
+                          "after %d hours." % (lane, bare,
+                                               HELD_NO_INCIDENT_FOR // 3600))
+        else:
+            self._routine(repo, number,
+                          "Lane %s held: %s. The ticket keeps its rung and returns to the "
+                          "queue when the factory incident closes." % (lane, bare))
+        _say("held %s#%d for the factory: %s" % (repo, number, reason))
 
     def _routine(self, repo: str, number: int, text: str) -> None:
         """A lane failure, factory hold or stop the factory acts on by itself,
@@ -8636,11 +8661,11 @@ class Station:
         said = self._no_change_said(lane, name)
         issue = self._issue(repo, number)
         names = _label_names(issue)
-        if self._unproven_no_change(repo, number, issue, said):
+        if self._unproven_no_change(repo, number, issue, said, lane, name, self._field(brief, "Model")):
             return
         undoes = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         merged = self._merged_linked(repo, issue) if (
-            issue.get("state") == "open" and RUNNING in names and not undoes) else []
+            self._no_change_running(issue) and not undoes) else []
         decide = criteria_gate.open_decisions(str(issue.get("body") or ""))
         if merged and decide:
             # The merged work does not settle a decision only an operator
@@ -8671,24 +8696,245 @@ class Station:
                                 "No merged pull request references this ticket"))
         self._routine(repo, number, "%s\n\n%s" % (said, note))
 
+    @staticmethod
+    def _no_change_running(issue: Dict[str, Any]) -> bool:
+        return issue.get("state") == "open" and RUNNING in _label_names(issue)
+
     def _unproven_no_change(self, repo: str, number: int, issue: Dict[str, Any],
-                            said: str) -> bool:
-        """Send a running ticket back to loom:queued, naming each box, when a
-        no-change answer leaves a code acceptance box unproven (neither the
-        ticket nor the answer's checklist ticks it). On 2026-10-17 a lane's
-        no-op answer settled a ticket whose third box still failed, and it
-        went on to loom:merged (loom#2032). True when it requeued."""
-        if issue.get("state") != "open" or RUNNING not in _label_names(issue):
-            return False
+                            said: str, lane: str = "", name: str = "", model: str = "") -> bool:
+        """Budget an answer that leaves code boxes unproven: retry below the
+        limit, promote once, then hold for the brain. Build and fix outcomes
+        share the same ticket/box budget. True when this path handles it."""
         left = factory.unproven_criteria(str(issue.get("body") or ""), said)
         if not left:
+            self._clear_no_change_boxes(repo, number)
             return False
-        self._relabel(repo, number, "loom:queued")
-        self._routine(repo, number, "%s\n\n%s" % (said, NO_CHANGE_UNPROVEN_NOTE % "; ".join(
-            " ".join(text.split())[:criteria_gate.ASK_WIDTH] for text in left)))
-        _say("%s#%d: a no-change answer left %d box(es) unproven, requeued"
-             % (repo, number, len(left)))
+        return self._no_change_budget(repo, number, issue, left, lane, name, 0, model)
+
+    def _no_change_data(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, no_change.FILE), {})
+        if not isinstance(data, dict) or not all(no_change.valid_entry(e) for e in data.values()):
+            raise StateError("invalid no-change budget state")
+        return data
+
+    def _save_no_change(self, data: Dict[str, Any]) -> None:
+        _write_json(os.path.join(self.state, no_change.FILE), data)
+
+    def _clear_no_change_boxes(self, repo: str, number: int) -> None:
+        data = self._no_change_data()
+        entry = data.get("%s#%d" % (repo, number))
+        if entry and entry.get("key"):
+            entry.update(key=None, count=0, promoted=None)
+            for step in entry.get("runs", {}).values():
+                step["done"] = True
+            self._save_no_change(data)
+
+    def _no_change_stamp(self, lane: str, name: str, suffix: str) -> int:
+        path = os.path.join(self.s.home, "logs", lane, name + suffix)
+        try:
+            return os.stat(path).st_mtime_ns
+        except FileNotFoundError:
+            # Failed fix rounds park with a final log, but no .answered marker.
+            if suffix == ".answered":
+                return self._no_change_stamp(lane, name, ".log")
+            raise StateError("no-change outcome has no stable completion evidence") from None
+
+    def _no_change_finished(self, repo: str, number: int, lane: str, name: str) -> bool:
+        entry = self._no_change_data().get("%s#%d" % (repo, number), {})
+        return entry.get("runs", {}).get(lane + "/" + name, {}).get("done", False)
+
+    def _no_change_pending(self, repo: str, number: int, lane: str, name: str) -> bool:
+        entry = self._no_change_data().get("%s#%d" % (repo, number), {})
+        step = entry.get("runs", {}).get(lane + "/" + name, {})
+        return bool(step) and not step.get("done")
+
+    def _reset_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
+        if not self._pushed(lane, name):
+            return
+        data = self._no_change_data()
+        ticket, run = "%s#%d" % (repo, number), lane + "/" + name
+        at = self._no_change_stamp(lane, name, ".pushed")
+        active = bool(data.get(ticket, {}).get("key")) and at >= data.get(ticket, {}).get("at", 0)
+        if no_change.reset(data, ticket, run, at):
+            if active:
+                data[ticket]["reset_note"] = run
+            self._save_no_change(data)
+        if data.get(ticket, {}).get("reset_note") == run:
+            marker = no_change.RESET + " " + no_change.key([run])[:16]
+            if not any(marker in text for text in self._status_texts(repo, number)):
+                self._routine(repo, number, marker + "\nA committed run resets the no-change budget.")
+            data[ticket].pop("reset_note")
+            self._save_no_change(data)
+
+    def _no_change_budget(self, repo: str, number: int, issue: Dict[str, Any],
+                          boxes: List[str], lane: str, name: str, fix: int, model: str = "") -> bool:
+        data = self._no_change_data()
+        ticket, run = "%s#%d" % (repo, number), lane + "/" + name
+        entry = data.get(ticket, {})
+        prior = entry.get("runs", {}).get(run)
+        promoted = entry.get("promoted")
+        if entry.get("key") == no_change.key(boxes) and self._old_no_change_run(promoted, prior, lane, model):
+            entry.setdefault("runs", {})[run] = {"action": "ignore", "done": True}
+            self._save_no_change(data)
+            return True
+        planning = self._no_change_planning_issue(repo, issue, lane, name)
+        if planning is None or self._no_change_intervened(planning, prior, fix):
+            # A handled obsolete outcome must also suppress the outer
+            # failed-report fallback, including on its very first report.
+            entry = data.setdefault(ticket, {})
+            entry.setdefault("runs", {})[run] = {"action": "ignore", "done": True}
+            self._save_no_change(data)
+            return True
+        entry, step = no_change.outcome(data, ticket, boxes, run, factory.NO_CHANGE_LIMIT,
+                                        self._no_change_stamp(lane, name, ".answered"))
+        self._save_no_change(data)  # A retried result keeps the same decision and plan.
+        if step["done"]:
+            return True
+        if not self._no_change_area_ready(repo, issue, step):
+            step.update(action="ignore", done=True)
+            step.pop("plan", None)
+            self._save_no_change(data)
+            return True
+        if step["action"] == "promote" and "plan" not in step:
+            plan = self._no_change_plan(repo, planning)
+            if plan is None:
+                self._set_wait(repo, issue, "no-change")
+                return True
+            step["plan"] = plan
+            self._save_no_change(data)
+        self._apply_no_change(repo, number, issue, boxes, step, fix)
+        if step["action"] == "promote" and step["plan"]:
+            entry["promoted"] = step["plan"]
+        step["done"] = True
+        self._save_no_change(data)
+        self._log_no_change(repo, number, boxes, step, fix)
         return True
+
+    def _no_change_area_ready(self, repo: str, issue: Dict[str, Any], step: Dict[str, Any]) -> bool:
+        """Recheck the area gate before selecting or replaying a promotion.
+
+        An unreadable label list raises before any remote write and leaves
+        the outcome pending. A definite refusal uses the normal station
+        hold, rather than moving to a lane whose next claim would refuse it.
+        """
+        if step["action"] != "promote" or set(_label_names(issue)) & {REGRESSION, factory.REVERT_LABEL}:
+            return True
+        if brief_check.area_verdict(issue, self._area_labels(repo)) is None:
+            return True
+        self._brief_holds(repo, issue, [])
+        return False
+
+    @staticmethod
+    def _log_no_change(repo: str, number: int, boxes: List[str], step: Dict[str, Any], fix: int) -> None:
+        action = "returned to PR" if fix else "requeued"
+        if step["action"] == "promote":
+            action = "promoted" if step.get("plan") else "held"
+        elif step["action"] == "hold":
+            action = "held"
+        _say("%s#%d: a no-change answer left %d box(es) unproven, %s"
+             % (repo, number, len(boxes), action))
+
+    def _no_change_intervened(self, issue: Dict[str, Any], prior: Any, fix: int) -> bool:
+        if issue.get("state") != "open" or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers):
+            return True
+        names = set(_label_names(issue))
+        allowed = {RUNNING, "wait:no-change"}
+        if prior:
+            held = prior["action"] == "hold" or prior.get("plan") == {}
+            target = "answered" if held else ("pr" if fix else "queued")
+            if prior.get("plan") and not fix:
+                target = "briefed"
+            allowed.add("loom:" + target)
+            if held:
+                allowed.add("needs-brain")
+        other = self._drop_claim(names - allowed)
+        return any(_holds_ticket(n) or self._held_wait_label(n) for n in other)
+
+    @staticmethod
+    def _old_no_change_run(promoted: Any, prior: Any, lane: str, model: str) -> bool:
+        if not promoted or prior:
+            return False
+        return model != promoted["model"] if model else lane != promoted["lane"]
+
+    def _no_change_planning_issue(self, repo: str, issue: Dict[str, Any], lane: str,
+                                  name: str) -> Optional[Dict[str, Any]]:
+        """Ignore only the ended run's own claim in the ladder's read view.
+
+        The remote issue is unchanged. A different lane, a later claim or
+        unreadable claim timing is not evidence that this run owns it.
+        Recheck on replay, before applying even a previously saved plan.
+        """
+        own = stale_claims.own_claims(issue, self.s.authors)
+        if not own:
+            return issue
+        names = _label_names(issue)
+        lanes = [n for n in names if n.startswith("lane:")]
+        if len(own) != 1 or not self._no_change_running(issue) or lanes != ["lane:" + lane]:
+            return None
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+        claim = next(iter(own.values()))
+        claimed = stale_claims._claimed_at(events, claim)
+        ended = self._no_change_stamp(lane, name, ".answered") / 1_000_000_000
+        if claimed is None:
+            raise StateError("no-change outcome cannot establish claim timing; retry later")
+        if claimed > ended:
+            return None
+        return dict(issue, labels=[label for label in issue.get("labels", [])
+                                   if label.get("name") != claim])
+
+    def _no_change_plan(self, repo: str, issue: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        runner = self._factory()
+        comments = runner._comments(repo, int(issue["number"]))
+        if factory.person_claim(issue) or factory.RUNAWAY in _label_names(issue):
+            return None
+        if runner._move_capped(repo, issue, comments):
+            return None
+        tried, reached = runner._tried(issue, comments)
+        up = runner._up_lanes(repo)
+        rung = factory.next_rung(tried, runner.load, {n for n in up if up[n]}, reached, lanes=up)
+        if not rung:
+            return None if runner._rungs_left(repo, issue, comments) else {}
+        lane = factory.pick_lane(up[rung], runner.load)
+        return {"lane": lane, "model": factory.CLIMB[rung - 1][1], "rung": rung}
+
+    def _apply_no_change(self, repo: str, number: int, issue: Dict[str, Any],
+                         boxes: List[str], step: Dict[str, Any], fix: int) -> None:
+        plan = step.get("plan")
+        held = step["action"] == "hold" or (step["action"] == "promote" and not plan)
+        target = "answered" if held else ("pr" if fix else "queued")
+        if plan:
+            body = factory.with_model(str(issue.get("body") or ""), plan["model"])
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+            target = "pr" if fix else "briefed"
+        self._no_change_labels(repo, number, issue, target, plan, held)
+        marker = "<!-- loom:no-change-outcome %s -->" % step["marker"]
+        if any(marker in text for text in self._status_texts(repo, number)):
+            return
+        note = no_change.MARKER + " " + no_change.key(boxes) + "\n" + marker
+        if plan:
+            note += "\n" + factory.history.rung_marker(plan["rung"])
+        note += "\nNo-change answer leaves these boxes unproven: " + "; ".join(boxes)
+        if held:
+            note += ". Held for the brain after the no-change budget."
+            notify.post(self.gh, repo, number, note, notify.HELD)
+        else:
+            if fix:
+                self._no_change_review(repo, fix, step["marker"])
+            self._routine(repo, number, note)
+
+    def _no_change_review(self, repo: str, pr: int, run: str) -> None:
+        marker = "<!-- loom:no-change-review %s -->" % run
+        if not any(marker in text for text in self._status_texts(repo, pr)):
+            self._comment(repo, pr, factory.review_again() + "\n\n" + marker, notify.REVIEW_REQUEST)
+
+    def _no_change_labels(self, repo: str, number: int, issue: Dict[str, Any], target: str,
+                          plan: Optional[Dict[str, Any]], held: bool) -> None:
+        labels = ticket_move.next_labels(
+            _label_names(issue), target, lane=plan["lane"] if plan else None,
+            own_logins=self.s.authors, clear_needs_brain=False)
+        if held and "needs-brain" not in labels:
+            labels.append("needs-brain")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
 
     def _merged_cited(self, repo: str, issue: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Merged pull requests the Fabric workspace cites as already doing
@@ -8911,7 +9157,8 @@ class Station:
                  % (thread_id, repo, pr, lane, _redacted_answer(why)))
         return not why
 
-    def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
+    def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str,
+                        brief: str = "") -> None:
         """A fix brief that ended with nothing committed. Most often the lane
         found every thread already fixed (a stale review thread) and said
         so. Its explanation stays in the local lane log, the review bot is asked
@@ -8919,6 +9166,12 @@ class Station:
         the ticket returns to loom:pr. If the review still stands, the factory
         sends it back a rung up the model ladder (bus/factory.py), so this
         never loops on one lane."""
+        issue = self._issue(repo, number)
+        boxes = factory.unproven_criteria(str(issue.get("body") or ""), self._no_change_said(lane, name))
+        if boxes and self._no_change_budget(repo, number, issue, boxes, lane, name, pr, self._field(brief, "Model")):
+            return
+        if not boxes:
+            self._clear_no_change_boxes(repo, number)
         # Routine lane prose remains in the existing local run log. Only
         # the review command reaches the PR; findings still use their threads.
         self._comment(repo, pr, factory.review_again(), notify.REVIEW_REQUEST)
