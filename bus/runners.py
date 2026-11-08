@@ -874,7 +874,7 @@ class Runners:
         for rel, data in sorted(files.items()):
             if rel.startswith("briefs/%s/" % slot) and "/answers/" not in rel:
                 continue   # the brief moves below; the local copy is the one sent
-            if rel.startswith("state/usage/"):
+            if rel == beat_rel:
                 continue   # the station writes the slot's heartbeat itself (_beat)
             _write(os.path.join(self.home, *rel.split("/")), data)
         if kinds:
