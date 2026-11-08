@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -155,6 +156,45 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(self.step("prepare").returncode, 1)
         self.inputs(slot="codex-2", settings="LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
         self.assertEqual(self.step("prepare").returncode, 0)
+
+    def test_codex_session_file_stays_out_of_the_job_log_and_sealed_report(self):
+        secret = "session-access-placeholder"
+        auth = json.dumps({"tokens": {"access_token": secret, "account_id": "account-placeholder"}})
+        self.inputs(slot="codex-2", settings="LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+        job = self.load()
+        out = io.StringIO()
+        with mock.patch.object(job, "job_dir", return_value=str(self.job)), \
+                mock.patch.object(job, "_settings", return_value={
+                    "LOOM_CODEX_SESSION_SSM": "/lane/codex/session"}), \
+                mock.patch.object(job, "_fetch", return_value=json.dumps({
+                    "published_at": 1_800_000_000, "auth": json.loads(auth)})):
+            with mock.patch.object(job.time, "time", return_value=1_800_000_001), \
+                    contextlib.redirect_stdout(out):
+                job.ssm()
+        auth_file = self.job / "home" / "run" / "codex-auth.json"
+        self.assertEqual(stat.S_IMODE(auth_file.stat().st_mode), 0o600)
+        log = self.job / "home" / "logs" / "codex-2" / "owner.app-7.service.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("runner output with no session contents\n")
+        self.real_key()
+        with mock.patch.object(job, "job_dir", return_value=str(self.job)):
+            job.report()
+        self.assertTrue((self.job / "report" / "report.enc").is_file())
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as zipped:
+            for path in (self.job / "report").iterdir():
+                zipped.write(path, path.name)
+        station_home = self.tmp / "station"
+        station_runner = runners.Runners(None, str(station_home), "owner/loom", [], {},
+                                         lambda repo: True, lambda message: None)
+        Path(station_runner.key_path()).parent.mkdir(parents=True)
+        shutil.copy(self.tmp / "station.pem", station_runner.key_path())
+        reported = station_runner.open_report(archive.getvalue(), RUN_ID, MAC_KEY)
+        self.assertFalse(any("codex-auth.json" in path for path in reported))
+        self.assertNotIn(secret, out.getvalue())
+        self.assertNotIn(secret.encode(), b"\n".join(reported.values()))
+        self.assertNotIn(secret, log.read_text())
 
     def test_claude_runner_slot_requires_its_oauth_parameter(self):
         self.inputs(slot="claude")

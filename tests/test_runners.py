@@ -138,14 +138,16 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai"])
+                         ["claude", "zen", "free-kilo", "codex-2", "codex-3", "codex-4", "codex-5",
+                          "codex-6", "codex-7", "codex-8", "free-openrouter", "workersai"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai"])
+                         ["free-gemma", "codex-2", "codex-3", "codex-4", "codex-5", "codex-6",
+                          "codex-7", "codex-8", "free-openrouter", "workersai"])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
         settings = runners.lane_settings("workersai", {
@@ -179,6 +181,44 @@ class RunnersTest(unittest.TestCase):
             self.assertFalse(station.needs_public_repo("opencode-go-3", "opencode-go/beam-free"))
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": ""}):
             self.assertFalse(station.needs_public_repo("opencode-go-2", "opencode-go/beam-free"))
+
+    def test_a_codex_runner_slot_dispatches_public_repos_and_refuses_private_ones(self):
+        slot = "codex-2"
+        self.assertEqual([name for name in runners.TRACKED_SLOTS if name.startswith("codex-")],
+                         ["codex-%d" % number for number in range(2, 9)])
+        inbox = self.home / "briefs" / slot
+        inbox.mkdir(parents=True)
+        env = dict(self.env, LOOM_RUNNER_SLOTS=slot,
+                   LOOM_CODEX_SESSION_SSM="/lane/codex/session")
+        slots = runners.runner_slots(env)
+        self.assertIn(slot, slots)
+        public = runners.Runners(self.gh, str(self.home), REPO, slots, env,
+                         lambda repo: self.public.get(repo, False), self.said.append,
+                         actor=APP, now=self.now, fetch=self.fetch)
+        brief = BRIEF.replace("Lane: opencode-go", "Lane: codex")
+        (inbox / (TICKET + ".md")).write_text(brief)
+
+        public.tend()
+
+        dispatches = self.gh.posts("/dispatches")
+        self.assertEqual(len(dispatches), 1)
+        self.assertEqual(dispatches[0][2]["inputs"]["slot"], slot)
+        self.assertIn("LOOM_CODEX_SESSION_SSM=/lane/codex/session", dispatches[0][2]["inputs"]["settings"])
+        self.assertIn("LOOM_CODEX_2_MODEL=gpt-6-luna", dispatches[0][2]["inputs"]["settings"])
+
+        self.public["owner/app"] = False
+        self.gh.calls.clear()
+        private_ticket = "owner.app-8"
+        private_home = self.home.parent / "private-loom"
+        private_inbox = private_home / "briefs" / slot
+        private_inbox.mkdir(parents=True)
+        (private_inbox / (private_ticket + ".md")).write_text(brief.replace("owner.app-7", private_ticket))
+        private = runners.Runners(self.gh, str(private_home), REPO, slots, env,
+                          lambda repo: self.public.get(repo, False), self.said.append,
+                          actor=APP, now=self.now, fetch=self.fetch)
+        private.tend()
+        self.assertEqual(self.gh.posts("/dispatches"), [])
+        self.assertTrue((private_inbox / "failed" / (private_ticket + ".md")).exists())
 
     def test_the_settings_sent_are_the_slots_and_the_lanes_app_never_the_stations(self):
         settings = runners.lane_settings("opencode-go-2", self.env)

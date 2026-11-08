@@ -77,6 +77,8 @@ RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "w
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
 TRACKED_SLOTS = {
+    **{"codex-%d" % number: {"LOOM_CODEX_%d_MODEL" % number: "gpt-6-luna"}
+       for number in range(2, 9)},
     "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
     "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
 }
