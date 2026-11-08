@@ -60,7 +60,6 @@ from . import brief_check
 from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
-from . import merge_verdict
 from . import history
 from . import friction_intake
 from . import review_debt
@@ -7809,10 +7808,6 @@ class Station:
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
                     ready: Optional[str]) -> None:
-        decision = merge_verdict.decide({"head_sha": sha})
-        if not decision.ready:
-            self._remove_ready_if_present(repo, number, names)
-            return
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
         # Routine, so an event in the status comment rather than a comment of
