@@ -133,7 +133,7 @@ def held(gh: GitHub, repos: Sequence[str], authors: Sequence[str], now: float) -
             comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, int(issue["number"])))
             for comment in _trusted(comments, authors):
                 found = read(str(comment.get("body") or ""))
-                until = _stamp(comment.get("created_at")) + HOLD
+                until = now + HOLD
                 if found and found[0] == "fail" and until > now:
                     out[found[1]] = max(out.get(found[1], 0.0), until)
     return out
