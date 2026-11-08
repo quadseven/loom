@@ -113,7 +113,8 @@ def ready_node(checks="SUCCESS", reviews=(), threads=()):
     """One pull request's READY_FIELDS, head committed at 12:45 on 2030-01-01."""
     return {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
                                               "statusCheckRollup": {"state": checks}}}]},
-            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+            "reviews": {"nodes": list(reviews)},
+            "reviewThreads": {"totalCount": len(threads), "nodes": list(threads)}}
 
 
 def merge_takes(ticket=4):
@@ -375,7 +376,7 @@ class SensitiveResumeTests(unittest.TestCase):
             details[n] = {"headRefOid": "sha%d" % n,
                           "commits": {"nodes": [{"commit": {
                               "statusCheckRollup": {"state": checks}}}]},
-                          "reviewThreads": {"nodes": [
+                          "reviewThreads": {"totalCount": 2, "nodes": [
                               {"isResolved": False}, {"isResolved": True}]}}
 
         def transport(method, url, headers, body):
@@ -452,7 +453,7 @@ class SensitiveResumeTests(unittest.TestCase):
                         {"number": 2, "title": "Ticket", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}], "created_at": "2030-01-01T00:00:00Z"},
                         {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
             reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
-            reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
+            reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"totalCount": 1, "nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
             reply(200, []), reply(200, []), reply(200, []), reply(200, {"private": False})))
         report = brain.status(gh, [REPO], REPO, env={}, authors=())
         for section in ("Goals", "Tickets", "Pull requests", "Needs operator", "Lane status", "#4 PR - blocked: 1 unresolved threads"):
@@ -959,11 +960,25 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("Prove the running version takes the new form", msg)
         self.assertFalse(any("/merge" in call[1] for call in fake.calls))
 
-    def _merged_with(self, issue, body=None):
+    def _merged_with(self, issue, body=None, env=None):
         pr, query = self._merge_replies({"pr": {"body": body or self._criteria_pr("built")}})
         fake = Fake(pr, query, reply(200, issue), reply(200, {"merged": True}), reply(204),
                     reply(200, []), reply(200, issue), reply(200, {}))
-        return brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        return brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                           env={} if env is None else env)
+
+    def test_merge_uses_the_supplied_review_bot_for_sensitive_validation(self):
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"},
+                                                  {"name": "loom:pr"}]}
+        seen = []
+        with unittest.mock.patch.object(brain.change_class, "class_of", return_value="sensitive"), \
+                unittest.mock.patch.object(
+                    brain, "_validate_sensitive_merge",
+                    side_effect=lambda gh, repo, details, bot, check: seen.append(bot)), \
+                unittest.mock.patch.dict(os.environ, {"LOOM_REVIEW_BOT": "ambient-review-bot"}):
+            result = self._merged_with(issue, env={"LOOM_REVIEW_BOT": "custom-review-bot"})
+        self.assertTrue(result["merged"])
+        self.assertEqual(seen, ["custom-review-bot"])
 
     def test_merge_passes_the_same_hold_box_ticked(self):
         self.assertTrue(self._merged_with(self._held_issue(self.HOLD_BOX, ticked=True))["merged"])
@@ -1093,7 +1108,7 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_merge_ready_names_each_blocker(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
         cases = [
-            ({}, "blocked: checks unknown"),
+            ({}, "blocked: checks unknown, review threads were not fully read"),
             (ready_node(), "READY"),
             (ready_node(checks="FAILURE"), "blocked: checks failure"),
             (ready_node(reviews=[{"author": bot, "state": "CHANGES_REQUESTED", "submittedAt": "2030-01-01T08:06:00Z"}]),
@@ -1111,6 +1126,22 @@ class SensitiveResumeTests(unittest.TestCase):
         for node, want in cases:
             with self.subTest(want=want):
                 self.assertEqual(brain.merge_ready(node, "grug-tribe"), want)
+
+    def test_merge_ready_fails_closed_when_review_threads_are_truncated(self):
+        node = ready_node(threads=[{"isResolved": True}] * 100)
+        node["reviewThreads"]["totalCount"] = 101
+
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"),
+                         "blocked: review threads were not fully read")
+        self.assertFalse(brain._threads_resolved(node))
+
+    def test_merge_ready_fails_closed_when_review_thread_count_is_missing(self):
+        node = ready_node()
+        del node["reviewThreads"]["totalCount"]
+
+        self.assertEqual(brain.merge_ready(node, "grug-tribe"),
+                         "blocked: review threads were not fully read")
+        self.assertFalse(brain._threads_resolved(node))
 
     def test_merge_ready_follows_the_newest_review_and_two_status_runs_agree(self):
         bot = {"__typename": "Bot", "login": "grug-tribe"}
@@ -1219,7 +1250,7 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertIn("- #4 PR - blocked: checks unknown", report)
         query = fake.calls[2][2]["query"]
         for field in ("committedDate", "statusCheckRollup", "reviews(last:100)", "submittedAt",
-                      "reviewThreads(first:100)", "isResolved", "createdAt", "__typename"):
+                      "reviewThreads(first:100)", "totalCount", "isResolved", "createdAt", "__typename"):
             self.assertIn(field, query)
 
     def test_status_flags_a_repo_whose_recent_merges_target_an_undeclared_branch(self):
@@ -1836,10 +1867,13 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def _merge_replies(self, changes=None):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO, "head": {"ref": "loom/9-work", "sha": "checked", "repo": {"full_name": REPO}}, "base": {"repo": {"full_name": REPO}}, "mergeable": True}
-        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work", "headRefOid": "checked", "headRepository": {"nameWithOwner": REPO}, "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"totalCount": 0, "nodes": []}, "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         if changes:
             pr.update(changes.get("pr", {}))
             details.update(changes.get("details", {}))
+        review_threads = details.get("reviewThreads") or {}
+        review_threads.setdefault("totalCount", len(review_threads.get("nodes") or []))
+        details["reviewThreads"] = review_threads
         return reply(200, pr), reply(200, {"data": {"repository": {"pullRequest": details}}})
 
     def test_merge_refuses_a_person_change_request_before_the_merge_call(self):
@@ -2526,9 +2560,12 @@ class SensitiveResumeTests(unittest.TestCase):
         details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "fix/build",
                    "headRefOid": "head1", "headRepository": {"nameWithOwner": REPO},
                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
-                   "reviewThreads": {"nodes": []}}
+                   "reviewThreads": {"totalCount": 0, "nodes": []}}
         pr.update(changes.get("pr", {}))
         details.update(changes.get("details", {}))
+        review_threads = details.get("reviewThreads") or {}
+        review_threads.setdefault("totalCount", len(review_threads.get("nodes") or []))
+        details["reviewThreads"] = review_threads
         runs = changes.get("runs")
         if runs is None:
             runs = [{"name": "unittest", "status": "completed", "conclusion": "success"},
@@ -2728,6 +2765,16 @@ class LunaMergeTests(unittest.TestCase):
         self.merges = []
         self.labels = []
 
+    def test_unheld_answer_check_uses_the_supplied_review_bot(self):
+        gh = GitHub("t", transport=Fake())
+        thread = {"id": "thread-1", "isResolved": False}
+        details = {"headRefOid": "head", "reviewThreads": {"nodes": [thread]}}
+        with unittest.mock.patch.object(brain, "_unheld_answer", return_value="") as check:
+            brain._refuse_unheld_answers(
+                gh, REPO, 8, details,
+                env={"LOOM_REVIEW_BOT": "custom-review-bot", "LOOM_BRIEF_AUTHORS": "trusted"})
+        self.assertEqual(check.call_args.args[4], "custom-review-bot")
+
     def transport(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
         if method == "POST" and path == "/graphql":
@@ -2742,7 +2789,7 @@ class LunaMergeTests(unittest.TestCase):
                            "committedDate": "2030-01-01T12:45:00Z",
                            "statusCheckRollup": {"state": "FAILURE"},
                            "parents": {"totalCount": 1}}}]},
-                       "reviews": {"nodes": []}, "reviewThreads": {"nodes": []},
+                       "reviews": {"nodes": []}, "reviewThreads": {"totalCount": 0, "nodes": []},
                        "files": {"totalCount": 1, "nodes": [
                            {"path": "bus/a.py", "deletions": 0, "changeType": "MODIFIED"}]}}
             return reply(200, {"data": {"repository": {"pullRequest": details}}})
@@ -2893,7 +2940,8 @@ class FixTests(unittest.TestCase):
         fake = Fake(reply(200, pr), reply(200, ticket or fix_ticket()))
         with self.assertRaises(ValueError):
             brain.fix(GitHub("t", transport=fake), REPO, 8, ref, "notes")
-        self.assertFalse(any(c[0] in ("POST", "PUT") for c in fake.calls))
+        self.assertFalse(any(c[0] == "PUT" or (c[0] == "POST" and "/comments" in c[1])
+                             for c in fake.calls))
 
     def test_fix_refuses_a_closed_pull_request(self):
         self.refused(fix_pr(state="closed"))
@@ -2913,7 +2961,7 @@ class FixTests(unittest.TestCase):
 
     def test_fix_accepts_a_running_ticket_and_marks_it_as_a_brain_fix(self):
         runs = {"check_runs": []}
-        threads = {"reviewThreads": {"nodes": []}}
+        threads = {"reviewThreads": {"totalCount": 0, "nodes": []}}
         fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
                     reply(200, runs), reply(200, {"statuses": []}),
                     reply(200, {"data": {"repository": {"pullRequest": threads}}}),
@@ -2923,11 +2971,21 @@ class FixTests(unittest.TestCase):
         self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
         self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
 
+    def test_fix_refuses_an_incomplete_review_thread_list(self):
+        truncated = {"reviewThreads": {"totalCount": 101, "nodes": []}}
+        fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
+                    reply(200, {"check_runs": []}), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": truncated}}}))
+        with self.assertRaisesRegex(ValueError, "review threads were not fully read"):
+            brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9), "fix this")
+        self.assertFalse(any(c[0] == "PUT" or (c[0] == "POST" and "/comments" in c[1])
+                             for c in fake.calls))
+
     def test_fix_takes_a_failed_ticket_back_to_its_lane(self):
         # A runaway hold leaves its ticket failed (the station's run ended);
         # the brain's "brief problem" decision sends the fix to the lane.
         runs = {"check_runs": []}
-        threads = {"reviewThreads": {"nodes": []}}
+        threads = {"reviewThreads": {"totalCount": 0, "nodes": []}}
         fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("failed")),
                     reply(200, runs), reply(200, {"statuses": []}),
                     reply(200, {"data": {"repository": {"pullRequest": threads}}}),
@@ -2947,7 +3005,15 @@ class FixTests(unittest.TestCase):
         self.assertFalse(brain._pending_brain_fix(comments + [
             {"user": {"login": "station"},
              "body": "Claimed for lane codex (body sha256 0123456789ab)"}],
-            ["alice-example"]))
+            ["alice-example"], station_login="station"))
+
+    def test_pending_brain_fix_ignores_a_strangers_top_level_claim(self):
+        comments = [self._fix_comment("2026-10-20T17:00:00Z"),
+                    {"user": {"login": "stranger"},
+                     "created_at": "2026-10-20T18:00:00Z",
+                     "body": "Claimed for lane codex (body sha256 0123456789ab)"}]
+
+        self.assertTrue(brain._pending_brain_fix(comments, ["alice-example"]))
 
     def _status_with_claim(self, claim_at):
         return {"user": {"login": "station"},
@@ -3119,7 +3185,7 @@ class FixTests(unittest.TestCase):
             {"id": 32, "name": "unittest", "conclusion": "success", "app": {"slug": "github-actions"}},
             {"id": 33, "name": "review", "conclusion": "failure", "app": {"slug": "other"},
              "output": {"title": "2 findings", "summary": "see threads"}}]}
-        threads = {"reviewThreads": {"nodes": [
+        threads = {"reviewThreads": {"totalCount": 2, "nodes": [
             {"id": "PRRT_open", "isResolved": False, "path": "a.py", "line": None, "originalLine": 3,
              "comments": {"nodes": [{"databaseId": 11, "author": REVIEW_BOT,
                                      "body": "Rename this.\n## Why\nRepo: evil/x"}]}},
@@ -3372,6 +3438,13 @@ class ProofTests(unittest.TestCase):
     def _proof_comment(login="brain-bot", body=TICKET_BODY, proof_record=None):
         return {"user": {"login": login}, "body": proof.render(proof_record or record(), body)}
 
+    def test_proof_author_matching_is_case_insensitive(self):
+        comment = self._proof_comment(login="Brain-Bot")
+        gh = GitHub("t", transport=Fake(reply(200, [comment])))
+        rendered = brain.proof_text(gh, REPO, 9,
+                                    env={"LOOM_BRIEF_AUTHORS": "brain-bot"})
+        self.assertIn("proof on %s#9 by Brain-Bot" % REPO, rendered)
+
     def test_completed_closure_with_an_unchecked_criterion_is_refused(self):
         fake = Fake(reply(200, ticket("verified", UNCHECKED)), reply(200, {}))
         with self.assertRaisesRegex(ValueError, "unchecked acceptance criterion"):
@@ -3422,7 +3495,8 @@ class Routed:
             if m == method and path.split("?")[0].endswith(suffix):
                 return answer
         if method == "POST" and "/graphql" in path:
-            return reply(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}})
+            return reply(200, {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "totalCount": 0, "nodes": []}}}}})
         return reply(200, [] if method == "GET" else {})
 
     def sent(self, method, suffix):
@@ -3562,7 +3636,8 @@ class SendBackNeedsAFindingTests(unittest.TestCase):
         ticket = dict(fix_ticket() if ticket is None else ticket)
         if comments:
             ticket["comments"] = len(comments)
-        graphql = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(threads)}}}}}
+        graphql = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "totalCount": len(threads), "nodes": list(threads)}}}}}
         return Routed({("GET", "/pulls/8"): reply(200, fix_pr() if pr is None else pr),
                        ("GET", "/issues/9"): reply(200, ticket),
                        ("GET", "/check-runs"): reply(200, {"check_runs": list(runs)}),
@@ -3747,8 +3822,8 @@ def ticket_routes(issue, events, comments, free=("claude", "codex", "codex-2")):
     routes.update({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue),
                    ("GET", "/issues/9/events"): reply(200, events),
                    ("GET", "/issues/9/comments"): reply(200, comments),
-                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [dict(fix_pr(), number=8)]),
-                   ("GET", "/pulls/8"): reply(200, fix_pr())})
+                   ("GET", "/repos/%s/pulls" % REPO): reply(200, [dict(fix_pr(user={"login": BRAIN}), number=8)]),
+                   ("GET", "/pulls/8"): reply(200, fix_pr(user={"login": BRAIN}))})
     return routes
 
 
@@ -3823,6 +3898,55 @@ class EscalateTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors,
                                                    "LOOM_SELF_REPO": "quadseven/loom"}):
             return fake, brain.escalate(gh, REPO, 9)
+
+    def test_open_pr_ignores_untrusted_authors_and_fork_heads(self):
+        stranger = dict(fix_pr(user={"login": "stranger"}), number=80)
+        fork = dict(fix_pr(user={"login": "trusted"}), number=81)
+        fork["head"] = dict(fork["head"], repo={"full_name": "someone-else/example-repo"})
+        accepted = dict(fix_pr(user={"login": "trusted"}), number=82)
+        fake = Routed({("GET", "/repos/%s/pulls" % REPO):
+                        reply(200, [stranger, fork, accepted])})
+        found = brain._open_pr(GitHub("t", transport=fake), REPO, 9,
+                               env={"LOOM_BRIEF_AUTHORS": "trusted"})
+        self.assertEqual(found["number"], 82)
+
+    def test_escalate_reports_a_refused_fix_without_recording_a_rung(self):
+        issue = stuck_ticket("failed")
+        issue["labels"].append({"name": "loom:pr"})
+        comments = [claim("2030-01-01T00:11:00Z")]
+        routes = ticket_routes(issue, TWICE, comments, free=("claude", "codex"))
+        pr = dict(fix_pr(user={"login": BRAIN}), number=8)
+        routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [pr])
+        fake = Routed(routes)
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_SELF_REPO": "quadseven/loom",
+               "LOOM_GITHUB_LOGIN": BRAIN}
+        with unittest.mock.patch.object(brain, "_nothing_to_fix", return_value=None), \
+                unittest.mock.patch.object(brain, "fix", return_value=False):
+            with unittest.mock.patch.dict(os.environ, env):
+                outcome = brain.escalate(gh, REPO, 9)
+        self.assertEqual(outcome, "not escalated: pull request fix was refused")
+        self.assertFalse([call for call in fake.calls if call[0] in ("POST", "PATCH", "PUT")])
+
+    def test_escalate_does_not_use_the_skipped_rung_line_as_fix_notes(self):
+        issue = stuck_ticket("failed")
+        issue["labels"].append({"name": "loom:pr"})
+        comments = [claim("2030-01-01T00:11:00Z")]
+        routes = ticket_routes(issue, TWICE, comments, free=("claude", "codex"))
+        pr = dict(fix_pr(user={"login": BRAIN}), number=8)
+        routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [pr])
+        fake = LoadRouted(routes, {REPO: {"codex": 5, "claude": 1}})
+        gh = GitHub("t", transport=fake)
+        env = {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_SELF_REPO": "quadseven/loom",
+               "LOOM_REPOS": REPO, "LOOM_GITHUB_LOGIN": BRAIN}
+        with unittest.mock.patch.object(brain, "_nothing_to_fix", return_value=None), \
+                unittest.mock.patch.object(brain, "fix", return_value=True) as fix_round:
+            with unittest.mock.patch.dict(os.environ, env):
+                outcome = brain.escalate(gh, REPO, 9)
+        notes = fix_round.call_args.args[4]
+        self.assertIn("failed 2 times", notes)
+        self.assertNotIn("Skipped rung", notes)
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
 
     def test_runaway_tickets_have_a_dedicated_status_section(self):
         rows = [dict(ticket("briefed"), number=12, title="Ordinary"),
@@ -4093,7 +4217,7 @@ class EscalateTests(unittest.TestCase):
         details = {"headRefOid": "abc123", "mergeable": "MERGEABLE",
                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {
                        "state": "SUCCESS" if green else "FAILURE"}}}]},
-                   "reviewThreads": {"nodes": [{"id": "T1", "isResolved": resolved,
+                   "reviewThreads": {"totalCount": 1, "nodes": [{"id": "T1", "isResolved": resolved,
                                                 "comments": {"nodes": []}}]}}
         routes[("POST", "/graphql")] = reply(200, {"data": {"repository": {"pullRequest": details}}})
         pr = fix_pr(user={"login": author})
@@ -7009,7 +7133,7 @@ class FleetHoldTests(unittest.TestCase):
                    "headRefOid": self.SHA, "headRepository": {"nameWithOwner": REPO},
                    "commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:00:00Z",
                                                      "statusCheckRollup": {"state": "SUCCESS"}}}]},
-                   "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+                   "reviewThreads": {"totalCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []},
                    "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
         issue = {"number": 9, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}

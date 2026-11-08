@@ -95,7 +95,9 @@ def person_blockers(node: Dict[str, Any]) -> List[str]:
             for _, r in sorted(newest.items()) if r.get("state") == "CHANGES_REQUESTED"]
 
 
-def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
+def _threads_blocker(threads: List[Dict[str, Any]], total_count: Any = None) -> Optional[str]:
+    if type(total_count) is not int or total_count != len(threads):
+        return "review threads were not fully read"
     unresolved = sum(1 for t in threads if not t.get("isResolved"))
     return "%d unresolved threads" % unresolved if unresolved else None
 
@@ -119,11 +121,13 @@ def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
     Blockers keep their rule order, each with the actor who can clear it."""
     node = node or {}
     head = head_commit(node)
-    threads = (node.get("reviewThreads") or {}).get("nodes") or []
+    review_threads = node.get("reviewThreads") or {}
+    threads = review_threads.get("nodes") or []
     rules: List[Tuple[Optional[str], str]] = [(_checks_blocker(head), LANE),
                                               (_review_blocker(node, bot), LANE)]
     rules += [(blocker, OPERATOR) for blocker in person_blockers(node)]
-    rules += [(_threads_blocker(threads), LANE), (_unfixed_blocker(threads, head, bot), LANE)]
+    rules += [(_threads_blocker(threads, review_threads.get("totalCount")), LANE),
+              (_unfixed_blocker(threads, head, bot), LANE)]
     found = [(blocker, actor) for blocker, actor in rules if blocker]
     return decide(node, blockers=[blocker for blocker, _ in found],
                   actors=[actor for _, actor in found])

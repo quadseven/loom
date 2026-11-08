@@ -114,7 +114,7 @@ class FakeGitHub:
             "headRepository": {"nameWithOwner": REPO},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {
                 "state": "SUCCESS" if green else "FAILURE"}}}]},
-            "reviewThreads": {"nodes": [{"id": "PRRT_1", "isResolved": resolved,
+            "reviewThreads": {"totalCount": 1, "nodes": [{"id": "PRRT_1", "isResolved": resolved,
                                          "comments": {"nodes": []}}]}}
 
     # -- the GitHub client surface the factory uses --------------------
@@ -312,7 +312,8 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None, lint_run=None, now=NOW):
+           no_lane_since=None, review_brief=None, lint_run=None, now=NOW,
+           fix_accept=True):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -325,11 +326,21 @@ class Base(unittest.TestCase):
             self.merged.append((number, ticket))
         def fix(gh, repo, number, ticket, notes, lane=None, model=None, authors=None):
             f.notes = notes
+            if not fix_accept:
+                return False
+            if model:
+                gh.issues[ticket[1]]["body"] = brain._with_model(
+                    gh.issues[ticket[1]]["body"], model)
+            gh.issues[ticket[1]]["labels"] = [
+                x for x in gh.issues[ticket[1]]["labels"]
+                if x["name"] not in ("loom:failed", "loom:pr", "loom:running", "loom:briefed")
+            ] + [{"name": "loom:briefed"}]
             if lane:
                 gh.issues[ticket[1]]["labels"] = [
                     x for x in gh.issues[ticket[1]]["labels"] if not x["name"].startswith("lane:")
                 ] + [{"name": "lane:" + lane}]
             self.fixed.append((number, ticket, gh.issues[ticket[1]]["labels"][:]))
+            return fix_accept
         def move(gh, repo, number, state, lane=None, note=None):
             self.moved.append((number, state, lane))
         def close(gh, repo, number, comment):
@@ -364,6 +375,18 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_factory_refuses_an_incomplete_review_thread_list(self):
+        self.gh.ticket(5, "pr")
+        self.gh.pull(50, 5)
+        self.gh.details[50]["reviewThreads"] = {
+            "totalCount": 101,
+            "nodes": [{"id": "thread-%d" % n, "isResolved": True} for n in range(100)],
+        }
+        station = factory.Factory(self.gh, [REPO], NOW, trusted=[ME["login"]])
+
+        with self.assertRaisesRegex(ValueError, "review threads were not fully read"):
+            station._threads(REPO, 50)
+
     def test_vacuous_builtin_lookup_override_sends_back_named_finding(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
@@ -2980,7 +3003,7 @@ class SendBackNeedsAFinding(Base):
 
     def test_pr_faults_reads_the_reduced_runs_beside_the_rollup(self):
         green = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
-                 "reviewThreads": {"nodes": []}}
+                 "reviewThreads": {"totalCount": 0, "nodes": []}}
         failed = [{"name": "a", "conclusion": "failure"}]
         self.assertEqual(factory.pr_faults(green, {"mergeable": True}), [])
         self.assertEqual(factory.pr_faults(green, {"mergeable": True}, [{"name": "a", "conclusion": "success"}]), [])
@@ -3418,8 +3441,22 @@ class Tickets(Base):
         self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
         self.go()
         self.assertEqual([f[:2] for f in self.fixed], [(60, (REPO, 6))])
-        self.assertIn({"name": "loom:pr"}, self.fixed[0][2])
+        self.assertIn({"name": "loom:briefed"}, self.fixed[0][2])
         self.assertNotIn({"name": "loom:failed"}, self.fixed[0][2])
+
+    def test_a_refused_fix_brief_keeps_the_failed_ticket_unclimbed(self):
+        self.gh.ticket(6, "failed")
+        self.gh.pull(60, 6, runs=(("unittest", "in_progress"),))
+        original_body = self.gh.issues[6]["body"]
+        original_labels = list(self.gh.issues[6]["labels"])
+
+        self.go(fix_accept=False)
+
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.moved, [])
+        self.assertEqual(self.gh.issues[6]["body"], original_body)
+        self.assertEqual(self.gh.issues[6]["labels"], original_labels)
+        self.assertEqual(self.gh.comments[6], [])
 
     def ended(self, number, text, lane="zai"):
         """The ticket's claim on `lane` and the ending that closed it."""
@@ -5574,7 +5611,7 @@ class AbandonedReview(Base):
         self.gh.comments[51] = [{"id": 777, "body": self.NOTICE, "created_at": iso(90),
                                  "user": {"login": "grug-tribe[bot]", "type": "Bot"},
                                  "html_url": "https://example.test/pull/51#issuecomment-777"}]
-        self.gh.details[51]["reviewThreads"] = {"nodes": [{
+        self.gh.details[51]["reviewThreads"] = {"totalCount": 1, "nodes": [{
             "id": "PRRT_9", "isResolved": True, "isOutdated": False, "path": self.PATH,
             "root": {"nodes": [{"author": {"__typename": "Bot", "login": "grug-tribe"},
                                 "body": self.S110, "url": "https://example.test/t9"}]},
