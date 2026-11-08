@@ -1,5 +1,28 @@
 # Muse tick instructions
 
+## Merge and direct-channel blockers
+
+The merge duty calls the fleet gate at `scripts/pr-merge-gated.sh` from its
+repository checkout. The gate's ticket-holds implementation is documented in
+`bus/hold_boxes.py`; this checkout does not contain the gate script, the
+`pr-bot-comments` helper, a fleet bot identity shim, or an installer for
+placing them on the Muse VM. Do not treat a file under the wrong checkout or
+an absent helper as a working installation. Before changing the VM, capture
+the merge duty's exact command, working directory, and stderr. The script,
+helper, and identity shim must be installed through their owning repository's
+documented installer or outbox installer, at the paths that script expects;
+then verify the gate with a real Muse merge. This repo alone cannot supply or
+verify that VM installation.
+
+For the direct channel, the tick's read command is the `buzz messages thread`
+command in Step 0 below, using the channel and event IDs shown there. If it
+fails, record the exact command and complete error. A private-channel
+membership or permission error requires an operator to add Muse's existing
+public key to that channel; do not generate or give Muse another credential.
+This checkout cannot determine whether the failure is membership, permission,
+or another cause, and it does not contain the failing output. After access is
+fixed, verify that a test mention is read and answered within one tick.
+
 At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
 Run every command from that checkout.
