@@ -46,7 +46,7 @@ agent.
 | Z.ai | Gateway route | None | None in the agent |
 | Workers AI | Gateway route (to build); until then the token and the account id copied by the `ssm` step | None | Interim exported key; the account id is not readable by the role today |
 | Zen | No key | None | None |
-| agy (Gemini) | Works on Linux, does not rotate on use; lane service writes token to SSM, pods read-only copies | One device sign-in on the lane service | Medium: the token file is visible in the agent's environment; all slots share one subscription limit |
+| agy (Gemini) | Not established; remains on the Mac, capped at two slots | None | The Linux file-store behavior and whether use rotates it are unverified |
 | Copilot | Exported token with Copilot access only | Create the scoped token once (none is set for the Mac lane today) | Visible in the agent's environment; CLI headless behaviour is unproven (#2791) |
 
 What can be verified without the operator: the OIDC role, the `ssm` copy, the
@@ -94,6 +94,14 @@ The broker's identity may write one parameter and nothing else; the lane
 role stays read-only.
 
 ## Capacity plan
+
+### agy decision
+
+Keep agy on the Mac, with at most two light slots. The installed agy CLI was
+1.4.12 on Darwin. This run checked its version and help output only; it had no
+network and no Linux environment, so it did not test Linux sign-in, the file
+store, or whether using that store rotates it. Do not move agy to the cluster
+until those behaviors are verified.
 
 Measured read-only on 2026-11-07 (allocatable against requests). The pool
 today is capped at 4 pods of 500m CPU and 2Gi, pinned to one build node.
