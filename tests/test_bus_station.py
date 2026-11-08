@@ -7374,10 +7374,16 @@ class FactoryIncidentTest(Base):
         # check without g++ on the runner image, 2026-10-27): the runner
         # still cannot tell its image from a red base, so another lane runs
         # the base check and files the incident if the base is red there too.
+        # A cluster runner that does not file the incident (no tool, bad
+        # sandbox, missing interpreter) says so and is retried the same way.
         for reason in ("[factory] setup failed: base check exited 1 on the unmodified repo; "
                        "factory incident %s#99" % REPO,
                        "[factory] setup failed: base check exited 2 on the default branch; "
-                       "factory incident %s#99" % REPO):
+                       "factory incident %s#99" % REPO,
+                       "[factory] setup failed: interpreter python3.13 is not on PATH; "
+                       "no incident filed on a cluster runner: another lane takes the ticket",
+                       "[factory] setup failed: bwrap narrows no network; "
+                       "no incident filed on a cluster runner: another lane takes the ticket"):
             with self.subTest(reason=reason):
                 self.setUp()
                 self.heartbeat("anthropic")

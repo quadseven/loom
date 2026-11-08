@@ -123,7 +123,7 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude-9 zen, free-kilo"}),
-                         ["zen", "free-kilo", "free-openrouter"])
+                         ["zen", "free-kilo", "free-gemma", "free-openrouter"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
@@ -140,14 +140,18 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(runners.lane_settings(
             "free-openrouter", {"LOOM_FREE_OPENROUTER_MODEL": "free/other"})["LOOM_FREE_OPENROUTER_MODEL"],
             "free/other")
+        self.assertEqual(runners.lane_settings("free-gemma", {}),
+                         {"LOOM_FREE_GEMMA_MODEL": "free/gemini"})
 
     def test_the_station_knows_a_tracked_slots_model_with_no_setting(self):
-        # Its plist holds no LOOM_FREE_OPENROUTER_MODEL: without this a run's
-        # footer and model record are dropped as an unknown model.
+        # Its plist holds no LOOM_FREE_OPENROUTER_MODEL/LOOM_FREE_GEMMA_MODEL:
+        # without this a run's footer and model record are dropped as unknown.
         self.assertEqual(brain.lane_model("free-openrouter", {}), "free/openrouter")
         self.assertIn("free/openrouter", factory.known_models({}))
         self.assertEqual(brain.lane_model("free-openrouter", {"LOOM_FREE_OPENROUTER_MODEL": "free/x"}),
                          "free/x")
+        self.assertEqual(brain.lane_model("free-gemma", {}), "free/gemini")
+        self.assertIn("free/gemini", factory.known_models({}))
 
     def test_a_runner_slot_takes_public_repos_only(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "opencode-go-2"}):

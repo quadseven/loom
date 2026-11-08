@@ -557,15 +557,14 @@ DECISION_ASK = ("Kind: decision\nA merged pull request already carries this tick
 # A no-change answer that leaves a code acceptance box unproven (loom#2032).
 NO_CHANGE_UNPROVEN_NOTE = ("The answer does not prove every acceptance box, so the ticket is "
                            "back at loom:queued instead of settling. Not proven: %s")
-# A base check that failed before the agent ran: it could not start (exit
-# 125 to 127) or it was red on the unmodified repo or default branch. On a
-# cluster runner that is often the runner image (a tool the repo's check
-# calls is not installed, which a script may report as exit 1), and the
-# runner cannot tell it from a red base: another lane runs the check, and
-# holds the ticket behind an incident if the base is red there too.
+# A base check or validation environment that failed before the agent ran.
+# It could not start (exit 125 to 127) or the base was red. On a cluster
+# runner that is often the runner image, and a repo's base is unknown to the
+# pod: another lane runs it instead of holding the ticket behind an incident.
 CHECK_CANNOT_RUN_RE = re.compile(r"the check exited 12[5-7] on the unmodified base"
                                  r"|base check exited [0-9]+ on the (?:unmodified repo"
-                                 r"|default branch)")
+                                 r"|default branch)"
+                                 r"|no incident filed on a cluster runner")
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 # A [factory] hold whose reason names no incident (the incident filing failed)
 # has nothing that can close it, so the station releases it after this long:
@@ -8097,8 +8096,8 @@ class Station:
             return True
         if (klass == "factory" and lane in runners.runner_slots()
                 and CHECK_CANNOT_RUN_RE.search(bare)):
-            # Held behind the incident, the ticket went back to the same
-            # runner, which can never clear it: another lane runs the check.
+            # On a cluster runner the validation environment is often the
+            # runner image, which cannot be fixed by retrying the same slot.
             note = self._retry(repo, number, lane, "transient", reason)
             if note:
                 self._requeue_transient(repo, number, lane, reason, note)
