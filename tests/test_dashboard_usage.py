@@ -310,6 +310,15 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("collected on lane-box", provider_row(body, "codex"))
         self.assertNotIn("collected on", provider_row(body, "zen"))
 
+    def test_runner_resources_render_per_repo_on_the_usage_view(self):
+        row = reading("owner/app", ["opencode-go-2"], "run", source="runner cgroup",
+                      peak_mem_mib=2048.0, peak_cpu_cores=1.5, wall_s=120.0, repo="owner/app")
+        body = usage.render(usage.build([row], NOW))
+        cell = provider_row(body, "owner/app")
+        self.assertIn("2048", cell)
+        self.assertIn("1.5", cell)
+        self.assertIn("120", cell)
+
     def test_get_api_usage_serves_the_live_snapshot_to_the_read_token_only(self):
         class State:
             pass

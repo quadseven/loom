@@ -460,10 +460,54 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         except Exception as err:
             records.append(_record(provider, slots, "all", None, None, None, None,
                                    "adapter", now, "adapter error: %s" % type(err).__name__))
+    records.extend(runner_resource_records(home, now))
     for record in records:
         record["holds"] = lane_holds(home, record.get("lanes") or [])
         record["host"] = host
     return records
+
+
+def runner_resource_records(home: str, now: float) -> List[Dict[str, Any]]:
+    """One reading per repo from the runner reports' resource files
+    (logs/<slot>/<ticket>.resources.json, lanes/k8s/lane_job.py run):
+    the largest peak memory, CPU and wall time seen for that repo, as a
+    "run" window reading the Usage view shows per repo."""
+    logs = Path(home) / "logs"
+    best: Dict[str, Dict[str, Any]] = {}
+    if not logs.is_dir():
+        return []
+    for path in sorted(logs.glob("*/*.resources.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        repo = row.get("repo")
+        if not isinstance(repo, str) or not repo:
+            continue
+        peak = row.get("peak_mem_mib")
+        cores = row.get("peak_cpu_cores")
+        wall = row.get("wall_s")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (peak, cores, wall)):
+            continue
+        at = row.get("at")
+        at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else now
+        lane = row.get("lane") if isinstance(row.get("lane"), str) and row.get("lane") else path.parent.name
+        prev = best.get(repo)
+        if prev is None or float(peak) > float(prev["peak_mem_mib"]):
+            best[repo] = {"repo": repo, "lane": lane, "at": at, "peak_mem_mib": float(peak),
+                          "peak_cpu_cores": float(cores), "wall_s": float(wall)}
+    out = []
+    for repo in sorted(best):
+        item = best[repo]
+        record = _record(repo, [item["lane"]], "run", None, None, None, None,
+                         "runner cgroup", item["at"],
+                         "peak %.0f MiB, %.2f cores, %.0fs" % (item["peak_mem_mib"],
+                                                                 item["peak_cpu_cores"], item["wall_s"]))
+        record.update(item)
+        out.append(record)
+    return out
 
 
 def lane_holds(home: str, lanes: List[str]) -> Dict[str, str]:

@@ -83,6 +83,10 @@ TRACKED_SLOTS = {
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
+# The runner pool at most this many runs in flight and queued at once
+# (LOOM_RUNNER_POOL_MAX, default 4): dispatching more turns held pods into
+# runs cancelled by the queue limit. Extra briefs wait in the inbox.
+POOL_MAX_DEFAULT = 4
 # How long a slot stays held after a run reported it unavailable with no
 # reset time, or after no runner took its run.
 HOLD_SECONDS = 1800
@@ -173,6 +177,18 @@ def runner_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
         names += list(TRACKED_SLOTS)
     return [n for n in dict.fromkeys(names)
             if n in LANES and provider(n) in RUNNER_LANES and n != "codex"]
+
+
+def pool_max(env: Optional[Dict[str, str]] = None) -> int:
+    """The pool's most runs in flight and queued at once, from
+    LOOM_RUNNER_POOL_MAX (default POOL_MAX_DEFAULT). An unreadable or
+    non-positive value falls back to the default."""
+    env = os.environ if env is None else env
+    try:
+        value = int(str(env.get("LOOM_RUNNER_POOL_MAX") or "").strip())
+    except ValueError:
+        return POOL_MAX_DEFAULT
+    return value if value > 0 else POOL_MAX_DEFAULT
 
 
 def setting_allowed(slot: str, name: str) -> bool:
@@ -351,6 +367,11 @@ class Runners:
         return any(e.get("slot") == slot and e.get("state") == "dispatched"
                    for e in ledger["runs"].values())
 
+    def _pool_used(self, ledger: Dict[str, Any]) -> int:
+        """Runs in flight and queued across every slot: every ledger entry
+        still dispatched, whether a runner has taken it or it waits queued."""
+        return sum(1 for e in ledger["runs"].values() if e.get("state") == "dispatched")
+
     # -- dispatch ----------------------------------------------------------
     def _dispatch_slot(self, ledger: Dict[str, Any], slot: str) -> None:
         try:
@@ -364,6 +385,8 @@ class Runners:
                 continue   # never dispatched twice, whatever became of it
             if self._in_flight(ledger, slot):
                 return     # one run per slot, as one local runner
+            if self._pool_used(ledger) >= pool_max(self.env):
+                return     # the pool is full: the brief waits in the inbox
             hold = ledger["holds"].get(slot) or {}
             if float(hold.get("until") or 0) > self.now:
                 return     # held, as its heartbeat says: the brief waits
@@ -946,7 +969,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
     each runner slot's settings, less its model settings (the plist's
     model_env writes those) and the names the plist writes itself."""
     out: Dict[str, str] = {}
-    for name in ("LOOM_RUNNER_SLOTS", "LOOM_RUNNER_REPO") + tuple(LANES_APP):
+    for name in ("LOOM_RUNNER_SLOTS", "LOOM_RUNNER_REPO", "LOOM_RUNNER_POOL_MAX") + tuple(LANES_APP):
         if env.get(name):
             out[name] = env[name]
     for slot in runner_slots(env):
