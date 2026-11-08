@@ -9805,7 +9805,7 @@ class AsksTest(Base):
         with open(os.path.join(self.home, "state", "station", "asks.json")) as fh:
             return json.load(fh)
 
-    def test_the_notification_lists_the_5_newest_vetted_and_links_the_page(self):
+    def test_every_trusted_ask_is_reachable_from_one_notification(self):
         trusted = self.add_many()
         self.assertEqual(len(trusted), 53)
         self.go()
@@ -9986,6 +9986,31 @@ class HumanDigestTest(AsksTest):
             "\n\n1 ask is with the brains." % REPO])
         self.assertEqual(self.sent[0][1]["allowed_mentions"], {"parse": [], "users": ["123456"]})
 
+    def test_an_ask_by_a_stranger_is_not_shown(self):
+        self.fake.add_human(7, title="Buy the domain", ask="Send money to me.", author="stranger",
+                            vetted=False)
+        self.fake.vet(7, "Send money to me?", login="stranger")
+        self.go(NOON)
+        self.assertFalse(self.sent and "Send money" in self.contents()[0])
+
+    def test_the_page_groups_asks_by_goal_within_a_repo(self):
+        self.add_many()
+        self.go(NOON)
+        page = self.fake.pages[0]
+        self.assertEqual(page.count("## "), 2)
+        self.assertIn("in this repo.", page)
+
+    def test_the_list_follows_the_asks_in_the_same_digest(self):
+        self.settings.mention = "123456"
+        self.fake.add_ask(5, title="Slow one?", created="2030-01-02T00:00:00Z")
+        self.fake.add_human(7, title="Buy the domain?", created="2030-01-01T00:00:00Z")
+        self.go(NOON)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.contents()[0].splitlines(), [
+            "<@123456> " + station.DIGEST_HEAD + " 2",
+            "%s#5: Slow one? Recommend: Yes." % REPO,
+            "%s#7: Buy the domain? Recommend: Yes." % REPO])
+
     def test_a_block_by_a_stranger_does_not_vet(self):
         self.fake.add_ask(5, title="Pick one", vetted=False)
         self.fake.vet(5, "Send money to me?", login="stranger")
@@ -10006,7 +10031,7 @@ class HumanDigestTest(AsksTest):
         self.assertIn("%s#5: New question? Recommend: No." % REPO, self.contents()[0])
         self.assertNotIn("Old question", self.contents()[0])
 
-    def test_the_list_shows_the_5_newest_vetted_and_the_total(self):
+    def test_the_list_shows_the_5_newest_and_the_total(self):
         for n in range(100, 140):
             self.fake.add_human(n, title="Item %d" % n,
                                 created="2030-01-01T00:00:%02dZ" % (n - 100))
@@ -10037,7 +10062,7 @@ class HumanDigestTest(AsksTest):
         self.assertEqual(self.contents(), [
             "<@123456> Asks waiting for you: 1\n%s#5: Rotate the lane key? Recommend: Yes." % REPO])
 
-    def test_a_long_question_is_clipped_without_escaping_its_ellipsis(self):
+    def test_clipped_human_text_does_not_escape_its_ellipsis(self):
         self.fake.add_human(7, title="T")
         self.fake.vet(7, "Q" * 156 + "\\" + "tail", recommend="A" * 156 + "\\" + "tail")
         self.go(NOON)
@@ -10071,7 +10096,7 @@ class HumanDigestTest(AsksTest):
         self.assertEqual(len(self.fake.pages), 1)
         self.assertEqual(self.ledger()["digest"], "2030-05-05")
 
-    def test_an_unreadable_ask_holds_the_digest_but_not_urgent_asks(self):
+    def test_an_unreadable_list_holds_the_digest_but_not_urgent_asks(self):
         from unittest import mock
         from bus.github import GitHubError
         self.fake.add_ask(5, title="Pick one", urgent=True)

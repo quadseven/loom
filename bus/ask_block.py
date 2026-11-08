@@ -67,7 +67,7 @@ def newest(comments: Sequence[Any], trusted: Sequence[str], login) -> Optional[B
 def line(ref: str, block: Block, question_max: int = 160, answer_max: int = 160) -> str:
     """`repo#N: <question> Recommend: <answer>.`"""
     def clip(text: str, size: int) -> str:
-        text = " ".join(text.split()).replace("@", "@​")
+        text = " ".join(text.split()).replace("@", "@\u200b")
         return text if len(text) <= size else text[:size - 3].rstrip(" \\") + "..."
     answer = clip(block.recommend.rstrip().rstrip("."), answer_max)
     return "%s: %s Recommend: %s." % (ref, clip(block.ask, question_max), answer)
