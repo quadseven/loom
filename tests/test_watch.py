@@ -251,6 +251,14 @@ class BrainStatusTest(unittest.TestCase):
 
 
 class FilingTest(WatchBase):
+    def test_a_deferred_file_expires_when_its_repeat_window_does(self):
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0, write=False)
+        self.assertEqual(self.gh.issues, {})
+        self.run_at(T0 + watch.WINDOW)
+        self.assertEqual(self.gh.issues, {})
+        self.assertTrue(any("discarded stale file" in line for line in self.said))
+
     def test_three_hits_in_thirty_minutes_file_one_issue_and_a_fourth_adds_nothing(self):
         self.append(LINE_403)
         self.run_at(T0)
@@ -567,12 +575,13 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual([n for n, _ in self.gh.comments], [1])
 
-    def test_a_low_budget_scans_and_files_on_a_later_pass(self):
+    def test_a_low_budget_drops_a_repeat_after_its_window_expires(self):
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0, write=False)
         self.assertEqual(self.gh.issues, {})
         self.run_at(T0 + 3600)
-        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.gh.issues, {})
+        self.assertTrue(any("discarded stale file" in line for line in self.said))
 
     def test_a_failed_filing_does_not_skip_another_due_signature(self):
         other = "Connection refused"

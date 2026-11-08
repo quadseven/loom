@@ -1144,9 +1144,14 @@ class Watcher:
         rec["told_total"] = rec.get("total", 0)
         rec.pop("due", None)
 
-    def _due(self, rec: Dict[str, Any]) -> Optional[str]:
+    def _due(self, rec: Dict[str, Any], key: str = "") -> Optional[str]:
         """What the signature is due: "file" (a new burst not yet filed),
         "count" (new hits on its issue, the last count an hour ago) or None."""
+        if (rec.get("due") == "file" and "hits" in rec and "refusal" not in rec
+                and not self._new_burst(rec)):
+            self.say("watch: discarded stale file for %s (%d hits in the last %d minutes)"
+                     % (key.split(": ", 1)[0], self._window(rec), WINDOW // 60))
+            rec.pop("due", None)
         if rec.get("due") in ("file", "count"):
             return str(rec["due"])
         if rec.get("incident_linked") and not rec.get("done"):
@@ -1286,7 +1291,7 @@ class Watcher:
                 if self._new_burst(rec):
                     rec["due"] = "file"
                 continue  # Its lookup is still unknown; never file a twin.
-            kind = self._due(rec)
+            kind = self._due(rec, key)
             if kind is None:
                 continue
             if not self.write or self.writes >= WRITES_MAX:
