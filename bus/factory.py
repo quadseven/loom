@@ -988,6 +988,16 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
     return still if still and all(minor(t) for t in still) else []
 
 
+def _finding_rule(thread: Dict[str, Any]) -> str:
+    """The review bot's rule named on a deferred finding's first line, or
+    "" when it is not a parseable finding."""
+    root = _end(thread, "root", 0)
+    lines = str(root.get("body") or "").strip().splitlines()
+    first = lines[0] if lines else ""
+    hit = merge_tier.finding(first)
+    return str(hit[2]) if hit else ""
+
+
 def finding_line(thread: Dict[str, Any]) -> str:
     """One ASCII line for a deferred finding: its severity line without the
     bot's symbols, its file, and a link to the thread."""
@@ -2084,6 +2094,10 @@ class Factory:
         for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
             if isinstance(found, dict) and found.get("title") in known and self._trusted(found):
                 return int(found["number"])
+        if picked and all(_finding_rule(t) == "missing-test-coverage" for t in picked):
+            _say("skipped follow-up for %s#%d: %d coverage-only "
+                 "(missing-test-coverage) finding(s)" % (repo, number, len(picked)))
+            return 0
         body = ("Review findings deferred from #%d (ticket #%d) when it landed: the "
                 "review check passed on %s after %d fix round(s), and these medium or "
                 "low findings were still open. The brain rewrites this into a ticket "
