@@ -543,8 +543,10 @@ GitHub holds at most 100 sub-issues under one issue. Once the standing epic
 holds that many, or GitHub answers 422 to a link under it, repairs roll over
 to the newest open factory repairs batch epic (an epic whose title starts
 "Epic: factory repairs", the goal's own or another in the repo) holding fewer
-than 15 tickets; when none has room, "Epic: factory repairs for this goal,
-next batch" opens even when the goal is at its open epic cap. The filer
+than 15 tickets; when none has room, a new batch epic opens even when the
+goal is at its open epic cap, and is retitled "Epic: factory repairs for this
+goal, batch <its issue number>" so no two open batches share a title (the
+`epic-title-shared` invariant). The filer
 logs each rollover, and the filed issue's `Part of` line names the batch
 epic. `epic-over-cap` counts an epic's open tickets, its sub-issues and every
 loom:ticket issue whose `Part of` line names it, each once, the same count

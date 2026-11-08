@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -2531,11 +2531,18 @@ def _rest_issue(node: Dict[str, Any]) -> Dict[str, Any]:
 def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
                   ) -> List[Dict[str, Any]]:
     """The epic's sub-issues, then the open tickets whose Part of line names
-    it that are not already among them."""
+    it that are not already among them. A ticket GitHub records as another
+    issue's sub-issue belongs to that parent, so a Part of line left naming
+    this epic is stale and does not count: two open sub-issues of an open
+    epic were reported as stranded under a closed one whose number their
+    bodies still named (loom#2767, loom#1713)."""
     tickets_ = [c for c in sub if isinstance(c, dict)]
     seen = {int(c.get("number") or 0) for c in tickets_}
     for item in open_tickets:
         n = int(item.get("number") or 0)
+        parent = _sub_issue_parent(item)
+        if parent is not None and parent != number:
+            continue
         if n and n not in seen and _names_goal(item.get("body"), number):
             tickets_.append(item)
             seen.add(n)
@@ -2605,6 +2612,19 @@ REPAIRS_BODY = (
 # batch epics repairs roll over to once it holds GitHub's sub-issue limit.
 REPAIRS_PREFIX = "Epic: factory repairs"
 REPAIRS_BATCH_TITLE = "Epic: factory repairs for this goal, next batch"
+# A batch epic is renamed to its own issue number once GitHub gives it one,
+# so no two open batches share a title (the epic-title-shared invariant,
+# loom#2650: seven batches were all titled REPAIRS_BATCH_TITLE), even when two
+# filers open a batch at the same moment. REPAIRS_BATCH_TITLE is only the
+# title it is filed with. The prefix still marks it a batch.
+REPAIRS_BATCH_NUMBERED = "Epic: factory repairs for this goal, batch %d"
+
+
+def repairs_batch_title(number: int) -> str:
+    """The title a factory repairs batch epic keeps: unique by its number."""
+    return REPAIRS_BATCH_NUMBERED % int(number)
+
+
 REPAIRS_BATCH_BODY = (
     "Done when: every ticket under this epic is closed. It holds at most %d tickets; "
     "the next factory repair past that opens a new batch.\n\n"
@@ -3260,7 +3280,18 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
     if not made.get("number"):
         raise ValueError("GitHub named no number for the next repairs batch epic of goal #%d"
                          % goal)
-    return int(made["number"])
+    number = int(made["number"])
+    try:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                {"title": repairs_batch_title(number)})
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        # The batch still works under its filed title; the epic-title-shared
+        # invariant names it if another open batch shares that title.
+        print("goal #%d: could not retitle batch epic #%d: %s" % (goal, number, err),
+              file=sys.stderr)
+    return number
 
 
 def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> None:
@@ -4499,23 +4530,8 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
 
 def _moved_labels(have: List[str], state: str, lane: Optional[str],
                   env: Optional[Dict[str, str]] = None) -> List[str]:
-    # Every state label goes, not only the ones a move can set: a ticket
-    # moved to shipped that kept loom:ready read as "ready" everywhere
-    # (tickets.ticket_state), and the Priorities list showed shipped work as
-    # lane work (2026-10-15).
-    states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
-    # A move ends whatever the ticket waited for, so its wait:* label goes.
-    # needs-brain goes too: it also reads "already reported", so a ticket
-    # re-briefed with it was never reported when it stalled again (loom#1393).
-    kept = [x for x in have if x not in states and not x.startswith("wait:")
-            and x != "needs-brain"
-            and not (lane is not None and x.startswith("lane:"))]
-    if "loom:running" in have and state != "running":
-        # The claim marks a run in progress; the run is over.
-        kept = stale_claims.without_own_claim(kept, trusted_authors(env))
-    kept.append("loom:" + state)
-    if lane:
-        kept.append("lane:" + lane)
+    kept = ticket_move.next_labels(have, state, lane=lane,
+                                   own_logins=trusted_authors(env))
     if state == "briefed" and sum(1 for x in kept if x.startswith("lane:")) != 1:
         raise ValueError("briefed ticket must have exactly one lane label")
     return kept

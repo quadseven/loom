@@ -83,6 +83,7 @@ from . import status
 from . import usage
 from . import verify_data
 from . import text as _text
+from . import ticket_move
 from . import tickets
 from . import transcripts
 from . import unmeetable
@@ -779,10 +780,12 @@ STATELESS_FILE = "stateless.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
 # Labels that mean someone or something already holds a ticket: any Loom
-# state or hold, a person's claim, an operator ask, or a wait.
+# state or hold, a person's claim, an operator ask, a wait, or finished work
+# waiting to be seen live (awaiting-live-check: queueing it sent three parked
+# tickets back to lanes that had nothing left to build, 2026-11-07).
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
     "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
+    "loom:closed-unmerged", "needs-brain", brain.LIVE_CHECK_LABEL, *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
@@ -8919,11 +8922,9 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = self._drop_claim(n for n in names if n != RUNNING and not n.startswith(WAIT))
-        if new not in labels:
-            labels.append(new)
-        if wait:
-            labels.append(WAIT + wait)
+        labels = ticket_move.next_labels(names, new, wait=wait,
+                                         own_logins=self.s.authors,
+                                         clear_needs_brain=False)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
 

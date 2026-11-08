@@ -69,6 +69,12 @@ AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
+# An evidence key the marker carries as it is: a word and a number or hex
+# stamp, which holds no repository reference. Any other key (a pull
+# request key names its repo) is written as a hash of itself, because the
+# public-text scrub rewrites a private repo reference inside the marker
+# and the read-back then never matched (loom#2835).
+PLAIN_KEY_RE = re.compile(r"[a-z]+-[0-9a-f]+")
 HEALTH_NOTE = "Held for the brain: %s. %s"
 
 # The marker bus/health.py writes into every ticket it files.
@@ -344,6 +350,22 @@ def _login(item: Mapping[str, Any]) -> str:
     return str((item.get("user") or {}).get("login") or "")
 
 
+def marker_key(key: str) -> str:
+    """The form of an evidence key the ask marker carries: the key itself
+    when it is plain, else `sha-` and a short sha256 of it, which no scrub
+    rewrites and names no repository."""
+    if PLAIN_KEY_RE.fullmatch(key):
+        return key
+    return "sha-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def was_asked(key: str, done: Iterable[str]) -> bool:
+    """Whether an earlier marker names the key, raw (a marker written before
+    loom#2835, or on a private repo, where nothing is scrubbed) or hashed."""
+    keys = set(done)
+    return key in keys or marker_key(key) in keys
+
+
 def asked(comments: Iterable[Mapping[str, Any]], trusted: Iterable[str]) -> set:
     """The evidence keys a trusted login already asked the operator about."""
     allowed = {t.lower() for t in trusted}
@@ -527,7 +549,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     try:
         for read in reads:
             found = read()
-            if found is not None and found.key not in done:
+            if found is not None and not was_asked(found.key, done):
                 return found
     except (GitHubError, ValueError, KeyError, TypeError) as err:
         raise Unread(str(err)) from err
@@ -540,4 +562,4 @@ def ask(verdict: Verdict) -> str:
             "builds a stale ticket rewrites working code to match it. Close the ticket if "
             "its work is done, or rewrite it to what is still missing and remove "
             "`needs:human`; this evidence will not hold it again."
-            % (ASK_MARKER % verdict.key, verdict.reason))
+            % (ASK_MARKER % marker_key(verdict.key), verdict.reason))
