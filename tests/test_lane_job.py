@@ -80,6 +80,36 @@ class LaneJobTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_published_codex_copy_has_no_refresh_token(self):
+        spec = importlib.util.spec_from_file_location("lane_job", ROOT / "lanes" / "k8s" / "lane_job.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        value = json.dumps({"published_at": 1000, "auth": {"tokens": {
+            "access_token": "access-placeholder", "account_id": "account-placeholder"}}})
+        copied = json.loads(module.codex_session(value, now=1001))
+        self.assertNotIn("refresh_token", copied["tokens"])
+        value_with_refresh = json.dumps({"published_at": 1000, "auth": {"tokens": {
+            "access_token": "access-placeholder", "refresh_token": "refresh-placeholder"}}})
+        with self.assertRaisesRegex(module.JobError, "contains a refresh token"):
+            module.codex_session(value_with_refresh, now=1001)
+
+    def test_stale_codex_copy_marks_slot_unavailable_without_failing_run(self):
+        spec = importlib.util.spec_from_file_location("lane_job", ROOT / "lanes" / "k8s" / "lane_job.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.job.mkdir(parents=True, exist_ok=True)
+        (self.job / "inputs.json").write_text(json.dumps({"slot": "codex-2", "ticket": "owner.app-7"}))
+        (self.job / "lane.env").write_text("LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
+        with mock.patch.object(module, "job_dir", return_value=str(self.job)):
+            with mock.patch.object(module, "_fetch", return_value=json.dumps({
+                    "published_at": 1, "auth": {"tokens": {"access_token": "access-placeholder"}}})):
+                module.ssm()
+            self.assertTrue((self.job / "codex-session-unavailable").exists())
+            module.run()
+        beat = json.loads((self.job / "home" / "state" / "usage" / "codex-2.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("stale", beat["reason"])
+
     def inputs(self, **over):
         inputs = {"slot": "opencode-go-2", "ticket": "owner.app-7", "brief": BRIEF,
                   "run_id": RUN_ID, "settings": "", "report_key": PUB, "report_mac_key": MAC_KEY}
@@ -119,6 +149,12 @@ class LaneJobTest(unittest.TestCase):
                      {"report_mac_key": "short"}):
             self.inputs(**over)
             self.assertEqual(self.step("prepare").returncode, 1, over)
+
+    def test_codex_runner_slot_requires_the_broker_session_parameter(self):
+        self.inputs(slot="codex-2")
+        self.assertEqual(self.step("prepare").returncode, 1)
+        self.inputs(slot="codex-2", settings="LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
 
     def test_a_gateway_lane_is_moved_onto_the_cluster_gateway(self):
         self.inputs(slot="spark-2", settings="LOOM_SPARK_2_URL=http://spark.example.internal:8000/v1\n"

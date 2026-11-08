@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ sys.path.insert(0, ROOT)
 from bus import runners  # noqa: E402
 
 DEFAULT_DENY_SSM = "/infra/leak-scan/deny-list"
+CODEX_SESSION_MAX_AGE = 6 * 60 * 60
 SSM_NAME_RE = re.compile(r"^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 GATEWAY_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 ORIGIN_RE = re.compile(r"^https?://[^/]+")
@@ -111,7 +113,8 @@ def rebase_gateway(slot: str, settings: Dict[str, str], gateway: str) -> Dict[st
 def prepare() -> None:
     inputs = _inputs()
     slot, ticket, run_id = inputs.get("slot", ""), inputs.get("ticket", ""), inputs.get("run_id", "")
-    if slot not in runners.LANES or runners.provider(slot) not in runners.RUNNER_LANES:
+    if (slot not in runners.LANES or runners.provider(slot) not in runners.RUNNER_LANES
+            or slot == "codex"):
         raise JobError("slot is not a lane a runner may run")
     if not runners.TICKET_RE.fullmatch(ticket):
         raise JobError("ticket must be letters, digits, dot, underscore or dash")
@@ -131,6 +134,8 @@ def prepare() -> None:
         settings = runners.parse_settings(slot, inputs.get("settings", ""))
     except ValueError as err:
         raise JobError(str(err)) from None
+    if runners.provider(slot) == "codex" and not settings.get("LOOM_CODEX_SESSION_SSM"):
+        raise JobError("a Codex runner slot needs LOOM_CODEX_SESSION_SSM")
     settings = rebase_gateway(slot, settings, os.environ.get("LOOM_RUNNER_GATEWAY_URL", ""))
     d = job_dir()
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -150,6 +155,27 @@ def _hold(reason: str) -> None:
     beat = {"lane": job["slot"], "at": int(time.time()), "available": False,
             "reason": reason, "limited_models": {}}
     _write(os.path.join(home, "state", "usage", job["slot"] + ".json"), json.dumps(beat) + "\n", 0o644)
+
+
+def codex_session(value: str, now: float = None) -> str:
+    """Return the published Codex auth file, or a safe freshness error."""
+    try:
+        published = json.loads(value)
+        auth = published["auth"]
+        stamp = float(published["published_at"])
+    except (ValueError, TypeError, KeyError):
+        raise JobError("the Codex session copy is invalid") from None
+    current = time.time() if now is None else now
+    if not math.isfinite(stamp) or stamp > current or current - stamp > CODEX_SESSION_MAX_AGE:
+        raise JobError("the Codex session copy is stale")
+    if not isinstance(auth, dict) or not isinstance(auth.get("tokens"), dict):
+        raise JobError("the Codex session copy is invalid")
+    tokens = auth["tokens"]
+    if not isinstance(tokens.get("access_token"), str) or not tokens["access_token"]:
+        raise JobError("the Codex session copy is invalid")
+    if "refresh_token" in tokens:
+        raise JobError("the Codex session copy contains a refresh token")
+    return json.dumps(auth, separators=(",", ":")) + "\n"
 
 
 def egress() -> None:
@@ -232,6 +258,19 @@ def ssm() -> None:
     d = job_dir()
     wanted = [(n, v) for n, v in sorted(settings.items())
               if n.endswith("_KEY_SSM") and n != "LOOM_GITHUB_APP_KEY_SSM"]
+    session_name = settings.get("LOOM_CODEX_SESSION_SSM", "")
+    if session_name:
+        if not SSM_NAME_RE.fullmatch(session_name):
+            raise JobError("LOOM_CODEX_SESSION_SSM is not an SSM parameter name")
+        try:
+            auth = codex_session(_fetch(session_name, region))
+        except JobError as err:
+            if "stale" in str(err):
+                _write(os.path.join(d, "codex-session-unavailable"), "stale\n")
+            else:
+                raise JobError("could not prepare the Codex session copy") from None
+        else:
+            _write(os.path.join(d, "home", "run", "codex-auth.json"), auth)
     wanted.append(("LOOM_LEAK_DENY_SSM", settings.get("LOOM_LEAK_DENY_SSM") or DEFAULT_DENY_SSM))
     for setting, name in wanted:
         if not SSM_NAME_RE.fullmatch(name) or "/../" in name + "/" or "/./" in name + "/":
@@ -274,6 +313,8 @@ def lane_env() -> Dict[str, str]:
         # Scratch on the job's volume, not the runner's small /tmp.
         "TMPDIR": os.path.join(d, "tmp"),
     })
+    if os.path.isfile(os.path.join(d, "home", "run", "codex-auth.json")):
+        env["LOOM_CODEX_AUTH_FILE"] = os.path.join(d, "home", "run", "codex-auth.json")
     os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
     for name in ("LOOM_EGRESS_DENY_PROBES", "LOOM_EGRESS_ALLOW_PROBE", "LOOM_EGRESS_PROBE_SECONDS",
                  "LOOM_LEAK_SCANNER", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"):
@@ -325,6 +366,10 @@ def run() -> None:
     job = _job()
     d = job_dir()
     home = os.path.join(d, "home")
+    if os.path.exists(os.path.join(d, "codex-session-unavailable")):
+        _hold("Codex session copy is stale; slot unavailable")
+        print("slot unavailable: Codex session copy is stale")
+        return
     inbox = os.path.join(home, "briefs", job["slot"])
     os.makedirs(os.path.join(home, "logs"), exist_ok=True)
     os.makedirs(inbox, exist_ok=True)
