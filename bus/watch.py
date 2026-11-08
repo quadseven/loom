@@ -129,9 +129,20 @@ HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for
 # "failed". bus/station.py _stop_fix_rounds ends a ticket's fix rounds, at the
 # top of the model ladder or at the round cap, and leaves it in loom:failed
 # for the hand-off pool (loom#1881, loom#1880 filed it twice).
+# - _audit_holds says, every pass, which lanes a failed proof audit keeps from
+#   verify runs and until when: the hold is the designed answer to the failed
+#   audit, said about 30 times an hour for a day (loom#2774).
+# - release_factory_held re-queues a ticket whose factory incident filing
+#   failed once its hold runs out: that is the recovery. The fault itself is
+#   the earlier "held ... for the factory: ... incident filing failed" line,
+#   which stays kept (loom#1890, loom#2770 filed the recovery instead).
 EXPECTED_RES = (
     re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+: fix rounds stopped \(.+\); "
                r"left failed for the hand-off pool[ \t]*"),
+    re.compile(r"station: lane [A-Za-z0-9_.-]+ takes no verify run until "
+               r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z: a proof it made failed its audit[ \t]*"),
+    re.compile(r"station: factory release: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ re-queued: "
+               r"incident filing failed[ \t]*"),
 )
 # The brain's own status output, read back into its log: it names stages,
 # states and outcomes ("failed"), so the error words match, but none of it is
