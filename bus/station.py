@@ -4041,7 +4041,7 @@ class Station:
         holds = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
         for lane, until in sorted(holds.items()):
             _say("lane %s takes no verify run until %s: a proof it made failed its audit"
-                 % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until))))
+                 % (lane, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))))
         return holds
 
     def _reserve_verify(self, free: List[str]) -> List[str]:
