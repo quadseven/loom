@@ -19,6 +19,7 @@ from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
@@ -641,92 +642,11 @@ def held_lines(held: Dict[int, List[tickets.After]],
     return lines if held else lines + ["- none"]
 
 
-def by_bot(comment: Dict[str, Any], bot: str) -> bool:
-    """Written by the review bot's app; a person can take the same login
-    without "[bot]", so the author type must be Bot as well."""
-    author = comment.get("author") or {}
-    return (author.get("__typename") == "Bot"
-            and str(author.get("login") or "").lower() == bot.lower())
-
-
-def _head_commit(node: Dict[str, Any]) -> Dict[str, Any]:
-    commits = (node.get("commits") or {}).get("nodes") or []
-    return (commits[-1].get("commit") or {}) if commits else {}
-
-
-def _checks_blocker(head: Dict[str, Any]) -> Optional[str]:
-    checks = (head.get("statusCheckRollup") or {}).get("state") or "UNKNOWN"
-    return None if checks == "SUCCESS" else "checks %s" % checks.lower()
-
-
-def _review_blocker(node: Dict[str, Any], bot: str) -> Optional[str]:
-    # The newest submitted review decides; an older CHANGES_REQUESTED that a
-    # later review from the bot superseded no longer blocks.
-    reviews = [r for r in (node.get("reviews") or {}).get("nodes") or []
-               if by_bot(r, bot) and r.get("submittedAt")]
-    latest = max(reviews, key=lambda r: str(r["submittedAt"]), default=None)
-    if latest and latest.get("state") == "CHANGES_REQUESTED":
-        return "grug changes_requested"
-    return None
-
-
-# A person's review that sets or clears their verdict, as GitHub's
-# reviewDecision reads it: a later COMMENTED review leaves a change request
-# standing, and a dismissal turns that review itself into DISMISSED.
-_VERDICT_STATES = ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
-
-
-def _person_blockers(node: Dict[str, Any]) -> List[str]:
-    """One blocker per person (any author that is not a Bot) whose newest
-    verdict review on the pull request is CHANGES_REQUESTED. Bots keep their
-    own rule (_review_blocker); the review bot dismisses or re-reviews its own.
-    A review from someone who cannot push to the repository never counts, as
-    in GitHub's reviewDecision; a payload without that field still counts."""
-    newest: Dict[str, Dict[str, Any]] = {}
-    for r in (node.get("reviews") or {}).get("nodes") or []:
-        author = r.get("author") or {}
-        login = str(author.get("login") or "")
-        stamp = str(r.get("submittedAt") or "")
-        if (author.get("__typename") == "Bot" or not login or not stamp
-                or r.get("authorCanPushToRepository") is False
-                or r.get("state") not in _VERDICT_STATES):
-            continue
-        seen = newest.get(login.lower())
-        if seen is None or stamp > str(seen.get("submittedAt") or ""):
-            newest[login.lower()] = r
-    return ["changes requested by a person (%s)" % (r.get("author") or {}).get("login")
-            for _, r in sorted(newest.items()) if r.get("state") == "CHANGES_REQUESTED"]
-
-
-def _threads_blocker(threads: List[Dict[str, Any]]) -> Optional[str]:
-    unresolved = sum(1 for t in threads if not t.get("isResolved"))
-    return "%d unresolved threads" % unresolved if unresolved else None
-
-
-def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
-                     bot: str) -> Optional[str]:
-    # A finding is fixed only when a commit came after it, so one created at
-    # or after the head commit (>=) still has no fix-up commit.
-    committed = str(head.get("committedDate") or "")
-    roots = [((t.get("root") or {}).get("nodes") or [{}])[0] or {} for t in threads]
-    unfixed = sum(1 for c in roots
-                  if by_bot(c, bot) and str(c.get("createdAt") or "") >= committed)
-    if unfixed:
-        return "%d grug findings with no fix-up commit after them" % unfixed
-    return None
-
-
 def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
     """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
-    "blocked: " and every blocker, from one pull request's READY_FIELDS.
-    It reads nothing else, so the same API data always gives the same verdict."""
-    node = node or {}
-    head = _head_commit(node)
-    threads = (node.get("reviewThreads") or {}).get("nodes") or []
-    blockers = [b for b in (_checks_blocker(head), _review_blocker(node, bot),
-                            *_person_blockers(node), _threads_blocker(threads),
-                            _unfixed_blocker(threads, head, bot)) if b]
-    return merge_verdict.decide(node, blockers=blockers).text
+    "blocked: " and every blocker, from one pull request's READY_FIELDS
+    (merge_verdict.ready_verdict owns the rules)."""
+    return merge_verdict.ready_verdict(node, bot).text
 
 
 _NOT_BUILT = re.compile(r";\s*not built:", re.I)
@@ -4859,7 +4779,7 @@ def _refuse_person_change_request(details: Dict[str, Any]) -> None:
     """Refuse before the merge call, in the words status shows, when a
     person's change request stands: GitHub would answer the PUT with a bare
     405, and the brain would retry it every tick."""
-    blockers = _person_blockers(details)
+    blockers = merge_verdict.person_blockers(details)
     if blockers:
         raise ValueError("blocked: " + ", ".join(blockers))
 
