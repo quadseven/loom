@@ -5291,6 +5291,19 @@ fi
         self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_retry_after_is_capped_at_one_day(self):
+        _, result = self.api_lane(
+            "free-openrouter",
+            FAKE_CURL="503",
+            FAKE_CURL_RETRY_AFTER="9999999999999999999999999999",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 86400, delta=2)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
         inbox, result = self.api_lane("spark", extra="AGENT_FAIL=1\n", FAKE_CURL="200 503", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
