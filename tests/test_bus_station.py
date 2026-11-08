@@ -8809,6 +8809,17 @@ class VerifyBeforeBuildTest(Base):
         self.assertTrue(all(c["body"].startswith("<!-- loom:status v1 -->")
                             for c in self.fake.comments[21]), self.fake.comments[21])
 
+    def test_a_ticket_awaiting_a_live_check_is_not_queued(self):
+        # A brain parks finished work with awaiting-live-check and no state
+        # label; queueing it sent three tickets back to lanes with
+        # nothing left to build (2026-11-07).
+        self.fake.add(31)
+        self.fake.issues[31]["labels"] = [{"name": "loom:ticket"}, {"name": "awaiting-live-check"}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.queue_stateless_tickets()
+        self.assertNotIn("loom:queued", self.fake.names(31))
+        self.assertEqual(self.fake.comments.get(31, []), [])
+
     def test_a_merged_pull_request_fabric_cites_sends_the_ticket_to_verify(self):
         # loom#1437: the work merged without a link to the ticket, and a lane
         # would build it again.

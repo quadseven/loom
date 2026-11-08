@@ -779,10 +779,12 @@ STATELESS_FILE = "stateless.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
 # Labels that mean someone or something already holds a ticket: any Loom
-# state or hold, a person's claim, an operator ask, or a wait.
+# state or hold, a person's claim, an operator ask, a wait, or finished work
+# waiting to be seen live (awaiting-live-check: queueing it sent three parked
+# tickets back to lanes that had nothing left to build, 2026-11-07).
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
     "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
+    "loom:closed-unmerged", "needs-brain", brain.LIVE_CHECK_LABEL, *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
