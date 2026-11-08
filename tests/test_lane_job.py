@@ -156,6 +156,12 @@ class LaneJobTest(unittest.TestCase):
         self.inputs(slot="codex-2", settings="LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
         self.assertEqual(self.step("prepare").returncode, 0)
 
+    def test_claude_runner_slot_requires_its_oauth_parameter(self):
+        self.inputs(slot="claude")
+        self.assertEqual(self.step("prepare").returncode, 1)
+        self.inputs(slot="claude", settings="LOOM_CLAUDE_KEY_SSM=/lane/claude/oauth\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+
     def test_a_gateway_lane_is_moved_onto_the_cluster_gateway(self):
         self.inputs(slot="spark-2", settings="LOOM_SPARK_2_URL=http://spark.example.internal:8000/v1\n"
                                              "LOOM_SPARK_MODEL=spark/coder\n")
@@ -237,6 +243,41 @@ class LaneJobTest(unittest.TestCase):
                          "value-of/workersai/token\n")
         self.assertEqual((self.job / "ssm" / "workersai" / "account").read_text(),
                          "value-of/workersai/account\n")
+
+    def test_ssm_puts_claude_oauth_in_job_home_without_printing_it(self):
+        self.inputs(slot="claude", settings="LOOM_CLAUDE_KEY_SSM=/lane/claude/oauth\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+        code, printed, asked = self.ssm_step()
+        self.assertEqual(code, 0, printed)
+        token = "value-of/lane/claude/oauth\n"
+        path = self.job / "home" / "run" / "claude-oauth-token"
+        self.assertEqual(path.read_text(), token)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertIn("/lane/claude/oauth", [name for _, _, name in asked])
+        ordinary = "".join(line for line in printed.splitlines(True)
+                           if not line.startswith("::add-mask::"))
+        self.assertNotIn(token, ordinary)
+        self.assertNotIn(token.strip(), ordinary)
+        env = self.job / "runner.env"
+        self.assertEqual(self.step("run").returncode, 0)
+        self.assertIn("LOOM_CLAUDE_AUTH_FILE=" + str(path), env.read_text())
+
+    def test_claude_oauth_is_exported_only_to_agent_cli_without_printing_it(self):
+        token_file = self.job / "home" / "run" / "claude-oauth-token"
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text("oauth-placeholder\n")
+        capture = self.tmp / "agent-token"
+        cli = self.bin / "claude"
+        cli.write_text("#!/bin/sh\nprintf '%s' \"$CLAUDE_CODE_OAUTH_TOKEN\" > \"$TOKEN_CAPTURE\"\n")
+        cli.chmod(0o755)
+        script = '. "$1"; MODEL=test AGENT_TIMEOUT=5; agent_cli claude lane prompt'
+        env = dict(os.environ, PATH=str(self.bin) + ":" + os.environ["PATH"],
+                   LOOM_CLAUDE_AUTH_FILE=str(token_file), TOKEN_CAPTURE=str(capture))
+        result = subprocess.run(["bash", "-c", script, "bash", str(ROOT / "lanes" / "agent_cli.sh")],
+                                env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(capture.read_text(), "oauth-placeholder")
+        self.assertNotIn("oauth-placeholder", result.stdout + result.stderr)
 
     def test_the_request_is_signed_as_aws_signs_it(self):
         # Pinned from botocore's SigV4Auth for the same request (checked when

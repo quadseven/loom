@@ -34,8 +34,8 @@ Rules:
   slot, the slot takes no more of that repo: its briefs park [transient] so
   another lane takes them, until the repo's head or the runner image changes.
 
-Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
-stay on this machine. docs/LANES.md, "Lanes on cluster runners".
+Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
+docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
 
@@ -69,9 +69,9 @@ REF = "main"
 # GitHub refuses a workflow_dispatch whose inputs together pass this many
 # characters.
 INPUT_LIMIT = 65535
-# Provider lanes a runner may run: the Codex subscription lane, API lanes
-# whose key the workflow's role can read, and gateway-served spark and free.
-RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+# Provider lanes a runner may run: Codex and Claude subscription lanes, API
+# lanes whose key the workflow's role can read, and gateway-served spark/free.
+RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac

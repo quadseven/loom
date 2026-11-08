@@ -39,7 +39,7 @@ agent.
 | Subscription | Path | Done once by the operator | Risk |
 |---|---|---|---|
 | Codex (Luna) | Broker-owned lane login; pods read a copy with no refresh token (below) | One device sign-in on the broker | Highest: a rotating session. The design below contains it |
-| Claude | A long-lived OAuth token for Claude Code, exported to the CLI only; it does not rotate on use, so many pods share it | Generate the token once and store it in SSM | Visible in the agent's environment; all slots share one subscription limit |
+| Claude | A long-lived OAuth token for Claude Code, copied by the `ssm` step into a mode-600 file under job HOME and exported to the CLI only; it does not rotate on use, so many pods share it | Generate the token once and store it in SSM | Visible in the agent's environment; all slots share one subscription limit |
 | Anthropic (API credits) | Exported key, as the Mac lane does today | None (the key is in SSM); the role needs the parameter | Visible in the agent's environment; spend is recorded per run |
 | opencode-go | Exported key; a gateway route later | None | Same; four slots share one monthly limit, held by each report's heartbeat |
 | OpenRouter | Gateway route (the slot exists) | None | None in the agent; the free daily count is small (see #2781) |
