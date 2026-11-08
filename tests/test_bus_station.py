@@ -13200,6 +13200,15 @@ class VerifyDispatchTest(Base):
         self.run_pass()
         self.assertEqual(self.briefs(), [])
 
+    def test_failed_audit_log_uses_the_exact_utc_hold_expiry(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        expiry = 1799999999
+        with mock.patch("bus.station.audit.held", return_value={"opencode-go": expiry}), \
+                mock.patch("bus.station._say") as say:
+            runner._audit_holds()
+        say.assert_called_once_with("lane opencode-go takes no verify run until %s: a proof it made failed its audit"
+                                    % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(expiry)))
+
     def test_the_hold_ends_after_a_day_and_only_a_trusted_audit_holds(self):
         for hours, login in ((25, "alice-example"), (2, "someone-else")):
             with self.subTest(hours=hours, login=login):
