@@ -1784,6 +1784,20 @@ def _lane_status_line(reads: Any, lanes_repo: str, authors: Sequence[str], now: 
     return "status skipped the lane status: %s" % why.replace(", past the deadline", "")
 
 
+def shipped_backlog_line(now: float, env: Optional[Dict[str, str]] = None) -> str:
+    """Show the fresh station-stamped shipped count and median without new API reads."""
+    from . import metrics
+
+    env = os.environ if env is None else env
+    home = env.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    row = metrics.read_shipped_row(os.path.join(home, "state", "station"), now)
+    if row is None:
+        return "not read (no fresh station stamp)"
+    if row["n"] == 0:
+        return "0 waiting"
+    return "%d waiting, median wait %.1fh" % (row["n"], row["median_h"])
+
+
 def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dict[str, Any]]],
                      waiting: Dict[str, Dict[str, Any]], lanes_repo: str, authors: Sequence[str],
                      now: datetime, env: Dict[str, str]) -> Tuple[List[str], List[str]]:
@@ -1804,6 +1818,7 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
     tail += [""] + validation_gap_lines(env)
     unread: List[str] = []
     tail += ["", "## Lane status", _lane_status_line(reads, lanes_repo, authors, now, unread)]
+    tail += ["", "## Shipped backlog", "- " + shipped_backlog_line(now.timestamp(), env)]
     return tail, unread
 
 
@@ -1823,7 +1838,8 @@ def _status_tail(reads: Any, repos: Sequence[str], found: Dict[str, List[Dict[st
     else:
         if side is not None:
             side.end()  # the sections still reading end now, not at the command's exit
-        tail = ["", "status skipped the sections across repos: deadline"]
+        tail = ["", "status skipped the sections across repos: deadline",
+                "", "## Shipped backlog", "- not read (status deadline)"]
         missed.append("sections across repos")
     if missed:
         tail += ["", "status partial: not read this run: %s" % " ".join(missed)]

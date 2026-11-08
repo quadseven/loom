@@ -1,6 +1,7 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional, Sequence, Set,
@@ -118,12 +119,14 @@ def _items(value: Union[str, Iterable[str], None]) -> str:
 
 
 def render_journal(when, holder, shipped, briefed, waiting, asks,
-                   requests, minutes, measure=None) -> str:
+                   requests, minutes, measure=None, backlog=None) -> str:
     head = [JOURNAL_MARKER, "Tick %s, %s" % (_when(when), holder)]
     if measure is not None:
         head.append("- Measure: %s" % _items(measure))
-    return "\n".join(head + [
-        "- Shipped: %s" % _items(shipped),
+    lines = ["- Shipped: %s" % _items(shipped)]
+    if backlog is not None:
+        lines.append("- Shipped backlog: %s" % backlog)
+    return "\n".join(head + lines + [
         "- Briefed: %s" % _items(briefed),
         "- Waiting: %s" % _items(waiting),
         "- Asks: %s" % _items(asks),
@@ -175,6 +178,42 @@ def with_tick(text: str, holder: Optional[str], now: Optional[datetime] = None) 
         raise ValueError("holder must be letters, digits, dot, dash or underscore")
     tick = "Tick %s, %s" % (_when(now or datetime.now(timezone.utc)), holder)
     return "%s\n%s\n%s" % (JOURNAL_MARKER, tick, rest)
+
+
+def with_shipped_backlog(text: str, now: Optional[datetime] = None) -> str:
+    """Put the fresh station-stamped shipped count on the current journal tick."""
+    if not text.startswith(JOURNAL_MARKER):
+        return text
+    from . import metrics
+
+    when = now or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    row = metrics.read_shipped_row(os.path.join(home, "state", "station"), when.timestamp())
+    if row is None:
+        value = "not read (no fresh station stamp)"
+    elif row["n"] == 0:
+        value = "0 waiting"
+    else:
+        value = "%d waiting, median wait %.1fh" % (row["n"], row["median_h"])
+    line = "- Shipped backlog: " + value
+
+    current, marker, earlier = text.partition(EARLIER_OPEN)
+    found = re.search(r"(?m)^- Shipped backlog:.*$", current)
+    if found:
+        current = current[:found.start()] + line + current[found.end():]
+    else:
+        shipped = re.search(r"(?m)^- Shipped:.*$", current)
+        if shipped:
+            at = shipped.end()
+            current = current[:at] + "\n" + line + current[at:]
+        else:
+            tick = re.search(r"(?m)^Tick .*?$", current)
+            if tick is None:
+                return text
+            current = current.rstrip("\n") + "\n" + line + "\n"
+    return current + (marker + earlier if marker else "")
 
 
 _STEPS_LINE = re.compile(r"^[ \t]*-[ \t]+Steps:.*(?:\r?\n|$)", re.M)
@@ -358,6 +397,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
                           _answer.operators(None, list(trusted) or None))
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder, now)
+        text = with_shipped_backlog(text, now)
         _text.check(text)
         mine, previous = _journal_context(gh, repo, issue_number, text)
         text = with_steps(journal_check.annotate(text, previous), steps)

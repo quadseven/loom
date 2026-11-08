@@ -728,6 +728,10 @@ VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+VERIFY_PRIORITY_MEDIAN_H = 24.0
+VERIFY_PRIORITY_AFTER = 24 * 3600
+VERIFY_PRIORITY_EVERY = metrics.SHIPPED_STAMP_MAX_AGE
+VERIFY_PRIORITY_FILE = metrics.SHIPPED_STAMP_FILE
 # A shipped ticket still unverified this long after its ship with no verify
 # attempt ever recorded gets one missing-evidence note (loom#2092): the
 # reserved lane reaches one ticket per VERIFY_RESERVE_EVERY, so the rest of
@@ -3346,6 +3350,7 @@ class Station:
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
         free = self._not_demoted(free)
+        free = self._prioritize_verifies(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -4062,6 +4067,44 @@ class Station:
         self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
         return [lane for lane in free if self._inbox_empty(lane)]
 
+    def _shipped_median(self) -> Optional[float]:
+        """Read the fresh station stamp without starting another repo scan."""
+        cached = metrics.read_shipped_row(self.state, self.now)
+        return cached["median_h"] if cached is not None else None
+
+    def _refresh_shipped_priority_stamp(self) -> None:
+        """Refresh shipped waits after this pass's deadline-bound reads."""
+        if metrics.read_shipped_row(self.state, self.now) is not None or self._deferred():
+            return
+        try:
+            row = metrics.shipped_row(self.gh, self._verify_repos(), self.now)
+        except TargetReached as err:
+            _say("shipped wait stamp carried over to the next pass: %s" % err)
+            return
+        except RateLimited:
+            _say("shipped wait stamp waits for the GitHub rate-limit reset")
+            return
+        except (GitHubError, OSError, TypeError, ValueError) as err:
+            _say("could not refresh shipped wait stamp: %s" % err)
+            return
+        _write_json(os.path.join(self.state, VERIFY_PRIORITY_FILE), {
+            "at": self.now,
+            "n": row["n"] if row else 0,
+            "median_h": row["median_h"] if row else None,
+        })
+
+    def _prioritize_verifies(self, free: List[str]) -> List[str]:
+        """Drain overdue shipped work before new briefs while its median is high."""
+        if not free:
+            return free
+        median = self._shipped_median()
+        if median is None or median < VERIFY_PRIORITY_MEDIAN_H:
+            return free
+        _say("shipped median wait %.1fh is at or over %.0fh: verify runs take free lanes "
+             "ahead of build briefs" % (median, VERIFY_PRIORITY_MEDIAN_H))
+        self._hand_verifies(free, starved_for=VERIFY_PRIORITY_AFTER, queued_holds=False)
+        return [lane for lane in free if self._inbox_empty(lane)]
+
     def note_stale_shipped(self) -> None:
         """One missing-evidence note on every shipped ticket older than
         VERIFY_NOTE_AFTER that no verify attempt has ever reached
@@ -4169,7 +4212,7 @@ class Station:
         ledger[key] = {"at": self.now}
 
     def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
-                       limit: int = 0) -> None:
+                       limit: int = 0, queued_holds: Optional[bool] = None) -> None:
         """Give each idle slot that may verify, has no build work and is
         empty one shipped ticket to verify. The ticket keeps its labels: the
         station moves it when the result comes back (_report_verify).
@@ -4183,7 +4226,8 @@ class Station:
         attempts = _read_json(path, {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, held = self._verify_pool(attempts, queued_holds=not starved_for)
+            pool, held = self._verify_pool(
+                attempts, queued_holds=queued_holds if queued_holds is not None else not starved_for)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -15881,6 +15925,7 @@ class Station:
                 raise
             except (GitHubError, OSError) as err:
                 _say("watch_logs failed: %s" % err)
+            self._refresh_shipped_priority_stamp()
         finally:
             self._end_pass_locally()
 

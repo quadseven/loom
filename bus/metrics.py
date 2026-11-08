@@ -7,6 +7,7 @@ import statistics
 import subprocess
 import sys
 import argparse
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ WAIT_WINDOW = 7 * 86400
 # Ticket event lists read at once by waits_for_repos (bus.brain status and
 # the dashboard read with eight workers too).
 WAIT_READ_WORKERS = 8
+SHIPPED_STAMP_FILE = "verify-priority.json"
+SHIPPED_STAMP_MAX_AGE = 30 * 60
 # Ticket states a lane can still move toward a merge.
 WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 # A ticket in a terminal state is done, not waiting: verified is the end of the
@@ -221,6 +224,33 @@ def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
     if cause_rows is not None:
         cause_rows.extend(summarize_wait_causes(causes))
     return summarize_waits(tickets)
+
+
+def shipped_row(gh: GitHub, repos: Sequence[str], now: float) -> Dict[str, Any] | None:
+    """Return the shipped-state wait row from the canonical waits read."""
+    rows, _ = waits_for_repos(gh, repos, now)
+    return next((row for row in rows if row.get("state") == "shipped"), None)
+
+
+def read_shipped_row(state_dir: str, now: float) -> Dict[str, Any] | None:
+    """Read a fresh station-written shipped row; never trigger a network read."""
+    try:
+        with open(os.path.join(state_dir, SHIPPED_STAMP_FILE), encoding="utf-8") as fh:
+            stamp_data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stamp_data, dict):
+        return None
+    at, count, median = (stamp_data.get("at"), stamp_data.get("n"),
+                         stamp_data.get("median_h"))
+    fresh = (isinstance(at, (int, float)) and not isinstance(at, bool)
+             and 0 <= now - float(at) < SHIPPED_STAMP_MAX_AGE)
+    valid_count = isinstance(count, int) and not isinstance(count, bool) and count >= 0
+    valid_median = (median is None if count == 0 else
+                    isinstance(median, (int, float)) and not isinstance(median, bool))
+    if not (fresh and valid_count and valid_median):
+        return None
+    return {"n": count, "median_h": median}
 
 
 def waits_main(argv: Sequence[str] | None = None) -> int:
