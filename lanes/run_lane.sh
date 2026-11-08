@@ -1431,12 +1431,18 @@ spark_probe() {
       }
       END { if (retry != "") print retry }
     ' | tail -1)"
-    if [[ "$retry_after" =~ ^[0-9]{1,5}$ ]] && [ "$retry_after" -gt 0 ] &&
-       [ "$retry_after" -le "$LIMIT_MAX_HOLD" ]; then
-      LIMIT_RETRY_AFTER="$retry_after"
-      LIMIT_WHY="the $LANE endpoint answered 503; gateway retry after ${retry_after}s"
-    else
-      LIMIT_WHY="the $LANE endpoint answered 503"
+    LIMIT_WHY="the $LANE endpoint answered 503"
+    if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+      retry_after="${retry_after#"${retry_after%%[!0]*}"}"
+      if [ -n "$retry_after" ]; then
+        if [ "${#retry_after}" -gt 5 ] || [ "$retry_after" -gt "$LIMIT_MAX_HOLD" ]; then
+          retry_after="$LIMIT_MAX_HOLD"
+        fi
+        if [ "$retry_after" -gt 0 ]; then
+          LIMIT_RETRY_AFTER="$retry_after"
+          LIMIT_WHY="the $LANE endpoint answered 503; gateway retry after ${retry_after}s"
+        fi
+      fi
     fi
     return 1
   fi
