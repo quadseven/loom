@@ -4595,13 +4595,31 @@ class Station:
     def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
         """Ask once when an adapter verify run could not supply station proof."""
         issue = self._issue(repo, number)
-        if needs_human(_label_names(issue)):
+        names = _label_names(issue)
+        if needs_human(names):
+            return
+        body = str(issue.get("body") or "")
+        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
+        if criteria_gate.live_wait(names, gaps, [body]):
+            # A LIVE WAIT IS NOT ON THE HUMAN LINE (loom#2872). A ticket that
+            # waits on a live event (a wait:* label, or awaiting-live-check or
+            # a stated waiting line with only live boxes open) stays shipped
+            # in the verify queue; the missing check is a status line, not a
+            # person label. Only a box that needs an operator action asks.
+            self._verify_note(repo, number, "adapter", "no read-only check named for its "
+                              "live wait (%s: %s)" % (self._note_text(step),
+                                                      self._note_text(reason)))
+            return
+        if self._asked_already(repo, number, body, gaps):
+            # Asked for these same criteria and a brain or operator took the
+            # label off: it is not added back until the criteria change.
             return
         ask = ("Kind: decision\nThe station could not verify the prose Live criterion. "
                "Step tried: %s. Reason: %s. Restate the criterion with a safe "
                "read-only check or resolve it by hand." %
                (self._note_text(step), self._note_text(reason)))
         brain.human(self.gh, repo, number, ask)
+        self._record_ask(repo, number, body)
 
     def _apply_adapter_verify(self, repo: str, number: int, answer: Any) -> None:
         """Run a verify lane's proposed adapter step and close only on its own read."""
