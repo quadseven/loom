@@ -557,6 +557,68 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 600)
         self.assertEqual(self.gh.issues[1]["state"], "closed")
 
+
+class ValidationFailureTest(unittest.TestCase):
+    def test_a_lane_validation_failure_on_a_green_base_is_an_outcome_not_an_error(self):
+        # T2771: a lane's validation failure on a green base is a designed outcome,
+        # not an error. These lines are filed by bus/station.py when a lane's validation
+        # fails while the base check passes.
+        validation_lines = [
+            # First line shape: reported OWNER/REPO#N failed: [work] validation failed...
+            "station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); the edits are on branch main",
+            "station: reported example-owner/repo-a#1752 failed: [work] validation failed: the check exited 1 at 1ff8431ac480 (base check exited 0); the edits are committed in the lane tree",
+            "station: reported example-owner/repo-a#1234 failed: [work] validation failed: the check exited 1 at abc123def456 (base check exited 0); the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree",
+            # Second line shape: reported OWNER/REPO#N fix failed, back to loom:failed...
+            "station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); the edits are on branch test-branch",
+            "station: reported example-owner/repo-a#9012 fix failed, back to loom:failed: [work] validation failed: the check exited 2 at 0123456789ab (base check exited 0); the push of test-branch failed; the edits are committed in the lane tree",
+            # Without timestamp (the station adds it, but keep should work without)
+            "station: reported example-owner/repo-a#3456 failed: [work] validation failed: the check exited 1 at fedcba098765 (base check exited 0); the edits are on branch main",
+        ]
+        for line in validation_lines:
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line), line)
+
+        # These should still be errors (not expected results)
+        error_lines = [
+            "station: reported example-owner/repo-a#999 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 1)",
+            "station: reported example-owner/repo-a#888 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)",
+            "station: reported example-owner/repo-a#777 failed: [work] validation failed: validation environment unavailable: the check exited 126",
+            "station: reported example-owner/repo-a#666 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the edits are on branch main; push failed",
+        ]
+        for line in error_lines:
+            with self.subTest(line=line):
+                self.assertTrue(watch.keep(line), line)
+
+    def test_a_lane_validation_failure_on_a_green_base_is_an_outcome_not_an_error(self):
+        # T2771: a lane's validation failure on a green base is a designed outcome,
+        # not an error. These lines are filed by bus/station.py when a lane's validation
+        # fails while the base check passes.
+        validation_lines = [
+            # First line shape: reported OWNER/REPO#N failed: [work] validation failed...
+            "station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); the edits are on branch main",
+            "station: reported example-owner/repo-a#1752 failed: [work] validation failed: the check exited 1 at 1ff8431ac480 (base check exited 0); the edits are committed in the lane tree",
+            "station: reported example-owner/repo-a#1234 failed: [work] validation failed: the check exited 1 at abc123def456 (base check exited 0); the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree",
+            # Second line shape: reported OWNER/REPO#N fix failed, back to loom:failed...
+            "station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); the edits are on branch test-branch",
+            "station: reported example-owner/repo-a#9012 fix failed, back to loom:failed: [work] validation failed: the check exited 2 at 0123456789ab (base check exited 0); the push of test-branch failed; the edits are committed in the lane tree",
+            # Without timestamp (the station adds it, but keep should work without)
+            "station: reported example-owner/repo-a#3456 failed: [work] validation failed: the check exited 1 at fedcba098765 (base check exited 0); the edits are on branch main",
+        ]
+        for line in validation_lines:
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line), line)
+
+        # These should still be errors (not expected results)
+        error_lines = [
+            "station: reported example-owner/repo-a#999 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 1)",
+            "station: reported example-owner/repo-a#888 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)",
+            "station: reported example-owner/repo-a#777 failed: [work] validation failed: validation environment unavailable: the check exited 126",
+            "station: reported example-owner/repo-a#666 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the edits are on branch main; push failed",
+        ]
+        for line in error_lines:
+            with self.subTest(line=line):
+                self.assertTrue(watch.keep(line), line)
+
     def test_an_open_issue_with_the_title_is_counted_not_filed_twice(self):
         title = "station: " + watch.signature(LINE_403)
         self.gh.issues[1] = {"number": 1, "title": title, "state": "open",
