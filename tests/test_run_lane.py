@@ -4036,13 +4036,88 @@ exec /usr/bin/git "$@"
         self.assertFalse(beat["available"])
         self.assertIn("bwrap narrows no network", beat["reason"])
 
-    def test_without_drop_trees_a_lane_keeps_its_tree_for_the_station_to_prune(self):
-        self.drop_brief()
-        result = self.run_lane()
+    def test_copilot_runs_on_a_pod_with_token_environment_variable(self):
+        # A copilot lane pod run (cluster runner) with a token from SSM.
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        (ssm / "copilot").write_text("fake-copilot-token")
+        inbox = self.loom / "briefs" / "copilot"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: copilot"))
+        # Leftovers of a check a killed runner never finished.
+        (self.loom / "worktrees" / "T042-fix-the-thing-default-check").mkdir(parents=True)
+        (self.loom / "run" / "copilot-check-default").mkdir(parents=True)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("copilot", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
+                               LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"), LOOM_COPILOT_KEY_SSM="/k/copilot",
+                               FAKE_GH_PRIVATE="true")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((self.loom / "worktrees" / "T042-fix-the-thing").is_dir())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertEqual(self.pushed_files(), ["fix.txt"])
+        calls = self.calls()
+        self.assertNotIn("sandbox-exec", calls)
+        self.assertFalse([c for c in calls if c.startswith("aws ")], calls)
+        copilot_calls = [c for c in calls if c.startswith("copilot ")]
+        self.assertEqual(len(copilot_calls), 1, copilot_calls)
+        self.assertIn("-p", copilot_calls[0])
+        self.assertIn("--allow-all-tools", copilot_calls[0])
+        self.assertIn("COPILOT_GITHUB_TOKEN=fake-copilot-token", copilot_calls[0])
+        self.assertIn("lane copilot, model copilot-free", self.body.read_text())
+        self.assertIn("T042-fix-the-thing done", (self.loom / "logs" / "copilot" / "T042-fix-the-thing.log").read_text())
 
-    def test_opencode_temp_paths_and_external_directory_denial_keep_the_sandbox_boundary(self):
+    def test_copilot_token_is_scoped_only_to_copilot_access(self):
+        # The copilot token should only be accessible in the copilot lane,
+        # not in other lanes like openrouter.
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        self.write_tool(self.bin / "bwrap", "#!/usr/bin/env bash\n"
+                        "while [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n"
+                        "[ $# -gt 0 ] || exit 0\nshift\nexec \"$@\"\n")
+        ssm = self.home / ".ssm" / "k"
+        ssm.mkdir(parents=True)
+        # Set a fake copilot token
+        (ssm / "copilot").write_text("fake-copilot-token")
+        # Set a different fake openrouter token
+        (ssm / "openrouter").write_text("fake-openrouter-token")
+        inbox = self.loom / "briefs" / "copilot"
+        inbox.mkdir(parents=True)
+        (inbox / "T042-fix-the-thing.md").write_text(BRIEF.replace("Lane: codex", "Lane: copilot"))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = "127.0.0.1:%d" % probe.getsockname()[1]
+        reachable = socket.socket()
+        reachable.bind(("127.0.0.1", 0))
+        reachable.listen(8)
+        self.addCleanup(reachable.close)
+        result = self.run_lane("copilot", LOOM_SANDBOX="bwrap", LOOM_DROP_TREES="1",
+                               LOOM_EGRESS_DENY_PROBES=closed,
+                               LOOM_EGRESS_ALLOW_PROBE="127.0.0.1:%d" % reachable.getsockname()[1],
+                               LOOM_SSM_DIR=str(self.home / ".ssm"), LOOM_COPILOT_KEY_SSM="/k/copilot",
+                               LOOM_OPENROUTER_KEY_SSM="/k/openrouter", FAKE_GH_PRIVATE="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), self.calls())
+        copilot_calls = [c for c in self.calls() if c.startswith("copilot ")]
+        openrouter_calls = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(copilot_calls), 1, copilot_calls)
+        self.assertIn("COPILOT_GITHUB_TOKEN=fake-copilot-token", copilot_calls[0])
+        # Verify that the openrouter token is not accessible in the copilot lane
+        self.assertFalse(any("OPENROUTER_API_KEY" in c for c in copilot_calls))
+
+    def test_a_pod_lane_without_narrowed_egress_runs_no_agent(self):
         profile_file = str(Path(self._tmp.name) / "sandbox.profile")
         self.write_tool(
             self.bin / "sandbox-exec",

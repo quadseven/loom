@@ -71,7 +71,7 @@ REF = "main"
 INPUT_LIMIT = 65535
 # Provider lanes a runner may run: the Codex subscription lane, API lanes
 # whose key the workflow's role can read, and gateway-served spark and free.
-RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark", "copilot")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
