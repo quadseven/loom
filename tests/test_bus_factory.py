@@ -142,6 +142,9 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/reviews$", path)
         if m:
             return list(self.reviews.get(int(m.group(1)), []))
+        if re.search(r"^/repos/[^/]+/[^/]+/labels(?:\?|$)", path):
+            # The repo's labels; a test sets repo_labels to define `area:` ones.
+            return [{"name": n} for n in getattr(self, "repo_labels", ())]
         raise AssertionError("unexpected paginate %s" % path)
 
     def rest(self, method, path, body=None, etag=None, ok=()):
