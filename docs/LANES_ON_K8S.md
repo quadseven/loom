@@ -44,7 +44,7 @@ agent.
 | opencode-go | Exported key; a gateway route later | None | Same; four slots share one monthly limit, held by each report's heartbeat |
 | OpenRouter | Gateway route (the slot exists) | None | None in the agent; the free daily count is small (see #2781) |
 | Z.ai | Gateway route | None | None in the agent |
-| Workers AI | Gateway route (to build); until then the token and the account id copied by the `ssm` step | None | Interim exported key; the account id is not readable by the role today |
+| Workers AI | Token and account id copied by the `ssm` step | None | Both values are available to the lane agent |
 | Zen | No key | None | None |
 | agy (Gemini) | Not established; remains on the Mac, capped at two slots | None | The Linux file-store behavior and whether use rotates it are unverified |
 | Copilot | Exported token with Copilot access only | Create the scoped token once (none is set for the Mac lane today) | Visible in the agent's environment; CLI headless behaviour is unproven (#2791) |
