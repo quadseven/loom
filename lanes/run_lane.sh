@@ -2547,9 +2547,17 @@ file_factory_incident() {  # kind, detail
 
 # File or update the factory incident for the current failure, append its
 # reference to the named reason variable, and park the brief as [factory]
-# so the ticket keeps its rung. (Assigns via printf -v, never in a
-# subshell, so PARK_CLASS survives.)
+# so the ticket keeps its rung. On a cluster runner a filed incident held
+# nothing and waited for a person to close it (the base check path already
+# avoids it); another lane takes the ticket instead. (Assigns via printf -v,
+# never in a subshell, so PARK_CLASS survives.)
 note_factory_incident() {  # kind, detail, reason_var_name
+  if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
+    PARK_CLASS=factory
+    printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane takes the ticket"
+    echo "$1 failure on a cluster runner; no incident filed: $2" >> "$LOG"
+    return 0
+  fi
   local ref
   ref="$(file_factory_incident "$1" "$2")"
   PARK_CLASS=factory

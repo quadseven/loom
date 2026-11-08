@@ -16,14 +16,15 @@ queued. More lanes on that host do not mean more work done.
 ## Where cluster lanes stand
 
 Only two slots run on the pool. `free-gemma` succeeded 7 times on 2026-11-02
-and failed 37 times since. `free-openrouter` failed all 56 of its runs from
-2026-11-02 to 2026-11-04, each with `the agent did not run (limit)`: the slot
-held on a provider limit before the agent started, and a pod has no memory of
-the hold. The gateway's 503 includes `Retry-After`, but the lane discarded it
-and applied a 15-minute fallback; the station then dispatched again before
-the gateway's hold expired. #2781 fixes reset propagation from the sealed
-heartbeat; #2782 does the same for `free-gemma`. Nothing else moves
-until one slot runs end to end.
+and failed 37 times between 2026-11-02 and 2026-11-04 in the classes `work`,
+`limit` and `factory`. `free-openrouter` failed all 56 of its runs in that
+window, each with `the agent did not run (limit)`. #2781 fixed gateway
+`Retry-After` propagation from the sealed heartbeat for the free routes;
+#2782 names the `free-gemma` failure classes and fixes the runner/station
+path that misread runner-image environment faults on a cluster slot (no
+tracked model, and factory incidents filed from the pod that held the
+ticket instead of retrying it elsewhere). Nothing else moves until one slot
+runs end to end with an `agent-ran` mark and a pull request or diff.
 
 ## Credential path per subscription
 
