@@ -8899,7 +8899,8 @@ class Station:
         if RUNNING not in names:
             return
         labels = ticket_move.next_labels(names, new, wait=wait,
-                                         own_logins=self.s.authors)
+                                         own_logins=self.s.authors,
+                                         clear_needs_brain=False)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
 

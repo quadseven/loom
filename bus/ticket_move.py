@@ -28,10 +28,12 @@ def _strip_prefix(name: str, prefix: str) -> str:
     return name[len(prefix):] if name.startswith(prefix) else name
 
 
-def _drop(name: str, lane_given: bool) -> bool:
+def _drop(name: str, lane_given: bool, clear_needs_brain: bool = True) -> bool:
     """Return True if `name` is cleared on a ticket move."""
-    if name in STATE_LABELS or name.startswith("wait:") or name == "needs-brain":
+    if name in STATE_LABELS or name.startswith("wait:"):
         return True
+    if name == "needs-brain":
+        return clear_needs_brain
     return lane_given and name.startswith("lane:")
 
 
@@ -41,10 +43,14 @@ def next_labels(
     lane: Optional[str] = None,
     wait: Optional[str] = None,
     own_logins: Iterable[str] = (),
+    clear_needs_brain: bool = True,
 ) -> List[str]:
     """Return the labels after a ticket move.
 
     Every loom state label, wait:* label, and needs-brain is removed.
+    A station move that only ends a run passes clear_needs_brain=False:
+    needs-brain reads "already reported", and only a brain move clears it
+    (docs/BRAIN.md).
     When a lane is given, existing lane:* labels are removed.
     When the ticket leaves loom:running, this Loom's own claim:<login> labels
     are removed.
@@ -53,7 +59,7 @@ def next_labels(
     clean_state = _strip_prefix(state, "loom:")
     lane_given = lane is not None
     have_list = list(have)
-    kept = [x for x in have_list if not _drop(x, lane_given)]
+    kept = [x for x in have_list if not _drop(x, lane_given, clear_needs_brain)]
     if "loom:running" in have_list and clean_state != "running":
         # The claim marks a run in progress; the run is over.
         kept = stale_claims.without_own_claim(kept, own_logins)

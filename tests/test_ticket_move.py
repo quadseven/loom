@@ -110,6 +110,28 @@ class TicketMoveNextLabelsTests(unittest.TestCase):
         self.assertEqual(from_bare, ["loom:ticket", "loom:briefed", "lane:codex"])
         self.assertEqual(from_prefixed, ["loom:ticket", "loom:briefed", "lane:codex"])
 
+    def test_strip_prefix_leaves_text_without_the_prefix_unchanged(self):
+        # A name that does not start with the prefix comes back as it was,
+        # including one that holds the prefix word later in the string.
+        for name in ("codex", "claude-2", "my-lane:x", "x-wait:gate", "", "lane"):
+            self.assertEqual(name, ticket_move._strip_prefix(name, "lane:"), name)
+            self.assertEqual(name, ticket_move._strip_prefix(name, "wait:"), name)
+        self.assertEqual("codex", ticket_move._strip_prefix("lane:codex", "lane:"))
+        # Only one leading prefix goes.
+        self.assertEqual("lane:codex", ticket_move._strip_prefix("lane:lane:codex", "lane:"))
+
+    def test_a_lane_or_wait_holding_the_prefix_word_mid_name_is_kept_whole(self):
+        have = ["loom:ticket", "loom:running"]
+        result = ticket_move.next_labels(have, "queued", lane="my-lane:x",
+                                         wait="x-wait:gate")
+        self.assertIn("lane:my-lane:x", result)
+        self.assertIn("wait:x-wait:gate", result)
+
+    def test_needs_brain_is_kept_when_the_caller_does_not_clear_it(self):
+        have = ["loom:ticket", "loom:running", "needs-brain", "wait:gate"]
+        result = ticket_move.next_labels(have, "failed", clear_needs_brain=False)
+        self.assertEqual(["loom:ticket", "needs-brain", "loom:failed"], result)
+
 
 if __name__ == "__main__":
     unittest.main()

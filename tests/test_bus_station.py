@@ -11960,6 +11960,17 @@ class ClaimDropTest(Base):
         self.assertNotIn(self.OURS, names)
         self.assertIn(self.THEIRS, names)
 
+    def test_a_running_ticket_the_station_relabels_keeps_needs_brain(self):
+        # Station._relabel ends a run; only a brain move clears needs-brain
+        # (docs/BRAIN.md), so a station move keeps it as main did (loom#2455).
+        runner = self.running()
+        self.fake.issues[12]["labels"] += [{"name": "needs-brain"}]
+        runner._relabel(REPO, 12, "loom:failed")
+        names = self.fake.names(12)
+        self.assertIn("loom:failed", names)
+        self.assertNotIn("loom:running", names)
+        self.assertIn("needs-brain", names)
+
     def test_a_claim_that_starts_a_run_is_still_added(self):
         self.fake.add(12, lane="codex", body=PLAIN_WITH_CRITERIA, state="briefed")
         self.run_pass()
