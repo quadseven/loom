@@ -987,6 +987,20 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
     return still if still and all(minor(t) for t in still) else []
 
 
+def coverage_only(picked: Sequence[Dict[str, Any]]) -> bool:
+    """Whether every deferred finding names the rule missing-test-coverage:
+    the only work is new tests for code that already works, which the
+    runner's base-test gate refuses (docs/LANES.md), so no follow-up
+    issue is filed for it."""
+    def rule(thread: Dict[str, Any]) -> str:
+        root = _end(thread, "root", 0)
+        body = str(root.get("body") or "")
+        first = next((line for line in body.splitlines() if line.strip()), "")
+        return converge.rule_of(first)
+
+    return bool(picked) and all(rule(t) == "missing-test-coverage" for t in picked)
+
+
 def finding_line(thread: Dict[str, Any]) -> str:
     """One ASCII line for a deferred finding: its severity line without the
     bot's symbols, its file, and a link to the thread."""
@@ -2077,7 +2091,13 @@ class Factory:
     def _follow_up(self, repo: str, number: int, ticket: int, sha: str,
                    picked: Sequence[Dict[str, Any]], rounds: int) -> int:
         """The open follow-up issue for this pull request's deferred findings,
-        filed now unless an earlier pass already filed it."""
+        filed now unless an earlier pass already filed it. All coverage-only
+        findings file nothing, so the pull request never becomes lane work."""
+        if coverage_only(picked):
+            _say("skipped the deferred-findings follow-up for %s#%d: all %d "
+                 "finding(s) name missing-test-coverage"
+                 % (repo, number, len(picked)))
+            return 0
         title = DEFER_TITLE % number
         known = (title, DEFER_TITLE_LEGACY % (repo, number))
         for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):

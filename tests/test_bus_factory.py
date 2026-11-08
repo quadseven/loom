@@ -2713,6 +2713,7 @@ class NoChangeRounds(Base):
 
 
 MEDIUM = "\U0001f7e0 medium | _robustness_ | `missing-error-handling` | quick win\n\nGrug see a gap."
+COVERAGE = "\U0001f7e0 medium | _test coverage_ | `missing-test-coverage` | quick win\n\nGrug see no test."
 HIGH = "\U0001f525 high | _correctness_ | `null-deref` | quick win\n\nGrug see a crash."
 ASKED_ONCE = FIX_MARKER + "\nPull request: x#50\n\n### Thread PRRT_1 (comment 1) at a.py:1\n\n    gap"
 ASKED_OTHER = FIX_MARKER + "\nPull request: x#50\n\n### Thread PRRT_9 (comment 9) at a.py:9\n\n    other"
@@ -2755,6 +2756,32 @@ class DeferredFindings(Base):
         self.assertTrue(replies[0][2].startswith("Deferred: "))
         self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
         self.assertEqual((self.merged, self.fixed), ([(50, (REPO, 5))], []))
+
+    def test_all_coverage_findings_file_no_follow_up(self):
+        self.finding(COVERAGE)
+        said = []
+        with mock.patch.object(factory, "_say", said.append):
+            self.go()
+            self.settle()
+        self.assertEqual(self.gh.filed, [])
+        self.assertFalse(any(w[0] == "POST" and w[1].endswith("/issues") for w in self.gh.writes))
+        self.assertTrue(any("#50" in m and "missing-test-coverage" in m for m in said))
+
+    def test_a_coverage_finding_with_another_rule_still_files(self):
+        self.finding(COVERAGE, asked=(ASKED_ONCE, ASKED_ONCE))
+        root = {"author": BOT, "body": MEDIUM, "url": "https://example.invalid/pr/50#r2"}
+        self.gh.details[50]["reviewThreads"]["nodes"].append(
+            {"id": "PRRT_2", "isResolved": False, "path": "bus/b.py",
+             "comments": {"nodes": [root]}, "root": {"nodes": [root]}})
+        self.gh.details[50]["reviewThreads"]["totalCount"] = 2
+        self.go()
+        self.assertIn(("RESOLVE", "PRRT_1", None), self.gh.writes)
+        self.assertIn(("RESOLVE", "PRRT_2", None), self.gh.writes)
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
+        body = self.gh.filed[0]["body"]
+        self.assertIn("missing-test-coverage", body)
+        self.assertIn("missing-error-handling", body)
 
     def test_a_new_medium_finding_on_the_first_round_is_deferred_not_sent_back(self):
         self.finding(MEDIUM, asked=(ASKED_OTHER,))
