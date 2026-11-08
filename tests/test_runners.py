@@ -222,6 +222,28 @@ class RunnersTest(unittest.TestCase):
         self.runner(actor=None).tend()
         self.assertEqual(self.gh.calls, [])
 
+    def test_the_pool_bound_holds_extra_briefs_in_the_inbox(self):
+        slots = ["opencode-go-2", "opencode-go-3", "opencode-go-4", "zen", "spark-2"]
+        env = dict(self.env, LOOM_RUNNER_POOL_MAX="2")
+        for slot in slots:
+            (self.home / "briefs" / slot).mkdir(parents=True, exist_ok=True)
+            (self.home / "briefs" / slot / (TICKET + ".md")).write_text(BRIEF)
+        r = runners.Runners(self.gh, str(self.home), REPO, slots, env,
+                            lambda repo: self.public.get(repo, False), self.said.append,
+                            actor=APP, now=self.now, fetch=self.fetch)
+        r.tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 2)
+        waiting = [slot for slot in slots
+                   if (self.home / "briefs" / slot / (TICKET + ".md")).exists()
+                   and not (self.home / "briefs" / slot / "failed" / (TICKET + ".md")).exists()]
+        # Only the two dispatched slots stay in the inbox too; the other three
+        # must still be in the inbox, not parked.
+        still = [slot for slot in slots
+                 if (self.home / "briefs" / slot / (TICKET + ".md")).exists()]
+        self.assertEqual(len(still), 5)
+        self.assertFalse(any((self.home / "briefs" / slot / "failed" / (TICKET + ".md")).exists()
+                             for slot in slots))
+
     def test_a_budget_refusal_sends_the_brief_on_a_later_pass(self):
         self.drop_brief()
         self.gh.dispatch_error = RateLimited("budget", 403, "", 0)

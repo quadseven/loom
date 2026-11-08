@@ -357,6 +357,67 @@ def failure_class(log: str) -> str:
     return found[-1] if found else "unknown"
 
 
+def _cgroup_int(root: str, names) -> int | None:
+    for name in names:
+        try:
+            text = open(os.path.join(root, name), encoding="ascii").read().strip().splitlines()[0].strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            return int(text)
+        except ValueError:
+            continue
+    return None
+
+
+def _cpu_usec(root: str) -> int | None:
+    try:
+        with open(os.path.join(root, "cpu.stat"), encoding="ascii") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "usage_usec":
+                    return int(parts[1])
+    except (OSError, ValueError):
+        pass
+    return _cgroup_int(root, ("cpuacct.usage", "cpu.usage", "memory.cpu.usage"))
+
+
+def read_cgroup(root: str | None = None):
+    """(peak memory bytes, cpu usage microseconds) from the cgroup of this
+    pod, or (None, None) when unreadable. cgroup v2 memory.peak and
+    cpu.stat usage_usec, with v1 memory.memory.usage_in_bytes and
+    cpuacct.usage as fallbacks. LOOM_CGROUP_ROOT names the root in tests."""
+    base = root or os.environ.get("LOOM_CGROUP_ROOT") or "/sys/fs/cgroup"
+    peak = _cgroup_int(base, ("memory.peak", "memory/memory.peak",
+                              "memory.current", "memory/memory.usage_in_bytes"))
+    return peak, _cpu_usec(base)
+
+
+def resources(wall_s: float, peak_bytes, cpu_usec) -> dict:
+    """peak_mem_mib, peak_cpu_cores and wall_s for one run. CPU cores is the
+    average cores used over the wall time (cpu usage divided by wall)."""
+    mem = round(float(peak_bytes) / 1048576.0, 3) if isinstance(peak_bytes, (int, float)) and peak_bytes else 0.0
+    cores = round(float(cpu_usec) / (wall_s * 1000000.0), 3) if (wall_s and wall_s > 0
+                 and isinstance(cpu_usec, (int, float)) and cpu_usec) else 0.0
+    return {"peak_mem_mib": mem, "peak_cpu_cores": cores, "wall_s": round(float(wall_s), 3)}
+
+
+def write_resources(home: str, slot: str, ticket: str, wall_s: float) -> dict:
+    """The run's resources file in the report: logs/<slot>/<ticket>.resources.json
+    with repo, lane, at and the peak fields. The repo is the brief's own."""
+    peak, cpu = read_cgroup()
+    try:
+        with open(os.path.join(job_dir(), "brief.md"), encoding="utf-8") as fh:
+            repo = runners.brief_field(fh.read(), "Repo")
+    except OSError:
+        repo = ""
+    row = {"repo": repo, "lane": slot, "at": int(time.time()), **resources(wall_s, peak, cpu)}
+    path = os.path.join(home, "logs", slot, ticket + ".resources.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write(path, json.dumps(row) + "\n", 0o644)
+    return row
+
+
 def run() -> None:
     """lanes/run_lane.sh <slot> once, on the one brief in the inbox. Its
     output goes to the service log in the sealed report, not to the public
@@ -377,12 +438,15 @@ def run() -> None:
     shutil.copyfile(os.path.join(d, "brief.md"), os.path.join(inbox, job["ticket"] + ".md"))
     log = os.path.join(home, "logs", job["slot"], job["ticket"] + ".service.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
+    start = time.monotonic()
     with open(log, "ab") as out:
         rc = subprocess.call(["bash", os.path.join(ROOT, "lanes", "run_lane.sh"), job["slot"]],
                              env=lane_env(), stdout=out, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL)
+    wall = time.monotonic() - start
     print("run_lane.sh exited %d" % rc)
     base = os.path.join(home, "logs", job["slot"], job["ticket"])
+    write_resources(home, job["slot"], job["ticket"], wall)
     _write(base + ".image", image_id() + "\n", 0o644)
     if not os.path.exists(base + ".agent-ran"):
         raise JobError("the agent did not run (%s); the reason is in the sealed report"

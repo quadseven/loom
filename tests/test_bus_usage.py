@@ -272,6 +272,18 @@ class UsageTests(unittest.TestCase):
         row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
         self.assertIsNone(row["used_pct"])
 
+    def test_runner_resources_are_collected_per_repo_for_the_usage_view(self):
+        logs = Path(self.home) / "logs" / "opencode-go-2"
+        logs.mkdir(parents=True)
+        (logs / "owner.app-7.resources.json").write_text(json.dumps({
+            "repo": "owner/app", "lane": "opencode-go-2", "at": 1000,
+            "peak_mem_mib": 2048.0, "peak_cpu_cores": 1.5, "wall_s": 120.0}))
+        rows = [r for r in usage.collect(self.home, now=1000, lane_names=[]) if r.get("repo") == "owner/app"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["peak_mem_mib"], 2048.0)
+        self.assertEqual(rows[0]["peak_cpu_cores"], 1.5)
+        self.assertEqual(rows[0]["wall_s"], 120.0)
+
     def test_codex_on_a_machine_without_session_logs_says_so(self):
         rows = usage.codex_records(["codex"], Path(self.home) / "no-sessions", 1000)
         self.assertIsNone(rows[0]["used_pct"])
