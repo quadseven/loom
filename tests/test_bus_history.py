@@ -152,5 +152,70 @@ class ReadHistory(unittest.TestCase):
         self.assertEqual(factory.FIX_MARKER, history.FIX_MARKER)
 
 
+FIX = "<!-- loom:fix v1 -->\n\n### Check: lint\n\n    E1"
+NO_CHANGE = "Lane claude made no change for the fix to #50 and said why on the pull request"
+NO_REASON_FAILURE = "Lane zai failed: [work] agent made no commit and wrote no reason on loom/6-x"
+SUBMODULE_FAILURE = ("Lane zai failed: [work] the change edits files inside submodule sub-example "
+                     "(sub-example/src/a.c), which a push of this repo does not carry; "
+                     "that repo needs the change first. nothing pushed")
+
+
+class CommentReaders(unittest.TestCase):
+    """The four fix-round and failure readers, called at bus.history itself
+    (loom#2457), with the cases tests/test_bus_factory.py drives through the
+    factory pass."""
+
+    def test_no_change_at_reads_the_latest_unanswered_no_change_note(self):
+        self.assertEqual(history.no_change_at([]), 0.0)
+        noted = [comment(FIX), comment(NO_CHANGE, at=LATER)]
+        self.assertEqual(history.no_change_at(noted), history._ts(LATER))
+        # A newer fix round means the no-change note is no longer the latest.
+        self.assertEqual(history.no_change_at(noted + [comment(FIX)]), 0.0)
+
+    def test_two_no_change_rounds_on_one_check_count_two(self):
+        rounds = [comment(b) for b in (FIX, NO_CHANGE, FIX, NO_CHANGE)]
+        self.assertEqual(history.no_change_rounds(rounds), {"lint": 2})
+
+    def test_a_round_that_changed_something_resets_the_count(self):
+        rounds = [comment(b) for b in (FIX, NO_CHANGE, FIX, FIX, NO_CHANGE)]
+        self.assertEqual(history.no_change_rounds(rounds), {"lint": 1})
+
+    def test_a_check_a_later_round_does_not_name_loses_its_count(self):
+        other = FIX.replace("### Check: lint", "### Check: unit")
+        rounds = [comment(b) for b in (FIX, NO_CHANGE, other, NO_CHANGE)]
+        self.assertEqual(history.no_change_rounds(rounds), {"unit": 1})
+
+    def test_one_no_reason_failure_does_not_repeat(self):
+        self.assertFalse(history.repeated_no_reason([comment(NO_REASON_FAILURE)]))
+
+    def test_a_second_no_reason_failure_repeats(self):
+        comments = [CLAIM, comment(NO_REASON_FAILURE), comment(history.rung_marker(1)),
+                    CLAIM, comment(NO_REASON_FAILURE)]
+        self.assertTrue(history.repeated_no_reason(comments))
+
+    def test_a_rung_zero_marker_restarts_the_no_reason_count(self):
+        comments = [comment(NO_REASON_FAILURE), comment(history.rung_marker(0)),
+                    CLAIM, comment(NO_REASON_FAILURE)]
+        self.assertFalse(history.repeated_no_reason(comments))
+
+    def test_needs_other_repo_reads_the_newest_failure_only(self):
+        self.assertIsNone(history.needs_other_repo([]))
+        self.assertEqual(history.needs_other_repo([CLAIM, comment(SUBMODULE_FAILURE)]),
+                         "sub-example")
+        # A newer failure for another reason supersedes the submodule one.
+        self.assertIsNone(history.needs_other_repo(
+            [comment(SUBMODULE_FAILURE), comment(NO_REASON_FAILURE)]))
+
+    def test_factory_names_delegate_to_the_history_readers(self):
+        comments = [comment(b) for b in (FIX, NO_CHANGE, SUBMODULE_FAILURE)]
+        for name in ("no_change_at", "no_change_rounds", "repeated_no_reason",
+                     "needs_other_repo"):
+            self.assertEqual(getattr(factory, name)(comments),
+                             getattr(history, name)(comments), name)
+        self.assertIs(factory.SUBMODULE_EDIT_RE, history.SUBMODULE_EDIT_RE)
+        self.assertIs(factory.NO_CHANGE_RE, history.NO_CHANGE_RE)
+        self.assertEqual(factory.NO_REASON, history.NO_REASON)
+
+
 if __name__ == "__main__":
     unittest.main()

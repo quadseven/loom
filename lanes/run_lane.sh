@@ -124,6 +124,22 @@ leak_scan() {
   env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
     python3 -B "$LEAK_SCANNER" "$@" --deny-list-ssm "$LEAK_DENY_SSM"
 }
+
+# A refused public repo scan's hits as one line a public ticket may carry:
+# each hit's rule and path:line, never its text (bus/leak_hits.py). The
+# scanner's whole output, LEAK_OUT, goes to the lane log only: the reason
+# once held just its first line, the counts of rules loaded, and the next
+# lane repeated the refusal blind (loom#2804). $1 is --diff RANGE (run in the
+# tree) or --text NAME.
+leak_hits() {
+  local named
+  printf '%s\n' "$LEAK_OUT" >> "$LOG"
+  named="$(cd "$TREE" && printf '%s\n' "$LEAK_OUT" |
+    PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.leak_hits "$@" 2>> "$LOG")" ||
+    named="the hits could not be located; the scanner output is in the lane log"
+  printf '%s' "$named"
+}
+
 # Keep $INFRA_PUBLIC cloned and fast-forward it at most once an hour, so the
 # leak scanner a public-repo push needs is present before any lane scans.
 # The first lane that needs it clones it; a later run fetches at most hourly,
@@ -625,7 +641,7 @@ pr_body() {
   size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
     section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
-  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$VALIDATED" "$CONTRACT_FILE")"
+  [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$(validation_summary)" "$CONTRACT_FILE")"
   [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
@@ -768,6 +784,8 @@ fix_contract_line() {
   [ -n "$checks" ] || return 0
   if [ -z "$HAS_CONTRACT" ]; then
     printf 'no validation contract check maps to the failing checks (%s): the repo has no %s, so CI is the first to run them on the new head' "$checks" "$CONTRACT_FILE"
+  elif [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'changed paths are not validated by a known contract mapping for checks (%s): %s; CI must check the new head' "$checks" "$(validation_summary)"
   elif grep -q "so the lane's own validation never ran it" "$1"; then
     printf 'no validation contract check maps to some failing checks (%s): the brief names CI jobs %s does not run; the contract check %s' "$checks" "$CONTRACT_FILE" "${VALIDATED:-did not pass}"
   else
@@ -1373,14 +1391,19 @@ $AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" <
 # The spark lane: a vLLM coder on a machine of the operator's own, serving
 # one stream at a time behind a thermal guard that refuses new connections
 # (or answers 503) while the box is hot. That is a limit, not a failure: the
-# lane says unavailable for LIMIT_HOLD seconds, and every brief it holds is
-# parked with a "limit:" reason, which the station hands to the next lane.
+# lane says unavailable for LIMIT_HOLD seconds by default, or honors a
+# gateway Retry-After on 503. Every held brief is parked with a "limit:"
+# reason, which the station hands to the next lane.
 LIMIT_HOLD=900
+# The free gateway caps Retry-After at a day. Keep that value intact across
+# lane passes so a cluster slot does not probe again while its route is held.
+LIMIT_MAX_HOLD=86400
 LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.limit"
 # A spark slot (spark-2) may name its own box: LOOM_SPARK_2_URL, else LOOM_SPARK_URL.
 SPARK_URL="$(lane_setting URL)"
 SPARK_PROBE_TIMEOUT=15
 LIMITED=""
+LIMIT_RETRY_AFTER=""
 LIMIT_WHY=""
 # Whether the provider answered the last probe at all (provider_at_limit).
 PROBE_ANSWERED=0
@@ -1393,11 +1416,36 @@ AUTH_WHY_PREFIX="API key expired: renew"
 # Ask the endpoint for its models. 0: it answered; 1: refused or 503, with
 # LIMIT_WHY set; 2: no answer for another reason, with READY_REASON set.
 spark_probe() {
-  local code status
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  local response code status retry_after
+  LIMIT_RETRY_AFTER=""
+  response="$(curl -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
+  code="${response##*$'\n'}"
   if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
-  if [ "$code" = 503 ]; then LIMIT_WHY="the $LANE endpoint answered 503"; return 1; fi
+  if [ "$code" = 503 ]; then
+    retry_after="$(printf '%s\n' "$response" | awk '
+      tolower($1) == "retry-after:" {
+        value = $2
+        gsub(/\r/, "", value)
+        if (value ~ /^[0-9]+$/) retry = value
+      }
+      END { if (retry != "") print retry }
+    ' | tail -1)"
+    LIMIT_WHY="the $LANE endpoint answered 503"
+    if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
+      retry_after="${retry_after#"${retry_after%%[!0]*}"}"
+      if [ -n "$retry_after" ]; then
+        if [ "${#retry_after}" -gt 5 ] || [ "$retry_after" -gt "$LIMIT_MAX_HOLD" ]; then
+          retry_after="$LIMIT_MAX_HOLD"
+        fi
+        if [ "$retry_after" -gt 0 ]; then
+          LIMIT_RETRY_AFTER="$retry_after"
+          LIMIT_WHY="the $LANE endpoint answered 503; gateway retry after ${retry_after}s"
+        fi
+      fi
+    fi
+    return 1
+  fi
   [ "$status" -eq 0 ] && return 0
   READY_REASON="the $LANE endpoint did not answer (curl exit $status)"
   return 2
@@ -1405,7 +1453,12 @@ spark_probe() {
 
 # Record a limit for LIMIT_HOLD seconds and say so in the heartbeat.
 mark_limit() {
-  LIMIT_UNTIL=$(( $(date +%s) + LIMIT_HOLD ))
+  local hold="$LIMIT_HOLD"
+  if [[ "${LIMIT_RETRY_AFTER:-}" =~ ^[0-9]{1,5}$ ]] &&
+     [ "$LIMIT_RETRY_AFTER" -gt 0 ] && [ "$LIMIT_RETRY_AFTER" -le "$LIMIT_MAX_HOLD" ]; then
+    hold="$LIMIT_RETRY_AFTER"
+  fi
+  LIMIT_UNTIL=$(( $(date +%s) + hold ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
   LIMITED=1
@@ -1414,13 +1467,13 @@ mark_limit() {
 }
 
 # A limit recorded by an earlier pass that has not run out. A time further
-# ahead than LIMIT_HOLD (a clock that was wrong) is ignored.
+# ahead than the gateway's maximum Retry-After (a clock that was wrong) is ignored.
 limit_held() {
   local ends why now
   [ -f "$LIMIT_FILE" ] || return 1
   read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
-  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_HOLD )) ] || return 1
+  [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_MAX_HOLD )) ] || return 1
   LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
 }
@@ -3134,6 +3187,39 @@ final_validation() {
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
   [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  assess_validation_paths
+}
+
+# A successful shell command proves its exit status, not which changed paths
+# it validated. The contract has no path-to-check mapping, even for affected:
+# hooks. Keep execution evidence separate and leave path validation to CI.
+assess_validation_paths() {
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
+  UNVALIDATED_PATHS="$(validation_changed_paths | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.validation_paths)" || COVERAGE_UNKNOWN=true
+}
+
+validation_changed_paths() {
+  local range
+  range="$(lane_diff_range)" || return 1
+  safe_git diff --name-only -z "$range"
+}
+
+validation_summary() {
+  printf '%s' "$VALIDATED"
+  if [ "$COVERAGE_UNKNOWN" = true ]; then
+    printf '; not validated: changed paths could not be read; contract path coverage unknown'
+  elif [ -n "$UNVALIDATED_PATHS" ]; then
+    printf '; not validated: contract path coverage unknown for %s' "$UNVALIDATED_PATHS"
+  fi
+}
+
+validation_round_note() {
+  if [ -n "$UNVALIDATED_PATHS$COVERAGE_UNKNOWN" ]; then
+    printf 'Contract command result: %s. CI must validate the changed paths on the new head. ' "$(validation_summary)"
+  elif [ -n "$VALIDATED" ]; then
+    printf 'Contract command result: %s. ' "$VALIDATED"
+  fi
+  printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
@@ -3921,6 +4007,7 @@ fi
 # reason that says "limit:" (which limit, until when) is kept as it was.
 LIMIT_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
 CONFIGURED_MODELS="$(lane_setting MODELS)"
+PREHELD=""
 # A Go allowance hold never binds a slot on a free model (limit_group): a
 # hold written before the slot moved to one, or by an older runner, is
 # dropped. On 2026-10-23 the Beam Free slots kept a monthly hold Kimi had
@@ -3931,7 +4018,8 @@ if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_mode
   rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
   LIMIT_UNTIL=""
 fi
-if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ]; then
+if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] &&
+   [ "$LIMIT_UNTIL" -gt "$(date +%s)" ] && [ ! -f "$LIMIT_FILE" ]; then
   HELD_REASON="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
   case "$HELD_REASON" in limit:*) ;; *) HELD_REASON="provider limit reached; lane waits until $(utc "$LIMIT_UNTIL")" ;; esac
   # The provider's allowance refills while the lane sleeps, so the lane asks
@@ -3943,7 +4031,16 @@ if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt 
     NEW_UNTIL="$(sed -nE 's/.*"retry_at": *([0-9]+).*/\1/p' "$BEAT" 2>/dev/null | head -1)"
     [ -n "$NEW_UNTIL" ] && LIMIT_UNTIL="$NEW_UNTIL"
     heartbeat false "$HELD_REASON" "$LIMIT_UNTIL"
-    exit 0
+    # The cluster OpenRouter slot loses its local .limit file on pod restart,
+    # so rehydrate the shared hold and hand off any queued brief. Other lanes
+    # keep their provider-limit behavior: their queued brief stays in place.
+    if [ "$SLOT" = free-openrouter ]; then
+      LIMITED=1
+      LIMIT_WHY="${HELD_REASON#limit: }"
+      PREHELD=1
+    else
+      exit 0
+    fi
   fi
 fi
 
@@ -3965,8 +4062,14 @@ CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
-if ! lane_ready; then
-  heartbeat false "$READY_REASON"
+if [ -n "$PREHELD" ]; then
+  READY_REASON="$HELD_REASON"
+elif ! lane_ready; then
+  if [ -n "$LIMITED" ]; then
+    heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
+  else
+    heartbeat false "$READY_REASON"
+  fi
   # A limited lane, or one whose key expired, still passes over its inbox, to
   # hand every brief on.
   [ -n "$LIMITED" ] || [ -n "$AUTH_HELD" ] || exit 0
@@ -4237,6 +4340,7 @@ for BRIEF in "$INBOX"/*.md; do
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
   HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
+  UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
   FIX_UPSTREAM=""
@@ -4663,7 +4767,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "public repo leak scan could not run; nothing pushed: $LEAK_OUT" transient
       continue
     elif [ "$LEAK_RC" -ne 0 ]; then
-      park "$BRIEF" "public repo leak scan failed; nothing pushed: $LEAK_OUT"
+      park "$BRIEF" "public repo leak scan failed; nothing pushed: $(leak_hits --diff "$SCAN_RANGE")"
       continue
     fi
     printf '%s\n' "$LEAK_OUT" >> "$LOG"
@@ -4692,7 +4796,7 @@ for BRIEF in "$INBOX"/*.md; do
       printf '%s\n' "$PR_BODY" > "$BODY_FILE"
       if ! LEAK_OUT="$(leak_scan --text-file "$BODY_FILE" --allow-repo-ref "$REPO" 2>&1)"; then
         rm -f "$BODY_FILE"
-        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $LEAK_OUT"
+        park "$BRIEF" "public repo PR body leak scan failed; nothing pushed: $(leak_hits --text "PR body")"
         continue
       fi
       rm -f "$BODY_FILE"
@@ -4843,8 +4947,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
       # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
       # reader nothing; the comment says what went up and what happens next.
       PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
-      CHECKED="CI and review run again on the new head; the factory lands the pull request once they pass."
-      [ -n "$VALIDATED" ] && CHECKED="The repo's check passed at ${VALIDATED##* }. $CHECKED"
+      CHECKED="$(validation_round_note)"
       COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
 
 $(pushed_commits)

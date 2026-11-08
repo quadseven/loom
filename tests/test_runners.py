@@ -330,6 +330,24 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(len(self.gh.posts("/dispatches")), 2)
         self.assertTrue(self.beat()["available"])
 
+    def test_a_gateway_retry_after_keeps_the_runner_slot_undispatched_until_reset(self):
+        run, run_id = self.dispatched()
+        reset = int(self.now + 24 * 3600)
+        artifact = self.seal(run_id, {}, beat={
+            "lane": "opencode-go-2", "at": 1, "available": False,
+            "reason": "limit: free gateway route unavailable", "retry_at": reset,
+        })
+        self.finish(run, run_id, artifact, "failure")
+        self.runner(now=self.now + 600).tend()
+        self.assertEqual(self.beat()["retry_at"], reset)
+
+        self.drop_brief(name="owner.app-8")
+        # A one-day retry window blocks dispatch through its final second.
+        self.runner(now=reset - 1).tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 1)
+        self.runner(now=reset + 1).tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 2)
+
     # -- a repo whose base check is red on the slot's runner -------------------
     def run_base(self, name, rows, image="image-a", text=BRIEF):
         """Dispatch brief `name` and finish its run with these validation rows."""

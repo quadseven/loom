@@ -1318,9 +1318,12 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     if ticket is not None:
         issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
         reason = _ticket_refusal(issue, "pr")
-        if reason == "ticket is not loom:pr":
+        if reason.startswith("ticket is not loom:pr"):
             at = [x for x in _labels(issue) if x.startswith("loom:") and x[5:] in STATES]
-            reason = "ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+            # The same fix-round note merge raises, so status and merge speak
+            # one wording for a ticket a fix round holds (loom#2611).
+            reason = ("ticket at %s, not loom:pr" % (", ".join(at) or "no state")
+                      + _mid_round_note(at, "pr"))
         if reason:
             found.append(reason)
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
@@ -6655,8 +6658,23 @@ def _ticket_refusal(issue: Dict[str, Any], expected_state: str) -> str:
     if issue.get("state") != "open" or "loom:ticket" not in names:
         return "ticket is not an open loom:ticket"
     if "loom:" + expected_state not in names:
-        return "ticket is not loom:" + expected_state
+        return "ticket is not loom:" + expected_state + _mid_round_note(names, expected_state)
     return ""
+
+
+# The refusal for a ticket a fix round holds. A retry-branch pull request is
+# linked the same as a first attempt's (the station matches loom/<n>-...), so
+# a lane pull request whose ticket sits at loom:briefed or loom:running is
+# mid fix round, not missing a reconciliation (loom#2611).
+MID_ROUND_NOTE = (" (at %s: a fix round has a lane pushing a new head; the station moves the "
+                  "ticket back to loom:pr when that lane reports, so wait for it, do not relabel)")
+
+
+def _mid_round_note(names: List[str], expected_state: str) -> str:
+    if expected_state != "pr":
+        return ""
+    at = [x for x in ("loom:briefed", "loom:running") if x in names]
+    return MID_ROUND_NOTE % at[0] if at else ""
 
 
 def _check_fix(repo: str, pr: Dict[str, Any], ticket: Tuple[str, int],

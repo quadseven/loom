@@ -1,6 +1,7 @@
 """lanes/run_lane.sh run as a process: a temp loom home, a local bare repo as
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
+import base64
 import hashlib
 import json
 import os
@@ -374,6 +375,13 @@ if [ "${FAKE_AGENT:-commit}" = manifest ]; then
   git -c user.name=t -c user.email=t@example.invalid commit -qm "Place the thing"
   exit 0
 fi
+if [ "${FAKE_AGENT:-commit}" = source ]; then
+  mkdir -p "$(dirname "$FAKE_SOURCE_PATH")"
+  printf '%s\n' "$FAKE_SOURCE_TEXT" > "$FAKE_SOURCE_PATH"
+  git add -A
+  git -c user.name=t -c user.email=t@example.invalid commit -qm "Fix the source file"
+  exit 0
+fi
 if [ "${FAKE_AGENT:-commit}" = contract-edit ]; then
   mkdir -p .loom
   printf '%s' "$FAKE_CONTRACT_TEXT" > .loom/validation.conf
@@ -511,11 +519,18 @@ printf '%s\\n' "$val"
 FAKE_CURL = """#!/usr/bin/env bash
 printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
 n="$(grep -c '^curl ' "$FAKE_LOG")"
+header_dump=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -D ] && [ "$#" -gt 1 ]; then header_dump="$2"; shift 2; else shift; fi
+done
 set -- ${FAKE_CURL:-200}
 [ "$n" -le "$#" ] || n="$#"
 answer="${!n}"
 if [ "$answer" = refused ]; then printf '000'; exit 7; fi
 if [ "$answer" = timeout ]; then printf '000'; exit 28; fi
+if [ "$header_dump" = - ] && [ -n "${FAKE_CURL_RETRY_AFTER:-}" ]; then
+  printf 'HTTP/1.1 %s Fake\\r\\nRetry-After: %s\\r\\n\\r\\n' "$answer" "$FAKE_CURL_RETRY_AFTER"
+fi
 printf '%s' "$answer"
 """
 
@@ -1113,6 +1128,39 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertNotIn("loom/T042-fix-the-thing", heads)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    def failed_line(self, name="T042-fix-the-thing.log"):
+        """The one `failed:` line the station reads from a lane log."""
+        failed = [line for line in self.run_log(name).splitlines() if " failed: [" in line]
+        self.assertEqual(len(failed), 1, failed)
+        return failed[0]
+
+    def test_a_public_leak_refusal_parks_naming_each_hit_by_rule_and_line(self):
+        # The reason held only the counts of rules the scanner loaded, so the
+        # next lane could not tell what to remove and repeated the refusal
+        # (loom#2804).
+        self.drop_brief()
+        self.run_lane(FAKE_AGENT="private-ip")
+        failed = self.failed_line()
+        self.assertTrue(failed.endswith(
+            "public repo leak scan failed; nothing pushed: 1 hit: [rfc1918-ip] fix.txt:2"), failed)
+        self.assertNotIn("BLOCKED", failed)
+        self.assertNotIn(base64.b64decode("MTAuMjMuNC41").decode(), failed)
+        # The scanner's whole output still goes to the lane log.
+        self.assertIn("BLOCKED: private identifier found", self.run_log())
+
+    def test_a_public_pr_body_leak_refusal_names_the_rule_and_line_only(self):
+        address = ".".join(["10", "23", "4", "5"])
+        self.drop_brief(text=BRIEF.replace(
+            "The thing is broken for every user.",
+            "The thing is broken for every user at %s." % address))
+        self.run_lane()
+        failed = self.failed_line()
+        self.assertRegex(failed, r"public repo PR body leak scan failed; nothing pushed: "
+                                 r"1 hit: \[rfc1918-ip\] PR body line \d+$")
+        self.assertNotIn(address, failed)
+        self.assertNotIn("leak-body", failed)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_a_diff_citing_its_own_repos_issues_pushes(self):
         # A lane change citing its own ticket (NAME#N in code or a test) was
@@ -5209,6 +5257,53 @@ fi
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_retry_after_sets_the_cluster_slot_hold(self):
+        inbox, result = self.api_lane(
+            "free-openrouter", FAKE_CURL="503", FAKE_CURL_RETRY_AFTER="43200",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 43200, delta=2)
+        limit = (self.loom / "state" / "usage" / "free-openrouter.limit").read_text().split()
+        self.assertEqual(int(limit[0]), beat["retry_at"])
+        probes = sum(c.startswith("curl ") for c in self.calls())
+        (inbox / "T043-next.md").write_text(BRIEF.replace("Lane: codex", "Lane: free-openrouter"))
+        # A fresh cluster pod has the shared heartbeat but not this local marker.
+        (self.loom / "state" / "usage" / "free-openrouter.limit").unlink()
+        self.run_lane("free-openrouter", LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid",
+                      FAKE_CURL="200")
+        self.assertEqual(sum(c.startswith("curl ") for c in self.calls()), probes)
+        self.assertTrue((inbox / "failed" / "T043-next.md").exists())
+        held = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(held["available"])
+        self.assertEqual(held["retry_at"], beat["retry_at"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_503_without_retry_after_uses_the_fallback(self):
+        _, result = self.api_lane(
+            "free-openrouter", FAKE_CURL="503",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 900, delta=2)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_free_gateway_retry_after_is_capped_at_one_day(self):
+        _, result = self.api_lane(
+            "free-openrouter",
+            FAKE_CURL="503",
+            FAKE_CURL_RETRY_AFTER="9999999999999999999999999999",
+            LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = json.loads((self.loom / "state" / "usage" / "free-openrouter.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertAlmostEqual(beat["retry_at"] - beat["at"], 86400, delta=2)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_run_cut_off_by_a_503_is_a_limit_not_a_failure(self):
         inbox, result = self.api_lane("spark", extra="AGENT_FAIL=1\n", FAKE_CURL="200 503", **self.SPARK)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -7334,6 +7429,48 @@ exec /usr/bin/git "$@"
         self.assertEqual([(r["phase"], r["ok"]) for r in records][-2:],
                          [("final", True), ("affected", True)])
         self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_kotlin_only_round_is_not_called_validated_by_python_and_go_commands(self):
+        # Python and Go checks do not validate a Kotlin-only changed path.
+        contract = ("interpreter: python3\nsubmodules: yes\n"
+                    "setup: python3 -c 'open(\".prepared\", \"w\").write(\"ok\")'\n"
+                    "check: test -f .prepared && python3 check.py && go vet ./...\n")
+        self.contract_repo(contract=contract)
+        self.write_tool(self.bin / "go", "#!/bin/sh\nexit 0\n")
+        name, before = self.fix_brief()
+        brief = self.inbox / (name + ".md")
+        brief.write_text(brief.read_text() + "\nChange companion-android/src/main/kotlin/Main.kt.\n")
+        result = self.run_contract_lane(FAKE_GH_EXISTING="7", FAKE_AGENT="source",
+                                        FAKE_SOURCE_PATH="companion-android/src/main/kotlin/Main.kt",
+                                        FAKE_SOURCE_TEXT="package example")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.remote_head(self.FIX_BRANCH), before)
+        changed = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "diff", "--name-only", "main", self.FIX_BRANCH],
+            capture_output=True, text=True, check=True).stdout.splitlines()
+        self.assertIn("companion-android/src/main/kotlin/Main.kt", changed)
+        comments = Path(str(self.log) + ".comments")
+        note = next(body for body in comments.iterdir()
+                    if body.is_file() and not body.name.endswith(".on")).read_text()
+        self.assertIn("not validated", note.lower())
+        self.assertIn("companion-android/src/main/kotlin/Main.kt", note)
+        self.assertIn("CI", note)
+        self.assertNotIn("repo's check passed", note)
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_python_source_pr_keeps_execution_evidence_but_reports_unknown_coverage(self):
+        self.contract_repo(CONTRACT + "affected: true\n")
+        self.drop_brief(text=BRIEF + "\nChange service/main.py.\n")
+        result = self.run_contract_lane(FAKE_AGENT="source", FAKE_SOURCE_PATH="service/main.py",
+                                        FAKE_SOURCE_TEXT="value = 1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = self.body.read_text()
+        self.assertIn("Validation: check exited 0", body)
+        self.assertIn("affected check exited 0", body)
+        self.assertIn("not validated: contract path coverage unknown for `service/main.py`", body)
+        self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-2:],
+                         [("final", True), ("affected", True)])
 
     def contract_edit_lane(self, text):
         self.contract_repo()

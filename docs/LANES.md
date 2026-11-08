@@ -53,7 +53,12 @@ and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
 script's path when using another checkout. A scanner that is still missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
-another reason parks the brief `[transient]`. A lane pod or cluster runner
+another reason parks the brief `[transient]`. A hit parks the brief with
+one line naming each hit's rule class and place, up to five (for example
+`[deny-list] docs/LANDING.md:12`, or `PR body line 4`), never the matched
+text, and never the name of a file whose name itself hit
+(`bus/leak_hits.py`); the scanner's full output goes to the lane log only.
+A lane pod or cluster runner
 (`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
@@ -93,6 +98,20 @@ parks the brief as `validation failed: the affected check exited N` and
 pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
+
+A successful contract command proves its exit status, not coverage of the
+changed paths. The contract has no path-to-check mapping. PR bodies and
+fix-round comments therefore keep the command result (including retries,
+host-red exceptions and `affected:` results) but also say `not validated:
+contract path coverage unknown` and name the changed paths. This applies to
+Python-only changes too: a Python command may check another directory. An
+arbitrary `affected:` hook, a language launcher or a filename mentioned in a
+command does not prove coverage. Documentation and configuration changes are
+not silently exempted. The path excerpt uses literal code spans, escapes
+control characters and backticks, and caps its size with an omitted count.
+If the diff cannot be read, coverage remains unknown.
+This is reporting only: existing check failures still block pushing, and the
+factory still waits for CI and review on the new head before landing it.
 
 After the repo check passes, the runner also checks each changed Python test
 against the exact base commit's code in the check sandbox. It copies each
@@ -1907,8 +1926,11 @@ separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
 `free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
-holds only that slot for 15 minutes as a limit, so the station can assign the
-ticket elsewhere without counting it as a work failure. Ollama and Gemma
+holds only that slot as a limit, using the gateway's numeric `Retry-After`
+(capped at one day); when that header is absent or invalid, the slot uses its
+15-minute fallback. The heartbeat preserves that reset across passes, so the
+station avoids dispatching while the route remains held and assigns any
+already-queued ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
 
@@ -1941,7 +1963,8 @@ unchanged for a run that did not end on a described step.
   answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
   first, and asks again after a run that failed. A refused connection or a
   503 is a limit, not a failure: the heartbeat says unavailable, with a
-  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  reason starting `limit:`, for 15 minutes by default or for the gateway's
+  `Retry-After` on a 503; every brief in the inbox is
   parked with that reason; the station puts its ticket back to briefed (a
   fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
   limited lane to the next rung of the model ladder at once. Any other
