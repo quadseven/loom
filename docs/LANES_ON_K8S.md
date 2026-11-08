@@ -131,13 +131,39 @@ through `TRACKED_SLOTS`, which needs no plist change.
 
 - Public repos only: a run's inputs and logs live in this repository's
   Actions. 8 of the 19 registered repos are private; their tickets stay on
-  the Mac until #2793 decides a path.
+  the Mac under the decision below.
 - Network egress is default-deny with TCP 443 to public addresses, which
   covers every provider; no new network rule is needed.
 - A green Actions run says only that an agent started; the proof of a lane
   is the pull request or diff it produced.
 - A Mac lane goes only after its slot produced a pull request someone read
   (#2794).
+
+## Decision: private repositories stay on the Mac
+
+Keep private-repository tickets on the Mac lanes. Cap them at three concurrent
+heavy tickets across all private repositories. The cap is for private-repository
+work only; other Mac lanes retain their existing capacity and scheduling.
+
+Do not create a private lane-workflow repository or a second runner scale set
+for this path. Cluster jobs continue to use the public `quadseven/loom`
+repository's `lane` workflow. Its AWS OIDC trust is anchored to that
+repository's numeric `repository_id`, the `main` ref, and
+`.github/workflows/lane.yml`; a private workflow repository would need its own
+numeric repository ID and an equivalent `main` plus workflow-file restriction.
+No such trust is being created under this decision.
+
+The current workflow's dispatch inputs, run metadata and Actions logs are
+publicly exposed through the public repository. Encrypting the sealed report
+protects its contents, but does not make the workflow inputs or logs private.
+A private lane-workflow repository would keep those workflow records within
+that private repository's access boundary, while its authorized readers and
+runner operators could still access them. Keeping private-repository work on
+the Mac avoids placing its inputs and logs in public Actions. It also means
+that private work continues to consume Mac capacity, bounded by the cap above.
+
+This is the decision record and proof for the Mac-cap path; no build tickets
+are needed for that path.
 
 ## Slices
 
