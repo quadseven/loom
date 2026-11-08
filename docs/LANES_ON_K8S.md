@@ -123,7 +123,7 @@ through `TRACKED_SLOTS`, which needs no plist change.
 
 - Public repos only: a run's inputs and logs live in this repository's
   Actions. 8 of the 19 registered repos are private; their tickets stay on
-  the Mac until #2793 decides a path.
+  the Mac with a cap of 3 concurrent private tickets (decision 0004).
 - Network egress is default-deny with TCP 443 to public addresses, which
   covers every provider; no new network rule is needed.
 - A green Actions run says only that an agent started; the proof of a lane
@@ -138,7 +138,7 @@ through `TRACKED_SLOTS`, which needs no plist change.
 3. #2784 Codex broker, then #2785 the Luna slots.
 4. #2786 claude, #2787 anthropic, #2788 opencode-go, #2789 zai and zen,
    #2790 Workers AI, #2791 copilot.
-5. #2792 agy and #2793 private repos decisions, then #2794 retiring Mac lanes.
+5. #2792 agy, #2793 decided in 0004, then #2794 retiring Mac lanes.
 
 The paired infrastructure work (pool placement and sizing, runner image with
 the three CLIs, the role's exact parameter list, the broker) is tracked in the
