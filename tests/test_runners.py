@@ -123,14 +123,37 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude-9 zen, free-kilo"}),
-                         ["zen", "free-kilo", "free-openrouter"])
+                         ["zen", "free-kilo", "free-openrouter", "anthropic-2", "anthropic-3",
+                          "anthropic-4", "anthropic-5", "anthropic-6", "anthropic-7",
+                          "anthropic-8"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter"])
+                         ["free-gemma", "free-openrouter", "anthropic-2", "anthropic-3",
+                          "anthropic-4", "anthropic-5", "anthropic-6", "anthropic-7",
+                          "anthropic-8"])
+
+    def test_an_anthropic_runner_report_records_its_sealed_spend_line(self):
+        slot = "anthropic-2"
+        runner = runners.Runners(self.gh, str(self.home), REPO, [slot],
+                                 {**self.env, "LOOM_RUNNER_SLOTS": slot},
+                                 lambda repo: self.public.get(repo, False), self.said.append,
+                                 actor=APP, now=self.now, fetch=self.fetch)
+        run_id = "a" * 32
+        mac_key = "b" * 64
+        self.mac_key = mac_key
+        runner.public_key()
+        artifact = self.seal(run_id, {
+            "state/usage/spend.jsonl": json.dumps({"slot": slot, "ticket": TICKET,
+                                                   "cost_usd": 0.4321}) + "\n",
+        }, slot=slot)
+        files = runner.open_report(artifact, run_id, mac_key)
+        self.assertEqual(runner.apply(slot, TICKET, files), None)
+        lines = (self.home / "state" / "usage" / "spend.jsonl").read_text().splitlines()
+        self.assertEqual(json.loads(lines[0])["cost_usd"], 0.4321)
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",
@@ -254,7 +277,8 @@ class RunnersTest(unittest.TestCase):
         self.mac_key = inputs["report_mac_key"]
         return self.gh.next_run, inputs["run_id"]
 
-    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET):
+    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET,
+             slot="opencode-go-2"):
         """A report artifact as the lane job seals it: `files` written under a
         job's loom home, then lane_job.py report."""
         job = load_job()
@@ -266,8 +290,8 @@ class RunnersTest(unittest.TestCase):
             (home / rel).write_text(text)
         if beat is not None:
             (home / "state" / "usage").mkdir(parents=True, exist_ok=True)
-            (home / "state" / "usage" / "opencode-go-2.json").write_text(json.dumps(beat))
-        (jobdir / "inputs.json").write_text(json.dumps({"slot": "opencode-go-2", "ticket": ticket,
+            (home / "state" / "usage" / (slot + ".json")).write_text(json.dumps(beat))
+        (jobdir / "inputs.json").write_text(json.dumps({"slot": slot, "ticket": ticket,
                                                         "run_id": run_id}))
         key = self.home / "state" / "runners" / "report-key.pem.pub"
         shutil.copy(key, jobdir / "report-key.pem")

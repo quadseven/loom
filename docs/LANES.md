@@ -2180,7 +2180,7 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
 tree, cache or session database stays anywhere. API lanes only: opencode-go,
 zen, openrouter, zai, workersai, the free provider slots and spark (both
-through the gateway). codex, claude, agy and anthropic stay local.
+through the gateway), and anthropic (API credits). codex, claude and agy stay local.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125

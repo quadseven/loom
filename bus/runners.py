@@ -34,8 +34,8 @@ Rules:
   slot, the slot takes no more of that repo: its briefs park [transient] so
   another lane takes them, until the repo's head or the runner image changes.
 
-Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
-stay on this machine. docs/LANES.md, "Lanes on cluster runners".
+Only API lanes run there (RUNNER_LANES); codex, claude and agy stay on this
+machine. docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
 
@@ -71,12 +71,16 @@ REF = "main"
 INPUT_LIMIT = 65535
 # Provider lanes a runner may run: API lanes whose key the workflow's role
 # can read, and the gateway-served spark and free lanes.
-RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark",
+                "anthropic")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {
+    "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    **{"anthropic-%d" % n: {} for n in range(2, 9)},
+}
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -130,7 +134,8 @@ LANES_APP = {"LOOM_LANES_GITHUB_APP_ID": "LOOM_GITHUB_APP_ID",
              "LOOM_LANES_GITHUB_APP_INSTALLATION_ID": "LOOM_GITHUB_APP_INSTALLATION_ID",
              "LOOM_LANES_GITHUB_APP_KEY_SSM": "LOOM_GITHUB_APP_KEY_SSM"}
 # Heartbeat side files a report may carry for its slot.
-USAGE_SUFFIXES = (".json", ".models", ".limit", ".provider-limit.json", ".meter.json")
+USAGE_SUFFIXES = (".json", ".models", ".limit", ".provider-limit.json", ".meter.json",
+                  "spend.jsonl")
 
 
 class ReportError(Exception):
@@ -822,7 +827,7 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
-            return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
+            return parts[2] == "spend.jsonl" or parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
         return False
 
     def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:
@@ -847,7 +852,7 @@ class Runners:
         for rel, data in sorted(files.items()):
             if rel.startswith("briefs/%s/" % slot) and "/answers/" not in rel:
                 continue   # the brief moves below; the local copy is the one sent
-            if rel.startswith("state/usage/"):
+            if rel.startswith("state/usage/") and not rel.endswith("/spend.jsonl"):
                 continue   # the station writes the slot's heartbeat itself (_beat)
             _write(os.path.join(self.home, *rel.split("/")), data)
         if kinds:
@@ -928,7 +933,8 @@ def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
             "logs/%s/%s.*" % (slot, ticket)) + tuple(
-                "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+                "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES) + (
+                    "state/usage/spend.jsonl",)
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never
