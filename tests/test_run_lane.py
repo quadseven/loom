@@ -5215,6 +5215,17 @@ fi
                          {"context": 120000, "output": 16384})
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_zai_cluster_lane_uses_its_gateway_without_a_key(self):
+        _, result = self.api_lane("zai", LOOM_FREE_GATEWAY_URL="http://gateway.example.invalid",
+                                  LOOM_ZAI_MODEL="zai/glm-4.7-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any("ZHIPU_API_KEY" in call for call in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["zai"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/zai/v1"})
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_spark_window_that_is_not_a_number_falls_back_to_the_defaults(self):
         _, result = self.api_lane("spark", LOOM_SPARK_CONTEXT='1", "x": "', LOOM_SPARK_OUTPUT="lots",
                                   **self.SPARK)
@@ -8373,6 +8384,14 @@ exec /usr/bin/git "$@"
         out = subprocess.run(["bash", "-c", script, "_", str(RUNNER)],
                              capture_output=True, text=True, check=True).stdout
         self.assertEqual(out, "http://gw:8080/free-public/openrouter/v1")
+
+    def test_zai_lane_reaches_its_gateway_route_with_no_key(self):
+        script = ('LOOM_FREE_GATEWAY_URL=http://gateway.example.invalid SLOT=zai LANE=zai; '
+                  'eval "$(sed -n "/^setting_var()/,/^}/p" "$1")"; '
+                  'lane_setting URL')
+        out = subprocess.run(["bash", "-c", script, "_", str(RUNNER)],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "http://gateway.example.invalid/zai/v1")
 
     def red_base_contract(self, check):
         return "interpreter: loom-test-python\nsubmodules: yes\ncheck: %s\n" % check

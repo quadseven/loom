@@ -496,6 +496,10 @@ opencode_config() {
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  if [ "$LANE" = zai ]; then
+    v="$(lane_setting URL)"
+    [ -z "$v" ] || provider=", \"provider\": {\"zai\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Z.ai gateway\", \"options\": {\"baseURL\": \"$v\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}}"
+  fi
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }

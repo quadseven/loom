@@ -78,6 +78,8 @@ RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "w
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
 TRACKED_SLOTS = {
     "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "zai": {"LOOM_ZAI_MODEL": "zai/glm-4.7-flash"},
+    "zen": {"LOOM_ZEN_MODEL": "opencode/minimax-m3.1-flash-free"},
     "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
     "opencode-go-1": {"LOOM_OPENCODE_GO_1_MODEL": "opencode-go/mimo-v2.6-flash"},
     "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
@@ -216,6 +218,8 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
         if name.startswith("LOOM_GITHUB_APP_"):
             continue
         name = LANES_APP.get(name, name)
+        if slot in ("zai", "zen") and name.endswith("_KEY_SSM"):
+            continue
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
             out[name] = str(value)
     return dict(sorted(out.items()))
@@ -1002,6 +1006,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
     for slot in runner_slots(env):
         for name, value in env.items():
             if (setting_allowed(slot, name) and not name.startswith("LOOM_GITHUB_APP_")
+                    and not (slot in ("zai", "zen") and name.endswith("_KEY_SSM"))
                     and name not in STATION_OWN and not name.endswith(("_MODEL", "_MODELS"))
                     and value and VALUE_RE.fullmatch(value)):
                 out[name] = value

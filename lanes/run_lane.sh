@@ -397,6 +397,9 @@ lane_setting() {
     esac
     value="${LOOM_FREE_GATEWAY_URL%/}$route"
   fi
+  if [ -z "$value" ] && [ "$LANE" = zai ] && [ "$1" = URL ] && [ -n "${LOOM_FREE_GATEWAY_URL:-}" ]; then
+    value="${LOOM_FREE_GATEWAY_URL%/}/zai/v1"
+  fi
   printf '%s' "$value"
 }
 
@@ -3876,7 +3879,13 @@ Do not search the whole filesystem (for example, find /). Search within the chec
     zen) opencode_agent_continuing - text "$brief_text" ;;
     spark) opencode_agent_continuing - raw "$brief_text" ;;
     free) opencode_agent_continuing - text "$brief_text" ;;
-    zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
+    zai)
+      if [ -n "$(lane_setting URL)" ]; then
+        opencode_agent_continuing - text "$brief_text"
+      else
+        opencode_agent_continuing ZHIPU_API_KEY text "$brief_text"
+      fi
+      ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
@@ -3989,7 +3998,11 @@ lane_ready() {
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   sandbox_ready || { READY_REASON="$SANDBOX_WHY"; return 1; }
-  case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
+  case "$LANE" in
+    zen) return 0 ;;
+    zai) [ -n "$(lane_setting URL)" ] && return 0 ;;
+    spark|free) spark_ready; return ;;
+  esac
   key_ssm="$(lane_setting KEY_SSM)"
   [ -n "$key_ssm" ] || { READY_REASON="$(lane_var KEY_SSM) is not set"; return 1; }
   API_KEY="$(ssm_value "$key_ssm")"

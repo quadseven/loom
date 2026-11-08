@@ -138,7 +138,7 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
+                         ["claude", "zen", "free-kilo", "free-openrouter", "zai", "workersai",
                           "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
@@ -146,7 +146,7 @@ class RunnersTest(unittest.TestCase):
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                         ["free-gemma", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
@@ -157,6 +157,15 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(settings["LOOM_WORKERSAI_MODEL"],
                          "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b")
         self.assertEqual(settings["LOOM_WORKERSAI_ACCOUNT_SSM"], "/workersai/account")
+
+    def test_zai_and_zen_are_tracked_slots_and_zai_has_no_key_setting(self):
+        self.assertIn("zai", runners.runner_slots({"LOOM_RUNNER_SLOTS": "claude"}))
+        self.assertIn("zen", runners.runner_slots({"LOOM_RUNNER_SLOTS": "claude"}))
+        settings = runners.lane_settings("zai", {"LOOM_ZAI_KEY_SSM": "/zai/key"})
+        self.assertFalse([name for name in settings if name.endswith("_KEY_SSM")])
+        self.assertEqual(settings["LOOM_ZAI_MODEL"], "zai/glm-4.7-flash")
+        self.assertEqual(runners.lane_settings("zen", {})["LOOM_ZEN_MODEL"],
+                         "opencode/minimax-m3.1-flash-free")
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",
