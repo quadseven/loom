@@ -3354,69 +3354,109 @@ class Factory:
         conflict round once per head after 24 hours. Explicit claims,
         brain holds and running tickets always keep their work."""
         labels = _labels(issue)
-        if (any(label.startswith("claim:") for label in labels)
-                or "needs-brain" in labels or "loom:running" in labels):
+        if self._conflict_hygiene_held(labels):
             return
         handoff = HANDOFF_LABEL in labels
-        if handoff:
-            events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, issue["number"]))
-            added = max((_ts(event.get("created_at")) for event in events
-                         if isinstance(event, dict) and event.get("event") == "labeled"
-                         and (event.get("label") or {}).get("name") == HANDOFF_LABEL), default=0)
-            if not added or self.now - added <= 6 * 3600:
-                return
+        if handoff and not self._handoff_is_aged(repo, issue):
+            return
         comments = self._comments(repo, int(issue["number"]))
-        rounds = [comment for comment in comments
-                  if self._conflict_round_open([comment], repo, number, sha)]
-        retry_marker = "<!-- loom:conflict-retry pr=%d sha=%s -->" % (number, sha)
-        retried = any(retry_marker in str(comment.get("body") or "") for comment in comments)
+        retry_marker, retried, has_round, stale = self._conflict_round_state(
+            comments, repo, number, sha)
         if retried:
             self._conflict_incident(repo, number, issue, sha)
             return
+        if (has_round and not stale
+                or not handoff and not stale and _state(issue) != "pr"):
+            return
+        self._dispatch_conflict_recovery(repo, number, issue, labels, handoff,
+                                         stale, retry_marker)
+
+    @staticmethod
+    def _conflict_hygiene_held(labels: Sequence[str]) -> bool:
+        """Whether a claim, brain hold or live lane owns this ticket."""
+        return (any(label.startswith("claim:") for label in labels)
+                or "needs-brain" in labels or "loom:running" in labels)
+
+    def _handoff_is_aged(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Only recover a hand-off whose trusted label age exceeds six hours."""
+        events = self.gh.paginate("/repos/%s/issues/%d/events" % (repo, issue["number"]))
+        added = max((_ts(event.get("created_at")) for event in events
+                     if isinstance(event, dict) and event.get("event") == "labeled"
+                     and (event.get("label") or {}).get("name") == HANDOFF_LABEL), default=0)
+        return bool(added) and self.now - added > 6 * 3600
+
+    def _conflict_round_state(self, comments: Sequence[Dict[str, Any]], repo: str,
+                              number: int, sha: str) -> Tuple[str, bool, bool, bool]:
+        """Return retry marker, already-retried, open-round, and stale state."""
+        marker = "<!-- loom:conflict-retry pr=%d sha=%s -->" % (number, sha)
+        retried = any(marker in str(comment.get("body") or "") for comment in comments)
+        rounds = [comment for comment in comments
+                  if self._conflict_round_open([comment], repo, number, sha)]
         stale = bool(rounds) and all(_ts(comment.get("created_at")) > 0
-                                    and self.now - _ts(comment.get("created_at")) > 24 * 3600
-                                    for comment in rounds)
-        if rounds and not stale:
+                                     and self.now - _ts(comment.get("created_at")) > 24 * 3600
+                                     for comment in rounds)
+        return marker, retried, bool(rounds), stale
+
+    def _dispatch_conflict_recovery(self, repo: str, number: int, issue: Dict[str, Any],
+                                    labels: Sequence[str], handoff: bool, stale: bool,
+                                    retry_marker: str) -> None:
+        """Stage the ticket, dispatch one fix round, and restore refused moves."""
+        original_body = self._prepare_conflict_ticket(repo, issue, labels, handoff, stale)
+        if original_body is None:
             return
-        if not handoff and not stale and _state(issue) != "pr":
-            return
-        original_body = str(issue.get("body") or "")
-        if handoff or stale:
-            lane, _ = self._tier_move(repo, issue, old=_lane(issue) if stale else "",
-                                      allow_remote=False)
-            if lane is None:
-                return
-            kept = [label for label in labels
-                    if label != HANDOFF_LABEL and not label.startswith("lane:")
-                    and label not in ("loom:queued", "loom:briefed", "loom:failed", "loom:pr")]
-            # Remove a previous lane's model override before offering the new lane.
-            body = without_model(original_body)
-            if body != original_body:
-                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
-                             {"body": body})
-                issue["body"] = body
-            self._relabel(repo, issue, kept + ["loom:pr", "lane:" + lane])
         notes = HYGIENE_CONFLICT_NOTES
         if stale:
             notes += "\n\n" + retry_marker + "\nRetry the unchanged conflict once on a free lane."
         try:
             sent = self._open_round(repo, number, issue, notes)
         except Exception:
-            if handoff or stale:
-                if str(issue.get("body") or "") != original_body:
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
-                                 {"body": original_body})
-                    issue["body"] = original_body
-                self._relabel(repo, issue, labels)
+            self._restore_conflict_ticket(repo, issue, labels, original_body,
+                                          handoff or stale)
             raise
         if sent is False:
-            if handoff or stale:
-                if str(issue.get("body") or "") != original_body:
-                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
-                                 {"body": original_body})
-                    issue["body"] = original_body
-                self._relabel(repo, issue, labels)
+            self._restore_conflict_ticket(repo, issue, labels, original_body,
+                                          handoff or stale)
             return
+        self._record_conflict_recovery(repo, number, issue, handoff, stale, retry_marker)
+
+    def _prepare_conflict_ticket(self, repo: str, issue: Dict[str, Any],
+                                 labels: Sequence[str], handoff: bool,
+                                 stale: bool) -> Optional[str]:
+        """Move an aged ticket to a free lane and clear its prior model pin."""
+        original_body = str(issue.get("body") or "")
+        if not handoff and not stale:
+            return original_body
+        lane, _ = self._tier_move(repo, issue, old=_lane(issue) if stale else "",
+                                  allow_remote=False)
+        if lane is None:
+            return None
+        kept = [label for label in labels
+                if label != HANDOFF_LABEL and not label.startswith("lane:")
+                and label not in ("loom:queued", "loom:briefed", "loom:failed", "loom:pr")]
+        body = without_model(original_body)
+        if body != original_body:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
+                         {"body": body})
+            issue["body"] = body
+        self._relabel(repo, issue, kept + ["loom:pr", "lane:" + lane])
+        return original_body
+
+    def _restore_conflict_ticket(self, repo: str, issue: Dict[str, Any],
+                                 labels: Sequence[str], original_body: str,
+                                 moved: bool) -> None:
+        """Undo a staged lane move if the fix brief refuses or raises."""
+        if not moved:
+            return
+        if str(issue.get("body") or "") != original_body:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, issue["number"]),
+                         {"body": original_body})
+            issue["body"] = original_body
+        self._relabel(repo, issue, labels)
+
+    def _record_conflict_recovery(self, repo: str, number: int,
+                                  issue: Dict[str, Any], handoff: bool, stale: bool,
+                                  retry_marker: str) -> None:
+        """Record the successful retry or hand-off recovery once."""
         if stale:
             self._status_note(repo, int(issue["number"]),
                               retry_marker + " Conflict round exceeded 24 hours without a new head; re-sent once.")
