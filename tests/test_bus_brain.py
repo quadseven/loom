@@ -1020,6 +1020,17 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertLess(puts[0], polled[0])
         self.assertLess(polled[0], deleted[0])
 
+    def test_merge_refuses_an_open_stacked_base_with_the_status_blocker(self):
+        pr, _ = self._merge_replies({"pr": {
+            "body": self._criteria_pr("built"),
+            "base": {"ref": "feature/base", "repo": {
+                "default_branch": "main", "full_name": REPO}}}})
+        base = {"number": 7, "state": "open", "head": {"ref": "feature/base"}}
+        fake = Fake(pr, reply(200, [base]))
+        with self.assertRaisesRegex(ValueError, "blocked: stacked on #7"):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+        self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
+
     def test_merge_refuses_a_behind_pull_request_whose_hunks_overlap_its_base(self):
         # loom#2622: bus.brain merge applies the same hunk-overlap test as
         # the factory before its merge call.
@@ -3510,9 +3521,30 @@ class StatusMergeRefusalTests(unittest.TestCase):
     PR = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": "h"},
           "labels": [{"name": "class:logic"}]}
 
+    def test_stacked_base_is_named_and_default_branch_is_unaffected(self):
+        base = {"number": 8, "title": "Base", "state": "open",
+                "head": {"ref": "feature/base"}}
+        gh = GitHub("t", transport=Routed({
+            ("GET", "/pulls"): reply(200, [base]),
+        }))
+        stacked = {"number": 9, "base": {"ref": "feature/base"}}
+        main = {"number": 10, "base": {"ref": "main"}}
+        self.assertEqual(brain._stacked_base_blocker(gh, REPO, stacked, "main"),
+                         "stacked on #8")
+        self.assertEqual(brain._stacked_base_blocker(gh, REPO, main, "main"), "")
+
+    def test_an_open_base_declared_in_the_pull_request_body_blocks_main_base(self):
+        gh = GitHub("t", transport=Routed({
+            ("GET", "/pulls/8"): reply(200, {"state": "open"}),
+        }))
+        declared = {"number": 9, "base": {"ref": "main"},
+                    "body": "Stacked on pull request #8 after this is complete."}
+        self.assertEqual(brain._stacked_base_blocker(gh, REPO, declared, "main"),
+                         "stacked on #8")
+
     def lines(self, state="pr", mergeable=True, mergeable_state="clean",
               files=("bus/a.py", "tests/test_a.py"), env=None,
-              search_count=0):
+              search_count=0, base_ref="main"):
         issue = {"number": 7, "state": "open", "body": "",
                  "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state}]}
         routes = {
@@ -3520,11 +3552,15 @@ class StatusMergeRefusalTests(unittest.TestCase):
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": mergeable,
                                              "mergeable_state": mergeable_state}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": f, "patch": "+x"} for f in files]),
+            ("GET", "/pulls"): reply(200, [{"number": 8, "head": {"ref": base_ref}}]
+                                          if base_ref != "main" else []),
             ("GET", "/search/issues"): reply(200, {"total_count": search_count}),
         }
         gh = GitHub("t", transport=Routed(routes))
         with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
-            return brain._pull_request_lines(gh, REPO, [self.PR], {"prs": {9: ready_node()}},
+            pr = dict(self.PR, base={"ref": base_ref})
+            return brain._pull_request_lines(gh, REPO, [pr], {"trunk": "main",
+                                             "prs": {9: ready_node()}},
                                              "grug-tribe")
 
     def test_a_ticket_not_at_pr_blocks(self):
@@ -3547,6 +3583,10 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def test_a_pull_request_merge_would_take_is_ready(self):
         self.assertEqual(self.lines()[1], "- #9 Work - READY")
+
+    def test_a_stacked_pull_request_names_its_open_base_and_is_blocked(self):
+        self.assertEqual(self.lines(base_ref="feature/base")[1],
+                         "- #9 Work - blocked: stacked on #8")
 
     def test_a_pull_request_at_the_hourly_cap_blocks(self):
         env = {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code",

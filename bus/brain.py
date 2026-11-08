@@ -1147,6 +1147,10 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _status_pr_line(gh, repo, pr, node, bot, check)
     ticket = _safe_ticket_association(repo, pr)
     line = _docs_criterion_override(gh, repo, ticket, line)
+    stacked = _stacked_base_blocker(gh, repo, pr,
+                                    str(data.get("trunk") or ""))
+    if stacked:
+        line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
         for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
             line = _add_blocker(line, blocker)
@@ -1275,6 +1279,35 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         found.append("held by the hourly merge cap: %s" % refusal)
     return list(merge_verdict.decide(pr, issue, found,
                                      ("operator",) if found else ()).blockers)
+
+
+def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
+                          default_branch: str) -> str:
+    """Name an open stacked base pull request or its non-default branch."""
+    declared = re.search(r"\bstacked\s+on\s+(?:pull\s+request\s+)?#?(\d+)\b",
+                         str(pr.get("body") or ""), re.I)
+    if declared:
+        number = int(declared.group(1))
+        try:
+            base_pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        except GitHubError:
+            return "stacked on #%d (base pull request unreadable)" % number
+        if base_pr.get("state") == "open":
+            return "stacked on #%d" % number
+    base = str((pr.get("base") or {}).get("ref") or "")
+    if not base or not default_branch or base == default_branch:
+        return ""
+    owner = repo.partition("/")[0]
+    path = "/repos/%s/pulls?state=open&head=%s:%s" % (
+        repo, owner, quote(base, safe=""))
+    try:
+        matches = gh.paginate(path)
+    except GitHubError:
+        return "stacked on branch %s (base pull request unreadable)" % base
+    number = next((item.get("number") for item in matches
+                   if item.get("number") != pr.get("number")
+                   and str((item.get("head") or {}).get("ref") or "") == base), None)
+    return "stacked on #%s" % number if number is not None else "stacked on branch %s" % base
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -4919,6 +4952,11 @@ def merge(gh: GitHub, repo: str, number: int,
     if adopt and ticket is not None:
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    base_repo = (pr.get("base") or {}).get("repo") or {}
+    stacked = _stacked_base_blocker(gh, repo, pr,
+                                    str(base_repo.get("default_branch") or ""))
+    if stacked:
+        raise ValueError("blocked: " + stacked)
     details = _pr_graphql(gh, repo, number)
     tier = ""
     cancellation: Optional[str] = None
