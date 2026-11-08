@@ -45,7 +45,7 @@ def _node():
                                               "statusCheckRollup": {"state": "SUCCESS"}}}]},
             "reviews": {"nodes": [{"author": GRUG, "state": "APPROVED",
                                    "submittedAt": "2030-01-01T13:00:00Z"}]},
-            "reviewThreads": {"nodes": []}}
+            "reviewThreads": {"totalCount": 0, "nodes": []}}
 
 
 class PathFake:

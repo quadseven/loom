@@ -75,7 +75,7 @@ def _node() -> dict:
                                               "statusCheckRollup": {"state": "SUCCESS"}}}]},
             "reviews": {"nodes": [{"author": GRUG, "state": "APPROVED",
                                    "submittedAt": "2030-01-01T11:00:00Z"}]},
-            "reviewThreads": {"nodes": []}}
+            "reviewThreads": {"totalCount": 0, "nodes": []}}
 
 
 class Fake:

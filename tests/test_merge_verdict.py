@@ -11,7 +11,8 @@ def node(checks="SUCCESS", reviews=(), threads=()):
     """A pull request's ready facts: head committed at 12:45 on 2030-01-01."""
     return {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
                                               "statusCheckRollup": {"state": checks}}}]},
-            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+            "reviews": {"nodes": list(reviews)},
+            "reviewThreads": {"totalCount": len(threads), "nodes": list(threads)}}
 
 
 def review(author, state, at="2030-01-01T08:06:00Z"):
@@ -26,7 +27,7 @@ def thread(resolved, author=BOT_AUTHOR, at="2029-01-01T00:00:00Z"):
 class ReadyVerdictTests(unittest.TestCase):
     def test_characterization_table(self):
         cases = [
-            ({}, "blocked: checks unknown", ("lane",)),
+            ({}, "blocked: checks unknown, review threads were not fully read", ("lane",)),
             (node(), "READY", ()),
             (node(checks="FAILURE"), "blocked: checks failure", ("lane",)),
             (node(checks="PENDING", threads=[thread(False)]),
