@@ -72,6 +72,7 @@ Never edit or pull the runtime clone by hand: local changes stop the deploy.
 - `docs/MUSE.md`: what one brain tick does
 - `docs/LANES.md`: lanes, the station and the installer
 - `docs/USAGE_ROUTING.md`: how work follows usage limits
+- `docs/ASK_BLOCK.md`: how a brain vets an ask before it reaches the operator
 - `docs/BRIEF_FORMAT.md`: how a ticket is written
 - `docs/NAMING.md`: kind labels and title rules
 - `docs/DASHBOARD.md`: dashboard settings

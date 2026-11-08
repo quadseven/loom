@@ -727,15 +727,17 @@ labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
 empty nothing is forwarded). A `loom:urgent` ask is posted at once, once, and
-nothing the digest needs can hold it; all open asks go in one digest per day
-after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists asks new or
-changed since the last digest first. When the asks do not all fit in one
-message, the station posts every ask, grouped by the goal home its body names
-(`#N`), as a comment on the open `loom:digest` issue in the ask's own repo
-(created when missing), and the message links to each repo's comment. The
-same digest includes a "Waiting on you" section for open `loom:human` issues
-across `LOOM_REPOS`: the 15 newest grouped by repo, with title, link, and the
-first line of the brain's ask, plus the total count. A `loom:human` issue is
+nothing the digest needs can hold it; the other asks go in one digest per day
+after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists only vetted
+asks (docs/ASK_BLOCK.md: a brain wrote an ask block on the ticket), as one line each,
+`repo#N: <question> Recommend: <answer>.`, the 5 newest first, across `LOOM_REPOS`
+and including open `loom:human` issues. It tags `LOOM_DISCORD_MENTION` only when an
+ask is vetted; asks no brain has vetted are counted (`N asks are with the brains.`)
+and never listed. Station, lane and invariant upkeep asks are neither listed nor
+counted unless a brain marks them needs-person. With more than 5 vetted asks, the
+station posts every vetted ask, grouped by the goal home its body names (`#N`), as a
+comment on the open `loom:digest` issue in the ask's own repo (created when
+missing), and the message links to each repo's comment. A `loom:human` issue is
 never posted on its own, even if it also has `needs-operator` or
 `loom:urgent`. A long daily digest may take multiple Discord messages.
 The digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
