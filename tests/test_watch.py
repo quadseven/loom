@@ -182,6 +182,30 @@ class SignatureTest(unittest.TestCase):
                      "station: example-owner/repo-a#486: fix rounds stopped (x); left failed"):
             self.assertTrue(watch.keep(line), line)
 
+    def test_audit_holds_accept_minute_and_second_precision(self):
+        for timestamp in ("2026-11-08T03:44Z", "2026-11-08T03:44:59Z"):
+            for prefix in ("", "[2026-11-08T02:00:00Z] "):
+                line = (prefix + "station: lane lane-a takes no verify run until "
+                        + timestamp + ": a proof it made failed its audit")
+                with self.subTest(timestamp=timestamp, prefix=prefix):
+                    self.assertFalse(watch.keep(line), line)
+
+    def test_audit_hold_exclusion_keeps_malformed_times_and_real_failures(self):
+        template = ("station: lane lane-a takes no verify run until %s: "
+                    "a proof it made failed its audit")
+        malformed = ("soon", "2026-11-08T03:44:5Z", "2026-11-08T03:44:599Z",
+                     "2026-11-08T03:44:59", "2026-11-08T03:44:59.123Z",
+                     "2026-11-08T03:44:59+00:00")
+        lines = [template % timestamp for timestamp in malformed]
+        for timestamp in ("2026-11-08T03:44Z", "2026-11-08T03:44:59Z"):
+            hold = template % timestamp
+            lines.extend(("error: " + hold, hold + "; push failed",
+                          hold.replace("a proof it made failed its audit", "audit lookup failed")))
+        for line in lines:
+            for prefix in ("", "[2026-11-08T02:00:00Z] "):
+                with self.subTest(line=line, prefix=prefix):
+                    self.assertTrue(watch.keep(prefix + line), prefix + line)
+
     def test_an_audit_hold_and_a_factory_release_are_outcomes_not_errors(self):
         # loom#2774: the verify hold a failed proof audit sets, said each pass.
         # loom#2770: the re-queue after a hold whose incident filing failed.
