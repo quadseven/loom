@@ -110,9 +110,9 @@ HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
-# How often the station moves the tickets that sit under a goal home and
-# under no epic into an open intake epic of that goal (decision 0003).
-OUTSIDE_EPIC_EVERY = 3600
+# How often the station moves tickets under no epic or a closed epic into an
+# open intake epic, matching the closed-epic invariant's check interval.
+OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
