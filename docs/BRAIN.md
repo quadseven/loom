@@ -1293,14 +1293,16 @@ then.
 
 An `[auth]` failure takes every lane that bills that key offline instead: each
 one writes its heartbeat unavailable with `API key expired: renew <the SSM
-parameter its key came from>`, no `retry_at`, takes no brief and hands each one
-on as `[auth]`. The hold lifts only when the value at that parameter changes
-(the operator renewed it). A lane that reads no key parameter at all (codex,
-claude and zen sign in with the CLI's own file) is not held: nothing there
+setting name>`, no `retry_at`, takes no brief and hands each one on as
+`[auth]`. The setting names the parameter but the path stays out of the
+heartbeat, park reason and public ask. The hold lifts only when the value at
+that parameter changes (the operator renewed it). A lane that reads no key
+parameter at all (codex, claude and zen sign in with the CLI's own file) is
+not held: nothing there
 changes, so its next pass fails the same way, and the ask below still says
 which lane to fix. The runner files one `needs:human` ask on the factory
-repo naming the exact parameter, and comments on that ask instead of filing a
-second one.
+repo naming the `LOOM_<LANE>_KEY_SSM` setting, and comments on that ask
+instead of filing a second one.
 
 - A failed fix brief (a `Fix-PR:` line) goes back to `loom:pr`, whatever its
   class, so its open pull request is never duplicated.

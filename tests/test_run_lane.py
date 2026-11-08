@@ -5883,15 +5883,19 @@ echo fixed > fix.txt
     def test_an_expired_key_is_auth_and_takes_every_lane_that_bills_it_offline(self):
         # Acceptance (loom#744): the expired-key error is [auth], not
         # [transient], and every slot billing that key is unavailable with the
-        # reason naming the parameter to renew.
+        # setting name, never the parameter path, in its public reason.
         inbox, result = self.expired_key_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("failed: [auth] agent exited 1: API key expired: renew /k/go", self.go_log())
+        self.assertIn("failed: [auth] agent exited 1: API key expired: renew LOOM_OPENCODE_GO_KEY_SSM",
+                      self.go_log())
+        self.assertNotIn("/k/go", self.go_log())
         self.assertNotIn("transient", self.go_log())
         for slot in self.GROUP:
             beat = self.beat(slot)
             self.assertFalse(beat["available"], slot)
-            self.assertEqual(beat["reason"], "API key expired: renew /k/go", slot)
+            self.assertEqual(beat["reason"],
+                             "API key expired: renew LOOM_OPENCODE_GO_KEY_SSM", slot)
+            self.assertNotIn("/k/go", beat["reason"], slot)
             # No retry time: only a renewed key lifts this hold.
             self.assertNotIn("retry_at", beat, slot)
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
@@ -5906,8 +5910,9 @@ echo fixed > fix.txt
         # No run, and the waiting brief is handed on rather than left to fail.
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertFalse((inbox / "T043-next.md").exists())
-        self.assertIn("failed: [auth] API key expired: renew /k/go",
+        self.assertIn("failed: [auth] API key expired: renew LOOM_OPENCODE_GO_KEY_SSM",
                       (self.loom / "logs" / "opencode-go" / "T043-next.log").read_text())
+        self.assertNotIn("/k/go", (self.loom / "logs" / "opencode-go" / "T043-next.log").read_text())
         self.assertFalse(self.beat("opencode-go")["available"])
         # The operator renews the key: the lane is back, and its digest is gone
         # so the next expiry is this key's, not the old one's.
@@ -5919,12 +5924,33 @@ echo fixed > fix.txt
         usage = self.loom / "state" / "usage"
         self.assertFalse((usage / "opencode-go.key-sha").exists())
 
-    def test_an_expired_key_opens_one_needs_operator_ask_naming_the_parameter(self):
+    def test_a_legacy_expired_key_heartbeat_stays_held_without_logging_its_path(self):
+        self.expired_key_lane()
+        beat_path = self.loom / "state" / "usage" / "opencode-go.json"
+        beat = json.loads(beat_path.read_text())
+        beat["reason"] = "API key expired: renew /k/go"
+        beat_path.write_text(json.dumps(beat))
+        inbox = self.go_brief()
+
+        result = self.run_lane("opencode-go", **self.go_key_env())
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse((inbox / "T043-next.md").exists())
+        self.assertEqual(self.beat("opencode-go")["reason"],
+                         "API key expired: renew LOOM_OPENCODE_GO_KEY_SSM")
+        self.assertNotIn("/k/go", self.go_log())
+
+    def test_an_expired_key_ask_names_the_setting_and_hides_the_parameter_path(self):
         self.expired_key_lane()
         filed = [c for c in self.calls() if c.startswith("gh issue create")]
         self.assertEqual(len(filed), 1, self.calls())
         self.assertIn("--label needs:human", filed[0])
-        self.assertIn("renew /k/go", filed[0])
+        self.assertIn("LOOM_OPENCODE_GO_KEY_SSM", filed[0])
+        self.assertNotIn("/k/go", filed[0])
+        ask_body = Path(str(self.body) + ".issue").read_text()
+        self.assertIn("LOOM_OPENCODE_GO_KEY_SSM", ask_body)
+        self.assertNotIn("/k/go", ask_body)
         # The next lane to hit that key finds the open ask and edits one
         # repeat comment on it, so the operator has one thread to answer, not
         # one comment per lane or per failure.
@@ -6865,6 +6891,7 @@ exit %d
                     time.sleep(0.1)
         finally:
             session_procs.kill_session(runner.pid)
+            runner.wait(timeout=5)
 
     def test_stale_lock_without_a_live_group_is_reclaimed(self):
         # A lock written before watchdog_pgid existed still recovers.
@@ -6876,6 +6903,47 @@ exit %d
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_live_unrelated_pid_does_not_hold_the_lane_lock(self):
+        self.drop_brief()
+        lock = self.loom / "run" / "codex.lock"
+        lock.mkdir(parents=True)
+        unrelated = subprocess.Popen(["sleep", "60"])
+        (lock / "pid").write_text(f"{unrelated.pid}\n")
+        try:
+            result = self.run_lane()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+            self.assertTrue(self.alive(unrelated.pid), "reclaiming the lock killed an unrelated process")
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5)
+
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
+    def test_live_runner_for_this_slot_keeps_the_lane_lock(self):
+        self.drop_brief()
+        lock = self.loom / "run" / "codex.lock"
+        agent_pid = self.hung_agent()
+        runner = subprocess.Popen(
+            ["bash", str(RUNNER), "codex"],
+            env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            for _ in range(200):
+                if (lock / "pid").exists() and agent_pid.exists():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(agent_pid.exists(), "the live runner never started its agent")
+            self.assertEqual(int((lock / "pid").read_text()), runner.pid)
+
+            second = self.run_lane()
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertTrue((self.inbox / "T042-fix-the-thing.md").exists())
+        finally:
+            session_procs.kill_session(runner.pid)
+            runner.wait(timeout=5)
 
     def test_wait_job_gone_counts_a_job_that_vanishes_at_the_last_look_as_gone(self):
         # A fake launchctl that finds the job 50 times, then not.
