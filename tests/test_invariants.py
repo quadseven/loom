@@ -1588,6 +1588,19 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual([b.subject for b in invariants.closed_epic_open_tickets(f)],
                          ["%s#42" % REPO])
 
+    def test_closed_epic_ticket_also_held_by_open_epic_is_not_a_breach(self):
+        """A sub-issue can remain linked to a closed epic after moving."""
+        goal = Ref("%s#%d" % (REPO, GOAL), "#30")
+        ticket_ref = Ref("%s#7" % REPO, "#7")
+        closed = invariants.EpicShape(
+            Ref("%s#40" % REPO, "#40"), False, 1, (ticket_ref,))
+        opened = invariants.EpicShape(
+            Ref("%s#41" % REPO, "#41"), True, 1, (ticket_ref,))
+        facts = Facts(T0, shapes=[invariants.GoalShape(
+            goal, 6, (closed, opened), ())])
+
+        self.assertEqual(invariants.closed_epic_open_tickets(facts), [])
+
     def test_tickets_outside_an_epic_in_many_goals_are_one_rolling_breach(self):
         """One rolling breach for every goal home, not one issue per goal:
         the sweep found 18 issues for this one cause (infra#5613)."""

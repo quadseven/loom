@@ -804,17 +804,27 @@ def goal_epics_over_cap(f: Facts) -> List[Breach]:
 
 
 def closed_epic_open_tickets(f: Facts) -> List[Breach]:
-    """A closed epic that still holds open tickets."""
+    """A closed epic that still holds open tickets not held by an open epic."""
     if f.shapes is None:
         return []
-    return [Breach("closed-epic-open-tickets", epic.epic.key,
-                   "Closed epic %s holds %d open tickets" % (epic.epic.label,
-                                                            len(epic.open_tickets)),
-                   ("Open tickets under it: %s" % _refs(epic.open_tickets),
-                    "Reopen the epic, or move the tickets under an open one"),
-                   f.now)
-            for shape in f.shapes for epic in shape.epics
-            if not epic.open and epic.open_tickets]
+    out = []
+    for shape in f.shapes:
+        held_open = {ticket.key for epic in shape.epics if epic.open
+                     for ticket in epic.open_tickets}
+        for epic in shape.epics:
+            if epic.open:
+                continue
+            tickets = tuple(ticket for ticket in epic.open_tickets
+                            if ticket.key not in held_open)
+            if tickets:
+                out.append(Breach(
+                    "closed-epic-open-tickets", epic.epic.key,
+                    "Closed epic %s holds %d open tickets" % (epic.epic.label,
+                                                             len(tickets)),
+                    ("Open tickets under it: %s" % _refs(tickets),
+                     "Reopen the epic, or move the tickets under an open one"),
+                    f.now))
+    return out
 
 
 def epic_title_shared(f: Facts) -> List[Breach]:
