@@ -76,7 +76,11 @@ RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", 
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {
+    "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "opencode-go-1": {}, "opencode-go-2": {}, "opencode-go-3": {}, "opencode-go-4": {},
+}
+OPENCODE_GO_SLOTS = ("opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4")
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -616,12 +620,27 @@ class Runners:
             until = beat.get("retry_at")
             if isinstance(until, bool) or not isinstance(until, (int, float)) or until <= self.now:
                 until = self.now + HOLD_SECONDS
-            self._hold(ledger, slot, float(until), str(beat.get("reason") or "unavailable on the runner"),
-                       models)
+            reason = str(beat.get("reason") or "unavailable on the runner")
+            self._hold(ledger, slot, float(until), reason, models)
+            if provider(slot) == "opencode-go" and reason.startswith("limit:"):
+                self._hold_opencode_go_plan(ledger, float(until), reason)
             return
         ledger["holds"].pop(slot, None)
         if isinstance(models, dict) and models:
             self._hold(ledger, slot, 0, "", models)
+
+    def _hold_opencode_go_plan(self, ledger: Dict[str, Any], until: float, reason: str) -> None:
+        """Carry a paid OpenCode Go plan limit across isolated runner pods."""
+        for slot in OPENCODE_GO_SLOTS:
+            if self._opencode_go_free(slot):
+                continue
+            self._hold(ledger, slot, until, reason)
+
+    def _opencode_go_free(self, slot: str) -> bool:
+        """Whether a slot is configured for a free model outside the plan."""
+        model = self.env.get(_prefix(slot) + "MODEL") or self.env.get(_prefix("opencode-go") + "MODEL", "")
+        model = TRACKED_SLOTS.get(slot, {}).get(_prefix(slot) + "MODEL", model)
+        return bool(re.fullmatch(r"opencode-go/.+-free", model))
 
     def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
