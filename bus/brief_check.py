@@ -32,6 +32,11 @@ Before the station hands a ticket to a lane (`check`), it reads:
   brain's work: the ticket goes back to the queue with `needs-brain`, and
   the factory gives it no lane until the cause is named
   (`health_hold`).
+- area: in a repo that files its tickets by area of play (it defines at
+  least one `area:` label), a ticket carrying no `area:` label gets no lane
+  (`area_verdict`). Every per-area view misses it, and picking the area is
+  the brain's intake work, so it goes back the same way a health ticket
+  does. A repo with no `area:` labels is not held to the rule.
 - criteria: a build ticket whose body names no acceptance criteria gets
   no lane (`criteria_verdict`): its brief could restate no criterion as
   the check that proves it, and the runner would park the brief as a work
@@ -59,9 +64,17 @@ from .github import GitHubError
 STALE = "stale"
 HEALTH = "health"
 CRITERIA = "criteria"
+AREA = "area"
+AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
+# An evidence key the marker carries as it is: a word and a number or hex
+# stamp, which holds no repository reference. Any other key (a pull
+# request key names its repo) is written as a hash of itself, because the
+# public-text scrub rewrites a private repo reference inside the marker
+# and the read-back then never matched (loom#2835).
+PLAIN_KEY_RE = re.compile(r"[a-z]+-[0-9a-f]+")
 HEALTH_NOTE = "Held for the brain: %s. %s"
 
 # The marker bus/health.py writes into every ticket it files.
@@ -222,6 +235,33 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
                    "restated as the check that proves it")
 
 
+# -- area ---------------------------------------------------------------------
+def _area_names(labels: Iterable[Any]) -> List[str]:
+    out = []
+    for label in labels or ():
+        name = str((label.get("name") if isinstance(label, Mapping) else label) or "")
+        if name.startswith(AREA_PREFIX) and name[len(AREA_PREFIX):].strip():
+            out.append(name)
+    return out
+
+
+def area_labels(gh: Any, repo: str) -> List[str]:
+    """The repo's `area:` label names. Raises GitHubError when the read
+    fails: the caller holds the ticket rather than guess the repo has none."""
+    return sorted(_area_names(gh.paginate("/repos/%s/labels?per_page=100" % repo)))
+
+
+def area_verdict(issue: Mapping[str, Any], areas: Sequence[str]) -> Optional[Verdict]:
+    """Why a ticket with no `area:` label gets no lane, or None. `areas` is
+    the repo's own `area:` labels (area_labels): a repo that defines none
+    files no ticket by area, and nothing is held. Reads nothing."""
+    if not areas or _area_names(issue.get("labels") or ()):
+        return None
+    return Verdict(AREA, "area-%s" % issue.get("number"),
+                   "its repo files every ticket under an area of play and it carries "
+                   "no `area:` label")
+
+
 # A brief that says another issue does its work (loom#2033): "Superseded by
 # #21", "superseded by issue #21", "issue #21 supersedes this work".
 SUPERSEDED_RE = re.compile(
@@ -308,6 +348,22 @@ def measurement_files(entries: Sequence[Mapping[str, Any]]) -> List[str]:
 # -- stale --------------------------------------------------------------------
 def _login(item: Mapping[str, Any]) -> str:
     return str((item.get("user") or {}).get("login") or "")
+
+
+def marker_key(key: str) -> str:
+    """The form of an evidence key the ask marker carries: the key itself
+    when it is plain, else `sha-` and a short sha256 of it, which no scrub
+    rewrites and names no repository."""
+    if PLAIN_KEY_RE.fullmatch(key):
+        return key
+    return "sha-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def was_asked(key: str, done: Iterable[str]) -> bool:
+    """Whether an earlier marker names the key, raw (a marker written before
+    loom#2835, or on a private repo, where nothing is scrubbed) or hashed."""
+    keys = set(done)
+    return key in keys or marker_key(key) in keys
 
 
 def asked(comments: Iterable[Mapping[str, Any]], trusted: Iterable[str]) -> set:
@@ -493,7 +549,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     try:
         for read in reads:
             found = read()
-            if found is not None and found.key not in done:
+            if found is not None and not was_asked(found.key, done):
                 return found
     except (GitHubError, ValueError, KeyError, TypeError) as err:
         raise Unread(str(err)) from err
@@ -506,4 +562,4 @@ def ask(verdict: Verdict) -> str:
             "builds a stale ticket rewrites working code to match it. Close the ticket if "
             "its work is done, or rewrite it to what is still missing and remove "
             "`needs:human`; this evidence will not hold it again."
-            % (ASK_MARKER % verdict.key, verdict.reason))
+            % (ASK_MARKER % marker_key(verdict.key), verdict.reason))

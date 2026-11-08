@@ -21,6 +21,14 @@ LINE_403_B = ("[2026-10-13T10:02:41Z] station: could not scan example-owner/repo
 # bus/station.py _try_ticket's hold line, as loom#645 and loom#646 saw it.
 HOLD_LINE = "station: example-owner/repo-a#506 waits for #102 (failed)"
 HOLD_LINE_CROSS = "station: example-owner/repo-b#871 waits for example-owner/repo-a#102 (failed)"
+# bus/station.py _stop_fix_rounds's hand-off line, in its two wordings: the
+# top of the model ladder (loom#1881) and the round cap (loom#1880).
+HANDOFF_LINES = (
+    "station: example-owner/repo-a#486: fix rounds stopped (the same failures came back and "
+    "no rung of the model ladder is left above it); left failed for the hand-off pool",
+    "station: example-owner/repo-b#921: fix rounds stopped (the fix round cap (3) is reached "
+    "on its rung); left failed for the hand-off pool",
+)
 
 
 class FakeGH:
@@ -164,6 +172,60 @@ class SignatureTest(unittest.TestCase):
                      "error: example-owner/repo-a#7 waits for #3 (failed)"):
             self.assertTrue(watch.keep(line), line)
 
+    def test_a_fix_round_hand_off_is_an_outcome_not_an_error(self):
+        # loom#1881 and loom#1880: the station logs the end of a ladder.
+        for line in HANDOFF_LINES + ("[2026-10-26T05:59:31Z] " + HANDOFF_LINES[0],):
+            self.assertFalse(watch.keep(line), line)
+        # Anything more on the line than the hand-off is judged as usual.
+        for line in (HANDOFF_LINES[0] + "; push failed",
+                     "error: " + HANDOFF_LINES[1],
+                     "station: example-owner/repo-a#486: fix rounds stopped (x); left failed"):
+            self.assertTrue(watch.keep(line), line)
+
+    def test_audit_holds_accept_minute_and_second_precision(self):
+        for timestamp in ("2026-11-08T03:44Z", "2026-11-08T03:44:59Z"):
+            for prefix in ("", "[2026-11-08T02:00:00Z] "):
+                line = (prefix + "station: lane lane-a takes no verify run until "
+                        + timestamp + ": a proof it made failed its audit")
+                with self.subTest(timestamp=timestamp, prefix=prefix):
+                    self.assertFalse(watch.keep(line), line)
+
+    def test_audit_hold_exclusion_keeps_malformed_times_and_real_failures(self):
+        template = ("station: lane lane-a takes no verify run until %s: "
+                    "a proof it made failed its audit")
+        malformed = ("soon", "2026-11-08T03:44:5Z", "2026-11-08T03:44:599Z",
+                     "2026-11-08T03:44:59", "2026-11-08T03:44:59.123Z",
+                     "2026-11-08T03:44:59+00:00")
+        lines = [template % timestamp for timestamp in malformed]
+        for timestamp in ("2026-11-08T03:44Z", "2026-11-08T03:44:59Z"):
+            hold = template % timestamp
+            lines.extend(("error: " + hold, hold + "; push failed",
+                          hold.replace("a proof it made failed its audit", "audit lookup failed")))
+        for line in lines:
+            for prefix in ("", "[2026-11-08T02:00:00Z] "):
+                with self.subTest(line=line, prefix=prefix):
+                    self.assertTrue(watch.keep(prefix + line), prefix + line)
+
+    def test_an_audit_hold_and_a_factory_release_are_outcomes_not_errors(self):
+        # loom#2774: the verify hold a failed proof audit sets, said each pass.
+        # loom#2770: the re-queue after a hold whose incident filing failed.
+        audit_hold = ("station: lane lane-a takes no verify run until 2026-11-08T03:44Z: "
+                      "a proof it made failed its audit")
+        release = ("station: factory release: example-owner/repo-a#2404 re-queued: "
+                   "incident filing failed")
+        for line in (audit_hold, release, "[2026-11-07T10:29:42Z] " + audit_hold,
+                     "[2026-11-07T05:26:58Z] " + release):
+            self.assertFalse(watch.keep(line), line)
+        # The hold that names the failed filing is the fault, and stays kept;
+        # so does anything more on either line.
+        for line in ("station: held example-owner/repo-a#2404 for the factory: [factory] setup "
+                     "failed: base check exited 124; factory incident filing failed",
+                     audit_hold + "; push failed",
+                     "error: " + release,
+                     "station: lane lane-a takes no verify run until soon: a proof it made "
+                     "failed its audit"):
+            self.assertTrue(watch.keep(line), line)
+
 
 def _brain_status_lines():
     """The brain's own status output, made by the code that prints it: the
@@ -305,6 +367,17 @@ class FilingTest(WatchBase):
             self.append(HOLD_LINE, HOLD_LINE_CROSS)
             self.run_at(T0 + i * 300)
         self.assertEqual(self.gh.issues, {})
+
+    def test_a_fix_round_hand_off_files_nothing_and_other_errors_still_file(self):
+        # loom#1881: the hand-off line is the designed end of a ladder; a
+        # station error repeated beside it is still filed.
+        for i in range(5):
+            self.append(*["[2026-10-26T06:0%dZ] %s" % (i, line) for line in HANDOFF_LINES])
+            self.append(LINE_403)
+            self.run_at(T0 + i * 300)
+        self.assertEqual(len(self.gh.issues), 1)
+        self.assertEqual(self.gh.issues[1]["title"], "station: " + watch.signature(LINE_403))
+        self.assertEqual(list(self.saved()["sigs"]), ["station: " + watch.signature(LINE_403)])
 
     def test_hits_spread_wider_than_the_window_file_nothing(self):
         for i in range(3):
@@ -508,6 +581,7 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 600)
         self.assertEqual(self.gh.issues[1]["state"], "closed")
 
+
     def test_an_open_issue_with_the_title_is_counted_not_filed_twice(self):
         title = "station: " + watch.signature(LINE_403)
         self.gh.issues[1] = {"number": 1, "title": title, "state": "open",
@@ -569,6 +643,44 @@ class FilingTest(WatchBase):
         self.run_at(T0)
         self.assertEqual(len(self.said), 1)
         self.assertIn("watch: scanned 1 logs", self.said[0])
+
+
+class ValidationFailureTest(unittest.TestCase):
+    def test_a_lane_validation_failure_on_a_green_base_is_an_outcome_not_an_error(self):
+        branch_notes = [
+            'the edits are on branch main',
+            'the edits are committed in the lane tree',
+            'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree',
+            'the push of test-branch failed; the edits are committed in the lane tree',
+        ]
+        validation_lines = []
+        for note in branch_notes:
+            validation_lines.append(
+                'station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note)
+            validation_lines.append(
+                'station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note + '; no pull request opened')
+            validation_lines.append(
+                'station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); ' + note)
+            # with leading timestamp
+            validation_lines.append(
+                '[2026-11-07T00:52:34Z] station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note + '; no pull request opened')
+            validation_lines.append(
+                '[2026-11-07T00:52:34Z] station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); ' + note)
+        for line in validation_lines:
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line), line)
+
+        error_lines = [
+            'station: reported example-owner/repo-a#999 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 1)',
+            'station: reported example-owner/repo-a#888 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)',
+            'station: reported example-owner/repo-a#777 failed: [work] validation failed: validation environment unavailable: the check exited 126',
+            'station: reported example-owner/repo-a#666 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the edits are on branch main; push failed',
+        ]
+        for line in error_lines:
+            with self.subTest(line=line):
+                self.assertTrue(watch.keep(line), line)
+        # timed-out check standalone substring case
+        self.assertTrue(watch.keep('station: reported example-owner/repo-a#1 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)'))
 
 
 class ExampleTextTest(WatchBase):

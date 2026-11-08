@@ -25,7 +25,8 @@
 # cannot read this checkout or the GitHub sign-in, and as this user it would
 # read the login keychain.
 #
-# Settings: LOOM_REPOS, LOOM_STATUS_REPO (where the lock lives; default this
+# Settings: LOOM_REPOS, LOOM_SWEEP_REPOS (the repos the Muse sweep may close
+# or rewrite in; unset means no sweep), LOOM_STATUS_REPO (where the lock lives; default this
 # checkout's origin), LOOM_BRAIN_LADDER, LOOM_BRAIN_MODEL, LOOM_BRAIN_HOLDER, LOOM_BRAIN_MINUTES
 # (the agent's hard stop, also the lock's expiry), LOOM_BRAIN_WAIT (minutes to
 # wait for a held lock: 25 for a live tick, 0 otherwise), LOOM_BRAIN_SCOPE: all
@@ -207,7 +208,7 @@ ladder_open() {
 # The settings the brain's commands read (bus.brain, bus journal), passed
 # to a sandboxed rung by name. An allowlist: nothing else of this
 # environment, a key or an SSM parameter name included, reaches the agent.
-BRAIN_SETTINGS=(LOOM_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
+BRAIN_SETTINGS=(LOOM_REPOS LOOM_SWEEP_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
   LOOM_ASK_ANSWERERS LOOM_REPO_OWNERS LOOM_HOME
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN

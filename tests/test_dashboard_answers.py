@@ -82,6 +82,7 @@ def _fixture():
     kind, ask = brain.human_kind(operator_hold.ask(8, [operator_hold.GENERIC_WHY]))
     hold_ask = "%s\n%s\nKind: %s" % (brain.HUMAN_MARKER, ask, kind)
     rest = {
+        "/repos/%s/pulls/8" % REPO: {"state": "open", "head": {"sha": "a" * 40}},
         "/repos/%s/issues/42/comments?per_page=100&page=1" % REPO: [
             {"id": 9, "body": hold_ask, "user": {"login": LOOM}, "created_at": "2030-01-01T09:00:00Z",
              "html_url": URL % (REPO, 42, 9)}],
@@ -116,7 +117,7 @@ class Call:
 
 
 class AnswerTest(unittest.TestCase):
-    env = {"LOOM_BRIEF_AUTHORS": LOOM, "LOOM_OPERATORS": "%s second-operator" % OWNER,
+    env = {"LOOM_BRIEF_AUTHORS": LOOM + "," + LOOM + "[bot]", "LOOM_OPERATORS": "%s second-operator" % OWNER,
            "LOOM_ANSWER_TOKEN": TOKEN, "LOOM_IDENTITY_HEADER": "", "LOOM_UPLOAD_TOKEN": ""}
 
     def setUp(self):
@@ -190,12 +191,44 @@ class Identity(AnswerTest):
     def test_an_identity_header_maps_to_an_operator_and_anyone_else_is_refused(self):
         env = {"LOOM_IDENTITY_HEADER": "Tailscale-User-Login", "LOOM_OPERATORS": "owner@github=" + OWNER}
         with mock.patch.dict(os.environ, env):
-            code, _ = self.answer_it(token=None, headers={"Tailscale-User-Login": "stranger@github"})
+            code, _ = self.answer_it(token=None, headers={"Tailscale-User-Login": "stranger@github",
+                                                          "Content-Type": "application/json"})
             self.assertEqual(code, 403)
             self.assertEqual(self.gh.writes, [])
-            code, found = self.answer_it(token=None, headers={"Tailscale-User-Login": "owner@github"})
+            code, found = self.answer_it(token=None, headers={"Tailscale-User-Login": "owner@github",
+                                                              "Content-Type": "application/json"})
         self.assertEqual(code, 200, found)
         self.assertEqual(found["answer"]["login"], OWNER)
+
+    def test_a_cross_site_post_in_identity_header_mode_is_refused(self):
+        # loom#2580: the proxy stamps the operator's identity on any request
+        # the browser sends, so a page on another origin must not answer.
+        # A non-JSON body skips the CORS preflight; Sec-Fetch-Site names the
+        # sending site.
+        env = {"LOOM_IDENTITY_HEADER": "X-Loom-Id", "LOOM_OPERATORS": "alice=" + OWNER}
+        refused = (
+            {"Content-Type": "text/plain"},
+            {"Content-Type": "application/x-www-form-urlencoded"},
+            {},
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "cross-site"},
+            {"Content-Type": "application/json", "Sec-Fetch-Site": "same-site"},
+        )
+        with mock.patch.dict(os.environ, env):
+            for extra in refused:
+                with self.subTest(headers=extra):
+                    code, _ = self.answer_it(token=None, headers=dict(extra, **{"X-Loom-Id": "alice"}))
+                    self.assertEqual(code, 403)
+            self.assertEqual(self.gh.writes, [])
+            code, found = self.answer_it(token=None, headers={
+                "X-Loom-Id": "alice", "Content-Type": "application/json; charset=utf-8",
+                "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(code, 200, found)
+        self.assertEqual(found["answer"]["login"], OWNER)
+        self.assertEqual(len(self.comments_posted()), 1)
+
+    def test_token_mode_does_not_check_the_request_origin(self):
+        code, found = self.answer_it(headers={"Content-Type": "text/plain"})
+        self.assertEqual(code, 200, found)
 
 
 class Posting(AnswerTest):
@@ -218,6 +251,63 @@ class Posting(AnswerTest):
         self.assertIn("loom:human", found["removed"])
         self.assertEqual([x["name"] for x in self.gh.issues[42]["labels"]],
                          ["loom:ticket", "loom:pr", answer.ANSWERED_LABEL])
+
+    def test_explicit_review_request_requires_the_displayed_head(self):
+        self.read_ask(42)
+        current = self.gh.rest_data['/repos/%s/issues/42/comments?per_page=100&page=1' % REPO][0]
+        code, result = self.call('POST', '/api/needs-you/answer', {
+            'repo': REPO, 'number': 42, 'choice': 'Merge', 'note': '', 'as': OWNER,
+            'review_pr': 8, 'review_ask': answer.review_ask_key(current)}, {'Authorization': 'Bearer ' + TOKEN})
+        self.assertEqual(code, 409, result)
+        self.assertEqual(self.comments_posted(), [])
+
+    def _answer_after_review_ask_change(self, replace):
+        import hashlib
+        self.read_ask(42)
+        path = '/repos/%s/issues/42/comments?per_page=100&page=1' % REPO
+        original = dict(self.gh.rest_data[path][0])
+        key = '%d:%s' % (original['id'], hashlib.sha256(original['body'].encode()).hexdigest())
+        changed = dict(original)
+        if replace:
+            changed['id'] += 1
+        else:
+            changed['body'] += '\nRecovery test must pass before approval.'
+        self.gh.rest_data[path] = [changed]
+        code, result = self.call('POST', '/api/needs-you/answer', {
+            'repo': REPO, 'number': 42, 'choice': 'Merge', 'note': '', 'as': OWNER,
+            'review_pr': 8, 'review_head': 'a' * 40, 'review_ask': key},
+            {'Authorization': 'Bearer ' + TOKEN})
+        self.assertEqual(code, 409, result)
+        self.assertEqual(self.comments_posted(), [])
+
+    def test_review_post_persists_exact_ask_binding_for_the_consumer(self):
+        self.read_ask(42)
+        path = '/repos/%s/issues/42/comments?per_page=100&page=1' % REPO
+        original = dict(self.gh.rest_data[path][0])
+        code, result = self.call('POST', '/api/needs-you/answer', {
+            'repo': REPO, 'number': 42, 'choice': 'Merge', 'note': '', 'as': OWNER,
+            'review_pr': 8, 'review_head': 'a' * 40, 'review_ask': answer.review_ask_key(original)},
+            {'Authorization': 'Bearer ' + TOKEN})
+        self.assertEqual(code, 200, result)
+        posted = {'body': self.comments_posted()[0]['body'], 'user': {'login': LOOM}}
+        self.assertIsNotNone(answer.pr_verdict([original, posted], 8, [LOOM], [OWNER], head='a' * 40))
+        original['body'] += '\nA new operator requirement.'
+        self.assertIsNone(answer.pr_verdict([original, posted], 8, [LOOM], [OWNER], head='a' * 40))
+
+    def test_edited_same_pr_ask_refuses_the_rendered_review_card(self):
+        self._answer_after_review_ask_change(False)
+
+    def test_replaced_same_pr_ask_refuses_the_rendered_review_card(self):
+        self._answer_after_review_ask_change(True)
+
+    def test_a_forged_answer_cannot_suppress_the_operator_comment(self):
+        self.gh.issues[40]['comments'] = 1
+        self.gh.rest_data['/repos/%s/issues/40/comments?per_page=100&page=1' % REPO] = [
+            {'body': answer.comment_body(OWNER, 'Yes'), 'user': {'login': 'outsider'}}]
+        code, result = self.answer_it()
+        self.assertEqual(code, 200, result)
+        self.assertEqual(result['status'], 'posted')
+        self.assertEqual(len(self.comments_posted()), 1)
 
     def test_a_second_click_posts_nothing_even_after_a_restart(self):
         self.assertEqual(self.answer_it()[0], 200)

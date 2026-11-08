@@ -161,7 +161,7 @@ def rewritten_source(body: Any) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -185,7 +185,7 @@ AFTER_RE = re.compile(r"%s(?:[ \t]*,[ \t]*%s)*" % (_AFTER_ITEM, _AFTER_ITEM))
 _AFTER_REF_RE = re.compile(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#([0-9]+)")
 # The runner reads the first line starting with one of these, so a body line
 # that looks like a header must not follow the real header lines.
-FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable):")
+FIELD_LINE_RE = re.compile(r"(Repo|Branch|Lane|Issue|Model|Base|Fix-PR|Deliverable|Repairs incident):")
 SLUG_MAX = 40
 # An issue rewritten in place (brain.brief --refs, loom#1229) keeps its
 # original title and text under this last section, quoted line by line, so
@@ -243,6 +243,8 @@ def ticket_name(repo: str, number: int, attempt: int = 1) -> str:
 
 # Each header's rule: (is the value usable, the message when it is not).
 _HEADER_RULES = {
+    "Repairs incident": (lambda v: bool(re.fullmatch(r"#[1-9][0-9]*", v)),
+                         lambda v: "Repairs incident: must name an incident like #7"),
     "Difficulty": (lambda v: v in DIFFICULTIES,
                    lambda v: "Difficulty: must be one of %s" % ", ".join(DIFFICULTIES)),
     "Priority": (lambda v: v in PRIORITIES,
@@ -760,7 +762,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
                   linked: Sequence[str] = (), demoted_models: str = "",
-                  claim: str = "") -> str:
+                  claim: str = "", defaults: Sequence[str] = ()) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -806,6 +808,12 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if reads_stored_rows(body):
         text += "\n" + FIXTURE_NOTE + "\n"
     text += _context_text(notes, linked)
+    if defaults:
+        text += ("\n## Automated decision default\n\nThis reversible choice followed the declared "
+                 "timeout policy, not human approval. It cannot authorize merges, access or other "
+                 "operator-only actions. A later operator answer supersedes it.\n")
+        text += "".join("> %s\n" % _CONTROL_RE.sub(" ", str(note)).replace("\n", " ")[:NOTE_CHARS]
+                        for note in defaults)
     if resume:
         text += ("\n## Earlier attempt\n\nAn earlier attempt ended (a timeout or a limit) after "
                  "editing, and the runner kept its edits on branch %s. The runner merges them into this tree "
@@ -904,10 +912,12 @@ A runtime proof template with every required key and these criteria filled in
 LIVE_CRITERION_RE = re.compile(r"^\s*live\b", re.I)
 
 
-def verify_template(criteria: List[str]) -> str:
+def verify_template(criteria: List[str], live_criteria: Optional[Sequence[str]] = None) -> str:
     """The runtime proof skeleton a verify brief shows (loom#714): lanes that
     built the record from prose alone left out observed or environment, and
-    bus/proof.py refused the proof for its shape, not its evidence."""
+    bus/proof.py refused the proof for its shape, not its evidence. The
+    station may name a prose criterion that criteria_gate classified live."""
+    live = set(live_criteria or ())
     return json.dumps({
         "kind": "runtime",
         "revision": "<the commit SHA on the default branch that carries the change>",
@@ -918,7 +928,8 @@ def verify_template(criteria: List[str]) -> str:
         "sources": ["<a reference to each piece of evidence>"],
         "criteria": [{"criterion": text, "result": "pass",
                       "evidence": ("<what you saw, quoted, and the UTC time you saw it>"
-                                   if LIVE_CRITERION_RE.match(text) else "<what shows it>")}
+                                   if LIVE_CRITERION_RE.match(text) or text in live
+                                   else "<what shows it>")}
                      for text in criteria],
         "measure": {"name": "<what you measured>", "baseline": "<before>",
                     "target": "<the goal>", "after": "<after>"},
@@ -945,7 +956,7 @@ def merged_first_section(pulls: Iterable[int]) -> str:
 
 
 def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
-                        live: str) -> str:
+                        live: str, live_criteria: Optional[Sequence[str]] = None) -> str:
     """The brief that hands a lane slot one shipped ticket to verify: no
     branch is pushed (the Branch: line only names the work directory) and the
     result is verify.json, not a pull request."""
@@ -957,7 +968,8 @@ def render_verify_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
             "Branch: loom/verify-%d-%d" % (number, stamp), "Lane: %s" % lane,
             "Issue: %s#%d" % (repo, number), "Deliverable: verify", "",
             "# T%d: Verify %s" % (number, title), ""]
-    return "\n".join(head) + "\n" + VERIFY_BRIEF % (live, wanted, verify_template(texts))
+    return "\n".join(head) + "\n" + VERIFY_BRIEF % (
+        live, wanted, verify_template(texts, live_criteria))
 
 
 REVIEW_BRIEF = """\

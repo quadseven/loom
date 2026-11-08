@@ -1,6 +1,7 @@
 """The journal and report comment formats from docs/BRAIN.md."""
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional, Sequence, Set,
@@ -9,6 +10,7 @@ from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional
 from . import answer as _answer
 from . import decision_claim as _decision_claim
 from . import handoff
+from . import journal_check
 from . import notify as _notify
 from . import quiet as _quiet
 from . import text as _text
@@ -117,12 +119,14 @@ def _items(value: Union[str, Iterable[str], None]) -> str:
 
 
 def render_journal(when, holder, shipped, briefed, waiting, asks,
-                   requests, minutes, measure=None) -> str:
+                   requests, minutes, measure=None, backlog=None) -> str:
     head = [JOURNAL_MARKER, "Tick %s, %s" % (_when(when), holder)]
     if measure is not None:
         head.append("- Measure: %s" % _items(measure))
-    return "\n".join(head + [
-        "- Shipped: %s" % _items(shipped),
+    lines = ["- Shipped: %s" % _items(shipped)]
+    if backlog is not None:
+        lines.append("- Shipped backlog: %s" % backlog)
+    return "\n".join(head + lines + [
         "- Briefed: %s" % _items(briefed),
         "- Waiting: %s" % _items(waiting),
         "- Asks: %s" % _items(asks),
@@ -174,6 +178,42 @@ def with_tick(text: str, holder: Optional[str], now: Optional[datetime] = None) 
         raise ValueError("holder must be letters, digits, dot, dash or underscore")
     tick = "Tick %s, %s" % (_when(now or datetime.now(timezone.utc)), holder)
     return "%s\n%s\n%s" % (JOURNAL_MARKER, tick, rest)
+
+
+def with_shipped_backlog(text: str, now: Optional[datetime] = None) -> str:
+    """Put the fresh station-stamped shipped count on the current journal tick."""
+    if not text.startswith(JOURNAL_MARKER):
+        return text
+    from . import metrics
+
+    when = now or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    row = metrics.read_shipped_row(os.path.join(home, "state", "station"), when.timestamp())
+    if row is None:
+        value = "not read (no fresh station stamp)"
+    elif row["n"] == 0:
+        value = "0 waiting"
+    else:
+        value = "%d waiting, median wait %.1fh" % (row["n"], row["median_h"])
+    line = "- Shipped backlog: " + value
+
+    current, marker, earlier = text.partition(EARLIER_OPEN)
+    found = re.search(r"(?m)^- Shipped backlog:.*$", current)
+    if found:
+        current = current[:found.start()] + line + current[found.end():]
+    else:
+        shipped = re.search(r"(?m)^- Shipped:.*$", current)
+        if shipped:
+            at = shipped.end()
+            current = current[:at] + "\n" + line + current[at:]
+        else:
+            tick = re.search(r"(?m)^Tick .*?$", current)
+            if tick is None:
+                return text
+            current = current.rstrip("\n") + "\n" + line + "\n"
+    return current + (marker + earlier if marker else "")
 
 
 _STEPS_LINE = re.compile(r"^[ \t]*-[ \t]+Steps:.*(?:\r?\n|$)", re.M)
@@ -246,6 +286,25 @@ def merged(new: str, old: str, limit: int = JOURNAL_MAX) -> str:
     return new
 
 
+def _public_refs(text: str, home: str) -> str:
+    """`text` with every [owner/]name#N reference to a repo other than the
+    goal home `home` (owner/name) written as "issue N of another repo", as
+    lanes/run_lane.sh does for a lane PR body. The home's own refs stay, bare
+    or owner-qualified. bus/text.py check() does not refuse the bare name#N
+    form, and the App-boundary scrub rewrites only owner/name#N refs to
+    private repos, so a journal named private repos' issues on a public goal
+    home (loom#1750)."""
+    # bus.factory imports bus.brain, which imports this module.
+    from .factory import SCAN_REF_RE
+    owner, _, name = home.lower().partition("/")
+
+    def words(m: "re.Match[str]") -> str:
+        if m.group(2).lower() == name and (m.group(1) or owner).lower() == owner:
+            return m.group(0)
+        return "issue %s of another repo" % m.group(3)
+    return SCAN_REF_RE.sub(words, text)
+
+
 def _self_login(gh: GitHub) -> str:
     """The login this client posts as: the App's bot login, else
     LOOM_GITHUB_LOGIN (brain.sh sets it for an agent that holds only an
@@ -256,21 +315,47 @@ def _self_login(gh: GitHub) -> str:
 
 def todays_journal(gh: GitHub, repo: str, issue_number: int,
                    text: str) -> Optional[Dict[str, Any]]:
-    """This client's journal comment for the same holder on the same UTC day
-    as `text`'s Tick line, the newest such; None when there is none. One read
-    of the day's comments (since= filters on the last edit)."""
+    """This client's journal for the same holder and UTC day as the new tick."""
+    return _journal_context(gh, repo, issue_number, text)[0]
+
+
+def _journal_context(gh: GitHub, repo: str, issue_number: int,
+                     text: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Today's editable comment and the preceding own tick since yesterday.
+
+    One bounded-date read covers midnight without treating another author,
+    holder, a future tick or an unread older day as evidence of repetition.
+    """
     tick = re.search(r"^Tick (\d{4}-\d{2}-\d{2})T\S*, (\S+)\s*$", text, re.M)
     if not tick:
-        return None
+        return None, ""
     day, holder = tick.group(1), tick.group(2)
+    current = split_journal(text)[-1][0]
+    since = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
     me = _self_login(gh).lower()
     found = None
+    previous = ("", "")
     for c in gh.paginate("/repos/%s/issues/%d/comments?since=%sT00:00:00Z&per_page=100"
-                         % (repo, int(issue_number), day)):
+                         % (repo, int(issue_number), since)):
         if _mine_today(c, me, day, holder) and (
                 found is None or str(c.get("created_at")) > str(found.get("created_at"))):
             found = c
-    return found
+        previous = _previous_tick(c, me, holder, current, previous)
+    return found, previous[1]
+
+
+def _previous_tick(c: Any, me: str, holder: str, current: str,
+                   previous: Tuple[str, str]) -> Tuple[str, str]:
+    """Choose the immediately preceding attributed tick, not a historical match."""
+    if not me or not isinstance(c, dict) or str((c.get("user") or {}).get("login") or "").lower() != me:
+        return previous
+    body = str(c.get("body") or "")
+    if not body.startswith(JOURNAL_MARKER):
+        return previous
+    for at, part in split_journal(body):
+        if previous[0] < at < current and journal_holder({"body": part}) == holder:
+            previous = (at, part)
+    return previous
 
 
 def _mine_today(c: Any, me: str, day: str, holder: str) -> bool:
@@ -305,17 +390,19 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     home is a backlog goal, whose report is refused with ReportBacklog.
     `steps` is the tick's "- Steps:" line (tick_clock.footer), put last in
     a journal tick and never in a report or reply."""
-    text = as_journal(text, holder)
+    text = _public_refs(as_journal(text, holder), repo)
     # A journal that says a person decided needs that person's record
     # (bus/decision_claim.py, loom#2089).
     _decision_claim.check(gh, repo, issue_number, text, list(trusted),
                           _answer.operators(None, list(trusted) or None))
     if text.startswith(JOURNAL_MARKER):
-        text = with_steps(with_tick(text, holder, now), steps)
+        text = with_tick(text, holder, now)
+        text = with_shipped_backlog(text, now)
         _text.check(text)
-        mine = todays_journal(gh, repo, issue_number, text)
+        mine, previous = _journal_context(gh, repo, issue_number, text)
+        text = with_steps(journal_check.annotate(text, previous), steps)
         if mine is not None:
-            body = merged(text, str(mine.get("body") or ""))
+            body = _public_refs(merged(text, str(mine.get("body") or "")), repo)
             _text.check(body)
             return gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(mine["id"])),
                            {"body": body})

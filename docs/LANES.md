@@ -53,7 +53,12 @@ and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
 script's path when using another checkout. A scanner that is still missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
-another reason parks the brief `[transient]`. A lane pod or cluster runner
+another reason parks the brief `[transient]`. A hit parks the brief with
+one line naming each hit's rule class and place, up to five (for example
+`[deny-list] docs/LANDING.md:12`, or `PR body line 4`), never the matched
+text, and never the name of a file whose name itself hit
+(`bus/leak_hits.py`); the scanner's full output goes to the lane log only.
+A lane pod or cluster runner
 (`LOOM_SSM_DIR`) holds no AWS
 key: the scanner reads the deny-list's copy under `LOOM_SSM_DIR` through
 `lanes/k8s/ssm-dir-bin/aws`, a stand-in for the AWS CLI put first on the
@@ -94,11 +99,34 @@ pushes nothing, and its record is the `affected` phase. A lane pull request
 in the deploy repo passed its check and went red in CI on two such suites
 (loom#1773).
 
+A successful contract command proves its exit status, not coverage of the
+changed paths. The contract has no path-to-check mapping. PR bodies and
+fix-round comments therefore keep the command result (including retries,
+host-red exceptions and `affected:` results) but also say `not validated:
+contract path coverage unknown` and name the changed paths. This applies to
+Python-only changes too: a Python command may check another directory. An
+arbitrary `affected:` hook, a language launcher or a filename mentioned in a
+command does not prove coverage. Documentation and configuration changes are
+not silently exempted. The path excerpt uses literal code spans, escapes
+control characters and backticks, and caps its size with an omitted count.
+If the diff cannot be read, coverage remains unknown.
+This is reporting only: existing check failures still block pushing, and the
+factory still waits for CI and review on the new head before landing it.
+
 After the repo check passes, the runner also checks each changed Python test
 against the exact base commit's code in the check sandbox. It copies each
 changed test file into a temporary base tree, then runs each changed test by
 name: a `unittest.TestCase` method through unittest, a module-level
 `test_*` function through pytest when the tree has it, else by calling it.
+A changed test is one whose body differs from the base file's, or one that
+uses a module or helper-class name whose own value differs (`A, B = 1, 2` to
+`A, B, C = 1, 2, 3` changes only `C`). On a fix round that merged the
+default branch, what the head shares with that branch's file came in with
+the merge and is not the round's own. A fix round's base is the pull
+request head it started from, which already holds the code the pull request
+adds, so a changed test that passes there runs again on the default branch's
+merge base: one that fails there tests the pull request's own code and is
+accepted; one that passes on both still blocks (loom#2831).
 A test that passes on base, one that times out, or a module-level test that
 takes fixtures with no pytest to run it, blocks validation and names the
 test for the lane to fix. The archive and test run have bounded
@@ -129,6 +157,22 @@ unset variables.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
+- A base check red only on the lane host is not a broken default branch.
+  The runner treats a fresh red base run (exit 1 to 123, after its second
+  run) as host-only red when all of these hold: GitHub's own check runs on
+  the same commit all completed as success, neutral or skipped; the output
+  names at most 20 failing tests, each a plain pytest node id; every failure
+  or error line in the output is one of those names; and the check exits 0
+  when rerun with exactly those tests deselected (`PYTEST_ADDOPTS` carries
+  `--deselect`, and `LOOM_DESELECT_TESTS` lists them). Then it files no
+  incident, the agent runs, and the repo's open base-check incident closes
+  so the station re-queues the tickets it held. A red final check passes
+  only if its rerun with the same tests deselected exits 0, and never when
+  the change touches a file holding one of them. The check sandbox denies
+  localhost and the network, so tests that need either fail only here; a
+  repo fixes that by skipping them when a localhost probe fails. Anything
+  else, including a fix round, a cached red verdict and unittest or go
+  failures, still files the incident.
 - The agent is told the check and how it did on the base.
 - A lane change that adds or edits `.loom/validation.conf` must read and pass
   under itself. Before the push the runner reads the committed file with the
@@ -155,6 +199,29 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
+  run at once across all lanes, as `run/check-slots/slot-N` directories that
+  hold the runner's pid; a slot whose pid is gone is reclaimed. A lane waits
+  up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
+  its keepalive stamp stays fresh while it waits. A wait that runs out, or a
+  base check that times out (exit 124), parks the brief `[transient]` and
+  files no base-check incident: both mean host load, not a red base. A
+  final or affected check after the agent that times out also parks
+  `[transient]` once; the station counts a second check timeout in a row on
+  the same ticket as `[work]`, as it does for agent timeouts. The
+  runner passes `LOOM_CHECK_WORKERS` into each check. The host sets it to 2
+  by default and can override it per host. A repo's test runner must read
+  that variable to use the cap. The runner inventory available to Loom is:
+
+  | Repository runner | Lane check source | Worker cap status |
+  |---|---|---|
+  | Loom `.github/unittest_parallel.py` | `.loom/validation.conf` | Honors `LOOM_CHECK_WORKERS`; defaults to four when unset. |
+  | Other repositories | Each repo's `.loom/validation.conf` command | Repo-defined; Loom does not keep a central inventory or detect whether the command honors the variable. Confirm in that repo's runner and contract. |
+- Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
+  repo's test that needs a loopback connection may skip when that variable
+  is `1`, and only then; CI and local runs never set it, so the test still
+  runs there. A unittest repo has no other way to drop such a test from a
+  lane check.
 - `logs/<lane>/<ticket>.validation.jsonl` holds one line per step: phase
   (`prepare`, `setup`, `baseline`, `contract-setup`, `contract-check`, `final`, `affected`), command, exit code, tree
   revision, `ok` and detail (the interpreter's version, the submodule
@@ -376,9 +443,10 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 `state/usage/` to clear it sooner). A key the provider will not take is
 `[auth]`, not a transient failure: it costs the ticket no attempt, never
 flags `loom:runaway`, and every lane that bills that key stays unavailable
-with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
-`retry_at`, until the value at that parameter changes. The runner opens one
-`needs:human` ask on the factory repo naming that parameter. opencode
+with `API key expired: renew <LOOM_<LANE>_KEY_SSM>` in its heartbeat, with no
+`retry_at`, until the value at that setting's parameter changes. The runner
+opens one `needs:human` ask on the factory repo naming the setting, never the
+parameter path. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
@@ -465,7 +533,9 @@ A new App is easiest made from
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
-down or demoted (bus/scorecard.py). The same test picks every tier move,
+down or demoted (bus/scorecard.py: `LOOM_LANE_DEMOTE_AT` bad outcomes in
+the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
+requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
 It skips future `Not before:` times and tickets without a readable Difficulty.
@@ -657,15 +727,17 @@ labeller are in `LOOM_BRIEF_AUTHORS` to a Discord webhook whose URL it reads
 from the SSM parameter named by `LOOM_DISCORD_WEBHOOK_SSM` (region
 `LOOM_AWS_REGION`, default us-east-1; never printed, and with the setting
 empty nothing is forwarded). A `loom:urgent` ask is posted at once, once, and
-nothing the digest needs can hold it; all open asks go in one digest per day
-after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists asks new or
-changed since the last digest first. When the asks do not all fit in one
-message, the station posts every ask, grouped by the goal home its body names
-(`#N`), as a comment on the open `loom:digest` issue in the ask's own repo
-(created when missing), and the message links to each repo's comment. The
-same digest includes a "Waiting on you" section for open `loom:human` issues
-across `LOOM_REPOS`: the 15 newest grouped by repo, with title, link, and the
-first line of the brain's ask, plus the total count. A `loom:human` issue is
+nothing the digest needs can hold it; the other asks go in one digest per day
+after `LOOM_DIGEST_HOUR` (local hour, default 9). The digest lists only vetted
+asks (docs/ASK_BLOCK.md: a brain wrote an ask block on the ticket), as one line each,
+`repo#N: <question> Recommend: <answer>.`, the 5 newest first, across `LOOM_REPOS`
+and including open `loom:human` issues. It tags `LOOM_DISCORD_MENTION` only when an
+ask is vetted; asks no brain has vetted are counted (`N asks are with the brains.`)
+and never listed. Station, lane and invariant upkeep asks are neither listed nor
+counted unless a brain marks them needs-person. With more than 5 vetted asks, the
+station posts every vetted ask, grouped by the goal home its body names (`#N`), as a
+comment on the open `loom:digest` issue in the ask's own repo (created when
+missing), and the message links to each repo's comment. A `loom:human` issue is
 never posted on its own, even if it also has `needs-operator` or
 `loom:urgent`. A long daily digest may take multiple Discord messages.
 The digest is fixed in `state/station/asks.json` (`pending`) before it is sent, so
@@ -935,6 +1007,11 @@ idle slot: every 30 minutes at most, one free slot that may verify is taken
 from build work for the oldest such ticket (queued work of the slot's tier does
 not hold it back; a failed proof audit still does), so a factory with build
 work for every lane still verifies what it ships.
+When the median shipped wait is at least 24 hours, each free lane that may
+verify takes an eligible ticket shipped at least 24 hours ago before new build
+work; queued build work does not hold that priority drain. The median is read
+from the same wait rows as the Hot spots page, cached for 30 minutes, and a
+failed read leaves the usual claim order in place.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in
@@ -1133,6 +1210,10 @@ sent (and from the tick's start), each closing the commitment for the same
 stage, item and brief key. Between ticks, at most every 10 minutes, the
 station sends the new done markers to `/api/brain/commitments`, so work
 another brain finished closes without waiting for this machine's next tick.
+A refused upload is logged with its status and retried after exponential
+back-off (one minute, doubling to ten minutes at most); after three
+consecutive refusals the station keeps the markers in its local ledger in
+safe mode until an upload succeeds.
 After a tick posts, the station loads the rules digest's sources that
 changed: the Rules section of `docs/MUSE.md`, keyed by the commit that last
 changed it, and each goal home's rules, keyed by its newest rules comment
@@ -1213,6 +1294,20 @@ marker is younger than its deadline (the pass was killed), `ended ...s into
 its ...s deadline without a clean finish`. The default sits above a daily
 metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
 its own (loom#1924).
+
+## Paused steps
+
+`LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
+of step method names, for example `triage_backlogs rewrite_triaged
+move_outside_tickets`. The station also reads names from
+`state/station/paused_steps.txt` (same form, any whitespace) and reads both
+again on every pass, so writing or emptying that file pauses or resumes a step
+with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
+comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
+pass and counts as done, so the rotation moves on and nothing carries over. A
+name that is not a pass step logs `unknown paused step <name>, ignored` and
+pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
+paused; the work a pass does before or after it always runs.
 
 ## Log watch
 
@@ -1566,6 +1661,12 @@ cannot query the viewer or any other local service.
   for days (the provider's `Retry-After` was never read, so every limit fell
   back to a week) and the lane-held invariant fired while 33 tickets of the
   tier waited.
+- A run killed with SIGTERM (exit 143) is a `[transient]` ending, never a
+  `[limit]`: a limit phrase in its output came from what it read, so it writes
+  no provider limit and no hold. Only the runner's own watchdog, which kills a
+  run after the provider's limit line, holds the lane. A codex run killed this
+  way had read about a monthly limit and held the lane until the next month
+  (loom#2683).
 - Go and Zen slots pick each run's model (`bus/model_pick.py`). The picker
   reads the live Go and Zen lists and models.dev, the catalogue the CLI reads,
   drops what is deprecated or paused, probes each candidate, and takes the first
@@ -1735,7 +1836,11 @@ lookup leaves the brief for the next pass. The rule covers:
 - the `zai` lane (Z.ai free Flash models),
 - the `copilot` lane (Free allowance; public repositories only),
 - `opencode-go` runs of a Muse Spark Contributor model (it trains Meta's
-  models); other Go models keep 0 to 30 days and take any repo.
+  models); other Go models keep 0 to 30 days and take any repo,
+- the `openrouter` and `workersai` lanes: the station's claim refuses a
+  private repo for every free lane (`bus/station.py` `needs_public_repo`),
+  and the factory reads the same rule (`bus/factory.py` `public_only`), so it
+  never offers them a private ticket (loom#2358).
 
 ## API lanes: zen, zai
 
@@ -1839,8 +1944,11 @@ separate pinned routes: `free-ollama` uses `/free/ollama-cloud/v1`,
 `free-kilo` and `free-groq` use `/free-public/nvidia-nim/v1`, `/free-public/kilo/v1` and
 `/free-public/groq/v1`. A slot's `LOOM_FREE_<PROVIDER>_URL` overrides its
 derived URL. Each slot probes its own route's `/models` before a run. A 503
-holds only that slot for 15 minutes as a limit, so the station can assign the
-ticket elsewhere without counting it as a work failure. Ollama and Gemma
+holds only that slot as a limit, using the gateway's numeric `Retry-After`
+(capped at one day); when that header is absent or invalid, the slot uses its
+15-minute fallback. The heartbeat preserves that reset across passes, so the
+station avoids dispatching while the route remains held and assigns any
+already-queued ticket elsewhere without counting it as a work failure. Ollama and Gemma
 accept private repos; the other three accept public repos only. The routes
 need your own gateway and provider configuration.
 
@@ -1873,7 +1981,8 @@ unchanged for a run that did not end on a described step.
   answers 503, while the box is hot. Each pass asks `$LOOM_SPARK_URL/models`
   first, and asks again after a run that failed. A refused connection or a
   503 is a limit, not a failure: the heartbeat says unavailable, with a
-  reason starting `limit:`, for 15 minutes; every brief in the inbox is
+  reason starting `limit:`, for 15 minutes by default or for the gateway's
+  `Retry-After` on a 503; every brief in the inbox is
   parked with that reason; the station puts its ticket back to briefed (a
   fix brief's back to `loom:pr`), and the factory moves a ticket briefed on a
   limited lane to the next rung of the model ladder at once. Any other
@@ -2035,8 +2144,7 @@ What changes in a pod:
   its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
   new PID namespace hides the runner's processes. bwrap needs user
   namespaces inside the container; a lane whose bwrap cannot start reports
-  itself unavailable (`sandbox_ready`). The agy lane and the codex and
-  claude lanes stay on the Mac.
+  itself unavailable (`sandbox_ready`). The agy lane stays on the Mac.
 - Egress, fail closed: bwrap narrows no network, so the pod's network
   policy must (no cloud metadata address, no API server, no cluster-internal
   ranges; DNS and 443 to the internet only). `sandbox_ready` proves it
@@ -2076,9 +2184,12 @@ claims for it is dispatched to the `lane` workflow
 (`.github/workflows/lane.yml`), which runs `lanes/run_lane.sh` once for that
 brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
-tree, cache or session database stays anywhere. API lanes only: opencode-go,
-zen, openrouter, zai, workersai, the free provider slots and spark (both
-through the gateway). codex, claude, agy and anthropic stay local.
+tree, cache or session database stays anywhere. Claude Code runs with its
+long-lived OAuth token copied from SSM into a mode-600 file under the job home
+and exported only to the Claude CLI process. Codex uses its broker session
+file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
+provider slots and spark (both through the gateway). agy and anthropic stay
+local.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125

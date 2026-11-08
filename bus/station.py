@@ -55,11 +55,14 @@ from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import ask_block
 from . import ask_state
 from . import brief_check
 from . import label_pass
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
+from . import merge_verdict
+from . import history
 from . import friction_intake
 from . import review_debt
 from . import evidence
@@ -81,6 +84,7 @@ from . import status
 from . import usage
 from . import verify_data
 from . import text as _text
+from . import ticket_move
 from . import tickets
 from . import transcripts
 from . import unmeetable
@@ -94,9 +98,11 @@ from . import weakened
 from . import labels
 from . import lock
 from .brain import HUMAN_MARKER, LANES_REPUBLISH
+from . import home_repo
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
-                     _OPENER, _next_link, read_ssm, rest_login, unreadable)
+                     _OPENER, _next_link, read_ssm, rest_login, secret_read_reason,
+                     unreadable)
 from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
@@ -105,12 +111,17 @@ HEARTBEAT_MAX_AGE = 600
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
-# How often the station moves the tickets that sit under a goal home and
-# under no epic into an open intake epic of that goal (decision 0003).
-OUTSIDE_EPIC_EVERY = 3600
+# How often the station moves tickets under no epic or a closed epic into an
+# open intake epic, matching the closed-epic invariant's check interval.
+OUTSIDE_EPIC_EVERY = invariants.CHECK_EVERY
 # The marker on the comment the station posts when it reviews a runaway hold
 # caused by one dead lane (loom#565): the release, or why the hold stays.
 DEAD_LANE_MARKER = "<!-- loom:runaway-dead-lane v1 lane=%s -->"
+# The words that tell the release apart from the hold that stays.
+DEAD_LANE_RELEASED = "Runaway hold released"
+# How long a done brief whose pull request is not found is read again before
+# its run is reported as over with nothing to show (loom#2583).
+DONE_NO_PR_WAIT = 2 * 3600
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -233,13 +244,12 @@ DIGEST_HEAD = "Asks waiting for you:"
 HUMAN = "loom:human"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
-HUMAN_HEAD = "Waiting on you"
+# The digest lists at most this many vetted asks (docs/ASK_BLOCK.md).
 HUMAN_SHOWN = 5
+VETTED, UPKEEP, WITH_BRAINS = "vetted", "upkeep", "with the brains"
 # A report first line whose only count is work in flight: the digest counts
 # that goal as quiet.
 IN_FLIGHT_ONLY_RE = re.compile(r"\A\d+ in flight( since the last report)?\.?\Z", re.I)
-HUMAN_TITLE_MAX = 100
-HUMAN_ASK_MAX = 140
 # When every ask does not fit in the daily notification, the full digest is a
 # comment on this issue in each ask's own repo (so a private repo's asks stay
 # in that repo), and the notification links to it.
@@ -367,6 +377,9 @@ LIVE_PROOF_FILE = "live-proof.json"
 LIVE_PROOFS_PER_PASS = 5
 # Asks for unverified criteria are emails: at most this many an hour.
 LIVE_ASKS_PER_HOUR = 4
+# In LIVE_CHECKS_FILE: ticket -> the criteria_gate.criteria_key its
+# verification ask was made for. The ask is made once per set (loom#2805).
+LIVE_ASKED_KEY = "_asked"
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
 REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
@@ -470,6 +483,12 @@ ROLL_SIGNAL_EVERY = 3600
 ROLL_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}")
 PIN_SHIP_SETTLE = 3600
 PIN_SHIPS_FILE = "pin_ships.json"
+# Compare answers by "repo commit revision" for two full commit SHAs: whether
+# one carries the other never changes, so each pair is asked once (loom#2357).
+# A 404 or an answer with no status is never kept; the oldest go past the cap.
+COMPARES_FILE = "compares.json"
+COMPARES_MAX = 2000
+COMPARE_STATUSES = ("ahead", "identical", "behind", "diverged")
 SHIP_PATH_FILES = "ship_path_files.json"
 SHIP_PATH_MANUAL = "ship_path_manual.json"
 # The pull request files API returns at most this many files.
@@ -521,9 +540,14 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
+# Whether this process has said the send-back comparison is off (unset target).
+_SEND_BACK_UNSET_SAID = False
 # Where the runner files its validation incidents (lanes/run_lane.sh
-# FACTORY_REPO), and the marker and ticket line their bodies carry.
-FACTORY_REPO = "quadseven/loom"
+# FACTORY_REPO, from LOOM_FACTORY_REPO or the deployment's own repo
+# settings, never a literal: loom#2584), and the marker and ticket line
+# their bodies carry.
+FACTORY_REPO = (os.environ.get("LOOM_FACTORY_REPO", "").strip()
+                or home_repo.home_repo())
 INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 # The note that says the station unticked a decision box a lane ticked.
 DECISION_REVERT_MARKER = "<!-- loom:decision-revert v1 -->"
@@ -547,8 +571,6 @@ HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([
 # has nothing that can close it, so the station releases it after this long:
 # the ticket is not held forever.
 HELD_NO_INCIDENT_FOR = 2 * 3600
-RETRY_RE = re.compile(r"Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
-                      r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 # The brain's lane order for a retry, after the failed lane's own provider.
 # claude is never chosen: it spends the operator's own subscription.
 RETRY_ORDER = ["anthropic", "anthropic-2", "anthropic-3", "anthropic-4",
@@ -603,6 +625,25 @@ UPLOAD_PER_PASS = 10
 # most this often (post_brain_memory), so a commitment another brain
 # finished closes without waiting for this machine's next tick.
 CLOSE_EVERY = 600
+# A refused done-marker upload retries on exponential back-off (_closings_delay):
+# it starts at CLOSE_BASE_DELAY seconds (one minute), doubles each consecutive
+# UploadRefused, and is capped at CLOSE_MAX_DELAY (the configured max delay).
+CLOSE_BASE_DELAY = 60
+CLOSE_MAX_DELAY = 600
+# After this many consecutive UploadRefused errors the station enters safe mode:
+# it keeps the markers in the local ledger cache until an upload succeeds.
+CLOSE_SAFE_AFTER = 3
+
+
+def _closings_delay(fails: int) -> int:
+    """The back-off before the next done-marker retry after `fails` consecutive
+    UploadRefused errors: CLOSE_BASE_DELAY doubled each time, capped at
+    CLOSE_MAX_DELAY."""
+    tries = fails if fails >= 1 else 1
+    delay = CLOSE_BASE_DELAY * (2 ** (tries - 1))
+    return delay if delay < CLOSE_MAX_DELAY else CLOSE_MAX_DELAY
+
+
 # The rules digest's source for docs/MUSE.md's Rules section.
 MUSE_RULES = "docs/MUSE.md"
 
@@ -678,6 +719,8 @@ LIVE_EVENT_MARKER = "<!-- loom:wait-live-event v1 -->"
 VERIFY_REFUSAL_CAP = 3
 # Per ticket, the reasons its proofs were refused.
 VERIFY_REFUSED_FILE = "verify-refused.json"
+VERIFY_MISSING_FILE = "verify-missing.json"
+VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 # A shipped ticket still unverified this long after its ship takes a lane
 # ahead of build work (loom#964): verify used to run only on a lane with
 # nothing else to do, so a busy factory never verified. At most one lane is
@@ -685,6 +728,10 @@ VERIFY_REFUSED_FILE = "verify-refused.json"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+VERIFY_PRIORITY_MEDIAN_H = 24.0
+VERIFY_PRIORITY_AFTER = 24 * 3600
+VERIFY_PRIORITY_EVERY = metrics.SHIPPED_STAMP_MAX_AGE
+VERIFY_PRIORITY_FILE = metrics.SHIPPED_STAMP_FILE
 # A shipped ticket still unverified this long after its ship with no verify
 # attempt ever recorded gets one missing-evidence note (loom#2092): the
 # reserved lane reaches one ticket per VERIFY_RESERVE_EVERY, so the rest of
@@ -721,6 +768,11 @@ PASS_STEP_BUDGET = 300
 PASS_DEADLINE = 3600
 DEADLINE_MARKER_FILE = "pass-deadline.json"
 STEP_ROTATION_FILE = "step-rotation.json"
+# Pass steps held by name (loom#1630): LOOM_PAUSED_STEPS in the environment
+# and this state file, both space-separated step names, read every pass so a
+# pause needs no reload. A bulk cleanup holds triage, rewrite and the
+# outside-epic move this way, so its relabels draw no bot comments.
+PAUSED_STEPS_FILE = "paused_steps.txt"
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
@@ -732,10 +784,12 @@ STATELESS_FILE = "stateless.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
 # Labels that mean someone or something already holds a ticket: any Loom
-# state or hold, a person's claim, an operator ask, or a wait.
+# state or hold, a person's claim, an operator ask, a wait, or finished work
+# waiting to be seen live (awaiting-live-check: queueing it sent three parked
+# tickets back to lanes that had nothing left to build, 2026-11-07).
 _HOLD_LABELS = {"loom:" + state for state in brain.STATES} | {
     "loom:triage", "loom:held", "loom:ready", "loom:awaiting-evidence",
-    "loom:closed-unmerged", "needs-brain", *HUMAN_LABELS}
+    "loom:closed-unmerged", "needs-brain", brain.LIVE_CHECK_LABEL, *HUMAN_LABELS}
 
 
 def _holds_ticket(name: str) -> bool:
@@ -759,6 +813,8 @@ FABRIC_QUESTION = (
     "pull request cards you can see, each as a link to its card. If none does, "
     "answer: none.")
 
+# The prefix of each open pull request line in the lane status comment.
+PR_LINE_PREFIX = "Open pull requests: "
 # Per-lane transient verify failures and the holds they earn (loom#714).
 VERIFY_LANES_FILE = "verify-lanes.json"
 VERIFY_STRIKES = 2
@@ -797,27 +853,25 @@ NOTE_MAX = 1500
 def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                attempts: Dict[str, Any], now: float,
                refused: Optional[Dict[str, Any]] = None,
-               adapter_tickets: Sequence[str] = ()
+               adapter_tickets: Sequence[str] = (),
+               missing: Optional[Dict[str, Any]] = None,
+               check_live: bool = True
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
     (`refused`: ticket -> reasons) is left to the brain."""
     due = []
     for repo, issue in issues:
-        labels = _label_names(issue)
-        needles = live_needles(issue.get("body"))
         key = "%s#%s" % (repo, issue.get("number"))
-        if needles is not None and not needles and key not in adapter_tickets:
-            continue
-        if (issue.get("state") != "open" or "loom:ticket" not in labels
-                or "loom:shipped" not in labels or "loom:verified" in labels
-                or issue.get("has_proof")):
+        if not _verify_candidate(issue, key in adapter_tickets or not check_live):
             continue
         last = attempts.get(key)
         if isinstance(last, (int, float)) and now - float(last) < VERIFY_INTERVAL:
             continue
         reasons = (refused or {}).get(key)
         if isinstance(reasons, list) and len(reasons) >= VERIFY_REFUSAL_CAP:
+            continue
+        if _missing_capped((missing or {}).get(key)):
             continue
         due.append((repo, issue))
     # A ticket the health pass has proved absent for 24 hours goes first: it
@@ -826,6 +880,32 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
         not item[1].get("health_proof"),
         float(item[1].get("shipped_at", 0) or 0),
         item[0], int(item[1].get("number", 0))))
+
+
+def _verify_body_known(issue: Dict[str, Any]) -> bool:
+    return "body" in issue and (issue["body"] is None or isinstance(issue["body"], str))
+
+
+def _verify_active(issue: Dict[str, Any]) -> bool:
+    names = _label_names(issue)
+    return (issue.get("state") == "open" and "loom:shipped" in names
+            and "loom:verified" not in names)
+
+
+def _verify_candidate(issue: Dict[str, Any], adapter: bool = False) -> bool:
+    names = _label_names(issue)
+    if (not _verify_body_known(issue) or issue.get("state") != "open" or "loom:ticket" not in names
+            or "loom:shipped" not in names or "loom:verified" in names
+            or issue.get("has_proof") or not proof.criteria(issue.get("body"))):
+        return False
+    return adapter or live_needles(issue.get("body")) != []
+
+
+def _missing_capped(reasons: Any) -> bool:
+    if isinstance(reasons, dict) and "reasons" in reasons:
+        reasons = reasons["reasons"]
+    return isinstance(reasons, dict) and any(
+        isinstance(count, int) and count >= VERIFY_REFUSAL_CAP for count in reasons.values())
 
 
 def verify_note_text(shipped_at: float, now: float) -> str:
@@ -850,6 +930,27 @@ def live_needles(body: Optional[str]) -> Optional[List[str]]:
     if live == "(no Live criterion on the ticket)":
         return None
     return evidence.needles(live)
+
+
+def _adapter_live_criterion(body: str) -> Optional[str]:
+    """Return the live criterion an adapter verify run can read, if any."""
+    explicit = brain.live_criterion(body, limit=None)
+    if explicit != "(no Live criterion on the ticket)":
+        if criteria_gate.check_of(explicit) is None \
+                and live_proof.step_of(explicit)[0] is None:
+            return explicit
+        return None
+    for checked, criterion in proof.criteria(body):
+        if checked or criteria_gate.kind(criterion) != criteria_gate.LIVE:
+            continue
+        if not re.search(r"`[^`\n]+`", criterion) or not evidence.needles(criterion):
+            continue
+        step, why = live_proof.step_of(criterion)
+        if (criteria_gate.check_of(criterion) is not None or why
+                or (step is not None and not (step.kind == live_proof.LOG and not step.source))):
+            continue
+        return criterion
+    return None
 
 
 def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
@@ -994,6 +1095,7 @@ class Settings:
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
+                 live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -1016,6 +1118,7 @@ class Settings:
                  thin_snapshots: bool = False,
                  urgency_config: Optional[urgency.Config] = None,
                  pass_deadline: int = 0,
+                 decision_window_days: int = 3,
                  repo_pr_caps: Optional[Dict[str, int]] = None) -> None:
         self.home = home
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
@@ -1023,6 +1126,7 @@ class Settings:
         # stack and exits (PASS_DEADLINE). 0, the default for a Settings
         # built in code, arms nothing.
         self.pass_deadline = pass_deadline
+        self.decision_window_days = max(1, int(decision_window_days))
         # LOOM_URGENCY_*: score each ask before it is routed (bus/urgency.py,
         # loom#1787). Off for a Settings built in code; from_env defaults to
         # shadow, which records scores and still routes by the label rules.
@@ -1094,6 +1198,9 @@ class Settings:
         # read-only kubeconfig) an adapter is handed. Empty is off.
         self.live_evidence_repos = list(live_evidence_repos)
         self.live_evidence_env = dict(live_evidence_env or {})
+        # LOOM_LIVE_EVIDENCE_LENDS: borrower -> lender repo; the borrower
+        # reads the lender's LOG adapter only (live_adapter.lends).
+        self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
@@ -1220,6 +1327,8 @@ class Settings:
                        env.get("LOOM_LIVE_EVIDENCE_REPOS", "")),
                    live_evidence_env=live_adapter.passed_env(
                        env.get("LOOM_LIVE_EVIDENCE_PASS_ENV", ""), env),
+                   live_evidence_lends=live_adapter.lends(
+                       env.get("LOOM_LIVE_EVIDENCE_LENDS", "")),
                    health_urls=env.get("LOOM_HEALTH_URLS", "").strip(),
                    health_every=_seconds(env.get("LOOM_HEALTH_EVERY", ""), health.EVERY),
                    health_diagnose=_health_diagnose(env),
@@ -1248,7 +1357,8 @@ class Settings:
                    thin_snapshots=env.get("LOOM_THIN_SNAPSHOTS", "1").strip() != "0",
                    repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
-                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")))
+                   pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -1500,6 +1610,14 @@ def _seconds(raw: str, default: int) -> int:
     return int(raw) if raw.isdigit() and int(raw) >= 60 else default
 
 
+def _decision_window_days(raw: str) -> int:
+    """A positive decision-default window in whole days, else three."""
+    return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+DECISION_DEFAULT_CHECK_EVERY = 3600
+
+
 def _pass_deadline(raw: str) -> int:
     """LOOM_PASS_DEADLINE: 0 turns the deadline off; a whole number of
     seconds of at least 60 is used; anything else is PASS_DEADLINE."""
@@ -1586,14 +1704,7 @@ def _disarm_pass_deadline(path: Optional[str]) -> None:
 
 def _origin_repo() -> str:
     """owner/name of this checkout's origin remote, or "" when unknown."""
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    try:
-        out = subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
-                             capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    m = REMOTE_RE.search(out.stdout.strip()) if out.returncode == 0 else None
-    return m.group(1) if m else ""
+    return home_repo.origin_repo()
 
 
 def _checkout_head() -> str:
@@ -1708,7 +1819,9 @@ def discord_call(method: str, path: str, token: str,
         data=None if body is None else json.dumps(body).encode("utf-8"),
         headers={"Authorization": "Bot " + token,
                  "Content-Type": "application/json",
-                 "User-Agent": "DiscordBot (https://github.com/quadseven/loom, 1)"})
+                 "User-Agent": "DiscordBot (%s, 1)" % (
+                     "https://github.com/" + FACTORY_REPO if FACTORY_REPO
+                     else "https://example.com/loom")})
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status, raw = resp.status, resp.read()
@@ -1962,19 +2075,7 @@ def retry_chain(comments: List[Any]) -> Tuple[int, set, Optional[Tuple[str, str]
     pull request, the lanes those retries left, and (from, to) of the latest
     retry when no claim has followed it: a retry whose relabel did not
     happen yet)."""
-    used, left, pending = 0, set(), None
-    for c in comments:
-        body = str(c.get("body") or "").strip() if isinstance(c, dict) else ""
-        m = RETRY_RE.match(body)
-        if m:
-            used += 1
-            left.add(m.group(1))
-            pending = (m.group(1), m.group(2))
-        elif body.startswith("Lane "):
-            used, left, pending = 0, set(), None
-        elif CLAIM_RE.fullmatch(body):
-            pending = None
-    return used, left, pending
+    return history.retry_chain(comments)
 
 
 def scrub(reason: str) -> str:
@@ -2111,6 +2212,18 @@ def rolled_commit(record: str, key: str) -> str:
     return shas.pop() if len(shas) == 1 else ""
 
 
+def _landed_at(path: str, default: float) -> float:
+    """When a brief landed where it is: the later of its mtime and ctime. A
+    lane moves its brief into done/ by rename, which keeps the mtime of when
+    the brief was written and moves the ctime; `default` when it cannot be
+    read."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return default
+    return max(st.st_mtime, st.st_ctime)
+
+
 class Station:
     def __init__(self, gh: GitHub, settings: Settings,
                  now: Optional[float] = None,
@@ -2163,6 +2276,8 @@ class Station:
         self._due: Optional[List[str]] = None
         self._scans: Dict[str, Any] = {}
         self._seen: Dict[str, set] = {}
+        # Compare answers kept across passes (_carries), read on first use.
+        self._compare_memo: Optional[Dict[str, Any]] = None
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
         # The tickets named by After: lines, read once a pass.
@@ -2186,6 +2301,8 @@ class Station:
         # it holds, and the lanes it left idle.
         self._gate_holds: Dict[str, Dict[str, Any]] = {}
         self._repo_pr_counts: Dict[str, Optional[int]] = {}
+        # This pass's briefed tickets _repo_pr_held refused, "owner/repo#n".
+        self._cap_held: set = set()
         self._lanes_issues: Dict[str, int] = {}
         # Free bytes on the loom home's disk, read once a pass (_disk_free).
         self._free: Optional[int] = None
@@ -2202,11 +2319,13 @@ class Station:
         # This pass's closed pull requests and default branches, per repo:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._closed_complete: Dict[str, bool] = {}
         # The claimed settle's re-review requests, by "repo#pull request", as
         # saved in claimed.json, and how many it has written this run.
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._area_cache: Dict[str, List[str]] = {}
         self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
@@ -2659,7 +2778,9 @@ class Station:
                                         + list(self.s.owners)),
                                     linked=self._linked_pulls(repo, number),
                                     demoted_models=self._brief_demoted_models(lane),
-                                    claim=self._lane_claim_label())
+                                    claim=self._lane_claim_label(),
+                                    defaults=answer.default_notes(comments, self.s.authors,
+                                                                  answer.operators(trusted=self.s.authors)))
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -3033,6 +3154,14 @@ class Station:
             ok, reason = self._check_trust(repo, issue)
         except ValueError as err:
             ok, reason = False, "unusable brief: %s" % err
+        if self._target_reached():
+            # Not a refusal: the pass's request target is spent, so the
+            # half-done claim waits for the next pass, as _try_ticket's does.
+            # Refused here, untrusted.json skipped the ticket until an edit
+            # (loom#2583).
+            _say("finishing the claim of %s#%d waits for the next pass: request target reached"
+                 % (repo, number))
+            return
         if not ok:
             os.remove(path)
             self._refuse(repo, issue, reason)
@@ -3213,6 +3342,7 @@ class Station:
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
+        self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
         # free lane of its tier on its own (loom#565), before claims.
@@ -3220,6 +3350,7 @@ class Station:
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
         free = self._not_demoted(free)
+        free = self._prioritize_verifies(free)
         if not free:
             self._claim_candidates([])
             self._record_slot_sample(False)
@@ -3315,20 +3446,27 @@ class Station:
             return
         inv_number, inv_title = dead[lane]
         marker = DEAD_LANE_MARKER % lane
-        if any(str(c.get("body") or "").startswith(marker) for c in comments):
+        reviewed = [str(c.get("body") or "") for c in comments
+                    if str(c.get("body") or "").startswith(marker)]
+        # The marker starts both comments: only a release ends the review. A
+        # hold that stayed for want of a free tier lane is reviewed again each
+        # pass, and released once a lane of its tier is free (loom#2583).
+        if any(DEAD_LANE_RELEASED in body for body in reviewed):
             return
         if repo not in self._publics:
             self._publics[repo] = self._public(repo)
         tier = factory.tier_lanes(issue, not self._publics[repo])
         target = next((x for x in tier if x in free and x not in used), None)
         if target is None:
-            self._comment(repo, number,
-                          "%s\nRunaway hold reviewed: every attempt since the last brief ran "
-                          "on lane %s, which has an open runs-and-none-done invariant "
-                          "(#%d); but no lane of its difficulty tier is free, so the hold "
-                          "stays." % (marker, lane, inv_number), notify.RUNAWAY)
-            _say("%s#%d stays held: its dead lane %s has no free tier lane"
-                 % (repo, number, lane))
+            # Said once: a later pass with no free tier lane posts nothing.
+            if not reviewed:
+                self._comment(repo, number,
+                              "%s\nRunaway hold reviewed: every attempt since the last brief "
+                              "ran on lane %s, which has an open runs-and-none-done invariant "
+                              "(#%d); but no lane of its difficulty tier is free, so the hold "
+                              "stays." % (marker, lane, inv_number), notify.RUNAWAY)
+                _say("%s#%d stays held: its dead lane %s has no free tier lane"
+                     % (repo, number, lane))
             return
         names = self._drop_claim(n for n in names
                                  if n != RUNAWAY and n != RUNNING and not n.startswith("lane:"))
@@ -3338,10 +3476,11 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": names})
         issue["labels"] = [{"name": n} for n in names]
         self._comment(repo, number,
-                      "%s\nRunaway hold released: every attempt since the last brief ran on "
+                      "%s\n%s: every attempt since the last brief ran on "
                       "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
                       "This is not a failure: the ticket is briefed to lane %s, in its "
-                      "difficulty tier." % (marker, lane, inv_number, inv_title, target),
+                      "difficulty tier." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
+                                            inv_title, target),
                       notify.RUNAWAY)
         used.add(target)
         _say("released runaway %s#%d from dead lane %s to lane %s" % (repo, number, lane, target))
@@ -3461,9 +3600,13 @@ class Station:
 
     def _gate_held(self) -> List[str]:
         """The tickets the unproven-work gate refused this pass, "owner/repo#n":
-        the factory neither counts them as lane load nor moves them."""
-        return ["%s#%d" % (hold["repo"], int(number))
-                for hold in self._gate_holds.values() for number in hold["tickets"]]
+        the factory neither counts them as lane load nor moves them. The
+        tickets of a repo held at its open pull request cap are here too: the
+        station will not claim them, and counted, each kept its lane busy for
+        every other repo's queued tickets (2026-11-06, six idle lanes)."""
+        return (["%s#%d" % (hold["repo"], int(number))
+                 for hold in self._gate_holds.values() for number in hold["tickets"]]
+                + sorted(self._cap_held))
 
     def _record_gate_hold(self, repo: str, issue: Dict[str, Any], limit: int,
                          counts: Dict[Tuple[str, int], int]) -> None:
@@ -3605,39 +3748,115 @@ class Station:
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
+        shipped = [(repo, issue) for repo, issue in shipped
+                   if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
                            if self._adapter_can_verify(repo, issue)}
-        unsearchable = sum(1 for repo, issue in shipped
-                           if "loom:shipped" in _label_names(issue)
-                           and live_needles(issue.get("body")) == []
-                           and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
-        if unsearchable:
-            _say("skipped %d shipped tickets whose Live criterion names no exact string" %
-                 unsearchable)
+        self._note_unsearchable(shipped, adapter_tickets)
         refused = self._verify_refused_ledger()
+        missing = self._verify_missing_ledger()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
-        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets):
+        for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
+                                      missing, check_live=False):
+            issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
+            if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
+                continue
             if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
                     and self._unmeetable_live(repo, issue, reads)):
                 continue
             issue["shipped_at"] = self._shipped_stamp(repo, issue)
-            issue["has_proof"] = self._proven(repo, int(issue["number"]))
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused, adapter_tickets), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing), held
+
+    @staticmethod
+    def _note_unsearchable(shipped: Sequence[Tuple[str, Dict[str, Any]]],
+                           adapter_tickets: set) -> None:
+        count = sum(1 for repo, issue in shipped
+                    if "loom:shipped" in _label_names(issue)
+                    and live_needles(issue.get("body")) == []
+                    and "%s#%s" % (repo, issue.get("number")) not in adapter_tickets)
+        if count:
+            _say("skipped %d shipped tickets whose Live criterion names no exact string" % count)
+
+    def _verify_criteria(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """A shipped ticket without boxes belongs to rewrite, not a lane."""
+        if not _verify_body_known(issue):
+            return False
+        names = _label_names(issue)
+        if (issue.get("state") != "open" or "loom:ticket" not in names
+                or "loom:shipped" not in names or "loom:verified" in names
+                or proof.criteria(issue.get("body"))):
+            return True
+        if self._verify_proof_state(repo, int(issue["number"])) is False:
+            self._return_unverifiable(repo, issue, "triage", "no acceptance criteria checkboxes")
+        return False
+
+    def _verify_proof_state(self, repo: str, number: int) -> Optional[bool]:
+        """Read proof absence strictly before routing a shipped ticket away."""
+        path = "/repos/%s/issues/%d/comments?per_page=100" % (repo, number)
+        url = path
+        comments = []
+        for page in range(SHIP_PAGES):
+            response = self.gh.rest("GET", url)
+            if not self._verify_comments_known(response.data):
+                return None
+            comments.extend(response.data)
+            url, known = self._verify_next_page(path, response, page)
+            if not known:
+                return None
+            if not url:
+                return audit.proven(status.resort(comments), self.s.authors)
+        return None
+
+    @staticmethod
+    def _verify_comments_known(data: Any) -> bool:
+        if not isinstance(data, list):
+            return False
+        for comment in data:
+            if not isinstance(comment, dict) or not isinstance(comment.get("body"), str):
+                return False
+            if "user" not in comment:
+                return False
+            user = comment["user"]
+            if user is not None and (not isinstance(user, dict)
+                                     or not isinstance(user.get("login"), str)):
+                return False
+        return True
+
+    def _verify_has_merge(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Unknown or truncated GitHub reads never prove that no PR merged."""
+        _, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        if error:
+            return False
+        if pulls:
+            return True
+        if self._closed_complete.get(repo, False):
+            self._return_unverifiable(repo, issue, "queued", "no merged pull request")
+        return False
+
+    def _return_unverifiable(self, repo: str, issue: Dict[str, Any], state: str,
+                             reason: str) -> None:
+        names = _label_names(issue)
+        states = {"loom:" + value for value in brain.STATES + tickets.TICKET_STATES}
+        labels = [n for n in names if n not in states and not n.startswith("lane:")
+                  and n != brain.AWAITING_EVIDENCE]
+        labels.append("loom:" + state)
+        number = int(issue["number"])
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        issue["labels"] = [{"name": n} for n in labels]
+        self._forget_verify_attempt(repo, number)
+        _say("%s#%d left verify for %s: %s" % (repo, number, state, reason))
 
     def _adapter_can_verify(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether this opted-in repo can send a prose Live box to a verify
         lane for an adapter step proposed by that lane."""
-        body = str(issue.get("body") or "")
-        live = brain.live_criterion(body, limit=None)
-        if (live == "(no Live criterion on the ticket)"
-                or criteria_gate.check_of(live) is not None
-                or live_proof.step_of(live)[0] is not None):
+        live = _adapter_live_criterion(str(issue.get("body") or ""))
+        if live is None:
             return False
         return self._live_adapter(repo) is not None
 
@@ -3827,7 +4046,7 @@ class Station:
         holds = audit.held(self.gh, self._verify_repos(), self.s.authors, self.now)
         for lane, until in sorted(holds.items()):
             _say("lane %s takes no verify run until %s: a proof it made failed its audit"
-                 % (lane, time.strftime("%Y-%m-%dT%H:%MZ", time.gmtime(until))))
+                 % (lane, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))))
         return holds
 
     def _reserve_verify(self, free: List[str]) -> List[str]:
@@ -3846,6 +4065,44 @@ class Station:
             return free
         _write_json(path, {"at": self.now})
         self._hand_verifies(free, starved_for=VERIFY_RESERVE_AFTER, limit=1)
+        return [lane for lane in free if self._inbox_empty(lane)]
+
+    def _shipped_median(self) -> Optional[float]:
+        """Read the fresh station stamp without starting another repo scan."""
+        cached = metrics.read_shipped_row(self.state, self.now)
+        return cached["median_h"] if cached is not None else None
+
+    def _refresh_shipped_priority_stamp(self) -> None:
+        """Refresh shipped waits after this pass's deadline-bound reads."""
+        if metrics.read_shipped_row(self.state, self.now) is not None or self._deferred():
+            return
+        try:
+            row = metrics.shipped_row(self.gh, self._verify_repos(), self.now)
+        except TargetReached as err:
+            _say("shipped wait stamp carried over to the next pass: %s" % err)
+            return
+        except RateLimited:
+            _say("shipped wait stamp waits for the GitHub rate-limit reset")
+            return
+        except (GitHubError, OSError, TypeError, ValueError) as err:
+            _say("could not refresh shipped wait stamp: %s" % err)
+            return
+        _write_json(os.path.join(self.state, VERIFY_PRIORITY_FILE), {
+            "at": self.now,
+            "n": row["n"] if row else 0,
+            "median_h": row["median_h"] if row else None,
+        })
+
+    def _prioritize_verifies(self, free: List[str]) -> List[str]:
+        """Drain overdue shipped work before new briefs while its median is high."""
+        if not free:
+            return free
+        median = self._shipped_median()
+        if median is None or median < VERIFY_PRIORITY_MEDIAN_H:
+            return free
+        _say("shipped median wait %.1fh is at or over %.0fh: verify runs take free lanes "
+             "ahead of build briefs" % (median, VERIFY_PRIORITY_MEDIAN_H))
+        self._hand_verifies(free, starved_for=VERIFY_PRIORITY_AFTER, queued_holds=False)
         return [lane for lane in free if self._inbox_empty(lane)]
 
     def note_stale_shipped(self) -> None:
@@ -3955,7 +4212,7 @@ class Station:
         ledger[key] = {"at": self.now}
 
     def _hand_verifies(self, idle: List[str], starved_for: float = 0.0,
-                       limit: int = 0) -> None:
+                       limit: int = 0, queued_holds: Optional[bool] = None) -> None:
         """Give each idle slot that may verify, has no build work and is
         empty one shipped ticket to verify. The ticket keeps its labels: the
         station moves it when the result comes back (_report_verify).
@@ -3969,7 +4226,8 @@ class Station:
         attempts = _read_json(path, {}, strict=False)
         attempts = attempts if isinstance(attempts, dict) else {}
         try:
-            pool, held = self._verify_pool(attempts, queued_holds=not starved_for)
+            pool, held = self._verify_pool(
+                attempts, queued_holds=queued_holds if queued_holds is not None else not starved_for)
         except RateLimited:
             raise
         except GitHubError as err:
@@ -4002,8 +4260,12 @@ class Station:
         if brain.WAIT_LIVE_EVENT in _label_names(issue):
             self._clear_live_event(repo, number)
         stamp = int(self.now)
+        adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
+                        if self._adapter_can_verify(repo, issue) else None)
         text = tickets.render_verify_brief(
-            repo, issue, lane, stamp, brain.live_criterion(issue.get("body")))
+            repo, issue, lane, stamp,
+            adapter_live or brain.live_criterion(issue.get("body")),
+            live_criteria=[adapter_live] if adapter_live else None)
         text += self._verify_github_data(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:
@@ -4279,34 +4541,13 @@ class Station:
         """Apply a finished verify run. A failed run changes nothing: the
         ticket is due again once its cooldown is over."""
         if kind == "failed":
-            klass = failure_class(self._failure_reason(lane, name))
-            if klass in ("transient", "limit"):
-                # The run never looked at the ticket: it costs the ticket no
-                # cooldown, and a lane failing this way twice sits out an hour
-                # (loom#714).
-                self._forget_verify_attempt(repo, number)
-                held = klass == "transient" and self._verify_strike(lane)
-                _say("verify run %s failed [%s]; %s#%d is due again now%s"
-                     % (name, klass, repo, number,
-                        "; lane %s takes no verify run for an hour after %d transient "
-                        "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
-                return True
-            self._verify_clear(lane)
-            # Status, not a fault: the ticket waits its cooldown. The line
-            # names the class and the reason the runner recorded, which it
-            # once left out, so a repeat could not be diagnosed (loom#463);
-            # the log watcher reads it as status (watch.VERIFY_RUN_RE).
-            reason = self._failure_reason(lane, name)
-            _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
-                 "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
-                                     VERIFY_INTERVAL // 3600))
-            return True
+            return self._report_verify_failed(lane, repo, number, name)
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
         issue = self._issue(repo, number)
-        active = (issue.get("state") == "open" and "loom:shipped" in _label_names(issue)
-                  and "loom:verified" not in _label_names(issue))
-        if active and self._adapter_can_verify(repo, issue) and not (
+        if not _verify_active(issue) or self._missing_handoff(repo, number, result, issue, lane + "/" + name):
+            return True
+        if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
             self._adapter_human_ask(repo, number, "no adapter_step was returned",
@@ -4325,6 +4566,30 @@ class Station:
             self._refute_merged(lane, repo, number, result["unmet"])
         else:
             self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+        return True
+
+    def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
+        klass = failure_class(self._failure_reason(lane, name))
+        if klass in ("transient", "limit"):
+            # The run never looked at the ticket: it costs the ticket no
+            # cooldown, and a lane failing this way twice sits out an hour
+            # (loom#714).
+            self._forget_verify_attempt(repo, number)
+            held = klass == "transient" and self._verify_strike(lane)
+            _say("verify run %s failed [%s]; %s#%d is due again now%s"
+                 % (name, klass, repo, number,
+                    "; lane %s takes no verify run for an hour after %d transient "
+                    "verify failures in a row" % (lane, VERIFY_STRIKES) if held else ""))
+            return True
+        self._verify_clear(lane)
+        # Status, not a fault: the ticket waits its cooldown. The line
+        # names the class and the reason the runner recorded, which it
+        # once left out, so a repeat could not be diagnosed (loom#463);
+        # the log watcher reads it as status (watch.VERIFY_RUN_RE).
+        reason = self._failure_reason(lane, name)
+        _say("verify run %s failed [%s]: %s; %s#%d stays shipped and is tried again "
+             "after %d hours" % (name, klass, CLASS_RE.sub("", reason), repo, number,
+                                 VERIFY_INTERVAL // 3600))
         return True
 
     def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
@@ -4541,6 +4806,46 @@ class Station:
         _say("%s#%d: the merged change does not meet its criteria; queued for a build (lane %s)"
              % (repo, number, lane))
 
+    def _verify_missing_ledger(self) -> Dict[str, Any]:
+        data = _read_json(os.path.join(self.state, VERIFY_MISSING_FILE), {}, strict=False)
+        return data if isinstance(data, dict) else {}
+
+    def _missing_handoff(self, repo: str, number: int, result: Any,
+                         issue: Dict[str, Any], run: str) -> bool:
+        """Count distinct runs, not retries of one partly applied result."""
+        data = self._verify_missing_ledger()
+        key = "%s#%d" % (repo, number)
+        record = data.get(key)
+        record = record if isinstance(record, dict) else {}
+        reasons = record.get("reasons", {})
+        reasons = reasons if isinstance(reasons, dict) else {}
+        runs = record.get("runs", [])
+        runs = runs if isinstance(runs, list) else []
+        if not isinstance(result, dict) or set(result) != {"missing"}:
+            return False
+        reason = self._note_text(result["missing"]).strip()
+        if not _missing_capped(reasons) and run not in runs:
+            count = reasons.get(reason, 0)
+            reasons[reason] = (count if isinstance(count, int) else 0) + 1
+            data[key] = {"reasons": reasons, "runs": runs + [run]}
+            _write_json(os.path.join(self.state, VERIFY_MISSING_FILE), data)
+        if not _missing_capped(reasons):
+            return False
+        self._handoff_missing(repo, number, issue, reason)
+        return True
+
+    def _handoff_missing(self, repo: str, number: int, issue: Dict[str, Any], reason: str) -> None:
+        if "needs-brain" in _label_names(issue):
+            return
+        if not any(text.startswith(VERIFY_MISSING_MARKER)
+                   for text in self._status_texts(repo, number)):
+            notify.post(self.gh, repo, number,
+                        VERIFY_MISSING_MARKER + "\n"
+                        "The station stops handing this ticket out to verify after %d "
+                        "missing answers with the same reason. The brain must prove or "
+                        "rewrite it.\n\n%s" % (VERIFY_REFUSAL_CAP, reason), notify.PROOF_REFUSED)
+        self._add_label(repo, number, "needs-brain")
+
     def _verify_refused_ledger(self) -> Dict[str, Any]:
         # One station pass runs at a time (run() holds station.lock) and applies
         # verify results one after another, and _write_json replaces the file
@@ -4549,9 +4854,10 @@ class Station:
         return data if isinstance(data, dict) else {}
 
     def _forget_refusals(self, repo: str, number: int) -> None:
-        data = self._verify_refused_ledger()
-        if data.pop("%s#%d" % (repo, number), None) is not None:
-            _write_json(os.path.join(self.state, VERIFY_REFUSED_FILE), data)
+        for filename in (VERIFY_REFUSED_FILE, VERIFY_MISSING_FILE):
+            data = _read_json(os.path.join(self.state, filename), {}, strict=False)
+            if isinstance(data, dict) and data.pop("%s#%d" % (repo, number), None) is not None:
+                _write_json(os.path.join(self.state, filename), data)
 
     def _proof_refused(self, repo: str, number: int, lane: str, names: List[str],
                        why: str) -> None:
@@ -4576,7 +4882,11 @@ class Station:
                     len(reasons), "\n".join("- " + self._note_text(x) for x in reasons)),
                 notify.PROOF_REFUSED)
             self._add_label(repo, number, "needs-brain")
-        _say("%s#%d left the verify queue after %d refused proofs; left for the brain"
+        if "needs-brain" not in _label_names(self._issue(repo, number)):
+            _say("%s#%d verify queue exit was not tracked after %d refused proofs"
+                 % (repo, number, len(reasons)))
+            raise RuntimeError("verify queue exit was not tracked for %s#%d" % (repo, number))
+        _say("%s#%d verify queue exit tracked after %d refused proofs; handed to the brain"
              % (repo, number, len(reasons)))
 
     def _forget_verify_attempt(self, repo: str, number: int) -> None:
@@ -4992,6 +5302,7 @@ class Station:
         if self._last_repo_pr_hold(repo, int(issue["number"])) != reason:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
+        self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
@@ -5015,7 +5326,7 @@ class Station:
                     self._publics[repo] = self._public(repo)
                 if not self._publics[repo]:
                     name = "private repo %d" % (self.s.repos.index(repo) + 1)
-            lines.append("Open pull requests: %s %s/%d" % (
+            lines.append(PR_LINE_PREFIX + "%s %s/%d" % (
                 name, "unread" if count is None else count, cap))
         return lines
 
@@ -5031,7 +5342,15 @@ class Station:
         names = _label_names(issue)
         body = str(issue.get("body") or "")
         found = brief_check.health_verdict(body)
-        if found is None and not set(names) & {REGRESSION, factory.REVERT_LABEL}:
+        exempt = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
+        if found is None and not exempt:
+            try:
+                found = brief_check.area_verdict(issue, self._area_labels(repo))
+            except GitHubError as err:
+                _say("%s#%d waits: the area check could not read the repo's labels (%s)"
+                     % (repo, number, err))
+                return True
+        if found is None and not exempt:
             try:
                 found = brief_check.check(self.gh, repo, issue,
                                           [c for c in comments if isinstance(c, dict)],
@@ -5052,6 +5371,13 @@ class Station:
                     found.reason, "A lane gets it once its body names the cause on a "
                     "`Cause:` line: why the affected are affected, not what the health read "
                     "counts."))
+            elif found.kind == brief_check.AREA:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once it carries the one `area:` label "
+                    "that names its area of play."))
             elif found.kind == brief_check.CRITERIA:
                 # Added, not put: the label list read before the move is stale.
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -5152,6 +5478,34 @@ class Station:
                 _write_json(path, reported)
                 if kind == "done":
                     scorecard.Scorecard(self.state, self.now).clear_zero_done(lane)
+        if self._prune_reported(reported):
+            _write_json(path, reported)
+
+    def _prune_reported(self, reported: Dict[str, Any]) -> bool:
+        """Drop each reported.json key whose brief is gone from its lane's
+        done/ and failed/: the key is read only beside its brief, and the
+        ledger grew by one key per finished brief, never pruned (loom#2583).
+        A lane whose folders cannot be listed, or that is not in LANES, keeps
+        its keys. True when a key was dropped."""
+        on_disk: Dict[str, Set[str]] = {}
+        for lane in LANES:
+            names: Set[str] = set()
+            try:
+                for kind in ("done", "failed"):
+                    folder = os.path.join(self.inbox(lane), kind)
+                    if os.path.isdir(folder):
+                        names.update(e[:-3] for e in os.listdir(folder) if e.endswith(".md"))
+            except OSError:
+                continue
+            on_disk[lane] = names
+        stale = []
+        for key in reported:
+            lane, _, name = key.partition("/")
+            if lane in on_disk and name not in on_disk[lane]:
+                stale.append(key)
+        for key in stale:
+            del reported[key]
+        return bool(stale)
 
     @staticmethod
     def _pr_ticket_number(repo: str, pr: dict) -> Optional[int]:
@@ -5203,7 +5557,9 @@ class Station:
         state_names = ("queued", "briefed", "running", "pr", "ready", "answered", "failed",
                        "merged", "shipped", "verified", "closed-unmerged")
         states = {"loom:" + state for state in state_names}
-        kept = self._drop_claim(name for name in labels if name not in states)
+        kept = self._drop_claim(
+            name for name in labels
+            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -5378,27 +5734,6 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
-        # Also check contributor-linked tickets for merging
-        for pr in closed if isinstance(closed, list) else []:
-            if isinstance(pr, dict) and pr.get("state") == "closed":
-                merged = self._terminal_label(pr) == "loom:merged"
-                if not merged:
-                    continue
-                # Find tickets linked by this contributor PR
-                author = tickets._login(pr.get("user"))
-                if author in trusted_authors:
-                    continue
-                # Look for tickets this contributor owns and linked by this PR
-                number = self._pr_ticket_number(repo, pr)
-                if number is not None:
-                    ticket = tickets_by_number.get(number)
-                    if ticket is not None and self._contributor_ticket(repo, pr, author) is ticket:
-                        # This is a contributor-linked ticket
-                        pool = tickets_by_number if merged else waiting
-                        self._reconcile_pr_ticket(repo, pr, pool, landed)
-                        # Check if it moved to merged
-                        if "loom:merged" in _label_names(ticket):
-                            _say("%s#%d: contributor-linked pull request #%d moved to loom:merged" % (repo, number, int(pr["number"])))
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
@@ -5620,8 +5955,9 @@ class Station:
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
-                     self.release_factory_held)
+                     self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
+        paused = self._paused_steps(steps)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
@@ -5646,6 +5982,9 @@ class Station:
                             steps[next_step].__name__))
                     break
                 step = steps[next_step]
+                if step.__name__ in paused:
+                    _say("step %s paused (LOOM_PAUSED_STEPS)" % step.__name__)
+                    continue
                 try:
                     if not self._timed(step):
                         if carried == step.__name__:
@@ -5672,6 +6011,24 @@ class Station:
                 _write_json(rotation_path, {"next": next_step, "carried": next_carried})
             except OSError as err:
                 _say("could not record the step rotation: %s" % err)
+
+    def _paused_steps(self, steps: Sequence[Any]) -> Set[str]:
+        """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
+        pass, read again each pass so a pause or its removal needs no reload.
+        An unreadable file pauses nothing; an unknown name is logged and
+        ignored, never raised."""
+        names = os.environ.get("LOOM_PAUSED_STEPS", "").split()
+        try:
+            with open(os.path.join(self.state, PAUSED_STEPS_FILE)) as fh:
+                names.extend(fh.read().split())
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeDecodeError) as err:
+            _say("could not read %s: %s" % (PAUSED_STEPS_FILE, err))
+        known = {step.__name__ for step in steps}
+        for name in sorted(set(names) - known):
+            _say("unknown paused step %s, ignored" % name)
+        return set(names) & known
 
     def _note_every_pass(self) -> None:
         """The missing-evidence note pass, run every pass ahead of the step
@@ -5901,19 +6258,68 @@ class Station:
         requests survives."""
         if repo not in self._closed_cache:
             pulls: List[Dict[str, Any]] = []
+            complete = True
             url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                                   "&direction=desc&per_page=100" % repo)
-            for _ in range(SHIP_PAGES):
+            for page in range(SHIP_PAGES):
                 resp = self.gh.rest("GET", url)
-                for pr in resp.data if isinstance(resp.data, list) else []:
-                    if isinstance(pr, dict) and pr.get("merged_at") \
-                            and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or "")):
-                        pulls.append(pr)
-                url = _next_link(resp.headers.get("link", ""))
+                merged, known = self._closed_page(resp.data)
+                pulls.extend(merged)
+                url, pagination_known = self._closed_next(repo, resp, page)
+                complete = complete and known and pagination_known
                 if not url:
                     break
+            self._closed_complete[repo] = complete and not url
             self._closed_cache[repo] = pulls
         return self._closed_cache[repo]
+
+    def _closed_page(self, data: Any) -> Tuple[List[Dict[str, Any]], bool]:
+        if not isinstance(data, list):
+            return [], False
+        merged = []
+        complete = True
+        for pr in data:
+            if not isinstance(pr, dict) or "merged_at" not in pr:
+                complete = False
+            elif pr["merged_at"] is not None:
+                if (isinstance(pr["merged_at"], str) and metrics.stamp(pr["merged_at"]) > 0
+                        and COMMIT_RE.fullmatch(str(pr.get("merge_commit_sha") or ""))
+                        and isinstance(pr.get("head") or {}, dict)):
+                    merged.append(pr)
+                    complete = complete and self._verify_link_fields(pr)
+                else:
+                    complete = False
+        return merged, complete
+
+    @staticmethod
+    def _closed_next(repo: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        path = "/repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100" % repo
+        return Station._verify_next_page(path, resp, page)
+
+    @staticmethod
+    def _verify_next_page(path: str, resp: Any, page: int) -> Tuple[Optional[str], bool]:
+        link = resp.headers.get("link", "")
+        following = _next_link(link)
+        if not following and "next" in link:
+            return None, False
+        if not following and isinstance(resp.data, list) and len(resp.data) >= 100:
+            # Cached full pages can lose their next link; probe one more page.
+            following = path + "&page=%d" % (page + 2)
+        return following, True
+
+    @staticmethod
+    def _verify_link_fields(pr: Dict[str, Any]) -> bool:
+        """Absent linkage fields are unknown, not evidence of no reference."""
+        head = pr.get("head")
+        return ("body" in pr and (pr["body"] is None or isinstance(pr["body"], str))
+                and isinstance(head, dict) and isinstance(head.get("ref"), str)
+                and bool(head["ref"]))
+
+    def _area_labels(self, repo: str) -> List[str]:
+        """The repo's `area:` labels (bus/brief_check.py), cached for the pass."""
+        if repo not in self._area_cache:
+            self._area_cache[repo] = brief_check.area_labels(self.gh, repo)
+        return self._area_cache[repo]
 
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""
@@ -6706,14 +7112,43 @@ class Station:
 
     def _carries(self, repo: str, commit: str, revision: str) -> bool:
         """The commit is the revision or one of its ancestors in the repo on
-        GitHub (the compare API); an unknown commit is not."""
+        GitHub (the compare API); an unknown commit is not. An answer for two
+        full commit SHAs is read from and kept in COMPARES_FILE."""
+        key = "%s %s %s" % (repo, commit, revision)
+        fixed = bool(COMMIT_RE.fullmatch(commit) and COMMIT_RE.fullmatch(revision))
+        known = self._compares().get(key) if fixed else None
+        if isinstance(known, bool):
+            return known
         resp = self.gh.rest("GET", "/repos/%s/compare/%s...%s" % (repo, commit, revision),
                             ok=(404,))
         data = resp.data if resp.status != 404 and isinstance(resp.data, dict) else {}
-        return data.get("status") in ("ahead", "identical")
+        status = data.get("status")
+        if fixed and status in COMPARE_STATUSES:
+            self._keep_compare(key, status in ("ahead", "identical"))
+        return status in ("ahead", "identical")
+
+    def _compares(self) -> Dict[str, Any]:
+        """The kept compare answers, read once a pass."""
+        if self._compare_memo is None:
+            saved = _read_json(os.path.join(self.state, COMPARES_FILE), {}, strict=False)
+            self._compare_memo = saved if isinstance(saved, dict) else {}
+        return self._compare_memo
+
+    def _keep_compare(self, key: str, carried: bool) -> None:
+        memo = self._compares()
+        memo[key] = carried
+        for old in list(memo)[:max(0, len(memo) - COMPARES_MAX)]:
+            del memo[old]
+        try:
+            _write_json(os.path.join(self.state, COMPARES_FILE), memo)
+        except OSError as err:
+            _say("could not save compare answers: %s" % err)
 
     def _ship_published(self, source: str, short: str, deploy: str, pin: Dict[str, Any],
                         left: List[int]) -> bool:
+        # Nothing more moves this pass: read nothing for the pin (loom#2357).
+        if left[0] <= 0:
+            return False
         commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (source, short),
                               ok=(404, 422))
         revision = str((commit.data or {}).get("sha") or "") \
@@ -7418,6 +7853,10 @@ class Station:
 
     def _mark_ready(self, repo: str, number: int, sha: str, names: List[str],
                     ready: Optional[str]) -> None:
+        decision = merge_verdict.decide({"head_sha": sha})
+        if not decision.ready:
+            self._remove_ready_if_present(repo, number, names)
+            return
         if "loom:ready" not in names:
             self._add_label(repo, number, "loom:ready")
         # Routine, so an event in the status comment rather than a comment of
@@ -7605,8 +8044,7 @@ class Station:
                                % (repo, repo.split("/")[0], branch)).data
             url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
             if not url:
-                _say("no pull request found yet for %s (%s)" % (name, branch))
-                return False
+                return self._done_without_pr(repo, number, lane, path, name, branch)
             self._relabel(repo, number, "loom:pr")
             if self._field(text, "Fix-PR").isdigit():
                 self._post_answers(repo, int(self._field(text, "Fix-PR")), lane, name, text)
@@ -7632,6 +8070,22 @@ class Station:
             return True
         if not self._report_failure(repo, number, lane, text, name):
             return False
+        self._never_left_running(repo, number, lane)
+        return True
+
+    def _done_without_pr(self, repo: str, number: int, lane: str, path: str, name: str,
+                         branch: str) -> bool:
+        """A done brief whose pull request is not found: read again each pass
+        until DONE_NO_PR_WAIT after the brief landed in done/. Past that the
+        run is over with no pull request, so it is reported and takes the
+        failure path; it retried forever and held its ticket loom:running
+        (loom#2583)."""
+        age = self.now - _landed_at(path, self.now)
+        if age < DONE_NO_PR_WAIT:
+            _say("no pull request found yet for %s (%s)" % (name, branch))
+            return False
+        _say("no pull request found for %s (%s) %d minutes after its run; reported"
+             % (name, branch, age // 60))
         self._never_left_running(repo, number, lane)
         return True
 
@@ -7961,6 +8415,7 @@ class Station:
         ticket goes back to briefed, where the factory moves it to the next
         lane; a fix brief's goes back to loom:pr, where the factory sends its
         pull request back again."""
+        repeated = self._limit_already_reported(repo, number, lane)
         self._relabel(repo, number, "loom:pr" if fix else BRIEFED,
                       wait="" if fix else "model-limit")
         # No new comment: a limit is not news, and one comment a bounce
@@ -7968,7 +8423,23 @@ class Station:
         # event is an edit, and it ends the claim as [limit], so the runaway
         # detector does not count it as work.
         self._stopped(repo, number, lane, "limit", reason)
-        _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+        if not repeated:
+            _say("reported %s#%d limited on lane %s: %s" % (repo, number, lane, reason))
+
+    def _limit_already_reported(self, repo: str, number: int, lane: str) -> bool:
+        """Whether this lane's latest outcome for the ticket was already a limit.
+
+        Reclaims are routine while a provider limit persists. Keep each claim's
+        [limit] status event for the attempt ledger, but log the condition only
+        once until this lane later has a different outcome.
+        """
+        events = self._status_texts(repo, number)
+        prefix = "Lane %s stopped: [limit] " % lane
+        for event in reversed(events):
+            if event.startswith("Claimed for lane "):
+                continue
+            return event.startswith(prefix)
+        return False
 
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
@@ -8443,26 +8914,17 @@ class Station:
     def _nothing_to_fix(self, repo: str, number: int, pr: int, lane: str, name: str) -> None:
         """A fix brief that ended with nothing committed. Most often the lane
         found every thread already fixed (a stale review thread) and said
-        so. Its explanation goes on the pull request, the review bot is asked
+        so. Its explanation stays in the local lane log, the review bot is asked
         to review the head again (it resolves what it no longer raises), and
         the ticket returns to loom:pr. If the review still stands, the factory
         sends it back a rung up the model ladder (bus/factory.py), so this
         never loops on one lane."""
-        said = self._lane_said(lane, name)
-        body = "Lane %s made no change for this fix." % lane
-        if said:
-            body = "Lane %s made no change for this fix. It said:\n\n%s" % (
-                lane, "\n".join("> " + line for line in said.splitlines()))
-        try:
-            _text.check(body)
-        except ValueError:
-            body = ("Lane %s made no change for this fix; its explanation did not "
-                    "pass the text checks and is in the lane log." % lane)
-        self._comment(repo, pr, body, notify.NOTE)
+        # Routine lane prose remains in the existing local run log. Only
+        # the review command reaches the PR; findings still use their threads.
         self._comment(repo, pr, factory.review_again(), notify.REVIEW_REQUEST)
         self._relabel(repo, number, "loom:pr")
         self._comment(repo, number, "Lane %s made no change for the fix to #%d and said why "
-                      "on the pull request; the review bot was asked to review it again."
+                      "in its local run log; the review bot was asked to review it again."
                       % (lane, pr), notify.NOTE)
         _say("reported %s#%d: no change for #%d; review requested" % (repo, number, pr))
 
@@ -8504,11 +8966,9 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = self._drop_claim(n for n in names if n != RUNNING and not n.startswith(WAIT))
-        if new not in labels:
-            labels.append(new)
-        if wait:
-            labels.append(WAIT + wait)
+        labels = ticket_move.next_labels(names, new, wait=wait,
+                                         own_logins=self.s.authors,
+                                         clear_needs_brain=False)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                      {"labels": labels})
 
@@ -8682,6 +9142,27 @@ class Station:
         made = notify.post(self.gh, repo, number, body, notify.RECORD).data
         return int(made["id"]) if isinstance(made, dict) and "id" in made else None
 
+    def _carried_pr_lines(self) -> Tuple[Optional[List[str]], Optional[float], List[str]]:
+        """(stored lines, their read time, lines to show) for a publish that
+        spends no pull request reads (loom#2652). The last counted publish's
+        lines carry forward under their read time; with none stored, as after
+        a restart, the counts are pending. Lines saved for another status repo
+        or repo list are pending too: their private repo masking was for that
+        audience, and masking again would spend visibility reads. It reads no
+        GitHub state."""
+        saved = _read_json(os.path.join(self.state, "lanes.json"), {}, strict=False)
+        if (not isinstance(saved, dict) or saved.get("repo") != self.s.status_repo
+                or saved.get("pr_repos") != list(self.s.repos)):
+            saved = {}
+        lines, read_at = saved.get("pr_lines"), saved.get("pr_read_at")
+        if (not isinstance(lines, list) or not lines
+                or not all(isinstance(line, str) and line.startswith(PR_LINE_PREFIX)
+                           for line in lines)
+                or isinstance(read_at, bool) or not isinstance(read_at, (int, float))):
+            return None, None, [PR_LINE_PREFIX + "pending this pass"]
+        label = "Open pull requests (read %s): " % time.strftime("%H:%MZ", time.gmtime(read_at))
+        return lines, read_at, [label + line[len(PR_LINE_PREFIX):] for line in lines]
+
     def publish_lanes(self, refresh_pr_counts: bool = True) -> None:
         repo = self.s.status_repo
         if not repo:
@@ -8702,16 +9183,22 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
-        pr_lines = (self._repo_pr_lines() if refresh_pr_counts
-                    else ["Open pull requests: pending this pass"])
+        if refresh_pr_counts:
+            read_lines, read_at = self._repo_pr_lines(), self.now
+            pr_lines = read_lines
+        else:
+            read_lines, read_at, pr_lines = self._carried_pr_lines()
         values["open PRs"] = "\n".join(pr_lines)
         if self._lanes_unchanged(repo, values):
             return
         number = self._lanes_issue(repo)
         comment_id = self._upsert_lanes_comment(repo, number, self._lanes_body(rows, pr_lines))
-        _write_json(os.path.join(self.state, "lanes.json"),
-                    {"repo": repo, "issue": number, "comment_id": comment_id,
-                     "values": values, "at": self.now})
+        record = {"repo": repo, "issue": number, "comment_id": comment_id,
+                  "values": values, "at": self.now}
+        if read_lines is not None:
+            record.update(pr_lines=read_lines, pr_read_at=read_at,
+                          pr_repos=list(self.s.repos))
+        _write_json(os.path.join(self.state, "lanes.json"), record)
         _say("published lane status to %s#%d" % (repo, number))
 
     # -- asks -------------------------------------------------------------
@@ -8774,53 +9261,108 @@ class Station:
                 _say("could not list %s issues in %s: %s" % (HUMAN, repo, err))
                 return None
             found += [(repo, i) for i in items if isinstance(i, dict)
-                      and "pull_request" not in i and i.get("html_url") and "number" in i]
+                      and "pull_request" not in i and i.get("html_url") and "number" in i
+                      and not any(n.startswith("blocked:") for n in _label_names(i))]
         found.sort(key=lambda f: (str(f[1].get("created_at") or ""), int(f[1]["number"])),
                    reverse=True)
         return found
 
-    def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The first line of the newest needs:human comment from an allowed
-        login (the brain's ask), or "" when there is none."""
-        allowed = {a.lower() for a in self.s.authors}
-        # paginate follows the next links, so the newest comment is read however
-        # long the thread is. Only the HUMAN_SHOWN listed issues are read, once a
-        # day when the digest is due. A GitHubError is left to _human_text,
-        # which holds the whole digest rather than send a list missing an ask.
-        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100"
-                                    % (repo, int(issue["number"])))
-        for c in reversed(comments):
-            body = str(c.get("body") or "") if isinstance(c, dict) else ""
-            if body.startswith(HUMAN_MARKER) and tickets._login(c.get("user")) in allowed:
-                lines = [ln.strip() for ln in body[len(HUMAN_MARKER):].splitlines() if ln.strip()]
-                return _clip(lines[0], HUMAN_ASK_MAX) if lines else ""
-        return ""
-
-    def _human_text(self, found: List[Tuple[str, Dict[str, Any]]]) -> Optional[str]:
-        """The digest's "Waiting on you" section: the newest HUMAN_SHOWN
-        issues grouped by repo, each with its ask; None when it cannot be read."""
-        shown = found[:HUMAN_SHOWN]
-        head = "%s (%d):" % (HUMAN_HEAD, len(found))
-        if len(found) > len(shown):
-            head = "%s (the %d newest of %d):" % (HUMAN_HEAD, len(shown), len(found))
-        lines = [head]
-        for repo in dict.fromkeys(r for r, _ in shown):
-            lines.append(repo)
-            for r, issue in shown:
-                if r != repo:
+    def apply_decision_defaults(self, force: bool = False) -> None:
+        """Apply overdue reversible decision defaults through the answer format."""
+        path = os.path.join(self.state, "decision-defaults.json")
+        state = _read_json(path, {}, strict=False)
+        checked = state.get("at") if isinstance(state, dict) else None
+        if not force and not isinstance(checked, (int, float)):
+            _write_json(path, {"at": self.now})
+            return
+        if (not force and isinstance(checked, (int, float))
+                and 0 <= self.now - checked < DECISION_DEFAULT_CHECK_EVERY):
+            return
+        operators = answer.operators(trusted=self.s.authors)
+        for repo in self.s.repos:
+            candidates = {}
+            for label in (HUMAN, NEEDS_HUMAN):
+                for issue in self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
+                                            % (repo, quote(label, safe=""))):
+                    if isinstance(issue, dict) and "pull_request" not in issue:
+                        candidates[int(issue["number"])] = issue
+            for number in candidates:
+                live = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+                if (not isinstance(live, dict) or live.get("state") != "open"
+                        or not needs_human(_label_names(live))
+                        or any(label.startswith("blocked:") for label in _label_names(live))):
                     continue
-                title = _clip(" ".join(str(issue.get("title") or "").split()), HUMAN_TITLE_MAX)
-                lines.append("- %s %s" % (title, issue["html_url"]))
-                try:
-                    ask = self._human_ask(repo, issue)
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    _say("could not read the ask on %s#%s: %s" % (repo, issue["number"], err))
-                    return None
-                if ask:
-                    lines.append("  %s" % ask)
-        return "\n".join(lines)
+                self._apply_decision_default(repo, live, operators)
+        _write_json(path, {"at": self.now})
+
+    def _apply_decision_default(self, repo: str, issue: Dict[str, Any],
+                                operators: Sequence[str]) -> None:
+        """Record an overdue default without attributing it to any operator."""
+        number = int(issue["number"])
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        selected = self._overdue_decision_default(repo, number, comments)
+        if selected is None:
+            return
+        index, ask, choice = selected
+        later = comments[index + 1:]
+        if any(answer.trusted_answer(c, self.s.authors, operators)
+               or tickets._login(c.get("user")) in operators for c in later if isinstance(c, dict)):
+            return  # an operator answered; the existing answer path owns its labels
+        if not any(answer.trusted_default(c, ask, self.s.authors) for c in later):
+            note = ("Default applied after %d days without an answer. Reverse it by posting a new answer "
+                    "on the Needs-you page." % self.s.decision_window_days)
+            try:
+                record = answer.default_body(ask, choice, note)
+            except ValueError:
+                _say("decision default on %s#%d lacks a valid ask identity; left alone" % (repo, number))
+                return
+            notify.post(self.gh, repo, number, record, notify.RECORD)
+        self._clear_decision_wait(repo, issue, operators)
+
+    def _overdue_decision_default(self, repo: str, number: int, comments: Sequence[Any]
+                                  ) -> Optional[Tuple[int, Dict[str, Any], str]]:
+        """Validate the newest trusted ask and its unchanged waiting window."""
+        asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+                and str(c.get("body") or "").startswith(HUMAN_MARKER)
+                and tickets._login(c.get("user")) in {name.lower() for name in self.s.authors}]
+        if not asks:
+            return None
+        index, ask = asks[-1]
+        body = str(ask.get("body") or "")
+        asked_at = self._epoch(str(ask.get("updated_at") or ask.get("created_at") or ""))
+        try:
+            choice = answer.decision_default(body)
+        except ValueError:
+            _say("decision default on %s#%d is invalid; left for correction" % (repo, number))
+            return None
+        if not choice or asked_at is None or self.now - asked_at < self.s.decision_window_days * 86400:
+            return None
+        return index, ask, choice
+
+    def _clear_decision_wait(self, repo: str, issue: Dict[str, Any], operators: Sequence[str]) -> None:
+        """Remove only person-wait labels after an automated record is present."""
+        number = int(issue["number"])
+        removable = set(HUMAN_LABELS) | {"needs:" + login for login in operators}
+        for label in _label_names(issue):
+            if label in removable:
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s" %
+                             (repo, number, quote(label, safe="")), ok=(404,))
+        if answer.ANSWERED_LABEL not in _label_names(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": [answer.ANSWERED_LABEL]})
+
+    def _vet(self, repo: str, issue: Dict[str, Any]) -> Tuple[str, Optional[ask_block.Block]]:
+        """(VETTED, block) when a trusted brain wrote an ask block on the
+        ticket; (UPKEEP, None) for upkeep no brain marked needs-person, which
+        the factory path owns; (WITH_BRAINS, None) otherwise. A GitHubError
+        is left to _new_digest_plan, which holds the whole digest."""
+        comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100"
+                                  % (repo, int(issue["number"])))
+        block = ask_block.newest(comments, self.s.authors, tickets._login)
+        upkeep = ask_block.is_upkeep(issue, _label_names(issue))
+        if block and (block.needs_person or not upkeep):
+            return VETTED, block
+        return (UPKEEP if upkeep else WITH_BRAINS), None
 
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
@@ -8837,7 +9379,8 @@ class Station:
                 _say("could not list asks in %s: %s" % (repo, err))
                 return None
         # A needs:human issue waits in the digest's own list, never alone.
-        asks = [a for a in asks if HUMAN not in _label_names(a[1])]
+        asks = [a for a in asks if HUMAN not in _label_names(a[1])
+                and not any(n.startswith("blocked:") for n in _label_names(a[1]))]
         asks.sort(key=lambda a: (str(a[1].get("created_at") or ""), a[0], int(a[1]["number"])))
         return [("%s#%s" % (r, i["number"]), r, i) for r, i in asks]
 
@@ -9011,31 +9554,32 @@ class Station:
         return _sha12("%s\n%s" % (issue.get("title") or "", issue.get("body") or ""))
 
     def _plan_digest(self, asks: List[Tuple[str, str, Dict[str, Any]]],
-                     covered_before: Any, today: str) -> Dict[str, Any]:
+                     covered_before: Any, today: str,
+                     vetted: Sequence[Tuple[str, str, Dict[str, Any], ask_block.Block]] = (),
+                     brains: int = 0) -> Dict[str, Any]:
         """Today's digest, fixed before anything is sent so a retry sends the
-        same one. Asks new or changed since the last sent digest go first,
-        newest first, so they are not buried behind old ones."""
-        prev = covered_before if isinstance(covered_before, dict) else {}
+        same one. Only vetted asks are listed, newest vetted first (score
+        order in act mode), at most HUMAN_SHOWN; the rest are counted."""
         covered = {k: self._ask_rev(i) for k, _, i in asks}
-        # Asks ranked by their urgency score (act mode) keep that order.
-        ranked = self._digest_ranked
-        new = [a for a in (asks if ranked else reversed(asks))
-               if prev.get(a[0]) != covered[a[0]]]
-        seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
-        lines = [self._line(i) for _, _, i in new + seen]
+        rows = list(vetted)
+        if not self._digest_ranked:
+            rows.sort(key=lambda r: (r[3].at, r[0]), reverse=True)
+        lines = [ask_block.line(k, b) for k, _, _, b in rows[:HUMAN_SHOWN]]
         lines.extend(self._idle_pull_lines())
         plan: Dict[str, Any] = {
-            "day": today, "covered": covered, "new": len(new),
+            "day": today, "covered": covered, "vetted": len(rows), "brains": brains,
             "lines": lines, "pages": {}}
         whole = "\n".join([self._digest_head(plan)] + plan["lines"])
-        if len(whole) <= DISCORD_MAX - MENTION_ROOM:
+        # Past the listed few, or past one message, the full list of vetted asks
+        # goes to a page per repo and the notification links to it.
+        if len(rows) <= HUMAN_SHOWN and len(whole) <= DISCORD_MAX - MENTION_ROOM:
             return plan
         repos: List[str] = []
-        for _, repo, _ in asks:
+        for _, repo, _, _ in rows:
             if repo not in repos:
                 repos.append(repo)
         plan["pages"] = {repo: {"body": self._page_body(
-            repo, [i for _, r, i in asks if r == repo], today), "url": ""}
+            repo, [i for _, r, i, _ in rows if r == repo], today), "url": ""}
             for repo in repos}
         plan["order"] = repos
         return plan
@@ -9085,18 +9629,30 @@ class Station:
 
     @staticmethod
     def _digest_head(plan: Dict[str, Any]) -> str:
-        return "%s %d, %d new since the last digest" % (DIGEST_HEAD, len(plan["lines"]), plan["new"])
+        vetted = int(plan.get("vetted") or 0)
+        if not vetted:
+            return ""
+        if vetted > HUMAN_SHOWN:
+            return "%s the %d newest of %d" % (DIGEST_HEAD, HUMAN_SHOWN, vetted)
+        return "%s %d" % (DIGEST_HEAD, vetted)
+
+    @staticmethod
+    def _brains_line(brains: int) -> str:
+        if not brains:
+            return ""
+        return "1 ask is with the brains." if brains == 1 else "%d asks are with the brains." % brains
 
     def _digest_text(self, plan: Dict[str, Any]) -> str:
-        """The daily notification: as many asks as fit, then a link per repo
-        to the full digest when some do not."""
-        lines = plan["lines"]
+        """The daily notification: the vetted asks, one line each, then the
+        count still with the brains. With none vetted it holds no ask lines."""
+        lines = plan["lines"] if plan.get("vetted") else []
         head = self._digest_head(plan)
         pages = plan.get("pages") or {}
         tail = ["Every ask, by goal:"] + [
             "- %s %s" % (repo, pages[repo].get("url") or "")
             for repo in plan.get("order") or []] if pages else []
-        room = DISCORD_MAX - MENTION_ROOM - len(head) - sum(len(t) + 1 for t in tail)
+        brains = self._brains_line(int(plan.get("brains") or 0))
+        room = DISCORD_MAX - MENTION_ROOM - len(head) - len(brains) - sum(len(t) + 1 for t in tail)
         keep: List[str] = []
         size = len("- and 9999 more") + 1 if pages else 0
         for line in lines:
@@ -9107,7 +9663,7 @@ class Station:
         if len(keep) < len(lines):
             keep.append("- and %d more" % (len(lines) - len(keep)))
         asks = "\n".join([head] + keep + tail) if lines else ""
-        return "\n\n".join(part for part in (asks, plan.get("human") or "") if part)
+        return "\n\n".join(part for part in (asks, brains) if part)
 
     def _digest_issue(self, repo: str) -> int:
         found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
@@ -9189,18 +9745,36 @@ class Station:
         except GitHubError as err:
             _say("could not read an ask for the digest: %s; next pass" % err)
             return None
-        human = self._human_text(found) if found else ""
-        if human is None or (not asks and not human):
+        try:
+            vetted, brains = self._vet_all(
+                asks + [("%s#%s" % (r, i["number"]), r, i) for r, i in found])
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read an ask for the digest: %s; next pass" % err)
+            return None
+        if not vetted and not brains:
             return None
         try:
-            plan = self._plan_digest(asks, covered, today)
+            return self._plan_digest(asks, covered, today, vetted, brains)
         except RateLimited:
             raise
         except GitHubError as err:
             _say("could not read the goal homes for the digest: %s; next pass" % err)
             return None
-        plan["human"] = human
-        return plan
+
+    def _vet_all(self, items: Sequence[Tuple[str, str, Dict[str, Any]]]
+                 ) -> Tuple[List[Tuple[str, str, Dict[str, Any], ask_block.Block]], int]:
+        """The vetted asks, and how many are still with the brains."""
+        vetted: List[Tuple[str, str, Dict[str, Any], ask_block.Block]] = []
+        brains = 0
+        for key, repo, issue in items:
+            state, block = self._vet(repo, issue)
+            if block:
+                vetted.append((key, repo, issue, block))
+            elif state == WITH_BRAINS:
+                brains += 1
+        return vetted, brains
 
     def _send_digest(self, url: Optional[str], keyed: List[Tuple[str, str, Dict[str, Any]]],
                      ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
@@ -9217,7 +9791,8 @@ class Station:
         if url is None or not self._post_pages(plan, ledger):
             return
         chunks = self._chunks(self._digest_text(plan), DISCORD_MAX - MENTION_ROOM)
-        if all(self._send(url, chunk, mention=n == 0) for n, chunk in enumerate(chunks)):
+        tag = bool(plan.get("vetted"))
+        if all(self._send(url, chunk, mention=tag and n == 0) for n, chunk in enumerate(chunks)):
             # What the operator was sent: each ask's revision and the links.
             sent["digest"] = today
             sent["covered"] = plan["covered"]
@@ -10438,13 +11013,19 @@ class Station:
         """The repo's live-evidence adapter, read once a pass from its default
         branch, for a repo in LOOM_LIVE_EVIDENCE_REPOS; None otherwise or when
         its manifest does not parse (said once a pass)."""
-        if repo not in self.s.live_evidence_repos:
+        home = (repo if repo in self.s.live_evidence_repos
+                else live_adapter.lender_of(repo, self.s.live_evidence_repos,
+                                            self.s.live_evidence_lends))
+        if home is None:
             return None
         cache = self.__dict__.setdefault("_live_adapters", {})
         if repo not in cache:
             def read(path: str) -> Optional[str]:
-                return self._contents_text(repo, path)
+                return self._contents_text(home, path)
             adapter, why = live_adapter.parse(read(live_adapter.MANIFEST), read)
+            if adapter is not None and home != repo:
+                adapter = live_adapter.logs_only(adapter)
+                why = "" if adapter is not None else "%s declares no log command to lend" % home
             if adapter is None:
                 _say("no live-evidence adapter for %s: %s" % (repo, why))
             cache[repo] = None if adapter is None else live_adapter.Runner(
@@ -10640,6 +11221,48 @@ class Station:
         _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
         return True
 
+    def _record_ask(self, repo: str, number: int, body: str) -> None:
+        """Keep which criteria the verification ask of the ticket was made
+        for (criteria_gate.criteria_key), so it is made once per set."""
+        state = self._live_checks()
+        asked = state.get(LIVE_ASKED_KEY)
+        asked = asked if isinstance(asked, dict) else {}
+        asked["%s#%d" % (repo, number)] = criteria_gate.criteria_key(body)
+        state[LIVE_ASKED_KEY] = asked
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+
+    def _asked_already(self, repo: str, number: int, body: str,
+                       gaps: Sequence[Tuple[str, str]]) -> bool:
+        """Whether the verification ask must not be made now (loom#2805):
+        it was made for these same criteria, and a brain or operator has
+        since taken the person label off; or a trusted comment states a
+        `waiting:` line on a ticket whose gaps are all live. An ask the
+        station made before it kept this record counts as made for the
+        criteria it finds now: re-adding the label a brain removed sent a
+        settled live wait back to the operator."""
+        asked = self._live_checks().get(LIVE_ASKED_KEY)
+        asked = asked if isinstance(asked, dict) else {}
+        made = asked.get("%s#%d" % (repo, number))
+        if made == criteria_gate.criteria_key(body):
+            return True
+        trusted = {a.lower() for a in list(self.s.authors)
+                   + answer.operators(trusted=self.s.authors)}
+        try:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the comments of %s#%d before asking: %s" % (repo, number, err))
+            return True
+        mine = [c for c in comments if isinstance(c, dict)
+                and brain.comment_login(c).lower() in trusted]
+        if criteria_gate.live_wait([], gaps, [c.get("body") for c in mine]):
+            return True
+        if made is None and any(criteria_gate.is_verification_ask(c.get("body")) for c in mine):
+            self._record_ask(repo, number, body)
+            return True
+        return False
+
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
@@ -10662,7 +11285,10 @@ class Station:
         waiting = [t for k, t in gaps if k == criteria_gate.LIVE
                    and criteria_gate.check_of(t) is not None
                    and criteria_gate.key(t) not in failed]
-        if waiting or needs_human(_label_names(issue)) or not self._live_ask_room():
+        names = _label_names(issue)
+        if waiting or needs_human(names) or criteria_gate.live_wait(names, gaps, [body]):
+            return True
+        if self._asked_already(repo, number, body, gaps) or not self._live_ask_room():
             return True
         try:
             brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
@@ -10671,6 +11297,7 @@ class Station:
         except (ValueError, GitHubError) as err:
             _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
             return True
+        self._record_ask(repo, number, body)
         _say("held done %s#%d for the operator: %d criteria have no evidence"
              % (repo, number, len(gaps)))
         return True
@@ -10797,6 +11424,21 @@ class Station:
         _say("settled the source of %s#%d: %s" % (repo, ticket, said))
         return 1
 
+    def _requests_sent(self) -> int:
+        """Every request this pass sent so far, 304s and refusals included."""
+        return int(getattr(self.gh, "requests", 0) or 0)
+
+    def _stamp_every(self, state: Dict[str, Any], mark: int) -> None:
+        """Stamp an EVERY step's state file with this run's time, from the
+        step's finally. A step ending on a RateLimited raised by its first
+        request (one request or none sent since `mark`) read nothing, so it
+        is not stamped and the pass after the reset runs it; stamped, it lost
+        a whole EVERY window (loom#2583)."""
+        refused = isinstance(sys.exc_info()[1], RateLimited)
+        if refused and self._requests_sent() - mark <= 1:
+            return
+        state["_at"] = self.now
+
     def settle_claimed_tickets(self) -> None:
         """Settle operator-claimed issues whose pull requests merged
         (bus/claimed.py): an issue with a claim:<login> label and no loom:
@@ -10818,7 +11460,9 @@ class Station:
         if not isinstance(state.get("rereview"), dict):
             state["rereview"] = {}
         self._claimed_rereviews = state["rereview"]
-        # Stamped however the run ends, as settle_orphan_sources is.
+        # Stamped however the run ends, as settle_orphan_sources is, unless
+        # its first request was refused for budget (_stamp_every).
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -10830,7 +11474,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not settle the claimed issues of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             _write_json(path, state)
 
     def queue_stateless_tickets(self) -> None:
@@ -10888,6 +11532,7 @@ class Station:
         if isinstance(last, (int, float)) and 0 <= self.now - last < stale_claims.EVERY:
             return
         left = stale_claims.PER_RUN
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -10900,7 +11545,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not read the claims of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             _write_json(path, state)
 
     def withdraw_held_pr_waits(self) -> None:
@@ -11029,6 +11674,7 @@ class Station:
             return
         notes = state.get("notes") if isinstance(state.get("notes"), dict) else {}
         left = label_pass.PER_RUN
+        mark = self._requests_sent()
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -11040,7 +11686,7 @@ class Station:
                 except GitHubError as err:
                     _say("could not clean the labels of %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             state["notes"] = notes
             _write_json(path, state)
 
@@ -11138,12 +11784,13 @@ class Station:
         whole = False
         due: List[Tuple[str, Dict[str, Any]]] = []
         start = 0
+        mark = self._requests_sent()
         try:
             due, listed = self._all_claims_due()
             ordered, start = claim_referee.in_turn(due, state.get("turn"))
             whole = self._referee_in_turn(ordered, first, budget) and listed
         finally:
-            state["_at"] = self.now
+            self._stamp_every(state, mark)
             state["turn"] = (start + budget["spent"]) % len(due) if due else 0
             if first and whole and self.s.claim_referee == "on":
                 state["swept"] = True
@@ -12523,10 +13170,10 @@ class Station:
         try:
             return self.read_secret(self.s.transcript_token_ssm, self.s.region)
         # Deliberately broad, as in _webhook: an error text must never carry
-        # the secret; only the type is logged.
+        # the secret; only the type, or an SSM read's safe reason, is logged.
         except Exception as err:  # noqa: BLE001
             _say("could not read the transcript token parameter (%s); next pass"
-                 % type(err).__name__)
+                 % secret_read_reason(err))
             return None
 
     def upload_transcripts(self) -> None:
@@ -12599,8 +13246,11 @@ class Station:
         the rules digest's sources that changed. A failed post is tried on
         the next pass, UPLOAD_TRIES times in all; the rules wait for a tick
         that posted. Between ticks, every CLOSE_EVERY seconds, it sends the
-        done markers written since the last send. Uses the transcript upload
-        settings and token."""
+        done markers written since the last send. A refused marker upload
+        retries on exponential back-off (_closings_delay), and after
+        CLOSE_SAFE_AFTER consecutive refusals it caches locally in safe mode
+        until an upload succeeds. Uses the transcript upload settings and
+        token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
             return
         path = os.path.join(self.state, "brain_memory.json")
@@ -12609,9 +13259,13 @@ class Station:
             raise StateError("state file %s does not hold an object" % path)
         last = self._finished_brain_tick()
         tries = self._tick_tries(ledger, last)
-        closed_at = ledger.get("closed_at")
-        close_due = self._num(ledger.get("since")) and not (
-            self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
+        next_at = ledger.get("closings_next_at")
+        if self._num(next_at):
+            close_due = self._num(ledger.get("since")) and self.now >= next_at
+        else:
+            closed_at = ledger.get("closed_at")
+            close_due = self._num(ledger.get("since")) and not (
+                self._num(closed_at) and 0 <= self.now - closed_at < CLOSE_EVERY)
         if tries is None and not close_due:
             return
         token = self._transcript_token()
@@ -12655,6 +13309,10 @@ class Station:
                         token, body)
             result: Any = "sent"
             ledger["since"] = max(since or 0, last["at"] + brain_memory.GRACE)
+            ledger["closings_fails"] = 0
+            ledger.pop("closings_next_at", None)
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
         except UploadRefused as err:
             _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
             result = "refused"
@@ -12670,22 +13328,48 @@ class Station:
     def _post_brain_closings(self, ledger: Dict[str, Any], token: str,
                              found: List[Dict[str, Any]]) -> None:
         """Send the done markers written since the last send, so the
-        commitments they finish close; a failed send is tried CLOSE_EVERY
-        seconds later."""
+        commitments they finish close. A refused upload is logged with its
+        status and retried after exponential back-off (_closings_delay);
+        after CLOSE_SAFE_AFTER consecutive refusals the markers stay in the
+        local ledger cache in safe mode until an upload succeeds. Any other
+        failure is retried CLOSE_EVERY seconds later."""
         ledger["closed_at"] = self.now
         closings = brain_memory.closings(found, ledger["since"])
         if not closings:
+            ledger.pop("closings_next_at", None)
+            ledger["closings_fails"] = 0
+            ledger["closings_safe"] = False
+            ledger.pop("closings_cache", None)
             return
         try:
             self.upload(brain_memory.dashboard_url(self.s.transcript_url,
                                                    brain_memory.COMMITMENTS_PATH),
                         token, {"commitments": [c for _, c in closings]})
+        except UploadRefused as err:
+            raw = ledger.get("closings_fails")
+            fails = int(raw) + 1 if self._num(raw) else 1
+            delay = _closings_delay(fails)
+            ledger["closings_fails"] = fails
+            ledger["closings_next_at"] = self.now + delay
+            ledger["closings_cache"] = [c for _, c in closings]
+            if fails >= CLOSE_SAFE_AFTER:
+                ledger["closings_safe"] = True
+            _say("could not send the brain's done markers (UploadRefused status %d); "
+                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
+                                           "; safe mode on, caching locally"
+                                           if ledger.get("closings_safe") else ""))
+            return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
+            ledger["closings_next_at"] = self.now + CLOSE_EVERY
             _say("could not send the brain's done markers (%s); next in %d minutes"
                  % (type(err).__name__, CLOSE_EVERY // 60))
             return
         ledger["since"] = closings[-1][0] + 1
+        ledger["closings_fails"] = 0
+        ledger.pop("closings_next_at", None)
+        ledger["closings_safe"] = False
+        ledger.pop("closings_cache", None)
 
     def _post_brain_rules(self, ledger: Dict[str, Any], token: str,
                           homes: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]) -> None:
@@ -13029,6 +13713,7 @@ class Station:
         return shown + (" and %d more" % more if more > 0 else "")
 
     # -- stale ask detection -----------------------------------------------
+    STALE_ASK_THROTTLE = 86400
     STALE_ASK_PATTERN = re.compile(r"stale-when:\s*commit\s+([0-9a-f]{7,40})\s+live", re.I)
     ISSUE_EXISTS_PATTERN = re.compile(r"stale-when:\s*issue\s+exists", re.I)
     NEEDS_LABEL_PATTERN = re.compile(r"^needs:([a-z0-9_.-]+)$", re.I)
@@ -13100,9 +13785,11 @@ class Station:
         return self._is_ask_text(str(issue.get("body") or ""))
 
     def _target_labels_after_withdrawal(self, labels: List[str], reason: str) -> List[str]:
-        remaining = [name for name in labels if not self.NEEDS_LABEL_PATTERN.match(name)]
-        if not any(k in remaining for k in ("awaiting-live-check", "loom:queued")):
-            target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        remaining = [name for name in labels
+                     if not self.NEEDS_LABEL_PATTERN.match(name)
+                     and name not in label_pass.STATE_LABELS]
+        target = "awaiting-live-check" if reason.startswith(("commit", "roll")) else "loom:queued"
+        if target not in remaining:
             remaining.append(target)
         return remaining
 
@@ -13164,6 +13851,21 @@ class Station:
                 return self._withdraw_stale_ask(repo, issue, "issue %s exists" % dep_num)
         return False
 
+    def _has_brain_human_marker(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a trusted text on the issue carries the brain's own
+        human-ask marker: only then is a needs:human ask the brain's own
+        stale ask. Anyone can comment on a public repo, and docs/BRAIN.md
+        reads another login's comment as data, never a marker, so only
+        trusted logins' comments count, and the issue body only when a
+        trusted login opened the issue."""
+        number = int(issue.get("number") or 0)
+        comments = brain.trusted_comments(self._get_issue_comments(repo, number),
+                                          self.s.authors)
+        texts = [str(c.get("body") or "") for c in comments]
+        if brain.comment_login(issue).lower() in {a.lower() for a in self.s.authors if a}:
+            texts.append(str(issue.get("body") or ""))
+        return any(text.startswith(HUMAN_MARKER) for text in texts)
+
     def _process_stale_ask_issue(self, issue: Dict[str, Any],
                                  deployed_commits: Set[str],
                                  deployed_issues: Set[Tuple[str, int]]) -> bool:
@@ -13174,6 +13876,9 @@ class Station:
             return False
 
         repo = issue.get("repository", {}).get("full_name") or (self.s.repos[0] if self.s.repos else "")
+        if any(lbl.lower() == NEEDS_HUMAN for lbl in labels) \
+                and not self._has_brain_human_marker(repo, issue):
+            return False
         if not self._has_ask_comment(issue):
             return self._withdraw_stale_ask(repo, issue, "no ask comment")
 
@@ -15070,10 +15775,21 @@ class Station:
 
     def _check_stale_asks(self, last_check: Optional[float] = None, force: bool = False) -> int:
         """Check and withdraw stale needs:login asks after each deploy event and daily.
-        Returns the number of asks withdrawn as stale."""
+        Returns the number of asks withdrawn as stale. The 24-hour throttle
+        reads the persisted last-run time, so it holds at the forced call
+        sites (watch_deploys, roll_source_pins) too: force no longer
+        bypasses it."""
         try:
+            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
+            saved = _read_json(stale_asks_path, {}, strict=False)
+            if not isinstance(saved, dict):
+                saved = {}
             check_time = float(last_check) if isinstance(last_check, (int, float)) else 0.0
-            if not force and check_time > 0 and self.now - check_time < 86400:
+            if not force and check_time > 0 and self.now - check_time < self.STALE_ASK_THROTTLE:
+                return 0
+            saved_at = saved.get("at")
+            if isinstance(saved_at, (int, float)) and not isinstance(saved_at, bool) \
+                    and 0 <= self.now - float(saved_at) < self.STALE_ASK_THROTTLE:
                 return 0
             deployed_commits, deployed_issues = self._get_deployed_items()
             issues = self._open_needs_issues()
@@ -15081,10 +15797,6 @@ class Station:
             self._stale_asks_withdrawn += withdrawn
             if withdrawn:
                 _say("stale ask detection: withdrew %d asks" % withdrawn)
-            stale_asks_path = os.path.join(self.state, "stale_asks_check.json")
-            saved = _read_json(stale_asks_path, {}, strict=False)
-            if not isinstance(saved, dict):
-                saved = {}
             saved["at"] = self.now
             saved["withdrawn_today"] = saved.get("withdrawn_today", 0) + withdrawn
             _write_json(stale_asks_path, saved)
@@ -15130,6 +15842,18 @@ class Station:
             synced.append(repo)
             _write_json(path, {"digest": digest, "repos": synced})
 
+    def _feed_lanes(self) -> None:
+        """Run assign_queued unless the pass is deferred; a GitHub or disk
+        failure is logged and the pass goes on."""
+        if self._deferred():
+            return
+        try:
+            self._timed(self.assign_queued)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("assign_queued failed: %s" % err)
+
     def run_pass(self) -> None:
         if self._budget_exhausted():
             return
@@ -15151,6 +15875,11 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # Briefing a queued ticket onto a free lane comes before the heavy
+            # reads: reconcile_pull_requests and claim_new spend the pass's
+            # request target, and on 2026-11-07 assign_queued carried over
+            # behind them pass after pass, leaving free lanes idle.
+            self._feed_lanes()
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
@@ -15174,13 +15903,8 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
-            if not self._deferred():
-                try:
-                    self._timed(self.assign_queued)
-                except RateLimited:
-                    raise
-                except (GitHubError, OSError) as err:
-                    _say("assign_queued failed: %s" % err)
+            # Again after the claims, for a ticket claimed in this pass.
+            self._feed_lanes()
             try:
                 self.record_scans()
             except OSError as err:
@@ -15201,6 +15925,7 @@ class Station:
                 raise
             except (GitHubError, OSError) as err:
                 _say("watch_logs failed: %s" % err)
+            self._refresh_shipped_priority_stamp()
         finally:
             self._end_pass_locally()
 
@@ -15208,7 +15933,16 @@ class Station:
         """Run the one seven-day comparison of bus/send_back.py, at most
         hourly until it is done; it never runs a second time."""
         from . import send_back
-        repo = send_back.REPO
+        repo = send_back.repo()
+        if not repo:
+            # Opt-in: with no LOOM_SEND_BACK_REPO nothing is written, and
+            # the station says so once per process, not once per pass.
+            global _SEND_BACK_UNSET_SAID
+            if not _SEND_BACK_UNSET_SAID:
+                _SEND_BACK_UNSET_SAID = True
+                _say("send-back comparison off: set LOOM_SEND_BACK_REPO to the repo whose "
+                     "issue #%d it writes to" % send_back.TICKET)
+            return
         if repo not in self.s.repos:
             return
         path = os.path.join(self.state, send_back.STATE_FILE)

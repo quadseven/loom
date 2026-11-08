@@ -43,7 +43,7 @@ import re
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, naming, notify
+from . import brain, naming, notify, text
 from .factory import GREEN, REVERT_LABEL, Factory, _labels, _lane, _state, _ts
 from .github import GitHub, GitHubError
 from .tickets import DIFFICULTIES
@@ -600,7 +600,10 @@ class Reverts:
         summary = "\n".join(str(x) for x in (output.get("title"), output.get("summary"),
                                                output.get("text")) if x)
         details = errors + ([tail] if tail else []) + ([summary] if summary else [])
-        return "\n".join(details) or "No failure details available."
+        # Runner logs name absolute paths (/home/runner/..., /Users/runner/...);
+        # quoted raw they fail the written-text check and stop the pass (loom#2646).
+        return text.LOCAL_PATH_RE.sub("<path>", "\n".join(details)) or \
+            "No failure details available."
 
     def _preexisting(self, repo: str, branch: str, sha: str, before: str,
                      names: List[str]) -> None:

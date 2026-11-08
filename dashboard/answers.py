@@ -29,7 +29,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
-from bus import answer, notify, text
+from bus import answer, brain, notify, text
 from bus.labels import HUMAN_LABELS
 from bus.github import GitHubError
 
@@ -70,9 +70,24 @@ def identify(headers: Mapping[str, str], body: Mapping[str, Any],
         raise Refused(403, "no operator is configured (LOOM_OPERATORS or LOOM_BRIEF_AUTHORS)")
     header = str(values.get(IDENTITY_HEADER) or "").strip()
     if header:
+        _check_same_origin(headers)
         return _header_login(str(headers.get(header) or ""), known)
     _check_token(str(headers.get("Authorization") or ""), values)
     return _named_login(body, list(dict.fromkeys(known.values())))
+
+
+def _check_same_origin(headers: Mapping[str, str]) -> None:
+    """Refused (403) for a request another site could have sent (loom#2580).
+    The proxy stamps the operator's identity on every request the browser
+    makes, so a page on any origin could answer as the operator. A JSON
+    Content-Type forces a CORS preflight this server never answers, and a
+    browser's Sec-Fetch-Site, when sent, must say the page itself sent it."""
+    media = str(headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if media != "application/json":
+        raise Refused(403, "an answer is a JSON request (Content-Type: application/json)")
+    site = str(headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        raise Refused(403, "an answer comes from this dashboard's own page")
 
 
 def _header_login(value: str, known: Mapping[str, str]) -> str:
@@ -164,26 +179,41 @@ def _labels(issue: Mapping[str, Any]) -> List[str]:
 
 
 def _comments(gh: Any, repo: str, number: int, count: int) -> List[Dict[str, Any]]:
-    """The issue's last comment page (operators.ASK_COMMENTS), oldest first."""
+    """All issue comments, oldest first, including asks on earlier pages."""
     if count < 1:
         return []
-    page = (count - 1) // operators.ASK_COMMENTS + 1
-    data = gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d"
-                   % (quote(repo, safe="/"), number, operators.ASK_COMMENTS, page)).data
-    return [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+    comments = []
+    for page in range(1, 101):
+        data = gh.rest("GET", "/repos/%s/issues/%d/comments?per_page=%d&page=%d"
+                       % (quote(repo, safe="/"), number, operators.ASK_COMMENTS, page)).data
+        if not isinstance(data, list):
+            raise Refused(502, "issue comments are unreadable; retry before answering")
+        comments.extend(c for c in data if isinstance(c, dict))
+        if len(data) < operators.ASK_COMMENTS:
+            return comments
+    raise Refused(502, "issue comment history is incomplete; answer on the issue")
 
 
 def _already(comments: List[Dict[str, Any]], choice: str) -> Optional[Dict[str, Any]]:
     """The newest answer comment when it already gives this choice and no
     ask came after it: answering again posts nothing."""
+    trusted, ops = brain.trusted_authors(), answer.operators()
     for comment in reversed(comments):
         body = str(comment.get("body") or "")
-        if body.startswith(answer.HUMAN_MARKER):
+        if body.startswith(answer.HUMAN_MARKER) and brain.trusted_comments([comment], trusted):
             return None
-        found = answer.parse(comment)
+        found = answer.trusted_answer(comment, trusted, ops)
         if found is not None:
             return comment if found.choice.lower() == choice.lower() else None
     return None
+
+
+def _existing_answer(comments: List[Dict[str, Any]], choice: str, target: str
+                     ) -> Optional[Dict[str, Any]]:
+    same = _already(comments, choice)
+    if same is not None and target and not str(same.get("body") or "").endswith(target):
+        return None
+    return same
 
 
 def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
@@ -193,7 +223,62 @@ def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
     return [name for name in _labels(issue) if name.lower() in wanted]
 
 
-def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any) -> Dict[str, Any]:
+def review_target(gh: Any, entry: Dict[str, Any], comments: List[Dict[str, Any]],
+                  expected_pr: Any = None, expected_head: Any = None, expected_ask: Any = None) -> str:
+    """Re-read a review card's target before posting, binding the decision to its head and complete ask."""
+    number = answer.held_pr(needs_you.full_ask(entry))
+    if number is None:
+        if any(value is not None for value in (expected_pr, expected_head, expected_ask)):
+            raise Refused(409, "the current ask is not a held pull request")
+        return ""
+    explicit = any(value is not None for value in (expected_pr, expected_head, expected_ask))
+    if explicit:
+        _require_review_fields(expected_pr, expected_head, expected_ask)
+    key = _check_review_ask(comments, number, expected_pr, expected_ask, needs_you.full_ask(entry))
+    repo = quote(str(entry['repo']), safe='/')
+    pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
+    head = _review_head(pr, expected_head)
+    return "Review target: #%d %s ask=%s" % (number, head, key)
+
+
+def _require_review_fields(number: Any, head: Any, ask: Any) -> None:
+    if (type(number) is not int or number <= 0 or not isinstance(head, str)
+            or not re.fullmatch('[0-9a-f]{40}', head) or not isinstance(ask, str)
+            or not re.fullmatch('[1-9][0-9]*:[0-9a-f]{64}', ask)):
+        raise Refused(409, "the reviewed PR, head and ask are required; reload the review queue")
+
+
+def _check_review_ask(comments: List[Dict[str, Any]], number: int, expected_pr: Any,
+                      expected_ask: Any, displayed: str) -> str:
+    current = answer.latest_ask(comments, brain.trusted_authors())
+    if current is None or answer.held_pr(str(current.get('body') or '')) != number:
+        raise Refused(409, "the ask changed; reload before answering")
+    if expected_pr is not None and expected_pr != number:
+        raise Refused(409, "the held pull request changed; reload before answering")
+    try:
+        key = answer.review_ask_key(current)
+    except ValueError as error:
+        raise Refused(409, "the current review ask has no identity") from error
+    if expected_ask is not None:
+        if expected_ask != key:
+            raise Refused(409, "the reviewed ask changed; reload and read its current requirements")
+    elif (len(str(current.get('body') or '')) > operators.ASK_FULL_CHARS
+          or operators.ask_full(current.get('body')) != displayed):
+        raise Refused(409, "the complete review ask changed or was not displayed; use the review queue")
+    return key
+
+
+def _review_head(pr: Dict[str, Any], expected_head: Any) -> str:
+    head = str((pr.get('head') or {}).get('sha') or '')
+    if pr.get('state') != 'open' or pr.get('merged_at') or not re.fullmatch('[0-9a-f]{40}', head):
+        raise Refused(409, "the pull request is not open with a readable head")
+    if expected_head is not None and expected_head != head:
+        raise Refused(409, "the pull request changed; reload and review its new head")
+    return head
+
+
+def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in: Any,
+         expected_pr: Any = None, expected_head: Any = None, expected_ask: Any = None) -> Dict[str, Any]:
     """Post one answer to the item `entry` (a Needs-you entry) and change its
     labels. Refused for an answer the card does not offer, a text the
     written-text check refuses, no App to post as, or a closed item."""
@@ -217,7 +302,10 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
         if not isinstance(issue, dict) or issue.get("state") != "open":
             raise Refused(409, "%s#%d is not open" % (repo, number))
         comments = _comments(gh, repo, number, int(issue.get("comments") or 0))
-        same = _already(comments, choice)
+        target = review_target(gh, entry, comments, expected_pr, expected_head, expected_ask)
+        if target:
+            body += "\n\n" + target
+        same = _existing_answer(comments, choice, target)
         status = "already" if same is not None else "posted"
         if same is None:
             same = notify.post(gh, repo, number, body, notify.ANSWER).data or {}

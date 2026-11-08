@@ -88,7 +88,7 @@ def person(login, body, db=2):
 class OpenThreadsTests(unittest.TestCase):
     def threads(self, nodes):
         gh = types.SimpleNamespace(graphql=lambda q: {"repository": {"pullRequest": {
-            "reviewThreads": {"nodes": nodes}}}})
+            "reviewThreads": {"totalCount": len(nodes), "nodes": nodes}}}})
         return brain._open_threads(gh, REPO, 8, bot="grug-tribe", authors=AUTHORS)
 
     def test_an_outsiders_thread_never_reaches_a_fix_brief(self):

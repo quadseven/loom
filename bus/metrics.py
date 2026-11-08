@@ -7,6 +7,7 @@ import statistics
 import subprocess
 import sys
 import argparse
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ WAIT_WINDOW = 7 * 86400
 # Ticket event lists read at once by waits_for_repos (bus.brain status and
 # the dashboard read with eight workers too).
 WAIT_READ_WORKERS = 8
+SHIPPED_STAMP_FILE = "verify-priority.json"
+SHIPPED_STAMP_MAX_AGE = 30 * 60
 # Ticket states a lane can still move toward a merge.
 WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:failed")
 # A ticket in a terminal state is done, not waiting: verified is the end of the
@@ -105,6 +108,50 @@ def summarize_waits(tickets: Sequence[tuple[str, Dict[str, float]]]) -> tuple[Li
     return rows, bottleneck(rows)
 
 
+def summarize_wait_causes(tickets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group active wait labels by ticket tier and requested model."""
+    groups: Dict[tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for ticket in tickets:
+        key = (str(ticket.get("cause") or "unknown"),
+               str(ticket.get("tier") or "unknown"),
+               str(ticket.get("model") or "unknown"))
+        groups.setdefault(key, []).append(ticket)
+    rows = []
+    for (cause, tier, model), samples in sorted(groups.items()):
+        timed = [(str(row["ticket"]), float(row["wait_h"])) for row in samples
+                 if row.get("wait_h") is not None]
+        worst_ticket, worst_h = max(timed, key=lambda item: item[1]) if timed else (None, None)
+        rows.append({"cause": cause, "tier": tier, "model": model,
+                     "median_h": statistics.median(value for _, value in timed) if timed else None,
+                     "worst_h": worst_h, "worst_ticket": worst_ticket,
+                     "known_waits": len(timed), "n": len(samples)})
+    return sorted(rows, key=lambda row: (-row["n"], row["cause"], row["tier"], row["model"]))
+
+
+def active_waits(events: Sequence[Dict[str, Any]], current_labels: set[str], now: float) -> List[tuple[str, float | None]]:
+    """Return currently applied wait labels and known time since each was added."""
+    entered: Dict[str, float] = {}
+    for event in sorted(events, key=lambda item: stamp(item.get("created_at"))):
+        label = event.get("label")
+        name = label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name.startswith("wait:"):
+            continue
+        if event.get("event") == "labeled":
+            entered[name] = stamp(event.get("created_at"))
+        elif event.get("event") == "unlabeled":
+            entered.pop(name, None)
+    return [(name, max(0.0, now - entered[name]) / 3600 if name in entered else None)
+            for name in sorted(current_labels) if name.startswith("wait:")]
+
+
+def _ticket_profile(body: Any) -> tuple[str, str]:
+    text = body if isinstance(body, str) else ""
+    model = re.search(r"^Model:\s*(.+?)\s*$", text, re.M)
+    tier = re.search(r"^(?:Difficulty|Tier):\s*(.+?)\s*$", text, re.M | re.I)
+    return ((model.group(1) if model else "unknown"),
+            (tier.group(1).lower() if tier else "unknown"))
+
+
 def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
     """The ticket's current lifecycle state and when its label was added, by
     the same reading as ticket_waits, or None when no state label is on."""
@@ -122,21 +169,32 @@ def entered_state(events: Sequence[Dict[str, Any]]) -> tuple[str, float] | None:
 
 def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
                     entered: Dict[str, tuple[str, float]] | None = None,
-                    workers: int = WAIT_READ_WORKERS) -> tuple[List[Dict[str, Any]], str | None]:
+                    workers: int = WAIT_READ_WORKERS,
+                    cause_rows: List[Dict[str, Any]] | None = None) -> tuple[List[Dict[str, Any]], str | None]:
     """Median and worst hours per state over the last week. With `entered`,
     also fills it with each read ticket's current state and the time it
     entered it ({"owner/name#N": (state, epoch seconds)}), from the same
     events: the Tickets page shows that as the age in state."""
     since = datetime.fromtimestamp(now - WAIT_WINDOW, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def recent(repo: str) -> List[tuple[str, int]]:
+    def recent(repo: str) -> List[tuple[str, int, Dict[str, Any], bool]]:
         issues = gh.paginate("/repos/%s/issues?state=all&labels=loom%%3Aticket&since=%s&per_page=100" % (repo, since))
-        return [(repo, int(issue["number"])) for issue in issues
-                if isinstance(issue, dict) and "pull_request" not in issue
-                and stamp(issue.get("updated_at")) >= now - WAIT_WINDOW]
+        found = {int(issue["number"]): (repo, int(issue["number"]), issue, True)
+                 for issue in issues if isinstance(issue, dict) and "pull_request" not in issue
+                 and stamp(issue.get("updated_at")) >= now - WAIT_WINDOW}
+        if cause_rows is not None:
+            # The seven-day state chart is bounded, but active wait causes must
+            # include older open tickets that have not changed recently.
+            active = gh.paginate("/repos/%s/issues?state=open&labels=loom%%3Aticket&per_page=100" % repo)
+            for issue in active:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                if any(name.startswith("wait:") for name in names(issue)):
+                    found.setdefault(int(issue["number"]), (repo, int(issue["number"]), issue, False))
+        return list(found.values())
 
-    def events(ref: tuple[str, int]) -> List[Any]:
-        return gh.paginate("/repos/%s/issues/%d/events?per_page=100" % ref)
+    def events(ref: tuple[str, int, Dict[str, Any], bool]) -> List[Any]:
+        return gh.paginate("/repos/%s/issues/%d/events?per_page=100" % ref[:2])
 
     # One event list per ticket: read one after another that was 699
     # requests and 229 s of a cold dashboard's 320 s first snapshot
@@ -150,13 +208,49 @@ def waits_for_repos(gh: GitHub, repos: Sequence[str], now: float,
             pool.shutdown(wait=True, cancel_futures=True)
             raise
     tickets: List[tuple[str, Dict[str, float]]] = []
-    for (repo, number), found in zip(refs, read, strict=True):
-        tickets.append(("%s#%d" % (repo, number), ticket_waits(found, now)))
+    causes: List[Dict[str, Any]] = []
+    for (repo, number, issue, in_window), found in zip(refs, read, strict=True):
+        if in_window:
+            tickets.append(("%s#%d" % (repo, number), ticket_waits(found, now)))
+        if issue.get("state") == "open":
+            model, tier = _ticket_profile(issue.get("body"))
+            for cause, wait_h in active_waits(found, names(issue), now):
+                causes.append({"ticket": "%s#%d" % (repo, number), "cause": cause,
+                               "model": model, "tier": tier, "wait_h": wait_h})
         if entered is not None:
             state = entered_state(found)
             if state:
                 entered["%s#%d" % (repo, number)] = state
+    if cause_rows is not None:
+        cause_rows.extend(summarize_wait_causes(causes))
     return summarize_waits(tickets)
+
+
+def shipped_row(gh: GitHub, repos: Sequence[str], now: float) -> Dict[str, Any] | None:
+    """Return the shipped-state wait row from the canonical waits read."""
+    rows, _ = waits_for_repos(gh, repos, now)
+    return next((row for row in rows if row.get("state") == "shipped"), None)
+
+
+def read_shipped_row(state_dir: str, now: float) -> Dict[str, Any] | None:
+    """Read a fresh station-written shipped row; never trigger a network read."""
+    try:
+        with open(os.path.join(state_dir, SHIPPED_STAMP_FILE), encoding="utf-8") as fh:
+            stamp_data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(stamp_data, dict):
+        return None
+    at, count, median = (stamp_data.get("at"), stamp_data.get("n"),
+                         stamp_data.get("median_h"))
+    fresh = (isinstance(at, (int, float)) and not isinstance(at, bool)
+             and 0 <= now - float(at) < SHIPPED_STAMP_MAX_AGE)
+    valid_count = isinstance(count, int) and not isinstance(count, bool) and count >= 0
+    valid_median = (median is None if count == 0 else
+                    isinstance(median, (int, float)) and not isinstance(median, bool))
+    if not (fresh and valid_count and valid_median):
+        return None
+    return {"n": count, "median_h": median}
 
 
 def waits_main(argv: Sequence[str] | None = None) -> int:

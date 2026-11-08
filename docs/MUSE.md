@@ -4,6 +4,14 @@ At the start of each tick, run `git -C loom pull`. Clone
 `https://github.com/quadseven/loom` into `loom` first if it is not present.
 Run every command from that checkout.
 
+Step 0 of every tick, the :10 build tick and the :40 brain tick alike: read
+your direct thread first. Run `buzz messages thread --channel
+116b0815-4938-4486-a5b6-e213f6a24d1f --event
+4835ea7e5bd9abda0b1c28934e8e91d98ad4a417ef541737478e6f1275c5a70d`. Answer
+every message there that mentions you and has no reply from you, in the same
+tick, in that thread: `ack` plus the result, or `blocked: <step, exact
+command, exact error>`. Then continue with the tick.
+
 Muse writes only as the agent-meta-muse App, in both ticks: never as the
 Loom Brain App, whose credentials belong to the lane machine's scheduled
 brain job alone, and never as a person (loom#1142). Set that App's
@@ -26,7 +34,9 @@ agent-meta-muse is in `LOOM_BRIEF_AUTHORS`; until then, finish each stage
 in the tick that starts it. The :10 tick builds (Build).
 
 Set `LOOM_REPOS` (space separated `OWNER/NAME`
-values) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
+values), `LOOM_SWEEP_REPOS` (the subset the step 9 sweep may close or rewrite
+in, same format; unset means no sweep, and it never falls back to
+`LOOM_REPOS`) and `LOOM_BRIEF_AUTHORS` (the login or logins that brief tickets and
 post proofs, the same value the station uses). Without it `prioritize`,
 `close`, verified moves and merges refuse every ticket as untrusted. Set
 `LOOM_ASK_ANSWERERS` to the station's value too: unset, `bus.needs_you` reads a
@@ -67,6 +77,8 @@ brain steps under Tick, takes no brain lock, and spends its whole 25
 minutes on one ticket. The tick that starts at :40 is the brain tick
 (Tick). Any other Muse chat or task that builds (duty 10) uses the same
 commands, so every Muse run shares one claim and one open pull request.
+
+The operator hands Muse specific work with the label `for-muse`. Such a ticket sorts before every priority and skips the soft holds only (`lane:*`, `loom:briefed`, `loom:triage`); every other hold still applies (any claim other than Muse's own, `needs:*`, `wait:*`, `loom:human`, `needs-brain`, `awaiting-live-check`, an epic or goal, a running or pull-request state, `blocked`, `wontfix`, `duplicate`, `question`, a pull request naming it, a Size outside XS to M, no acceptance checkbox). The pick scans down the sorted list until one ticket has no open or merged pull request naming it, checking at most 120 tickets, and it searches only the repos in LOOM_REPOS.
 
 Build commands write as the agent-meta-muse App, like every Muse write (the
 top of this file); set its variables in the same shell call as each
@@ -325,6 +337,20 @@ below; where the steps leave room, this is how to spend it.
     deferred N with their stages. A tick that moved nothing says so as its
     first line and names what stopped it; it never grades itself as
     succeeded.
+    The journal writer flags missing counts or a repeated unchanged stuck
+    list with no counted action using `- Journal check:`. It does not reject
+    the write or invent work. Use a footer such as `- Moved: merged 1,
+    briefed 0, escalated 1`, or explicit counted fields such as `- Merged: 1`.
+    A legitimate zero-work tick can instead state `- No work: <reason>` or
+    `- Standdown: <observed reason>`. Fenced examples are not evidence.
+    Repetition compares `Waiting:`, `Still stuck:` or `Stuck:` fields and
+    their indented list items with the immediately preceding tick by the same
+    author and holder in the comments read since the previous UTC day. Missing
+    older history is not proof of repetition. Changed stuck lists and positive
+    action counts do not get a repetition warning. Deferred counts establish
+    a counted footer but are not positive action for a repeated stuck list.
+    These checks concern journal
+    evidence only, not the runner's identity or permission to act.
 
 ## Improving Loom itself
 
@@ -423,7 +449,11 @@ line for that stage and ticket retires it).
   brief records nothing.
 - The newest marker for an item wins, and `resume` drops a defer whose
   item was closed or changed since (new commits, new comments, another
-  state), so no brain repeats finished work. `status` shows, per goal and
+  state), so no brain repeats finished work. A merge no brain can make is
+  not stage work: an operator tier label, or a head outside `loom/` that
+  conflicts with its base. `resume` drops its defer with that reason, and
+  `defer --stage merge` refuses it, so it never counts as deferred; the
+  operator or the pull request's author moves it. `status` shows, per goal and
   stage, the brain that last held it and its last done action.
 - Only the lock holder acts: `resume` refuses for anyone else.
 
@@ -919,15 +949,15 @@ on hard work):
   `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
   route on the spark-gateway, each waiting out its own provider's reset
   (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
-  free lane: opencode-go, openrouter, workersai, or zen, zai, agy,
+  free lane: opencode-go, or openrouter, workersai, zen, zai, agy,
   opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then the other free
-  lanes, openrouter and workersai, or on a public repo zen and zai (the
+  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then on a public
+  repo the other free lanes, openrouter, workersai, zen and zai (the
   operator wants every free tier used up, 2026-10-19); then opencode-go (its strong tier; opencode-go-4 on public repos only) or codex; an
   anthropic slot only when every spark, codex and opencode-go slot already
   holds work.
@@ -1000,7 +1030,7 @@ rather than a wait behind a busy lane that is up), never the model that
 already failed it, and never a free lane:
 
 1. the claude lane with `claude-sonnet-5-5`;
-2. the codex lane (or codex-2) with `gpt-6-luna`;
+2. the codex lane or one of its slots, codex-2 to codex-16, with `gpt-6-luna`;
 3. `claude-opus-5-5` on the claude lane, else an anthropic slot.
 
 A rung with one lane up holds a bounded few waiting tickets: past

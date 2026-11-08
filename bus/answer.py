@@ -18,6 +18,7 @@ type the marker; nobody else's copy counts.
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
@@ -32,7 +33,7 @@ CHOICE_MAX = 200
 NOTE_MAX = 1000
 
 CHOICE, NUMBER, TEXT = "choice", "number", "text"
-MERGE, HOLD = "Merge", "Hold"
+MERGE, HOLD, SEND_BACK = "Merge", "Hold", "Send back"
 NOT_NOW = "Not now"
 from .kinds import DONE_KINDS
 
@@ -58,6 +59,74 @@ _REPLY_LETTERS_RE = re.compile(r"\breply (?:with )?\(?([a-d])\)?((?:\s*,\s*\(?[a
 _LETTER_OPTION_RE = re.compile(r"(?:^|[\s(])\(([a-d])\)\s", re.I | re.M)
 _DONE_RE = re.compile(r"\breply (?:with )?done\b", re.I)
 _KIND_RE = re.compile(r"^\s*Kind:\s*(\S+)\s*$", re.I | re.M)
+_DEFAULT_RE = re.compile(r"^\s*Default:\s*(.*?)\s*$", re.I | re.M)
+_REVERSIBLE_RE = re.compile(r"^\s*Reversible:\s*(\S+)\s*$", re.I | re.M)
+
+
+def decision_default(text: str) -> str:
+    """Return a validated default for a reversible decision ask, else empty."""
+    source = str(text or "")
+    found = _DEFAULT_RE.findall(source)
+    if not found:
+        return ""
+    if len(found) != 1 or _KIND_RE.findall(source) != ["decision"]:
+        raise ValueError("a Default line is only allowed once on a decision ask")
+    if not reversible_decision(source):
+        raise ValueError("a decision default requires Reversible: yes")
+    cleaned = _DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", source))
+    offered = options(cleaned)
+    if offered.kind != CHOICE:
+        raise ValueError("a decision default requires explicit choices in the ask")
+    if any(choice in (MERGE, HOLD, SEND_BACK) for choice in offered.choices):
+        raise ValueError("review actions require an operator answer")
+    choice, _ = accept(offered, found[0])
+    return choice
+
+
+def default_body(ask: Mapping[str, Any], choice: str, note: str = "") -> str:
+    """An automated record bound to one exact ask; never an operator answer."""
+    ident = ask.get("id")
+    body = str(ask.get("body") or "")
+    if type(ident) is not int or ident <= 0 or not choice or decision_default(body) != choice:
+        raise ValueError("an automated default must match an identified reversible ask")
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    return ("<!-- loom:default ask=%d sha=%s -->\nAutomated reversible decision default: %s. %s"
+            % (ident, digest, choice, _one_line(note, NOTE_MAX))).rstrip()
+
+
+def trusted_default(comment: Any, ask: Mapping[str, Any], trusted: Iterable[str]) -> bool:
+    """Whether a trusted automated record applies to this unchanged ask."""
+    if not isinstance(comment, dict) or _author(comment) not in {str(t).lower() for t in trusted}:
+        return False
+    try:
+        prefix = default_body(ask, decision_default(str(ask.get("body") or "")))
+    except ValueError:
+        return False
+    body = str(comment.get("body") or "")
+    return body == prefix or body.startswith(prefix + " ")
+
+
+def default_notes(comments: Iterable[Any], trusted: Iterable[str], ops: Iterable[str]) -> List[str]:
+    """The latest ask's automated decision, superseded by any later operator reply."""
+    comments, trusted, ops = list(comments), list(trusted), list(ops)
+    asks = [(i, c) for i, c in enumerate(comments) if isinstance(c, dict)
+            and _author(c) in {t.lower() for t in trusted}
+            and str(c.get("body") or "").startswith(HUMAN_MARKER)]
+    if not asks:
+        return []
+    index, ask = asks[-1]
+    later = comments[index + 1:]
+    if any(trusted_answer(c, trusted, ops) or _author(c) in ops
+           for c in later if isinstance(c, dict)):
+        return []
+    records = [str(c["body"]).split("\n", 1)[1] for c in later if trusted_default(c, ask, trusted)]
+    return records[-1:]
+
+
+def reversible_decision(text: str) -> bool:
+    """Whether an ask explicitly names itself as a reversible decision."""
+    source = str(text or "")
+    return ask_kind(source) == "decision" and _REVERSIBLE_RE.findall(source) == ["yes"]
 
 
 def ask_kind(text: str) -> str:
@@ -96,11 +165,14 @@ def options(ask: str, kind: str = "") -> Options:
     - "reply done", or Kind account, physical or hardware: Done or Not now;
     - anything else: free text.
     """
-    text = " ".join(str(ask or "").replace("**", "").split())
+    text = " ".join(_DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", str(ask or "")))
+                    .replace("**", "").split())
     kind = (kind or ask_kind(str(ask or ""))).lower()
     if _NUMBER_RE.search(text):
         return Options(NUMBER)
-    if HELD_PR_RE.search(text) or _MERGE_HOLD_RE.search(text):
+    if HELD_PR_RE.search(text):
+        return Options(CHOICE, (MERGE, HOLD, SEND_BACK))
+    if _MERGE_HOLD_RE.search(text):
         return Options(CHOICE, (MERGE, HOLD))
     if _KEEP_CLOSE_RE.search(text):
         return Options(CHOICE, ("Keep", "Close"))
@@ -311,6 +383,22 @@ def _hold_asks(comments: Iterable[Any], trusted: Iterable[str]) -> List[Tuple[in
     return out
 
 
+def latest_ask(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[Mapping[str, Any]]:
+    """The latest complete person ask from a trusted REST comment author."""
+    allowed = {str(t).lower() for t in trusted}
+    found = [c for c in comments if isinstance(c, dict) and _author(c) in allowed
+             and str(c.get("body") or "").startswith(HUMAN_MARKER)]
+    return found[-1] if found else None
+
+
+def review_ask_key(ask: Mapping[str, Any]) -> str:
+    """Bind the comment ID and complete body, using the default record's provenance model."""
+    ident = ask.get("id")
+    if type(ident) is not int or ident <= 0:
+        raise ValueError("review ask has no comment identity")
+    return "%d:%s" % (ident, hashlib.sha256(str(ask.get("body") or "").encode()).hexdigest())
+
+
 def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[int]:
     """The pull request the newest person ask names as held, or None when
     the newest ask is not a held pull request ask, or there is no ask. An
@@ -329,15 +417,15 @@ def newest_held_pr(comments: Iterable[Any], trusted: Iterable[str]) -> Optional[
 
 
 def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops: Iterable[str],
-               since: str = "") -> Optional[Answer]:
-    """The operator's Merge or Hold on lane pull request `number`: the newest
-    operator answer saying Merge or Hold, given after the newest hold ask on
+               since: str = "", head: str = "") -> Optional[Answer]:
+    """The operator's Merge, Hold or Send back on lane pull request `number`: the newest
+    operator answer saying Merge, Hold or Send back, given after the newest hold ask on
     the ticket when that ask names this pull request, and (with `since`, the
     head commit's time) not before the head it would merge. None when there
     is none: the hold stands and asks as before."""
     trusted, ops = list(trusted), list(ops)
     asks = _hold_asks(comments, trusted)
-    if not asks or asks[-1][0] != int(number):
+    if not asks or newest_held_pr(comments, trusted) != int(number):
         return None
     asked = asks[-1][1]
     asked_at = str(asked.get("created_at") or "")
@@ -346,16 +434,37 @@ def pr_verdict(comments: Sequence[Any], number: int, trusted: Iterable[str], ops
         return None
     if since and verdict.created_at and verdict.created_at < since:
         return None
-    return verdict
+    return verdict if _review_binding_matches(verdict, asked, number, head) else None
+
+
+_REVIEW_TARGET_RE = re.compile(
+    r"Review target: #([1-9][0-9]*) ([0-9a-f]{40})(?: ask=([1-9][0-9]*:[0-9a-f]{64}))?$")
+
+
+def _review_binding_matches(verdict: Answer, ask: Mapping[str, Any], number: int, head: str) -> bool:
+    if "Review target:" not in verdict.note:
+        return True  # Existing manual operator answers retain their timestamp checks.
+    found = _REVIEW_TARGET_RE.search(verdict.note)
+    if not found or int(found.group(1)) != number or (head and found.group(2) != head):
+        return False
+    try:
+        return found.group(3) == review_ask_key(ask)
+    except ValueError:
+        return False
+
+
+def review_target(verdict: Answer) -> Optional[Tuple[int, str]]:
+    found = _REVIEW_TARGET_RE.search(verdict.note)
+    return (int(found.group(1)), found.group(2)) if found else None
 
 
 def _last_merge_or_hold(comments: Sequence[Any], asked: Any, trusted: List[str],
                        ops: List[str]) -> Optional[Answer]:
-    """The newest operator Merge or Hold after the comment `asked`."""
+    """The newest operator Merge, Hold or Send back after the comment `asked`."""
     later = list(comments)
     later = later[next(i for i, c in enumerate(later) if c is asked) + 1:]
     found = [a for a in (trusted_answer(c, trusted, ops) for c in later)
-             if a is not None and a.choice.lower() in (MERGE.lower(), HOLD.lower())]
+             if a is not None and a.choice.lower() in (MERGE.lower(), HOLD.lower(), SEND_BACK.lower())]
     return found[-1] if found else None
 
 
@@ -370,7 +479,7 @@ def is_hold(verdict: Optional[Answer]) -> bool:
 def record_verdict(repo: str, number: int, verdict: Answer, sha: str = "",
                    ticket: Optional[Tuple[str, int]] = None, source: str = "",
                    env: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
-    """Write the operator's Merge or Hold on a lane pull request to the
+    """Write the operator's review decision on a lane pull request to the
     shadow ledger, once per pull request, head and verdict (bus/shadow.py),
     so the ledger pairs Loom's decision with the operator's."""
     from . import shadow

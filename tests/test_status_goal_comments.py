@@ -34,7 +34,7 @@ PINNED_QUERY = (
     " commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
-    " reviewThreads(first:100) { nodes { isResolved"
+    " reviewThreads(first:100) { totalCount nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     " comments(last:100) { totalCount nodes { databaseId url createdAt body"
     " author { __typename login } } } }"

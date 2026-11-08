@@ -81,6 +81,7 @@ class InProcessBound(unittest.TestCase):
         self.assertIn("## %s" % LIGHT, text)
         self.assertIn("## %s" % HEAVY, text)
         self.assertIn("status skipped the sections across repos: deadline", text)
+        self.assertIn("## Shipped backlog\n- not read (status deadline)", text)
         self.assertEqual(["sections across repos"], missed)
         self.assertEqual("status partial: not read this run: sections across repos",
                          text.splitlines()[-1])

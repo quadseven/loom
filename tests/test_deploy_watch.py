@@ -154,7 +154,7 @@ class Base(unittest.TestCase):
             "headRefOid": "r" * 40, "headRepository": {"nameWithOwner": REPO},
             "commits": {"nodes": [{"commit": {"committedDate": iso(60),
                                               "statusCheckRollup": {"state": rollup}}}]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"totalCount": 0, "nodes": []},
             "files": {"totalCount": 1, "nodes": [{"path": CHANGED}]}}
         self.gh.routes["/repos/%s/pulls/77/files" % REPO] = [
             {"filename": CHANGED, "patch": inverse}]
@@ -167,6 +167,8 @@ class Base(unittest.TestCase):
         self.gh.routes["/repos/%s/issues/60/events" % REPO] = [
             {"event": "labeled", "label": {"name": "loom:revert"}, "actor": {"login": labeler}}]
         self.gh.routes["/repos/%s/compare/%s...main" % (REPO, MERGED)] = {"status": "ahead"}
+        # loom#2622: the merge reads how far the revert's head is behind main.
+        self.gh.routes["/repos/%s/compare/main...%s" % (REPO, "r" * 40)] = {"behind_by": 0}
         self.gh.routes["/repos/%s/contents/.github/workflows" % REPO] = []
 
     def merged(self):

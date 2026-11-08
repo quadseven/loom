@@ -80,6 +80,36 @@ class LaneJobTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
+    def test_published_codex_copy_has_no_refresh_token(self):
+        spec = importlib.util.spec_from_file_location("lane_job", ROOT / "lanes" / "k8s" / "lane_job.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        value = json.dumps({"published_at": 1000, "auth": {"tokens": {
+            "access_token": "access-placeholder", "account_id": "account-placeholder"}}})
+        copied = json.loads(module.codex_session(value, now=1001))
+        self.assertNotIn("refresh_token", copied["tokens"])
+        value_with_refresh = json.dumps({"published_at": 1000, "auth": {"tokens": {
+            "access_token": "access-placeholder", "refresh_token": "refresh-placeholder"}}})
+        with self.assertRaisesRegex(module.JobError, "contains a refresh token"):
+            module.codex_session(value_with_refresh, now=1001)
+
+    def test_stale_codex_copy_marks_slot_unavailable_without_failing_run(self):
+        spec = importlib.util.spec_from_file_location("lane_job", ROOT / "lanes" / "k8s" / "lane_job.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.job.mkdir(parents=True, exist_ok=True)
+        (self.job / "inputs.json").write_text(json.dumps({"slot": "codex-2", "ticket": "owner.app-7"}))
+        (self.job / "lane.env").write_text("LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
+        with mock.patch.object(module, "job_dir", return_value=str(self.job)):
+            with mock.patch.object(module, "_fetch", return_value=json.dumps({
+                    "published_at": 1, "auth": {"tokens": {"access_token": "access-placeholder"}}})):
+                module.ssm()
+            self.assertTrue((self.job / "codex-session-unavailable").exists())
+            module.run()
+        beat = json.loads((self.job / "home" / "state" / "usage" / "codex-2.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("stale", beat["reason"])
+
     def inputs(self, **over):
         inputs = {"slot": "opencode-go-2", "ticket": "owner.app-7", "brief": BRIEF,
                   "run_id": RUN_ID, "settings": "", "report_key": PUB, "report_mac_key": MAC_KEY}
@@ -119,6 +149,18 @@ class LaneJobTest(unittest.TestCase):
                      {"report_mac_key": "short"}):
             self.inputs(**over)
             self.assertEqual(self.step("prepare").returncode, 1, over)
+
+    def test_codex_runner_slot_requires_the_broker_session_parameter(self):
+        self.inputs(slot="codex-2")
+        self.assertEqual(self.step("prepare").returncode, 1)
+        self.inputs(slot="codex-2", settings="LOOM_CODEX_SESSION_SSM=/lane/codex/session\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+
+    def test_claude_runner_slot_requires_its_oauth_parameter(self):
+        self.inputs(slot="claude")
+        self.assertEqual(self.step("prepare").returncode, 1)
+        self.inputs(slot="claude", settings="LOOM_CLAUDE_KEY_SSM=/lane/claude/oauth\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
 
     def test_a_gateway_lane_is_moved_onto_the_cluster_gateway(self):
         self.inputs(slot="spark-2", settings="LOOM_SPARK_2_URL=http://spark.example.internal:8000/v1\n"
@@ -177,7 +219,8 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual((self.job / "app-key.pem").read_text(), "value-of/x/app\n")
         for path in (ssm / "x" / "oc", deny, self.job / "app-key.pem"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        masked = "".join(l for l in printed.splitlines(True) if not l.startswith("::add-mask::"))
+        masked = "".join(line for line in printed.splitlines(True)
+                          if not line.startswith("::add-mask::"))
         self.assertNotIn("/x/", masked)
         self.assertNotIn("value-of", masked)
         self.assertIn("::add-mask::value-of/x/oc", printed)
@@ -186,6 +229,55 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(headers["X-amz-target"], "AmazonSSM.GetParameter")
         self.assertEqual(headers["X-amz-security-token"], "tok")
         self.assertTrue(headers["Authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"))
+
+    def test_ssm_copies_workersai_token_and_account_parameters(self):
+        self.inputs(slot="workersai", settings=(
+            "LOOM_WORKERSAI_KEY_SSM=/workersai/token\n"
+            "LOOM_WORKERSAI_ACCOUNT_SSM=/workersai/account\n"))
+        self.assertEqual(self.step("prepare").returncode, 0)
+        code, printed, asked = self.ssm_step()
+        self.assertEqual(code, 0, printed)
+        self.assertEqual({name for _, _, name in asked}, {
+            "/workersai/token", "/workersai/account", "/infra/leak-scan/deny-list"})
+        self.assertEqual((self.job / "ssm" / "workersai" / "token").read_text(),
+                         "value-of/workersai/token\n")
+        self.assertEqual((self.job / "ssm" / "workersai" / "account").read_text(),
+                         "value-of/workersai/account\n")
+
+    def test_ssm_puts_claude_oauth_in_job_home_without_printing_it(self):
+        self.inputs(slot="claude", settings="LOOM_CLAUDE_KEY_SSM=/lane/claude/oauth\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+        code, printed, asked = self.ssm_step()
+        self.assertEqual(code, 0, printed)
+        token = "value-of/lane/claude/oauth\n"
+        path = self.job / "home" / "run" / "claude-oauth-token"
+        self.assertEqual(path.read_text(), token)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertIn("/lane/claude/oauth", [name for _, _, name in asked])
+        ordinary = "".join(line for line in printed.splitlines(True)
+                           if not line.startswith("::add-mask::"))
+        self.assertNotIn(token, ordinary)
+        self.assertNotIn(token.strip(), ordinary)
+        env = self.job / "runner.env"
+        self.assertEqual(self.step("run").returncode, 0)
+        self.assertIn("LOOM_CLAUDE_AUTH_FILE=" + str(path), env.read_text())
+
+    def test_claude_oauth_is_exported_only_to_agent_cli_without_printing_it(self):
+        token_file = self.job / "home" / "run" / "claude-oauth-token"
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text("oauth-placeholder\n")
+        capture = self.tmp / "agent-token"
+        cli = self.bin / "claude"
+        cli.write_text("#!/bin/sh\nprintf '%s' \"$CLAUDE_CODE_OAUTH_TOKEN\" > \"$TOKEN_CAPTURE\"\n")
+        cli.chmod(0o755)
+        script = '. "$1"; MODEL=test AGENT_TIMEOUT=5; agent_cli claude lane prompt'
+        env = dict(os.environ, PATH=str(self.bin) + ":" + os.environ["PATH"],
+                   LOOM_CLAUDE_AUTH_FILE=str(token_file), TOKEN_CAPTURE=str(capture))
+        result = subprocess.run(["bash", "-c", script, "bash", str(ROOT / "lanes" / "agent_cli.sh")],
+                                env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(capture.read_text(), "oauth-placeholder")
+        self.assertNotIn("oauth-placeholder", result.stdout + result.stderr)
 
     def test_the_request_is_signed_as_aws_signs_it(self):
         # Pinned from botocore's SigV4Auth for the same request (checked when
@@ -270,6 +362,24 @@ class LaneJobTest(unittest.TestCase):
         image = self.job / "home" / "logs" / "opencode-go-2" / "owner.app-7.image"
         self.assertRegex(image.read_text().strip(), r"^[0-9a-f]{64}$")
 
+    def test_the_run_records_peak_resources_in_the_report(self):
+        croot = self.tmp / "cgroup"
+        croot.mkdir()
+        (croot / "memory.peak").write_text("1073741824\n")
+        (croot / "cpu.stat").write_text("usage_usec 2000000\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+        result = self.step("run", LOOM_CGROUP_ROOT=str(croot))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.job / "home" / "logs" / "opencode-go-2" / "owner.app-7.resources.json"
+        self.assertTrue(path.exists(), "report must carry peak resources")
+        row = json.loads(path.read_text())
+        for field in ("peak_mem_mib", "peak_cpu_cores", "wall_s"):
+            self.assertIn(field, row, field)
+        self.assertGreaterEqual(row["peak_mem_mib"], 1024)
+        self.assertGreaterEqual(row["peak_cpu_cores"], 0)
+        self.assertGreater(row["wall_s"], 0)
+        self.assertIn("logs/opencode-go-2/owner.app-7.resources.json", load_job_files(self.job))
+
     def test_the_report_holds_exactly_this_runs_files(self):
         self.assertEqual(self.step("prepare").returncode, 0)
         self.assertEqual(self.step("run").returncode, 0)
@@ -284,7 +394,7 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(job.report_files(str(home), "opencode-go-2", "owner.app-7"), [
             "briefs/opencode-go-2/done/owner.app-7.md",
             "logs/opencode-go-2/owner.app-7.answered", "logs/opencode-go-2/owner.app-7.image",
-        "logs/opencode-go-2/owner.app-7.log",
+        "logs/opencode-go-2/owner.app-7.log", "logs/opencode-go-2/owner.app-7.resources.json",
             "logs/opencode-go-2/owner.app-7.service.log", "state/usage/opencode-go-2.json"])
         r = runners.Runners(None, str(self.tmp / "station"), "o/r", [], {}, lambda r: True, print)
         for rel in job.report_files(str(home), "opencode-go-2", "owner.app-7"):
@@ -299,6 +409,27 @@ class LaneJobTest(unittest.TestCase):
         pub = subprocess.run(["openssl", "pkey", "-in", str(priv), "-pubout"], check=True,
                              capture_output=True, text=True).stdout
         (self.job / "report-key.pem").write_text(pub)
+
+    def test_report_secret_is_private_at_creation(self):
+        self.assertEqual(self.step("prepare").returncode, 0)
+        self.assertEqual(self.step("run").returncode, 0)
+        self.real_key()
+        job = self.load()
+        secret = self.job / "report-secret"
+        modes = []
+        original_open = os.open
+
+        def observe_open(path, flags, mode=0o777):
+            fd = original_open(path, flags, mode)
+            if os.fspath(path) == str(secret):
+                modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+            return fd
+
+        env = {"LOOM_JOB_DIR": str(self.job), "LOOM_JOB_EVENT": str(self.event),
+               "GITHUB_ACTIONS": "true"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(job.os, "open", side_effect=observe_open):
+            job.report()
+        self.assertEqual(modes, [0o600])
 
     def test_sealing_drops_the_runs_mac_key(self):
         self.assertEqual(self.step("prepare").returncode, 0)

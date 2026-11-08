@@ -284,6 +284,23 @@ def limit_records(provider: str) -> Callable[[str, List[str], Dict[str, str], fl
     return adapter
 
 
+def _cli_meter_records(provider: str, home: str, slots: List[str], now: float) -> List[Dict[str, Any]]:
+    """Use a lane's latest CLI /usage reading; retain limit history if absent."""
+    meter = _newest_meter(home, slots)
+    if meter is None:
+        rows = limit_records(provider)(home, slots, {}, now)
+        for row in rows:
+            if row.get("note") == "no limit seen":
+                row["note"] = "no CLI /usage reading yet; no limit seen"
+        return rows
+    rows = _meter_records(provider, home, slots, now)
+    if rows and rows[0].get("used_pct") is not None:
+        return rows
+    return [_record(provider, slots, "all", None, None, None, None,
+                    str(meter.get("source") or "CLI /usage"), now,
+                    "CLI usage read failed: %s" % (meter.get("error") or "no usage windows"))]
+
+
 def _remote_records(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
     """A remote lane (muse) reports only a heartbeat, which the station keeps
     in state/station/remote-status.json: no usage figure or limit reaches
@@ -358,7 +375,8 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
         if not isinstance(window, dict) or not window.get("window"):
             continue
         record = _record(provider, slots, str(window["window"]), window.get("used_pct"),
-                         window.get("remaining"), window.get("unit"), window.get("resets_at"),
+                         window.get("remaining"), window.get("unit"),
+                         _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
         record["window_minutes"] = window.get("window_minutes")
         record["observed_at"] = observed
@@ -429,8 +447,8 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
                                     or Path.home() / ".codex" / "sessions"), stamp),
         "opencode-go": _opencode_records,
         "spark": _spark_records,
-        "claude": limit_records("claude"),
-        "agy": limit_records("agy"),
+        "claude": lambda _home, slots, _settings, stamp: _cli_meter_records("claude", _home, slots, stamp),
+        "agy": lambda _home, slots, _settings, stamp: _cli_meter_records("agy", _home, slots, stamp),
         "openrouter": lambda _home, slots, _settings, stamp: _meter_records("openrouter", _home, slots, stamp),
         "workersai": lambda _home, slots, _settings, stamp: _meter_records("workersai", _home, slots, stamp),
     }
@@ -442,10 +460,54 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
         except Exception as err:
             records.append(_record(provider, slots, "all", None, None, None, None,
                                    "adapter", now, "adapter error: %s" % type(err).__name__))
+    records.extend(runner_resource_records(home, now))
     for record in records:
         record["holds"] = lane_holds(home, record.get("lanes") or [])
         record["host"] = host
     return records
+
+
+def runner_resource_records(home: str, now: float) -> List[Dict[str, Any]]:
+    """One reading per repo from the runner reports' resource files
+    (logs/<slot>/<ticket>.resources.json, lanes/k8s/lane_job.py run):
+    the largest peak memory, CPU and wall time seen for that repo, as a
+    "run" window reading the Usage view shows per repo."""
+    logs = Path(home) / "logs"
+    best: Dict[str, Dict[str, Any]] = {}
+    if not logs.is_dir():
+        return []
+    for path in sorted(logs.glob("*/*.resources.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(row, dict):
+            continue
+        repo = row.get("repo")
+        if not isinstance(repo, str) or not repo:
+            continue
+        peak = row.get("peak_mem_mib")
+        cores = row.get("peak_cpu_cores")
+        wall = row.get("wall_s")
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (peak, cores, wall)):
+            continue
+        at = row.get("at")
+        at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else now
+        lane = row.get("lane") if isinstance(row.get("lane"), str) and row.get("lane") else path.parent.name
+        prev = best.get(repo)
+        if prev is None or float(peak) > float(prev["peak_mem_mib"]):
+            best[repo] = {"repo": repo, "lane": lane, "at": at, "peak_mem_mib": float(peak),
+                          "peak_cpu_cores": float(cores), "wall_s": float(wall)}
+    out = []
+    for repo in sorted(best):
+        item = best[repo]
+        record = _record(repo, [item["lane"]], "run", None, None, None, None,
+                         "runner cgroup", item["at"],
+                         "peak %.0f MiB, %.2f cores, %.0fs" % (item["peak_mem_mib"],
+                                                                 item["peak_cpu_cores"], item["wall_s"]))
+        record.update(item)
+        out.append(record)
+    return out
 
 
 def lane_holds(home: str, lanes: List[str]) -> Dict[str, str]:

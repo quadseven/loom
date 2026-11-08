@@ -4,7 +4,7 @@
 # classed. The opencode lanes run through opencode_run (lanes/agent_sandbox.sh).
 #
 # The caller sets MODEL and AGENT_TIMEOUT (seconds).
-# shellcheck shell=bash disable=SC2034 # FAIL_CLASS and RETRY_AT are read by the caller
+# shellcheck shell=bash disable=SC2034 # FAIL_CLASS, RETRY_AT and FAIL_REASON are read by the caller
 
 # Run lane $1's agent CLI on prompt $3, as the lane runner does ($2 = lane)
 # or as the brain does ($2 = brain). A lane run edits one tree: codex is
@@ -30,7 +30,13 @@ agent_cli() {
     uv_dir=(--add-dir "$AGENT_UV_DIR")
   fi
   case "$1:$2" in
-    claude:lane) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null ;;
+    claude:lane)
+      if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+          claude -p --model "$MODEL" "$3" < /dev/null
+      else
+        timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
+      fi ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
@@ -95,6 +101,18 @@ MODEL_GONE_RE='ProviderModelNotFoundError: Model not found'
 # so they count only on the copilot lane and only in the last lines of its run:
 # a ticket, a diff or a file the agent read can say them on any lane.
 COPILOT_ALLOWANCE_RE='exceeded your [a-z ]*allowance|you have no quota'
+# A provider that cannot serve one request: opencode-go's 400
+# "[prompt_rendering_failed] The request could not be rendered into a prompt
+# for this model" ended two runs while about 30 others on the same model
+# finished (2026-10-25). The fault is the provider's, so the run is transient
+# and names it, and the ticket does not climb the model ladder (loom#1749).
+# It is no limit: the lane and model stay available.
+PROVIDER_FAULT_RE='prompt_rendering_failed'
+# The same kind of fault in another form: the openrouter lane's Cohere model
+# answers some requests with a non-retryable 400 naming a message the provider
+# itself dropped, "[Cohere] missing required parameter: 'messages[60].content'".
+# Eight run logs ended on it from 2026-10-31, five parked as work (loom#2754).
+PROVIDER_PARAM_FAULT_RE="missing required parameter: 'messages\\[[0-9]+\\]"
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -158,7 +176,8 @@ if not done:
 # match $4. On limit also sets RETRY_AT. A key the provider will not take is
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
-# a signal or a network fault is transient; anything else is work.
+# a signal, a network fault or a provider fault on one request is transient;
+# anything else is work. FAIL_REASON names a provider fault for the park line.
 # An agent CLI's JSON events that carry the work, not the provider's word:
 # tool results, the model's own text and reasoning, step markers (opencode
 # --format json). Code about rate limits that a tool read is no limit: two
@@ -185,11 +204,15 @@ classify_failure() {
   # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
   seen="$whole"
   [ "$status" -eq 0 ] && seen="$tail"
-  FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT=""
+  FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON=""
   now="$(date +%s)"
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
     FAIL_CLASS=auth
+  elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_FAULT_RE ]]; then
+    FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt (prompt_rendering_failed)"
+  elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_PARAM_FAULT_RE ]]; then
+    FAIL_CLASS=transient FAIL_REASON="provider fault: the provider rejected its own request (missing required parameter in messages)"
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
   elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then

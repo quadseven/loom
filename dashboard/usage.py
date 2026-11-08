@@ -64,6 +64,12 @@ def _optional_fields(row: dict[str, Any]) -> dict[str, Any]:
     if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
                                 or not 0 < minutes <= 60 * 24 * 366):
         row["window_minutes"] = None
+    for key in ("peak_mem_mib", "peak_cpu_cores", "wall_s"):
+        value = row.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0):
+            row[key] = None
+        elif isinstance(value, (int, float)):
+            row[key] = float(value)
     return row
 
 
@@ -100,7 +106,7 @@ MIN_PACE_FRACTION = 0.05
 WINDOW_MINUTES = {"5-hour": 300, "weekly": 10080}
 WINDOW_NAMES = {"5-hour": "5-hour", "weekly": "Weekly", "credit": "Credit",
                 "all": "Usage", "last 429": "Last 429", "thermal hold": "Thermal hold",
-                "limit": "Limit"}
+                "limit": "Limit", "run": "Run"}
 HOLD_UNTIL = re.compile(r";\s*(?:lane waits|unavailable) until (\S+)")
 DOWN_WORDS = ("endpoint", "503", "unreachable", "down")
 RECENT_PR_DAYS = 7
@@ -260,6 +266,8 @@ def read_window(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         w.update(_projection(used, reset, observed, minutes))
     if row.get("unit") == "USD" and isinstance(row.get("remaining"), (int, float)):
         w["usd_left"] = float(row["remaining"])
+    for key in ("peak_mem_mib", "peak_cpu_cores", "wall_s"):
+        w[key] = row.get(key)
     return w
 
 
@@ -296,7 +304,7 @@ def _status(lanes: list[str], kinds: list[str], windows: list[dict[str, Any]]) -
         (any(w["used"] >= NEAR_LIMIT_PCT for w in metered), "near limit", 0),
         (any(w["runs_out"] for w in metered), "runs out early", 1),
         (any(w["error"] for w in windows), "error", 1),
-        (any(w["stale"] and w["used"] is not None for w in windows), "stale", 1),
+        (any(w["stale"] for w in windows), "stale", 1),
         (blocked, "partly down" if all_down else "partly held", 2),
         (metered, "ok", 3),
     )
@@ -348,7 +356,7 @@ def _window_ask(name: str, w: dict[str, Any], now: datetime) -> list[tuple[str, 
 
 
 def _stale_ask(p: dict[str, Any]) -> list[tuple[str, str]]:
-    stale = [w for w in p["windows"] if w["stale"] and w["used"] is not None]
+    stale = [w for w in p["windows"] if w["stale"]]
     if not stale:
         return []
     return [("warn", "%s %s: %s stale (%s)." % (
@@ -419,6 +427,9 @@ def _sentence(text: str) -> str:
 
 def _unknown_note(w: dict[str, Any], now: datetime) -> str:
     """Why a reading has no figure, in words."""
+    if w["stale"]:
+        detail = _limit_note(w, now) if w["kind"] == "limit" else _sentence(w["note"])
+        return "STALE: %s. %s" % (w["stale"], detail)
     if w["kind"] == "last 429" and w["reset"] is not None:
         limit = w["note"].replace("limitName:", "").strip() or "a"
         return ("Last hit its %s limit; the provider said retry after %s (%s)."
@@ -449,7 +460,27 @@ def _limit_note(w: dict[str, Any], now: datetime) -> str:
     return _sentence(note)
 
 
+def _resource_meter(w: dict[str, Any], now: datetime) -> str:
+    """A runner run window per repo: peak memory, CPU cores and wall time."""
+    esc = html.escape
+    detail = "Peak %s MiB, %s cores, %ss." % (
+        ("%.0f" % w["peak_mem_mib"]) if w.get("peak_mem_mib") is not None else "unknown",
+        ("%.2f" % w["peak_cpu_cores"]) if w.get("peak_cpu_cores") is not None else "unknown",
+        ("%.0f" % w["wall_s"]) if w.get("wall_s") is not None else "unknown")
+    if w.get("note"):
+        detail += " " + _sentence(w["note"])
+    return ('<div class="um um-resource"><span class="um-name">%s</span>'
+            '<p class="um-fig">Peak %s MiB, %s cores, %ss</p><p class="um-detail">%s</p></div>'
+            % (esc(w["name"]),
+               esc(("%.0f" % w["peak_mem_mib"]) if w.get("peak_mem_mib") is not None else "unknown"),
+               esc(("%.2f" % w["peak_cpu_cores"]) if w.get("peak_cpu_cores") is not None else "unknown"),
+               esc(("%.0f" % w["wall_s"]) if w.get("wall_s") is not None else "unknown"),
+               esc(detail)))
+
+
 def _unknown_meter(w: dict[str, Any], now: datetime) -> str:
+    if w["kind"] == "run" and w.get("peak_mem_mib") is not None:
+        return _resource_meter(w, now)
     return ('<div class="um um-none"><span class="um-name">%s</span>'
             '<div class="um-bar um-unknown" aria-hidden="true"></div>'
             '<p class="um-fig">Unknown</p><p class="um-detail">%s</p></div>'
@@ -571,10 +602,13 @@ def _quiet_html(p: dict[str, Any], newest: datetime | None, now: datetime) -> st
     """A provider with no usage figure and every lane free: one compact row."""
     esc = html.escape
     holds = [w for w in p["windows"] if w["kind"] == "thermal hold"]
-    notes = _unique(_unknown_note(w, now) for w in p["windows"] if w["kind"] != "thermal hold")
+    meters = "".join(_meter(w, now) for w in p["windows"] if w["kind"] == "run")
+    notes = _unique(_unknown_note(w, now) for w in p["windows"]
+                    if w["kind"] != "thermal hold" and w["kind"] != "run")
     return ('<li class="uq"><div class="uq-head"><h3 class="up-name">%s</h3><span class="up-lanes">%s</span></div>'
-            '<div class="uq-body">%s%s<p class="up-source">%s %s</p></div></li>'
+            '<div class="uq-body">%s%s%s<p class="up-source">%s %s</p></div></li>'
             % (esc(p["name"]), esc(_free_line(p)), _holds(holds, now) if holds else "",
+               ('<div class="up-meters">%s</div>' % meters) if meters else "",
                _lane_groups(p), esc(" ".join(notes)), esc(_read_line(p, newest, now))))
 
 

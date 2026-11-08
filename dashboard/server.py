@@ -41,6 +41,7 @@ from . import tree as tree_view
 from . import operators as operators_view
 from . import needs_you as needs_you_view
 from . import answers as answers_view
+from . import review_queue
 from bus import answer as bus_answer
 from .github import AskBudget
 from bus.github import GitHubError
@@ -138,7 +139,7 @@ def _backlog(state):
     if not source:
         return None, "LOOM_BACKLOG_SOURCE is not set"
     try:
-        raw = _backlog_bytes()
+        raw = _backlog_raw(state)
         if raw is None:
             return None, "backlog source unavailable or rejected"
         data = json.loads(raw.decode("utf-8"))
@@ -210,7 +211,7 @@ def _when(stamp):
 
 def _start_here_line(state):
     """Hunt's start-here: the top epic and its next ticket, from backlog.json."""
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     if raw is None:
         return None, "the backlog source is not set or unreadable"
     epics = _backlog_document(raw).get("epics") or []
@@ -525,6 +526,18 @@ def _backlog_bytes():
         return Path(source).read_bytes()
     except (OSError, ValueError):
         return None
+
+
+def _backlog_raw(state):
+    """The backlog bytes for a page request. A URL source is read on the
+    refresh thread (TicketStore._read_backlog) and a request serves the copy
+    it kept, so no page waits on the network (loom#2581); a file path is
+    read here. A stand-in state with no refresh thread reads the source."""
+    source = os.environ.get("LOOM_BACKLOG_SOURCE", "").strip()
+    cached = getattr(state, "backlog_cached", None)
+    if cached is None or urlsplit(source).scheme not in ("http", "https"):
+        return _backlog_bytes()
+    return cached(source)
 
 
 def _backlog_document(raw):
@@ -845,8 +858,34 @@ def _needs_you(document, state, *, source_missing=False, who=""):
                 status="Read only" if mode == "off" else "Answers on")
 
 
+def _review_queue(state):
+    document = _backlog_document(_backlog_bytes() or b"{}")
+    asks, claims, repos = _needs_sources(document, state)
+    mode = answers_view.mode(state)
+    entries, _ = needs_you_view.render(asks, claims, "", repos, answers_view.posted(state), mode)
+    reader = getattr(state, "review_details", None)
+    if reader is None and getattr(state, "gh", None) is not None:
+        reader = review_queue.Details(state.gh)
+        state.review_details = reader
+    details = {}
+    below_floor = getattr(state, "_below_floor", lambda: False)()
+    if reader is not None and not below_floor:
+        for entry in review_queue.held(entries):
+            details["%s#%d" % (entry["repo"], entry["number"])] = reader.get(entry)
+    content = ('<p class="page-lede">Review held changes, read their evidence, and choose the next step. '
+               'Approval still runs every merge check.</p>' + _answer_bar(mode))
+    if below_floor:
+        content += '<p role="status">GitHub reads are waiting for the request budget to recover.</p>'
+    unknown = sum(1 for entry in entries if entry.get("comment_ask") is None)
+    if unknown:
+        content += ('<p role="status">%d asks are not classified yet. '
+                    '<a href="/needs-you">Read their asks in Needs you</a>.</p>') % unknown
+    content += review_queue.render(entries, details, mode)
+    return page("Review queue", "review-queue", content, status="Answers on" if mode != "off" else "Read only")
+
+
 def _needs_entry(state, repo, number):
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     asks, claims, repos = _needs_sources(_backlog_document(raw or b"{}"), state)
     return needs_you_view.find(asks, claims, repo, number, repos, answers_view.posted(state))
 
@@ -869,7 +908,8 @@ def _handle_answer_post(handler, state):
         if entry.get("pending"):
             raise answers_view.Refused(409, "%s#%d is answered; the station has not applied it yet"
                                        % (repo, number))
-        result = answers_view.post(state, entry, login, body.get("choice"), body.get("note"))
+        result = answers_view.post(state, entry, login, body.get("choice"), body.get("note"),
+                                   body.get("review_pr"), body.get("review_head"), body.get("review_ask"))
     except answers_view.Refused as exc:
         return handler.send_json(exc.code, {"error": str(exc)})
     entry = _needs_entry(state, repo, number)
@@ -1225,6 +1265,8 @@ def _dispatch_get(handler, state):
         return _dispatch_view(handler, state, path, parsed)
     if re.fullmatch(r"/t/[^/]+/[^/]+/[0-9]+", path):
         return _dispatch_ticket_page(handler, state, path, parsed)
+    if path == "/review-queue":
+        return handler.send_page(_review_queue(state))
     if path == "/operators":
         return handler.send_page(operators_view.page_html(state.response(), time.time()))
     return _dispatch_basic(handler, state, path)
@@ -1276,7 +1318,7 @@ def _dispatch_run(handler, parsed, store, runs, run_number):
 
 
 def _dispatch_backlog(handler, state, path, parsed):
-    raw = _backlog_bytes()
+    raw = _backlog_raw(state)
     if path == "/backlog.json":
         return handler.send_bytes(503, b"backlog source unavailable", "text/plain; charset=utf-8") if raw is None else handler.send_bytes(200, raw, "application/json")
     if path == "/backlog":
@@ -1540,6 +1582,8 @@ def _send_dashboard_view(handler, state, path):
 
 def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
     state = store or TicketStore()
+    # The refresh thread reads a URL backlog source; requests read its copy.
+    state.backlog_fetch = _backlog_bytes
 
     class DashboardHTTPServer(ThreadingHTTPServer):
         def server_bind(self):

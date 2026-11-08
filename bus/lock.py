@@ -1,6 +1,7 @@
 """The brain's tick lock: a branch whose commit message names the holder.
 
-Creating a ref that exists fails with 422, so only one holder wins. The
+Creating a ref that exists fails with 422, and an expired lock is replaced
+only by a fast-forward from the expired commit, so only one holder wins. The
 message is `holder=<name> expires=<UTC> acquired=<UTC>`, with ` run=<id>` when
 the caller named its run, and ` login=<login>` when it named the GitHub
 login it writes as: a fleet brain acts as the brain only while the lock
@@ -18,7 +19,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .github import GitHub
 
@@ -250,19 +251,44 @@ def _create_ref(gh: GitHub, repo: str, sha: str) -> bool:
     return resp.status != 422
 
 
+def _lock_commit(gh: GitHub, repo: str, message: str, parents: List[str]) -> str:
+    """POST a lock commit on main's tree and answer its sha. Called only once
+    the caller is about to write the ref, so a waiting brain leaves no orphan."""
+    base = gh.rest("GET", "/repos/%s/git/ref/heads/main" % repo).data["object"]["sha"]
+    tree = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, base)).data["tree"]["sha"]
+    return gh.rest("POST", "/repos/%s/git/commits" % repo, {
+        "message": message, "tree": tree, "parents": parents}).data["sha"]
+
+
+def _fast_forward(gh: GitHub, repo: str, sha: str) -> bool:
+    """Move the lock ref to `sha` without force: False when GitHub refuses
+    because `sha` does not descend from the branch head (the branch moved)."""
+    resp = gh.rest("PATCH", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
+                   {"sha": sha, "force": False}, ok=(409, 422))
+    return resp.status not in (409, 422)
+
+
+def _no_holder() -> Holder:
+    return Holder("", None, None)
+
+
 def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
-            now: Optional[datetime] = None, run: str = "", login: str = "") -> Attempt:
+            now: Optional[datetime] = None, run: str = "", login: str = "",
+            sleep: Callable[[float], None] = time.sleep) -> Attempt:
     """Try once to take the lock. A live lock that is the caller's own (same
     holder, and same run when `run` is given) is acquired, not held: a
     re-attempt after a lost or misread answer must not stand the brain down
-    against itself."""
+    against itself.
+
+    The lock is read first, and a live lock is answered with no write. A
+    free lock is created; an expired one is taken over by compare-and-swap
+    (loom#2579): the new lock commit's parent is the expired lock and the ref
+    moves only by fast-forward, so of two takers that read the same expired
+    lock GitHub lets exactly one through."""
     _check_holder(holder)
     _check_run(run)
     _check_login(login)
     now = _utc(now)
-    main = gh.rest("GET", "/repos/%s/git/ref/heads/main" % repo)
-    base = main.data["object"]["sha"]
-    tree = gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, base)).data["tree"]["sha"]
     expires = now + timedelta(minutes=minutes)
     message = "holder=%s expires=%s acquired=%s" % (
         holder, expires.strftime(TIME_FORMAT), now.strftime(TIME_FORMAT))
@@ -271,34 +297,46 @@ def attempt(gh: GitHub, repo: str, holder: str, minutes: int = 15,
     if login:
         message += " login=%s" % login
     mine = Holder(holder, expires, now, run, login=login)
-    commit = gh.rest("POST", "/repos/%s/git/commits" % repo, {
-        "message": message,
-        "tree": tree,
-        "parents": [],
-    })
-    sha = commit.data["sha"]
-    if _create_ref(gh, repo, sha):
-        return Attempt(True, mine, holder)
     read = _read_message(gh, repo)
-    if read is not None:
-        current = _holder_from(read[1])
-        if current.live(now):
-            if current.is_caller(holder, run):
-                return Attempt(True, current, holder, already=True)
-            return Attempt(False, current, holder)
-        gh.rest("DELETE", "/repos/%s/git/refs/heads/%s" % (repo, LOCK_BRANCH),
-                ok=(404, 422))
+    if read is None:
+        if _create_ref(gh, repo, _lock_commit(gh, repo, message, [])):
+            return Attempt(True, mine, holder)
+        # Another taker created the lock between the read and the create.
+        read = _read_message(gh, repo)
+        if read is None:
+            return Attempt(False, _no_holder(), holder)
+    current = _holder_from(read[1])
+    if current.live(now):
+        if current.is_caller(holder, run):
+            return Attempt(True, current, holder, already=True)
+        return Attempt(False, current, holder)
+    return _take_over(gh, repo, holder, message, mine, read, now, sleep)
+
+
+def _take_over(gh: GitHub, repo: str, holder: str, message: str, mine: Holder,
+               read: Tuple[str, str], now: datetime,
+               sleep: Callable[[float], None]) -> Attempt:
+    """Replace the expired lock `read` by fast-forward. A refusal whose fresh
+    read finds a live lock is a lost race: whoever it names, even the
+    caller's own holder name, the caller never held it. A refusal whose
+    fresh read still finds the lock expired (a lagging read, loom#2555)
+    tries again from that read, after each of WRITE_RETRY_WAITS."""
+    waits = list(WRITE_RETRY_WAITS)
+    while True:
+        stale, stale_message = read
         # The expired lock's yield record goes on into the new lock.
-        carried = _with_yields(message, yields_from(read[1]), now)
-        if carried != message:
-            sha = gh.rest("POST", "/repos/%s/git/commits" % repo, {
-                "message": carried, "tree": tree, "parents": []}).data["sha"]
-    if _create_ref(gh, repo, sha):
-        return Attempt(True, mine, holder)
-    # A second failed create means another taker won the gap after the
-    # stale-lock delete: whoever it names, the caller never held this lock.
-    current = read_holder(gh, repo)
-    return Attempt(False, current or Holder("", None, None), holder)
+        carried = _with_yields(message, yields_from(stale_message), now)
+        if _fast_forward(gh, repo, _lock_commit(gh, repo, carried, [stale])):
+            return Attempt(True, mine, holder)
+        fresh = _read_message(gh, repo)
+        retry = fresh is not None and not _holder_from(fresh[1]).live(now) and bool(waits)
+        if retry:
+            sleep(waits.pop(0))
+            fresh = _read_message(gh, repo)
+        current = _no_holder() if fresh is None else _holder_from(fresh[1])
+        if not retry or fresh is None or current.live(now):
+            return Attempt(False, current, holder)
+        read = fresh
 
 
 def attempt_waiting(gh: GitHub, repo: str, holder: str, minutes: int = 15,

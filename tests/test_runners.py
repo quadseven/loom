@@ -119,18 +119,44 @@ class RunnersTest(unittest.TestCase):
     def beat(self):
         return json.loads((self.home / "state" / "usage" / "opencode-go-2.json").read_text())
 
+    def test_runner_report_persists_provider_limit_record_but_not_its_heartbeat(self):
+        runner = self.runner()
+        files = {
+            "state/usage/opencode-go-2.provider-limit.json": b'{"limit_name":"weekly"}\n',
+            "state/usage/opencode-go-2.json": b'{"available":false}\n',
+        }
+
+        runner.apply("opencode-go-2", TICKET, files)
+
+        usage = self.home / "state" / "usage"
+        self.assertEqual((usage / "opencode-go-2.provider-limit.json").read_bytes(),
+                         files["state/usage/opencode-go-2.provider-limit.json"])
+        self.assertFalse((usage / "opencode-go-2.json").exists(),
+                         "the station writes its own heartbeat from the report")
+
     # -- configuration -------------------------------------------------------
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
-        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude-9 zen, free-kilo"}),
-                         ["zen", "free-kilo", "free-openrouter"])
+        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
+                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
+                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter"])
+                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4"])
+
+    def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
+        settings = runners.lane_settings("workersai", {
+            "LOOM_WORKERSAI_KEY_SSM": "/workersai/token",
+            "LOOM_WORKERSAI_ACCOUNT_SSM": "/workersai/account",
+        })
+        self.assertEqual(settings["LOOM_WORKERSAI_MODEL"],
+                         "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b")
+        self.assertEqual(settings["LOOM_WORKERSAI_ACCOUNT_SSM"], "/workersai/account")
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",
@@ -152,7 +178,7 @@ class RunnersTest(unittest.TestCase):
     def test_a_runner_slot_takes_public_repos_only(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "opencode-go-2"}):
             self.assertTrue(station.needs_public_repo("opencode-go-2", "opencode-go/beam-free"))
-            self.assertFalse(station.needs_public_repo("opencode-go-3", "opencode-go/beam-free"))
+            self.assertTrue(station.needs_public_repo("opencode-go-3", "opencode-go/beam-free"))
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": ""}):
             self.assertFalse(station.needs_public_repo("opencode-go-2", "opencode-go/beam-free"))
 
@@ -212,6 +238,28 @@ class RunnersTest(unittest.TestCase):
         self.drop_brief()
         self.runner(actor=None).tend()
         self.assertEqual(self.gh.calls, [])
+
+    def test_the_pool_bound_holds_extra_briefs_in_the_inbox(self):
+        slots = ["opencode-go-2", "opencode-go-3", "opencode-go-4", "zen", "spark-2"]
+        env = dict(self.env, LOOM_RUNNER_POOL_MAX="2")
+        for slot in slots:
+            (self.home / "briefs" / slot).mkdir(parents=True, exist_ok=True)
+            (self.home / "briefs" / slot / (TICKET + ".md")).write_text(BRIEF)
+        r = runners.Runners(self.gh, str(self.home), REPO, slots, env,
+                            lambda repo: self.public.get(repo, False), self.said.append,
+                            actor=APP, now=self.now, fetch=self.fetch)
+        r.tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 2)
+        waiting = [slot for slot in slots
+                   if (self.home / "briefs" / slot / (TICKET + ".md")).exists()
+                   and not (self.home / "briefs" / slot / "failed" / (TICKET + ".md")).exists()]
+        # Only the two dispatched slots stay in the inbox too; the other three
+        # must still be in the inbox, not parked.
+        still = [slot for slot in slots
+                 if (self.home / "briefs" / slot / (TICKET + ".md")).exists()]
+        self.assertEqual(len(still), 5)
+        self.assertFalse(any((self.home / "briefs" / slot / "failed" / (TICKET + ".md")).exists()
+                             for slot in slots))
 
     def test_a_budget_refusal_sends_the_brief_on_a_later_pass(self):
         self.drop_brief()
@@ -329,6 +377,46 @@ class RunnersTest(unittest.TestCase):
         self.runner(now=self.now + 601 + runners.HOLD_SECONDS).tend()
         self.assertEqual(len(self.gh.posts("/dispatches")), 2)
         self.assertTrue(self.beat()["available"])
+
+    def test_a_gateway_retry_after_keeps_the_runner_slot_undispatched_until_reset(self):
+        run, run_id = self.dispatched()
+        reset = int(self.now + 24 * 3600)
+        artifact = self.seal(run_id, {}, beat={
+            "lane": "opencode-go-2", "at": 1, "available": False,
+            "reason": "limit: free gateway route unavailable", "retry_at": reset,
+        })
+        self.finish(run, run_id, artifact, "failure")
+        self.runner(now=self.now + 600).tend()
+        self.assertEqual(self.beat()["retry_at"], reset)
+
+        self.drop_brief(name="owner.app-8")
+        # A one-day retry window blocks dispatch through its final second.
+        self.runner(now=reset - 1).tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 1)
+        self.runner(now=reset + 1).tend()
+        self.assertEqual(len(self.gh.posts("/dispatches")), 2)
+
+    def test_an_opencode_go_limit_report_holds_paid_sibling_slots_in_their_beats(self):
+        slots = ["opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
+        env = dict(self.env, LOOM_OPENCODE_GO_1_MODEL="opencode-go/mimo-v2.6-flash",
+                   LOOM_OPENCODE_GO_2_MODEL="opencode-go/beam-free",
+                   LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash",
+                   LOOM_OPENCODE_GO_4_MODEL="opencode-go/muse-spark-1.3-contributor")
+        runner = runners.Runners(self.gh, str(self.home), REPO, slots, env,
+                                 lambda repo: True, self.said.append, actor=APP, now=self.now)
+        ledger = runner.load()
+        reset = int(self.now + 86400)
+        beat = {"lane": "opencode-go-1", "at": int(self.now), "available": False,
+                "reason": "limit: provider usage limit", "retry_at": reset}
+        runner._take_beat(ledger, "opencode-go-1", beat)
+        for slot in slots:
+            runner._beat(ledger, slot)
+
+        for slot in ("opencode-go-1", "opencode-go-3", "opencode-go-4"):
+            sibling = json.loads((self.home / "state/usage" / (slot + ".json")).read_text())
+            self.assertFalse(sibling["available"])
+            self.assertEqual(sibling["retry_at"], reset)
+        self.assertTrue(json.loads((self.home / "state/usage/opencode-go-2.json").read_text())["available"])
 
     # -- a repo whose base check is red on the slot's runner -------------------
     def run_base(self, name, rows, image="image-a", text=BRIEF):

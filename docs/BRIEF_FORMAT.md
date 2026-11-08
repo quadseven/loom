@@ -14,6 +14,16 @@ it the runner uses the lane default (`LOOM_CODEX_MODEL` or
 pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
+`Repairs incident: #7` names an open base-check factory incident in the
+factory repository. `bus.brain brief --repairs-incident 7` writes this
+header, and the station preserves it in the lane brief. The runner verifies
+that the incident belongs to the same repository (using its opaque alias
+for a private repository). Only then can a clean, red baseline admit the
+repair agent. Environment failures and interrupted or timed-out checks
+still hold the run. The baseline remains recorded as red; final validation
+must pass before any pull request opens. Closed, missing, unreadable or
+unrelated incidents grant no exception.
+
 `Fix-PR` is optional and written only by the station: it names the open pull
 request already on `Branch`. The runner then clones that branch instead of
 creating it, runs the agent with the brief and its closing `## Fix` section,

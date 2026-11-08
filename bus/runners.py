@@ -34,8 +34,8 @@ Rules:
   slot, the slot takes no more of that repo: its briefs park [transient] so
   another lane takes them, until the repo's head or the runner image changes.
 
-Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
-stay on this machine. docs/LANES.md, "Lanes on cluster runners".
+Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
+docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
 
@@ -69,17 +69,29 @@ REF = "main"
 # GitHub refuses a workflow_dispatch whose inputs together pass this many
 # characters.
 INPUT_LIMIT = 65535
-# Provider lanes a runner may run: API lanes whose key the workflow's role
-# can read, and the gateway-served spark and free lanes.
-RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+# Provider lanes a runner may run: Codex and Claude subscription lanes, API
+# lanes whose key the workflow's role can read, and gateway-served spark/free.
+RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {
+    "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
+    "opencode-go-1": {"LOOM_OPENCODE_GO_1_MODEL": "opencode-go/mimo-v2.6-flash"},
+    "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
+    "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
+    "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
+}
+OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
+# The runner pool at most this many runs in flight and queued at once
+# (LOOM_RUNNER_POOL_MAX, default 4): dispatching more turns held pods into
+# runs cancelled by the queue limit. Extra briefs wait in the inbox.
+POOL_MAX_DEFAULT = 4
 # How long a slot stays held after a run reported it unavailable with no
 # reset time, or after no runner took its run.
 HOLD_SECONDS = 1800
@@ -117,7 +129,7 @@ NAME_RE = re.compile(r"^LOOM_[A-Z0-9_]+$")
 VALUE_RE = re.compile(r"^[\x20-\x7e]{0,1000}$")
 # Per-lane settings a runner job may receive: LOOM_<SLOT>_<SUFFIX> or
 # LOOM_<LANE>_<SUFFIX>, as run_lane.sh's lane_setting reads them.
-SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
+SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "ACCOUNT_SSM", "SESSION_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
             "CONTEXT", "OUTPUT")
 # Settings shared by every lane that a runner job may receive.
 SHARED = ("LOOM_REPO_OWNERS", "LOOM_AWS_REGION", "LOOM_AGENT_TIMEOUT",
@@ -168,7 +180,20 @@ def runner_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
     names = [n for n in re.split(r"[\s,]+", str(env.get("LOOM_RUNNER_SLOTS") or "").strip()) if n]
     if names:
         names += list(TRACKED_SLOTS)
-    return [n for n in dict.fromkeys(names) if n in LANES and provider(n) in RUNNER_LANES]
+    return [n for n in dict.fromkeys(names)
+            if n in LANES and provider(n) in RUNNER_LANES and n != "codex"]
+
+
+def pool_max(env: Optional[Dict[str, str]] = None) -> int:
+    """The pool's most runs in flight and queued at once, from
+    LOOM_RUNNER_POOL_MAX (default POOL_MAX_DEFAULT). An unreadable or
+    non-positive value falls back to the default."""
+    env = os.environ if env is None else env
+    try:
+        value = int(str(env.get("LOOM_RUNNER_POOL_MAX") or "").strip())
+    except ValueError:
+        return POOL_MAX_DEFAULT
+    return value if value > 0 else POOL_MAX_DEFAULT
 
 
 def setting_allowed(slot: str, name: str) -> bool:
@@ -347,6 +372,11 @@ class Runners:
         return any(e.get("slot") == slot and e.get("state") == "dispatched"
                    for e in ledger["runs"].values())
 
+    def _pool_used(self, ledger: Dict[str, Any]) -> int:
+        """Runs in flight and queued across every slot: every ledger entry
+        still dispatched, whether a runner has taken it or it waits queued."""
+        return sum(1 for e in ledger["runs"].values() if e.get("state") == "dispatched")
+
     # -- dispatch ----------------------------------------------------------
     def _dispatch_slot(self, ledger: Dict[str, Any], slot: str) -> None:
         try:
@@ -360,6 +390,8 @@ class Runners:
                 continue   # never dispatched twice, whatever became of it
             if self._in_flight(ledger, slot):
                 return     # one run per slot, as one local runner
+            if self._pool_used(ledger) >= pool_max(self.env):
+                return     # the pool is full: the brief waits in the inbox
             hold = ledger["holds"].get(slot) or {}
             if float(hold.get("until") or 0) > self.now:
                 return     # held, as its heartbeat says: the brief waits
@@ -611,6 +643,7 @@ class Runners:
         HOLD_SECONDS when it was unavailable; keep its model limits."""
         if beat is None:
             return
+        self._share_opencode_go_limit(ledger, slot, beat)
         models = beat.get("limited_models")
         if beat.get("available") is not True:
             until = beat.get("retry_at")
@@ -622,6 +655,27 @@ class Runners:
         ledger["holds"].pop(slot, None)
         if isinstance(models, dict) and models:
             self._hold(ledger, slot, 0, "", models)
+
+    def _share_opencode_go_limit(self, ledger: Dict[str, Any], slot: str,
+                                 beat: Dict[str, Any]) -> None:
+        """Carry a paid Go plan limit from one pod report to every paid slot."""
+        reason = str(beat.get("reason") or "")
+        if slot not in OPENCODE_GO_SLOTS or beat.get("available") is not False \
+                or not reason.startswith("limit:") or self._go_slot_is_free(slot):
+            return
+        until = beat.get("retry_at")
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or until <= self.now:
+            until = self.now + HOLD_SECONDS
+        for sibling in OPENCODE_GO_SLOTS:
+            if not self._go_slot_is_free(sibling):
+                self._hold(ledger, sibling, float(until), reason)
+
+    def _go_slot_is_free(self, slot: str) -> bool:
+        """Whether a tracked Go slot runs a model outside its shared plan."""
+        settings = lane_settings(slot, self.env)
+        model = next((value for name, value in settings.items()
+                      if name.endswith("_MODEL") and name.startswith(_prefix(slot))), "")
+        return model.startswith("opencode-go/") and model.endswith("-free")
 
     def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
@@ -847,7 +901,7 @@ class Runners:
         for rel, data in sorted(files.items()):
             if rel.startswith("briefs/%s/" % slot) and "/answers/" not in rel:
                 continue   # the brief moves below; the local copy is the one sent
-            if rel.startswith("state/usage/"):
+            if rel == beat_rel:
                 continue   # the station writes the slot's heartbeat itself (_beat)
             _write(os.path.join(self.home, *rel.split("/")), data)
         if kinds:
@@ -942,7 +996,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
     each runner slot's settings, less its model settings (the plist's
     model_env writes those) and the names the plist writes itself."""
     out: Dict[str, str] = {}
-    for name in ("LOOM_RUNNER_SLOTS", "LOOM_RUNNER_REPO") + tuple(LANES_APP):
+    for name in ("LOOM_RUNNER_SLOTS", "LOOM_RUNNER_REPO", "LOOM_RUNNER_POOL_MAX") + tuple(LANES_APP):
         if env.get(name):
             out[name] = env[name]
     for slot in runner_slots(env):

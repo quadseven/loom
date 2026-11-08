@@ -47,6 +47,13 @@ OPERATOR_CHECK_READS = 30
 # keeps the ask the last pass read.
 OPERATOR_NEEDS_LABELS = 10
 OPERATOR_ASK_READS = 30
+# A kept GitHub answer no request used for this long is removed each pass
+# (seconds), as the station does (bus/station.py CACHE_KEEP); every TTL above
+# is far shorter, so a source read again still finds its ETag.
+CACHE_KEEP = 24 * 3600
+# A URL backlog source (LOOM_BACKLOG_SOURCE) is read on the refresh thread
+# this often (seconds); a page request reads only the kept copy (loom#2581).
+BACKLOG_SECONDS = 300
 LOG = logging.getLogger(__name__)
 
 
@@ -121,7 +128,6 @@ def ticket_record(repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "repo": repo, "number": issue.get("number"), "title": issue.get("title"),
         "refs": re.findall(r"(?:https?://github\.com/)?([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)", body),
-        "html_url": issue.get("html_url"),
         "state": next((name[5:] for name in names if name in labels.LABELS and name.startswith("loom:")
                         and name not in ("loom:ticket", "loom:goal", "loom:runaway")), None),
         # The issue the ticket names: an epic or, before tickets moved under
@@ -294,6 +300,7 @@ class TicketStore:
                           "improving": {"journals": [], "metrics_comments": []},
                           "improving_built": None,
                           "lanes": [], "pull_requests": [], "dashboard_errors": [],
+                          "wait_cause_rows": [],
                           "goal_context": {},
                           "goal_context_error": "the dashboard has not read its sources yet"}
         self.operator_items = []
@@ -320,6 +327,10 @@ class TicketStore:
         self._kept_prs: Dict[str, Dict[str, Any]] = {}
         self._kept_lock = threading.Lock()
         self._request_mark: Optional[Tuple[float, Dict[str, int], int]] = None
+        # The backlog source reader, set by make_server (dashboard/server.py
+        # _backlog_bytes): None reads nothing. (source, bytes or None, when).
+        self.backlog_fetch: Optional[Any] = None
+        self._backlog: Tuple[str, Optional[bytes], float] = ("", None, 0.0)
         # The Tiers and allowances page's sources (the gateway, Grug, run
         # outcomes), read once a pass below, never by a page request.
         self.tier_sources = tiers_sources.TierSources(runs_store=self._runs_store)
@@ -357,11 +368,51 @@ class TicketStore:
 
         def run() -> None:
             while not self._stop.is_set():
-                self.refresh()
+                # Broad on purpose: one unexpected GitHub shape (a TypeError
+                # in a join) must fail one pass, not end the thread and leave
+                # every page on the last snapshot for good (loom#2581).
+                try:
+                    self.refresh()
+                except Exception as exc:  # noqa: BLE001
+                    LOG.exception("dashboard refresh failed; next pass in %ds", interval)
+                    self._mark_refresh_failed(exc)
                 self._stop.wait(interval)
 
         self._refresh_thread = threading.Thread(target=run, daemon=True)
         self._refresh_thread.start()
+
+    def _mark_refresh_failed(self, exc: Exception) -> None:
+        """Keep the last snapshot but mark it stale, so every page says the
+        refresh failed instead of serving old data as live."""
+        with self._snapshot_lock:
+            snapshot = dict(self._snapshot)
+            snapshot["stale"] = True
+            snapshot["stale_reason"] = "the dashboard refresh failed (%s)" % type(exc).__name__
+            snapshot["next_refresh_at"] = int(time.time()) + _refresh_interval()
+            self._snapshot = snapshot
+
+    def backlog_cached(self, source: str) -> Optional[bytes]:
+        """The backlog bytes the refresh thread last read from `source`;
+        None before the first read or after a failed one."""
+        kept_source, raw, _ = self._backlog
+        return raw if kept_source == source else None
+
+    def _read_backlog(self, now: float) -> None:
+        """Read a URL backlog source once every BACKLOG_SECONDS, here on the
+        refresh thread, so no page request waits on it (loom#2581)."""
+        fetch = self.backlog_fetch
+        source = os.environ.get("LOOM_BACKLOG_SOURCE", "").strip()
+        if fetch is None or urlsplit(source).scheme not in ("http", "https"):
+            return
+        kept_source, raw, read_at = self._backlog
+        if kept_source == source and now - read_at < BACKLOG_SECONDS:
+            return
+        try:
+            raw = fetch()
+        except Exception as exc:  # noqa: BLE001 - refresh thread, as run() says
+            LOG.warning("backlog source read failed: %s", exc)
+            raw = None
+        self._backlog = (source, raw, now)
 
     def stop_background(self) -> None:
         self._stop.set()
@@ -418,9 +469,11 @@ class TicketStore:
             humans = self.gh.paginate("/repos/%s/issues?labels=loom%%3Ahuman&state=open" % quote(repo, safe="/"))
         except (GitHubError, OSError, ValueError) as exc:
             return repo, [], 0, "%s operator items: %s" % (repo, self._error_reason(exc))
-        humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row]
+        humans = [row for row in humans if isinstance(row, dict) and "pull_request" not in row
+                  and not any(name.startswith("blocked:") for name in _label_names(row))]
         unique = {issue.get("number"): issue for issue in asks
-                  if isinstance(issue, dict) and "pull_request" not in issue}
+                  if isinstance(issue, dict) and "pull_request" not in issue
+                  and not any(name.startswith("blocked:") for name in _label_names(issue))}
         found = [_operator_item(repo, issue, "needs_operator") for issue in unique.values()]
         # A needs:human issue waits on the operator too (loom#1777): its ask is
         # the needs:human comment, read with the needs-operator asks.
@@ -1150,21 +1203,27 @@ class TicketStore:
     def _refresh_waits(self, snapshot: Dict[str, Any], now: float) -> None:
         if now - self._waits_refreshed_at < 3600 or self._below_floor():
             snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_cause_rows"] = self._snapshot.get("wait_cause_rows", [])
             snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
             snapshot["state_entered"] = self._snapshot.get("state_entered", {})
             return
         try:
             entered = {}
-            rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered)
+            causes = []
+            rows, bottleneck = waits_for_repos(self.gh, self.repos, now, entered, cause_rows=causes)
             self.waits = {row["state"]: [row["median_h"]] * row["n"]
                           for row in rows if row.get("median_h") is not None and row.get("n")}
             snapshot["wait_rows"] = rows
+            snapshot["wait_cause_rows"] = causes
             snapshot["wait_bottleneck"] = bottleneck
             snapshot["state_entered"] = entered
             self.waits_error = ""
-        except (GitHubError, OSError, ValueError) as exc:
-            self.waits_error = self._error_reason(exc)
+        # Broad on purpose: waits_for_repos joins GitHub shapes, and a
+        # TypeError or KeyError there must cost the waits, not the pass.
+        except Exception as exc:  # noqa: BLE001
+            self.waits_error = self._error_reason(exc) or type(exc).__name__
             snapshot["wait_rows"] = self._snapshot.get("wait_rows", [])
+            snapshot["wait_cause_rows"] = self._snapshot.get("wait_cause_rows", [])
             snapshot["wait_bottleneck"] = self._snapshot.get("wait_bottleneck")
             snapshot["state_entered"] = self._snapshot.get("state_entered", {})
         self._waits_refreshed_at = now
@@ -1206,6 +1265,7 @@ class TicketStore:
             now = time.time()
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)
+            self._read_backlog(now)
             floor_context = dict(snapshot.get("floor_context") or {})
             # The Floor's count is every item the Needs-you page lists:
             # needs-operator asks and needs:<login> items, each once.
@@ -1218,8 +1278,20 @@ class TicketStore:
             with self._snapshot_lock:
                 self._snapshot = snapshot
             self._log_requests(now)
+            self._prune_cache(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
+
+    def _prune_cache(self, now: float) -> None:
+        """Remove kept GitHub answers no pass used for CACHE_KEEP: the
+        comment feed's daily since= URLs and finished pull requests' check
+        runs would otherwise grow the cache for the life of the process."""
+        prune = getattr(self.gh, "prune_cache", None)
+        if prune is None:
+            return
+        removed = prune(CACHE_KEEP, now)
+        if removed:
+            LOG.info("pruned %d kept GitHub answers", removed)
 
     def _runs_store(self) -> Any:
         """The transcript store; RuntimeError when none is configured."""
@@ -1272,6 +1344,7 @@ class TicketStore:
                 "latest_runs": snapshot.get("latest_runs", {}),
                 "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),
+                "wait_cause_rows": snapshot.get("wait_cause_rows", []),
                 "wait_bottleneck": snapshot.get("wait_bottleneck"),
                 "floor_context": snapshot.get("floor_context", {}),
                 "goal_context": snapshot.get("goal_context", {}),

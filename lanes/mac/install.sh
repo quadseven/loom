@@ -3,7 +3,7 @@
 #
 #   lanes/mac/install.sh [lane ...]
 #     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot,
-#     plus the extra slots anthropic-2 to anthropic-8, codex-2, opencode-go-2
+#     plus the extra slots anthropic-2 to anthropic-8, codex-2 to codex-16, opencode-go-2
 #     opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL) and opencode-go-4
 #     (LOOM_OPENCODE_GO_4_MODEL, Muse Spark Contributor: public repos only)
 #
@@ -213,7 +213,8 @@ keep_installed LOOM_ASK_ANSWERERS
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
   anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
+  codex-2 codex-3 codex-4 codex-5 codex-6 codex-7 codex-8 codex-9 codex-10 codex-11
+  codex-12 codex-13 codex-14 codex-15 codex-16 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
   free-ollama free-gemma free-nvidia free-kilo free-groq)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
@@ -230,8 +231,8 @@ X_REPO="$(xml "$REPO_ROOT")" X_LOOM="$(xml "$LOOM_HOME")" X_HOME="$(xml "$HOME")
 # The dashboard's database settings (LOOM_DB_*, a password among them) go to
 # the dashboard plist through db_env only: no lane or brain reads them.
 loom_env() {
-  local skip=" $* "
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local k v skip=" $* "
+  while IFS= read -r k; do
     case "$k" in
       LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS|LOOM_DB_*) continue ;;
       # Each job gets its own writer's App from app_env, never another's.
@@ -239,18 +240,21 @@ loom_env() {
       LOOM_*) ;; *) continue ;;
     esac
     case "$skip" in *" $k "*) continue ;; esac
+    v="${!k}"
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
-  done
+  done < <(compgen -e | LC_ALL=C sort)
 }
 
 # The LOOM_DB_* settings as plist entries, for the dashboard plist alone.
 db_env() {
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local k v
+  while IFS= read -r k; do
     case "$k" in LOOM_DB_*) ;; *) continue ;; esac
+    v="${!k}"
     v="$(xml "$v")"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
-  done
+  done < <(compgen -e | LC_ALL=C sort)
 }
 
 # One writer's App settings as the job's LOOM_GITHUB_APP_*: $1 is "" for the
@@ -270,10 +274,12 @@ app_env() {
 # the station: its factory reads what a lane ran from them when a claim had
 # no Model: line and no runner footer names it (bus/brain.py lane_model).
 model_env() {
-  env | LC_ALL=C sort | while IFS='=' read -r k v; do
+  local k v
+  while IFS= read -r k; do
     case "$k" in LOOM_BRAIN_MODEL) continue ;; LOOM_*_MODEL|LOOM_*_MODELS) ;; *) continue ;; esac
+    v="${!k}"
     printf '    <key>%s</key><string>%s</string>\n' "$k" "$(xml "$v")"
-  done
+  done < <(compgen -e | LC_ALL=C sort)
 }
 
 # A slot in LOOM_RUNNER_SLOTS runs on cluster runners: the station

@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ sys.path.insert(0, ROOT)
 from bus import runners  # noqa: E402
 
 DEFAULT_DENY_SSM = "/infra/leak-scan/deny-list"
+CODEX_SESSION_MAX_AGE = 6 * 60 * 60
 SSM_NAME_RE = re.compile(r"^/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$")
 GATEWAY_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 ORIGIN_RE = re.compile(r"^https?://[^/]+")
@@ -111,7 +113,8 @@ def rebase_gateway(slot: str, settings: Dict[str, str], gateway: str) -> Dict[st
 def prepare() -> None:
     inputs = _inputs()
     slot, ticket, run_id = inputs.get("slot", ""), inputs.get("ticket", ""), inputs.get("run_id", "")
-    if slot not in runners.LANES or runners.provider(slot) not in runners.RUNNER_LANES:
+    if (slot not in runners.LANES or runners.provider(slot) not in runners.RUNNER_LANES
+            or slot == "codex"):
         raise JobError("slot is not a lane a runner may run")
     if not runners.TICKET_RE.fullmatch(ticket):
         raise JobError("ticket must be letters, digits, dot, underscore or dash")
@@ -131,6 +134,10 @@ def prepare() -> None:
         settings = runners.parse_settings(slot, inputs.get("settings", ""))
     except ValueError as err:
         raise JobError(str(err)) from None
+    if runners.provider(slot) == "codex" and not settings.get("LOOM_CODEX_SESSION_SSM"):
+        raise JobError("a Codex runner slot needs LOOM_CODEX_SESSION_SSM")
+    if runners.provider(slot) == "claude" and not settings.get("LOOM_CLAUDE_KEY_SSM"):
+        raise JobError("a Claude runner slot needs LOOM_CLAUDE_KEY_SSM")
     settings = rebase_gateway(slot, settings, os.environ.get("LOOM_RUNNER_GATEWAY_URL", ""))
     d = job_dir()
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -150,6 +157,27 @@ def _hold(reason: str) -> None:
     beat = {"lane": job["slot"], "at": int(time.time()), "available": False,
             "reason": reason, "limited_models": {}}
     _write(os.path.join(home, "state", "usage", job["slot"] + ".json"), json.dumps(beat) + "\n", 0o644)
+
+
+def codex_session(value: str, now: float = None) -> str:
+    """Return the published Codex auth file, or a safe freshness error."""
+    try:
+        published = json.loads(value)
+        auth = published["auth"]
+        stamp = float(published["published_at"])
+    except (ValueError, TypeError, KeyError):
+        raise JobError("the Codex session copy is invalid") from None
+    current = time.time() if now is None else now
+    if not math.isfinite(stamp) or stamp > current or current - stamp > CODEX_SESSION_MAX_AGE:
+        raise JobError("the Codex session copy is stale")
+    if not isinstance(auth, dict) or not isinstance(auth.get("tokens"), dict):
+        raise JobError("the Codex session copy is invalid")
+    tokens = auth["tokens"]
+    if not isinstance(tokens.get("access_token"), str) or not tokens["access_token"]:
+        raise JobError("the Codex session copy is invalid")
+    if "refresh_token" in tokens:
+        raise JobError("the Codex session copy contains a refresh token")
+    return json.dumps(auth, separators=(",", ":")) + "\n"
 
 
 def egress() -> None:
@@ -231,7 +259,31 @@ def ssm() -> None:
     region = os.environ.get("AWS_REGION") or settings.get("LOOM_AWS_REGION", "")
     d = job_dir()
     wanted = [(n, v) for n, v in sorted(settings.items())
-              if n.endswith("_KEY_SSM") and n != "LOOM_GITHUB_APP_KEY_SSM"]
+              if n.endswith("_SSM") and n not in (
+                  "LOOM_GITHUB_APP_KEY_SSM", "LOOM_CODEX_SESSION_SSM", "LOOM_CLAUDE_KEY_SSM")]
+    session_name = settings.get("LOOM_CODEX_SESSION_SSM", "")
+    if session_name:
+        if not SSM_NAME_RE.fullmatch(session_name):
+            raise JobError("LOOM_CODEX_SESSION_SSM is not an SSM parameter name")
+        try:
+            auth = codex_session(_fetch(session_name, region))
+        except JobError as err:
+            if "stale" in str(err):
+                _write(os.path.join(d, "codex-session-unavailable"), "stale\n")
+            else:
+                raise JobError("could not prepare the Codex session copy") from None
+        else:
+            _write(os.path.join(d, "home", "run", "codex-auth.json"), auth)
+    claude_name = settings.get("LOOM_CLAUDE_KEY_SSM", "")
+    if claude_name:
+        if not SSM_NAME_RE.fullmatch(claude_name):
+            raise JobError("LOOM_CLAUDE_KEY_SSM is not an SSM parameter name")
+        try:
+            value = _fetch(claude_name, region)
+        except JobError:
+            raise JobError("could not read the parameter LOOM_CLAUDE_KEY_SSM names") from None
+        _mask(value)
+        _write(os.path.join(d, "home", "run", "claude-oauth-token"), value)
     wanted.append(("LOOM_LEAK_DENY_SSM", settings.get("LOOM_LEAK_DENY_SSM") or DEFAULT_DENY_SSM))
     for setting, name in wanted:
         if not SSM_NAME_RE.fullmatch(name) or "/../" in name + "/" or "/./" in name + "/":
@@ -274,6 +326,11 @@ def lane_env() -> Dict[str, str]:
         # Scratch on the job's volume, not the runner's small /tmp.
         "TMPDIR": os.path.join(d, "tmp"),
     })
+    if os.path.isfile(os.path.join(d, "home", "run", "codex-auth.json")):
+        env["LOOM_CODEX_AUTH_FILE"] = os.path.join(d, "home", "run", "codex-auth.json")
+    claude_token = os.path.join(d, "home", "run", "claude-oauth-token")
+    if os.path.isfile(claude_token):
+        env["LOOM_CLAUDE_AUTH_FILE"] = claude_token
     os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
     for name in ("LOOM_EGRESS_DENY_PROBES", "LOOM_EGRESS_ALLOW_PROBE", "LOOM_EGRESS_PROBE_SECONDS",
                  "LOOM_LEAK_SCANNER", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"):
@@ -315,6 +372,67 @@ def failure_class(log: str) -> str:
     return found[-1] if found else "unknown"
 
 
+def _cgroup_int(root: str, names) -> int | None:
+    for name in names:
+        try:
+            text = open(os.path.join(root, name), encoding="ascii").read().strip().splitlines()[0].strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            return int(text)
+        except ValueError:
+            continue
+    return None
+
+
+def _cpu_usec(root: str) -> int | None:
+    try:
+        with open(os.path.join(root, "cpu.stat"), encoding="ascii") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "usage_usec":
+                    return int(parts[1])
+    except (OSError, ValueError):
+        pass
+    return _cgroup_int(root, ("cpuacct.usage", "cpu.usage", "memory.cpu.usage"))
+
+
+def read_cgroup(root: str | None = None):
+    """(peak memory bytes, cpu usage microseconds) from the cgroup of this
+    pod, or (None, None) when unreadable. cgroup v2 memory.peak and
+    cpu.stat usage_usec, with v1 memory.memory.usage_in_bytes and
+    cpuacct.usage as fallbacks. LOOM_CGROUP_ROOT names the root in tests."""
+    base = root or os.environ.get("LOOM_CGROUP_ROOT") or "/sys/fs/cgroup"
+    peak = _cgroup_int(base, ("memory.peak", "memory/memory.peak",
+                              "memory.current", "memory/memory.usage_in_bytes"))
+    return peak, _cpu_usec(base)
+
+
+def resources(wall_s: float, peak_bytes, cpu_usec) -> dict:
+    """peak_mem_mib, peak_cpu_cores and wall_s for one run. CPU cores is the
+    average cores used over the wall time (cpu usage divided by wall)."""
+    mem = round(float(peak_bytes) / 1048576.0, 3) if isinstance(peak_bytes, (int, float)) and peak_bytes else 0.0
+    cores = round(float(cpu_usec) / (wall_s * 1000000.0), 3) if (wall_s and wall_s > 0
+                 and isinstance(cpu_usec, (int, float)) and cpu_usec) else 0.0
+    return {"peak_mem_mib": mem, "peak_cpu_cores": cores, "wall_s": round(float(wall_s), 3)}
+
+
+def write_resources(home: str, slot: str, ticket: str, wall_s: float) -> dict:
+    """The run's resources file in the report: logs/<slot>/<ticket>.resources.json
+    with repo, lane, at and the peak fields. The repo is the brief's own."""
+    peak, cpu = read_cgroup()
+    try:
+        with open(os.path.join(job_dir(), "brief.md"), encoding="utf-8") as fh:
+            repo = runners.brief_field(fh.read(), "Repo")
+    except OSError:
+        repo = ""
+    row = {"repo": repo, "lane": slot, "at": int(time.time()), **resources(wall_s, peak, cpu)}
+    path = os.path.join(home, "logs", slot, ticket + ".resources.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write(path, json.dumps(row) + "\n", 0o644)
+    return row
+
+
 def run() -> None:
     """lanes/run_lane.sh <slot> once, on the one brief in the inbox. Its
     output goes to the service log in the sealed report, not to the public
@@ -325,18 +443,25 @@ def run() -> None:
     job = _job()
     d = job_dir()
     home = os.path.join(d, "home")
+    if os.path.exists(os.path.join(d, "codex-session-unavailable")):
+        _hold("Codex session copy is stale; slot unavailable")
+        print("slot unavailable: Codex session copy is stale")
+        return
     inbox = os.path.join(home, "briefs", job["slot"])
     os.makedirs(os.path.join(home, "logs"), exist_ok=True)
     os.makedirs(inbox, exist_ok=True)
     shutil.copyfile(os.path.join(d, "brief.md"), os.path.join(inbox, job["ticket"] + ".md"))
     log = os.path.join(home, "logs", job["slot"], job["ticket"] + ".service.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
+    start = time.monotonic()
     with open(log, "ab") as out:
         rc = subprocess.call(["bash", os.path.join(ROOT, "lanes", "run_lane.sh"), job["slot"]],
                              env=lane_env(), stdout=out, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL)
+    wall = time.monotonic() - start
     print("run_lane.sh exited %d" % rc)
     base = os.path.join(home, "logs", job["slot"], job["ticket"])
+    write_resources(home, job["slot"], job["ticket"], wall)
     _write(base + ".image", image_id() + "\n", 0o644)
     if not os.path.exists(base + ".agent-ran"):
         raise JobError("the agent did not run (%s); the reason is in the sealed report"
@@ -377,8 +502,9 @@ def report() -> None:
         for rel in report_files(home, job["slot"], job["ticket"]):
             tar.add(os.path.join(home, rel), arcname=rel, recursive=False)
     secret = os.path.join(d, "report-secret")
-    with open(secret, "wb") as fh:
-        os.chmod(secret, 0o600)
+    fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        os.fchmod(fh.fileno(), 0o600)
         fh.write(os.urandom(32).hex().encode("ascii"))
     step = "encrypt the files"
     try:

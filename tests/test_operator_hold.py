@@ -418,7 +418,7 @@ def brain_routes(body, files, patches):
     details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
                "headRefOid": "checked", "headRepository": {"nameWithOwner": BRAIN_REPO},
                "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]},
-               "reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+               "reviewThreads": {"totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False}},
                "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": TICKET_BODY if "Leave" in body else "x",
               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
@@ -432,6 +432,7 @@ def brain_routes(body, files, patches):
         # The pull request's own comments: no fleet hold on it (loom#2393).
         "/repos/%s/issues/8/comments" % BRAIN_REPO: [],
         "/repos/%s/issues/9" % BRAIN_REPO: ticket,
+        "/repos/%s/compare/main...checked" % BRAIN_REPO: {"behind_by": 0},
         "/repos/%s/contents/.github/workflows/sync.yml" % BRAIN_REPO: {
             "content": base64.b64encode(SYNC_WORKFLOW.encode()).decode()},
         "/repos/%s/contents/.github/workflows" % BRAIN_REPO: [{"name": "sync.yml"}],
@@ -529,7 +530,8 @@ class BrainMerge(unittest.TestCase):
               "head": {"ref": "loom/9-work", "sha": "checked"}}
         node = {"commits": {"nodes": [{"commit": {"committedDate": "2030-01-01T12:45:00Z",
                                                   "statusCheckRollup": {"state": "SUCCESS"}}}]},
-                "reviews": {"nodes": []}, "reviewThreads": {"nodes": []}}
+                "reviews": {"nodes": []},
+                "reviewThreads": {"totalCount": 0, "nodes": []}}
         routes = {"/repos/%s/issues/9" % BRAIN_REPO: {
                       "state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]},
                   "/repos/%s/pulls/8/files" % BRAIN_REPO: [{"filename": "bus/a.py"}],

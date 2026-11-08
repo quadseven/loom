@@ -15,8 +15,11 @@ App. This module is the part of that loop a command can decide:
   with no claim:* label, no lane:* label, no hold (needs:*, loom:human,
   needs-brain, awaiting-live-check, wait:*, epic, a goal home, an active
   Loom state), a stated Size of XS, S or M, at least one acceptance
-  checkbox, and no open or merged pull request naming it. Highest priority first
-  (a P0..P3 label or a `Priority:` line; none counts as P2), then oldest.
+  checkbox, and no open or merged pull request naming it. A ticket labelled for-muse
+  sorts before every priority and skips the soft holds only (lane:*, loom:briefed,
+  loom:triage). Then highest priority first (a P0..P3 label or a `Priority:` line;
+  none counts as P2), then oldest. The scan walks down that order until one ticket
+  passes, checking at most CHECKS (120) for a naming pull request.
 - `claim` adds claim:muse and a marked comment, then reads the labels back
   and lets go when another holder's claim landed at the same time.
 - `push` pushes the muse/<n>-<slug> branch through the git-database API
@@ -54,7 +57,13 @@ SIZES = ("XS", "S", "M")
 # stops at 1000), and how many
 # eligible candidates it checks for an open pull request before giving up.
 PAGES = 10
-CHECKS = 10
+CHECKS = 120
+# The operator's hand-off label: a ticket carrying it sorts before every
+# priority and is exempt from the soft holds only (a lane, a briefing, a
+# triage state). Every other hold still applies.
+FOR_MUSE = "for-muse"
+SOFT_HOLD_LABELS = {"loom:briefed", "loom:triage"}
+SOFT_HOLD_PREFIXES = ("lane:",)
 HOLD_LABELS = {"epic", "loom:goal", "loom:backlog", "loom:human", "needs-brain",
                "awaiting-live-check", "loom:held", "loom:runaway", "loom:running",
                "loom:briefed", "loom:pr", "loom:ready", "loom:merged", "loom:shipped",
@@ -138,9 +147,16 @@ def _kind_hold(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def for_muse(item: Dict[str, Any]) -> bool:
+    return any(n.lower() == FOR_MUSE for n in _names(item))
+
+
 def _label_hold(item: Dict[str, Any]) -> Optional[str]:
+    handed = for_muse(item)
     for name in _names(item):
         low = name.lower()
+        if handed and (low in SOFT_HOLD_LABELS or low.startswith(SOFT_HOLD_PREFIXES)):
+            continue
         if low in HOLD_LABELS or low.startswith(HOLD_PREFIXES):
             return "label " + name
     return None
@@ -228,10 +244,18 @@ def pick(gh: Any, repos: Sequence[str]) -> Optional[Work]:
             found += [i for i in items if _repo_of(i).lower() in wanted and hold(i) is None]
             if len(items) < 100:
                 break
-    found.sort(key=lambda i: (priority(i), str(i.get("created_at") or "")))
-    for item in found[:CHECKS]:
+    found.sort(key=lambda i: (0 if for_muse(i) else 1, priority(i),
+                              str(i.get("created_at") or "")))
+    named: Dict[Any, bool] = {}
+    checked = 0
+    for item in found:
         repo, number = _repo_of(item), int(item["number"])
-        if _named_by_pr(gh, repo, number):
+        if (repo, number) not in named:
+            if checked >= CHECKS:
+                break
+            checked += 1
+            named[(repo, number)] = _named_by_pr(gh, repo, number)
+        if named[(repo, number)]:
             continue
         title = str(item.get("title") or "")
         return Work("new", repo, number, title, str(item.get("html_url") or ""),

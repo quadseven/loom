@@ -19,8 +19,16 @@ tools). A tree is removed when:
   * or every commit on it is on a remote branch and it has been idle for
     STALE_DAYS.
 
-A tree in use, changed in the last MIN_IDLE_HOURS, dirty, or not a git tree
-is kept and named. Of the idle clean trees with commits on no remote, the
+The brain also writes scratch here: prompt bodies such as b5298.md, and
+folders of notes with no git checkout at any depth. Scratch idle for
+STALE_DAYS is removed and named; fresher scratch is only counted, under
+`scratch` in the closing line, with no line of its own. A folder whose .git
+is no repo and which holds no file at all (a clone that died before its
+first fetch, so git status fails every tick) is removed once idle for
+MIN_IDLE_HOURS, reason broken-git-dir (loom#2564, loom#2563).
+
+A tree in use, changed in the last MIN_IDLE_HOURS, dirty, or a folder that
+holds a git checkout deeper down (not-a-git-tree) is kept and named. Of the idle clean trees with commits on no remote, the
 newest KEEP are kept and named with their count of unpushed commits; an older
 one is retired: its unpushed commits are saved first to a git bundle in
 $LOOM_HOME/brain/retired (the line names the bundle), and a tree whose bundle
@@ -97,6 +105,26 @@ def git_ok(args: Sequence[str], cwd: str) -> bool:
         return False
 
 
+def fetch_failure_reason(stderr: str) -> str:
+    """Map Git's private error text to a small, safe diagnostic category."""
+    detail = stderr.lower()
+    if any(term in detail for term in ("authentication failed", "could not read username",
+                                       "permission denied", "invalid username", "access denied",
+                                       "returned error: 401", "returned error: 403",
+                                       "repository not found")):
+        return "auth"
+    if any(term in detail for term in ("couldn't find remote ref", "could not find remote ref",
+                                       "not a valid ref", "bad config", "no such remote",
+                                       "invalid config", "does not appear to be a git repository")):
+        return "ref or config"
+    if any(term in detail for term in ("could not resolve host", "connection timed out",
+                                       "connection refused", "network is unreachable",
+                                       "operation timed out",
+                                       "failed to connect", "could not resolve proxy")):
+        return "transport"
+    return "unknown"
+
+
 def process_cwds() -> Optional[List[str]]:
     """Real paths of every visible process's cwd, or None when they cannot be
     listed (then every tree counts as in use)."""
@@ -148,6 +176,35 @@ def newest_mtime(path: str) -> float:
     return newest
 
 
+def _walk_error(err: OSError) -> None:
+    raise err
+
+
+def holds_git(path: str) -> bool:
+    """Whether a .git sits anywhere under path: a checkout nested in a
+    folder, kept since its commits may be on no remote. A folder that cannot
+    be read counts as holding one, so it is kept."""
+    try:
+        for _top, dirs, files in os.walk(path, onerror=_walk_error):
+            if ".git" in dirs or ".git" in files:
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def holds_files(path: str) -> bool:
+    """Whether anything but a folder sits anywhere under path. A folder that
+    cannot be read counts as holding files."""
+    try:
+        for _top, _dirs, files in os.walk(path, onerror=_walk_error):
+            if files:
+                return True
+    except OSError:
+        return True
+    return False
+
+
 @dataclass
 class Tree:
     name: str
@@ -169,6 +226,9 @@ class Pruner:
     cwds: Optional[List[str]] = None
     keep_reasons: Counter = field(default_factory=Counter)
     removed: int = 0
+    # Scratch and broken git dirs removed this tick, by kind: the recovery
+    # line names them once, so the next keeps line counting fewer is explained.
+    recovered: Counter = field(default_factory=Counter)
     fetched: Dict[str, bool] = field(default_factory=dict)
 
     def keep_tree(self, name: str, reason: str) -> None:
@@ -197,11 +257,17 @@ class Pruner:
         key = (common or path).strip()
         if key in self.fetched:
             return
-        ok = git_ok(["fetch", "-q", "--no-tags", "origin"], path)
+        try:
+            result = git(["fetch", "-q", "--no-tags", "origin"], path)
+            ok = result.returncode == 0
+            detail = result.stderr
+        except (OSError, subprocess.SubprocessError) as err:
+            ok = False
+            detail = str(err)
         self.fetched[key] = ok
         if not ok:
-            self.say("fetch-failed %s: its landed check reads the refs it had"
-                     % os.path.basename(path))
+            self.say("fetch-failed %s reason=%s: its landed check reads the refs it had"
+                     % (os.path.basename(path), fetch_failure_reason(detail)))
 
     def content_landed(self, path: str, default: str) -> bool:
         """Whether merging HEAD into default changes nothing. The merge's objects
@@ -282,10 +348,72 @@ class Pruner:
             return "holds-linked-worktrees"
         return None
 
+    def scratch_kind(self, path: str) -> Optional[str]:
+        """`scratch` for a plain file, or a folder with no git checkout at any
+        depth; `broken-git-dir` for a folder whose .git is no repo and which
+        holds no file at all (a clone that died before its first fetch).
+        None for anything else, which held() and the tree checks judge."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISREG(st.st_mode):
+            return "scratch"
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        dot_git = os.path.join(path, ".git")
+        if not os.path.lexists(dot_git):
+            return None if holds_git(path) else "scratch"
+        if os.path.isdir(dot_git) and not os.path.islink(dot_git) and not holds_files(path) \
+                and not git_ok(["--git-dir", dot_git, "rev-parse", "--git-dir"], path):
+            return "broken-git-dir"
+        return None
+
+    def sweep_scratch(self, name: str, path: str) -> bool:
+        """Remove scratch idle for STALE_DAYS, or a broken git dir idle for
+        MIN_IDLE_HOURS; count fresh scratch under `scratch` with no line of its own, since the brain
+        writes dozens of prompt bodies a day. A fresh broken git dir is left
+        to held(). True when the entry is dealt with."""
+        kind = self.scratch_kind(path)
+        if kind is None:
+            return False
+        is_dir = os.path.isdir(path)
+        if is_dir and self.in_use(path):
+            self.keep_tree(name, "in-use-cwd")
+            return True
+        try:
+            idle_h = (self.now - (newest_mtime(path) if is_dir else os.lstat(path).st_mtime)) / 3600.0
+        except OSError:
+            return False
+        # A clone still running writes objects, so a broken git dir idle for
+        # MIN_IDLE_HOURS is a dead one.
+        if idle_h < (self.stale_days * 24 if kind == "scratch" else self.min_idle_hours):
+            if kind != "scratch":
+                return False
+            self.keep_reasons["scratch"] += 1
+            return True
+        if is_dir:
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if os.path.lexists(path):
+            self.keep_tree(name, "remove-failed")
+            return True
+        self.removed += 1
+        self.recovered[kind] += 1
+        self.say("remove %s reason=%s" % (name, kind if kind != "scratch"
+                                          else "scratch-idle-%dd" % int(idle_h // 24)))
+        return True
+
     def judge(self, name: str) -> Optional[Tree]:
         """Remove or keep one tree. Returns it when it is idle and clean with
         commits on no remote: the caller keeps the newest KEEP of those."""
         path = os.path.join(self.work, name)
+        if self.sweep_scratch(name, path):
+            return None
         why = self.held(path)
         if why is not None:
             if why:
@@ -354,6 +482,9 @@ class Pruner:
             else:
                 self.retire(tree)
         self.prune_bundles()
+        if self.recovered:
+            self.say("recovered %s: removed, so later keeps lines no longer count them" % " ".join(
+                "%s=%d" % kv for kv in sorted(self.recovered.items())))
         kept = sum(self.keep_reasons.values())
         self.say("keeps total=%d %s removed=%d" % (kept, " ".join(
             "%s=%d" % kv for kv in sorted(self.keep_reasons.items(), key=lambda kv: (-kv[1], kv[0]))),

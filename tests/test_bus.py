@@ -535,20 +535,21 @@ class LockTests(unittest.TestCase):
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW, run="old").already)
         self.assertTrue(lock.attempt(gh, REPO, "lane-machine", 45, NOW).already)
 
-    def test_a_takeover_lost_after_the_stale_delete_is_held_not_yours(self):
-        # Another taker re-creates the lock between the stale-lock delete and
-        # the caller's second create: the caller never held it, even when
-        # the winner carries the caller's own holder name.
+    def test_a_takeover_lost_to_another_taker_is_held_not_yours(self):
+        # Another taker replaces the expired lock before the caller's
+        # fast-forward lands, so GitHub refuses it (loom#2579): the caller
+        # never held it, even when the winner carries the caller's own
+        # holder name.
         for winner in ("lane-machine", "muse"):
             g = FakeGit()
             g.seed_lock("old", stamp(NOW - timedelta(minutes=1)))
             real = g.__call__
 
             def racing(method, url, headers, body, g=g, real=real, winner=winner):
-                answer = real(method, url, headers, body)
-                if method == "DELETE":
+                if method == "PATCH" and "loom-lock" in url:
                     g.seed_lock(winner, stamp(NOW + timedelta(minutes=30)))
-                return answer
+                    return reply(422, {"message": "Update is not a fast forward"})
+                return real(method, url, headers, body)
 
             held = lock.attempt(GitHub("tok", transport=racing), REPO, "muse", 30, NOW)
             self.assertFalse(held.acquired, winner)
@@ -594,7 +595,9 @@ class LockTests(unittest.TestCase):
         gh = GitHub("tok", transport=g)
         self.assertEqual(take(gh, "tick-1", 15, NOW), (True, "tick-1"))
         self.assertIn("holder=tick-1", g.lock_message())
-        self.assertIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
+        # A fast-forward over the expired lock, never a delete (loom#2579).
+        self.assertIn(("PATCH", "git/refs/heads/loom-lock/brain"), g.calls)
+        self.assertNotIn(("DELETE", "git/refs/heads/loom-lock/brain"), g.calls)
 
     # A brain that stands down for a peer's lock records its yield on that
     # lock (loom#2606), so the station can tell a yield from a stop. The
@@ -720,6 +723,14 @@ class JournalTests(unittest.TestCase):
                                        measure="p95 2s").splitlines()
         self.assertEqual(lines[2], "- Measure: p95 2s")
 
+    def test_render_journal_with_a_shipped_backlog(self):
+        # loom#2161: the shipped stage's count and median wait ride every
+        # tick journal, right under the tick's own Shipped line.
+        lines = journal.render_journal(NOW, "tick-1", [], [], [], [], 1, 1,
+                                       backlog="215 waiting, median wait 57.8h").splitlines()
+        self.assertEqual(lines[2], "- Shipped: none")
+        self.assertEqual(lines[3], "- Shipped backlog: 215 waiting, median wait 57.8h")
+
     def test_render_report(self):
         lines = journal.render_report(NOW, "tick-1", "m", [], "f", "none", "n").splitlines()
         self.assertEqual(lines[0], journal.REPORT_MARKER)
@@ -737,6 +748,22 @@ class JournalTests(unittest.TestCase):
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx")
         self.assertEqual(t.calls[2][0], "POST")
         self.assertTrue(t.calls[2][1].endswith("/repos/%s/issues/7/comments" % REPO))
+
+    def test_post_adds_the_station_shipped_backlog_stamp_to_a_journal(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state = os.path.join(temp.name, "state", "station")
+        os.makedirs(state)
+        with open(os.path.join(state, "verify-priority.json"), "w") as fh:
+            json.dump({"at": NOW.timestamp(), "n": 4, "median_h": 30.7}, fh)
+        text = (journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\n"
+                "- Shipped: none\n- Briefed: none\n- Waiting: none\n- Asks: none\n- Cost: 0 requests, 0 minutes")
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        gh = GitHub("tok", transport=t)
+        with mock.patch.dict(os.environ, {"LOOM_HOME": temp.name}):
+            journal.post(gh, REPO, 7, text, now=NOW)
+        body = json.loads(t.calls[2][3])["body"]
+        self.assertIn("- Shipped backlog: 4 waiting, median wait 30.7h", body)
 
     def test_a_journal_without_its_tick_line_is_refused_unless_a_holder_adds_it(self):
         # No brain's journal carried a Tick line on 2026-10-16, so each read its
@@ -820,13 +847,13 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(json.loads(t.calls[1][3])["body"], journal.REPORT_MARKER + "\nReport")
 
     def test_a_journal_is_never_held_by_the_report_gap(self):
-        # A journal reads only its login and its own day's comments (to edit
-        # the day's journal in place), never the report gap's window.
+        # One comments read includes yesterday's tick for repeat-stall context
+        # and today's journal for in-place editing, not the report-gap window.
         t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
         gh = GitHub("tok", transport=t)
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx", now=NOW)
         self.assertEqual([c[0] for c in t.calls], ["GET", "GET", "POST"])
-        self.assertIn("since=2030-01-01T00:00:00Z", t.calls[1][1])
+        self.assertIn("since=2029-12-31T00:00:00Z", t.calls[1][1])
 
 
 class CliTests(unittest.TestCase):

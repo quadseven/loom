@@ -260,10 +260,16 @@ class StationPostTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def upload(self, url, token, body):
+        if getattr(self, "refuse_commitments", 0) and "commitments" in url:
+            self.refuse_commitments -= 1
+            raise station.UploadRefused(getattr(self, "refuse_status", 422))
         if self.failures:
             self.failures -= 1
             raise OSError("down")
         self.sent.append((url, body))
+
+    def ledger(self):
+        return json.loads(Path(self.home, "state", "station", "brain_memory.json").read_text())
 
     def tick(self, started, outcome="ok"):
         os.makedirs(os.path.join(self.home, "state"), exist_ok=True)
@@ -375,6 +381,67 @@ class StationPostTest(unittest.TestCase):
         self.tick(START)
         self.go()
         self.assertEqual(self.sent, [])
+
+    def _prime_close_pass(self):
+        self.fake.post(START + 600, DEFER)
+        self.tick(START)
+        self.go(now=START + 1300)
+        self.done_by_muse(START + 2000)
+
+    def test_upload_refused_done_markers_log_status_and_timestamp(self):
+        self._prime_close_pass()
+        self.refuse_commitments = 1
+        self.refuse_status = 422
+        out = self.go(now=START + 2100)
+        self.assertIn("UploadRefused", out)
+        self.assertIn("422", out)
+        self.assertRegex(out, r"\[\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\] station:")
+        self.assertNotIn("TOKEN", out)
+        ledger = self.ledger()
+        self.assertEqual(ledger.get("closings_fails"), 1)
+        self.assertEqual(ledger.get("closings_next_at"), START + 2100 + station.CLOSE_BASE_DELAY)
+        self.assertNotIn(ledger.get("since"), [START + 2000 + 1])
+
+    def test_closings_backoff_doubles_from_one_minute_to_the_max(self):
+        self.assertEqual(station._closings_delay(1), station.CLOSE_BASE_DELAY)
+        self.assertEqual(station._closings_delay(1), 60)
+        self.assertEqual(station._closings_delay(2), station.CLOSE_BASE_DELAY * 2)
+        self.assertEqual(station._closings_delay(3), station.CLOSE_BASE_DELAY * 4)
+        self.assertEqual(station._closings_delay(6), station.CLOSE_MAX_DELAY)
+        self.assertEqual(station._closings_delay(99), station.CLOSE_MAX_DELAY)
+        self.assertLessEqual(station._closings_delay(99), station.CLOSE_MAX_DELAY)
+
+    def test_after_three_refusals_safe_mode_caches_until_success(self):
+        self._prime_close_pass()
+        self.refuse_commitments = 3
+        self.refuse_status = 400
+        out1 = self.go(now=START + 2100)
+        self.assertIn("400", out1)
+        self.go(now=START + 2101)
+        ledger = self.ledger()
+        self.assertEqual(ledger.get("closings_fails"), 1)
+        before = len([b for u, b in self.sent if urlsplit(u).path == "/api/brain/commitments"])
+        self.assertEqual(before, 0)
+        self.go(now=START + 2100 + station.CLOSE_BASE_DELAY)
+        second = self.ledger()
+        self.assertEqual(second.get("closings_fails"), 2)
+        self.go(now=START + 2100 + station.CLOSE_BASE_DELAY + station._closings_delay(2))
+        third = self.ledger()
+        self.assertEqual(third.get("closings_fails"), 3)
+        self.assertTrue(third.get("closings_safe"))
+        self.assertTrue(third.get("closings_cache"))
+        self.assertEqual(third["closings_cache"][0]["item"], "%s#8" % REPO)
+        self.assertTrue(third.get("closings_next_at") is not None)
+        attempts_before = len(self.sent)
+        self.go(now=START + 2100 + station.CLOSE_BASE_DELAY + station._closings_delay(2) + 1)
+        self.assertEqual(len(self.sent), attempts_before)
+        ok_at = third["closings_next_at"]
+        self.go(now=ok_at)
+        self.assertTrue([b for u, b in self.sent if urlsplit(u).path == "/api/brain/commitments"])
+        cleared = self.ledger()
+        self.assertEqual(cleared.get("closings_fails"), 0)
+        self.assertFalse(cleared.get("closings_safe"))
+        self.assertFalse(cleared.get("closings_cache"))
 
 
 class MuseRulesTest(unittest.TestCase):
