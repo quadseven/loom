@@ -8811,7 +8811,7 @@ class VerifyBeforeBuildTest(Base):
 
     def test_a_ticket_awaiting_a_live_check_is_not_queued(self):
         # A brain parks finished work with awaiting-live-check and no state
-        # label; queueing it sent three quest tickets back to lanes with
+        # label; queueing it sent three tickets back to lanes with
         # nothing left to build (2026-11-07).
         self.fake.add(31)
         self.fake.issues[31]["labels"] = [{"name": "loom:ticket"}, {"name": "awaiting-live-check"}]
