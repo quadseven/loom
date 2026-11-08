@@ -463,13 +463,15 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
                       timeout: int = 120,
                       test_patches: Optional[Dict[str, str]] = None,
                       base_sources: Optional[Dict[str, str]] = None,
-                      upstream_sources: Optional[Dict[str, str]] = None) -> BaseTestResults:
+                      upstream_sources: Optional[Dict[str, str]] = None,
+                      only: Optional[Set[str]] = None) -> BaseTestResults:
     """Overlay PR test files onto base code and run each test independently.
 
     With base_sources (each changed file's base text, empty when added), the
     tests run are those own_changed_test_names picks; upstream_sources adds
     the default branch's text on a fix round. Otherwise test_patches picks
     them by changed lines, and with neither every test in the files runs.
+    With only, just the picked tests it names run.
     """
     if timeout <= 0:
         raise ValueError("timeout must be positive")
@@ -488,7 +490,8 @@ def base_test_results(base_tree: str, changed_tests: Dict[str, str],
         _overlay(checkout, changed_tests)
         names = sorted({name for path, source in changed_tests.items()
                         for name in _names_to_run(path, source, test_patches,
-                                                  base_sources, upstream_sources)})
+                                                  base_sources, upstream_sources)
+                        if only is None or name in only})
         deadline = time.monotonic() + timeout
         for index, name in enumerate(names):
             if name in top_level:
@@ -568,11 +571,19 @@ def _source_at(tree: str, revision: str, path: str) -> str:
 
 def git_base_test_results(tree: str, base: str, head: str,
                           timeout: int = 120,
-                          upstream: Optional[str] = None) -> BaseTestResults:
+                          upstream: Optional[str] = None,
+                          default: Optional[str] = None) -> BaseTestResults:
     """Run only changed PR tests on base code, with each test isolated by name.
 
     upstream is the default branch commit a fix round merged after base was
     taken; what the head shares with it is not the change's own.
+
+    default is a fix round's default branch commit (the merge base with it).
+    A fix round's base is the pull request head it started from, which
+    already holds the code the round's new tests cover, so a test that
+    passes there is run again on default: one that fails there is the pull
+    request's own test, not a vacuous one (loom#2831). A test that passes on
+    both, or cannot be judged on default, still passed on base.
     """
     if timeout <= 0:
         raise ValueError("timeout must be positive")
@@ -599,13 +610,28 @@ def git_base_test_results(tree: str, base: str, head: str,
             upstream_sources[path] = _source_at(tree, upstream_sha, path)
     if not changed_tests:
         return BaseTestResults([], [], [], [])
+    default_sha = _commit(tree, default) if default else ""
     with tempfile.TemporaryDirectory(prefix="loom-vacuous-base-") as scratch:
         checkout = os.path.join(scratch, "base")
         os.mkdir(checkout)
         _archive(checkout, tree, base_sha)
-        return base_test_results(checkout, changed_tests, timeout,
-                                 base_sources=base_sources,
-                                 upstream_sources=upstream_sources if upstream_sha else None)
+        result = base_test_results(checkout, changed_tests, timeout,
+                                   base_sources=base_sources,
+                                   upstream_sources=upstream_sources if upstream_sha else None)
+        if not default_sha or default_sha == base_sha or not result.passed_on_base:
+            return result
+        on_default = os.path.join(scratch, "default")
+        os.mkdir(on_default)
+        _archive(on_default, tree, default_sha)
+        again = base_test_results(on_default, changed_tests, timeout,
+                                  base_sources=base_sources,
+                                  upstream_sources=upstream_sources if upstream_sha else None,
+                                  only=set(result.passed_on_base))
+    own = set(again.failed_on_base)
+    return BaseTestResults([name for name in result.passed_on_base if name not in own],
+                           result.failed_on_base + [name for name in result.passed_on_base
+                                                    if name in own],
+                           result.timed_out, result.not_run)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -617,9 +643,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("head")
     parser.add_argument("--timeout", type=int, default=120)
     parser.add_argument("--upstream", default="")
+    parser.add_argument("--default", default="")
     args = parser.parse_args(argv)
     result = git_base_test_results(args.tree, args.base, args.head, args.timeout,
-                                   args.upstream or None)
+                                   args.upstream or None, args.default or None)
     for name in result.passed_on_base:
         print("base-pass: " + name)
     for name in result.timed_out:
