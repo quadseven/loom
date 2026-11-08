@@ -141,6 +141,10 @@ EXPECTED_RES = (
                r"left failed for the hand-off pool[ \t]*"),
     re.compile(r"station: lane [A-Za-z0-9_.-]+ takes no verify run until "
                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}Z: a proof it made failed its audit[ \t]*"),
+    re.compile(r"station: reported [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ failed: \[work\] validation failed: the check exited [0-9]+ at [0-9a-fA-F]+ \(base check exited 0\); "
+               r"(?:the edits are on branch [A-Za-z0-9_./-]+|the push of [A-Za-z0-9_./-]+ failed; the edits are committed in the lane tree|the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree|the edits are committed in the lane tree)(?:; no pull request opened)?[ \t]*"),
+    re.compile(r"station: reported [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ fix failed, back to [A-Za-z0-9_.:-]+: \[work\] validation failed: the check exited [0-9]+ at [0-9a-fA-F]+ \(base check exited 0\); "
+               r"(?:the edits are on branch [A-Za-z0-9_./-]+|the push of [A-Za-z0-9_./-]+ failed; the edits are committed in the lane tree|the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree|the edits are committed in the lane tree)(?:; no pull request opened)?[ \t]*"),
     re.compile(r"station: factory release: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ re-queued: "
                r"incident filing failed[ \t]*"),
 )
