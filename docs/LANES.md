@@ -209,8 +209,14 @@ unset variables.
   final or affected check after the agent that times out also parks
   `[transient]` once; the station counts a second check timeout in a row on
   the same ticket as `[work]`, as it does for agent timeouts. The
-  runner passes no worker cap to a test runner, because no runner reads an
-  env var for one.
+  runner passes `LOOM_CHECK_WORKERS` into each check. The host sets it to 2
+  by default and can override it per host. A repo's test runner must read
+  that variable to use the cap. The runner inventory available to Loom is:
+
+  | Repository runner | Lane check source | Worker cap status |
+  |---|---|---|
+  | Loom `.github/unittest_parallel.py` | `.loom/validation.conf` | Honors `LOOM_CHECK_WORKERS`; defaults to four when unset. |
+  | Other repositories | Each repo's `.loom/validation.conf` command | Repo-defined; Loom does not keep a central inventory or detect whether the command honors the variable. Confirm in that repo's runner and contract. |
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still

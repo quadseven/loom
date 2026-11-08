@@ -14185,8 +14185,8 @@ class OutsideEpicTest(Base):
         self.fake.sub_issues[1] = [epic, ticket]
         self.fake.sub_issues[60] = []
 
-    def run_pass_quiet(self):
-        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+    def run_pass_quiet(self, now=None):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
         out = io.StringIO()
         with contextlib.redirect_stderr(out):
             runner.move_outside_tickets()
@@ -14199,11 +14199,15 @@ class OutsideEpicTest(Base):
         self.assertIn("Part of #60", self.fake.issues[10]["body"])
         self.assertRegex(log, r"outside-epic: moved 1, left 0 for goal #1 in %s" % REPO)
 
-    def test_the_pass_waits_an_hour_between_runs(self):
+    def test_the_pass_retries_closed_epic_repair_at_the_invariant_interval(self):
         self.goal_with_a_ticket()
         self.run_pass_quiet()
         self.fake.sub_issues[60] = []
-        log = self.run_pass_quiet()
+        log = self.run_pass_quiet(now=time.time() + station.OUTSIDE_EPIC_EVERY)
+        self.assertEqual([i["number"] for i in self.fake.sub_issues[60]], [10])
+        self.assertIn("outside-epic: moved", log)
+        self.fake.sub_issues[60] = []
+        log = self.run_pass_quiet(now=time.time() + station.OUTSIDE_EPIC_EVERY + 1)
         self.assertEqual(self.fake.sub_issues[60], [])
         self.assertNotIn("outside-epic: moved", log)
 
