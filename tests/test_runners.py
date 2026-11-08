@@ -123,14 +123,16 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai"])
+                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
+                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai"])
+                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
         settings = runners.lane_settings("workersai", {
@@ -161,7 +163,7 @@ class RunnersTest(unittest.TestCase):
     def test_a_runner_slot_takes_public_repos_only(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "opencode-go-2"}):
             self.assertTrue(station.needs_public_repo("opencode-go-2", "opencode-go/beam-free"))
-            self.assertFalse(station.needs_public_repo("opencode-go-3", "opencode-go/beam-free"))
+            self.assertTrue(station.needs_public_repo("opencode-go-3", "opencode-go/beam-free"))
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": ""}):
             self.assertFalse(station.needs_public_repo("opencode-go-2", "opencode-go/beam-free"))
 
@@ -378,6 +380,28 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(len(self.gh.posts("/dispatches")), 1)
         self.runner(now=reset + 1).tend()
         self.assertEqual(len(self.gh.posts("/dispatches")), 2)
+
+    def test_an_opencode_go_limit_report_holds_paid_sibling_slots_in_their_beats(self):
+        slots = ["opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"]
+        env = dict(self.env, LOOM_OPENCODE_GO_1_MODEL="opencode-go/mimo-v2.6-flash",
+                   LOOM_OPENCODE_GO_2_MODEL="opencode-go/beam-free",
+                   LOOM_OPENCODE_GO_3_MODEL="opencode-go/deepseek-v4.1-flash",
+                   LOOM_OPENCODE_GO_4_MODEL="opencode-go/muse-spark-1.3-contributor")
+        runner = runners.Runners(self.gh, str(self.home), REPO, slots, env,
+                                 lambda repo: True, self.said.append, actor=APP, now=self.now)
+        ledger = runner.load()
+        reset = int(self.now + 86400)
+        beat = {"lane": "opencode-go-1", "at": int(self.now), "available": False,
+                "reason": "limit: provider usage limit", "retry_at": reset}
+        runner._take_beat(ledger, "opencode-go-1", beat)
+        for slot in slots:
+            runner._beat(ledger, slot)
+
+        for slot in ("opencode-go-1", "opencode-go-3", "opencode-go-4"):
+            sibling = json.loads((self.home / "state/usage" / (slot + ".json")).read_text())
+            self.assertFalse(sibling["available"])
+            self.assertEqual(sibling["retry_at"], reset)
+        self.assertTrue(json.loads((self.home / "state/usage/opencode-go-2.json").read_text())["available"])
 
     # -- a repo whose base check is red on the slot's runner -------------------
     def run_base(self, name, rows, image="image-a", text=BRIEF):

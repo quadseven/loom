@@ -79,7 +79,12 @@ RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "w
 TRACKED_SLOTS = {
     "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
     "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
+    "opencode-go-1": {"LOOM_OPENCODE_GO_1_MODEL": "opencode-go/mimo-v2.6-flash"},
+    "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
+    "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
+    "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
 }
+OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -638,6 +643,7 @@ class Runners:
         HOLD_SECONDS when it was unavailable; keep its model limits."""
         if beat is None:
             return
+        self._share_opencode_go_limit(ledger, slot, beat)
         models = beat.get("limited_models")
         if beat.get("available") is not True:
             until = beat.get("retry_at")
@@ -649,6 +655,27 @@ class Runners:
         ledger["holds"].pop(slot, None)
         if isinstance(models, dict) and models:
             self._hold(ledger, slot, 0, "", models)
+
+    def _share_opencode_go_limit(self, ledger: Dict[str, Any], slot: str,
+                                 beat: Dict[str, Any]) -> None:
+        """Carry a paid Go plan limit from one pod report to every paid slot."""
+        reason = str(beat.get("reason") or "")
+        if slot not in OPENCODE_GO_SLOTS or beat.get("available") is not False \
+                or not reason.startswith("limit:") or self._go_slot_is_free(slot):
+            return
+        until = beat.get("retry_at")
+        if isinstance(until, bool) or not isinstance(until, (int, float)) or until <= self.now:
+            until = self.now + HOLD_SECONDS
+        for sibling in OPENCODE_GO_SLOTS:
+            if not self._go_slot_is_free(sibling):
+                self._hold(ledger, sibling, float(until), reason)
+
+    def _go_slot_is_free(self, slot: str) -> bool:
+        """Whether a tracked Go slot runs a model outside its shared plan."""
+        settings = lane_settings(slot, self.env)
+        model = next((value for name, value in settings.items()
+                      if name.endswith("_MODEL") and name.startswith(_prefix(slot))), "")
+        return model.startswith("opencode-go/") and model.endswith("-free")
 
     def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
