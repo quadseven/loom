@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, tickets
+from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
 from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -4499,23 +4499,8 @@ def _check_move_args(state: str, lane: Optional[str], note: Optional[str],
 
 def _moved_labels(have: List[str], state: str, lane: Optional[str],
                   env: Optional[Dict[str, str]] = None) -> List[str]:
-    # Every state label goes, not only the ones a move can set: a ticket
-    # moved to shipped that kept loom:ready read as "ready" everywhere
-    # (tickets.ticket_state), and the Priorities list showed shipped work as
-    # lane work (2026-10-15).
-    states = ["loom:" + item for item in STATES + tickets.TICKET_STATES]
-    # A move ends whatever the ticket waited for, so its wait:* label goes.
-    # needs-brain goes too: it also reads "already reported", so a ticket
-    # re-briefed with it was never reported when it stalled again (loom#1393).
-    kept = [x for x in have if x not in states and not x.startswith("wait:")
-            and x != "needs-brain"
-            and not (lane is not None and x.startswith("lane:"))]
-    if "loom:running" in have and state != "running":
-        # The claim marks a run in progress; the run is over.
-        kept = stale_claims.without_own_claim(kept, trusted_authors(env))
-    kept.append("loom:" + state)
-    if lane:
-        kept.append("lane:" + lane)
+    kept = ticket_move.next_labels(have, state, lane=lane,
+                                   own_logins=trusted_authors(env))
     if state == "briefed" and sum(1 for x in kept if x.startswith("lane:")) != 1:
         raise ValueError("briefed ticket must have exactly one lane label")
     return kept
