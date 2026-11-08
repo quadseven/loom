@@ -2982,6 +2982,24 @@ class FixTests(unittest.TestCase):
         self.assertIn(brain.BRAIN_FIX_MARKER, posted[2]["body"])
         self.assertFalse(any(c[0] == "PUT" for c in fake.calls))
 
+    def test_conflict_recovery_fix_dispatches_the_selected_lane(self):
+        issue = fix_ticket("pr")
+        issue["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                           {"name": "lane:claude"}]
+        pr = fix_pr(mergeable=False)
+        fake = Fake(reply(200, pr), reply(200, issue),
+                    reply(200, {"check_runs": []}), reply(200, {"statuses": []}),
+                    reply(200, {"data": {"repository": {"pullRequest": {
+                        "reviewThreads": {"totalCount": 0, "nodes": []}}}}}),
+                    reply(201, {}), reply(200, []))
+        sent = brain.fix(GitHub("t", transport=fake), REPO, 8, (REPO, 9),
+                         "Retry the unchanged conflict once on a free lane.", lane="claude")
+        self.assertTrue(sent)
+        put = next(c for c in fake.calls if c[0] == "PUT")
+        self.assertIn("loom:briefed", put[2]["labels"])
+        self.assertIn("lane:claude", put[2]["labels"])
+        self.assertNotIn("handoff:claude", put[2]["labels"])
+
     def test_fix_refuses_an_incomplete_review_thread_list(self):
         truncated = {"reviewThreads": {"totalCount": 101, "nodes": []}}
         fake = Fake(reply(200, fix_pr()), reply(200, fix_ticket("running")),
