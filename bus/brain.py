@@ -2612,6 +2612,19 @@ REPAIRS_BODY = (
 # batch epics repairs roll over to once it holds GitHub's sub-issue limit.
 REPAIRS_PREFIX = "Epic: factory repairs"
 REPAIRS_BATCH_TITLE = "Epic: factory repairs for this goal, next batch"
+# A batch epic is renamed to its own issue number once GitHub gives it one,
+# so no two open batches share a title (the epic-title-shared invariant,
+# loom#2650: seven batches were all titled REPAIRS_BATCH_TITLE), even when two
+# filers open a batch at the same moment. REPAIRS_BATCH_TITLE is only the
+# title it is filed with. The prefix still marks it a batch.
+REPAIRS_BATCH_NUMBERED = "Epic: factory repairs for this goal, batch %d"
+
+
+def repairs_batch_title(number: int) -> str:
+    """The title a factory repairs batch epic keeps: unique by its number."""
+    return REPAIRS_BATCH_NUMBERED % int(number)
+
+
 REPAIRS_BATCH_BODY = (
     "Done when: every ticket under this epic is closed. It holds at most %d tickets; "
     "the next factory repair past that opens a new batch.\n\n"
@@ -3267,7 +3280,18 @@ def repairs_batch_epic(gh: GitHub, repo: str, goal: int,
     if not made.get("number"):
         raise ValueError("GitHub named no number for the next repairs batch epic of goal #%d"
                          % goal)
-    return int(made["number"])
+    number = int(made["number"])
+    try:
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                {"title": repairs_batch_title(number)})
+    except RateLimited:
+        raise
+    except GitHubError as err:
+        # The batch still works under its filed title; the epic-title-shared
+        # invariant names it if another open batch shares that title.
+        print("goal #%d: could not retitle batch epic #%d: %s" % (goal, number, err),
+              file=sys.stderr)
+    return number
 
 
 def file_under_epic(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any]) -> None:

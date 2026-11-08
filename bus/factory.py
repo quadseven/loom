@@ -687,6 +687,11 @@ NO_CRITERIA_NOTE = (
     "can prove. Add an `## Acceptance criteria` section with at least one `- [ ]` "
     "checkbox; no lane takes it until then.")
 
+NO_AREA_NOTE = (
+    "Held for the brain (needs-brain): this repo files every ticket under an area of "
+    "play, and this ticket carries no `area:` label. Add the one `area:` label that "
+    "names its area; no lane takes it until then.")
+
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
 # refuses to send alone.
@@ -1823,6 +1828,8 @@ class Factory:
         self._merged_prs: Dict[str, Dict[int, int]] = {}
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
+        # Each repo's `area:` labels, read once a pass by _repo_areas.
+        self._areas: Dict[str, Optional[List[str]]] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -4905,7 +4912,7 @@ class Factory:
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
-                or self._superseded_or_blocked(repo, issue))
+                or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
             return "waits: " + held
         # A ticket held by After: is never briefed: the station refuses the
@@ -4950,6 +4957,47 @@ class Factory:
             self.actions += 1
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         reason = "has no acceptance criteria"
+        self._waiting(repo, number, reason)
+        return reason
+
+    def _repo_areas(self, repo: str) -> Optional[List[str]]:
+        """The repo's `area:` labels, read once a pass, or None when the read
+        failed (a rate limit or shadow hold still stops the pass)."""
+        if repo not in self._areas:
+            try:
+                self._areas[repo] = brief_check.area_labels(self.gh, repo)
+            except (ShadowHeld, RateLimited):
+                raise
+            except GitHubError:
+                self._areas[repo] = None
+        return self._areas[repo]
+
+    def _no_area(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket with no `area:` label, in a repo that files
+        its tickets by area of play, gets no lane, or "" (brief_check.
+        area_verdict, the station's claim refusal). Like _no_criteria it
+        gains needs-brain and one note, once, so the ticket does not move
+        across lanes the station keeps refusing. A regression or revert
+        ticket is exempt, as at the station. A failed label read holds the
+        ticket for the next pass."""
+        if set(_labels(issue)) & {"loom:regression", REVERT_LABEL}:
+            return ""
+        number = int(issue["number"])
+        areas = self._repo_areas(repo)
+        if areas is None:
+            reason = "its repo's area labels could not be read"
+            self._waiting(repo, number, reason)
+            return reason
+        if brief_check.area_verdict(issue, areas) is None:
+            return ""
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, NO_AREA_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no area label" % (repo, number))
+        reason = "carries no area: label"
         self._waiting(repo, number, reason)
         return reason
 

@@ -305,6 +305,34 @@ class Stale(unittest.TestCase):
             self.check()
 
 
+class Area(unittest.TestCase):
+    """A repo that files tickets by area of play (it has `area:` labels)
+    refuses a ticket carrying none; a repo with none is not held."""
+
+    def test_a_ticket_with_no_area_label_in_an_area_repo_gets_no_lane(self):
+        got = brief_check.area_verdict(ticket(), ["area:billing", "area:search"])
+        self.assertEqual(got.kind, brief_check.AREA)
+        self.assertEqual(got.key, "area-206")
+        self.assertIn("no `area:` label", got.reason)
+
+    def test_a_ticket_with_an_area_label_passes(self):
+        issue = ticket(labels=("loom:ticket", "loom:briefed", "area:billing"))
+        self.assertIsNone(brief_check.area_verdict(issue, ["area:billing"]))
+
+    def test_a_repo_with_no_area_labels_holds_nothing(self):
+        self.assertIsNone(brief_check.area_verdict(ticket(), []))
+
+    def test_a_bare_area_prefix_is_not_an_area(self):
+        issue = ticket(labels=("loom:ticket", "area:"))
+        self.assertIsNotNone(brief_check.area_verdict(issue, ["area:billing"]))
+
+    def test_the_repo_areas_are_read_from_its_labels(self):
+        fake = Route({"/repos/%s/labels" % REPO: [
+            {"name": "area:billing"}, {"name": "bug"}, {"name": "area:search"}]})
+        got = brief_check.area_labels(GitHub("t", transport=fake), REPO)
+        self.assertEqual(got, ["area:billing", "area:search"])
+
+
 class StationClaim(unittest.TestCase):
     def station(self, fake):
         home = tempfile.mkdtemp()
@@ -358,6 +386,43 @@ class StationClaim(unittest.TestCase):
         self.assertFalse(self.station(fake)._brief_holds(REPO, issue, []))
         self.assertEqual(fake.writes, [])
 
+    def test_a_ticket_with_no_area_label_in_an_area_repo_goes_to_the_brain(self):
+        issue = ticket()
+        fake = self.routes(issue)
+        fake.routes["/repos/%s/labels" % REPO] = [{"name": "area:billing"}]
+        self.assertTrue(self.station(fake)._brief_holds(REPO, issue, []))
+        self.assertIn(["loom:ticket", "lane:codex", "loom:queued"], self.labels_put(fake))
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs-brain"]}),
+                      fake.writes)
+        notes = [b["body"] for m, p, b in fake.writes
+                 if m in ("POST", "PATCH") and "/comments" in p]
+        self.assertTrue(any("no `area:` label" in n for n in notes), notes)
+        self.assertFalse(any("loom:stale-brief" in n for n in notes))
+
+    def test_a_ticket_with_an_area_label_goes_on_to_the_stale_check(self):
+        issue = ticket(labels=("loom:ticket", "loom:briefed", "lane:codex", "area:billing"))
+        fake = self.routes(issue)
+        fake.routes["/repos/%s/labels" % REPO] = [{"name": "area:billing"}]
+        self.assertTrue(self.station(fake)._brief_holds(REPO, issue, []))
+        asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
+        self.assertEqual(len(asks), 1)
+        self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
+
+    def test_an_area_label_read_that_fails_holds_it_and_writes_nothing(self):
+        issue = ticket()
+        fake = self.routes(issue)
+        fake.routes["/repos/%s/labels" % REPO] = []
+        fake.fail.add("/repos/%s/labels" % REPO)
+        self.assertTrue(self.station(fake)._brief_holds(REPO, issue, []))
+        self.assertEqual(fake.writes, [])
+
+    def test_a_regression_needs_no_area_label(self):
+        issue = ticket(labels=("loom:ticket", "loom:briefed", "lane:codex", "loom:regression"))
+        fake = self.routes(issue)
+        fake.routes["/repos/%s/labels" % REPO] = [{"name": "area:billing"}]
+        self.assertFalse(self.station(fake)._brief_holds(REPO, issue, []))
+        self.assertEqual(fake.writes, [])
+
 
 class FactoryQueue(unittest.TestCase):
     def setUp(self):
@@ -386,6 +451,30 @@ class FactoryQueue(unittest.TestCase):
         self.assertEqual(worker.waits["%s#7" % self.repo], "health ticket names no cause")
         self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (needs:human)")
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
+        self.assertNotIn("%s#9" % self.repo, worker.waits)
+
+    def test_a_ticket_with_no_area_label_in_an_area_repo_gets_no_lane_and_one_note(self):
+        good = ("Difficulty: medium\n\n" + HEALTH_INTAKE
+                + "\nCause: refunds post to the wrong account when two land at once.\n")
+        self.gh.repo_labels = ["area:billing", "bug"]
+        self.queued(7, good)
+        self.queued(9, good, extra=("area:billing",))
+        for _ in range(2):
+            worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+            worker.assign_queued()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "carries no area: label")
+        self.assertEqual(self.lane_of(7), [])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issues[7]["labels"]])
+        notes = [c for c in self.gh.comments.get(7, []) if "no `area:` label" in str(c.get("body"))]
+        self.assertEqual(len(notes), 1)
+        self.assertNotIn("%s#9" % self.repo, worker.waits)
+        self.assertNotEqual(self.lane_of(9), [])
+
+    def test_a_repo_with_no_area_labels_holds_no_ticket_for_one(self):
+        self.queued(9, "Difficulty: medium\n\n" + HEALTH_INTAKE
+                    + "\nCause: refunds post to the wrong account when two land at once.\n")
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+        worker.assign_queued()
         self.assertNotIn("%s#9" % self.repo, worker.waits)
 
 

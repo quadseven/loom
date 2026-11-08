@@ -122,7 +122,11 @@ A changed test is one whose body differs from the base file's, or one that
 uses a module or helper-class name whose own value differs (`A, B = 1, 2` to
 `A, B, C = 1, 2, 3` changes only `C`). On a fix round that merged the
 default branch, what the head shares with that branch's file came in with
-the merge and is not the round's own.
+the merge and is not the round's own. A fix round's base is the pull
+request head it started from, which already holds the code the pull request
+adds, so a changed test that passes there runs again on the default branch's
+merge base: one that fails there tests the pull request's own code and is
+accepted; one that passes on both still blocks (loom#2831).
 A test that passes on base, one that times out, or a module-level test that
 takes fixtures with no pytest to run it, blocks validation and names the
 test for the lane to fix. The archive and test run have bounded

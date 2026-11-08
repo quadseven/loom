@@ -32,6 +32,11 @@ Before the station hands a ticket to a lane (`check`), it reads:
   brain's work: the ticket goes back to the queue with `needs-brain`, and
   the factory gives it no lane until the cause is named
   (`health_hold`).
+- area: in a repo that files its tickets by area of play (it defines at
+  least one `area:` label), a ticket carrying no `area:` label gets no lane
+  (`area_verdict`). Every per-area view misses it, and picking the area is
+  the brain's intake work, so it goes back the same way a health ticket
+  does. A repo with no `area:` labels is not held to the rule.
 - criteria: a build ticket whose body names no acceptance criteria gets
   no lane (`criteria_verdict`): its brief could restate no criterion as
   the check that proves it, and the runner would park the brief as a work
@@ -59,6 +64,8 @@ from .github import GitHubError
 STALE = "stale"
 HEALTH = "health"
 CRITERIA = "criteria"
+AREA = "area"
+AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
@@ -226,6 +233,33 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
     return Verdict(CRITERIA, "criteria-" + stamp,
                    "its body names no acceptance criteria, so no criterion can be "
                    "restated as the check that proves it")
+
+
+# -- area ---------------------------------------------------------------------
+def _area_names(labels: Iterable[Any]) -> List[str]:
+    out = []
+    for label in labels or ():
+        name = str((label.get("name") if isinstance(label, Mapping) else label) or "")
+        if name.startswith(AREA_PREFIX) and name[len(AREA_PREFIX):].strip():
+            out.append(name)
+    return out
+
+
+def area_labels(gh: Any, repo: str) -> List[str]:
+    """The repo's `area:` label names. Raises GitHubError when the read
+    fails: the caller holds the ticket rather than guess the repo has none."""
+    return sorted(_area_names(gh.paginate("/repos/%s/labels?per_page=100" % repo)))
+
+
+def area_verdict(issue: Mapping[str, Any], areas: Sequence[str]) -> Optional[Verdict]:
+    """Why a ticket with no `area:` label gets no lane, or None. `areas` is
+    the repo's own `area:` labels (area_labels): a repo that defines none
+    files no ticket by area, and nothing is held. Reads nothing."""
+    if not areas or _area_names(issue.get("labels") or ()):
+        return None
+    return Verdict(AREA, "area-%s" % issue.get("number"),
+                   "its repo files every ticket under an area of play and it carries "
+                   "no `area:` label")
 
 
 # A brief that says another issue does its work (loom#2033): "Superseded by

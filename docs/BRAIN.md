@@ -543,8 +543,10 @@ GitHub holds at most 100 sub-issues under one issue. Once the standing epic
 holds that many, or GitHub answers 422 to a link under it, repairs roll over
 to the newest open factory repairs batch epic (an epic whose title starts
 "Epic: factory repairs", the goal's own or another in the repo) holding fewer
-than 15 tickets; when none has room, "Epic: factory repairs for this goal,
-next batch" opens even when the goal is at its open epic cap. The filer
+than 15 tickets; when none has room, a new batch epic opens even when the
+goal is at its open epic cap, and is retitled "Epic: factory repairs for this
+goal, batch <its issue number>" so no two open batches share a title (the
+`epic-title-shared` invariant). The filer
 logs each rollover, and the filed issue's `Part of` line names the batch
 epic. `epic-over-cap` counts an epic's open tickets, its sub-issues and every
 loom:ticket issue whose `Part of` line names it, each once, the same count
@@ -1083,6 +1085,16 @@ the brief as a work failure. The ticket goes back to `loom:queued` with
 each criterion as a checkbox under `## Acceptance criteria` (or the shorter
 `## Acceptance` heading). An answer ticket opens no pull request and is
 exempt, as at the runner.
+
+In a repo that files its tickets by area of play (it defines at least one
+`area:` label), a ticket carrying no `area:` label gets no lane either: every
+per-area view misses it, and picking the area is intake work. The factory
+gives it no lane, and the station refuses its claim; it goes back to
+`loom:queued` with `needs-brain` and one note, like a ticket with no
+criteria, until it carries the one `area:` label naming its area. A
+regression or revert ticket is exempt. A repo with no `area:` labels is not
+held to the rule, and a failed read of the repo's labels holds the ticket
+for the next pass.
 
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the

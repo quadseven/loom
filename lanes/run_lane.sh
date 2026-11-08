@@ -3061,7 +3061,7 @@ prepare_validation() {
 # Run changed Python tests on the base code in the check sandbox. This separate
 # pass has its own timeout because it archives the base tree and runs tests.
 final_base_tests() {
-  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names
+  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names default_rev=""
   cp "$LOOM_ROOT/bus/vacuous.py" "$helper" || {
     VALIDATION_REASON="validation environment unavailable: could not stage the base-test gate"
     return 125
@@ -3071,6 +3071,14 @@ final_base_tests() {
   # A fix round merged the default branch after BASE was taken: tests and
   # fixtures that came in with that merge are not the round's own.
   [ -z "${FIX_UPSTREAM:-}" ] || printf -v command '%s --upstream %q' "$command" "$FIX_UPSTREAM"
+  # A fix round's BASE is the pull request head, which already holds the code
+  # its new tests cover: a test that passes there but fails on the default
+  # branch's merge base is the pull request's own (loom#2831).
+  if [ -n "${FIX_PR:-}" ] && [ -n "${FIX_DEFAULT:-}" ] &&
+     default_rev="$(safe_git merge-base HEAD "origin/$FIX_DEFAULT" 2> /dev/null)" &&
+     [ -n "$default_rev" ]; then
+    printf -v command '%s --default %q' "$command" "$default_rev"
+  fi
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
