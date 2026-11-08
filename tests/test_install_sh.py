@@ -67,6 +67,20 @@ class InstallScriptTest(unittest.TestCase):
             ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), *(lanes or ("codex",))],
             env=full, capture_output=True, text=True, timeout=60)
 
+    def test_default_install_keeps_only_mac_lanes(self):
+        script = INSTALL.read_text()
+        default = re.search(r'LANES=\("\$@"\).*?LANES=\((.*?)\)', script, re.S).group(1)
+        lanes = set(default.split())
+        for lane in ("codex", "claude", "anthropic", "agy", "spark", "copilot"):
+            self.assertIn(lane, lanes)
+        for lane in ("spark-2", "spark-3", "spark-4"):
+            self.assertIn(lane, lanes)
+        for lane in ("openrouter", "opencode-go", "zen", "zai", "workersai",
+                     "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                     "free-gemma", "free-kilo", "free-nvidia", "free-groq",
+                     "anthropic-2", "codex-2"):
+            self.assertNotIn(lane, lanes)
+
     def test_a_runner_slot_gets_no_local_runner_and_the_station_gets_its_settings(self):
         # LOOM_RUNNER_SLOTS (docs/LANES.md, "Lanes on cluster runners"): the
         # station dispatches the slot's briefs, so no launchd runner may take

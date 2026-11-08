@@ -2,10 +2,8 @@
 # Install the lanes (and the station) as launchd agents on the login machine.
 #
 #   lanes/mac/install.sh [lane ...]
-#     default: codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot,
-#     plus the extra slots anthropic-2 to anthropic-8, codex-2 to codex-16, opencode-go-2
-#     opencode-go-3 (which runs LOOM_OPENCODE_GO_3_MODEL) and opencode-go-4
-#     (LOOM_OPENCODE_GO_4_MODEL, Muse Spark Contributor: public repos only)
+#     default: codex claude anthropic agy spark copilot,
+#     plus the extra spark slots spark-2 to spark-4
 #
 # API lanes read their provider key from SSM at run time. Name each
 # parameter in the environment when installing (LOOM_OPENROUTER_KEY_SSM,
@@ -211,11 +209,7 @@ keep_installed LOOM_BRIEF_AUTHORS
 keep_installed LOOM_ASK_ANSWERERS
 
 LANES=("$@")
-[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
-  anthropic-2 anthropic-3 anthropic-4 anthropic-5 anthropic-6 anthropic-7 anthropic-8
-  codex-2 codex-3 codex-4 codex-5 codex-6 codex-7 codex-8 codex-9 codex-10 codex-11
-  codex-12 codex-13 codex-14 codex-15 codex-16 opencode-go-2 opencode-go-3 opencode-go-4 spark-2 spark-3 spark-4
-  free-ollama free-gemma free-nvidia free-kilo free-groq)
+[ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude anthropic agy spark copilot spark-2 spark-3 spark-4)
 
 # PATH puts the official CLI install dirs (~/.local/bin for claude,
 # ~/.opencode/bin for opencode) ahead of package-manager copies, which can lag
