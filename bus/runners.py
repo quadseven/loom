@@ -34,7 +34,7 @@ Rules:
   slot, the slot takes no more of that repo: its briefs park [transient] so
   another lane takes them, until the repo's head or the runner image changes.
 
-Only API lanes run there (RUNNER_LANES); codex, claude, agy and anthropic
+Only API lanes run there (RUNNER_LANES); claude and agy
 stay on this machine. docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
@@ -59,6 +59,7 @@ import zipfile
 import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import spend
 from .github import RateLimited
 from .labels import LANES
 
@@ -71,12 +72,21 @@ REF = "main"
 INPUT_LIMIT = 65535
 # Provider lanes a runner may run: the Codex subscription lane, API lanes
 # whose key the workflow's role can read, and gateway-served spark and free.
-RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark", "anthropic")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {
+    "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "anthropic-2": {},
+    "anthropic-3": {},
+    "anthropic-4": {},
+    "anthropic-5": {},
+    "anthropic-6": {},
+    "anthropic-7": {},
+    "anthropic-8": {},
+}
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -823,8 +833,21 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
+            if parts[2] == "spend.jsonl":
+                return provider(slot) == "anthropic"
             return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
         return False
+
+    @staticmethod
+    def _read_beat(files: Dict[str, bytes], slot: str) -> Optional[Dict[str, Any]]:
+        raw = files.get("state/usage/%s.json" % slot)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:
         """Write a report's files where a local runner writes them, move the
@@ -837,14 +860,9 @@ class Runners:
         kinds = [k for k in ("done", "failed") if "briefs/%s/%s/%s.md" % (slot, k, ticket) in files]
         if len(kinds) > 1:
             raise ReportError("the report moves the brief to both done/ and failed/")
-        beat: Optional[Dict[str, Any]] = None
-        beat_rel = "state/usage/%s.json" % slot
-        if beat_rel in files:
-            try:
-                parsed = json.loads(files[beat_rel].decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                parsed = None
-            beat = parsed if isinstance(parsed, dict) else None
+        beat = self._read_beat(files, slot)
+        if provider(slot) == "anthropic" and "state/usage/spend.jsonl" in files:
+            spend.record_report(self.home, files["state/usage/spend.jsonl"])
         for rel, data in sorted(files.items()):
             if rel.startswith("briefs/%s/" % slot) and "/answers/" not in rel:
                 continue   # the brief moves below; the local copy is the one sent
@@ -926,10 +944,13 @@ class Runners:
 def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     """What a runner job copies into its report, relative to its loom home,
     as globs: what the station reads for a run (Runners.allowed_path)."""
-    return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
-            "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
-            "logs/%s/%s.*" % (slot, ticket)) + tuple(
-                "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+    paths = ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
+             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
+             "logs/%s/%s.*" % (slot, ticket)) + tuple(
+                 "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+    if provider(slot) == "anthropic":
+        paths += ("state/usage/spend.jsonl",)
+    return paths
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never

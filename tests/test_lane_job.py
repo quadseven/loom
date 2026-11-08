@@ -327,6 +327,22 @@ class LaneJobTest(unittest.TestCase):
         for rel in job.report_files(str(home), "opencode-go-2", "owner.app-7"):
             self.assertTrue(r.allowed_path("opencode-go-2", "owner.app-7", rel), rel)
 
+    def test_anthropic_report_files_include_spend_jsonl(self):
+        home = self.tmp / "home-an"
+        (home / "briefs" / "anthropic-2" / "done").mkdir(parents=True)
+        (home / "briefs" / "anthropic-2" / "done" / "owner.app-7.md").write_text(BRIEF)
+        (home / "state" / "usage").mkdir(parents=True)
+        (home / "state" / "usage" / "spend.jsonl").write_text('{"at": 1, "slot": "anthropic-2", "cost_usd": 0.5}\n')
+        load = __import__("importlib.util").util
+        spec = load.spec_from_file_location("lane_job", self.root / "lanes" / "k8s" / "lane_job.py")
+        job = load.module_from_spec(spec)
+        spec.loader.exec_module(job)
+        files = job.report_files(str(home), "anthropic-2", "owner.app-7")
+        self.assertIn("state/usage/spend.jsonl", files)
+        r = runners.Runners(None, str(self.tmp / "station"), "o/r", [], {}, lambda r: True, print)
+        self.assertTrue(r.allowed_path("anthropic-2", "owner.app-7", "state/usage/spend.jsonl"))
+        self.assertFalse(r.allowed_path("opencode-go-2", "owner.app-7", "state/usage/spend.jsonl"))
+
 
     def real_key(self):
         """A real report public key in the job dir (openssl, as the station makes it)."""

@@ -9469,6 +9469,15 @@ class SpendTest(Base):
         bad = station.Settings.from_env({"LOOM_ANTHROPIC_BUDGET_USD": "lots"})
         self.assertIsNone(bad.anthropic.usd)
 
+    def test_record_report_appends_valid_anthropic_rows(self):
+        spend.record_report(self.home, b'{"at": 1000, "slot": "anthropic-2", "cost_usd": 1.25}\n'
+                                       b'{"at": 1001, "slot": "other", "cost_usd": 5.0}\n'
+                                       b'{invalid json\n')
+        rows = spend.load(self.home)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["slot"], "anthropic-2")
+        self.assertEqual(rows[0]["cost_usd"], 1.25)
+
 
 class AsksTest(Base):
     def setUp(self):

@@ -104,6 +104,31 @@ def record(home: str, output: str, slot: str, ticket: str, model: str,
     return line
 
 
+def record_report(home: str, raw: Any) -> List[Dict[str, Any]]:
+    """Append readable anthropic spend lines from a runner report to spend.jsonl."""
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    valid: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and _number(row.get("at")) is not None
+                and str(row.get("slot", "")).startswith("anthropic")):
+            valid.append(row)
+    if not valid:
+        return []
+    path = spend_path(home)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for row in valid:
+            fh.write(json.dumps(row) + "\n")
+    return valid
+
+
 def load(home: str) -> List[Dict[str, Any]]:
     """Every readable anthropic line; a torn or foreign line is skipped."""
     rows = []
