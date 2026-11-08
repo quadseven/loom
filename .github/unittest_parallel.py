@@ -60,8 +60,35 @@ def worker_count(item_count: int, cpu_count: int | None,
     return min(workers, worker_cap) if worker_cap is not None else workers
 
 
+def is_git_shim(path: Path) -> bool:
+    """Whether a git executable is the fleet session shim, by its header text."""
+    try:
+        with path.open("r", errors="replace") as handle:
+            head = "".join(handle.readline() for _ in range(5))
+    except OSError:
+        return False
+    return "git shim" in head
+
+
 def child_env(test_dir: Path) -> dict[str, str]:
+    """Environment for test children: isolated Git config, no fleet git shim.
+
+    Every test child runs Git only against throwaway repositories, so the
+    session shim's pre-push privacy scan guards nothing there and only fails
+    in a sandbox that cannot reach its deny list. Directories whose git is
+    the shim leave PATH and FLEET_* variables are dropped. With no other git
+    on PATH, PATH stays as it was."""
     env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith("FLEET_"):
+            env.pop(key)
+    entries = env.get("PATH", "").split(os.pathsep)
+    kept = [entry for entry in entries
+            if not (entry and is_git_shim(Path(entry) / "git"))]
+    has_real_git = any(entry and (Path(entry) / "git").is_file()
+                       and os.access(Path(entry) / "git", os.X_OK) for entry in kept)
+    if kept != entries and has_real_git:
+        env["PATH"] = os.pathsep.join(kept)
     python_path = str(test_dir)
     if env.get("PYTHONPATH"):
         python_path += os.pathsep + env["PYTHONPATH"]
