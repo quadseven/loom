@@ -6886,12 +6886,32 @@ class RepairsEpicTests(unittest.TestCase):
         self.assertEqual(brain.placement_epic(gh, REPO, 50), 71)
         self.assertEqual(fake.created(), [])
 
+    def test_each_batch_epic_is_titled_by_its_own_number(self):
+        """loom#2650: every batch was titled "next batch", so seven open epics
+        shared one title and the epic-title-shared invariant never cleared."""
+        title = brain.repairs_batch_title(2711)
+        self.assertEqual(title, "Epic: factory repairs for this goal, batch 2711")
+        self.assertNotEqual(title, brain.repairs_batch_title(2712))
+        self.assertLessEqual(len(brain.repairs_batch_title(10 ** 9)), brain.EPIC_TITLE_MAX)
+        self.assertTrue(brain.repairs_batch({"title": title}))
+        self.assertFalse(brain.standing_epic({"title": title}))
+
+    def test_two_batches_opened_back_to_back_do_not_share_a_title(self):
+        fake = self.full_repairs()
+        self.batch(fake, 70, 15)
+        gh = GitHub("t", transport=fake)
+        first = brain.repairs_batch_epic(gh, REPO, 1, brain.goal_tree(gh, REPO, 1)[1])
+        second = brain.repairs_batch_epic(gh, REPO, 1, brain.goal_tree(gh, REPO, 1)[1],
+                                          full=(first,))
+        self.assertNotEqual(first, second)
+        self.assertNotEqual(fake.issues[first]["title"], fake.issues[second]["title"])
+
     def test_a_full_repairs_epic_with_no_batch_room_opens_the_next_batch_outside_the_cap(self):
         fake = self.full_repairs()
         self.batch(fake, 70, 15)
         gh = GitHub("t", transport=fake)
         number = brain.repairs_epic(gh, REPO, 1)
-        self.assertEqual(fake.issues[number]["title"], brain.REPAIRS_BATCH_TITLE)
+        self.assertEqual(fake.issues[number]["title"], brain.repairs_batch_title(number))
         self.assertTrue(brain.repairs_batch(fake.issues[number]))
         self.assertFalse(brain.standing_epic(fake.issues[number]))
         self.assertIn("Part of #1", fake.issues[number]["body"])
