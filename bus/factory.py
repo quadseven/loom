@@ -193,6 +193,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
+from . import no_change
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
@@ -2458,7 +2459,8 @@ class Factory:
             _say("%s#%d is held (%s); not sent back for %s"
                  % (repo, number, ", ".join(sorted(held)), why))
             return
-        if checks_failing and self._past_no_change(repo, issue, comments):
+        box_budget = no_change.active(comments) and bool(unproven_criteria(str(issue.get("body") or ""), ""))
+        if checks_failing and not box_budget and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
         threads = self._trusted_open(repo, pr, open_threads)
@@ -2467,7 +2469,7 @@ class Factory:
         # request past the ladder, however old the pull request is
         # (loom#1963): a ready pull request that hand merges left
         # conflicting got no brief at all once its age read as stuck.
-        if (not conflict_only and stuck(comments, open_threads, checks_failing, age, self.now,
+        if (not conflict_only and not box_budget and stuck(comments, open_threads, checks_failing, age, self.now,
                                         no_test, tuple(unticked) + tuple(unproven), threads)
                 and not self._climb_or_stop(repo, pr, issue, comments, why)):
             return
