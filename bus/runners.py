@@ -69,9 +69,9 @@ REF = "main"
 # GitHub refuses a workflow_dispatch whose inputs together pass this many
 # characters.
 INPUT_LIMIT = 65535
-# Provider lanes a runner may run: API lanes whose key the workflow's role
-# can read, and the gateway-served spark and free lanes.
-RUNNER_LANES = ("opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+# Provider lanes a runner may run: the Codex subscription lane, API lanes
+# whose key the workflow's role can read, and gateway-served spark and free.
+RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
@@ -117,7 +117,7 @@ NAME_RE = re.compile(r"^LOOM_[A-Z0-9_]+$")
 VALUE_RE = re.compile(r"^[\x20-\x7e]{0,1000}$")
 # Per-lane settings a runner job may receive: LOOM_<SLOT>_<SUFFIX> or
 # LOOM_<LANE>_<SUFFIX>, as run_lane.sh's lane_setting reads them.
-SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
+SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "SESSION_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
             "CONTEXT", "OUTPUT")
 # Settings shared by every lane that a runner job may receive.
 SHARED = ("LOOM_REPO_OWNERS", "LOOM_AWS_REGION", "LOOM_AGENT_TIMEOUT",
@@ -168,7 +168,8 @@ def runner_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
     names = [n for n in re.split(r"[\s,]+", str(env.get("LOOM_RUNNER_SLOTS") or "").strip()) if n]
     if names:
         names += list(TRACKED_SLOTS)
-    return [n for n in dict.fromkeys(names) if n in LANES and provider(n) in RUNNER_LANES]
+    return [n for n in dict.fromkeys(names)
+            if n in LANES and provider(n) in RUNNER_LANES and n != "codex"]
 
 
 def setting_allowed(slot: str, name: str) -> bool:

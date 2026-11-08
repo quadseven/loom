@@ -76,13 +76,22 @@ end the session on the Mac too. Options:
    no token (the "design only" section of `LANE_RUNNERS_PLAN.md`). The
    strongest, and the follow-up once option 3 works.
 
-Option 3 depends on three facts about the installed CLI that are unproven
-until the spike in #2784 runs: it works with an access token and no refresh
-token, how long the access token lasts (this sets the broker's schedule), and
-it does not write the file back. If any fails, the fallback is option 4. A
-copy older than the broker's maximum age makes the slot report unavailable
-instead of failing runs. The broker's identity may write one parameter and
-nothing else; the lane role stays read-only.
+Spike, Codex CLI 0.163.0: the locally installed auth file's access-token
+claims report an `exp` minus `iat` lifetime of 864000 seconds (10 days). No
+token value is recorded here. This lane has no network, so successful CLI use
+after removing `refresh_token`, and whether the CLI writes the file back,
+remain unverified. The single-writer design must not be enabled until those
+two observations are made with the dedicated lane login; if either fails,
+use option 4.
+
+The broker publishes one JSON value with `published_at` (Unix seconds) and
+`auth` (the Codex auth file object). The `auth.tokens` object contains the
+access token but no `refresh_token`. The pod accepts a publication no older
+than six hours, writes only `auth` to its private Codex home, and marks the
+slot unavailable on an old publication. Tests enforce the field removal and
+the stale-copy heartbeat; they do not prove the live two-pod, 24-hour line.
+The broker's identity may write one parameter and nothing else; the lane
+role stays read-only.
 
 ## Capacity plan
 
