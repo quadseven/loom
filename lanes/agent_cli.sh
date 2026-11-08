@@ -30,7 +30,13 @@ agent_cli() {
     uv_dir=(--add-dir "$AGENT_UV_DIR")
   fi
   case "$1:$2" in
-    claude:lane) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null ;;
+    claude:lane)
+      if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+        CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+          claude -p --model "$MODEL" "$3" < /dev/null
+      else
+        timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
+      fi ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \

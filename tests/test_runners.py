@@ -122,8 +122,8 @@ class RunnersTest(unittest.TestCase):
     # -- configuration -------------------------------------------------------
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
-        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude-9 zen, free-kilo"}),
-                         ["zen", "free-kilo", "free-openrouter", "workersai"])
+        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
+                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every

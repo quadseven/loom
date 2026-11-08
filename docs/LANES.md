@@ -2137,8 +2137,7 @@ What changes in a pod:
   its writes go to the tree, its check home and `/tmp`. A fresh `/proc` in a
   new PID namespace hides the runner's processes. bwrap needs user
   namespaces inside the container; a lane whose bwrap cannot start reports
-  itself unavailable (`sandbox_ready`). The agy lane and the codex and
-  claude lanes stay on the Mac.
+  itself unavailable (`sandbox_ready`). The agy lane stays on the Mac.
 - Egress, fail closed: bwrap narrows no network, so the pod's network
   policy must (no cloud metadata address, no API server, no cluster-internal
   ranges; DNS and 443 to the internet only). `sandbox_ready` proves it
@@ -2178,9 +2177,12 @@ claims for it is dispatched to the `lane` workflow
 (`.github/workflows/lane.yml`), which runs `lanes/run_lane.sh` once for that
 brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
-tree, cache or session database stays anywhere. API lanes only: opencode-go,
-zen, openrouter, zai, workersai, the free provider slots and spark (both
-through the gateway). codex, claude, agy and anthropic stay local.
+tree, cache or session database stays anywhere. Claude Code runs with its
+long-lived OAuth token copied from SSM into a mode-600 file under the job home
+and exported only to the Claude CLI process. Codex uses its broker session
+file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
+provider slots and spark (both through the gateway). agy and anthropic stay
+local.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125

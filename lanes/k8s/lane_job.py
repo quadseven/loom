@@ -136,6 +136,8 @@ def prepare() -> None:
         raise JobError(str(err)) from None
     if runners.provider(slot) == "codex" and not settings.get("LOOM_CODEX_SESSION_SSM"):
         raise JobError("a Codex runner slot needs LOOM_CODEX_SESSION_SSM")
+    if runners.provider(slot) == "claude" and not settings.get("LOOM_CLAUDE_KEY_SSM"):
+        raise JobError("a Claude runner slot needs LOOM_CLAUDE_KEY_SSM")
     settings = rebase_gateway(slot, settings, os.environ.get("LOOM_RUNNER_GATEWAY_URL", ""))
     d = job_dir()
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -258,7 +260,7 @@ def ssm() -> None:
     d = job_dir()
     wanted = [(n, v) for n, v in sorted(settings.items())
               if n.endswith("_SSM") and n not in (
-                  "LOOM_GITHUB_APP_KEY_SSM", "LOOM_CODEX_SESSION_SSM")]
+                  "LOOM_GITHUB_APP_KEY_SSM", "LOOM_CODEX_SESSION_SSM", "LOOM_CLAUDE_KEY_SSM")]
     session_name = settings.get("LOOM_CODEX_SESSION_SSM", "")
     if session_name:
         if not SSM_NAME_RE.fullmatch(session_name):
@@ -272,6 +274,16 @@ def ssm() -> None:
                 raise JobError("could not prepare the Codex session copy") from None
         else:
             _write(os.path.join(d, "home", "run", "codex-auth.json"), auth)
+    claude_name = settings.get("LOOM_CLAUDE_KEY_SSM", "")
+    if claude_name:
+        if not SSM_NAME_RE.fullmatch(claude_name):
+            raise JobError("LOOM_CLAUDE_KEY_SSM is not an SSM parameter name")
+        try:
+            value = _fetch(claude_name, region)
+        except JobError:
+            raise JobError("could not read the parameter LOOM_CLAUDE_KEY_SSM names") from None
+        _mask(value)
+        _write(os.path.join(d, "home", "run", "claude-oauth-token"), value)
     wanted.append(("LOOM_LEAK_DENY_SSM", settings.get("LOOM_LEAK_DENY_SSM") or DEFAULT_DENY_SSM))
     for setting, name in wanted:
         if not SSM_NAME_RE.fullmatch(name) or "/../" in name + "/" or "/./" in name + "/":
@@ -316,6 +328,9 @@ def lane_env() -> Dict[str, str]:
     })
     if os.path.isfile(os.path.join(d, "home", "run", "codex-auth.json")):
         env["LOOM_CODEX_AUTH_FILE"] = os.path.join(d, "home", "run", "codex-auth.json")
+    claude_token = os.path.join(d, "home", "run", "claude-oauth-token")
+    if os.path.isfile(claude_token):
+        env["LOOM_CLAUDE_AUTH_FILE"] = claude_token
     os.makedirs(env["TMPDIR"], mode=0o700, exist_ok=True)
     for name in ("LOOM_EGRESS_DENY_PROBES", "LOOM_EGRESS_ALLOW_PROBE", "LOOM_EGRESS_PROBE_SECONDS",
                  "LOOM_LEAK_SCANNER", "KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"):
