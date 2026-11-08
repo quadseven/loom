@@ -557,6 +557,7 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 600)
         self.assertEqual(self.gh.issues[1]["state"], "closed")
 
+
     def test_an_open_issue_with_the_title_is_counted_not_filed_twice(self):
         title = "station: " + watch.signature(LINE_403)
         self.gh.issues[1] = {"number": 1, "title": title, "state": "open",
@@ -618,6 +619,44 @@ class FilingTest(WatchBase):
         self.run_at(T0)
         self.assertEqual(len(self.said), 1)
         self.assertIn("watch: scanned 1 logs", self.said[0])
+
+
+class ValidationFailureTest(unittest.TestCase):
+    def test_a_lane_validation_failure_on_a_green_base_is_an_outcome_not_an_error(self):
+        branch_notes = [
+            'the edits are on branch main',
+            'the edits are committed in the lane tree',
+            'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree',
+            'the push of test-branch failed; the edits are committed in the lane tree',
+        ]
+        validation_lines = []
+        for note in branch_notes:
+            validation_lines.append(
+                'station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note)
+            validation_lines.append(
+                'station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note + '; no pull request opened')
+            validation_lines.append(
+                'station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); ' + note)
+            # with leading timestamp
+            validation_lines.append(
+                '[2026-11-07T00:52:34Z] station: reported example-owner/repo-a#6134 failed: [work] validation failed: the check exited 1 at 3e8c214fcd36 (base check exited 0); ' + note + '; no pull request opened')
+            validation_lines.append(
+                '[2026-11-07T00:52:34Z] station: reported example-owner/repo-a#5678 fix failed, back to loom:failed: [work] validation failed: the check exited 1 at 789def456abc (base check exited 0); ' + note)
+        for line in validation_lines:
+            with self.subTest(line=line):
+                self.assertFalse(watch.keep(line), line)
+
+        error_lines = [
+            'station: reported example-owner/repo-a#999 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 1)',
+            'station: reported example-owner/repo-a#888 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)',
+            'station: reported example-owner/repo-a#777 failed: [work] validation failed: validation environment unavailable: the check exited 126',
+            'station: reported example-owner/repo-a#666 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the edits are on branch main; push failed',
+        ]
+        for line in error_lines:
+            with self.subTest(line=line):
+                self.assertTrue(watch.keep(line), line)
+        # timed-out check standalone substring case
+        self.assertTrue(watch.keep('station: reported example-owner/repo-a#1 failed: [work] validation failed: the check exited 1 at abc123 (base check exited 0); the check timed out after 900s at abc123def456 (base check exited 0)'))
 
 
 class ExampleTextTest(WatchBase):
