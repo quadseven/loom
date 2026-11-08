@@ -25,8 +25,15 @@ class UnittestStep(unittest.TestCase):
         module = __import__("importlib.util").util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertEqual(module.worker_count(145, 12), 4)
-        self.assertEqual(module.worker_count(2, 12), 2)
+        self.assertEqual(module.worker_count(145, 12, 2), 2)
+        self.assertEqual(module.worker_count(2, 12, 2), 2)
         self.assertEqual(module.worker_count(145, 2), 2)
+
+    def test_lane_check_exports_the_host_worker_cap(self):
+        lane_runner = WORKFLOW.parents[2] / "lanes" / "run_lane.sh"
+        text = lane_runner.read_text()
+        self.assertIn('CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"', text)
+        self.assertIn('export LOOM_CHECK_WORKERS="$CHECK_WORKERS"', text)
 
     def test_the_piped_unittest_step_runs_with_pipefail(self):
         text = WORKFLOW.read_text()

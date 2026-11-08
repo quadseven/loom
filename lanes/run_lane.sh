@@ -298,6 +298,7 @@ trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
+CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
@@ -2715,6 +2716,7 @@ contract_run_sandboxed() {
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
+    export LOOM_CHECK_WORKERS="$CHECK_WORKERS"
     # Host-red tests to set aside (host_red_deselected_passes): node ids
     # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
     # names them for a check that reads them itself.
