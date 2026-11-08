@@ -32,7 +32,7 @@ SLOTS = ["anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5", "anthropic-
          # (operator, 2026-11-07: way more Luna lanes).
          "codex-9", "codex-10", "codex-11", "codex-12", "codex-13", "codex-14",
          "codex-15", "codex-16",
-         "opencode-go-2", "opencode-go-3",
+         "opencode-go-1", "opencode-go-2", "opencode-go-3",
          "opencode-go-4",
          # A second local coder: the other Spark box, at LOOM_SPARK_2_URL.
          "spark-2",
