@@ -6758,8 +6758,8 @@ exit %d
         self.drop_brief()
         agent_pid = self.hung_agent()
         lock = self.loom / "run" / "codex.lock"
-        runner = subprocess.Popen(
-            ["bash", str(RUNNER), "codex"],
+        runner = subprocess.Popen(  # noqa: S603, S607 - fixed runner and slot under test
+            ["bash", str(RUNNER), "codex"],  # noqa: S607 - fixed local runner path
             env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
@@ -6926,7 +6926,7 @@ exit %d
         self.drop_brief()
         lock = self.loom / "run" / "codex.lock"
         lock.mkdir(parents=True)
-        unrelated = subprocess.Popen(["sleep", "60"])
+        unrelated = subprocess.Popen(["/bin/sleep", "60"])
         (lock / "pid").write_text(f"{unrelated.pid}\n")
         try:
             result = self.run_lane()
@@ -6942,8 +6942,8 @@ exit %d
         self.drop_brief()
         lock = self.loom / "run" / "codex.lock"
         agent_pid = self.hung_agent()
-        runner = subprocess.Popen(
-            ["bash", str(RUNNER), "codex"],
+        runner = subprocess.Popen(  # noqa: S603, S607 - fixed runner and slot under test
+            ["bash", str(RUNNER), "codex"],  # noqa: S607 - fixed local runner path
             env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
