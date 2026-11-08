@@ -723,6 +723,14 @@ class JournalTests(unittest.TestCase):
                                        measure="p95 2s").splitlines()
         self.assertEqual(lines[2], "- Measure: p95 2s")
 
+    def test_render_journal_with_a_shipped_backlog(self):
+        # loom#2161: the shipped stage's count and median wait ride every
+        # tick journal, right under the tick's own Shipped line.
+        lines = journal.render_journal(NOW, "tick-1", [], [], [], [], 1, 1,
+                                       backlog="215 waiting, median wait 57.8h").splitlines()
+        self.assertEqual(lines[2], "- Shipped: none")
+        self.assertEqual(lines[3], "- Shipped backlog: 215 waiting, median wait 57.8h")
+
     def test_render_report(self):
         lines = journal.render_report(NOW, "tick-1", "m", [], "f", "none", "n").splitlines()
         self.assertEqual(lines[0], journal.REPORT_MARKER)
@@ -740,6 +748,22 @@ class JournalTests(unittest.TestCase):
         journal.post(gh, REPO, 7, journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\nx")
         self.assertEqual(t.calls[2][0], "POST")
         self.assertTrue(t.calls[2][1].endswith("/repos/%s/issues/7/comments" % REPO))
+
+    def test_post_adds_the_station_shipped_backlog_stamp_to_a_journal(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        state = os.path.join(temp.name, "state", "station")
+        os.makedirs(state)
+        with open(os.path.join(state, "verify-priority.json"), "w") as fh:
+            json.dump({"at": NOW.timestamp(), "n": 4, "median_h": 30.7}, fh)
+        text = (journal.JOURNAL_MARKER + "\nTick 2030-01-01T12:00:00Z, muse\n"
+                "- Shipped: none\n- Briefed: none\n- Waiting: none\n- Asks: none\n- Cost: 0 requests, 0 minutes")
+        t = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        gh = GitHub("tok", transport=t)
+        with mock.patch.dict(os.environ, {"LOOM_HOME": temp.name}):
+            journal.post(gh, REPO, 7, text, now=NOW)
+        body = json.loads(t.calls[2][3])["body"]
+        self.assertIn("- Shipped backlog: 4 waiting, median wait 30.7h", body)
 
     def test_a_journal_without_its_tick_line_is_refused_unless_a_holder_adds_it(self):
         # No brain's journal carried a Tick line on 2026-10-16, so each read its

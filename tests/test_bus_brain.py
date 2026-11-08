@@ -16,8 +16,8 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, hold_boxes, journal, proof, station, text, tickets
-from bus.github import GitHub, GitHubError
+from bus import brain, factory, hold_boxes, journal, metrics, proof, station, text, tickets
+from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
 
@@ -7357,3 +7357,133 @@ class RemoteLaneRepoReadTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "this repo is private"):
                 brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
             self.assertFalse(any(c[0] == "POST" for c in fake.calls))
+
+
+class WaitsStub:
+    """A GitHub boundary for brain.shipped_backlog_line: canned ticket
+    listings and event lists in the paginate shape metrics.waits_for_repos
+    reads (the shape test_bus_metrics' SlowEvents serves)."""
+
+    NOW = 1768000000.0
+
+    def __init__(self, events, error=None):
+        self.events = events
+        self.error = error
+
+    @staticmethod
+    def _iso(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def labeled(self, name, hours_ago):
+        return {"event": "labeled", "label": {"name": name},
+                "created_at": self._iso(self.NOW - hours_ago * 3600)}
+
+    def shipped(self, number, hours_ago):
+        self.events[number] = [self.labeled("loom:shipped", hours_ago)]
+
+    def paginate(self, path):
+        if "/events" not in path:
+            return [{"number": n, "updated_at": self._iso(self.NOW)} for n in sorted(self.events)]
+        if self.error is not None:
+            raise self.error
+        number = int(path.split("/issues/")[1].split("/")[0])
+        return self.events[number]
+
+
+class ShippedRowTest(unittest.TestCase):
+    """The station uses the canonical waits read for its priority stamp."""
+
+    def test_the_line_counts_shipped_tickets_and_their_median_wait(self):
+        stub = WaitsStub({})
+        stub.shipped(1, 40)
+        stub.shipped(2, 60)
+        stub.shipped(3, 80)
+        stub.events[4] = [stub.labeled("loom:queued", 90)]
+        row = metrics.shipped_row(stub, [REPO], stub.NOW)
+        self.assertEqual(row["n"], 3)
+        self.assertEqual(row["median_h"], 60.0)
+
+    def test_no_shipped_tickets_reads_as_zero_waiting(self):
+        stub = WaitsStub({})
+        self.assertEqual(metrics.shipped_row(stub, [REPO], stub.NOW)["n"], 0)
+
+    def test_a_failed_read_says_so_instead_of_estimating(self):
+        stub = WaitsStub({}, error=GitHubError("events read failed", 502))
+        stub.shipped(1, 40)
+        with self.assertRaisesRegex(GitHubError, "events read failed"):
+            metrics.shipped_row(stub, [REPO], stub.NOW)
+
+    def test_a_rate_limit_stops_the_read_like_every_other_status_read(self):
+        stub = WaitsStub({}, error=RateLimited("budget spent", 403, "", 0))
+        stub.shipped(1, 40)
+        with self.assertRaises(RateLimited):
+            metrics.shipped_row(stub, [REPO], stub.NOW)
+
+
+class ShippedBacklogLineTest(unittest.TestCase):
+    """Status reads a fresh station stamp and never launches a wait scan."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = self.temp.name
+        self.state = os.path.join(self.home, "state", "station")
+        os.makedirs(self.state)
+
+    def stamp(self, at, count, median):
+        with open(os.path.join(self.state, metrics.SHIPPED_STAMP_FILE), "w") as fh:
+            json.dump({"at": at, "n": count, "median_h": median}, fh)
+
+    def test_fresh_stamp_prints_shipped_count_and_median(self):
+        now = datetime.now(timezone.utc).timestamp()
+        self.stamp(now, 3, 60.0)
+        self.assertEqual(brain.shipped_backlog_line(now, {"LOOM_HOME": self.home}),
+                         "3 waiting, median wait 60.0h")
+
+    def test_fresh_empty_stamp_prints_zero_waiting(self):
+        now = datetime.now(timezone.utc).timestamp()
+        self.stamp(now, 0, None)
+        self.assertEqual(brain.shipped_backlog_line(now, {"LOOM_HOME": self.home}),
+                         "0 waiting")
+
+    def test_missing_or_stale_stamp_says_not_read(self):
+        now = datetime.now(timezone.utc).timestamp()
+        self.assertIn("not read", brain.shipped_backlog_line(now, {"LOOM_HOME": self.home}))
+        self.stamp(now - metrics.SHIPPED_STAMP_MAX_AGE, 3, 60.0)
+        self.assertIn("not read", brain.shipped_backlog_line(now, {"LOOM_HOME": self.home}))
+
+
+class StatusShippedBacklogTest(unittest.TestCase):
+    """The status the brain reads every tick carries the shipped backlog
+    section its journal line is copied from (loom#2161). The waits read is
+    served by the same scripted transport as every other read: a listing
+    of three shipped tickets and their ship events, whose waits (40, 60
+    and 80 hours) have the same median whatever order the parallel
+    events reads take them in."""
+
+    def test_status_carries_the_shipped_backlog(self):
+        now = datetime.now(timezone.utc)
+
+        def iso(ts):
+            return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def shipped_event(hours_ago):
+            return {"event": "labeled", "label": {"name": "loom:shipped"},
+                    "created_at": iso(now - brain.timedelta(hours=hours_ago))}
+
+        gh = GitHub("t", transport=Fake(
+            reply(200, [{"number": 1, "title": "Goal", "labels": [{"name": "loom:goal"}], "created_at": "2030-01-01T00:00:00Z"},
+                        {"number": 2, "title": "Ticket", "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}], "created_at": "2030-01-01T00:00:00Z"},
+                        {"number": 3, "title": "Ask", "labels": [{"name": "needs-operator"}]}]),
+            reply(200, [{"number": 4, "title": "PR", "head": {"ref": "loom/4-work"}}]),
+            reply(200, {"data": {"repository": {"p4": {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": "SUCCESS"}}}]}, "reviewThreads": {"nodes": [{"isResolved": False}]}}, "g1": {"comments": {"nodes": [{"body": "<!-- loom:journal v1 -->", "createdAt": "2030-01-01T01:00:00Z"}]}}}}}),
+            reply(200, []), reply(200, []),
+            reply(200, [{"number": n, "updated_at": iso(now)} for n in (11, 12, 13)]),
+            reply(200, [shipped_event(40)]),
+            reply(200, [shipped_event(60)]),
+            reply(200, [shipped_event(80)])))
+        with unittest.mock.patch.object(brain, "shipped_backlog_line",
+                                        return_value="3 waiting, median wait 60.0h"):
+            report = brain.status(gh, [REPO], REPO, env={}, authors=())
+        self.assertIn("## Shipped backlog", report)
+        self.assertIn("- 3 waiting, median wait 60.0h", report)
