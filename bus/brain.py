@@ -2531,11 +2531,18 @@ def _rest_issue(node: Dict[str, Any]) -> Dict[str, Any]:
 def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
                   ) -> List[Dict[str, Any]]:
     """The epic's sub-issues, then the open tickets whose Part of line names
-    it that are not already among them."""
+    it that are not already among them. A ticket GitHub records as another
+    issue's sub-issue belongs to that parent, so a Part of line left naming
+    this epic is stale and does not count: two open sub-issues of an open
+    epic were reported as stranded under a closed one whose number their
+    bodies still named (loom#2767, loom#1713)."""
     tickets_ = [c for c in sub if isinstance(c, dict)]
     seen = {int(c.get("number") or 0) for c in tickets_}
     for item in open_tickets:
         n = int(item.get("number") or 0)
+        parent = _sub_issue_parent(item)
+        if parent is not None and parent != number:
+            continue
         if n and n not in seen and _names_goal(item.get("body"), number):
             tickets_.append(item)
             seen.add(n)
