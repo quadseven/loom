@@ -554,7 +554,7 @@ def person_claim(issue: Dict[str, Any]) -> Optional[str]:
 # sets it; 0 turns the cap off.
 UNCLAIMED_MOVE_CAP = 6
 MOVE_CAP_MARKER = "<!-- loom:move-cap v1 -->"
-NO_REASON = "agent made no commit and wrote no reason"
+NO_REASON = history.NO_REASON
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
                  ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
