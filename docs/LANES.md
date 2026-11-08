@@ -443,9 +443,10 @@ provider's reset (else 60 minutes; delete its heartbeat file in
 `state/usage/` to clear it sooner). A key the provider will not take is
 `[auth]`, not a transient failure: it costs the ticket no attempt, never
 flags `loom:runaway`, and every lane that bills that key stays unavailable
-with `API key expired: renew <the SSM parameter>` in its heartbeat, with no
-`retry_at`, until the value at that parameter changes. The runner opens one
-`needs:human` ask on the factory repo naming that parameter. opencode
+with `API key expired: renew <LOOM_<LANE>_KEY_SSM>` in its heartbeat, with no
+`retry_at`, until the value at that setting's parameter changes. The runner
+opens one `needs:human` ask on the factory repo naming the setting, never the
+parameter path. opencode
 lanes run with `--print-logs --log-level ERROR`, because opencode's own
 output says only "UnknownError: Unexpected server error" for every provider
 fault: the logged error shows an upstream 429 (a limit) or a model opencode
