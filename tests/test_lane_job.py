@@ -224,6 +224,20 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(headers["X-amz-security-token"], "tok")
         self.assertTrue(headers["Authorization"].startswith("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"))
 
+    def test_ssm_copies_workersai_token_and_account_parameters(self):
+        self.inputs(slot="workersai", settings=(
+            "LOOM_WORKERSAI_KEY_SSM=/workersai/token\n"
+            "LOOM_WORKERSAI_ACCOUNT_SSM=/workersai/account\n"))
+        self.assertEqual(self.step("prepare").returncode, 0)
+        code, printed, asked = self.ssm_step()
+        self.assertEqual(code, 0, printed)
+        self.assertEqual({name for _, _, name in asked}, {
+            "/workersai/token", "/workersai/account", "/infra/leak-scan/deny-list"})
+        self.assertEqual((self.job / "ssm" / "workersai" / "token").read_text(),
+                         "value-of/workersai/token\n")
+        self.assertEqual((self.job / "ssm" / "workersai" / "account").read_text(),
+                         "value-of/workersai/account\n")
+
     def test_the_request_is_signed_as_aws_signs_it(self):
         # Pinned from botocore's SigV4Auth for the same request (checked when
         # this was written): the image has no AWS CLI, so the job signs.

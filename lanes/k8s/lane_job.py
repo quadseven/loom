@@ -257,7 +257,8 @@ def ssm() -> None:
     region = os.environ.get("AWS_REGION") or settings.get("LOOM_AWS_REGION", "")
     d = job_dir()
     wanted = [(n, v) for n, v in sorted(settings.items())
-              if n.endswith("_KEY_SSM") and n != "LOOM_GITHUB_APP_KEY_SSM"]
+              if n.endswith("_SSM") and n not in (
+                  "LOOM_GITHUB_APP_KEY_SSM", "LOOM_CODEX_SESSION_SSM")]
     session_name = settings.get("LOOM_CODEX_SESSION_SSM", "")
     if session_name:
         if not SSM_NAME_RE.fullmatch(session_name):

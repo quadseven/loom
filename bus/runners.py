@@ -76,7 +76,10 @@ RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai",
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {
+    "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
+}
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -121,7 +124,7 @@ NAME_RE = re.compile(r"^LOOM_[A-Z0-9_]+$")
 VALUE_RE = re.compile(r"^[\x20-\x7e]{0,1000}$")
 # Per-lane settings a runner job may receive: LOOM_<SLOT>_<SUFFIX> or
 # LOOM_<LANE>_<SUFFIX>, as run_lane.sh's lane_setting reads them.
-SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "SESSION_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
+SUFFIXES = ("MODEL", "MODELS", "KEY_SSM", "ACCOUNT_SSM", "SESSION_SSM", "PROBE_URL", "PROBE_HEADER", "URL",
             "CONTEXT", "OUTPUT")
 # Settings shared by every lane that a runner job may receive.
 SHARED = ("LOOM_REPO_OWNERS", "LOOM_AWS_REGION", "LOOM_AGENT_TIMEOUT",
