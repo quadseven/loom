@@ -100,6 +100,47 @@ def child_env(test_dir: Path) -> dict[str, str]:
     return env
 
 
+def real_git(env: dict[str, str]) -> str | None:
+    """The first non-shim git executable on the child PATH, or None."""
+    for entry in env.get("PATH", "").split(os.pathsep):
+        candidate = Path(entry) / "git" if entry else None
+        if (candidate and candidate.is_file() and os.access(candidate, os.X_OK)
+                and not is_git_shim(candidate)):
+            return str(candidate)
+    return None
+
+
+def select_modules(modules: list[str], selectors: list[str],
+                   test_dir: Path) -> tuple[list[str], list[str]] | str:
+    """Resolve --only selectors to (whole modules, single test ids), or an error.
+
+    A selector is a module name (test_x or tests.test_x), a path to a test
+    file, or a dotted test id inside a module (test_x.Class.test_name)."""
+    whole: list[str] = []
+    ids: list[str] = []
+    for selector in selectors:
+        text = selector
+        path = Path(selector)
+        if text.endswith(".py"):
+            try:
+                path = (path if path.is_absolute() else Path.cwd() / path).resolve()
+                text = ".".join(path.relative_to(test_dir).with_suffix("").parts)
+            except ValueError:
+                return "--only %s is not a file under %s" % (selector, test_dir)
+        elif text.startswith(test_dir.name + "."):
+            text = text[len(test_dir.name) + 1:]
+        owner = next((m for m in sorted(modules, key=len, reverse=True)
+                      if text == m or text.startswith(m + ".")), None)
+        if owner is None:
+            return "--only %s matches no test module under %s" % (selector, test_dir)
+        if text == owner:
+            if owner not in whole:
+                whole.append(owner)
+        else:
+            ids.append(text)
+    return whole, ids
+
+
 def local_push_check(test_dir: Path) -> str | None:
     """Check that the test environment can push to a local bare repository."""
     import tempfile
@@ -172,8 +213,19 @@ def main() -> int:
     # tests needing sandbox-exec, ps or a localhost port skip by design; CI
     # leaves this off and refuses every skip.
     parser.add_argument("--allow-skips", action="store_true")
+    # One module, file or test id (repeatable), run through the same isolated
+    # environment as the full suite.
+    parser.add_argument("--only", action="append", default=[], metavar="MODULE_OR_TEST")
     args = parser.parse_args()
     test_dir = args.tests_dir.resolve()
+    # Fail closed before any discovery or fixture: tests build real repositories
+    # and must never meet the fleet git shim, whose pre-push scan reaches the
+    # publication deny list and AWS.
+    if real_git(child_env(test_dir)) is None:
+        print("no real git on PATH (only the fleet git shim, or none); "
+              "install git or add its directory to PATH before running tests",
+              file=sys.stderr)
+        return 2
     push_error = local_push_check(test_dir)
     if push_error:
         print(push_error, file=sys.stderr)
@@ -183,7 +235,15 @@ def main() -> int:
         print("Ran 0 tests")
         return 0
 
-    items = work_items(modules, test_dir, max(1, args.shard_size))
+    extra_items: list[tuple[str, list[str]]] = []
+    if args.only:
+        selected = select_modules(modules, args.only, test_dir)
+        if isinstance(selected, str):
+            print(selected, file=sys.stderr)
+            return 2
+        modules, test_ids = selected
+        extra_items = [(test_id, [test_id]) for test_id in test_ids]
+    items = (work_items(modules, test_dir, max(1, args.shard_size)) if modules else []) + extra_items
     failed = False
     total = 0
     worker_cap = os.environ.get("LOOM_CHECK_WORKERS")
@@ -219,7 +279,7 @@ def main() -> int:
                 print("::error::a test skipped; the sandbox tests must run in CI")
                 failed = True
     print("Parallel unittest total: Ran %d tests across %d modules in %d processes"
-          % (total, len(modules), len(items)))
+          % (total, len(modules) + len(extra_items), len(items)))
     return 1 if failed else 0
 
 

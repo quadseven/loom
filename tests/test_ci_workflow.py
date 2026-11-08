@@ -2,6 +2,7 @@
 needs pipefail (on 2026-10-14 a failing ASCII test passed CI for hours)."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -161,6 +162,89 @@ class UnittestStep(unittest.TestCase):
 
 
 class ConcurrencyTest(unittest.TestCase):
+    def _write_tests(self, root, names=("alpha", "beta")):
+        tests = Path(root, "tests")
+        tests.mkdir()
+        for name in names:
+            Path(tests, "test_%s.py" % name).write_text(
+                "import unittest\nclass Sample(unittest.TestCase):\n"
+                " def test_one(self): pass\n def test_two(self): pass\n")
+        return tests
+
+    def _real_git_dir(self):
+        import shutil
+        found = shutil.which("git")
+        self.assertTrue(found, "these tests need a git on PATH")
+        return str(Path(found).parent)
+
+    def test_only_runs_one_module_through_the_runner(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = self._write_tests(temp)
+            for selector in ("test_alpha", "tests.test_alpha", str(tests / "test_alpha.py")):
+                result = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                         "--only", selector], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("Ran 2 tests across 1 modules", result.stdout)
+                self.assertNotIn("test_beta", result.stdout)
+
+    def test_only_accepts_one_test_id_and_rejects_an_unknown_selector(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = self._write_tests(temp)
+            one = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                  "--only", "test_alpha.Sample.test_two"],
+                                 text=True, capture_output=True)
+            self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
+            self.assertIn("Ran 1 tests across 1 modules", one.stdout)
+            bad = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                  "--only", "test_missing"], text=True, capture_output=True)
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("matches no test module", bad.stderr)
+
+    def test_runner_fails_closed_before_any_setup_when_only_the_git_shim_exists(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = self._write_tests(temp)
+            shim = Path(temp, "shimbin")
+            shim.mkdir()
+            Path(shim, "git").write_text("#!/bin/sh\n# fleet git shim\nexit 0\n")
+            Path(shim, "git").chmod(0o755)
+            marker = Path(temp, "ran")
+            Path(tests, "test_alpha.py").write_text(
+                "from pathlib import Path\nPath(%r).write_text('x')\n" % str(marker))
+            env = dict(os.environ, PATH=str(shim))
+            result = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests)],
+                                    text=True, capture_output=True, env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("no real git", result.stderr)
+            self.assertFalse(marker.exists(), "test discovery ran before the git check")
+
+    def test_run_never_calls_the_leak_scanner_or_aws(self):
+        runner = WORKFLOW.parents[1] / "unittest_parallel.py"
+        with tempfile.TemporaryDirectory() as temp:
+            tests = self._write_tests(temp)
+            fake = Path(temp, "fakebin")
+            fake.mkdir()
+            log = Path(temp, "calls.log")
+            for name in ("check_private_leaks.py", "aws", "ssm-put", "ssm-get"):
+                path = fake / name
+                path.write_text('#!/bin/sh\necho "%s $@" >> %s\nexit 1\n' % (name, log))
+                path.chmod(0o755)
+            boto = Path(temp, "pylib", "boto3")
+            boto.mkdir(parents=True)
+            Path(boto, "__init__.py").write_text(
+                "open(%r, 'a').write('boto3 imported\\n')\n" % str(log))
+            env = dict(os.environ,
+                       PATH=os.pathsep.join([str(fake), self._real_git_dir(),
+                                             str(Path(sys.executable).parent), "/usr/bin", "/bin"]),
+                       PYTHONPATH=str(boto.parent))
+            for extra in ([], ["--only", "test_alpha"]):
+                result = subprocess.run([sys.executable, str(runner), "--tests-dir", str(tests),
+                                         *extra], text=True, capture_output=True, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
+
     def test_runs_are_grouped_per_branch_and_pull_requests_cancel_older_runs(self):
         text = WORKFLOW.read_text()
         self.assertIn("concurrency:\n  group: test-${{ github.ref }}\n", text)

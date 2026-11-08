@@ -142,7 +142,7 @@ Layout:
 Commands:
 
 - Full suite, as `.loom/validation.conf` runs it: `python3 -B .github/unittest_parallel.py --allow-skips`. It takes several minutes.
-- One module: `python3 -B -m unittest tests.test_merge_tier`.
+- One module or test, through the same isolated runner: `python3 -B .github/unittest_parallel.py --allow-skips --only tests.test_merge_tier` (also a file path, or `test_merge_tier.Class.test_name`; repeatable). Never run `python3 -m unittest` directly: it skips the isolated environment, and the runner refuses to start when only the fleet git shim is on PATH.
 - Without `--allow-skips` a skip is a failure. That is the required CI form, and it needs macOS with `sandbox-exec`, `ps` and a localhost port.
 - Leak check before a push: run `.github/scripts/check_private_leaks.py` from `quadseven/infra-public` with `--text-file <file>` and `--deny-list-ssm` naming the private deny-list. CI here has no deny-list, so only this form catches people's names.
 
