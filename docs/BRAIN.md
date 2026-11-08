@@ -1221,9 +1221,17 @@ When the runner finishes, the station finds the brief in `done/` or
     or ticked in the answer's own Acceptance criteria checklist (a "not
     built" mark proves nothing, since the answer says the work is done).
     Live and operator boxes are left to the verifier and the operator. When
-    a box is unproven, the ticket goes back to `loom:queued` and the event
-    names each such box; it neither settles nor moves to `loom:merged`
-    (loom#2032).
+    a box is unproven, the event names it and the ticket neither settles nor
+    moves to `loom:merged` (loom#2032). Build and fix answers share a persisted
+    budget keyed by ticket and the set of unproven code boxes. Below
+    `NO_CHANGE_LIMIT`, a build returns to `loom:queued` and a fix keeps its
+    existing pull request workflow. At the limit the ticket moves up the
+    model ladder once; unavailable higher lanes leave `wait:no-change` while
+    that same promotion waits. One more same-box answer on the promoted
+    model, or an exhausted ladder, holds it at `loom:answered` with
+    `needs-brain` and one comment naming the boxes. Different boxes or a run
+    that pushed a commit reset the count. Replayed outcomes do not count
+    again, and external holds, claims and settlements are preserved.
   - When a pull request linked to the ticket (a `Refs` line or a
     `loom/<number>` branch) has merged into the default branch, that pull
     request carries the work the lane found done. The ticket moves to
