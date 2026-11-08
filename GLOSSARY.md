@@ -97,6 +97,14 @@ _Avoid_: test, check
 **Audit**:
 The brain re-reading the evidence of a proof a lane's verify run made; a failed audit moves the ticket back to shipped and holds that lane's verify runs for a day.
 
+**Ask block**:
+The comment a brain writes on an ask ticket after checking the live facts: a hidden `<!-- loom:ask v1 -->` marker, then `Ask:` (one question), `Recommend:` (the advised answer) and `Why:` (one line); see `docs/ASK_BLOCK.md`.
+_Avoid_: ask summary, triage note
+
+**Vetted ask**:
+An ask with an ask block by a brain. Only vetted asks are digest items or tag the operator; the others are with the brains, and station, lane and invariant upkeep is vetted only when the block adds `Needs person: yes`.
+_Avoid_: approved ask, confirmed ask
+
 **Close reason**:
 The plain-English comment `bus/closing.py` posts in the thread before any close or reopen. A close with no reason is refused.
 

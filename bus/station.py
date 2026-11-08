@@ -55,6 +55,7 @@ from . import scope_fit
 from . import shadow
 from . import urgency
 from . import stale_claims
+from . import ask_block
 from . import ask_state
 from . import brief_check
 from . import label_pass
@@ -243,13 +244,12 @@ DIGEST_HEAD = "Asks waiting for you:"
 HUMAN = "loom:human"
 # Why a ticket waits (bus/labels.py): one wait:* label at a time.
 WAIT = "wait:"
-HUMAN_HEAD = "Waiting on you"
+# The digest lists at most this many vetted asks (docs/ASK_BLOCK.md).
 HUMAN_SHOWN = 5
+VETTED, UPKEEP, WITH_BRAINS = "vetted", "upkeep", "with the brains"
 # A report first line whose only count is work in flight: the digest counts
 # that goal as quiet.
 IN_FLIGHT_ONLY_RE = re.compile(r"\A\d+ in flight( since the last report)?\.?\Z", re.I)
-HUMAN_TITLE_MAX = 100
-HUMAN_ASK_MAX = 140
 # When every ask does not fit in the daily notification, the full digest is a
 # comment on this issue in each ask's own repo (so a private repo's asks stay
 # in that repo), and the notification links to it.
@@ -9307,48 +9307,18 @@ class Station:
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": [answer.ANSWERED_LABEL]})
 
-    def _human_ask(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The first line of the newest needs:human comment from an allowed
-        login (the brain's ask), or "" when there is none."""
-        allowed = {a.lower() for a in self.s.authors}
-        # paginate follows the next links, so the newest comment is read however
-        # long the thread is. Only the HUMAN_SHOWN listed issues are read, once a
-        # day when the digest is due. A GitHubError is left to _human_text,
-        # which holds the whole digest rather than send a list missing an ask.
+    def _vet(self, repo: str, issue: Dict[str, Any]) -> Tuple[str, Optional[ask_block.Block]]:
+        """(VETTED, block) when a trusted brain wrote an ask block on the
+        ticket; (UPKEEP, None) for upkeep no brain marked needs-person, which
+        the factory path owns; (WITH_BRAINS, None) otherwise. A GitHubError
+        is left to _new_digest_plan, which holds the whole digest."""
         comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100"
-                                    % (repo, int(issue["number"])))
-        for c in reversed(comments):
-            body = str(c.get("body") or "") if isinstance(c, dict) else ""
-            if body.startswith(HUMAN_MARKER) and tickets._login(c.get("user")) in allowed:
-                lines = [ln.strip() for ln in body[len(HUMAN_MARKER):].splitlines() if ln.strip()]
-                return _clip(lines[0], HUMAN_ASK_MAX) if lines else ""
-        return ""
-
-    def _human_text(self, found: List[Tuple[str, Dict[str, Any]]]) -> Optional[str]:
-        """The digest's "Waiting on you" section: the newest HUMAN_SHOWN
-        issues grouped by repo, each with its ask; None when it cannot be read."""
-        shown = found[:HUMAN_SHOWN]
-        head = "%s (%d):" % (HUMAN_HEAD, len(found))
-        if len(found) > len(shown):
-            head = "%s (the %d newest of %d):" % (HUMAN_HEAD, len(shown), len(found))
-        lines = [head]
-        for repo in dict.fromkeys(r for r, _ in shown):
-            lines.append(repo)
-            for r, issue in shown:
-                if r != repo:
-                    continue
-                title = _clip(" ".join(str(issue.get("title") or "").split()), HUMAN_TITLE_MAX)
-                lines.append("- %s %s" % (title, issue["html_url"]))
-                try:
-                    ask = self._human_ask(repo, issue)
-                except RateLimited:
-                    raise
-                except GitHubError as err:
-                    _say("could not read the ask on %s#%s: %s" % (repo, issue["number"], err))
-                    return None
-                if ask:
-                    lines.append("  %s" % ask)
-        return "\n".join(lines)
+                                  % (repo, int(issue["number"])))
+        block = ask_block.newest(comments, self.s.authors, tickets._login)
+        upkeep = ask_block.is_upkeep(issue, _label_names(issue))
+        if block and (block.needs_person or not upkeep):
+            return VETTED, block
+        return (UPKEEP if upkeep else WITH_BRAINS), None
 
     def _gather_asks(self) -> Optional[List[Tuple[str, str, Dict[str, Any]]]]:
         """(key, repo, issue) for every open ask, oldest first; None when any
@@ -9540,31 +9510,32 @@ class Station:
         return _sha12("%s\n%s" % (issue.get("title") or "", issue.get("body") or ""))
 
     def _plan_digest(self, asks: List[Tuple[str, str, Dict[str, Any]]],
-                     covered_before: Any, today: str) -> Dict[str, Any]:
+                     covered_before: Any, today: str,
+                     vetted: Sequence[Tuple[str, str, Dict[str, Any], ask_block.Block]] = (),
+                     brains: int = 0) -> Dict[str, Any]:
         """Today's digest, fixed before anything is sent so a retry sends the
-        same one. Asks new or changed since the last sent digest go first,
-        newest first, so they are not buried behind old ones."""
-        prev = covered_before if isinstance(covered_before, dict) else {}
+        same one. Only vetted asks are listed, newest vetted first (score
+        order in act mode), at most HUMAN_SHOWN; the rest are counted."""
         covered = {k: self._ask_rev(i) for k, _, i in asks}
-        # Asks ranked by their urgency score (act mode) keep that order.
-        ranked = self._digest_ranked
-        new = [a for a in (asks if ranked else reversed(asks))
-               if prev.get(a[0]) != covered[a[0]]]
-        seen = [a for a in asks if prev.get(a[0]) == covered[a[0]]]
-        lines = [self._line(i) for _, _, i in new + seen]
+        rows = list(vetted)
+        if not self._digest_ranked:
+            rows.sort(key=lambda r: (r[3].at, r[0]), reverse=True)
+        lines = [ask_block.line(k, b) for k, _, _, b in rows[:HUMAN_SHOWN]]
         lines.extend(self._idle_pull_lines())
         plan: Dict[str, Any] = {
-            "day": today, "covered": covered, "new": len(new),
+            "day": today, "covered": covered, "vetted": len(rows), "brains": brains,
             "lines": lines, "pages": {}}
         whole = "\n".join([self._digest_head(plan)] + plan["lines"])
-        if len(whole) <= DISCORD_MAX - MENTION_ROOM:
+        # Past the listed few, or past one message, the full list of vetted asks
+        # goes to a page per repo and the notification links to it.
+        if len(rows) <= HUMAN_SHOWN and len(whole) <= DISCORD_MAX - MENTION_ROOM:
             return plan
         repos: List[str] = []
-        for _, repo, _ in asks:
+        for _, repo, _, _ in rows:
             if repo not in repos:
                 repos.append(repo)
         plan["pages"] = {repo: {"body": self._page_body(
-            repo, [i for _, r, i in asks if r == repo], today), "url": ""}
+            repo, [i for _, r, i, _ in rows if r == repo], today), "url": ""}
             for repo in repos}
         plan["order"] = repos
         return plan
@@ -9614,18 +9585,30 @@ class Station:
 
     @staticmethod
     def _digest_head(plan: Dict[str, Any]) -> str:
-        return "%s %d, %d new since the last digest" % (DIGEST_HEAD, len(plan["lines"]), plan["new"])
+        vetted = int(plan.get("vetted") or 0)
+        if not vetted:
+            return ""
+        if vetted > HUMAN_SHOWN:
+            return "%s the %d newest of %d" % (DIGEST_HEAD, HUMAN_SHOWN, vetted)
+        return "%s %d" % (DIGEST_HEAD, vetted)
+
+    @staticmethod
+    def _brains_line(brains: int) -> str:
+        if not brains:
+            return ""
+        return "1 ask is with the brains." if brains == 1 else "%d asks are with the brains." % brains
 
     def _digest_text(self, plan: Dict[str, Any]) -> str:
-        """The daily notification: as many asks as fit, then a link per repo
-        to the full digest when some do not."""
-        lines = plan["lines"]
+        """The daily notification: the vetted asks, one line each, then the
+        count still with the brains. With none vetted it holds no ask lines."""
+        lines = plan["lines"] if plan.get("vetted") else []
         head = self._digest_head(plan)
         pages = plan.get("pages") or {}
         tail = ["Every ask, by goal:"] + [
             "- %s %s" % (repo, pages[repo].get("url") or "")
             for repo in plan.get("order") or []] if pages else []
-        room = DISCORD_MAX - MENTION_ROOM - len(head) - sum(len(t) + 1 for t in tail)
+        brains = self._brains_line(int(plan.get("brains") or 0))
+        room = DISCORD_MAX - MENTION_ROOM - len(head) - len(brains) - sum(len(t) + 1 for t in tail)
         keep: List[str] = []
         size = len("- and 9999 more") + 1 if pages else 0
         for line in lines:
@@ -9636,7 +9619,7 @@ class Station:
         if len(keep) < len(lines):
             keep.append("- and %d more" % (len(lines) - len(keep)))
         asks = "\n".join([head] + keep + tail) if lines else ""
-        return "\n\n".join(part for part in (asks, plan.get("human") or "") if part)
+        return "\n\n".join(part for part in (asks, brains) if part)
 
     def _digest_issue(self, repo: str) -> int:
         found = self._paginate("/repos/%s/issues?labels=%s&state=open&per_page=100"
@@ -9718,18 +9701,36 @@ class Station:
         except GitHubError as err:
             _say("could not read an ask for the digest: %s; next pass" % err)
             return None
-        human = self._human_text(found) if found else ""
-        if human is None or (not asks and not human):
+        try:
+            vetted, brains = self._vet_all(
+                asks + [("%s#%s" % (r, i["number"]), r, i) for r, i in found])
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read an ask for the digest: %s; next pass" % err)
+            return None
+        if not vetted and not brains:
             return None
         try:
-            plan = self._plan_digest(asks, covered, today)
+            return self._plan_digest(asks, covered, today, vetted, brains)
         except RateLimited:
             raise
         except GitHubError as err:
             _say("could not read the goal homes for the digest: %s; next pass" % err)
             return None
-        plan["human"] = human
-        return plan
+
+    def _vet_all(self, items: Sequence[Tuple[str, str, Dict[str, Any]]]
+                 ) -> Tuple[List[Tuple[str, str, Dict[str, Any], ask_block.Block]], int]:
+        """The vetted asks, and how many are still with the brains."""
+        vetted: List[Tuple[str, str, Dict[str, Any], ask_block.Block]] = []
+        brains = 0
+        for key, repo, issue in items:
+            state, block = self._vet(repo, issue)
+            if block:
+                vetted.append((key, repo, issue, block))
+            elif state == WITH_BRAINS:
+                brains += 1
+        return vetted, brains
 
     def _send_digest(self, url: Optional[str], keyed: List[Tuple[str, str, Dict[str, Any]]],
                      ledger: Tuple[str, Dict[str, Any], List[str]], today: str) -> None:
@@ -9746,7 +9747,8 @@ class Station:
         if url is None or not self._post_pages(plan, ledger):
             return
         chunks = self._chunks(self._digest_text(plan), DISCORD_MAX - MENTION_ROOM)
-        if all(self._send(url, chunk, mention=n == 0) for n, chunk in enumerate(chunks)):
+        tag = bool(plan.get("vetted"))
+        if all(self._send(url, chunk, mention=tag and n == 0) for n, chunk in enumerate(chunks)):
             # What the operator was sent: each ask's revision and the links.
             sent["digest"] = today
             sent["covered"] = plan["covered"]

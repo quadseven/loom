@@ -1595,10 +1595,15 @@ An ask is an issue labelled `needs:human` in the goal's repo, holding one
 exact question or action and what the brain does in each case. The station
 forwards asks to the operator's Discord webhook (URL read from SSM on the
 lane machine, never on Muse's VM): `loom:urgent` asks within a minute, the
-rest as one daily digest. Asks in private repos stay private on GitHub; the
-digest carries only titles and links. When the digest does not fit in one
-message, its full list, grouped by goal, is a comment on the `loom:digest`
-issue in each ask's own repo, and the message links to it. To file an ask
+rest as one daily digest. The digest lists only vetted asks: a brain checks the
+live facts and writes an ask block on the ticket (a question, a recommended
+answer and one line of why; `docs/ASK_BLOCK.md`), and only then does the ask
+reach the operator or tag them. An unvetted ask waits with the brains, and the
+digest only counts it. Station, lane and invariant upkeep is never listed
+unless a brain marks it needs-person. Each vetted ask is one line, `repo#N:
+<question> Recommend: <answer>.`, the 5 newest first. With more than 5, the
+full list, grouped by goal, is a comment on the `loom:digest` issue in each
+ask's own repo, and the message links to it. To file an ask
 under its goal, name the goal home in its body (`Part of #N`).
 
 An ask about an outage dates it by its window, never by one time: the last
@@ -1607,10 +1612,8 @@ failing read 09:02Z"). The last good read is not the start. Every text a
 `bus` command posts is checked for this (`bus/text.py`).
 
 Open, unblocked issues still on the old `loom:human` name are never posted on their
-own. They are listed once a day under "Waiting on you" at the end of the
-same digest (the 15 newest, grouped by repo, each with the first line of
-its ask comment), so hundreds of them still make one message. Once such an
-issue moves to `needs:human`, it is listed with the asks.
+own. Once vetted, they are listed once a day with the other vetted asks in
+the same digest, so hundreds of them still make one message.
 
 ## The tick
 
