@@ -76,7 +76,9 @@ RUNNER_LANES = ("codex", "opencode-go", "zen", "openrouter", "zai", "workersai",
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
-TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"}}
+TRACKED_SLOTS = {"free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+                 "zai": {"LOOM_ZAI_MODEL": "zai/glm-4.7-flash"},
+                 "zen": {"LOOM_ZEN_MODEL": "opencode/deepseek-v4.1-flash-free"}}
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -192,6 +194,10 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
         if name.startswith("LOOM_GITHUB_APP_"):
             continue
         name = LANES_APP.get(name, name)
+        # Tracked slots run on cluster gateways and carry no credential name:
+        # their provider holds the key, so a *_KEY_SSM setting is never sent.
+        if slot in TRACKED_SLOTS and name.endswith("_KEY_SSM"):
+            continue
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
             out[name] = str(value)
     return dict(sorted(out.items()))
@@ -950,6 +956,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
         for name, value in env.items():
             if (setting_allowed(slot, name) and not name.startswith("LOOM_GITHUB_APP_")
                     and name not in STATION_OWN and not name.endswith(("_MODEL", "_MODELS"))
+                    and not (slot in TRACKED_SLOTS and name.endswith("_KEY_SSM"))
                     and value and VALUE_RE.fullmatch(value)):
                 out[name] = value
     return dict(sorted(out.items()))
