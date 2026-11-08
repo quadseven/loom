@@ -2356,6 +2356,30 @@ class SensitiveResumeTests(unittest.TestCase):
                           and not c[1].endswith("/graphql")]
                 self.assertEqual(writes, [])
 
+    def test_merge_refusal_names_the_fix_round_holding_the_ticket(self):
+        # loom#2611: a retry-branch pull request (loom/<n>-...-r3) was green
+        # while its ticket sat at loom:briefed for a fix round, and the bare
+        # "ticket is not loom:pr" read as a missing reconciliation. The
+        # refusal says which state holds it and that the lane's report moves
+        # it back, so the brain waits instead of relabelling.
+        for state in ("loom:running", "loom:briefed"):
+            with self.subTest(state=state):
+                pr, query = self._merge_replies()
+                issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": state}]}
+                fake = Fake(pr, query, reply(200, issue))
+                with self.assertRaises(ValueError) as caught:
+                    brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
+                self.assertIn("at %s: a fix round has a lane pushing a new head" % state,
+                              str(caught.exception))
+                self.assertIn("back to loom:pr when that lane reports", str(caught.exception))
+
+    def test_ticket_refusal_adds_no_fix_round_note_outside_a_round(self):
+        for names in (["loom:ticket", "loom:failed"], ["loom:ticket", "loom:queued"]):
+            issue = {"state": "open", "labels": [{"name": n} for n in names]}
+            self.assertEqual(brain._ticket_refusal(issue, "pr"), "ticket is not loom:pr")
+        issue = {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:briefed"}]}
+        self.assertEqual(brain._ticket_refusal(issue, "merged"), "ticket is not loom:merged")
+
     def test_merge_refuses_an_unrelated_closed_or_non_ticket_issue_before_write(self):
         cases = [
             ((REPO, 999), {"state": "open", "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}),
@@ -3431,7 +3455,13 @@ class StatusMergeRefusalTests(unittest.TestCase):
 
     def test_a_ticket_not_at_pr_blocks(self):
         self.assertEqual(self.lines(state="running")[1],
-                         "- #9 Work - blocked: ticket at loom:running, not loom:pr")
+                         "- #9 Work - blocked: ticket at loom:running, not loom:pr"
+                         + brain.MID_ROUND_NOTE % "loom:running")
+        self.assertIn("a fix round has a lane pushing a new head", self.lines(state="running")[1])
+
+    def test_a_failed_ticket_blocks_without_the_fix_round_note(self):
+        self.assertEqual(self.lines(state="failed")[1],
+                         "- #9 Work - blocked: ticket at loom:failed, not loom:pr")
 
     def test_a_dirty_pull_request_blocks_as_a_conflict(self):
         self.assertEqual(self.lines(mergeable=False, mergeable_state="dirty")[1],

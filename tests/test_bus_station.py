@@ -897,6 +897,36 @@ class ReconcilePullRequestTest(Base):
         self.assertNotIn("loom:pr", self.fake.names(12))
         self.assertEqual(len(self.fake.comments[12]), 1)
 
+    def test_a_retry_branch_pull_request_promotes_its_briefed_ticket(self):
+        # loom#2611: a lane pull request on a retry branch (the -r3 suffix
+        # branch_for adds) links its ticket the same as a first attempt's.
+        self.fake.add(12, state="briefed", lane="codex-2")
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": tickets.branch_for(12, "Fix the thing", 3),
+                                     "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+
+    def test_a_retry_branch_pull_request_in_a_fix_round_stays_briefed(self):
+        # The loom#2611 refusal: ticket 2592 sat at loom:briefed because a
+        # fix round sent a lane to fix its r3 pull request, not because the
+        # retry branch went unlinked.
+        branch = tickets.branch_for(12, "Fix the thing", 3)
+        self.fake.add(12, state="briefed", lane="codex-2")
+        self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
+                                   "body": "%s\nPull request: %s#99, branch %s\n\nFix the test."
+                                           % (tickets.FIX_MARKER, REPO, branch),
+                                   "created_at": "2030-01-01T00:00:00Z",
+                                   "updated_at": "2030-01-01T00:00:00Z"}]
+        self.fake.pulls = [{"number": 99, "state": "open", "user": {"login": "alice-example"},
+                            "body": "Refs %s#12" % REPO,
+                            "head": {"ref": branch, "repo": {"full_name": REPO}}}]
+        station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+        self.assertIn("loom:briefed", self.fake.names(12))
+        self.assertNotIn("loom:pr", self.fake.names(12))
+
     def test_a_briefed_ticket_whose_fix_names_another_pull_request_is_linked(self):
         self.fake.add(12, state="briefed", lane="codex")
         self.fake.comments[12] = [{"id": 501, "user": {"login": "alice-example"},
