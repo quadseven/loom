@@ -179,14 +179,25 @@ agent_groups() {
   for c in $(pgrep -P "$1" 2>/dev/null); do agent_groups "$c"; done
 }
 
+# A live PID is not enough to prove that this lane owns its lock: the PID may
+# have been recycled. Return 2 when the process command cannot be inspected so
+# callers can leave a possibly-live lock alone.
+is_lane_runner_pid() {
+  local pid="$1" command
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 1
+  command="$(ps -o command= -p "$pid" 2>/dev/null)" || return 2
+  [ -n "$command" ] || return 2
+  case "$command" in *"run_lane.sh $SLOT") return 0 ;; esac
+  return 1
+}
+
 # A runner killed mid-brief (a reinstall's bootout kills its process group)
 # leaves its agent running in groups of their own. Before a new run, stop the
 # whole tree under the recorded subshell, but only if that pid is still this
 # lane's runner subshell (a recycled pid is left alone).
 stop_orphaned_agent() {
   local leader="$1" mine groups g alive
-  [[ "$leader" =~ ^[0-9]+$ ]] && kill -0 "$leader" 2>/dev/null || return 0
-  grep -q -- "run_lane.sh $SLOT\$" <<<"$(ps -o command= -p "$leader" 2>/dev/null)" || return 0
+  is_lane_runner_pid "$leader" || return 0
   mine="$(ps -o pgid= -p $$ | tr -d ' ')"
   groups="$(agent_groups "$leader" | grep -v -x -e "$mine" -e 0 -e 1 | sort -u | tr '\n' ' ')"
   [ -n "$groups" ] || return 0
@@ -202,9 +213,12 @@ stop_orphaned_agent() {
 }
 
 # One runner per lane. mkdir is atomic; a stale lock from a killed run is
-# cleared when its pid is gone.
+# cleared when its pid is gone or belongs to another process.
 if ! mkdir "$LOCK" 2>/dev/null; then
-  if kill -0 "$(cat "$LOCK/pid" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+  lock_pid="$(cat "$LOCK/pid" 2>/dev/null)"
+  is_lane_runner_pid "$lock_pid"
+  lock_status=$?
+  [ "$lock_status" -eq 0 ] || [ "$lock_status" -eq 2 ] && exit 0
   stop_orphaned_agent "$(cat "$LOCK/pgid" 2>/dev/null || true)"
   # The agent's watchdog and its tail reader run in a group of their own; a
   # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
@@ -1409,7 +1423,7 @@ LIMIT_WHY=""
 # Whether the provider answered the last probe at all (provider_at_limit).
 PROBE_ANSWERED=0
 # An expired key holds a lane with no retry time, so its reason is the whole
-# of it: "API key expired: renew <the SSM parameter, or the lane sign-in>".
+# of it: "API key expired: renew <the setting name, or the lane sign-in>".
 AUTH_HELD=""
 AUTH_WHY=""
 AUTH_WHY_PREFIX="API key expired: renew"
@@ -1776,8 +1790,8 @@ hold_provider_limit() {
 }
 
 # The digest of a key, never the key: the hold an expired key puts on a lane
-# lifts when the value at its SSM parameter changes, and a digest changes with
-# the value. The key goes to the hasher on stdin, so it reaches no argv.
+# lifts when the value at its configured SSM parameter changes. The key goes
+# to the hasher on stdin, so it reaches no argv.
 key_digest() {
   if command -v shasum > /dev/null 2>&1; then
     printf '%s' "$1" | shasum -a 256 | cut -c1-16
@@ -1787,11 +1801,34 @@ key_digest() {
 }
 
 # Why a lane is unavailable for a key the provider refused: the SSM parameter
-# its value came from, or the lane's own sign-in for a lane that reads no key.
+# setting that names the SSM parameter, or the lane's own sign-in when it has
+# no key setting. The parameter path stays out of asks and park reasons.
+lane_setting_name() {
+  local slot_var lane_var
+  slot_var="$(setting_var "$SLOT" "$1")"
+  lane_var="$(lane_var "$1")"
+  if [ -n "${!slot_var:-}" ]; then
+    printf '%s' "$slot_var"
+  elif [ -n "${!lane_var:-}" ]; then
+    printf '%s' "$lane_var"
+  fi
+}
+
+key_renew_setting_name() {
+  local target="${1#"$AUTH_WHY_PREFIX "}"
+  if [[ "$target" =~ ^LOOM_[A-Z0-9_]+_KEY_SSM$ ]]; then
+    printf '%s' "$target"
+  elif [[ "$target" == /* ]]; then
+    lane_setting_name KEY_SSM
+  else
+    printf '%s' "$target"
+  fi
+}
+
 key_renew_reason() {
-  local param
-  param="$(lane_setting KEY_SSM)"
-  printf '%s %s' "$AUTH_WHY_PREFIX" "${param:-the $LANE lane sign-in}"
+  local setting
+  setting="$(lane_setting_name KEY_SSM)"
+  printf '%s %s' "$AUTH_WHY_PREFIX" "${setting:-the $LANE lane sign-in}"
 }
 
 # Whether this lane reads its key from an SSM parameter (a name under a path,
@@ -1824,15 +1861,32 @@ hold_expired_key() {  # reason
 }
 
 # Whether an expired key still holds this slot: 0 while it stands, 1 when there
-# is no hold. It lifts only when the value at the parameter its heartbeat names
-# is not the one the hold was recorded for: only the operator can renew a key.
+# is no hold. It lifts only when the value at the setting's parameter differs
+# from the recorded digest: only the operator can renew a key.
 # Sets AUTH_HELD, AUTH_WHY and READY_REASON while it stands.
 key_held() {
-  local reason param want key
+  local reason target setting param want key
   reason="$(sed -nE 's/.*"reason": "([^"]*)".*/\1/p' "$BEAT" 2>/dev/null | head -1)"
-  case "$reason" in "$AUTH_WHY_PREFIX "/*) ;; *) return 1 ;; esac
-  AUTH_HELD=1 AUTH_WHY="$reason" READY_REASON="$reason"
-  param="${reason#"$AUTH_WHY_PREFIX "}"
+  case "$reason" in "$AUTH_WHY_PREFIX "*) ;; *) return 1 ;; esac
+  target="${reason#"$AUTH_WHY_PREFIX "}"
+  setting="$(key_renew_setting_name "$reason")"
+  if [[ "$target" =~ ^LOOM_[A-Z0-9_]+_KEY_SSM$ ]]; then
+    param="${!target:-}"
+    reason="$AUTH_WHY_PREFIX $setting"
+    AUTH_HELD=1 AUTH_WHY="$reason" READY_REASON="$reason"
+    [[ "$param" == /* ]] || return 0
+  elif [[ "$target" == /* ]]; then
+    # Older heartbeats stored the parameter path. Continue watching that
+    # value, but replace the public reason with its setting name.
+    param="$target"
+    reason="$AUTH_WHY_PREFIX ${setting:-the $LANE lane sign-in}"
+    AUTH_HELD=1 AUTH_WHY="$reason" READY_REASON="$reason"
+    if [ "$reason" != "$AUTH_WHY_PREFIX $target" ]; then
+      write_beat "$SLOT" false "$reason"
+    fi
+  else
+    return 1
+  fi
   want="$(cat "$(key_sha_file "$SLOT")" 2>/dev/null)"
   key="$(ssm_value "$param")"
   if [ -n "$want" ] && [ -n "$key" ] && [ "$(key_digest "$key")" != "$want" ]; then
@@ -1844,16 +1898,15 @@ key_held() {
 }
 
 # The operator's ask for an expired key: $1 is the failure's reason, whose
-# tail names what to renew (the SSM parameter the key came from, or the lane's
-# own sign-in). Filed once per parameter -- another lane that hits the same key
-# comments on the open ask instead of filing a second. The body names no agent
-# output, so nothing the provider said, or a run echoed, can reach a public
-# issue.
+# tail names the setting to renew, never the SSM parameter path. Filed once
+# per setting; another lane that hits the same key comments on the open ask
+# instead of filing a second. The body names no agent output, so nothing the
+# provider said, or a run echoed, can reach a public issue.
 ask_renew_key() {
   local reason="$1" param title body
-  param="${reason#"$AUTH_WHY_PREFIX "}"
+  param="$(key_renew_setting_name "$reason")"
   title="Provider key expired: renew $param"
-  body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads that parameter is unavailable until the value there changes.\n' \
+  body="$(printf '%s\n\nLane %s could not use the provider key it reads.\n\nWhat to renew: `%s`\n\nThe lane log holds what the provider said. A lane that reads this setting is unavailable until the configured value changes.\n' \
     "$KEY_ASK_MARKER" "$SLOT" "$param")"
   file_ask "$title" "$body" "Could not use the key again"
 }
