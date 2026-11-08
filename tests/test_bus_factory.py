@@ -4039,13 +4039,13 @@ class Tickets(Base):
         self.assertFalse(any(factory.RUNG_RE.search(c["body"]) for c in self.gh.comments[7]))
 
     def test_a_private_easy_ticket_never_goes_to_a_public_only_lane(self):
-        self.limited_easy(busy=("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter",
+        self.limited_easy(busy=("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4", "openrouter",
                                 "workersai", "free-ollama", "free-gemma"))
         self.assertEqual((self.lane(7), self.model(7)), ("spark", "spark/coder"))
 
     def test_a_public_easy_ticket_may_go_to_the_muse_spark_slot_and_a_private_one_never(self):
         self.gh.private = False
-        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3")
+        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3")
                           + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "opencode-go-4")
         self.assertIn("opencode-go-4", factory.PUBLIC_ONLY)
@@ -4125,7 +4125,7 @@ class Tickets(Base):
 
     def test_a_public_easy_ticket_may_go_to_zen(self):
         self.gh.private = False
-        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+        self.limited_easy(busy=("muse", "agy", "opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                                 "openrouter", "workersai") + factory.FREE_POOL)
         self.assertEqual(self.lane(7), "zen")
 
@@ -4154,7 +4154,7 @@ class Tickets(Base):
         self.assertEqual(sorted((self.lane(7), self.lane(8))), ["spark", "spark-2"])
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        for n, lane in enumerate(factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3",
+        for n, lane in enumerate(factory.CODEX[1:] + ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3",
                                                       "opencode-go-4"), 20):
             self.gh.ticket(n, "briefed", lane=lane)
         self.go(limited=["codex"])
@@ -4162,7 +4162,7 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "spark")
         self.setUp()
         self.gh.ticket(7, "briefed", lane="codex", body=body)
-        busy = (factory.CODEX[1:] + ("opencode-go", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+        busy = (factory.CODEX[1:] + ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4")
                 + factory.SPARKS + factory.FREE_POOL + ("openrouter", "workersai", "zen", "zai"))
         for n, lane in enumerate(busy, 20):
             self.gh.ticket(n, "briefed", lane=lane)
