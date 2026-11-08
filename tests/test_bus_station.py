@@ -6042,17 +6042,25 @@ class FixTest(Base):
             "rsync(1): error: opencode: (l)stat: No such file or directory",
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: agent made no commit on loom/12-fix-the-thing"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN])
+        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN + "\n\n<!-- loom:no-change-review f158a40637347b3f -->"])
         log = os.path.join(self.home, "logs", "codex", tickets.ticket_name(REPO, 12, 2) + ".log")
         with open(log) as stream:
             self.assertIn("I didn't change any code", stream.read())
-        self.assertIn("asked to review it again", self.fake.comments[12][-1]["body"])
+        self.assertTrue(status.is_status(self.fake.comments[12][-1]["body"]))
+        # Replay a reported outcome after a lost reported.json save: the exact
+        # review command remains one comment, not another notification.
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        name = tickets.ticket_name(REPO, 12, 2)
+        self.assertTrue(runner._report("codex", "failed", self.inbox("codex", "failed", name + ".md"), name))
+        self.assertEqual([c["body"] for c in self.fake.comments[99]],
+                         [factory.REVIEW_AGAIN + "\n\n<!-- loom:no-change-review f158a40637347b3f -->"])
 
     def test_a_fix_with_nothing_to_change_is_recognised_under_its_failure_class(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] x failed: [work] agent made no commit on loom/12-fix-the-thing"])
         self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
-        self.assertEqual(self.fake.comments[99][-1]["body"], factory.REVIEW_AGAIN)
+        self.assertEqual([c["body"] for c in self.fake.comments[99]],
+                         [factory.REVIEW_AGAIN + "\n\n<!-- loom:no-change-review f158a40637347b3f -->"])
     def test_a_fix_whose_branch_moved_goes_back_to_its_pull_request_not_a_failure(self):
         self.failed_fix([
             "[2030-01-01T00:01:00Z] example-owner.example-repo-12-r2 failed: branch moved: "
@@ -6076,7 +6084,7 @@ class FixTest(Base):
             "I checked it. api_key=abc123 and Authorization: Bearer abcdefghijklmnop1234",
             "also ghp_" + "a1B2c3D4e5F6g7H8i9J0 leaked, plus " + "x" * 40,
             "[2030-01-01T00:01:00Z] x failed: agent made no commit on loom/12-fix-the-thing"])
-        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN])
+        self.assertEqual([c["body"] for c in self.fake.comments[99]], [factory.REVIEW_AGAIN + "\n\n<!-- loom:no-change-review f158a40637347b3f -->"])
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         said = runner._lane_said("codex", tickets.ticket_name(REPO, 12, 2))
         self.assertIn("I checked it.", said)
