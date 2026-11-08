@@ -3585,6 +3585,9 @@ fresh_agent_home() {
   local skills d
   rm -rf "$AGENT_HOME"
   mkdir -p "$AGENT_HOME/tmp"
+  if [ "$LANE" = codex ] && [ -n "${LOOM_CODEX_AUTH_FILE:-}" ] && [ -f "$LOOM_CODEX_AUTH_FILE" ]; then
+    mkdir -p "$AGENT_HOME/.codex" && cp "$LOOM_CODEX_AUTH_FILE" "$AGENT_HOME/.codex/auth.json" && chmod 600 "$AGENT_HOME/.codex/auth.json"
+  fi
   skills="$(cd "$SKILLS" 2> /dev/null && pwd -P)" || return 0
   for d in .claude .agents .config/opencode; do
     mkdir -p "$AGENT_HOME/$d" && ln -s "$skills" "$AGENT_HOME/$d/skills"
