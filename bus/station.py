@@ -2318,6 +2318,7 @@ class Station:
         self._claimed_rereviews: Dict[str, Any] = {}
         self._claimed_writes = 0
         self._branch_cache: Dict[str, str] = {}
+        self._area_cache: Dict[str, List[str]] = {}
         self._stale_asks_withdrawn = 0
         # Per pass: each path-scoped repo's workflow filters, and its deploy runs.
         self._path_filters: Dict[str, Dict[str, List[str]]] = {}
@@ -5294,7 +5295,15 @@ class Station:
         names = _label_names(issue)
         body = str(issue.get("body") or "")
         found = brief_check.health_verdict(body)
-        if found is None and not set(names) & {REGRESSION, factory.REVERT_LABEL}:
+        exempt = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
+        if found is None and not exempt:
+            try:
+                found = brief_check.area_verdict(issue, self._area_labels(repo))
+            except GitHubError as err:
+                _say("%s#%d waits: the area check could not read the repo's labels (%s)"
+                     % (repo, number, err))
+                return True
+        if found is None and not exempt:
             try:
                 found = brief_check.check(self.gh, repo, issue,
                                           [c for c in comments if isinstance(c, dict)],
@@ -5315,6 +5324,13 @@ class Station:
                     found.reason, "A lane gets it once its body names the cause on a "
                     "`Cause:` line: why the affected are affected, not what the health read "
                     "counts."))
+            elif found.kind == brief_check.AREA:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once it carries the one `area:` label "
+                    "that names its area of play."))
             elif found.kind == brief_check.CRITERIA:
                 # Added, not put: the label list read before the move is stale.
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -6251,6 +6267,12 @@ class Station:
         return ("body" in pr and (pr["body"] is None or isinstance(pr["body"], str))
                 and isinstance(head, dict) and isinstance(head.get("ref"), str)
                 and bool(head["ref"]))
+
+    def _area_labels(self, repo: str) -> List[str]:
+        """The repo's `area:` labels (bus/brief_check.py), cached for the pass."""
+        if repo not in self._area_cache:
+            self._area_cache[repo] = brief_check.area_labels(self.gh, repo)
+        return self._area_cache[repo]
 
     def _default_branch(self, repo: str) -> str:
         """The repo's default branch, cached for the pass."""

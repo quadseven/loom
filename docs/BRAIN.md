@@ -1084,6 +1084,16 @@ each criterion as a checkbox under `## Acceptance criteria` (or the shorter
 `## Acceptance` heading). An answer ticket opens no pull request and is
 exempt, as at the runner.
 
+In a repo that files its tickets by area of play (it defines at least one
+`area:` label), a ticket carrying no `area:` label gets no lane either: every
+per-area view misses it, and picking the area is intake work. The factory
+gives it no lane, and the station refuses its claim; it goes back to
+`loom:queued` with `needs-brain` and one note, like a ticket with no
+criteria, until it carries the one `area:` label naming its area. A
+regression or revert ticket is exempt. A repo with no `area:` labels is not
+held to the rule, and a failed read of the repo's labels holds the ticket
+for the next pass.
+
 A ticket briefed again after `loom:failed` gets a fresh branch:
 `loom/<number>-<slug>-r<attempt>`, where the attempt is one more than the
 station's earlier claim comments on it.
