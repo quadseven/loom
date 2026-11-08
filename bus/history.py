@@ -36,6 +36,7 @@ RUNG_RE = re.compile(r"<!-- loom:rung (\d+) -->")
 EQUIVALENT_MARKER = "<!-- loom:equivalent %s -->"
 EQUIVALENT_RE = re.compile(r"<!-- loom:equivalent (\S+) -->")
 FIX_MARKER = "<!-- loom:fix v1 -->"
+# bus/station.py's note when a fix round ended without a commit.
 NO_CHANGE_RE = re.compile(r"^Lane \S+ made no change for the fix")
 NO_REASON = "agent made no commit and wrote no reason"
 CLAIM_RE = re.compile(r"^Claimed for lane ")
@@ -244,6 +245,7 @@ def retry_chain(comments: Sequence[Any]) -> Tuple[int, set, Optional[Tuple[str, 
 
 
 def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
+    """When the last fix round ended with no commit, 0 when it did not."""
     for c in reversed(comments):
         body = str(c.get("body") or "")
         if body.startswith(FIX_MARKER):
@@ -254,6 +256,9 @@ def no_change_at(comments: Sequence[Dict[str, Any]]) -> float:
 
 
 def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+    """Per check name, the fix rounds in a row that named it and ended with no
+    commit (a loom:fix comment, then a no-change note). A round that changed
+    something, or one that no longer names the check, ends its count."""
     counts: Dict[str, int] = {}
     asked: set = set()
     answered = True
@@ -273,6 +278,11 @@ def no_change_rounds(comments: Sequence[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
+    """Did the ticket's newest failure commit nothing and give no reason, as
+    an earlier one did since its ladder last started (the newest rung 0
+    marker)? The ladder already climbed for that reason once, and a stronger
+    model did not help: five tickets climbed 4 to 6 times on it on
+    2026-10-13."""
     seen: List[bool] = []
     for c in comments:
         body = str(c.get("body") or "")
@@ -283,10 +293,15 @@ def repeated_no_reason(comments: Sequence[Dict[str, Any]]) -> bool:
     return bool(seen) and seen[-1] and sum(seen) >= 2
 
 
+# lanes/run_lane.sh's reason when the agent edited a submodule (loom#1316).
 SUBMODULE_EDIT_RE = re.compile(r"the change edits files inside submodule (\S+)")
 
 
 def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The submodule the ticket's newest failure says needs the change, else
+    None. The change belongs in that submodule's own repo, which a push of
+    this one cannot carry, so a stronger model fails the same way: three
+    tickets needed such a split on 2026-10-21."""
     newest = None
     for c in comments:
         body = str(c.get("body") or "")
