@@ -307,6 +307,24 @@ class LaneJobTest(unittest.TestCase):
         image = self.job / "home" / "logs" / "opencode-go-2" / "owner.app-7.image"
         self.assertRegex(image.read_text().strip(), r"^[0-9a-f]{64}$")
 
+    def test_the_run_records_peak_resources_in_the_report(self):
+        croot = self.tmp / "cgroup"
+        croot.mkdir()
+        (croot / "memory.peak").write_text("1073741824\n")
+        (croot / "cpu.stat").write_text("usage_usec 2000000\n")
+        self.assertEqual(self.step("prepare").returncode, 0)
+        result = self.step("run", LOOM_CGROUP_ROOT=str(croot))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.job / "home" / "logs" / "opencode-go-2" / "owner.app-7.resources.json"
+        self.assertTrue(path.exists(), "report must carry peak resources")
+        row = json.loads(path.read_text())
+        for field in ("peak_mem_mib", "peak_cpu_cores", "wall_s"):
+            self.assertIn(field, row, field)
+        self.assertGreaterEqual(row["peak_mem_mib"], 1024)
+        self.assertGreaterEqual(row["peak_cpu_cores"], 0)
+        self.assertGreater(row["wall_s"], 0)
+        self.assertIn("logs/opencode-go-2/owner.app-7.resources.json", load_job_files(self.job))
+
     def test_the_report_holds_exactly_this_runs_files(self):
         self.assertEqual(self.step("prepare").returncode, 0)
         self.assertEqual(self.step("run").returncode, 0)
@@ -321,7 +339,7 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(job.report_files(str(home), "opencode-go-2", "owner.app-7"), [
             "briefs/opencode-go-2/done/owner.app-7.md",
             "logs/opencode-go-2/owner.app-7.answered", "logs/opencode-go-2/owner.app-7.image",
-        "logs/opencode-go-2/owner.app-7.log",
+        "logs/opencode-go-2/owner.app-7.log", "logs/opencode-go-2/owner.app-7.resources.json",
             "logs/opencode-go-2/owner.app-7.service.log", "state/usage/opencode-go-2.json"])
         r = runners.Runners(None, str(self.tmp / "station"), "o/r", [], {}, lambda r: True, print)
         for rel in job.report_files(str(home), "opencode-go-2", "owner.app-7"):
