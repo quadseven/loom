@@ -154,7 +154,7 @@ class Base(unittest.TestCase):
             "headRefOid": "r" * 40, "headRepository": {"nameWithOwner": REPO},
             "commits": {"nodes": [{"commit": {"committedDate": iso(60),
                                               "statusCheckRollup": {"state": rollup}}}]},
-            "reviewThreads": {"nodes": []},
+            "reviewThreads": {"totalCount": 0, "nodes": []},
             "files": {"totalCount": 1, "nodes": [{"path": CHANGED}]}}
         self.gh.routes["/repos/%s/pulls/77/files" % REPO] = [
             {"filename": CHANGED, "patch": inverse}]

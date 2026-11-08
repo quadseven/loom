@@ -119,6 +119,21 @@ class RunnersTest(unittest.TestCase):
     def beat(self):
         return json.loads((self.home / "state" / "usage" / "opencode-go-2.json").read_text())
 
+    def test_runner_report_persists_provider_limit_record_but_not_its_heartbeat(self):
+        runner = self.runner()
+        files = {
+            "state/usage/opencode-go-2.provider-limit.json": b'{"limit_name":"weekly"}\n',
+            "state/usage/opencode-go-2.json": b'{"available":false}\n',
+        }
+
+        runner.apply("opencode-go-2", TICKET, files)
+
+        usage = self.home / "state" / "usage"
+        self.assertEqual((usage / "opencode-go-2.provider-limit.json").read_bytes(),
+                         files["state/usage/opencode-go-2.provider-limit.json"])
+        self.assertFalse((usage / "opencode-go-2.json").exists(),
+                         "the station writes its own heartbeat from the report")
+
     # -- configuration -------------------------------------------------------
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])

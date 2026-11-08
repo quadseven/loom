@@ -28,7 +28,8 @@ def reply(status=200, body=None):
 def ready_node(checks="SUCCESS", reviews=(), threads=()):
     return {"commits": {"nodes": [{"commit": {"committedDate": "2026-10-25T13:45:00Z",
                                               "statusCheckRollup": {"state": checks}}}]},
-            "reviews": {"nodes": list(reviews)}, "reviewThreads": {"nodes": list(threads)}}
+            "reviews": {"nodes": list(reviews)},
+            "reviewThreads": {"totalCount": len(threads), "nodes": list(threads)}}
 
 
 class StubTransport:
