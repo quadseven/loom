@@ -264,6 +264,40 @@ class Stale(unittest.TestCase):
         asked = comment(brief_check.ask(self.check()), login="loom-station[bot]", bot=True)
         self.assertIsNone(self.check(comments=[asked]))
 
+    def merged_in_other_repo(self, number):
+        self.fake.routes["/repos/%s/issues/206/timeline" % REPO] = [{
+            "event": "cross-referenced", "source": {"type": "issue", "issue": {
+                "number": number, "body": "Refs %s#206\n" % REPO, "title": "Ship it",
+                "repository": {"full_name": OTHER},
+                "pull_request": {"merged_at": iso(3600)}}}}]
+
+    def test_a_scrubbed_ask_on_a_public_repo_holds_it_once(self):
+        # loom#2835: the public scrub rewrote the private repo named in the
+        # marker key, the read-back saw another key, and the same evidence
+        # held the ticket on every pass.
+        from bus import text
+        self.merged_in_other_repo(31)
+        first = self.check()
+        posted = text.scrub_public_body(brief_check.ask(first), REPO, [OTHER], [])
+        self.assertNotIn(OTHER, posted)
+        asked = comment(posted, login="loom-station[bot]", bot=True)
+        self.assertIsNone(self.check(comments=[asked]))
+
+    def test_a_raw_marker_written_on_a_private_repo_still_counts(self):
+        self.merged_in_other_repo(31)
+        raw = "<!-- loom:stale-brief pr-%s#31 -->\nKind: decision" % OTHER
+        self.assertIsNone(self.check(comments=[comment(raw, login="loom-station[bot]",
+                                                       bot=True)]))
+
+    def test_new_evidence_still_holds_a_ticket_asked_about_before(self):
+        from bus import text
+        self.merged_in_other_repo(31)
+        posted = text.scrub_public_body(brief_check.ask(self.check()), REPO, [OTHER], [])
+        asked = comment(posted, login="loom-station[bot]", bot=True)
+        self.merged_in_other_repo(32)
+        got = self.check(comments=[asked])
+        self.assertEqual(got.key, "pr-%s#32" % OTHER)
+
     def test_a_read_that_fails_holds_the_ticket(self):
         self.fake.routes["/repos/%s/issues/206/timeline" % REPO] = []
         self.fake.fail.add("/repos/%s/issues/206/timeline" % REPO)
