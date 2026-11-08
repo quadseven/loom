@@ -46,7 +46,7 @@ agent.
 | Z.ai | Gateway route | None | None in the agent |
 | Workers AI | Gateway route (to build); until then the token and the account id copied by the `ssm` step | None | Interim exported key; the account id is not readable by the role today |
 | Zen | No key | None | None |
-| agy (Gemini) | Stays on the Mac until #2792 shows its file store works on Linux and does not rotate | None yet | It signs in as a separate macOS user through a keychain; capped at 2 light slots if it stays |
+| agy (Gemini) | Works on Linux, does not rotate on use; lane service writes token to SSM, pods read-only copies | One device sign-in on the lane service | Medium: the token file is visible in the agent's environment; all slots share one subscription limit |
 | Copilot | Exported token with Copilot access only | Create the scoped token once (none is set for the Mac lane today) | Visible in the agent's environment; CLI headless behaviour is unproven (#2791) |
 
 What can be verified without the operator: the OIDC role, the `ssm` copy, the
