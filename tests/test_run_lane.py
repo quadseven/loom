@@ -6753,15 +6753,32 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.loom / "run" / "codex-check").exists())
 
+    @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
     def test_a_running_lanes_check_home_is_left_to_it(self):
-        left = self.loom / "run" / "codex-check" / "tmp"
-        left.mkdir(parents=True)
+        self.drop_brief()
+        agent_pid = self.hung_agent()
         lock = self.loom / "run" / "codex.lock"
-        lock.mkdir(parents=True)
-        (lock / "pid").write_text(f"{os.getpid()}\n")
-        result = self.run_lane()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(left.exists())
+        runner = subprocess.Popen(
+            ["bash", str(RUNNER), "codex"],
+            env=self.lane_env(LOOM_WATCHDOG_POLL="1"),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        try:
+            for _ in range(200):
+                if (lock / "pid").exists() and agent_pid.exists():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(agent_pid.exists(), "the live runner never started its agent")
+            self.assertEqual(int((lock / "pid").read_text()), runner.pid)
+
+            left = self.loom / "run" / "codex-check" / "tmp"
+            left.mkdir(parents=True)
+            result = self.run_lane()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(left.exists())
+        finally:
+            session_procs.kill_session(runner.pid)
+            runner.wait(timeout=5)
 
     @unittest.skipUnless(sandbox_caps.PROCESS_TABLE, sandbox_caps.NO_PROCESS_TABLE)
     def test_a_watchdog_orphaned_by_a_killed_runner_is_stopped_by_the_next_pass(self):
