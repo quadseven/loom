@@ -34,7 +34,7 @@ Rules:
   slot, the slot takes no more of that repo: its briefs park [transient] so
   another lane takes them, until the repo's head or the runner image changes.
 
-Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
+Only lanes in RUNNER_LANES run there; agy stays on this machine.
 docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
@@ -71,7 +71,7 @@ REF = "main"
 INPUT_LIMIT = 65535
 # Provider lanes a runner may run: Codex and Claude subscription lanes, API
 # lanes whose key the workflow's role can read, and gateway-served spark/free.
-RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+RUNNER_LANES = ("codex", "claude", "anthropic", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
@@ -83,6 +83,8 @@ TRACKED_SLOTS = {
     "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
     "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
+    **{"anthropic-%d" % n: {"LOOM_ANTHROPIC_%d_MODEL" % n: "claude-sonnet-5-5"}
+       for n in range(2, 9)},
 }
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 # A run no runner has taken after this many seconds is cancelled and parked:
@@ -876,6 +878,8 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
+            if provider(slot) == "anthropic" and parts[2] == "spend.jsonl":
+                return True
             return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
         return False
 
@@ -903,6 +907,19 @@ class Runners:
                 continue   # the brief moves below; the local copy is the one sent
             if rel == beat_rel:
                 continue   # the station writes the slot's heartbeat itself (_beat)
+            if rel == "state/usage/spend.jsonl":
+                path = os.path.join(self.home, *rel.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                needs_newline = os.path.exists(path) and os.path.getsize(path) > 0
+                if needs_newline:
+                    with open(path, "rb") as fh:
+                        fh.seek(-1, os.SEEK_END)
+                        needs_newline = fh.read(1) != b"\n"
+                with open(path, "ab") as fh:
+                    if needs_newline:
+                        fh.write(b"\n")
+                    fh.write(data)
+                continue
             _write(os.path.join(self.home, *rel.split("/")), data)
         if kinds:
             src = os.path.join(self.inbox(slot), ticket + ".md")
@@ -979,10 +996,11 @@ class Runners:
 def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     """What a runner job copies into its report, relative to its loom home,
     as globs: what the station reads for a run (Runners.allowed_path)."""
-    return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
+    paths = ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
             "logs/%s/%s.*" % (slot, ticket)) + tuple(
                 "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+    return paths + (("state/usage/spend.jsonl",) if provider(slot) == "anthropic" else ())
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never

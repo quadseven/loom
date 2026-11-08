@@ -139,7 +139,9 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
                          ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
-                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
+                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
@@ -147,7 +149,15 @@ class RunnersTest(unittest.TestCase):
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
                          ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
-                          "opencode-go-2", "opencode-go-3", "opencode-go-4"])
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
+
+    def test_anthropic_slots_have_models_and_report_the_spend_ledger(self):
+        self.assertEqual(runners.TRACKED_SLOTS["anthropic-2"],
+                         {"LOOM_ANTHROPIC_2_MODEL": "claude-sonnet-5-5"})
+        self.assertIn("state/usage/spend.jsonl", runners.run_report_paths("anthropic-2", TICKET))
+        self.assertNotIn("state/usage/spend.jsonl", runners.run_report_paths("opencode-go-2", TICKET))
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
         settings = runners.lane_settings("workersai", {
@@ -302,7 +312,7 @@ class RunnersTest(unittest.TestCase):
         self.mac_key = inputs["report_mac_key"]
         return self.gh.next_run, inputs["run_id"]
 
-    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET):
+    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET, slot="opencode-go-2"):
         """A report artifact as the lane job seals it: `files` written under a
         job's loom home, then lane_job.py report."""
         job = load_job()
@@ -314,8 +324,8 @@ class RunnersTest(unittest.TestCase):
             (home / rel).write_text(text)
         if beat is not None:
             (home / "state" / "usage").mkdir(parents=True, exist_ok=True)
-            (home / "state" / "usage" / "opencode-go-2.json").write_text(json.dumps(beat))
-        (jobdir / "inputs.json").write_text(json.dumps({"slot": "opencode-go-2", "ticket": ticket,
+            (home / "state" / "usage" / (slot + ".json")).write_text(json.dumps(beat))
+        (jobdir / "inputs.json").write_text(json.dumps({"slot": slot, "ticket": ticket,
                                                         "run_id": run_id}))
         key = self.home / "state" / "runners" / "report-key.pem.pub"
         shutil.copy(key, jobdir / "report-key.pem")
@@ -357,6 +367,25 @@ class RunnersTest(unittest.TestCase):
         self.assertTrue(beat["available"])
         self.assertEqual(beat["at"], int(self.now + 600))
         self.assertFalse((self.home / "state" / "usage" / "opencode-go-2.alive").exists())
+
+    def test_an_anthropic_slot_report_appends_its_spend_line(self):
+        slot = "anthropic-2"
+        runner = runners.Runners(self.gh, str(self.home), REPO, [slot], self.env,
+                                 lambda repo: True, self.said.append, actor=APP, now=self.now)
+        runner.public_key()
+        mac_key = "a" * 64
+        line = {"at": 1800000000, "slot": slot, "cost_usd": 0.4321}
+        report = self.seal("b" * 32, {
+            "briefs/%s/done/%s.md" % (slot, TICKET): BRIEF,
+            "state/usage/spend.jsonl": json.dumps(line) + "\n",
+        }, mac_key=mac_key, ticket=TICKET, slot=slot)
+        files = runner.open_report(report, "b" * 32, mac_key)
+
+        runner.apply(slot, TICKET, files)
+
+        rows = [json.loads(raw) for raw in
+                (self.home / "state/usage/spend.jsonl").read_text().splitlines()]
+        self.assertEqual(rows, [line])
 
     def test_a_held_runner_parks_the_brief_and_holds_the_slot(self):
         run, run_id = self.dispatched()

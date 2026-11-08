@@ -2181,8 +2181,9 @@ tree, cache or session database stays anywhere. Claude Code runs with its
 long-lived OAuth token copied from SSM into a mode-600 file under the job home
 and exported only to the Claude CLI process. Codex uses its broker session
 file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
-provider slots and spark (both through the gateway). agy and anthropic stay
-local.
+provider slots and spark (both through the gateway). agy stays local.
+Anthropic slots can run on the cluster when enabled; their spend lines travel
+in the sealed report and append to the station's shared spend ledger.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125
