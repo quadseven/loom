@@ -4989,7 +4989,8 @@ class CorruptStateTest(Base):
         # held pull request wait withdrawal's read of the open tickets
         # (loom#1857), and the invariant pass's read of the queued tickets
         # for ones with no brief headers (loom#2571).
-        self.assertEqual(self.run_pass().requests, 19)
+        # The last-pass shipped wait stamp adds one canonical all-repo read.
+        self.assertEqual(self.run_pass().requests, 20)
 
 
 class TicketsTest(unittest.TestCase):
@@ -13520,6 +13521,84 @@ class VerifyNoteTest(Base):
             gh.rest("PATCH", "/repos/%s/issues/1" % REPO, {"state": "closed"})
         self.assertEqual(self.fake.issues[1]["state"], "open")
         self.assertEqual(self.fake.paths("PATCH"), [])
+
+
+class VerifyPriorityTest(Base):
+    """loom#2161: a fresh shipped-wait stamp prioritizes old verify work."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        self.fake.pulls = [verify_merge(1)]
+        self.fake.add(1, lane="codex", body=SHIPPED_BODY, state="shipped", events=shipped_at(30))
+        self.fake.add(7, state="briefed", lane="codex", body=BODY_WITH_CRITERIA)
+
+    def seed(self, name, payload):
+        path = os.path.join(self.home, "state", "station", name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(payload, fh)
+
+    def seed_median(self, median_h):
+        # A fresh reserve stamp keeps the loom#964 reserved run out of
+        # these tests: the priority step is the only verify hand-out.
+        self.seed(station.VERIFY_RESERVE_FILE, {"at": time.time()})
+        self.seed(station.VERIFY_PRIORITY_FILE,
+                  {"at": time.time(), "n": 1, "median_h": median_h})
+
+    def briefs(self, lane="codex"):
+        try:
+            return sorted(n for n in os.listdir(self.inbox(lane)) if n.endswith(".md"))
+        except OSError:
+            return []
+
+    def test_verify_goes_ahead_of_a_build_brief_while_the_median_is_high(self):
+        self.seed_median(57.8)
+        self.run_pass()
+        self.assertTrue(any("-verify-" in n for n in self.briefs()), self.briefs())
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertNotIn("loom:running", self.fake.names(7))
+
+    def test_the_build_brief_goes_first_while_the_median_is_low(self):
+        self.seed_median(3.0)
+        self.run_pass()
+        self.assertIn("loom:running", self.fake.names(7))
+        self.assertFalse(any("-verify-" in n for n in self.briefs()), self.briefs())
+
+    def test_missing_stamp_does_not_start_an_all_repo_waits_read(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertIsNone(st._shipped_median())
+        self.assertEqual(st.gh.requests, 0)
+
+    def test_refresh_writes_the_shipped_wait_stamp_and_reuses_it(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st._refresh_shipped_priority_stamp()
+        row = station.metrics.read_shipped_row(st.state, st.now)
+        self.assertEqual(row["n"], 1)
+        self.assertGreater(row["median_h"], 29.9)
+        self.assertLess(row["median_h"], 30.1)
+        requests = st.gh.requests
+        st._refresh_shipped_priority_stamp()
+        self.assertEqual(st.gh.requests, requests)
+
+    def test_a_stale_stamp_keeps_the_present_order(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.seed(station.VERIFY_PRIORITY_FILE,
+                  {"at": time.time() - station.VERIFY_PRIORITY_EVERY - 1,
+                   "n": 1, "median_h": 60.0})
+        self.assertEqual(st._prioritize_verifies(["codex"]), ["codex"])
+        self.assertEqual(self.briefs(), [])
+
+    def test_a_queued_build_ticket_does_not_hold_a_lane_from_a_priority_verify(self):
+        # The queued-holds rule (_verify_pool) keeps a lane a queued build
+        # ticket may take free for that build; the priority hand-out is
+        # the drain the ticket orders, so it does not hold.
+        self.fake.add(9, state="queued", lane="codex")
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st._hand_verifies(["codex"])
+        self.assertEqual(self.briefs(), [])
+        st._hand_verifies(["codex"], queued_holds=False)
+        self.assertTrue(any("-verify-" in n for n in self.briefs()), self.briefs())
 
 
 class VerifyResultTest(Base):

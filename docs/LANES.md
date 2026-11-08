@@ -1007,6 +1007,11 @@ idle slot: every 30 minutes at most, one free slot that may verify is taken
 from build work for the oldest such ticket (queued work of the slot's tier does
 not hold it back; a failed proof audit still does), so a factory with build
 work for every lane still verifies what it ships.
+When the median shipped wait is at least 24 hours, each free lane that may
+verify takes an eligible ticket shipped at least 24 hours ago before new build
+work; queued build work does not hold that priority drain. The median is read
+from the same wait rows as the Hot spots page, cached for 30 minutes, and a
+failed read leaves the usual claim order in place.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in
