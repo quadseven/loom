@@ -182,6 +182,26 @@ class SignatureTest(unittest.TestCase):
                      "station: example-owner/repo-a#486: fix rounds stopped (x); left failed"):
             self.assertTrue(watch.keep(line), line)
 
+    def test_an_audit_hold_and_a_factory_release_are_outcomes_not_errors(self):
+        # loom#2774: the verify hold a failed proof audit sets, said each pass.
+        # loom#2770: the re-queue after a hold whose incident filing failed.
+        audit_hold = ("station: lane lane-a takes no verify run until 2026-11-08T03:44Z: "
+                      "a proof it made failed its audit")
+        release = ("station: factory release: example-owner/repo-a#2404 re-queued: "
+                   "incident filing failed")
+        for line in (audit_hold, release, "[2026-11-07T10:29:42Z] " + audit_hold,
+                     "[2026-11-07T05:26:58Z] " + release):
+            self.assertFalse(watch.keep(line), line)
+        # The hold that names the failed filing is the fault, and stays kept;
+        # so does anything more on either line.
+        for line in ("station: held example-owner/repo-a#2404 for the factory: [factory] setup "
+                     "failed: base check exited 124; factory incident filing failed",
+                     audit_hold + "; push failed",
+                     "error: " + release,
+                     "station: lane lane-a takes no verify run until soon: a proof it made "
+                     "failed its audit"):
+            self.assertTrue(watch.keep(line), line)
+
 
 def _brain_status_lines():
     """The brain's own status output, made by the code that prints it: the
