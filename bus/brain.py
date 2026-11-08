@@ -283,7 +283,7 @@ READY_FIELDS = (
     "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
-    " reviewThreads(first:100) { nodes { isResolved"
+    " reviewThreads(first:100) { totalCount nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     # The pull request's own comments, for a fleet hold (loom#2393).
     " comments(last:100) { totalCount nodes { databaseId url createdAt body"
@@ -293,7 +293,7 @@ READY_FIELDS = (
 # What the "Past the last rung" section reads on top: the merge state and each
 # thread's comments, for its author, severity and the newest lane answer.
 RULING_FIELDS = (
-    " mergeable rulingThreads: reviewThreads(first:100) { nodes { isResolved"
+    " mergeable rulingThreads: reviewThreads(first:100) { totalCount nodes { isResolved"
     " comments(first:50) { nodes { databaseId author { __typename login } body } } } }")
 PAST_RUNG_HEADING = "### Past the last rung"
 # Open issues the station filed for a broken factory invariant (bus/invariants.py).
@@ -790,20 +790,25 @@ def _cancel_event(text: str) -> Optional[FixRound]:
 
 
 def _clearing_stamps(comment: Dict[str, Any], allowed: set,
-                     pending: Optional[FixRound] = None) -> Tuple[str, str]:
+                     pending: Optional[FixRound] = None,
+                     station_login: str = "") -> Tuple[str, str]:
     """The claim and cancellation stamps one comment carries, each "" when
-    it carries none. A claim comment's stamp is its own time, whoever wrote
-    it; a cancellation counts only from a trusted writer, as a fix does, and
-    only when it names the pending round's pull request and head. A trusted
-    status comment carries both as event lines with their own stamps: the
-    station edits that one comment in place, so the line's stamp - not the
-    comment's position - is what counts (loom#1203)."""
+    it carries none. A claim counts only from an allowed author or the
+    station login; a cancellation counts only from a trusted writer, as a
+    fix does, and only when it names the pending round's pull request and
+    head. A trusted status comment carries both as event lines with their own
+    stamps: the station edits that one comment in place, so the line's stamp
+    - not the comment's position - is what counts (loom#1203)."""
     body = str(comment.get("body") or "")
+    login = tickets._login(comment.get("user")).lower()
+    trusted = {author.lower() for author in allowed}
+    if station_login:
+        trusted.add(station_login.lower())
+    if login not in trusted:
+        return "", ""
     claim = cancel = ""
     if _CLAIM.fullmatch(body.strip()):
         claim = str(comment.get("created_at") or "")
-    if tickets._login(comment.get("user")) not in allowed:
-        return claim, cancel
     if pending is not None and _cancelled_round(body) == pending:
         cancel = str(comment.get("created_at") or "")
     if is_status_comment(body):
@@ -817,8 +822,10 @@ def _clearing_stamps(comment: Dict[str, Any], allowed: set,
 
 def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
                        current_pr: Optional[Tuple[str, int]] = None,
-                       pr_state: Optional[Callable[[str, int], Dict[str, Any]]] = None) -> bool:
+                       pr_state: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+                       station_login: str = "") -> bool:
     allowed = {a.lower() for a in authors}
+    claim_authors = allowed | ({station_login.lower()} if station_login else set())
     last_claim = last_cancel = newest = -1
     # Newest stamps seen, for the timestamped comparison below. A claim line
     # inside the ticket's status comment carries its own time: the station
@@ -835,11 +842,11 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
         body = str(comment.get("body") or "")
         remote_claim = re.fullmatch(r"<!-- loom:remote-claim v1 [^ ]+ ([0-9]+) [0-9.]+(?: [0-9.]+)? -->",
                                     body.strip())
-        if (_CLAIM.fullmatch(body.strip()) or
-                (remote_claim and tickets._login(comment.get("user")) in allowed)):
+        login = tickets._login(comment.get("user")).lower()
+        if login in claim_authors and (_CLAIM.fullmatch(body.strip()) or remote_claim):
             last_claim = i
-        claim, cancel = _clearing_stamps(comment, allowed, pending)
-        if remote_claim and tickets._login(comment.get("user")) in allowed:
+        claim, cancel = _clearing_stamps(comment, allowed, pending, station_login)
+        if remote_claim and login in claim_authors:
             claim = max(claim, str(comment.get("created_at") or ""))
         claim_stamp = max(claim_stamp, claim)
         if cancel:
@@ -1182,7 +1189,8 @@ def _pending_fix_blocker(gh: GitHub, repo: str, pr_number: int,
         comments = gh.paginate("/repos/%s/issues/%d/comments" % ticket)
         if _pending_brain_fix(comments, authors, (repo, pr_number),
                               lambda owner_repo, number: gh.rest(
-                                  "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {}):
+                                  "GET", "/repos/%s/pulls/%d" % (owner_repo, number)).data or {},
+                              station_login=writer_login(gh)):
             return _add_blocker(line, "pending brain fix")
     return line
 
@@ -4782,7 +4790,7 @@ def _pr_graphql(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
              ' authorCanPushToRepository state submittedAt } } '
              ' commits(last:20) { nodes { commit { committedDate parents { totalCount }'
              ' statusCheckRollup { state } } } } '
-             ' reviewThreads(first:100) { nodes { id isResolved resolvedBy { login } path comments(first:1) { nodes {'
+             ' reviewThreads(first:100) { totalCount nodes { id isResolved resolvedBy { login } path comments(first:1) { nodes {'
              ' databaseId author { __typename login } body createdAt } }'
              ' latest: comments(last:1) { nodes { author { __typename login } body } } } }'
              ' files(first:100) { totalCount nodes { path deletions changeType } }'
@@ -4931,7 +4939,7 @@ def merge(gh: GitHub, repo: str, number: int,
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
-            bot = (os.environ.get("LOOM_REVIEW_BOT", "").strip()
+            bot = ((os.environ if env is None else env).get("LOOM_REVIEW_BOT", "").strip()
                    or factory.DEFAULT_REVIEW_BOT)
             _validate_sensitive_merge(gh, repo, details, bot, review_check_name(env))
         association, issue = _validated_ticket(gh, repo, number, pr, ticket, "pr")
@@ -5451,7 +5459,8 @@ def _refuse_pending_fix(gh: GitHub, repo: str, number: int,
     comments = list(gh.paginate("/repos/%s/issues/%d/comments" % ticket))
     if not _pending_brain_fix(comments, authors, (repo, number),
                               lambda owner_repo, pr_number: gh.rest(
-                                  "GET", "/repos/%s/pulls/%d" % (owner_repo, pr_number)).data or {}):
+                                  "GET", "/repos/%s/pulls/%d" % (owner_repo, pr_number)).data or {},
+                              station_login=writer_login(gh, env)):
         return None
     note = _fix_cancellation(gh, repo, number, comments, details, env, authors)
     if note is not None:
@@ -5594,7 +5603,11 @@ def _luna_stands_in(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
 
 
 def _threads_resolved(details: Dict[str, Any]) -> bool:
-    threads = (details.get("reviewThreads") or {}).get("nodes") or []
+    review_threads = details.get("reviewThreads") or {}
+    threads = review_threads.get("nodes") or []
+    total_count = review_threads.get("totalCount")
+    if type(total_count) is not int or total_count != len(threads):
+        return False
     return all(thread.get("isResolved") for thread in threads)
 
 
@@ -5755,7 +5768,8 @@ def _refuse_unheld_answers(gh: GitHub, repo: str, number: int, details: Dict[str
     minor finding (_station_held, loom#2519); merge_tier.blocking_findings
     still blocks a high, critical or bad-work finding among them."""
     from . import factory  # factory imports this module
-    bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    settings = os.environ if env is None else env
+    bot = settings.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     trusted = {a.lower() for a in trusted_authors(env)}
     head = str(details.get("headRefOid") or "")
     held: Set[str] = set()
@@ -6536,12 +6550,16 @@ def _open_threads(gh: GitHub, repo: str, number: int, bot: Optional[str] = None,
         bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
     owner, name = repo.split("/", 1)
     query = ('query { repository(owner:%s,name:%s) { pullRequest(number:%d) {'
-             ' reviewThreads(first:100) { nodes { id isResolved path line originalLine'
+             ' reviewThreads(first:100) { totalCount nodes { id isResolved path line originalLine'
              ' comments(first:20) { nodes { databaseId body author { login __typename } } } } }'
              ' } } }') % (_gql(owner), _gql(name), number)
     data = gh.graphql(query) or {}
     pr = (data.get("repository") or {}).get("pullRequest") or {}
-    threads = (pr.get("reviewThreads") or {}).get("nodes") or []
+    review_threads = pr.get("reviewThreads") or {}
+    threads = review_threads.get("nodes") or []
+    total_count = review_threads.get("totalCount")
+    if type(total_count) is not int or total_count != len(threads):
+        raise ValueError("pull request review threads were not fully read")
     return trusted_review_threads(threads, bot,
                                   trusted_authors() if authors is None else authors)
 
@@ -8194,9 +8212,14 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
     return rows
 
 
-def _open_pr(gh: GitHub, repo: str, number: int) -> Optional[Dict[str, Any]]:
-    """The ticket's open pull request, or None."""
+def _open_pr(gh: GitHub, repo: str, number: int,
+             env: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    """The ticket's trusted, same-repository open pull request, or None."""
+    trusted = {author.lower() for author in trusted_authors(env)}
     for pr in gh.paginate("/repos/%s/pulls?state=open" % repo):
+        author = str((pr.get("user") or {}).get("login") or "").lower()
+        if not _same_repo(repo, pr, {}) or author not in trusted:
+            continue
         try:
             found = _ticket_association(repo, pr)
         except ValueError:
@@ -8396,7 +8419,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         hold_unclaimed(gh, repo, number, names, moves)
         return "needs-brain"
     pending_brain_fix = open_pr is not None and _pending_brain_fix(
-        gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors())
+        gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors(),
+        station_login=writer_login(gh))
     finished = (_nothing_to_fix(gh, repo, open_pr)
                 if open_pr is not None and not pending_brain_fix else None)
     if finished:
@@ -8447,7 +8471,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     _check_written_text(comment)
     pr = open_pr if "loom:pr" in names else None
     if pr is not None:
-        fix(gh, repo, pr, (repo, number), notes or comment.split("\n")[1], lane, model)
+        fix_notes = notes or next(line for line in comment_lines
+                                  if line.startswith("Reason: "))
+        if not fix(gh, repo, pr, (repo, number), fix_notes, lane, model):
+            return "not escalated: pull request fix was refused"
     else:
         move(gh, repo, number, "briefed", lane, None, None, model)
     _count_move(load, issue, lane)

@@ -556,7 +556,7 @@ UNCLAIMED_MOVE_CAP = 6
 MOVE_CAP_MARKER = "<!-- loom:move-cap v1 -->"
 NO_REASON = history.NO_REASON
 THREADS_QUERY = ('query($owner:String!,$name:String!,$number:Int!) { repository(owner:$owner,name:$name) {'
-                 ' pullRequest(number:$number) { reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine'
+                 ' pullRequest(number:$number) { reviewThreads(first:100) { totalCount nodes { id isResolved isOutdated path line originalLine'
                  ' root: comments(first:1) { nodes { author { __typename login } body url } }'
                  ' comments(last:20) { nodes { author { __typename login } body } } } } } } }')
 RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id})'
@@ -2017,8 +2017,13 @@ class Factory:
         owner, name = repo.split("/", 1)
         data = self.gh.graphql(THREADS_QUERY, {"owner": owner, "name": name,
                                                "number": number}) or {}
-        return ((((data.get("repository") or {}).get("pullRequest") or {})
-                 .get("reviewThreads") or {}).get("nodes") or [])
+        review_threads = ((((data.get("repository") or {}).get("pullRequest") or {})
+                           .get("reviewThreads") or {}))
+        threads = review_threads.get("nodes") or []
+        total_count = review_threads.get("totalCount")
+        if type(total_count) is not int or total_count != len(threads):
+            raise ValueError("pull request review threads were not fully read")
+        return threads
 
     def _resolve_bot_fixed(self, repo: str, number: int) -> None:
         picked = bot_fixed(self._threads(repo, number), self.review_bot)
@@ -2327,7 +2332,8 @@ class Factory:
 
     def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
-               skip: int = 0, footer: Optional[Tuple[str, str]] = None) -> Optional[str]:
+               skip: int = 0, footer: Optional[Tuple[str, str]] = None,
+               before_apply: Optional[Callable[[str, str], bool]] = None) -> Optional[str]:
         """Put the ticket on its next rung (climb_rungs): its Model: line and
         lane label, and a rung marker. The rung it ran on counts as tried when
         it failed there. Returns the lane, or None when no rung it may climb
@@ -2352,11 +2358,16 @@ class Factory:
             _say("%s#%d is on the last rung of the model ladder (%s on %s): one more "
                  "failure leaves it past the ladder and its lane pull request stalls"
                  % (repo, number, model, lane))
-        body = with_model(str(issue.get("body") or ""), model)
-        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
-        kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
-        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-        issue["labels"] = [{"name": x} for x in kept]
+        moved_before_climb = before_apply is not None
+        if before_apply is not None and not before_apply(lane, model):
+            return None
+        if not moved_before_climb:
+            body = with_model(str(issue.get("body") or ""), model)
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+            kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
                           "model ladder to rung %d, %s on lane %s." % (
                               history.rung_marker(rung), head, why, rung, model, lane))
@@ -4228,8 +4239,21 @@ class Factory:
         if self._not_work(repo, issue, comments, pr):
             return
         footer = self._footer(repo, pr)
+        fix_attempted = False
+        fix_accepted = False
+
+        def accept_fix(lane: str, model: str) -> bool:
+            nonlocal fix_attempted, fix_accepted
+            fix_attempted = True
+            fix_accepted = bool(self.fix(
+                self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES,
+                lane=lane, model=model, authors=sorted(self.trusted)))
+            return fix_accepted
+
         lane = self._climb(repo, issue, comments, "it failed on lane %s" % _lane(issue),
-                           footer=footer)
+                           footer=footer, before_apply=accept_fix if pr is not None else None)
+        if fix_attempted and not fix_accepted:
+            return
         if lane is None:
             if self._rungs_left(repo, issue, comments, footer):
                 return  # waits: no lane of an untried rung is up yet
@@ -4241,13 +4265,7 @@ class Factory:
                 self._close_past_ladder_pr(repo, pr)
             self._give_up(repo, issue, "it failed on lane %s" % _lane(issue))
             return
-        if pr is not None:
-            # Back to loom:pr so the fix brief reuses its open pull request.
-            kept = [x for x in _labels(issue) if x != "loom:failed"] + ["loom:pr"]
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
-            self.fix(self.gh, repo, int(pr["number"]), (repo, number), FAILED_RUN_NOTES,
-                     authors=sorted(self.trusted))
-        else:
+        if pr is None:
             self.move(self.gh, repo, number, "briefed", lane=lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))

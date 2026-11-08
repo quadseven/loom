@@ -334,7 +334,7 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
              "commits": {"nodes": commits or [{"commit": {
                  "committedDate": HEAD_AT, "parents": {"totalCount": 1},
                  "statusCheckRollup": {"state": "SUCCESS"}}}]},
-             "reviewThreads": {"nodes": list(threads or ())},
+             "reviewThreads": {"totalCount": len(threads or ()), "nodes": list(threads or ())},
              "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]}}
     ticket = {"number": 9, "state": "open", "body": "## What\nx\n",
               "labels": [{"name": n} for n in ("loom:ticket", "loom:pr") + tuple(ticket_labels)]}

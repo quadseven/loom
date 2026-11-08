@@ -171,7 +171,8 @@ class FakeGH:
 
     def graphql(self, query):
         self.calls.append(("POST", "/graphql"))
-        return {"repository": {"pullRequest": {"reviewThreads": {"nodes": self.threads}}}}
+        return {"repository": {"pullRequest": {"reviewThreads": {
+            "totalCount": len(self.threads), "nodes": self.threads}}}}
 
     def comment(self, number, at, body, repo=REPO, author=AUTHOR):
         self.comments.setdefault((repo, number), []).append(
