@@ -868,7 +868,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `- Step <name>: failed <why>` or `- Step <name>: degraded <why>`, with
    the step's name from the list above (lock, status, merge, verify, failed,
    asks, brief, triage, sweep, journal, unlock): the station files a ticket when one
-   brain's two ticks in a row carry such a line (docs/LANES.md, Invariants).
+   brain's two ticks in a row carry a failed line; a degraded line alone
+   (docs/LANES.md, Invariants).
    Twice a day per goal (when status lists the goal under "Reports owed
    before unlock" as due, overdue or heartbeat; a quiet goal and a backlog
    goal are not listed and get no report), also post the report: a separate comment on the goal

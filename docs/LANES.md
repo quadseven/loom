@@ -1414,8 +1414,9 @@ check on open lane pull requests (`LOOM_PLAN_CHECK`, default
 `Grug - Chief`), the lane pull requests nothing drives and remote heartbeats.
 Each invariant is one function returning breaches with evidence:
 
-- One brain's two newest ticks each journaled a failed or degraded step
-  (`- Step <name>: failed ...`, docs/BRAIN.md Journal), or no brain journaled
+- One brain's two newest ticks each journaled a failed step
+  (`- Step <name>: failed ...`, docs/BRAIN.md Journal; a degraded step is a
+  routine deferral and does not count), or no brain journaled
   for 90 minutes once one has been seen.
 - A `loom:metrics` line posted more than once for one day, or two
   `loom:report` comments within 90 minutes, on one goal home.

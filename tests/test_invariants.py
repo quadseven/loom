@@ -1475,6 +1475,27 @@ class InvariantTest(unittest.TestCase):
                                                            ("merge degraded",))])
         self.assertEqual(invariants.brain_failing(f), [])
 
+    def test_two_degraded_ticks_are_not_a_breach(self):
+        # A degraded step is a routine deferral (budget, cap, nothing to
+        # merge), not a failure: two such ticks in a row are the lane-machine
+        # brain's normal operation (loom#644), so they breach nothing.
+        f = Facts(T0, journals=[
+            self.j(T0 - 3000, holder="lane-machine",
+                   steps=("verify degraded: 5 verify-due tickets not reached on budget",
+                          "status degraded: resume needed a local 301 workaround")),
+            self.j(T0 - 600, holder="lane-machine",
+                   steps=("verify degraded: 3 verify-due tickets not reached on budget",
+                          "triage degraded: skipped on time budget"))])
+        self.assertEqual(invariants.brain_failing(f), [])
+
+    def test_two_failed_ticks_are_a_breach(self):
+        f = Facts(T0, journals=[
+            self.j(T0 - 3000, holder="lane-machine", steps=("merge failed: GitHub said 502",)),
+            self.j(T0 - 600, holder="lane-machine", steps=("merge failed: GitHub said 502",))])
+        (b,) = invariants.brain_failing(f)
+        self.assertEqual(b.invariant, "brain-failing")
+        self.assertIn("failed step", b.title)
+
     def test_failed_steps_reads_the_step_lines_only(self):
         body = journal(T0) + "\n- Waiting: #12 failed on lane codex\n- Brief step: degraded, cap reached"
         self.assertEqual(invariants.failed_steps(body),

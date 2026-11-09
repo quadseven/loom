@@ -517,9 +517,21 @@ def _lanes(count: int) -> str:
 
 
 # -- the invariants ------------------------------------------------------
+def _failed(step: str) -> bool:
+    """Whether a failed_steps() entry is a failure, not a degradation: its
+    second word is the kind (failed_steps: "<step> <failed|degraded>[: why]").
+    A degraded step is a routine deferral, not a failure (loom#644): a brain
+    tick is time-boxed, so a step that was not reached on budget, refused by
+    a goal cap, or had nothing to merge is journaled as degraded every busy
+    tick, and two such ticks in a row are normal operation."""
+    parts = step.split(None, 2)
+    return len(parts) > 1 and parts[1].rstrip(":") == "failed"
+
+
 def brain_failing(f: Facts) -> List[Breach]:
-    """A brain holder whose two newest ticks each journaled a failed or
-    degraded step. One tick may journal on several goals; it is one tick."""
+    """A brain holder whose two newest ticks each journaled a failed step.
+    A degraded step does not count (see _failed). One tick may journal on
+    several goals; it is one tick."""
     if f.journals is None:
         return []
     ticks: Dict[Tuple[str, str], List[Journal]] = {}
@@ -531,15 +543,16 @@ def brain_failing(f: Facts) -> List[Breach]:
     out = []
     for holder, found in by_holder.items():
         last = sorted(found, key=lambda t: max(j.at for j in t))[-2:]
-        if len(last) < 2 or not all(any(j.steps for j in t) for t in last):
+        if len(last) < 2 or not all(any(_failed(s) for j in t for s in j.steps) for t in last):
             continue
         name = holder or "unnamed"
         evidence = []
         for tick in last:
             for j in tick:
-                evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s) for s in j.steps]
+                evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s)
+                             for s in j.steps if _failed(s)]
         out.append(Breach("brain-failing", name,
-                          "Brain %s reported a failed or degraded step two ticks in a row" % name,
+                          "Brain %s reported a failed step two ticks in a row" % name,
                           tuple(evidence), max(j.at for j in last[-1])))
     return out
 
