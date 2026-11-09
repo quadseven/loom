@@ -5003,6 +5003,52 @@ class Station:
                     "%s" % self._note_text(err))
         return "Its proof was refused: %s." % mismatch if mismatch else ""
 
+    def _test_names_at(self, repo: str, revision: str, wanted: Set[str]) -> Optional[Set[str]]:
+        """The test functions defined in the test files at a revision, read
+        from GitHub; None when the tree or a file cannot be read. Stops
+        once every wanted name is found."""
+        try:
+            commit = self.gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, revision)).data
+            tree_sha = str(commit["tree"]["sha"])
+            tree = self.gh.rest(
+                "GET", "/repos/%s/git/trees/%s?recursive=1" % (repo, tree_sha)).data
+        except RateLimited:
+            raise
+        except (GitHubError, KeyError, TypeError):
+            return None
+        if not isinstance(tree, dict) or tree.get("truncated") \
+                or not isinstance(tree.get("tree"), list):
+            return None
+        entries = [e for e in tree["tree"] if isinstance(e, dict)
+                   and e.get("type") == "blob"
+                   and verify_data.test_file(str(e.get("path") or ""))]
+        present: Set[str] = set()
+        for entry in entries:
+            text = self._blob_text(repo, str(entry.get("sha") or ""))
+            if text is None:
+                return None
+            present.update(verify_data.defined_tests([text]))
+            if wanted <= present:
+                break
+        return present
+
+    def _cited_test_gap(self, repo: str, record: Dict[str, Any]) -> str:
+        """Why the proof cites a test the station cannot find at its
+        revision, or "" when every cited test is there (or none is cited)."""
+        cited = proof.cited_tests(record)
+        if not cited:
+            return ""
+        revision = str(record.get("revision") or "")
+        present = self._test_names_at(repo, revision, set(cited))
+        if present is None:
+            return ("Checked by the station: the station could not check the "
+                    "cited tests at revision %s" % revision[:12])
+        missing = proof.missing_cited_tests(cited, sorted(present))
+        if missing:
+            return ("Checked by the station: cited test %s is not in the test "
+                    "files at revision %s" % (", ".join(missing), revision[:12]))
+        return ""
+
     def _proof_facts(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]
                      ) -> Tuple[str, List[str]]:
         """(why the lane's evidence contradicts the merged pull requests'
@@ -5012,6 +5058,9 @@ class Station:
         branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
         if error:
             return "the station could not read the merged pull requests (%s)" % error, []
+        gap = self._cited_test_gap(repo, record)
+        if gap:
+            return gap, []
         return (proof.contradicts(record, verify_data.failing_checks(pulls)),
                 verify_data.proof_facts(branch, pulls))
 
