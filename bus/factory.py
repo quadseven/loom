@@ -4946,6 +4946,11 @@ class Factory:
         if assigned in REMOTE_LANES:
             lane, fallback = self._tier_move(repo, issue, old=assigned)
         else:
+            if not self._guarded(self._ensure_lane_headers, repo, issue):
+                if assigned:
+                    self._relabel(repo, issue, [name for name in _labels(issue) if not name.startswith("lane:")])
+                self._waiting(repo, issue["number"], "brief headers could not be completed")
+                return "%s waits: brief headers could not be completed" % ref
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
             if assigned in REMOTE_LANES and self._is_private(repo):
@@ -5011,6 +5016,8 @@ class Factory:
             if (pr.get("state", "open") != "open" or not self._trusted(pr)
                     or ((pr.get("head") or {}).get("repo") or {}).get("full_name") != repo
                     or not self._refs_ticket(str(pr.get("body") or ""), number)):
+                continue
+            if not self._guarded(self._ensure_lane_headers, repo, issue):
                 continue
             labels = brain._moved_labels(_labels(issue), "pr", None)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -5182,6 +5189,12 @@ class Factory:
         """Give a queued ticket pinned to `model` a lane that takes it, or an
         equivalent's: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if not self._guarded(self._ensure_lane_headers, repo, issue):
+            assigned = _lane(issue)
+            if assigned:
+                self._relabel(repo, issue, [name for name in _labels(issue) if not name.startswith("lane:")])
+            self._waiting(repo, issue["number"], "brief headers could not be completed")
+            return "%s waits: brief headers could not be completed" % ref
         equivalent = self._equivalent_lane(repo, model)
         if equivalent is not None:
             if not self._guarded(self._assign_equivalent, repo, issue, model, *equivalent):
@@ -5240,6 +5253,7 @@ class Factory:
             _say("reserved queued %s#%d for remote lane %s (tier %s)"
                  % (repo, number, lane, tier))
             return
+        self._ensure_lane_headers(repo, issue)
         self.move(self.gh, repo, number, "briefed", lane=lane)
         self._status_note(repo, number,
                           "The station gave this queued ticket lane %s (tier %s)." % (lane, tier))
