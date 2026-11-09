@@ -2255,13 +2255,17 @@ fetch_base_for_contract() {
 }
 
 load_contract() {
-  local rev="$BASE" mode canon
+  local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-HEAD}"
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
-  if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
-       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
-    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
-    return 1
+  if [ -n "$FIX_PR" ]; then
+    if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
+      if ! { fetch_base_for_contract &&
+           rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+        HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+        note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+        return 1
+      fi
+    fi
   fi
   mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
   [ -n "$mode" ] || return 0
