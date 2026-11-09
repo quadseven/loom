@@ -1221,9 +1221,17 @@ When the runner finishes, the station finds the brief in `done/` or
     or ticked in the answer's own Acceptance criteria checklist (a "not
     built" mark proves nothing, since the answer says the work is done).
     Live and operator boxes are left to the verifier and the operator. When
-    a box is unproven, the ticket goes back to `loom:queued` and the event
-    names each such box; it neither settles nor moves to `loom:merged`
-    (loom#2032).
+    a box is unproven, the event names it and the ticket neither settles nor
+    moves to `loom:merged` (loom#2032). Build and fix answers share a persisted
+    budget keyed by ticket and the set of unproven code boxes. Below
+    `NO_CHANGE_LIMIT`, a build returns to `loom:queued` and a fix keeps its
+    existing pull request workflow. At the limit the ticket moves up the
+    model ladder once; unavailable higher lanes leave `wait:no-change` while
+    that same promotion waits. One more same-box answer on the promoted
+    model, or an exhausted ladder, holds it at `loom:answered` with
+    `needs-brain` and one comment naming the boxes. Different boxes or a run
+    that pushed a commit reset the count. Replayed outcomes do not count
+    again, and external holds, claims and settlements are preserved.
   - When a pull request linked to the ticket (a `Refs` line or a
     `loom/<number>` branch) has merged into the default branch, that pull
     request carries the work the lane found done. The ticket moves to
@@ -1961,15 +1969,15 @@ behind, conflict-free one is brought up to date in small steps (at most
 two a repo a pass, never while another pull request there holds the
 landing lock or in a pass where the repo already landed one, and never on
 a head with a failed check, whose re-runs and fix rounds are the cheaper
-answer). A conflicting one gets exactly one fix round for the conflict,
+answer). A conflicting one gets a fix round for the conflict,
 open while the head it was opened for is still the head; a round opened
 before fix comments carried their head counts as open for any head, so an
 old round is never doubled. The judged send-back's holds still apply
 there, with one exception: a `needs:human` ticket gets its conflict round
 anyway, because that hold guards the pull request's merge, not its
 branch, and the label stays on the ticket through the move; a
-`needs-brain` ticket and one in the hand-off pool are left to the brain
-and that session. Hygiene never merges anything: a `class:sensitive`
+`needs-brain` ticket is left to the brain; a hand-off reserves its ticket
+for six hours. Hygiene never merges anything: a `class:sensitive`
 pull request is maintained exactly like a lane one up to the merge step,
 which stays with the brain or the operator as before. Each action is one
 station log line, and so is each skip the pass decides itself (a held
@@ -1980,6 +1988,16 @@ however many pull requests they cover. Pull requests outside the pass's
 remit (not a lane pull request, no ticket in the repo, not yet judged by
 GitHub, a red head the judge is already handling, one brought up to date
 within the cooldown) pass without a line.
+
+An unclaimed hand-off older than six hours returns to a free lane for its
+conflict. Unknown hand-off age, explicit claims, brain holds and running
+tickets remain untouched. A keyed conflict round older than 24 hours with
+no new head is re-sent once to a different free lane. The following pass
+files one factory incident for that head if it still has not moved and is
+not running; a persistent status marker prevents repeated incidents.
+
+Recovery removes the old lane model override so the selected lane uses its
+configured default. A refused fix brief restores the original body and labels.
 
 ## Merge by change class
 
