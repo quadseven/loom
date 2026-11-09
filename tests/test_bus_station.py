@@ -10770,6 +10770,66 @@ class ReportsTest(Base):
             self.standup_fresh()
             self.assertEqual(len(self.fake.comments[40]), 2)
 
+    def _overdue_goal_with(self, tickets, report=None):
+        """Goal 40 overdue, its last report the brain's, its tickets `tickets`."""
+        self.add_goal()
+        self.comment(40, 5, report or station.REPORT_MARKER + "\nbrain report")
+        self.fake.comments[40][0]["created_at"] = self.ago(REPORT_OVERDUE_AGE)
+        self.fake.sub_issues[40] = tickets
+
+    def test_a_goal_where_nothing_moved_gets_no_standup(self):
+        # loom#2898: only in-flight work is not news; no comment, no edit.
+        self._overdue_goal_with([
+            {"number": 41, "title": "Running", "state": "open",
+             "created_at": self.ago(REPORT_OVERDUE_AGE * 2),
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]}])
+        self.standup_fresh()
+        self.assertEqual(len(self.fake.comments[40]), 1)
+        self.assertEqual(self.fake.edits, [])
+
+    def test_a_goal_that_moved_edits_the_stations_standup_in_place(self):
+        # loom#2898: one status comment per goal; a later move edits it.
+        old = self.ago(REPORT_OVERDUE_AGE)
+        self._overdue_goal_with([
+            {"number": 41, "title": "Broke", "state": "open", "created_at": old,
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}])
+        self.standup_fresh()
+        self.assertEqual(len(self.fake.comments[40]), 2)
+        self.fake.comments[40][-1].update(id=7, created_at=old)
+        self.fake.sub_issues[40].append(
+            {"number": 42, "title": "Merged now", "state": "closed", "updated_at": self.recent(),
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]})
+        self.standup_fresh()
+        self.assertEqual(len(self.fake.comments[40]), 2)
+        self.assertEqual(len(self.fake.edits), 1)
+        self.assertIn("#42 Merged now", self.fake.edits[0])
+
+    def test_a_goals_standup_is_written_at_most_twice_a_day(self):
+        # loom#2898: a third write inside one ET day waits for the next day.
+        old = self.ago(REPORT_OVERDUE_AGE)
+        self._overdue_goal_with([
+            {"number": 41, "title": "Broke", "state": "open", "created_at": old,
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"}]}])
+        self.standup_fresh()
+        self.fake.comments[40][-1].update(id=7, created_at=old)
+        path = os.path.join(self.home, "state", "station", "standups.json")
+        for n in range(4):
+            self.fake.sub_issues[40].append(
+                {"number": 50 + n, "title": "Merged %d" % n, "state": "closed",
+                 "updated_at": self.recent(),
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]})
+            with open(path) as fh:
+                state = json.load(fh)
+            state.pop("%s#40" % REPO, None)
+            state.pop("_checked", None)
+            with open(path, "w") as fh:
+                json.dump(state, fh)
+            station.Station(GitHub("token", transport=self.fake), self.settings,
+                            now=time.time()).post_overdue_standups()
+        # One post, then at most one edit.
+        self.assertEqual(len(self.fake.comments[40]), 2)
+        self.assertLessEqual(len(self.fake.edits), 1)
+
     def standup_fresh(self):
         """One standup pass with no earlier standup state."""
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -10944,6 +11004,11 @@ class ReportsTest(Base):
             path = urlsplit(url).path
             answer = self.fake(method, url, headers, body)
             for number in goals:
+                if method == "PATCH" and path.startswith("/repos/%s/issues/comments/" % REPO) \
+                        and int(path.rsplit("/", 1)[1]) in [
+                            c.get("id") for c in self.fake.comments[number]]:
+                    # A standup edit in place counts as a write (loom#2898).
+                    posts[number] += 1
                 if method == "POST" and path == "/repos/%s/issues/%d/comments" % (REPO, number):
                     posts[number] += 1
                     # As GitHub returns it, so the next pass reads its time.

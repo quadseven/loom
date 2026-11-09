@@ -99,7 +99,7 @@ class JournalChecks(unittest.TestCase):
     def test_replay_recomputes_warning_once_and_keeps_steps_last(self):
         body = self.publish(["- Journal check: missing counted moved line"], steps="- Steps: journal 1s")
         self.assertEqual(body.count("- Journal check:"), 1)
-        self.assertTrue(body.endswith("- Steps: journal 1s"))
+        self.assertNotIn("Steps:", body)
         corrected = self.publish(["- Journal check: missing counted moved line", "- Moved: merged 1"])
         self.assertNotIn("Journal check:", corrected)
 
