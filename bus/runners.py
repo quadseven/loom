@@ -85,6 +85,7 @@ TRACKED_SLOTS = {
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
 }
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
+OPENCODE_GO_KEY_SSM = "LOOM_OPENCODE_GO_KEY_SSM"
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -433,11 +434,15 @@ class Runners:
                      % (slot, ticket, repo, red.get("why") or "no reason"))
             self._refuse(ledger, entry, red_reason(repo, red))
             return
+        settings = lane_settings(slot, self.env)
+        if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
+            self._refuse(ledger, entry, "missing required runner setting %s" % OPENCODE_GO_KEY_SSM)
+            return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
         mac_key = secrets.token_hex(32)
         inputs = {"slot": slot, "ticket": ticket, "brief": brief, "run_id": run_id,
-                  "settings": encode_settings(lane_settings(slot, self.env)),
+                  "settings": encode_settings(settings),
                   "report_key": self.public_key(), "report_mac_key": mac_key}
         size = input_size(inputs)
         if size > INPUT_LIMIT:
@@ -999,6 +1004,14 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
     for name in ("LOOM_RUNNER_SLOTS", "LOOM_RUNNER_REPO", "LOOM_RUNNER_POOL_MAX") + tuple(LANES_APP):
         if env.get(name):
             out[name] = env[name]
+    for slot in TRACKED_SLOTS:
+        lane = provider(slot)
+        if lane == "free":
+            continue
+        name = _prefix(lane) + "KEY_SSM"
+        value = env.get(name, "")
+        if value and VALUE_RE.fullmatch(str(value)):
+            out[name] = str(value)
     for slot in runner_slots(env):
         for name, value in env.items():
             if (setting_allowed(slot, name) and not name.startswith("LOOM_GITHUB_APP_")
