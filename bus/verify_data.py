@@ -24,6 +24,8 @@ MAX_CHECKS = 30
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 # An added test function, at module level or as a method of a test class.
 TEST_DEF_RE = re.compile(r"^\+(?:    )?def (test_[A-Za-z0-9_]+)\s*\(", re.M)
+# A defined test function in a whole file, at module level or as a method.
+DEF_RE = re.compile(r"^\s*def (test_[A-Za-z0-9_]+)\s*\(", re.M)
 # A test name or file path the station extracted itself, made of short
 # lowercase words, may be long without being a credential. A word that is a
 # long hex run, or a UUID, is never exempt.
@@ -44,6 +46,14 @@ def added_tests(files: Iterable[Dict[str, Any]]) -> List[str]:
     for item in files:
         if isinstance(item, dict) and test_file(str(item.get("filename") or "")):
             found.extend(TEST_DEF_RE.findall(str(item.get("patch") or "")))
+    return list(dict.fromkeys(found))
+
+
+def defined_tests(texts: Iterable[str]) -> List[str]:
+    """The test functions the file texts define, in order, once each."""
+    found: List[str] = []
+    for text in texts:
+        found.extend(DEF_RE.findall(str(text or "")))
     return list(dict.fromkeys(found))
 
 

@@ -13884,6 +13884,36 @@ class VerifyResultTest(Base):
         self.assertIn("PR #31 merged 2029-12-31T00:00:00Z as %s" % sha[:12], facts[0])
         self.assertIn("main contains it: yes", facts[0])
 
+    def test_a_proof_citing_a_missing_test_is_refused_with_the_missing_name(self):
+        self.merged_with_neutral_guard()
+        criteria = self.good()["criteria"]
+        criteria[0] = dict(criteria[0],
+                           evidence="ci run 12 shows test_absent_from_tree passing")
+        self.result(self.good(criteria=criteria))
+        present = {"test_present_in_tree"}
+        with mock.patch.object(station.Station, "_test_names_at", return_value=present), \
+                mock.patch("bus.station._say") as say:
+            self.run_pass()
+        said = " ".join(str(c) for c in say.call_args_list)
+        self.assertIn("loom:shipped", self.fake.names(5), said)
+        self.assertNotIn("loom:verified", self.fake.names(5))
+        self.assertEqual(self.proofs(), [])
+        self.assertIn("Checked by the station:", said)
+        self.assertIn("test_absent_from_tree", said)
+
+    def test_a_proof_citing_only_present_tests_is_recorded_with_no_new_line(self):
+        self.merged_with_neutral_guard()
+        criteria = self.good()["criteria"]
+        criteria[0] = dict(criteria[0],
+                           evidence="ci run 12 shows test_present_in_tree passing")
+        self.result(self.good(criteria=criteria))
+        present = {"test_present_in_tree"}
+        with mock.patch.object(station.Station, "_test_names_at", return_value=present):
+            self.run_pass()
+        self.assertIn("loom:verified", self.fake.names(5))
+        self.assertEqual(len(self.proofs()), 1)
+        self.assertNotIn("cited test", self.proofs()[0])
+
     def refuse_n(self, count):
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=time.time())
         for _ in range(count):
