@@ -1681,10 +1681,21 @@ class SensitiveResumeTests(unittest.TestCase):
                                 "html_url": "https://example.com/ticket"}),
                      reply(201, {}))
         gh = GitHub("t", transport=fake)
-        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        url = brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy", base="main")
         self.assertEqual(url, "https://example.com/ticket")
         payload = fake.calls[3][2]
         self.assertEqual(payload["labels"], ["loom:ticket", "loom:queued", "lane:muse"])
+        headers, _ = tickets.parse(payload["body"])
+        self.assertEqual(headers["Difficulty"], "easy")
+        self.assertEqual(headers["Base"], "main")
+
+    def test_brief_remote_lane_refuses_missing_base_before_filing(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                     reply(200, {"private": False}))
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "queued lane.*Base"):
+            brain.brief(gh, REPO, EPIC, "Ticket", BODY, "muse", "easy")
+        self.assertFalse(any(c[0] == "POST" for c in fake.calls))
 
     def test_brief_remote_lane_refuses_private_repo_before_filing(self):
         fake = Fake(reply(200, goal()), reply(200, []),
@@ -1713,6 +1724,7 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_brief_remote_lane_refuses_missing_difficulty(self):
         no_diff = BODY.replace("## Why\nwhy", "## Why\ndiff")
+        no_diff = "Base: main\n\n" + no_diff
         fake = Fake(reply(200, goal()), reply(200, []),
                      reply(200, {"private": False}))
         gh = GitHub("t", transport=fake)
@@ -1721,7 +1733,7 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertFalse(any(c[0] == "POST" for c in fake.calls))
 
     def test_rebrief_regressed_remote_lane_on_public_repo_files_queued(self):
-        issue = item(5, body="Difficulty: easy\n\n## Why\nx\n",
+        issue = item(5, body="Difficulty: easy\nBase: main\n\n## Why\nx\n",
                      labels=["loom:ticket", "loom:verified"])
         fake = Fake(reply(200, {"private": False}),
                      reply(200, []),
@@ -1851,7 +1863,9 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
-            reply(200, {"state": "open", "title": "My Title", "body": BODY, "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"state": "open", "title": "My Title",
+                        "body": "Difficulty: easy\nBase: main\n\n" + BODY,
+                        "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
             reply(200, []),
             reply(200, {}),
@@ -1862,6 +1876,20 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 5)
         self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
         self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
+        fake.assert_all_used()
+
+    def test_move_remote_lane_refuses_missing_base_before_labeling(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title",
+                        "body": "Difficulty: easy\n\n" + BODY,
+                        "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, [])
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "queued lane muse needs parseable Base"):
+            brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
         fake.assert_all_used()
 
     def test_move_remote_lane_with_pull_request_refuses(self):

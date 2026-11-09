@@ -4733,6 +4733,19 @@ def _check_remote_tier(body: str, lane: str) -> None:
                                           lane, ", ".join(REMOTE_LANES[lane]["tiers"])))
 
 
+def _check_queued_lane_headers(body: str, lane: str) -> None:
+    """Require the headers a queued lane needs before its labels are written."""
+    try:
+        headers = tickets.parse(body)[0]
+    except ValueError as err:
+        raise ValueError("queued lane %s needs parseable Difficulty and Base headers: %s" %
+                         (lane, err)) from None
+    missing = [name for name in ("Difficulty", "Base") if not headers.get(name)]
+    if missing:
+        raise ValueError("queued lane %s needs parseable %s header%s" %
+                         (lane, " and ".join(missing), "s" if len(missing) > 1 else ""))
+
+
 def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
     """Refuse a brief to a remote lane the lane could never claim: a private repo
     for a public-only lane, or a difficulty tier the lane does not run.
@@ -4741,6 +4754,7 @@ def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     _check_remote_tier(body, lane)
+    _check_queued_lane_headers(body, lane)
 
 
 def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
@@ -4758,6 +4772,9 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
         raise ValueError("ticket branch %s already has a pull request" % branch)
     if body is not None:
         _check_remote_tier(body, lane)
+        _check_queued_lane_headers(body, lane)
+    else:
+        _check_queued_lane_headers(str(issue.get("body") or ""), lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,
