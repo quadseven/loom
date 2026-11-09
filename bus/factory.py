@@ -1793,6 +1793,7 @@ class Factory:
         self.operators = [o.lower() for o in (operators if operators is not None
                                               else answer.operators(trusted=trusted))]
         self._private: Dict[str, bool] = {}
+        self._default_branches: Dict[str, str] = {}
         self.no_test_repos = {r.lower() for r in no_test_repos}
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
         # None skips the check.
@@ -1898,6 +1899,14 @@ class Factory:
             data = self.gh.rest("GET", "/repos/%s" % repo).data
             self._private[repo] = not isinstance(data, dict) or data.get("private") is not False
         return self._private[repo]
+
+    def _default_branch(self, repo: str) -> str:
+        """The repository's default branch, falling back to 'main'."""
+        if repo not in self._default_branches:
+            data = self.gh.rest("GET", "/repos/%s" % repo).data
+            self._default_branches[repo] = str(
+                (data.get("default_branch") if isinstance(data, dict) else "") or "main")
+        return self._default_branches[repo]
 
     def _takes_work(self, lane: str) -> bool:
         """Whether the lane may be given a ticket now: not at a limit, its
@@ -3762,7 +3771,15 @@ class Factory:
         named = split.epic_of(str(issue.get("body") or ""), number)
         placed = self._epic_with_room(repo, named, 1)
         epic = placed or named
-        body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
+        base_branch = ""
+        try:
+            base_branch = str(tickets.parse(issue.get("body"))[0].get("Base") or "")
+        except ValueError:
+            pass
+        if not base_branch:
+            base_branch = self._default_branch(repo)
+        body = ("Difficulty: medium\nBase: %s\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
+                % base_branch +
                 "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
                 "\n".join("- [ ] " + item for item in criteria) +
                 "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" % epic)
@@ -4926,6 +4943,16 @@ class Factory:
             return self._queued_model_lane(repo, match.group(1))
         return self._tier_move(repo, issue)[0]
 
+    def _drop_unclaimable_lane(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Remove a lane label when the ticket lacks required brief headers."""
+        try:
+            headers, _ = tickets.parse(issue.get("body"))
+        except ValueError:
+            headers = None
+        if headers is None or "Difficulty" not in headers or "Base" not in headers:
+            self._relabel(repo, issue, [name for name in _labels(issue)
+                                        if not name.startswith("lane:")])
+
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
@@ -4940,6 +4967,8 @@ class Factory:
         assigned = _lane(issue)
         if assigned in REMOTE_LANES and not self._is_private(repo):
             if not self._guarded(self._ensure_lane_headers, repo, issue):
+                self._relabel(repo, issue, [name for name in _labels(issue)
+                                            if not name.startswith("lane:")])
                 self._waiting(repo, issue["number"], "brief headers could not be completed")
                 return "%s waits: brief headers could not be completed" % ref
             return self._assign_remote_queued(repo, issue, assigned, ref)
@@ -4948,21 +4977,14 @@ class Factory:
         else:
             lane, fallback = self._tier_move(repo, issue)
         if lane is None:
-            if assigned in REMOTE_LANES and self._is_private(repo):
-                try:
-                    headers, _ = tickets.parse(issue.get("body"))
-                except ValueError:
-                    headers = None
-                # A remote lane renders its claim brief from Difficulty: (see
-                # _ensure_lane_headers); without it, as with no headers at all
-                # or an unreadable brief, no lane can claim the ticket.
-                if headers is None or "Difficulty" not in headers:
-                    self._relabel(repo, issue, [name for name in _labels(issue)
-                                                if not name.startswith("lane:")])
+            if assigned is not None:
+                self._drop_unclaimable_lane(repo, issue)
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
             return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
         tier = difficulty_of(issue) + (", " + fallback if fallback else "")
         if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            if assigned is not None:
+                self._drop_unclaimable_lane(repo, issue)
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
@@ -5249,12 +5271,11 @@ class Factory:
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
 
     def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Write the effective tier before reserving a remote lane.
+        """Write the effective tier and base branch before reserving a lane.
 
-        A headerless ticket defaults to medium in the factory, but remote
-        lanes reject it because they cannot render a claim brief. Materialize
-        that tier before adding a lane label. Base: is optional; when absent,
-        the runner uses the repository's default branch.
+        A queued ticket reserved for a lane requires parseable Difficulty: and
+        Base: headers so any claiming lane can build and run it. Materialize
+        the difficulty tier and repository default branch when omitted.
         """
         body = str(issue.get("body") or "")
         try:
@@ -5265,6 +5286,8 @@ class Factory:
         updated = body
         if "Difficulty" not in headers:
             updated = tickets.with_header(updated, "Difficulty", difficulty_of(issue))
+        if "Base" not in headers:
+            updated = tickets.with_header(updated, "Base", self._default_branch(repo))
         if updated == body:
             return
         tickets.parse(updated)

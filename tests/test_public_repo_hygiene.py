@@ -43,7 +43,7 @@ class RepoText(unittest.TestCase):
     smart quote slips in unnoticed unless a test says so."""
 
     def tracked(self):
-        out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True)
+        out = subprocess.run(["git", "-c", "safe.directory=*", "ls-files", "-z"], cwd=ROOT, capture_output=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         files = [ROOT / p for p in out.stdout.decode().split("\0") if p]
         self.assertTrue(files)

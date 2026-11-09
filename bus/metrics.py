@@ -526,7 +526,7 @@ class Collector:
     def generic_files(self) -> List[str]:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         try:
-            result = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+            result = subprocess.run(["git", "-c", "safe.directory=*", "ls-files", "-z"], cwd=root,
                                     capture_output=True, check=False, timeout=60)
         except subprocess.TimeoutExpired:
             raise OSError("git ls-files timed out for the generic metric") from None

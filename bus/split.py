@@ -104,15 +104,19 @@ def epic_of(body: str, fallback: int) -> int:
 
 
 def header_lines(body: str) -> List[str]:
-    """The Difficulty and Priority header lines of the original ticket, so a
-    part is worked in the same tier and order; Difficulty defaults to medium."""
+    """The Difficulty, Priority and Base header lines of the original ticket,
+    so a part is worked in the same tier and order; Difficulty defaults to medium."""
     keep = {}
     for line in str(body or "").splitlines():
         key, sep, value = line.partition(":")
-        if sep and key in ("Difficulty", "Priority") and value.strip():
+        if sep and key in ("Difficulty", "Priority", "Base") and value.strip():
             keep.setdefault(key, "%s: %s" % (key, value.strip()))
-    return [keep.get("Difficulty", "Difficulty: medium")] + (
-        [keep["Priority"]] if "Priority" in keep else [])
+    out = [keep.get("Difficulty", "Difficulty: medium")]
+    if "Priority" in keep:
+        out.append(keep["Priority"])
+    if "Base" in keep:
+        out.append(keep["Base"])
+    return out
 
 
 def ticket_body(original: int, pr: int, headers: Sequence[str], part: Dict[str, Any],

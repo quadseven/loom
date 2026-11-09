@@ -7636,7 +7636,7 @@ exec /usr/bin/git "$@"
         # LOOM_FACTORY_REPO, LOOM_SELF_REPO or LOOM_STATUS_REPO the
         # incident goes to the repo this checkout runs from, never to an
         # empty --repo that fails into the log alone.
-        origin = subprocess.run(["git", "-C", str(RUNNER.parent.parent), "remote", "get-url",
+        origin = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(RUNNER.parent.parent), "remote", "get-url",
                                  "origin"], capture_output=True, text=True).stdout.strip()
         expected = re.sub(r"\.git$", "", origin).rstrip("/")
         expected = "/".join(re.split(r"[:/]", expected)[-2:])

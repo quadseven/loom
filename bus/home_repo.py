@@ -24,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def origin_repo() -> str:
     """owner/name of this checkout's origin remote, or "" when unknown."""
     try:
-        out = subprocess.run(["git", "-C", ROOT, "remote", "get-url", "origin"],
+        out = subprocess.run(["git", "-c", "safe.directory=*", "-C", ROOT, "remote", "get-url", "origin"],
                              capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return ""

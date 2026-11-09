@@ -19,7 +19,7 @@ ALLOWED = {"bus/metrics.py", "tests/test_no_project_words.py"}
 
 class NoProjectWords(unittest.TestCase):
     def test_no_tracked_file_carries_a_project_word(self):
-        listed = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True,
+        listed = subprocess.run(["git", "-c", "safe.directory=*", "ls-files", "-z"], cwd=ROOT, capture_output=True,
                                 check=True).stdout.decode().split("\0")
         hits = []
         for rel in listed:

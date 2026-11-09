@@ -2477,7 +2477,7 @@ base_verdict_write() {  # key, exit
 # --repo would fail every filing into the log alone.
 FACTORY_REPO="${LOOM_FACTORY_REPO:-${LOOM_SELF_REPO:-${LOOM_STATUS_REPO:-}}}"
 if [ -z "$FACTORY_REPO" ]; then
-  FACTORY_REPO="$(git -C "$LOOM_ROOT" remote get-url origin 2>/dev/null |
+  FACTORY_REPO="$(git -c safe.directory=* -C "$LOOM_ROOT" remote get-url origin 2>/dev/null |
     sed -E 's#/$##; s#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#' || true)"
 fi
 case "$FACTORY_REPO" in

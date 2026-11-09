@@ -58,8 +58,8 @@ class Body(unittest.TestCase):
         self.assertTrue(body.endswith("Part of #7\n"))
 
     def test_header_lines_and_epic(self):
-        body = "Priority: P1\nDifficulty: easy\n\nPart of #9\n"
-        self.assertEqual(split.header_lines(body), ["Difficulty: easy", "Priority: P1"])
+        body = "Priority: P1\nDifficulty: easy\nBase: main\n\nPart of #9\n"
+        self.assertEqual(split.header_lines(body), ["Difficulty: easy", "Priority: P1", "Base: main"])
         self.assertEqual(split.header_lines(""), ["Difficulty: medium"])
         self.assertEqual(split.epic_of(body, 3), 9)
         self.assertEqual(split.epic_of("x", 3), 3)
