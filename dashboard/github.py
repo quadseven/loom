@@ -578,7 +578,13 @@ class TicketStore:
         data["goal_context"] = goals.goal_context(
             rows, list(data.get("issue_comments", [])) + reports, titles, metric_comments,
             os.environ.get("LOOM_METRICS_GOAL", "").strip() or None, datetime.now(timezone.utc),
-            parents=parents, unread=unread, epics=epics)
+            parents=parents, unread=unread, epics=epics,
+            home_types={ref: ("backlog" if entry.get("is_backlog") else
+                              "goal" if entry.get("is_goal") else
+                              "epic" if entry.get("is_epic") else "other")
+                        for ref, entry in (self.__dict__.get("_goal_info_cache") or {}).items()
+                        if not entry.get("is_missing") and
+                        all(key in entry for key in ("is_goal", "is_backlog", "is_epic"))})
         data["goal_context_error"] = ""
 
     def _read_dashboard(self, data: Dict[str, Any]) -> None:
@@ -928,7 +934,8 @@ class TicketStore:
                 # The issue does not exist, so there is no goal home here,
                 # whatever an earlier read cached: a definitive answer,
                 # not a transient failure (loom#2166).
-                return {"title": None, "parent": None, "is_goal": False, "is_epic": False,
+                return {"title": None, "parent": None, "is_goal": False, "is_backlog": False,
+                        "is_epic": False,
                         "epic_goal": None, "open": False, "is_missing": True, "read_at": now}
             # Keep what an earlier read found; try again next pass.
             return dict(entry or {}, read_at=0)
@@ -941,7 +948,8 @@ class TicketStore:
         is_epic = "epic" in names and "loom:goal" not in names
         return {"title": str(issue.get("title") or "") or None,
                 "parent": goals.parent_of(repo, issue, configured),
-                "is_goal": "loom:goal" in names, "is_epic": is_epic,
+                "is_goal": "loom:goal" in names, "is_backlog": "loom:backlog" in names,
+                "is_epic": is_epic,
                 "epic_goal": goals.epic_goal_of(repo, issue, configured) if is_epic else None,
                 "open": issue.get("state", "open") != "closed", "read_at": now}
 

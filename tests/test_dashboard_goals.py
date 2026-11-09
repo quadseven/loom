@@ -303,6 +303,35 @@ class RollUp(unittest.TestCase):
         self.assertEqual(sum(1 + len(children) for children in tree.values()), 2)
 
 
+class ConsolidatedGoalsPage(unittest.TestCase):
+    def test_only_outcome_homes_render_as_goal_cards(self):
+        rows = goal_rows((7, 30, "pr"), (8, 50, "queued"), (9, 60, "running"))
+        context = {
+            REPO + "#30": {"title": "Outcome", "kind": "goal", "parent": None,
+                           "metric": "1", "history": [0, 0, 0, 0, 0, 0, 1], "epics": []},
+            REPO + "#50": {"title": "Backlog: every issue", "kind": "backlog", "parent": REPO + "#30",
+                           "metric": "0", "history": [], "epics": []},
+            REPO + "#60": {"title": "Epic: batch bucket", "kind": "epic", "parent": None,
+                           "metric": "0", "history": [], "epics": []},
+        }
+
+        rendered = server._goals(goals_state(rows, context))
+
+        found = cards(rendered)
+        self.assertEqual(len(found), 1)
+        self.assertIn("Outcome", found[0])
+        self.assertNotIn("Backlog: every issue", rendered)
+        self.assertNotIn("batch bucket", rendered)
+
+
+    def test_goal_context_records_home_kind_from_live_issue_metadata(self):
+        context = goals.goal_context(
+            goal_rows((7, 30, "queued")), [], {REPO + "#30": "Outcome"}, [], None, NOW,
+            home_types={REPO + "#30": "goal"})
+
+        self.assertEqual(context[REPO + "#30"]["kind"], "goal")
+
+
 class ReportFreshness(unittest.TestCase):
     QUIET_TEXT = "No report on this goal in the last two weeks"
 
@@ -389,9 +418,11 @@ class StoreGoals(unittest.TestCase):
         self.gh = FakeGitHub(
             {"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
              "/repos/%s/issues/comments" % REPO: [standup]},
-            {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx"},
+            {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx",
+                                             "labels": [{"name": "loom:goal"}]},
              "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Smaller goal",
-                                            "body": "## Why\nx\n\nParent goal: %s#30" % REPO}})
+                                            "body": "## Why\nx\n\nParent goal: %s#30" % REPO,
+                                            "labels": [{"name": "loom:goal"}]}})
         self.store = TicketStore([REPO], gh=self.gh, budget_floor=500)
         self.store._waits_refreshed_at = float("inf")
 
@@ -405,6 +436,69 @@ class StoreGoals(unittest.TestCase):
         self.assertIn("1 in flight since the last report.", found[0])
         self.assertNotIn("No report on this goal in the last two weeks", found[0])
         self.assertIn("Smaller goal", found[0][found[0].index("goal-children"):])
+
+    def test_live_home_labels_hide_backlog_without_dropping_outcome_or_child(self):
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        tickets = [
+            {"number": 7, "title": "Outcome work", "state": "open", "created_at": stamp,
+             "body": "Part of #30\n\n## Why\nx",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:running"}]},
+            {"number": 8, "title": "Queue intake", "state": "open", "created_at": stamp,
+             "body": "Part of #50\n\n## Why\nx",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]},
+        ]
+        comments = [{"id": 2, "body": "<!-- loom:report v1 -->\nFresh report.",
+                     "created_at": stamp, "user": {"login": "station"},
+                     "issue_url": "https://api.github.com/repos/%s/issues/30" % REPO}]
+        gh = FakeGitHub(
+            {"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
+             "/repos/%s/issues/comments" % REPO: comments},
+            {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Outcome",
+                                             "body": "## Why\nx",
+                                             "labels": [{"name": "loom:goal"}]},
+             "/repos/%s/issues/50" % REPO: {"number": 50, "title": "Backlog", "body": "",
+                                             "labels": [{"name": "loom:goal"},
+                                                        {"name": "loom:backlog"}]}})
+        from dashboard.github import TicketStore
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+
+        store.refresh()
+
+        context = store.response()["goal_context"]
+        self.assertEqual(context[REPO + "#30"]["kind"], "goal")
+        self.assertEqual(context[REPO + "#50"]["kind"], "backlog")
+        page = server._goals(store)
+        self.assertEqual(len(cards(page)), 1)
+        self.assertIn("Outcome", page)
+        self.assertNotIn("<h2>Backlog</h2>", page)
+        self.assertNotIn("Queue intake", page)
+        self.assertEqual(len(store.response()["tickets"][REPO]), 2)
+
+    def test_transient_first_home_read_does_not_hide_the_goal_card(self):
+        stamp = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ticket = {"number": 7, "title": "Outcome work", "state": "open", "created_at": stamp,
+                  "body": "Part of #30\n\n## Why\nx",
+                  "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}
+        gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: [ticket],
+                         "/repos/%s/issues/comments" % REPO: []}, {})
+        rest = gh.rest
+
+        def fail_home_read(method, path, body=None):
+            if path == "/repos/%s/issues/30" % REPO:
+                raise OSError("temporary read failure")
+            return rest(method, path, body)
+
+        gh.rest = fail_home_read
+        from dashboard.github import TicketStore
+        store = TicketStore([REPO], gh=gh, budget_floor=500)
+        store._waits_refreshed_at = float("inf")
+
+        store.refresh()
+
+        page = server._goals(store)
+        self.assertEqual(len(cards(page)), 1)
+        self.assertIn("#30", page)
 
     def test_a_first_pass_below_the_floor_says_why_the_cards_are_empty(self):
         self.store._last_remaining, self.store._reset_at = 10, 2000000000
@@ -435,6 +529,8 @@ class GoalSourcesAreTrusted(unittest.TestCase):
                    for n, goal in ((7, 30), (8, 41))]
         issues = {"/repos/%s/issues/30" % REPO: {"number": 30, "title": "Main goal", "body": "## Why\nx"},
                   "/repos/%s/issues/41" % REPO: {"number": 41, "title": "Smaller goal", "body": goal_41_body}}
+        for issue in issues.values():
+            issue["labels"] = [{"name": "loom:goal"}]
         issues.update(extra_issues or {})
         gh = FakeGitHub({"/repos/%s/issues?labels=loom%%3Aticket" % REPO: tickets,
                          "/repos/%s/issues/30/comments" % REPO: list(home_comments)}, issues)
