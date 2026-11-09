@@ -155,7 +155,7 @@ class SamplerTests(unittest.TestCase):
         self.run_sample()
         for index in range(180):
             self.run_sample(NOW + (index + 1) * 3600)
-        self.assertLessEqual(len(self.saved()["samples"]), 168)
+        self.assertLessEqual(len(self.saved()["samples"]), 169)
 
     def test_corrupt_json_shapes_fail_closed(self):
         for value in ([], 42, None, {"binding": [], "samples": [None, [], 42], "signal": []}):
@@ -204,41 +204,11 @@ class IntegrationTests(unittest.TestCase):
             station.now = NOW
             station.s = SimpleNamespace(authors=["app[bot]", "operator"], repos=[])
             station.operator_reader = mock.Mock(return_value=(dict(CORE, remaining=0), {}))
-            station._inbox_repos = lambda: {"example/project"}
+            station._operator_lane_active = lambda: True
             station.sample_operator_budget()
             state = budget.load(Path(directory) / budget.FILE)
             self.assertIn("signal", state)
             station.operator_reader.assert_called_once_with("operator", {}, NOW)
-
-    def test_pending_signal_uses_normal_invariant_type(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / budget.FILE
-            reader = lambda *args: (dict(CORE, remaining=0), {})
-            budget.sample(path, NOW, "operator", True, reader, lambda _: None)
-            breaches = budget.breaches(path)
-            self.assertEqual(len(breaches), 1)
-            self.assertEqual(breaches[0].invariant, budget.KIND)
-            self.assertTrue(budget.known(path))
-
-    def test_missing_failed_and_stale_activity_are_not_active(self):
-        self.assertFalse(budget.active_scans({}, ["example/project"], NOW))
-        for at in (NOW - budget.EVERY, NOW + 1, "invalid"):
-            self.assertFalse(budget.active_scans({"example/project": {"busy": True, "at": at}},
-                                                 ["example/project"], NOW))
-        self.assertTrue(budget.active_scans({"example/project": {"busy": True, "at": NOW}},
-                                            ["example/project"], NOW))
-
-    def test_unknown_read_does_not_settle_factory_signal(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / budget.FILE
-            self.assertFalse(budget.known(path))
-            budget.sample(path, NOW, "operator", False,
-                          lambda *args: (CORE, {}), lambda _: None)
-            self.assertTrue(budget.known(path))
-            with mock.patch.object(budget, "read_core", side_effect=RuntimeError("private")):
-                budget.sample(path, NOW + 3600, "operator", False,
-                              budget.read_core, lambda _: None)
-            self.assertFalse(budget.known(path))
 
     def test_production_hook_is_wired_without_live_auth_in_injected_tests(self):
         from bus import station
@@ -256,3 +226,100 @@ class IntegrationTests(unittest.TestCase):
                 else:
                     self.assertIs(constructor.call_args.kwargs["operator_reader"], budget.read_core)
                     auth.assert_called_once_with()
+
+    def test_operator_sample_precedes_app_trust_failure(self):
+        from bus import station
+        gh = SimpleNamespace(cache_dir="unused", app=None)
+        events = []
+        with mock.patch.object(station, "Station") as constructor, \
+             mock.patch.object(station, "_trust_app_login", side_effect=RuntimeError("app unavailable")):
+            constructor.return_value.sample_operator_budget.side_effect = lambda: events.append("sample")
+            with self.assertRaises(RuntimeError):
+                station._locked_pass(SimpleNamespace(), "unused", gh, {})
+        self.assertEqual(events, ["sample"])
+
+    def test_extreme_state_numbers_are_unknown_not_exceptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / budget.FILE
+            path.write_text(json.dumps({"attempted_at": 10 ** 1000,
+                                        "binding": {"key": "a" * 64, "at": 10 ** 1000}}))
+            self.assertEqual(budget.load(path), {})
+
+    def test_unknown_busy_scan_does_not_mean_active(self):
+        from bus.station import Station
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "scans.json").write_text(json.dumps({"example/project": {"busy": True, "at": NOW}}))
+            station = object.__new__(Station)
+            station.state = directory
+            station.now = NOW
+            station.s = SimpleNamespace(authors=["operator"], repos=["example/project"])
+            station.operator_reader = mock.Mock(return_value=(dict(CORE, remaining=0), {}))
+            station._operator_lane_active = lambda: False
+            station.sample_operator_budget()
+            self.assertNotIn("signal", budget.load(Path(directory) / budget.FILE))
+
+    def test_unbounded_core_values_fail_closed_in_reader_and_state(self):
+        huge = 10 ** 1000
+        for field in ("remaining", "limit", "reset"):
+            core = dict(CORE, **{field: huge})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                budget.core_values(core)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / budget.FILE
+            record = dict(CORE, remaining=0, limit=huge, at=NOW, active=True)
+            path.write_text(json.dumps({"signal": record, "samples": [record]}))
+            state = budget.load(path)
+            self.assertNotIn("signal", state)
+            self.assertEqual(state.get("samples"), [])
+            budget.sample(path, NOW, "operator", True,
+                          lambda *args: (dict(CORE, limit=huge), {}), lambda _: None)
+            saved = budget.load(path)
+            self.assertNotIn("signal", saved)
+            self.assertEqual(saved["failures"][-1]["reason"], "read-failed")
+
+    def test_queued_ticket_without_live_agent_does_not_signal(self):
+        from bus.station import Station, LANES
+        with tempfile.TemporaryDirectory() as directory:
+            lane = next(iter(LANES))
+            inbox = Path(directory, "briefs", lane)
+            inbox.mkdir(parents=True)
+            repo = "example/project"
+            (inbox / "ticket.md").write_text("Issue: %s#%d\n" % (repo, 7))
+            station = object.__new__(Station)
+            station.state = str(Path(directory, "state", "station"))
+            station.now = NOW
+            station.s = SimpleNamespace(home=directory, authors=["operator"], repos=[repo])
+            station.operator_reader = mock.Mock(return_value=(dict(CORE, remaining=0), {}))
+            station._lock_pid = mock.Mock(return_value=None)
+            station._pid_alive = mock.Mock(return_value=False)
+            station.sample_operator_budget()
+            self.assertNotIn("signal", budget.load(Path(station.state) / budget.FILE))
+            station._pid_alive.assert_not_called()
+
+    def test_full_week_retains_both_endpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / budget.FILE
+            for hour in range(169):
+                budget.sample(path, NOW + hour * 3600, "operator", False,
+                              lambda *args: (CORE, {}), lambda _: None)
+            samples = budget.load(path)["samples"]
+            self.assertEqual(samples[0]["at"], NOW)
+            self.assertEqual(samples[-1]["at"] - samples[0]["at"], 7 * 24 * 3600)
+
+    def test_activity_requires_ticket_and_positive_live_agent_group(self):
+        from bus.station import Station, LANES
+        lane = next(iter(LANES))
+        for assigned, pid, alive, expected in (
+                (True, 123, True, True), (False, 123, True, False),
+                (True, 123, False, False), (True, None, True, False),
+                (True, -1, True, False), (True, 0, True, False),
+                (True, True, True, False), (True, 10 ** 1000, True, False)):
+            with self.subTest(assigned=assigned, pid=pid, alive=alive):
+                station = object.__new__(Station)
+                station.s = SimpleNamespace(home="unused")
+                station._operator_ticket_assigned = lambda current: assigned and current == lane
+                station._lock_pid = mock.Mock(return_value=pid)
+                station._pid_alive = mock.Mock(return_value=alive)
+                self.assertEqual(station._operator_lane_active(), expected)
+                if not assigned or pid in (None, -1, 0, True, 10 ** 1000):
+                    station._pid_alive.assert_not_called()

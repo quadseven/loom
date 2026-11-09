@@ -9,8 +9,8 @@ changes no authentication configuration, and makes only GET requests. The first
 non-bot login in `LOOM_BRIEF_AUTHORS` identifies the expected operator. A `/user`
 response must identify that user before a budget is attributed to the operator.
 
-The private station state file `operator-budget.json` contains up to 168 samples
-and 168 safe failed-read records. Each sample has an observation epoch, remaining,
+The private station state file `operator-budget.json` contains up to 169 samples
+and 169 safe failed-read records (a full week of hourly samples with both endpoints). Each sample has an observation epoch, remaining,
 limit, reset epoch, and whether work was active. No account names, credentials,
 raw headers, or exception text are stored. An atomic write records each attempt
 before network work; failed reads retry no sooner than five minutes later and do
@@ -26,13 +26,18 @@ App budget or a successful operator sample. The same limit applies after binding
 expiry. The sampler does not replace, refresh, or broaden credentials to recover.
 
 Below 10 percent remaining while work is active, a durable factory signal is
-kept. Activity means a local queued/running brief or positive in-flight evidence
-from a repo scan in the preceding hour. Idle low observations do not create a
+kept. Activity requires an assigned local ticket and a live agent or watchdog process
+group in that lane. A queued brief, idle runner, missing/unreadable process ID,
+or stale repo scan is insufficient. Process checks use the existing station helpers. Remote-only activity remains
+unknown: the existing runner ledger does not distinguish dispatched-but-queued
+work from a running agent, and this observer does not change runner dispatch
+logic. Sampling still runs regardless of lane type or activity. Idle low observations do not create a
 signal; if work becomes active before that observation expires or its quota resets,
 the station may flag that fresh observation without another API read. Failed reads
 do not clear an outstanding signal. A successful observation at or above the
-threshold clears it. The existing invariant filer surfaces the signal using the
-station client and its existing publication gates. The sampling client never
+threshold clears it. The station surfaces the durable factory flag in its normal output, including
+when the station App budget is exhausted. This observer does not publish issues
+or change existing merge, close, or reporting gates. The sampling client never
 publishes anything.
 
 Tests are entirely offline:

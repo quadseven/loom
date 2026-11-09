@@ -12956,15 +12956,11 @@ class Station:
         self._read_facts = facts
         self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
-        breaches.extend(operator_budget.breaches(os.path.join(self.state, operator_budget.FILE)))
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
                  "LOOM_INVARIANT_GOAL" % len(breaches))
         if filer is not None:
-            read = invariants.read_kinds(facts)
-            if operator_budget.known(os.path.join(self.state, operator_budget.FILE)):
-                read += (operator_budget.KIND,)
-            filer.reads(read, facts.unread)
+            filer.reads(invariants.read_kinds(facts), facts.unread)
             self._file_invariants(filer, breaches, self._invariant_write_gate())
         invariants.save(path, state)
 
@@ -16303,13 +16299,40 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("assign_queued failed: %s" % err)
 
-    def sample_operator_budget(self) -> None:
-        if self.operator_reader is None:
-            return
+    def _operator_ticket_assigned(self, lane: str) -> bool:
         try:
-            scans = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
-            active = bool(self._inbox_repos()) or operator_budget.active_scans(
-                scans, self.s.repos, self.now)
+            names = os.listdir(self.inbox(lane))
+        except OSError:
+            return False
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            try:
+                with open(os.path.join(self.inbox(lane), name), encoding="utf-8") as stream:
+                    if ISSUE_LINE_RE.search(stream.read()):
+                        return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _operator_lane_active(self) -> bool:
+        """A ticket and a live agent group, not an idle runner or queued brief."""
+        for lane in LANES:
+            if not self._operator_ticket_assigned(lane):
+                continue
+            lock = os.path.join(self.s.home, "run", lane + ".lock")
+            for name in ("pgid", "watchdog_pgid"):
+                pid = self._lock_pid(lock, name)
+                if isinstance(pid, int) and not isinstance(pid, bool) and 1 < pid <= 2147483647 and self._pid_alive(pid):
+                    return True
+        return False
+
+    def sample_operator_budget(self) -> None:
+        if self.operator_reader is None or getattr(self, "_operator_sampled", False):
+            return
+        self._operator_sampled = True
+        try:
+            active = self._operator_lane_active()
             state = operator_budget.sample(
                 os.path.join(self.state, operator_budget.FILE), self.now,
                 tickets.operator_login(self.s.authors), active, self.operator_reader, _say)
@@ -16596,7 +16619,6 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         gh = GitHub(auth_from_env())
         gh.status_in_body = True
         hooks.setdefault("operator_reader", operator_budget.read_core)
-    _trust_app_login(settings, gh)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
@@ -16607,6 +16629,11 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         app.state_file = os.path.join(state, "station", "app-token.json")
     st = Station(gh, settings, **hooks)
     try:
+        st.sample_operator_budget()
+        _trust_app_login(settings, gh)
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers.update(settings.authors)
         st.run_pass()
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)

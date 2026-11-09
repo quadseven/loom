@@ -20,14 +20,19 @@ FILE = "operator-budget.json"
 EVERY = 3600
 RETRY = 300
 BINDING_AGE = 86400
-KEEP = 168
-FLOOR = 0.10
-KIND = "operator-core-budget"
+KEEP = 169
+LOW_DIVISOR = 10
+MAX_CORE_LIMIT = 1_000_000_000
+MAX_EPOCH = 253402300799
 
 
 def number(value):
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value) and 0 <= value <= MAX_EPOCH
+    except OverflowError:
+        return False
 
 
 def core_values(data):
@@ -37,7 +42,7 @@ def core_values(data):
     if not all(isinstance(data.get(k), int) and not isinstance(data[k], bool) for k in keys):
         raise ValueError("invalid core sample")
     remaining, limit, reset = (data[k] for k in keys)
-    if limit <= 0 or not 0 <= remaining <= limit or reset <= 0:
+    if not 0 < limit <= MAX_CORE_LIMIT or not 0 <= remaining <= limit or not 0 < reset <= MAX_EPOCH:
         raise ValueError("invalid core sample")
     return {k: data[k] for k in keys}
 
@@ -103,7 +108,7 @@ def load(path):
         state["failures"] = [{"at": f["at"], "reason": "read-failed"}
                              for f in failures[-KEEP:] if isinstance(f, dict) and number(f.get("at"))]
     signal = clean_record(raw.get("signal"))
-    if signal and signal["active"] and signal["remaining"] < FLOOR * signal["limit"]:
+    if signal and signal["active"] and signal["remaining"] * LOW_DIVISOR < signal["limit"]:
         state["signal"] = signal
     return state
 
@@ -129,7 +134,7 @@ def flag(state, now, active):
         return
     latest = samples[-1]
     if (active and 0 <= now - latest["at"] < EVERY and latest["reset"] > now
-            and latest["remaining"] < FLOOR * latest["limit"]):
+            and latest["remaining"] * LOW_DIVISOR < latest["limit"]):
         state["signal"] = dict(latest, active=True)
 
 
@@ -158,41 +163,10 @@ def sample(path, now, operator, active, reader, say):
             state["binding"] = binding
             state["samples"] = (state.get("samples", []) + [record])[-KEEP:]
             state["next_at"] = now + EVERY
-            if record["remaining"] >= FLOOR * record["limit"]:
+            if record["remaining"] * LOW_DIVISOR >= record["limit"]:
                 state.pop("signal", None)
             flag(state, now, active)
         save(path, state)
     except (OSError, ValueError):
         say("operator core budget state unavailable; sampling deferred")
     return state
-
-
-def breaches(path):
-    """The durable flag uses the station's existing App-authorized filer."""
-    from .invariants import Breach
-    signal = load(path).get("signal")
-    if not signal:
-        return []
-    evidence = ("Operator core REST budget: %d of %d remaining; reset epoch %d."
-                % (signal["remaining"], signal["limit"], signal["reset"]),
-                "Observed while factory work was active. A failed read does not clear this signal.")
-    return [Breach(KIND, "operator-core", "Operator core REST budget low while active",
-                   evidence, signal["at"])]
-
-
-def active_scans(scans, repos, now):
-    """Recent positive in-flight evidence, not a guess from a missing scan."""
-    if not isinstance(scans, dict):
-        return False
-    return any(isinstance(scans.get(repo), dict) and scans[repo].get("busy") is True
-               and number(scans[repo].get("at")) and 0 <= now - scans[repo]["at"] < EVERY
-               for repo in repos)
-
-
-def known(path):
-    """Only successful evidence lets the normal filer settle an older signal."""
-    state = load(path)
-    if state.get("signal"):
-        return True
-    samples, failures = state.get("samples", []), state.get("failures", [])
-    return bool(samples and (not failures or samples[-1]["at"] > failures[-1]["at"]))
