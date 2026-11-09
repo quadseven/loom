@@ -7795,12 +7795,8 @@ class Station:
         distinct heads let a round that failed [transient] and pushed nothing
         repeat without end (grug#1315: 15 rounds, 9 on one head, 2026-10-24).
         A round the brain cancelled (loom#1998) never ran and does not count."""
-        cleared = set(brain.cancelled_fix_indexes(comments, authors))
-        return sum(1 for i, comment in enumerate(comments)
-                   if i not in cleared
-                   and isinstance(comment, dict)
-                   and tickets._login(comment.get("user")) in authors
-                   and Station._fix_head(str(comment.get("body") or "")))
+        return fixrounds.count(
+            comments, authors, brain.cancelled_fix_indexes(comments, authors))
 
     @staticmethod
     def _fix_head(body: str) -> Optional[str]:

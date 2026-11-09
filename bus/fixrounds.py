@@ -116,6 +116,24 @@ def transition_finding(finding: Mapping[str, Any], action: str, revision: str,
     return result
 
 
+def count(comments: List[Any], authors: Iterable[str],
+          cancelled: Iterable[int] = ()) -> int:
+    """Count trusted, uncancelled fix rounds carrying a head marker."""
+    allowed = {str(author).lower() for author in authors}
+    cleared = set(cancelled)
+    return sum(
+        1 for index, comment in enumerate(comments)
+        if index not in cleared
+        and isinstance(comment, dict)
+        and _login(comment) in allowed
+        and _has_head(str(comment.get("body") or ""))
+    )
+
+
+def _has_head(body: str) -> bool:
+    return body.startswith(FIX_MARKER) and bool(HEAD_RE.search(body))
+
+
 def is_rounds(body: Any) -> bool:
     text = str(body or "")
     return text.startswith(FIX_MARKER) and MARKER in text.split("\n", 3)[:3]
