@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from typing import (Any, Callable, Collection, Dict, Iterable, Mapping, Optional, Sequence, Set,
                     Tuple, Union)
@@ -400,7 +401,11 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
         text = with_shipped_backlog(text, now)
         _text.check(text)
         mine, previous = _journal_context(gh, repo, issue_number, text)
-        text = with_steps(journal_check.annotate(text, previous), steps)
+        # The tick's step timings are a log line, not a comment on the goal
+        # ticket (loom#2898).
+        text = _STEPS_LINE.sub("", journal_check.annotate(text, previous))
+        if steps:
+            print("journal %s#%d %s" % (repo, int(issue_number), steps), file=sys.stderr)
         if mine is not None:
             body = _public_refs(merged(text, str(mine.get("body") or "")), repo)
             _text.check(body)

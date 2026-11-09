@@ -349,7 +349,7 @@ class JournalFooterTests(unittest.TestCase):
                          "elapsed 8 of 25 minutes (1020 seconds left)")
         self.assertIsNone(tick_clock.footer({"started_at": "2030-01-01T12:00:00Z"}, at(8)))
 
-    def test_the_journal_command_puts_the_holders_step_times_last(self):
+    def test_the_journal_command_reads_the_holders_step_times(self):
         _, gh = held_lock()
         brain.tick_step(gh, REPO, "lock", holder="muse", now=at(0))
         brain.tick_step(gh, REPO, "merge", holder="muse", now=at(2))
@@ -363,9 +363,20 @@ class JournalFooterTests(unittest.TestCase):
         journal.post(GitHub("tok", transport=posting), REPO, 7,
                      journal.JOURNAL_MARKER + "\nMoved: one.\n- Steps: stale\n", "muse",
                      now=at(8), steps=line)
-        body = json.loads(posting.calls[2][3])["body"].splitlines()
-        self.assertEqual(body[-1], line)
-        self.assertNotIn("- Steps: stale", body)
+        body = json.loads(posting.calls[2][3])["body"]
+        self.assertNotIn("Steps:", body)
+
+    def test_the_step_times_go_to_the_log_not_the_comment(self):
+        # loom#2898: per-tick timings are not a GitHub comment.
+        posting = Scripted(reply(200, {"login": "me"}), reply(200, []), reply(201, {}))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            journal.post(GitHub("tok", transport=posting), REPO, 7,
+                         journal.JOURNAL_MARKER + "\nMoved: one.\n- Steps: stale\n", "muse",
+                         now=at(8), steps="- Steps: lock 1m00s")
+        body = json.loads(posting.calls[2][3])["body"]
+        self.assertNotIn("Steps:", body)
+        self.assertIn("- Steps: lock 1m00s", err.getvalue())
 
     def test_a_report_or_reply_reads_no_tick_record(self):
         class NoReads:
