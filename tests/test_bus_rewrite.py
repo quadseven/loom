@@ -264,6 +264,14 @@ class RewriteIssueTest(Base):
         self.assertEqual(out, "skip")
         self.assertEqual(self.fake.labels, [])
 
+    def test_only_the_real_research_label_refuses_kind_account(self):
+        answer = {"action": "human", "kind": "account", "ask": "Grant read access to the repo."}
+        for label in ("read-and-report", "research", "class:docs"):
+            with self.subTest(label=label):
+                out = rewrite.apply_answer(self.gh(), REPO, GOAL, 7, json.dumps(answer), [label])
+                self.assertEqual(out, "human")
+        self.assertEqual(self.fake.labels, [(7, ["needs-brain"])] * 3)
+
     def test_an_issue_left_to_the_brain_is_not_rewritten_again(self):
         self.fake.add_triage(7)
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
