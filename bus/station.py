@@ -46,6 +46,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import operator_budget
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -2241,8 +2242,10 @@ class Station:
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None,
-                 urgency_client: Optional[urgency.Client] = None) -> None:
+                 urgency_client: Optional[urgency.Client] = None,
+                 operator_reader: Optional[Callable[..., Any]] = None) -> None:
         self.gh = gh
+        self.operator_reader = operator_reader
         # The urgency model's client; None reads the key from SSM when a score
         # is first wanted (Station._urgency_client).
         self._urgency_injected = urgency_client
@@ -12953,11 +12956,15 @@ class Station:
         self._read_facts = facts
         self._unstick_lane_pulls(facts)
         breaches = invariants.check(facts, _say)
+        breaches.extend(operator_budget.breaches(os.path.join(self.state, operator_budget.FILE)))
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
                  "LOOM_INVARIANT_GOAL" % len(breaches))
         if filer is not None:
-            filer.reads(invariants.read_kinds(facts), facts.unread)
+            read = invariants.read_kinds(facts)
+            if operator_budget.known(os.path.join(self.state, operator_budget.FILE)):
+                read += (operator_budget.KIND,)
+            filer.reads(read, facts.unread)
             self._file_invariants(filer, breaches, self._invariant_write_gate())
         invariants.save(path, state)
 
@@ -16296,7 +16303,23 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("assign_queued failed: %s" % err)
 
+    def sample_operator_budget(self) -> None:
+        if self.operator_reader is None:
+            return
+        try:
+            scans = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
+            active = bool(self._inbox_repos()) or operator_budget.active_scans(
+                scans, self.s.repos, self.now)
+            state = operator_budget.sample(
+                os.path.join(self.state, operator_budget.FILE), self.now,
+                tickets.operator_login(self.s.authors), active, self.operator_reader, _say)
+            if state.get("signal"):
+                _say("operator core REST budget low during active work; durable factory signal pending")
+        except (OSError, ValueError):
+            _say("operator core budget activity unavailable; sampling deferred")
+
     def run_pass(self) -> None:
+        self.sample_operator_budget()
         if self._budget_exhausted():
             return
         if not self.check_repo_access():
@@ -16572,6 +16595,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         from .github import auth_from_env
         gh = GitHub(auth_from_env())
         gh.status_in_body = True
+        hooks.setdefault("operator_reader", operator_budget.read_core)
     _trust_app_login(settings, gh)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
