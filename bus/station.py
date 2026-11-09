@@ -15,6 +15,7 @@ import faulthandler
 import fcntl
 import fnmatch
 import gzip
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 import math
@@ -293,6 +294,8 @@ QUIET_RECHECK = 3600
 # own report to edit for a quiet goal's heartbeat.
 # A standup line names at most this many tickets, then "and N more".
 STANDUP_ROWS_MAX = 5
+# A goal's standup is written (posted or edited) at most this often per ET day.
+STANDUP_WRITES_PER_DAY = 2
 STANDUP_FOOTER = "Written by the station from ticket data, because no brain reported in time."
 # The operator's two reading times (2026-10-14: "Twice a day. Morning and
 # evening. 10am and 9pm"): one digest of every goal's reports each, instead of
@@ -13745,8 +13748,25 @@ class Station:
             return
         quiet = hold is None and body == self._overdue_standup_body(
             [], None, None if breaches is None else [], waiting=waiting)
+        # loom#2898: nothing moved and no ask, breach or hold: nothing is
+        # written, not even an edit.
+        if hold is None and not named and not self._standup_moved(children, last):
+            state[key] = self.now
+            return
+        day = now.astimezone(ZoneInfo(brain.REPORT_ZONE)).strftime("%Y-%m-%d")
+        written = state.get(key + " written")
+        count = written[1] if isinstance(written, list) and len(written) == 2 \
+            and written[0] == day and isinstance(written[1], int) else 0
+        if count >= STANDUP_WRITES_PER_DAY:
+            return
+        state[key + " written"] = [day, count + 1]
         previous = self._last_same_report(comments, authors, body)
-        if previous is not None:
+        mine = self._last_standup(comments, authors)
+        if previous is None and mine is not None:
+            # One status comment per goal: a change edits the station's
+            # standup, which notifies no one.
+            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, mine), {"body": body})
+        elif previous is not None:
             # Every new comment emails the goal's author; a report that says
             # what an earlier one said edits that one instead, which notifies
             # no one, even when a brain's report came in between.
@@ -13756,6 +13776,21 @@ class Station:
         else:
             notify.post(self.gh, repo, number, body, notify.REPORT)
         state[key] = self.now
+
+    def _standup_moved(self, children: List[Any], since: Optional[float]) -> bool:
+        """Whether any ticket merged, verified, shipped, failed, regressed,
+        went stuck, queued or asks the operator since `since` (loom#2898)."""
+        groups = self._standup_ticket_groups(children, since)
+        if any(groups[k] for k in ("merged", "verified", "sent_back", "failed", "regressed",
+                                   "aged_pr", "queued", "asks")):
+            return True
+        # A ticket opened or closed since the last report is news too, as in
+        # bus/quiet.py.
+        return since is None or any(
+            isinstance(issue, dict) and any(
+                (self._epoch(str(issue.get(field) or "")) or 0) > since
+                for field in ("created_at", "closed_at"))
+            for issue in children)
 
     def _open_asks(self) -> Optional[Dict[str, List[Dict[str, Any]]]]:
         """Each repo's open needs:human issues, read as `status` reads them so
