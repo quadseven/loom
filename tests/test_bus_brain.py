@@ -1851,7 +1851,9 @@ class SensitiveResumeTests(unittest.TestCase):
 
     def test_move_remote_lane_on_public_repo_succeeds(self):
         fake = Fake(
-            reply(200, {"state": "open", "title": "My Title", "body": BODY, "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"state": "open", "title": "My Title",
+                        "body": "Difficulty: medium\n\n" + BODY,
+                        "labels": [{"name": "loom:ticket"}]}),
             reply(200, {"private": False}),
             reply(200, []),
             reply(200, {}),
@@ -1862,6 +1864,19 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertEqual(len(fake.calls), 5)
         self.assertEqual(fake.calls[3][2], {"labels": ["loom:ticket", "loom:queued", "lane:muse"]})
         self.assertEqual(fake.calls[4][2], {"body": "moving to muse"})
+        fake.assert_all_used()
+
+    def test_move_remote_lane_refuses_ticket_without_readable_difficulty(self):
+        fake = Fake(
+            reply(200, {"state": "open", "title": "My Title", "body": BODY,
+                        "labels": [{"name": "loom:ticket"}]}),
+            reply(200, {"private": False}),
+            reply(200, [])
+        )
+        gh = GitHub("t", transport=fake)
+        with self.assertRaisesRegex(ValueError, "difficulty 'none'"):
+            brain.move(gh, REPO, 8, "queued", "muse")
+        self.assertEqual([call[0] for call in fake.calls], ["GET", "GET", "GET"])
         fake.assert_all_used()
 
     def test_move_remote_lane_with_pull_request_refuses(self):

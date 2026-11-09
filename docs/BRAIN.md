@@ -596,9 +596,10 @@ no further epic opens past it. An epic, an ask and a closed issue are never
 moved. The station log names each goal: `outside-epic: moved N, left M`.
 
 The station assigns queued tickets to free lanes on each pass. A brain that
-wants to choose the lane itself uses `brief --lane LANE`. Queued tickets without
-a readable Difficulty line appear in the goal's next station standup as
-needing a difficulty.
+wants to choose the lane itself uses `brief --lane LANE`. A queued ticket given
+a remote lane label must have a readable Difficulty line; `move` refuses to add
+the label otherwise. Queued tickets without a readable Difficulty line appear
+in the goal's next station standup as needing a difficulty.
 
 ### Health findings
 
