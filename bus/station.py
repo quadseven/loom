@@ -63,6 +63,8 @@ from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import merge_verdict
 from . import history
+from . import issue_reads
+from . import pass_view
 from . import friction_intake
 from . import review_debt
 from . import evidence
@@ -1620,87 +1622,23 @@ DECISION_DEFAULT_CHECK_EVERY = 3600
 
 
 def _pass_deadline(raw: str) -> int:
-    """LOOM_PASS_DEADLINE: 0 turns the deadline off; a whole number of
-    seconds of at least 60 is used; anything else is PASS_DEADLINE."""
-    raw = raw.strip()
-    if raw == "0":
-        return 0
-    if raw:
-        value = _seconds(raw, 0)
-        if value:
-            return value
-        _say("ignoring LOOM_PASS_DEADLINE %r: not a whole number of seconds, at least 60"
-             % raw)
-    return PASS_DEADLINE
+    return issue_reads.pass_deadline(raw)
 
 
 def _deadline_stream() -> Any:
-    """The stream faulthandler writes to: the station log (stderr, as launchd
-    runs the station), or the process's own stderr when sys.stderr has no
-    file descriptor (a test capturing it)."""
-    try:
-        sys.stderr.fileno()
-        return sys.stderr
-    except (AttributeError, OSError, ValueError):
-        return sys.__stderr__
+    return issue_reads.deadline_stream()
 
 
 def _arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
-    """Say whether the last pass overran, then arm this pass's deadline and
-    write its marker. Returns the marker's path, or None when off."""
-    path = os.path.join(state, "station", DEADLINE_MARKER_FILE)
-    last = _read_json(path, None, strict=False)
-    if isinstance(last, dict):
-        started = last.get("started")
-        limit = last.get("deadline")
-        if isinstance(started, (int, float)) and isinstance(limit, int):
-            ran = int(now - started)
-            if ran >= limit:
-                _say("the last pass (pid %s, started %s) overran its %ds deadline: its stack is "
-                     "in this log above" % (last.get("pid"), time.strftime(
-                         "%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)), limit))
-            else:
-                _say("the last pass (pid %s) ended %ds into its %ds deadline without a clean "
-                     "finish (killed or crashed)" % (last.get("pid"), ran, limit))
-    if seconds <= 0:
-        _discard(path)
-        return None
-    _write_json(path, {"pid": os.getpid(), "started": now, "deadline": seconds})
-    faulthandler.dump_traceback_later(seconds, exit=True, file=_deadline_stream())
-    return path
-
-
-def _discard(path: str) -> None:
-    """Remove a file that may already be gone."""
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
+    return issue_reads.arm_deadline(state, seconds, now, _say)
 
 
 def _try_arm_pass_deadline(state: str, seconds: int, now: float) -> Optional[str]:
-    """_arm_pass_deadline, but a failure to arm is logged and the pass runs
-    unarmed rather than dying before it starts: the deadline is a backstop,
-    and losing it must not stop the station."""
-    try:
-        return _arm_pass_deadline(state, seconds, now)
-    except Exception as err:  # noqa: BLE001 - any arm failure must not stop the pass
-        _say("could not arm the pass deadline (%s: %s); this pass runs without one"
-             % (type(err).__name__, err))
-        try:
-            faulthandler.cancel_dump_traceback_later()
-            _discard(os.path.join(state, "station", DEADLINE_MARKER_FILE))
-        except OSError as cleanup:
-            _say("could not clear the pass deadline marker: %s" % cleanup)
-        return None
+    return issue_reads.try_arm_deadline(state, seconds, now, _say)
 
 
 def _disarm_pass_deadline(path: Optional[str]) -> None:
-    """Cancel this pass's deadline and remove its marker."""
-    if path is None:
-        return
-    faulthandler.cancel_dump_traceback_later()
-    _discard(path)
+    issue_reads.disarm_deadline(path)
 
 
 def _origin_repo() -> str:
@@ -2293,9 +2231,16 @@ class Station:
         self._invariant_repo = ""
         # What this pass's invariant check read; empty until its reads are done.
         self._read_facts = invariants.Facts(now=self.now)
-        # The GitHub budget as the last pass left it, and the reset it was
-        # last reported low for.
-        self._budget: Optional[Dict[str, Any]] = None
+        self.view = issue_reads.pass_view(
+            gh,
+            state_dir=self.state,
+            now=self.now,
+            deadline=settings.pass_deadline,
+            target=PASS_REQUEST_TARGET,
+            log=_say,
+        )
+        self.gh = self.view
+        self._budget = self.view.budget_state
         self._told_low = False
         # This pass's unproven-work gate refusals, per goal (loom#564):
         # goal key -> the count and limit the gate hit, the briefed tickets
@@ -2334,11 +2279,8 @@ class Station:
         self._path_runs: Dict[Tuple[str, str], Optional[Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]]] = {}
         # Repos whose claim:<login> label this pass has made sure of.
         self._claim_labels: set = set()
-        self._issue_stamps: Dict[Tuple[str, int], str] = {}
-        saved_reads = _read_json(os.path.join(self.state, "ticket_reads.json"), {}, strict=False)
-        self._ticket_reads: Dict[str, Any] = saved_reads if isinstance(saved_reads, dict) else {}
-        if hasattr(self.gh, "target") and self.gh.target is None:
-            self.gh.target = PASS_REQUEST_TARGET
+        self._issue_stamps = self.view._issue_stamps
+        self._ticket_reads = self.view._ticket_reads
 
     # -- paths ---------------------------------------------------------
     def inbox(self, lane: str) -> str:
@@ -2349,51 +2291,13 @@ class Station:
 
     # -- reading GitHub ------------------------------------------------
     def _remember_issues(self, repo: str, items: Any) -> None:
-        if not isinstance(items, list):
-            return
-        for issue in items:
-            if not isinstance(issue, dict) or not isinstance(issue.get("updated_at"), str):
-                continue
-            try:
-                number = int(issue["number"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            self._issue_stamps[(repo, number)] = issue["updated_at"]
+        self.view.remember_issues(repo, items)
 
     def _paginate(self, path: str) -> List[Any]:
-        issue_list = re.match(r"^/repos/([^/]+/[^/]+)/issues\?", path)
-        if issue_list:
-            items = self.gh.paginate(path)
-            self._remember_issues(issue_list.group(1), items)
-            return items
-        detail = re.match(r"^/repos/([^/]+/[^/]+)/issues/(\d+)/(comments|events)(?:\?.*)?$", path)
-        if detail is None or ("?" in path and "since=" in path):
-            return self.gh.paginate(path)
-        repo, number_text, kind = detail.groups()
-        number = int(number_text)
-        stamp = self._issue_stamps.get((repo, number))
-        if (not stamp or not hasattr(self.gh, "issue_writes")
-                or self.gh.comment_edits or (repo, number) in self.gh.issue_writes):
-            return self.gh.paginate(path)
-        key = "%s#%d/%s" % (repo, number, kind)
-        kept = self._ticket_reads.get(key)
-        if isinstance(kept, dict) and kept.get("stamp") == stamp and isinstance(kept.get("data"), list):
-            kept["seen"] = self.now
-            return kept["data"]
-        carried_before = dict(getattr(self.gh, "carried_over", {}))
-        items = self.gh.paginate(path)
-        carried_after = getattr(self.gh, "carried_over", {})
-        if carried_before == carried_after:
-            self._ticket_reads[key] = {"stamp": stamp, "data": items, "seen": self.now}
-        return items
+        return self.view.paginate(path)
 
     def _issue(self, repo: str, number: int) -> Dict[str, Any]:
-        data = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
-        if not isinstance(data, dict):
-            raise GitHubError("no issue %s#%d" % (repo, number))
-        self._remember_issues(repo, [data])
-        data.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
-        return data
+        return self.view.issue(repo, number)
 
     def _editor(self, repo: str, number: int) -> Optional[str]:
         owner, name = repo.split("/")
@@ -12884,10 +12788,7 @@ class Station:
 
     def _pass_counted(self) -> int:
         """The requests this pass's target counts so far (304s left out)."""
-        counted = getattr(self.gh, "counted", None)
-        if counted is None:
-            counted = getattr(self.gh, "requests", 0) - getattr(self.gh, "not_modified", 0)
-        return int(counted)
+        return self.view.counted
 
     def _invariant_write_gate(self) -> Optional[str]:
         """What keeps this check from writing, or None. The pass target
@@ -15819,112 +15720,25 @@ class Station:
 
     # -- the GitHub budget --------------------------------------------------
     def _budget_state(self) -> Dict[str, Any]:
-        if self._budget is None:
-            saved = _read_json(os.path.join(self.state, "budget.json"), {}, strict=False)
-            self._budget = saved if isinstance(saved, dict) else {}
-        return self._budget
+        return self.view.budget_state
 
     def _rates(self) -> Dict[str, Tuple[int, int, int]]:
-        """resource -> (remaining, limit, reset) for every rate limit window
-        still open: the last pass's, updated by this pass's responses."""
-        rates: Dict[str, Tuple[int, int, int]] = {}
-        saved = self._budget_state().get("rates")
-        for resource, value in (saved.items() if isinstance(saved, dict) else ()):
-            if (isinstance(value, list) and len(value) == 3
-                    and all(isinstance(v, int) and not isinstance(v, bool) for v in value)):
-                rates[str(resource)] = (value[0], value[1], value[2])
-        rates.update(self.gh.rate)
-        return {r: v for r, v in rates.items() if v[1] > 0 and v[2] > self.now}
+        return self.view.rates()
 
     def budget_low(self) -> Optional[Tuple[str, int, int, int]]:
-        """(resource, remaining, limit, reset) of the lowest rate limit when
-        it is under BUDGET_FLOOR of its limit, else None."""
-        low = [(v[0] / v[1], r) + v for r, v in self._rates().items()
-               if v[0] < BUDGET_FLOOR * v[1]]
-        return min(low)[1:] if low else None
+        return self.view.budget_low()
 
     def _target_reached(self) -> bool:
-        target = getattr(self.gh, "target", None)
-        if not isinstance(target, int) or isinstance(target, bool):
-            return False
-        return self._pass_counted() >= target
+        return self.view.target_reached()
 
     def _deferred(self) -> bool:
-        """True when the budget is low or the pass request target has been
-        reached: deferrable steps wait for the reset or next pass."""
-        if self._target_reached():
-            return True
-        low = self.budget_low()
-        if low is None:
-            return False
-        resource, remaining, limit, reset = low
-        state = self._budget_state()
-        if not self._told_low and state.get("told") != [resource, reset]:
-            _say("GitHub %s budget low (%d of %d left, resets %s): claims and "
-                 "reports only until then" % (resource, remaining, limit, self._utc(reset)))
-        state["told"] = [resource, reset]
-        self._told_low = True
-        return True
+        return self.view.deferred()
 
     def _budget_exhausted(self) -> bool:
-        """True when the last budget refusal's window is still open: the pass
-        does nothing until it resets, and says so in one line (loom#666).
-        The window is the client's own, or the one an earlier pass kept."""
-        kept = self._budget_state().get("limited_until")
-        until = self.gh.limited_until or (kept if isinstance(kept, int) else None)
-        if until is None or until <= self.now:
-            return False
-        self.gh.limited_until = until
-        _say("GitHub budget exhausted until %s: this pass waits for the reset"
-             % self._utc(until))
-        return True
+        return self.view.budget_exhausted()
 
     def end_pass(self) -> None:
-        """Log this pass's requests, keep the rate limits for the next pass,
-        and remove conditional-request answers nothing uses any more."""
-        gh = self.gh
-        kinds = ", ".join("%s %d" % (k, n) for k, n in
-                          sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
-        line = "requests: %d, %d counted (%s), %d answered 304 (not counted)" % (
-            gh.requests, gh.requests - gh.not_modified, kinds or "none", gh.not_modified)
-        counted = gh.requests - gh.not_modified
-        target = getattr(gh, "target", None) or PASS_REQUEST_TARGET
-        line += "; target %d counted (%s)" % (
-            target, "over" if counted > target else "met")
-        carried = ", ".join("%s %d" % (k, n) for k, n in
-                            sorted(getattr(gh, "carried_over", {}).items(),
-                                   key=lambda kv: (-kv[1], kv[0])))
-        if carried:
-            line += "; carried over %s" % carried
-        rates = self._rates()
-        if "core" in rates:
-            remaining, limit, reset = rates["core"]
-            line += "; %sbudget %d of %d left, resets %s" % (
-                "GitHub App " if gh.auth == "app" else "", remaining, limit, self._utc(reset))
-        _say(line)
-        state = self._budget_state()
-        state["rates"] = {r: list(v) for r, v in rates.items()}
-        if gh.limited_until is not None and gh.limited_until > self.now:
-            state["limited_until"] = int(gh.limited_until)
-        else:
-            state.pop("limited_until", None)
-        if self.budget_low() is None:
-            state.pop("told", None)
-        try:
-            _write_json(os.path.join(self.state, "budget.json"), state)
-            if getattr(gh, "comment_edits", False):
-                self._ticket_reads.clear()
-            for repo, number in getattr(gh, "issue_writes", ()):
-                for kind in ("comments", "events"):
-                    self._ticket_reads.pop("%s#%d/%s" % (repo, number, kind), None)
-            self._ticket_reads = {
-                key: value for key, value in self._ticket_reads.items()
-                if isinstance(value, dict) and isinstance(value.get("seen"), (int, float))
-                and 0 <= self.now - value["seen"] < CACHE_KEEP}
-            _write_json(os.path.join(self.state, "ticket_reads.json"), self._ticket_reads)
-            gh.prune_cache(CACHE_KEEP, self.now)
-        except OSError as err:
-            _say("could not keep the GitHub budget: %s" % err)
+        self.view.end_pass()
 
     def check_repo_access(self) -> bool:
         """Check registered repositories hourly and keep unreadable ones out of this pass."""
