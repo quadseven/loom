@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, github, invariants, metrics, station  # noqa: E402
+from bus import brain, factory, github, invariants, metrics, station, tickets  # noqa: E402
 from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 from bus.invariants import Check, Event, Facts, GateHold, Journal, Posted, Ref, Run, SilentRun, Wait  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
@@ -551,10 +551,15 @@ class StationTest(StationBase):
         self.assertNotIn("#42", filed["title"] + filed["body"])
 
     def test_ticket_6219_queued_with_lane_label_and_brief_headers(self):
-        """Test that ticket 6219 satisfies the queued-ticket-no-headers invariant by having brief headers."""
+        """Ticket 6219's brief headers parse and satisfy the queued-ticket invariant."""
+        body = ("Difficulty: medium\nBase: shuttle-pilot/llm-routing/optimize\n\n"
+                "## Why\nOptimize LLM routing for shuttle pilot.\n")
+        headers, _ = tickets.parse(body)
+        self.assertEqual(headers["Difficulty"], "medium")
+        self.assertEqual(headers["Base"], "shuttle-pilot/llm-routing/optimize")
         self.gh.tickets.setdefault(REPO, []).append(
             {"number": 6219, "state": "open", "user": {"login": AUTHOR},
-             "body": "Difficulty: medium\nBase: shuttle-pilot/llm-routing/optimize\n\n## Why\nOptimize LLM routing for shuttle pilot.\n",
+             "body": body,
              "labels": [{"name": n} for n in ("loom:ticket", "loom:queued", "lane:openrouter")]})
         self.run_at(T0)
         self.assertEqual(self.breaches(), [])
