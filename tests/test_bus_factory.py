@@ -5011,7 +5011,20 @@ class RemoteQueued(Base):
         worker.assign_queued()
         headers, remainder = tickets.parse(self.gh.issues[7]["body"])
         self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
-        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertEqual(headers, {"Difficulty": "medium", "Base": "main"})
+        self.assertIn("## Why\nPreserve this text.", remainder)
+
+    def test_a_ticket_with_difficulty_only_gets_its_base_before_remote_lane_reservation(self):
+        self.gh.private = False
+        body = "Difficulty: easy\n\n## Why\nPreserve this text.\n" + ACCEPTANCE
+        self.gh.ticket(7, "queued", lane="muse", body=body)
+        self.gh.issues[7]["created_at"] = iso(0)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+        worker.assign_queued()
+        headers, remainder = tickets.parse(self.gh.issues[7]["body"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", "muse"))
+        self.assertEqual(headers, {"Difficulty": "easy", "Base": "main"})
         self.assertIn("## Why\nPreserve this text.", remainder)
 
     def test_a_private_headerless_ticket_drops_remote_lane_when_no_local_lane_is_free(self):
@@ -5040,10 +5053,23 @@ class RemoteQueued(Base):
         self.assertNotIn("lane:muse", names)
         self.assertIn("loom:queued", names)
 
-    def test_a_private_ticket_with_difficulty_keeps_remote_lane_when_no_lane_is_free(self):
+    def test_a_private_ticket_with_difficulty_only_drops_remote_lane_when_no_lane_is_free(self):
         self.gh.private = True
         self.gh.ticket(7, "queued", lane="muse",
                        body="Difficulty: medium\n\n## Why\nPreserve this text.\n" + ACCEPTANCE)
+        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
+                                 available=["muse"])
+
+        worker.assign_queued()
+
+        names = {label["name"] for label in self.gh.issues[7]["labels"]}
+        self.assertNotIn("lane:muse", names)
+        self.assertIn("loom:queued", names)
+
+    def test_a_private_ticket_with_full_headers_keeps_remote_lane_when_no_lane_is_free(self):
+        self.gh.private = True
+        self.gh.ticket(7, "queued", lane="muse",
+                       body="Difficulty: medium\nBase: main\n\n## Why\nPreserve this text.\n" + ACCEPTANCE)
         worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"],
                                  available=["muse"])
 
@@ -5059,7 +5085,7 @@ class RemoteQueued(Base):
         self.gh.issues[7]["body"] = body
         self.assign(0, ["muse"])
         headers, remainder = tickets.parse(self.gh.issues[7]["body"])
-        self.assertEqual(headers, {"Difficulty": "medium"})
+        self.assertEqual(headers, {"Difficulty": "medium", "Base": "main"})
         self.assertIn("## Why\nPreserve this text.", remainder)
 
     def test_past_reroute_after_it_moves_to_a_free_local_tier_lane(self):
