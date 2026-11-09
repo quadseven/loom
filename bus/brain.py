@@ -4777,8 +4777,7 @@ def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
         raise ValueError("ticket branch %s already has a pull request" % branch)
-    if body is not None:
-        _check_remote_tier(body, lane)
+    _check_remote_tier(str(issue.get("body") or "") if body is None else body, lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,
