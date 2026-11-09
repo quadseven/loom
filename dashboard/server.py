@@ -483,6 +483,15 @@ def _goals(state):
     goal_data = context.get("goals") or response.get("goal_context") or {}
     if not isinstance(goal_data, dict):
         goal_data = {}
+    # Tickets may name epics and intake homes as their immediate parent. The
+    # dashboard's metadata distinguishes those from outcome homes; intake
+    # remains visible on Backlog, while only real goal homes belong here.
+    known_kinds = {"goal", "backlog", "epic", "other"}
+    if goal_data and all(isinstance(info, dict) and info.get("kind") in known_kinds
+                         for info in goal_data.values()):
+        goal_data = {goal: info for goal, info in goal_data.items()
+                     if isinstance(info, dict) and info.get("kind") == "goal"}
+        grouped = {goal: tickets for goal, tickets in grouped.items() if goal in goal_data}
     # Why a goal has no record: the snapshot says, else it is not in it.
     missing = str(response.get("goal_context_error") or
                   "the goal is not in the last snapshot's goal data")

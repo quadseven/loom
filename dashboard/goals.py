@@ -295,7 +295,8 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                  metrics_goal: Optional[str], now: datetime,
                  parents: Optional[Dict[str, Optional[str]]] = None,
                  unread: Optional[Dict[str, str]] = None,
-                 epics: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+                 epics: Optional[Dict[str, Dict[str, Any]]] = None,
+                 home_types: Optional[Dict[str, str]] = None) -> Dict[str, Dict[str, Any]]:
     """One record per goal the tickets name (their `Part of` line), and one
     per parent goal those goals roll up into.
 
@@ -337,6 +338,9 @@ def goal_context(rows: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, An
                              unread_proofs=unread_for(tickets), in_flight=flying.get(goal, 0),
                              parent=parents.get(goal), live_held=live_held)
            for goal, tickets in by_goal.items()}
+    if home_types is not None:
+        for goal, record in out.items():
+            record["kind"] = home_types.get(goal, "unknown")
     for goal, record in out.items():
         record["epics"] = epic_rows(goal, rows, epics or {})
     factory = _factory(metric_comments, now) if metrics_goal in out else None
