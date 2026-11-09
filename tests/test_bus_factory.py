@@ -5685,29 +5685,38 @@ class AbandonedReview(Base):
 
     def test_no_findings_quoted_notice_in_follow_up_body(self):
         """When no findings are read from threads, the follow-up body quotes the notice."""
-        notice = {
-            "body": factory.ABANDONED_MARKER + "\n\nGrug Haunt notice: this PR was merged with 1 "
-                    "high/critical Elder finding(s) from EARLIER in its review that never got a reply.",
-            "html_url": "https://example.test/pull/51#issuecomment-777",
-        }
-        ticket = factory._abandoned_follow_up(self.gh, REPO, 51, notice, [])
-        self.assertIsNotNone(ticket)
-        body = self.gh.issues[ticket]["body"]
+        self.noticed()
+        finding_line = "- `S110` in `services/_shared/llm_client.py:42`: try, except, pass detected."
+        self.gh.comments[51][0]["body"] = (
+            factory.ABANDONED_MARKER + "\n\n"
+            "Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
+            "from EARLIER in its review that never got a reply.\n\n"
+            + finding_line
+        )
+        self.gh.details[51]["reviewThreads"] = {"totalCount": 0, "nodes": []}
+        self.go()
+        self.assertEqual(len(self.follow_ups()), 1)
+        body = self.follow_ups()[0]["body"]
+        self.assertIn("- the findings could not be read from the review threads this pass", body)
+        self.assertIn("> " + finding_line, body)
         self.assertIn("> Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
                       "from EARLIER in its review that never got a reply.", body)
 
-    def test_with_findings_noticed_quoted_in_follow_up_body(self):
+    def test_with_findings_notice_quoted_in_follow_up_body(self):
         """When findings are read, the follow-up body lists them AND quotes the notice."""
-        notice = {
-            "body": factory.ABANDONED_MARKER + "\n\nGrug Haunt notice: this PR was merged with 1 "
-                    "high/critical Elder finding(s) from EARLIER in its review that never got a reply.",
-            "html_url": "https://example.test/pull/51#issuecomment-777",
-        }
-        findings = [("high", "S110", "services/_shared/llm_client.py")]
-        ticket = factory._abandoned_follow_up(self.gh, REPO, 51, notice, findings)
-        self.assertIsNotNone(ticket)
-        body = self.gh.issues[ticket]["body"]
+        self.noticed()
+        finding_line = "- `S110` in `services/_shared/llm_client.py:42`: try, except, pass detected."
+        self.gh.comments[51][0]["body"] = (
+            factory.ABANDONED_MARKER + "\n\n"
+            "Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
+            "from EARLIER in its review that never got a reply.\n\n"
+            + finding_line
+        )
+        self.go(lint_run=lambda rule, path, text: True)
+        self.assertEqual(len(self.follow_ups()), 1)
+        body = self.follow_ups()[0]["body"]
         self.assertIn("- high `S110` on `services/_shared/llm_client.py`", body)
+        self.assertIn("> " + finding_line, body)
         self.assertIn("> Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
                       "from EARLIER in its review that never got a reply.", body)
 

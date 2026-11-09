@@ -2202,12 +2202,15 @@ class Factory:
         named = ("\n".join("- %s `%s` on `%s`" % (severity, rule.upper(), path)
                            for severity, rule, path in findings)
                  or "- the findings could not be read from the review threads this pass")
+        quoted = "\n".join("> " + line for line in str(notice.get("body") or "").splitlines())
         body = ("The review bot's Sentinel left an abandoned-review notice on #%d "
                 "(%s): the pull request merged while high or critical findings from "
                 "an earlier review had never got a reply. Settle it by re-checking "
                 "each finding on the merged branch; the factory answers the notice "
                 "itself once every re-check passes.\n\n%s\n"
                 % (pr_number, notice.get("html_url") or "no link read", named))
+        if quoted:
+            body += "\n%s\n" % quoted
         brain._check_written_text(title + "\n" + body)
         made = self.gh.rest("POST", "/repos/%s/issues" % repo,
                             {"title": title, "body": body, "labels": [DEFER_LABEL]}).data or {}
