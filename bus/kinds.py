@@ -18,7 +18,8 @@ OWNER_ONLY_KINDS = ("money", "hardware", "credential", "physical", "decision")
 
 # Labels a research or read-and-report ticket carries. Read from the stored
 # ticket, never from the ask text, which a model writes.
-RESEARCH_LABELS = ("research", "loom:research", "type:research", "read-and-report")
+# The only real one is wayfinder:research; class:* labels name change classes.
+RESEARCH_LABELS = ("wayfinder:research",)
 
 
 def research_source(labels) -> bool:

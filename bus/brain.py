@@ -4339,8 +4339,9 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
         # Kind account on a research source is work a lane can do: no hold, the
         # ticket goes to triage to be briefed (loom#2121).
         print("brain: %s#%d is a research source; Kind account is refused as a hold "
-              "and routed to a lane" % (repo, number), file=sys.stderr)
-        _set_ask_label(gh, repo, number, names, "loom:triage")
+              "and routed to a lane (an existing human hold stands)" % (repo, number), file=sys.stderr)
+        if not needs_human(names):
+            _set_ask_label(gh, repo, number, names, "loom:triage")
         return
     if needs_human(names):
         comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))

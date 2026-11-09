@@ -260,7 +260,7 @@ class RewriteIssueTest(Base):
 
     def test_a_research_ticket_with_kind_account_is_not_proposed_as_person_only(self):
         answer = {"action": "human", "kind": "account", "ask": "Grant read access to the repo."}
-        out = rewrite.apply_answer(self.gh(), REPO, GOAL, 7, json.dumps(answer), ["research", "loom:triage"])
+        out = rewrite.apply_answer(self.gh(), REPO, GOAL, 7, json.dumps(answer), ["wayfinder:research", "loom:triage"])
         self.assertEqual(out, "skip")
         self.assertEqual(self.fake.labels, [])
 
