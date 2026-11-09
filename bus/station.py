@@ -5027,7 +5027,7 @@ class Station:
             text = self._blob_text(repo, str(entry.get("sha") or ""))
             if text is None:
                 return None
-            present.update(verify_data.DEF_RE.findall(text))
+            present.update(verify_data.defined_tests([text]))
             if wanted <= present:
                 break
         return present

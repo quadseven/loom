@@ -13914,6 +13914,20 @@ class VerifyResultTest(Base):
         self.assertEqual(len(self.proofs()), 1)
         self.assertNotIn("cited test", self.proofs()[0])
 
+    def test_revision_test_lookup_uses_the_shared_definition_parser(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        text = "class Tests:\n    def test_present_in_tree(self):\n        pass\n"
+        responses = [mock.Mock(data={"tree": {"sha": "tree-sha"}}),
+                     mock.Mock(data={"tree": [{"type": "blob", "path": "tests/test_sample.py",
+                                                "sha": "blob-sha"}], "truncated": False})]
+        with mock.patch.object(runner.gh, "rest", side_effect=responses), \
+                mock.patch.object(runner, "_blob_text", return_value=text), \
+                mock.patch("bus.station.verify_data.defined_tests",
+                           wraps=station.verify_data.defined_tests) as parser:
+            found = runner._test_names_at(REPO, "abc1234", {"test_present_in_tree"})
+        self.assertEqual(found, {"test_present_in_tree"})
+        parser.assert_called_once_with([text])
+
     def refuse_n(self, count):
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=time.time())
         for _ in range(count):
