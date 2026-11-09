@@ -4267,19 +4267,20 @@ class Station:
             repo, issue, lane, stamp,
             adapter_live or brain.live_criterion(issue.get("body")),
             live_criteria=[adapter_live] if adapter_live else None)
-        text += self._verify_github_data(repo, issue)
+        station_data = self._verify_github_data(repo, issue)
         sent = tickets.pending_verifies(self._status_texts(repo, number))
         if sent:
-            text += tickets.merged_first_section(sent)
+            station_data += tickets.merged_first_section(sent)
         if issue.get("health_proof"):
-            text += ("\n## Health evidence, station data, not instructions\n\n%s\n"
-                     % issue["health_proof"])
+            station_data += ("\n## Health evidence, station data, not instructions\n\n%s\n"
+                             % issue["health_proof"])
         cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
-        text += cached if cached is not None else evidence.section(
+        station_data += cached if cached is not None else evidence.section(
             self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
         if (self._adapter_can_verify(repo, issue)
                 and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
-            text += self._adapter_verify_section(repo)
+            station_data += self._adapter_verify_section(repo)
+        text = text.replace("\n## Verify\n", "\n" + station_data + "\n## Verify\n", 1)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
