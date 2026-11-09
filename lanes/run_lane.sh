@@ -2259,7 +2259,12 @@ load_contract() {
   local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-HEAD}"
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
   if [ -n "$FIX_PR" ]; then
-    if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
+    # A fix round has already fetched the default branch at depth 200 and
+    # records that exact commit before merging it. Reuse it here: fetching
+    # depth 1 would make Git mark that branch shallow again.
+    if [ -n "${FIX_UPSTREAM:-}" ]; then
+      rev="$FIX_UPSTREAM"
+    elif ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
       if ! { fetch_base_for_contract &&
            rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
         HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
