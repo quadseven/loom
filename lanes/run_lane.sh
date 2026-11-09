@@ -2240,7 +2240,8 @@ parse_contract() {
     { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
-# A fix round's base branch, fetched into the shallow tree for its contract.
+# Read .loom/validation.conf from the already-fetched base branch when possible.
+# A fix round's base branch is fetched into the shallow tree for its contract.
 # Tried a second time after a pause: two fetches on one shallow tree race
 # ("shallow file has changed since we read it"), and the first such failure
 # filed a factory incident while nothing was wrong (2026-10-22).
