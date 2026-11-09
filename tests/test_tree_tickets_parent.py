@@ -37,6 +37,11 @@ class AStalePartOfLine(unittest.TestCase):
         self.assertEqual(brain._tree_tickets(53, [child], [child]), [child])
         self.assertEqual(brain._tree_tickets(53, [], [child]), [child])
 
+    def test_a_sub_issue_listed_under_an_epic_but_parented_elsewhere_is_not_counted(self):
+        stray = ticket(30, "Part of #53\n", parent=11)
+        self.assertEqual(brain._tree_tickets(53, [stray], []), [])
+        self.assertEqual(brain._tree_tickets(11, [stray], [stray]), [stray])
+
 
 if __name__ == "__main__":
     unittest.main()

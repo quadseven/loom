@@ -2512,8 +2512,12 @@ def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[s
     issue's sub-issue belongs to that parent, so a Part of line left naming
     this epic is stale and does not count: two open sub-issues of an open
     epic were reported as stranded under a closed one whose number their
-    bodies still named (loom#2767, loom#1713)."""
-    tickets_ = [c for c in sub if isinstance(c, dict)]
+    bodies still named (loom#2767, loom#1713). A sub-issue listed under this
+    epic whose parent_issue_url names another issue is likewise not counted,
+    since it belongs to that parent, not to this epic (loom#2856)."""
+    tickets_ = [c for c in sub if isinstance(c, dict)
+                and (_sub_issue_parent(c) is None
+                     or _sub_issue_parent(c) == number)]
     seen = {int(c.get("number") or 0) for c in tickets_}
     for item in open_tickets:
         n = int(item.get("number") or 0)
