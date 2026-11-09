@@ -550,6 +550,15 @@ class StationTest(StationBase):
         self.assertIn("#41", filed["title"] + filed["body"])
         self.assertNotIn("#42", filed["title"] + filed["body"])
 
+    def test_ticket_6219_queued_with_lane_label_and_brief_headers(self):
+        """Test that ticket 6219 satisfies the queued-ticket-no-headers invariant by having brief headers."""
+        self.gh.tickets.setdefault(REPO, []).append(
+            {"number": 6219, "state": "open", "user": {"login": AUTHOR},
+             "body": "Difficulty: medium\nBase: shuttle-pilot/llm-routing/optimize\n\n## Why\nOptimize LLM routing for shuttle pilot.\n",
+             "labels": [{"name": n} for n in ("loom:ticket", "loom:queued", "lane:openrouter")]})
+        self.run_at(T0)
+        self.assertEqual(self.breaches(), [])
+
     def test_no_topup_is_read_from_the_environment(self):
         self.assertEqual(station.Settings.from_env({"LOOM_NO_TOPUP": "Anthropic, zen"}).no_topup,
                          ["anthropic", "zen"])
