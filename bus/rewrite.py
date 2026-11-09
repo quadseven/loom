@@ -14,10 +14,10 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 from . import brain, tickets
-from .kinds import HUMAN_KINDS
+from .kinds import HUMAN_KINDS, refused_as_hold
 from .text import SECRET_RE, scrub_paths
 from .github import GitHub
 
@@ -326,7 +326,7 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
             kind = str(answer.get("kind") or "").strip().lower()
             if kind not in HUMAN_KINDS:
                 raise Invalid("kind is not one of %s" % ", ".join(HUMAN_KINDS))
-            return "human", {"ask": "Kind: %s\n%s" % (kind, ask)}
+            return "human", {"ask": "Kind: %s\n%s" % (kind, ask), "kind": kind}
         if action != "brief":
             raise Invalid("action is not brief, human or skip")
         title = _text(answer, "title").strip()
@@ -381,14 +381,21 @@ def prompt_for(gh: GitHub, repo: str, issue: Dict[str, Any]) -> str:
     return build_prompt(issue, [c for c in comments if isinstance(c, dict)], brief_format())
 
 
-def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str) -> str:
+def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str,
+                 labels: Sequence[str] = ()) -> str:
     """Write what the agent's answer asks for. Returns "brief", "human" or
-    "skip"; Invalid for a bad answer (nothing written)."""
+    "skip"; Invalid for a bad answer (nothing written). `labels` are the
+    stored labels of the issue: a person-only answer of Kind account on a
+    research source is refused, not proposed (loom#2121)."""
     action, fields = validate(parse_answer(output))
     if action == "brief":
         # No lane: the ticket is queued and the station's tier pick gives it one.
         brain.brief_intake(gh, repo, goal, fields["title"], fields["body"],
                     difficulty=fields["difficulty"], refs=number)
+    elif action == "human" and refused_as_hold(fields["kind"], labels):
+        print("rewrite: %s#%d is a research source; Kind account is refused as a hold "
+              "and left loom:triage for a lane" % (repo, number), file=sys.stderr)
+        return "skip"
     elif action == "human":
         # The rewrite model only proposes it: free models labelled factory
         # work as person-only (GitHub access as "a credential", a Datadog
@@ -406,7 +413,8 @@ def rewrite_issue(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any], cmd: 
     Raises Invalid for a bad answer (nothing written); GitHub errors and
     brain's own refusals (ValueError) pass through."""
     prompt = prompt_for(gh, repo, issue)
-    return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout))
+    return apply_answer(gh, repo, goal, int(issue["number"]), run_agent(cmd, prompt, timeout),
+                        [str((x or {}).get("name", "")) for x in issue.get("labels") or []])
 
 
 if __name__ == "__main__":

@@ -813,7 +813,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    with a line `Kind: K` (one of money, hardware, account, credential,
    physical, decision) and then names the exact thing needed. A credential is
    a secret only the owner holds, not GitHub access, which the factory has; a
-   decision is one nobody has made yet. Never park work there: a ticket the
+   decision is one nobody has made yet. Kind account on a research or
+   read-and-report ticket is refused as a hold and routed to a lane. Never
+   park work there: a ticket the
    unproven-work gate only delays stays `loom:triage`, and anything a lane,
    the brain or the station can do with the repo, the GitHub API, logs, a
    read of a running system or a diagnosis is a brief. When an open
