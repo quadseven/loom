@@ -23,7 +23,7 @@ from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
-from .labels import HANDOFF, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
+from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import tick_clock
 from . import home_repo
@@ -4292,7 +4292,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
 # do with the repo, the GitHub API, logs or a diagnosis is not one of these,
 # and neither is work the unproven-work gate only delays: 174 needs:human
 # issues on 2026-10-18 were mostly such work, parked as "waiting on you".
-from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE
+from bus.kinds import HUMAN_KINDS, HUMAN_KIND_RE, refused_as_hold
 import re
 _HUMAN_KIND_RE = re.compile(HUMAN_KIND_RE)
 
@@ -4303,9 +4303,24 @@ def human_kind(ask: str) -> Tuple[str, str]:
     match = _HUMAN_KIND_RE.match(ask.strip())
     kind = match.group(1).lower() if match else ""
     if kind not in HUMAN_KINDS:
+        # Unknown Kind keeps refusing as before; the warning names it (loom#2121).
+        print("warning: unknown ask Kind %r; refused as before" % kind, file=sys.stderr)
         raise ValueError("the ask must start with a line \"Kind: K\", K one of %s: "
                          "only a person can do it for that reason" % ", ".join(HUMAN_KINDS))
     return kind, ask.strip()[match.end():].strip()
+
+
+def _set_ask_label(gh: GitHub, repo: str, number: int, names: Sequence[str],
+                   add: str) -> None:
+    """The one writer of the ask and triage labels: loom:triage and needs:human
+    are mutually exclusive, so adding one takes the other off (loom#2121)."""
+    opposite = {NEEDS_HUMAN: ("loom:triage",),
+                "loom:triage": tuple(HUMAN_LABELS)}.get(add, ())
+    for gone in opposite:
+        if gone in names:
+            _remove_label(gh, repo, number, gone)
+    if add not in names:
+        gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [add]})
 
 
 def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
@@ -4320,6 +4335,13 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
     names = _labels(_open_issue(gh, repo, number))
     if any(label.startswith("blocked:") for label in names):
         raise ValueError("#%d is blocked; do not ask a person while the block stands" % number)
+    if refused_as_hold(kind, names):
+        # Kind account on a research source is work a lane can do: no hold, the
+        # ticket goes to triage to be briefed (loom#2121).
+        print("brain: %s#%d is a research source; Kind account is refused as a hold "
+              "and routed to a lane" % (repo, number), file=sys.stderr)
+        _set_ask_label(gh, repo, number, names, "loom:triage")
+        return
     if needs_human(names):
         comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         if any(str((comment or {}).get("body") or "").startswith(HUMAN_MARKER)
@@ -4327,9 +4349,7 @@ def human(gh: GitHub, repo: str, number: int, ask: str) -> None:
             raise ValueError("#%d is already needs:human" % number)
     notify.post(gh, repo, number, "%s\n%s\nKind: %s" % (HUMAN_MARKER, ask, kind),
                 notify.ASK)
-    if "loom:triage" in names:
-        _remove_label(gh, repo, number, "loom:triage")
-    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_HUMAN]})
+    _set_ask_label(gh, repo, number, names, NEEDS_HUMAN)
 
 
 # The backlog goal home's title (docs/NAMING.md); the loom:backlog label, not

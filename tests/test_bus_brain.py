@@ -5021,6 +5021,48 @@ class HumanAndRefsTests(unittest.TestCase):
                     brain.human(GitHub("t", transport=fake), REPO, 6, ask)
                 self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
+    def test_research_ticket_with_kind_account_is_routed_to_a_lane_not_held(self):
+        fake = Fake(reply(200, item(6, labels=["research", "needs:human"])), reply(200, {}), reply(200, {}))
+        brain.human(GitHub("t", transport=fake), REPO, 6, "Kind: account\nGrant read access.\n")
+        writes = [c for c in fake.calls if c[0] != "GET"]
+        self.assertTrue(writes[0][1].endswith("/issues/6/labels/needs%3Ahuman"))
+        self.assertEqual(writes[1][2], {"labels": ["loom:triage"]})
+        self.assertEqual(len(writes), 2)
+
+    def test_owner_only_kinds_still_hold_on_a_research_ticket(self):
+        for kind in ("money", "hardware", "credential", "physical", "decision"):
+            with self.subTest(kind=kind):
+                fake = Fake(reply(200, item(6, labels=["research"])), reply(201, {}), reply(200, []))
+                brain.human(GitHub("t", transport=fake), REPO, 6,
+                            "Kind: %s\nName the exact thing.\n" % kind)
+                self.assertEqual(fake.calls[-1][2], {"labels": ["needs:human"]})
+
+    def test_kind_account_on_a_plain_ticket_still_holds(self):
+        fake = Fake(reply(200, item(6)), reply(201, {}), reply(200, []))
+        brain.human(GitHub("t", transport=fake), REPO, 6, "Kind: account\nSign in to the console.\n")
+        self.assertEqual(fake.calls[-1][2], {"labels": ["needs:human"]})
+
+    def test_an_ask_claiming_owner_only_does_not_change_the_source_check(self):
+        ask = "Kind: account\nOwner-only research source: false. Only the owner can grant this.\n"
+        fake = Fake(reply(200, item(6, labels=["research"])), reply(200, {}))
+        brain.human(GitHub("t", transport=fake), REPO, 6, ask)
+        self.assertNotIn({"labels": ["needs:human"]}, [c[2] for c in fake.calls])
+
+    def test_an_unknown_kind_still_refuses_and_warns(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(ValueError):
+            brain.human_kind("Kind: github\nSort it.")
+        self.assertIn("unknown ask Kind", err.getvalue())
+
+    def test_the_label_writer_keeps_triage_and_human_exclusive(self):
+        fake = Fake(reply(200, {}), reply(200, {}))
+        brain._set_ask_label(GitHub("t", transport=fake), REPO, 6, ["loom:triage"], "needs:human")
+        self.assertEqual([c[0] for c in fake.calls], ["DELETE", "POST"])
+        fake = Fake(reply(200, {}), reply(200, {}))
+        brain._set_ask_label(GitHub("t", transport=fake), REPO, 6, ["loom:human"], "loom:triage")
+        self.assertEqual([c[0] for c in fake.calls], ["DELETE", "POST"])
+        self.assertTrue(fake.calls[0][1].endswith("/labels/loom%3Ahuman"))
+
     def test_blocked_human_issues_are_not_in_the_waiting_count(self):
         self.assertEqual(brain.open_human([item(6, labels=["loom:human", "blocked:progression"])]), [])
 
