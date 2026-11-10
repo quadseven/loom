@@ -2703,8 +2703,14 @@ def open_epic(gh: GitHub, repo: str, epic: int
     else:
         held = len(_epic_tickets(gh, repo, epic))
     if held >= EPIC_TICKET_CAP:
-        raise ValueError("epic #%d already holds %d tickets (cap %d): file under its next epic"
-                         % (epic, held, EPIC_TICKET_CAP))
+        standing = next((int(candidate.get("number") or 0)
+                         for candidate in _goal_epics(gh, repo, goal, [])
+                         if candidate.get("state") == "open" and standing_epic(candidate)), None)
+        route = "file under its next epic"
+        if standing:
+            route += ", or the standing repairs epic #%d" % standing
+        raise ValueError("epic #%d already holds %d tickets (cap %d): %s"
+                         % (epic, held, EPIC_TICKET_CAP, route))
     return issue, goal, goal_issue
 
 
