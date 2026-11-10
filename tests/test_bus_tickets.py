@@ -327,6 +327,18 @@ class DifficultyHeaderTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse(bad)
 
+    def test_a_stray_field_line_is_named_and_dropped(self):
+        # loom#1821: the station names the line when it triages such a
+        # ticket, and a writer drops the line so its own parser accepts
+        # the body; a real header block is left exactly as it is.
+        from bus.tickets import stray_field_line, without_stray_field_lines
+        body = "Difficulty: easy\n\n## What\nModel: some-model\nDo it.\n"
+        self.assertEqual(stray_field_line(body), "Model")
+        self.assertIsNone(stray_field_line("Difficulty: easy\n\n## What\nDo it.\n"))
+        cleaned = without_stray_field_lines(body)
+        self.assertEqual(parse(cleaned)[0], {"Difficulty": "easy"})
+        self.assertIn("Do it.", cleaned)
+
 
 class PriorityTest(unittest.TestCase):
     """Priority: P0 to P3 orders every queue after the FIRST labels."""

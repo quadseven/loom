@@ -679,6 +679,26 @@ class StationRewriteTest(Base):
 if __name__ == "__main__":
     unittest.main()
 
+class ValidateStrayFieldLineTest(unittest.TestCase):
+    """A rewrite answer whose body repeats a header-like line (a stray
+    "Model:" line in a section) was refused by the brief parser, so the
+    rewrite wrote nothing on every pass (loom#1821). The rewrite step drops
+    the stray line before writing, so its own parser accepts the body."""
+
+    def test_a_stray_field_line_is_dropped_and_the_brief_is_written(self):
+        body = BODY.replace("## What\nCache the query.",
+                            "## What\nModel: some-model\nCache the query.")
+        action, fields = rewrite.validate(
+            {"action": "brief", "title": "Cache the page query",
+             "difficulty": "easy", "body": body})
+        self.assertEqual(action, "brief")
+        self.assertNotIn("Model:", fields["body"])
+        self.assertIn("Cache the query.", fields["body"])
+        from bus import tickets
+        headers, _ = tickets.parse(fields["body"])
+        self.assertEqual(headers, {})
+
+
 class AnswerShapeTest(unittest.TestCase):
     """An unusable answer is described by its shape, never its words: all
     eight Live restates and 113 rewrites failed with one message on

@@ -5172,6 +5172,36 @@ class Station:
             _say("%s#%d is no longer held by %s, closed as not planned"
                  % (repo, number, dep.short))
 
+    def _triage_stray_brief(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Move a ticket whose body parse refuses for a header-like line to
+        loom:triage, with one comment naming the line (loom#1821). Such a
+        ticket was only logged on every claim pass and never repaired; in
+        triage the rewrite step and people see it. The marker comment makes
+        the move once per ticket, however many passes refuse it."""
+        field = tickets.stray_field_line(issue.get("body"))
+        if field is None:
+            return
+        number = int(issue["number"])
+        names = _label_names(issue)
+        if "loom:triage" not in names:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["loom:triage"]})
+            for state in ("loom:queued", "loom:briefed"):
+                if state in names:
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                                 % (repo, number, quote(state, safe="")), ok=(404,))
+        said = any(str(c.get("body") or "").startswith("<!-- loom:stray-brief v1 -->")
+                   for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                   if isinstance(c, dict))
+        if not said:
+            notify.post(self.gh, repo, number,
+                        "<!-- loom:stray-brief v1 -->\nMoved to loom:triage: the body "
+                        "line %r looks like a brief header, so the brief parser "
+                        "refuses this ticket and no lane can claim it as written. "
+                        "Reword or remove that line, or let the rewrite step "
+                        "rewrite the ticket, and it can be briefed again." % field,
+                        notify.RECORD)
+
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
@@ -5183,6 +5213,7 @@ class Station:
         try:
             headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
+            self._triage_stray_brief(repo, issue)
             self._refuse(repo, issue, "unusable brief: %s" % err)
             return False
         hold = tickets.not_before(headers)
