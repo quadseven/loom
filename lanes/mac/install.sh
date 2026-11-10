@@ -209,6 +209,10 @@ with open(sys.argv[1], "rb") as plist:
 keep_installed LOOM_TRUSTED_BRIEFERS
 keep_installed LOOM_BRIEF_AUTHORS
 keep_installed LOOM_ASK_ANSWERERS
+keep_installed LOOM_ANTHROPIC_BUDGET_USD
+keep_installed LOOM_ANTHROPIC_BUDGET_SINCE
+keep_installed LOOM_ANTHROPIC_BUDGET_EXPIRES
+keep_installed LOOM_NO_TOPUP
 
 LANES=("$@")
 [ "${#LANES[@]}" -gt 0 ] || LANES=(codex claude openrouter opencode-go anthropic zen zai workersai agy spark copilot
@@ -235,6 +239,8 @@ loom_env() {
   while IFS= read -r k; do
     case "$k" in
       LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS|LOOM_DB_*) continue ;;
+      # Review-output windows are station configuration, not agent input.
+      LOOM_FABRIC_REVIEW_NOTES) continue ;;
       # Each job gets its own writer's App from app_env, never another's.
       LOOM_GITHUB_APP_*|LOOM_LANES_GITHUB_APP_*|LOOM_BRAIN_GITHUB_APP_*) continue ;;
       LOOM_*) ;; *) continue ;;
@@ -503,6 +509,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
     <key>LOOM_FABRIC_KEY_SSM</key><string>$(xml "${LOOM_FABRIC_KEY_SSM:-}")</string>
+    <key>LOOM_FABRIC_REVIEW_NOTES</key><string>$(xml "${LOOM_FABRIC_REVIEW_NOTES:-}")</string>
     <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
     <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>

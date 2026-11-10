@@ -152,8 +152,11 @@ Neither needs a model:
 - A needs-brain hold older than a day that Loom set (bus/brain_hold.py,
   brain_holds; the station runs it at most every half hour, 5 a run) is
   resolved: a loom:pr ticket whose pull request fails only the plan check on
-  its body has the body rebuilt and the hold lifted; any other goes to the
-  hand-off pool with one note (loom#1872). A person's hold is never lifted.
+  its body has the body rebuilt and the hold lifted; any other ticket goes to
+  the hand-off pool with one note (loom#1872). A triage issue's hold is
+  lifted once for one more rewrite attempt, its refusal reason quoted, and
+  goes to the hand-off pool when the hold returns after that attempt
+  (loom#1884). A person's hold is never lifted.
 - A ticket with an open lane pull request that has carried needs-brain for
   brain_hold.STALL_AGE (4 hours, under the 6-hour lane-pr-stalled limit) goes
   to loom:human with one comment naming the pull request, the merge command
@@ -991,6 +994,16 @@ def deferrable(threads: Sequence[Dict[str, Any]], bot: str, asked: set,
                 and not merge_tier.bad_work(body)
                 and (immediate or str(t.get("id")) in asked or rounds >= DEFER_AFTER))
     return still if still and all(minor(t) for t in still) else []
+
+
+def _finding_rule(thread: Dict[str, Any]) -> str:
+    """The review bot's rule named on a deferred finding's first line, or
+    "" when it is not a parseable finding."""
+    root = _end(thread, "root", 0)
+    lines = str(root.get("body") or "").strip().splitlines()
+    first = lines[0] if lines else ""
+    hit = merge_tier.finding(first)
+    return str(hit[2]) if hit else ""
 
 
 def finding_line(thread: Dict[str, Any]) -> str:
@@ -2089,6 +2102,10 @@ class Factory:
         for found in self.gh.paginate("/repos/%s/issues?labels=%s&state=open" % (repo, DEFER_LABEL)):
             if isinstance(found, dict) and found.get("title") in known and self._trusted(found):
                 return int(found["number"])
+        if picked and all(_finding_rule(t) == "missing-test-coverage" for t in picked):
+            _say("skipped follow-up for %s#%d: %d coverage-only "
+                 "(missing-test-coverage) finding(s)" % (repo, number, len(picked)))
+            return 0
         body = ("Review findings deferred from #%d (ticket #%d) when it landed: the "
                 "review check passed on %s after %d fix round(s), and these medium or "
                 "low findings were still open. The brain rewrites this into a ticket "
@@ -5421,21 +5438,28 @@ class Factory:
                     write: bool = True) -> Dict[str, Dict[str, int]]:
         """Resolve up to `limit` needs-brain holds older than
         brain_hold.HOLD_AGE that Loom set (brain_hold.setter), oldest first
-        (_lift_hold). A hold a person set, or one whose setter is unknown, is
-        left and counted. Each repo's counts (brain_hold.counts) come back;
+        (_lift_hold; _lift_triage_hold for a triage issue, loom#1884). A hold
+        a person set, or one whose setter is unknown, is left and counted.
+        Each repo's counts (brain_hold.counts) come back;
         with write False nothing is written and the LOOM count says how many
         holds a run could resolve. A hold that errors still uses its turn,
         so a run never writes more than `limit` times however it ends."""
         report: Dict[str, Dict[str, int]] = {}
         loom = brain_hold.loom_logins(self.trusted)
-        due: List[Tuple[float, str, Dict[str, Any], brain_hold.Setter]] = []
+        due: List[Tuple[float, str, Dict[str, Any], brain_hold.Setter, bool]] = []
         for repo in self.repos:
             counts = report[repo] = brain_hold.counts()
             try:
-                held = [i for i in self._tickets(repo).values() if brain_hold.LABEL in _labels(i)]
+                by_number = {int(i["number"]): i for i in self._tickets(repo).values()}
             except GitHubError as err:
                 _say("could not read the held tickets of %s: %s" % (repo, err))
                 continue
+            try:
+                for issue in self._triaged(repo):
+                    by_number.setdefault(int(issue["number"]), issue)
+            except GitHubError as err:
+                _say("could not read the triage issues of %s: %s" % (repo, err))
+            held = [i for i in by_number.values() if brain_hold.LABEL in _labels(i)]
             for issue in held:
                 number = int(issue["number"])
                 try:
@@ -5450,17 +5474,58 @@ class Factory:
                 counts["old"] += 1
                 counts[found.kind] += 1
                 if found.kind == brain_hold.LOOM:
-                    due.append((age, repo, issue, found))
-        for age, repo, issue, found in sorted(due, key=lambda d: -d[0]):
+                    triage = (brain_hold.TRIAGE_LABEL in _labels(issue)
+                              and "loom:ticket" not in _labels(issue))
+                    due.append((age, repo, issue, found, triage))
+        for age, repo, issue, found, triage in sorted(due, key=lambda d: -d[0]):
             if not write or limit <= 0:
                 break
             done: List[bool] = []
-            ok = self._guarded(self._lift_hold, repo, issue, found, age, done)
+            lift = self._lift_triage_hold if triage else self._lift_hold
+            ok = self._guarded(lift, repo, issue, found, age, done)
             if done and done[0]:
                 report[repo]["lifted"] += 1
             if not ok or done[:1] == [True]:
                 limit -= 1
         return report
+
+    def _triaged(self, repo: str) -> List[Dict[str, Any]]:
+        """The repo's open triage issues (bus/rewrite.py candidates reads the
+        same listing): issues at loom:triage, not tickets and not pull
+        requests, whatever their other labels."""
+        data = self.gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open" % repo)
+        return [i for i in data if isinstance(i, dict) and "pull_request" not in i
+                and "number" in i and "loom:ticket" not in _labels(i)]
+
+    def _lift_triage_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
+                          age: float, done: List[bool]) -> None:
+        """Resolve one triage issue's hold Loom set (loom#1884): with no
+        retry note yet, take needs-brain off and leave the issue at
+        loom:triage with one retry note quoting why it was held (the
+        rewrite's last refusal), so the rewrite step -- whose candidates
+        leave held issues out -- tries once more. With a retry note already
+        on it, the rewrite could not turn it into a brief: put it in the
+        hand-off pool with one note, as _hold_hand_off does for a ticket."""
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        why = brain_hold.reason(comments, found.at, "triage")
+        hours = age / 3600
+        if any(brain_hold.RETRY_MARKER in str(c.get("body") or "") for c in comments):
+            kept = list(dict.fromkeys(
+                [x for x in _labels(issue) if x != brain_hold.LABEL] + [HANDOFF_LABEL]))
+            self._relabel(repo, issue, kept)
+            self._status_note(repo, number, brain_hold.triage_handoff_note(
+                found, hours, why, HANDOFF_LABEL))
+            _say("handed off %s#%d: its triage needs-brain hold returned after its "
+                 "rewrite retry" % (repo, number))
+        else:
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, brain_hold.LABEL), ok=(404,))
+            issue["labels"] = [{"name": x} for x in _labels(issue) if x != brain_hold.LABEL]
+            self._status_note(repo, number, brain_hold.triage_retry_note(found, hours, why))
+            _say("freed %s#%d's triage needs-brain hold for one more rewrite attempt"
+                 % (repo, number))
+        done.append(True)
 
     def _lift_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
                    age: float, done: List[bool]) -> None:

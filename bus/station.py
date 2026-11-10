@@ -47,7 +47,7 @@ from . import decision_claim
 from . import evidence_close
 from . import journal
 from . import operator_budget
-from . import fabric
+from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
 from . import flake
@@ -1127,7 +1127,8 @@ class Settings:
                  urgency_config: Optional[urgency.Config] = None,
                  pass_deadline: int = 0,
                  decision_window_days: int = 3,
-                 repo_pr_caps: Optional[Dict[str, int]] = None) -> None:
+                 repo_pr_caps: Optional[Dict[str, int]] = None,
+                 fabric_review_notes: str = "") -> None:
         self.home = home
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
@@ -1251,6 +1252,7 @@ class Settings:
         self.transcript_url = transcript_url
         # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
         self.fabric_key_ssm = fabric_key_ssm
+        self.fabric_review_notes = fabric_review_notes
         self.transcript_token_ssm = transcript_token_ssm
         # (component, log path) pairs bus/watch.py reads each pass.
         self.watched = watch.components(home) if watched is None else watched
@@ -1320,6 +1322,7 @@ class Settings:
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
+                   fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -6078,7 +6081,7 @@ class Station:
                      self.queue_stateless_tickets,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
-                     self.health_intake, self.intake_friction, self.report_review_debt,
+                     self.health_intake, self.check_fabric_reviews, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -12763,6 +12766,22 @@ class Station:
                 budget -= 1
                 self._restate_one(repo, key, issue, cmd)
             _write_json(path, state)
+
+    def check_fabric_reviews(self) -> None:
+        """Check expected Fabric note windows once per configured calendar day."""
+        if not self.s.fabric_review_notes:
+            return
+        path = os.path.join(self.state, fabric_reviews.STATE_FILE)
+        try:
+            state = _read_json(path, {})
+            if not isinstance(state, dict):
+                raise ValueError("invalid daily check state")
+            fabric_reviews.run_pass(
+                self.gh, self.s.self_repo, self.s.fabric_review_notes,
+                self.s.fabric_key_ssm, self.s.region, state, self.now,
+                lambda: _write_json(path, state), self.read_secret)
+        except (StateError, ValueError):
+            _say("Fabric review check stopped: invalid configuration or state")
 
     # -- health findings -------------------------------------------------
     def health_intake(self) -> None:
