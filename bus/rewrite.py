@@ -338,10 +338,11 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         body = _text(answer, "body").strip()
         # The agent sometimes repeats a header-like line inside a section
         # (a stray "Model:" line); the brief parser refuses that body, so
-        # the rewrite wrote nothing on every pass (loom#1821). Drop the
-        # stray lines before checking, so the rewrite never writes a body
-        # its own parser refuses.
-        body = tickets.without_stray_field_lines(body)
+        # the rewrite wrote nothing on every pass (loom#1821). Defuse the
+        # stray lines before checking (their words stay, only the header
+        # shape breaks), so the rewrite never writes a body its own parser
+        # refuses and never loses a line's text without a trace.
+        body = tickets.defuse_stray_field_lines(body)
         headers, _ = tickets.parse(body)
         if headers:
             raise Invalid("body carries header lines (%s)" % ", ".join(headers))

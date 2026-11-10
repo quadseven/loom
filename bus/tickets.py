@@ -332,10 +332,14 @@ def stray_field_line(body: Optional[str]) -> Optional[str]:
     return None
 
 
-def without_stray_field_lines(body: str) -> str:
-    """The body with its stray field lines dropped: lines after the header
-    block that FIELD_LINE_RE matches and parse therefore refuses. A writer
-    that composes a body (the rewrite step, loom#1821) runs its text through
+def defuse_stray_field_lines(body: str) -> str:
+    """The body with its stray field lines defused: a line after the header
+    block that FIELD_LINE_RE matches (and parse therefore refuses) keeps
+    every word it carried, with its colon replaced by a dash, so it reads
+    as prose and no longer looks like a brief header. Dropping such a line
+    instead would lose text without a trace: the line can be the only
+    statement of the problem ("Issue: the cache misses..."). A writer that
+    composes a body (the rewrite step, loom#1821) runs its text through
     this first, so it never writes a body its own parser refuses; the
     header block itself is kept exactly as it is, so a repeated or
     conflicting real header still refuses in parse."""
@@ -343,7 +347,12 @@ def without_stray_field_lines(body: str) -> str:
     i = 0
     while i < len(lines) and HEADER_RE.fullmatch(lines[i].rstrip()):
         i += 1
-    kept = lines[:i] + [line for line in lines[i:] if not FIELD_LINE_RE.match(line)]
+    kept = lines[:i]
+    for line in lines[i:]:
+        m = FIELD_LINE_RE.match(line)
+        if m:
+            line = "%s -%s" % (m.group(1), line[m.end():])
+        kept.append(line)
     return "\n".join(kept)
 
 

@@ -628,6 +628,62 @@ class Base(unittest.TestCase):
             return []
 
 
+class StrayBriefTriageTest(Base):
+    """loom#1821: a ticket the brief parser refuses for a header-like body
+    line is moved to loom:triage once per body, with one marker comment
+    naming the field, instead of only being logged on every claim pass."""
+
+    def runner(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def add_stray(self, number=41):
+        self.fake.add(number, state="queued",
+                      body="Difficulty: easy\n\n## What\nModel: some-model\nDo it.\n")
+        return self.fake.issues[number]
+
+    def marker_comments(self, number):
+        return [c for c in self.fake.comments[number]
+                if str(c.get("body") or "").startswith("<!-- loom:stray-brief v1 -->")]
+
+    def test_a_queued_ticket_with_a_stray_line_is_triaged_with_one_comment(self):
+        issue = self.add_stray()
+        self.runner()._triage_stray_brief(REPO, issue)
+        self.assertIn("loom:triage", self.fake.names(41))
+        self.assertNotIn("loom:queued", self.fake.names(41))
+        said = self.marker_comments(41)
+        self.assertEqual(len(said), 1)
+        self.assertIn("Model", said[0]["body"])
+
+    def test_a_second_refusal_of_the_same_ticket_posts_no_second_comment(self):
+        issue = self.add_stray()
+        runner = self.runner()
+        runner._triage_stray_brief(REPO, issue)
+        runner._triage_stray_brief(REPO, self.fake.issues[41])
+        self.assertEqual(len(self.marker_comments(41)), 1)
+
+    def test_a_ticket_requeued_with_its_body_unchanged_is_not_moved_again(self):
+        issue = self.add_stray()
+        runner = self.runner()
+        runner._triage_stray_brief(REPO, issue)
+        # Triage sends it back to the queue without rewording the line.
+        labels = [lab for lab in self.fake.issues[41]["labels"]
+                  if lab["name"] != "loom:triage"]
+        labels.append({"name": "loom:queued"})
+        self.fake.issues[41]["labels"] = labels
+        runner._triage_stray_brief(REPO, self.fake.issues[41])
+        self.assertIn("loom:queued", self.fake.names(41))
+        self.assertNotIn("loom:triage", self.fake.names(41))
+        self.assertEqual(len(self.marker_comments(41)), 1)
+
+    def test_a_ticket_refused_for_another_reason_is_not_moved(self):
+        self.fake.add(42, state="queued",
+                      body="Difficulty: easy\nDifficulty: hard\n\n## What\nDo it.\n")
+        self.runner()._triage_stray_brief(REPO, self.fake.issues[42])
+        self.assertNotIn("loom:triage", self.fake.names(42))
+        self.assertIn("loom:queued", self.fake.names(42))
+        self.assertEqual(self.marker_comments(42), [])
+
+
 class StationLabelSyncTest(Base):
     def test_changed_label_digest_syncs_every_repo_and_records_digest(self):
         repos = ["example-owner/first", "example-owner/second"]

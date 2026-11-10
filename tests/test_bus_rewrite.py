@@ -682,10 +682,11 @@ if __name__ == "__main__":
 class ValidateStrayFieldLineTest(unittest.TestCase):
     """A rewrite answer whose body repeats a header-like line (a stray
     "Model:" line in a section) was refused by the brief parser, so the
-    rewrite wrote nothing on every pass (loom#1821). The rewrite step drops
-    the stray line before writing, so its own parser accepts the body."""
+    rewrite wrote nothing on every pass (loom#1821). The rewrite step
+    defuses the stray line before writing (its words stay, only the
+    header shape breaks), so its own parser accepts the body."""
 
-    def test_a_stray_field_line_is_dropped_and_the_brief_is_written(self):
+    def test_a_stray_field_line_is_defused_and_the_brief_is_written(self):
         body = BODY.replace("## What\nCache the query.",
                             "## What\nModel: some-model\nCache the query.")
         action, fields = rewrite.validate(
@@ -693,10 +694,20 @@ class ValidateStrayFieldLineTest(unittest.TestCase):
              "difficulty": "easy", "body": body})
         self.assertEqual(action, "brief")
         self.assertNotIn("Model:", fields["body"])
+        self.assertIn("Model - some-model", fields["body"])
         self.assertIn("Cache the query.", fields["body"])
         from bus import tickets
         headers, _ = tickets.parse(fields["body"])
         self.assertEqual(headers, {})
+
+    def test_the_words_of_a_stray_line_survive_the_rewrite(self):
+        body = BODY.replace("## What\nCache the query.",
+                            "## What\nIssue: the cache misses on the first page")
+        action, fields = rewrite.validate(
+            {"action": "brief", "title": "Cache the page query",
+             "difficulty": "easy", "body": body})
+        self.assertEqual(action, "brief")
+        self.assertIn("the cache misses on the first page", fields["body"])
 
 
 class AnswerShapeTest(unittest.TestCase):
