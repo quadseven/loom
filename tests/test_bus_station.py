@@ -628,6 +628,62 @@ class Base(unittest.TestCase):
             return []
 
 
+class StrayBriefTriageTest(Base):
+    """loom#1821: a ticket the brief parser refuses for a header-like body
+    line is moved to loom:triage once per body, with one marker comment
+    naming the field, instead of only being logged on every claim pass."""
+
+    def runner(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def add_stray(self, number=41):
+        self.fake.add(number, state="queued",
+                      body="Difficulty: easy\n\n## What\nModel: some-model\nDo it.\n")
+        return self.fake.issues[number]
+
+    def marker_comments(self, number):
+        return [c for c in self.fake.comments[number]
+                if str(c.get("body") or "").startswith("<!-- loom:stray-brief v1 -->")]
+
+    def test_a_queued_ticket_with_a_stray_line_is_triaged_with_one_comment(self):
+        issue = self.add_stray()
+        self.runner()._triage_stray_brief(REPO, issue)
+        self.assertIn("loom:triage", self.fake.names(41))
+        self.assertNotIn("loom:queued", self.fake.names(41))
+        said = self.marker_comments(41)
+        self.assertEqual(len(said), 1)
+        self.assertIn("Model", said[0]["body"])
+
+    def test_a_second_refusal_of_the_same_ticket_posts_no_second_comment(self):
+        issue = self.add_stray()
+        runner = self.runner()
+        runner._triage_stray_brief(REPO, issue)
+        runner._triage_stray_brief(REPO, self.fake.issues[41])
+        self.assertEqual(len(self.marker_comments(41)), 1)
+
+    def test_a_ticket_requeued_with_its_body_unchanged_is_not_moved_again(self):
+        issue = self.add_stray()
+        runner = self.runner()
+        runner._triage_stray_brief(REPO, issue)
+        # Triage sends it back to the queue without rewording the line.
+        labels = [lab for lab in self.fake.issues[41]["labels"]
+                  if lab["name"] != "loom:triage"]
+        labels.append({"name": "loom:queued"})
+        self.fake.issues[41]["labels"] = labels
+        runner._triage_stray_brief(REPO, self.fake.issues[41])
+        self.assertIn("loom:queued", self.fake.names(41))
+        self.assertNotIn("loom:triage", self.fake.names(41))
+        self.assertEqual(len(self.marker_comments(41)), 1)
+
+    def test_a_ticket_refused_for_another_reason_is_not_moved(self):
+        self.fake.add(42, state="queued",
+                      body="Difficulty: easy\nDifficulty: hard\n\n## What\nDo it.\n")
+        self.runner()._triage_stray_brief(REPO, self.fake.issues[42])
+        self.assertNotIn("loom:triage", self.fake.names(42))
+        self.assertIn("loom:queued", self.fake.names(42))
+        self.assertEqual(self.marker_comments(42), [])
+
+
 class StationLabelSyncTest(Base):
     def test_changed_label_digest_syncs_every_repo_and_records_digest(self):
         repos = ["example-owner/first", "example-owner/second"]
@@ -894,7 +950,7 @@ class ReconcilePullRequestTest(Base):
         self.assertFalse(any("Linked pull request" in c["body"] for c in self.fake.comments[12]))
 
     def test_a_fix_round_for_the_open_pull_request_stays_briefed(self):
-        # zippie#269, 2026-10-18: a brain fix round moved the ticket from pr
+        # zippie issue 269, 2026-10-18: a brain fix round moved the ticket from pr
         # to briefed for a lane to fix pull request 99; this pass read the open
         # pull request as a new link, moved it back to pr and commented, and
         # the brain re-briefed it, every 3 to 6 minutes.
@@ -1488,7 +1544,7 @@ class ReconcilePullRequestTest(Base):
         self.fake.add(12, state="pr")
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
-                            "body": "Refs other-owner/other-repo#12",
+                            "body": "Refs other-owner/other-repo" "#12",
                             "head": {"ref": "fix/elsewhere"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:pr", self.fake.names(12))
@@ -3800,7 +3856,7 @@ class HandBackTest(unittest.TestCase):
         # (Bot.login "grug-tribe"); the REST API adds it. The station matched
         # only "grug-tribe[bot]", so from 2026-10-13 every fix round left out
         # the review bot's threads and their ids, and a lane could neither fix
-        # nor answer them (mod-overseer#1135 looped on 2026-10-24).
+        # nor answer them (mod-overseer issue 1135 looped on 2026-10-24).
         thread = {"id": "PRRT_graphql", "path": "a.py", "line": 4,
                   "comments": {"nodes": [{"databaseId": 9, "body": "change this",
                                              "author": {"login": "grug-tribe",
@@ -3861,7 +3917,7 @@ class HandBackTest(unittest.TestCase):
         self.assertEqual(len(fixes), 3)
 
     def test_fix_rounds_on_one_head_count_toward_the_cap(self):
-        # grug#1315, 2026-10-24: its fix rounds failed [transient] and pushed
+        # grug issue 1315, 2026-10-24: its fix rounds failed [transient] and pushed
         # nothing, so the head stayed the same; the cap counted distinct heads
         # (2) and sent 15 rounds, 9 of them for one head.
         self.gh.comments.extend({"user": {"login": "alice-example"},
@@ -5041,7 +5097,7 @@ class TicketsTest(unittest.TestCase):
             "Repo: example-owner/example-repo\n"
             "Branch: loom/12-fix-the-thing-r2\n"
             "Lane: codex\n"
-            "Issue: example-owner/example-repo#12\n"
+            "Issue: example-owner/example-repo" "#12\n"
             "Difficulty: hard\n"
             "Model: model-x\n\n"
             "# T12: Fix the thing\n\n"
@@ -5967,7 +6023,7 @@ class FixTest(Base):
         self.refused_fix(FIX_BODY, edited=True)
 
     def test_a_fix_comment_for_another_repo_is_refused(self):
-        self.refused_fix(FIX_BODY.replace(REPO + "#99", "example-owner/other#99"))
+        self.refused_fix(FIX_BODY.replace(REPO + "#99", "example-owner/other" "#99"))
 
     def test_a_fix_comment_for_a_branch_the_runner_refuses_is_refused(self):
         self.refused_fix(FIX_BODY.replace("branch loom/12-fix-the-thing", "branch main"))
@@ -11494,7 +11550,7 @@ class OperatorTest(Base):
 
     def test_a_reference_outside_the_goal_homes_falls_back_to_the_default(self):
         self.settings.default_goal = "%s#41" % REPO
-        self.say(1, "other/repo#40 and #12 and words in both: faster quicker")
+        self.say(1, "other/repo" "#40 and #12 and words in both: faster quicker")
         self.go()
         self.assertEqual(self.notes(40), [])
         self.assertEqual(len(self.notes(41)), 1)
@@ -12964,7 +13020,7 @@ class VerifyDispatchTest(Base):
         self.fake.add_foreign("example-owner/muster", 163, state="closed", reason="completed")
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
             "prints `daily status ready`",
-            "after deploy, muster#163 is verified and the log prints `daily status ready`")
+            "after deploy, muster" "#163 is verified and the log prints `daily status ready`")
         self.run_pass()
         self.assertFalse(any("-2-verify-" in n for n in self.briefs()), self.briefs())
         self.assertEqual(len(self.fake.comments[2]), 1)

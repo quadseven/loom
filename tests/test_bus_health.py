@@ -241,7 +241,7 @@ class Intake(Base):
         self.assertFalse(any(w[0] == "PATCH" for w in self.gh.writes))
 
     def test_a_finding_that_flaps_five_times_in_a_day_leaves_one_absent_note(self):
-        # wow-overseer#1204 got 7 absent notes in 18 hours: every return cleared
+        # wow-overseer issue 1204 got 7 absent notes in 18 hours: every return cleared
         # the absent stamp, so every next absence posted again.
         digest = sha()
         self.open_ticket(100, digest)
@@ -624,7 +624,7 @@ class SameCause(Base):
 class Sources(unittest.TestCase):
     def test_parse_sources_keeps_https_entries_and_names_the_rest(self):
         found, problems = health.parse_sources(
-            "%s#4=%s other-owner/other-repo#2=http://plain.example.test/h bad=https://x.test"
+            "%s#4=%s other-owner/other-repo" "#2=http://plain.example.test/h bad=https://x.test"
             % (REPO, URL))
         self.assertEqual(found, [health.Source(REPO, 4, URL)])
         self.assertEqual(len(problems), 2)

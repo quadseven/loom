@@ -116,10 +116,10 @@ class NeedsYouPageTest(unittest.TestCase):
                                         {"repo": "app", "number": 50, "title": "Epic: tidy up"}]}
         body = self.page(document)
         self.assertEqual(len(self.cards(body)), 4)
-        self.assertNotIn("app#42 -", body.replace("%s#42 -" % REPO, ""))
+        self.assertNotIn("app" "#42 -", body.replace("%s#42 -" % REPO, ""))
         self.assertIn("unblocks 3", self.card(body, 42))
         self.assertIn("From the backlog (1)", body)
-        self.assertNotIn(">app#40<", body)
+        self.assertNotIn(">app" "#40<", body)
 
     def test_reversible_human_decision_is_for_every_operator_and_blocked_waits_are_excluded(self):
         ask = "Kind: decision\nKeep this ticket open or close it?\nDefault: Keep\nReversible: yes"

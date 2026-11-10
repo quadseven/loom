@@ -15,7 +15,7 @@ SHA = re.compile(r"@[0-9a-f]{40}$")
 LEAK_SCAN = "quadseven/infra-public/.github/workflows/_reusable.leak-scan.yml@"
 PYTHON_VERSION = re.compile(r"^\s*python-version:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 # The lane and station images run python:3.13-slim, so CI tests the
-# interpreter the code runs under, not an older one (infra-public#175).
+# interpreter the code runs under, not an older one (infra-public issue 175).
 RUNTIME_PYTHON = "3.13"
 
 

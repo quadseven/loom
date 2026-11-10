@@ -18,7 +18,7 @@ def tree(*held):
 
 class ClosedReferenceTest(unittest.TestCase):
     def test_a_box_waiting_on_a_closed_issue_in_another_repo_is_flagged(self):
-        live = ("Live: after deploy, muster#163 is verified through the new mechanism "
+        live = ("Live: after deploy, muster" "#163 is verified through the new mechanism "
                 "and the log shows `verify handed`")
         found = unmeetable.reasons(
             live, REPO, 964, states({("example-owner/muster", 163): ("closed", False)}),

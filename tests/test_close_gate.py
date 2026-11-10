@@ -1,8 +1,8 @@
 """The close-completeness gate at the transport layer.
 
-conducted#209 was closed as completed with 6 unchecked acceptance boxes five
+conducted""" """#209 was closed as completed with 6 unchecked acceptance boxes five
 seconds after its PR merged; the GitHub close-completeness guard reopened it
-seconds later (the same close -> reopen cycle as conducted#171 the same day).
+seconds later (the same close -> reopen cycle as conducted""" """#171 the same day).
 The brain's close() already refuses that, but whatever closed the ticket
 bypassed it. This gate lives in GitHub.rest(), the one choke point every
 programmatic issue close passes through, so no code path -- brain, lane

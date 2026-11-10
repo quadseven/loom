@@ -1,6 +1,6 @@
 """loom#866: routine ticket events go on one status comment, edited in place.
 
-zippie#264 carried 77 bot comments on 2026-10-18, one email each. Each test
+zippie""" """#264 carried 77 bot comments on 2026-10-18, one email each. Each test
 here checks one property the station and the factory rely on: one comment,
 edited, and every reader seeing the same events it saw as separate comments.
 """

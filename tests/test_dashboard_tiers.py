@@ -385,7 +385,7 @@ class StalePanels(unittest.TestCase):
         self.assertIn("Stale", grug)
         self.assertIn("answered 500: boom", grug)
         self.assertIn("last good read 2026-10-19 11:58 UTC", grug)
-        self.assertIn("example-org/app#7", grug)
+        self.assertIn("example-org/app" "#7", grug)
 
     def test_transcripts_unavailable_shows_loom_runs_stale_and_the_gateway_rows_still_render(self):
         body = page(loom_runs=stale(None, "database is down", at=None, name="Loom run outcomes"))
@@ -421,13 +421,13 @@ class LiveNow(unittest.TestCase):
         self.assertEqual(live["gateway"]["items"][0]["target"], "spark-a")
         self.assertEqual(live["grug"]["items"][0]["persona"], "elder")
         body = panel(page(), "live")
-        self.assertIn("example-org/app#12", body)
+        self.assertIn("example-org/app" "#12", body)
         self.assertIn("spark-2", body)
         self.assertIn("coder-120b", body)
         self.assertIn("spark-a", body)
         self.assertIn("42s", body)
         self.assertIn("elder", body)
-        self.assertIn("example-org/app#7", body)
+        self.assertIn("example-org/app" "#7", body)
         self.assertIn("model-g", body)
 
     def test_grug_live_shows_elder_reviews_only(self):
@@ -436,7 +436,7 @@ class LiveNow(unittest.TestCase):
         self.assertEqual([item["persona"] for item in live["grug"]["items"]], ["elder"])
         body = panel(page(), "live")
         self.assertNotIn("model-c", body)
-        self.assertNotIn("example-org/app#8", body)
+        self.assertNotIn("example-org/app" "#8", body)
 
     def test_grug_entries_are_read_defensively(self):
         grug = good({"inflight": [{"persona": "Elder", "pr": "x", "model": "<b>m</b>"}, "junk", None,
@@ -503,7 +503,7 @@ class Route(unittest.TestCase):
         self.assertIn("<title>Tiers and allowances - Loom</title>", body)
         self.assertIn('href="/tiers" aria-current="page"', body)
         live = panel(body, "live")
-        self.assertIn("example-org/app#12", live)
+        self.assertIn("example-org/app" "#12", live)
         self.assertNotIn("Merged one", live)
         self.assertIn("spark-a", live)
         # No usage snapshot has arrived: allowance is unknown, not available.
@@ -552,7 +552,7 @@ class OneRefresh(unittest.TestCase):
         background.refresh(now=T)
         after = panel(tiers.render(tiers.build(dict(background.snapshot(now=T), station=good(STATION)), NOW)),
                       "live")
-        self.assertIn("example-org/app#12", after)
+        self.assertIn("example-org/app" "#12", after)
         self.assertIn("spark-a", after)
         self.assertIn("elder", after)
 

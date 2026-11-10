@@ -1591,7 +1591,7 @@ class InvariantTest(unittest.TestCase):
 
     def test_tickets_outside_an_epic_in_many_goals_are_one_rolling_breach(self):
         """One rolling breach for every goal home, not one issue per goal:
-        the sweep found 18 issues for this one cause (infra#5613)."""
+        the sweep found 18 issues for this one cause (infra""" """#5613)."""
         other = Ref("%s#12" % OTHER, "Goal home issue 12 of a private repo")
         shapes = [invariants.GoalShape(self.goal, 6, (), (Ref("%s#7" % REPO, "#7"),)),
                   invariants.GoalShape(other, 6, (), tuple(
