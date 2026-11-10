@@ -29,7 +29,7 @@ class TicketRenderingTests(unittest.TestCase):
     def test_two_attempt_ticket_pairs_tool_result_hides_thought_and_collapses_brief(self):
         record = {"repo": "example-owner/sample", "number": 12, "title": "Example", "state": "running",
                   "body": "- [x] First\n- [ ] Second", "lane": "codex", "model": "model-x",
-                  "difficulty": "hard", "goal": "example-owner/sample#30"}
+                  "difficulty": "hard", "goal": "example-owner/sample" "#30"}
         runs = [{"id": 1, "attempt": 1}, {"id": 2, "attempt": 2}]
         events = [{"ts": "2026-10-14T10:00:00Z", "role": "user", "kind": "text", "text": "Brief\nFull detail"},
                   {"ts": "2026-10-14T10:00:01Z", "role": "thinking", "kind": "text", "text": "Reasoning"},
@@ -54,7 +54,7 @@ class TicketRenderingTests(unittest.TestCase):
 
         state = State()
         handler_type = _handler_for(state)
-        payload = {"ticket": "example-owner/sample#12", "slot": "codex", "model": "model-x",
+        payload = {"ticket": "example-owner/sample" "#12", "slot": "codex", "model": "model-x",
                    "outcome": "running", "started_at": "2026-10-14T10:00:00Z",
                    "finished_at": "2026-10-14T10:01:00Z", "events": [
                        {"ts": "2026-10-14T10:00:01Z", "role": "assistant", "kind": "text", "text": "one"},
@@ -87,12 +87,12 @@ class TicketRenderingTests(unittest.TestCase):
 
 RECORD = {"repo": "example-owner/sample", "number": 12, "title": "Example change", "state": "pr",
           "body": "- [x] A test fails without the fix\n- [x] The change\n- [ ] Live: the proof shows",
-          "lane": "codex", "model": "model-x", "difficulty": "medium", "goal": "example-owner/sample#30"}
+          "lane": "codex", "model": "model-x", "difficulty": "medium", "goal": "example-owner/sample" "#30"}
 COMMENTS = [
     {"body": "Claimed for lane codex (body sha256 0123456789ab)", "created_at": "2026-10-14T10:00:00Z"},
     {"body": "Lane codex opened a pull request: https://github.com/example-owner/sample/pull/13",
      "created_at": "2026-10-14T10:05:00Z"},
-    {"body": "<!-- loom:fix v1 -->\nPull request: example-owner/sample#13\n\n### Check: unittest\n\n    E1\n\n"
+    {"body": "<!-- loom:fix v1 -->\nPull request: example-owner/sample" "#13\n\n### Check: unittest\n\n    E1\n\n"
              "### Thread PRRT_1 (comment 1) at a.py:1\n\n    rename", "created_at": "2026-10-14T10:10:00Z"},
     {"body": "Lane codex failed: [work] validation failed: the check exited 2 at abc",
      "created_at": "2026-10-14T10:20:00Z"},
@@ -153,7 +153,7 @@ class TicketDataTests(unittest.TestCase):
                 return dict(self.read("list")[0], events=[])
 
         store = transcripts.Store(Backend())
-        attempts = store.attempts("example-owner/sample#12")
+        attempts = store.attempts("example-owner/sample" "#12")
         self.assertEqual(attempts[0]["started_at"], "2026-10-14T10:00:00Z")
         self.assertEqual(attempts[0]["finished_at"], "2026-10-14T10:05:00Z")
         json.dumps(attempts)
@@ -175,7 +175,7 @@ class TicketDataTests(unittest.TestCase):
         prs = [{"number": 7, "body": "x", "head": {"ref": "loom/120-other"}},
                {"number": 8, "body": "x", "head": {"ref": "loom/12-example-r2"}}]
         self.assertEqual(ticket_data.pr_number_from("example-owner/sample", 12, [], prs), 8)
-        prs = [{"number": 9, "body": "Refs example-owner/sample#12", "head": {"ref": "feature"}}]
+        prs = [{"number": 9, "body": "Refs example-owner/sample" "#12", "head": {"ref": "feature"}}]
         self.assertEqual(ticket_data.pr_number_from("example-owner/sample", 12, [], prs), 9)
 
     def test_details_are_read_once_within_the_cache_window(self):

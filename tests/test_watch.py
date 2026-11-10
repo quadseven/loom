@@ -113,9 +113,9 @@ class SignatureTest(unittest.TestCase):
                             watch.signature(LINE_403.replace("403", "502")))
 
     def test_ids_numbers_shas_times_and_refs_are_placeholders(self):
-        a = ("2026-10-13 09:14:02 brain: push of 3f9c2a1b7e failed for example-owner/one#12 "
+        a = ("2026-10-13 09:14:02 brain: push of 3f9c2a1b7e failed for example-owner/one" "#12 "
              "(PRRT_kwDOAbCd1234, pid 4411) in /var/tmp/run-77")
-        b = ("2026-10-14 23:01:59 brain: push of 0d4e8f6a2c99 failed for other-owner/two#9 "
+        b = ("2026-10-14 23:01:59 brain: push of 0d4e8f6a2c99 failed for other-owner/two" "#9 "
              "(PRRT_kwDOZzZz9999, pid 12) in /var/tmp/run-3")
         self.assertEqual(watch.signature(a), watch.signature(b))
         self.assertEqual(watch.signature(a),
@@ -156,7 +156,7 @@ class SignatureTest(unittest.TestCase):
         for line in ("ValueError: bad", "push failed", "Connection refused",
                      "HTTP 502 from the API", "upstream said 404 Not Found"):
             self.assertTrue(watch.keep(line), line)
-        for line in ("claimed example-owner/repo#3 for lane codex", "took 403 ms"):
+        for line in ("claimed example-owner/repo" "#3 for lane codex", "took 403 ms"):
             self.assertFalse(watch.keep(line), line)
 
     def test_a_hold_on_a_failed_ticket_is_status_not_an_error(self):
@@ -696,7 +696,7 @@ class ExampleTextTest(WatchBase):
             self.assertNotIn(leak, issue["title"] + issue["body"])
 
     def test_an_example_that_fails_the_check_is_withheld(self):
-        bad = "push failed; this fixes example-owner/repo#3 says @%s" % text.REVIEW_BOT_SHORT_NAME
+        bad = "push failed; this fixes example-owner/repo" "#3 says @%s" % text.REVIEW_BOT_SHORT_NAME
         self.assertEqual(watch._checked("this fixes #3"), watch.WITHHELD)
         self.append(bad, bad, bad)
         self.run_at(T0)

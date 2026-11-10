@@ -4953,10 +4953,11 @@ class Factory:
                     headers, _ = tickets.parse(issue.get("body"))
                 except ValueError:
                     headers = None
-                # A remote lane renders its claim brief from Difficulty: (see
-                # _ensure_lane_headers); without it, as with no headers at all
-                # or an unreadable brief, no lane can claim the ticket.
-                if headers is None or "Difficulty" not in headers:
+                # A remote lane renders its claim brief from the Difficulty:
+                # and Base: headers (see _ensure_lane_headers); without either,
+                # as with no headers at all or an unreadable brief, no lane
+                # can claim the ticket, so it must not stay queued for one.
+                if headers is None or "Difficulty" not in headers or "Base" not in headers:
                     self._relabel(repo, issue, [name for name in _labels(issue)
                                                 if not name.startswith("lane:")])
             self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
@@ -5249,12 +5250,15 @@ class Factory:
         _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
 
     def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Write the effective tier before reserving a remote lane.
+        """Write the full claim header block before reserving a remote lane.
 
         A headerless ticket defaults to medium in the factory, but remote
-        lanes reject it because they cannot render a claim brief. Materialize
-        that tier before adding a lane label. Base: is optional; when absent,
-        the runner uses the repository's default branch.
+        lanes reject it because they cannot render a claim brief, and a
+        ticket with only one of the two headers is stranded the same way
+        once another path has labelled it for a lane (loom#2717).
+        Materialize both headers before adding a lane label: the effective
+        tier, and the repository's default branch as Base:, the same
+        fallback the lane claim itself uses when it reads the repo.
         """
         body = str(issue.get("body") or "")
         try:
@@ -5265,6 +5269,11 @@ class Factory:
         updated = body
         if "Difficulty" not in headers:
             updated = tickets.with_header(updated, "Difficulty", difficulty_of(issue))
+        if "Base" not in headers:
+            info = self.gh.rest("GET", "/repos/%s" % repo).data
+            base = str((info.get("default_branch")
+                        if isinstance(info, dict) else "") or "main")
+            updated = tickets.with_header(updated, "Base", base)
         if updated == body:
             return
         tickets.parse(updated)

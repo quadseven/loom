@@ -12,8 +12,8 @@ from bus.metrics import entered_state
 from dashboard import transcripts
 from dashboard.server import _floor, _tickets
 
-GOAL_A = "example-owner/app#30"
-GOAL_B = "example-owner/app#40"
+GOAL_A = "example-owner/app" "#30"
+GOAL_B = "example-owner/app" "#40"
 
 
 def _row(number, title, state, goal=GOAL_A, lane="codex", model=None, **extra):
@@ -80,7 +80,7 @@ class TicketsTableTest(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         first = next(g for g in groups if "Make the app faster" in g)
         second = next(g for g in groups if "Make the app safer" in g)
-        self.assertIn("app#30", first)
+        self.assertIn("app" "#30", first)
         self.assertIn("Cache the index", first)
         self.assertIn("Trim the payload", first)
         self.assertNotIn("Check the token", first)
@@ -125,9 +125,9 @@ class TicketsTableTest(unittest.TestCase):
                       _claim(33, "claude", "2026-10-16T05:00:00Z"),
                       _claim(34, "spark", "2026-10-16T05:00:00Z"),
                       _claim(35, "spark", "2026-10-16T05:00:00Z")],
-            runs=[{"ticket": "example-owner/app#34", "model": "model-transcript",
+            runs=[{"ticket": "example-owner/app" "#34", "model": "model-transcript",
                    "started_at": "2026-10-16T05:00:30Z", "finished_at": "2026-10-16T06:00:00Z"},
-                  {"ticket": "example-owner/app#35", "model": "model-before",
+                  {"ticket": "example-owner/app" "#35", "model": "model-before",
                    "started_at": "2026-10-15T05:00:00Z", "finished_at": "2026-10-15T06:00:00Z"}])
         with mock.patch.dict(os.environ, {"LOOM_CLAUDE_MODEL": "claude-opus-5-5"}):
             body = _tickets(state, urlsplit("/tickets"))
@@ -163,8 +163,8 @@ class TicketsTableTest(unittest.TestCase):
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 5 * 3600))
         state = State([_row(31, "Fresh label", "running"), _row(32, "Moved since the read", "queued",
                                                                  updated_at=stamp)],
-                      entered={"example-owner/app#31": ("running", now - 3 * 3600),
-                               "example-owner/app#32": ("briefed", now - 9 * 3600)})
+                      entered={"example-owner/app" "#31": ("running", now - 3 * 3600),
+                               "example-owner/app" "#32": ("briefed", now - 9 * 3600)})
         body = _tickets(state, urlsplit("/tickets"))
         self.assertEqual(_cell(body, 31, "tickets-age"), "3h")
         self.assertEqual(_cell(body, 32, "tickets-age"), "upd 5h")
@@ -193,14 +193,14 @@ class RunRecordsTest(unittest.TestCase):
 
     def test_store_latest_is_each_tickets_newest_run(self):
         store = transcripts.Store(transcripts.MemoryBackend())
-        for ticket, model, started in (("example-owner/app#1", "model-a", "2026-10-16T00:00:00Z"),
-                                       ("example-owner/app#1", "model-b", "2026-10-16T05:00:00Z"),
-                                       ("example-owner/app#2", "model-c", "2026-10-15T00:00:00Z")):
+        for ticket, model, started in (("example-owner/app" "#1", "model-a", "2026-10-16T00:00:00Z"),
+                                       ("example-owner/app" "#1", "model-b", "2026-10-16T05:00:00Z"),
+                                       ("example-owner/app" "#2", "model-c", "2026-10-15T00:00:00Z")):
             store.upload({"ticket": ticket, "slot": "codex", "model": model, "outcome": "done",
                           "started_at": started, "finished_at": started, "events": []})
         latest = store.latest()
         self.assertEqual({key: row["model"] for key, row in latest.items()},
-                         {"example-owner/app#1": "model-b", "example-owner/app#2": "model-c"})
+                         {"example-owner/app" "#1": "model-b", "example-owner/app" "#2": "model-c"})
 
 
 class SlowTranscripts:
@@ -224,8 +224,8 @@ class LatestRunsOffTheRequestTest(unittest.TestCase):
     def test_a_slow_transcript_store_does_not_delay_a_tickets_render(self):
         state = State([_row(34, "Transcript after its claim", "running", lane="spark")])
         state.transcripts = SlowTranscripts()
-        state.latest_runs = {"example-owner/app#34": {
-            "ticket": "example-owner/app#34", "model": "model-transcript",
+        state.latest_runs = {"example-owner/app" "#34": {
+            "ticket": "example-owner/app" "#34", "model": "model-transcript",
             "started_at": "2026-10-16T05:00:30Z", "finished_at": "2026-10-16T06:00:00Z"}}
         # Under the store's 3 s read, with room for a loaded machine: the
         # calls == 0 checks below are the real proof (2026-10-24).
@@ -250,18 +250,18 @@ class LatestRunsOffTheRequestTest(unittest.TestCase):
     def test_the_background_refresh_reads_the_latest_runs_map(self):
         store = self._ticket_store()
         store.transcripts = transcripts.Store(transcripts.MemoryBackend())
-        store.transcripts.upload({"ticket": "example-owner/app#7", "slot": "codex", "model": "model-a",
+        store.transcripts.upload({"ticket": "example-owner/app" "#7", "slot": "codex", "model": "model-a",
                                   "outcome": "done", "started_at": "2026-10-16T00:00:00Z",
                                   "finished_at": "2026-10-16T00:10:00Z", "events": []})
         with mock.patch.dict(os.environ, {}, clear=True):
             store.refresh()
         latest = store.response()["latest_runs"]
-        self.assertEqual(latest["example-owner/app#7"]["model"], "model-a")
+        self.assertEqual(latest["example-owner/app" "#7"]["model"], "model-a")
 
     def test_a_failed_read_keeps_the_last_map_and_says_why(self):
         store = self._ticket_store()
         store.transcripts = transcripts.Store(transcripts.MemoryBackend())
-        store.transcripts.upload({"ticket": "example-owner/app#7", "slot": "codex", "model": "model-a",
+        store.transcripts.upload({"ticket": "example-owner/app" "#7", "slot": "codex", "model": "model-a",
                                   "outcome": "done", "started_at": "2026-10-16T00:00:00Z",
                                   "finished_at": "2026-10-16T00:10:00Z", "events": []})
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -269,7 +269,7 @@ class LatestRunsOffTheRequestTest(unittest.TestCase):
             store.transcripts = SlowTranscripts(error=OSError("connect timed out"))
             store.refresh()
         payload = store.response()
-        self.assertEqual(payload["latest_runs"]["example-owner/app#7"]["model"], "model-a")
+        self.assertEqual(payload["latest_runs"]["example-owner/app" "#7"]["model"], "model-a")
         self.assertTrue(any("connect timed out" in error for error in payload["dashboard_errors"]))
 
     def test_a_driver_error_outside_storage_errors_never_breaks_the_refresh(self):

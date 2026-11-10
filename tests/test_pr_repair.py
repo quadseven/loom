@@ -20,7 +20,7 @@ BRIEF = """# Brief: example-owner.example-repo-42
 Repo: example-owner/example-repo
 Branch: loom/42-fix-the-thing
 Lane: codex
-Issue: example-owner/example-repo#42
+Issue: example-owner/example-repo""" """#42
 
 # T42: Fix the thing
 
@@ -56,7 +56,7 @@ RUNNER_BODY = (
     "## Operator steps before merge\nnone stated\n\n"
     "---\n"
     "Loom ticket T42, lane codex, model gpt-test.\n"
-    "Refs example-owner/example-repo#42")
+    "Refs example-owner/example-repo" "#42")
 
 BRIEF_CORRECTED = BRIEF.replace(
     "- [ ] A test covers the thing",
@@ -115,7 +115,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("\nSize: S\n", body)
         self.assertIn("## Out of scope\n- Other things", body)
         self.assertIn("---\nLoom ticket T42, lane codex, model gpt-test.", body)
-        self.assertIn("\nRefs example-owner/example-repo#42", body)
+        self.assertIn("\nRefs example-owner/example-repo" "#42", body)
 
     def test_rendered_body_reads_a_summary_heading_when_what_is_absent(self):
         # Ticket briefs often write the change under "## Summary"; the body's

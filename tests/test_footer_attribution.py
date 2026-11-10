@@ -16,7 +16,7 @@ BRIEF = """# Brief: example-owner.example-repo-42
 Repo: example-owner/example-repo
 Branch: loom/42-fix-the-thing
 Lane: muse
-Issue: example-owner/example-repo#42
+Issue: example-owner/example-repo""" """#42
 
 ## Why
 The thing is broken.

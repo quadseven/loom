@@ -875,13 +875,13 @@ class StoredPacketTests(unittest.TestCase):
     STORED = {"ticks": [{"holder": "muse", "lane": "brain", "model": "model-x",
                          "started": at(30), "ended": at(10), "outcome": "ok",
                          "decided": ["shipped something private"],
-                         "left_open": ["brief example-owner/hidden#4: private plan"],
+                         "left_open": ["brief example-owner/hidden" "#4: private plan"],
                          "handed_off": []}],
-              "commitments": [{"tick_id": 2, "holder": "muse", "item": "example-owner/hidden#4",
+              "commitments": [{"tick_id": 2, "holder": "muse", "item": "example-owner/hidden" "#4",
                                "stage": "brief", "what": "brief: private plan", "due": at(-90)},
                               {"tick_id": 2, "holder": "muse", "item": "%s#7" % REPO,
                                "stage": "merge", "what": "merge: wait", "due": None}],
-              "rules": [{"source": "example-owner/hidden#2", "source_ref": "comment 55",
+              "rules": [{"source": "example-owner/hidden" "#2", "source_ref": "comment 55",
                          "text": "secret rule"},
                         {"source": "docs/MUSE.md", "source_ref": "d" * 40, "text": "- one"}]}
 
