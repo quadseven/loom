@@ -8289,17 +8289,26 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
     body = _lane_status(gh, lanes_repo, authors)
     rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    from . import labels as _labels_mod
+    from . import scorecard as _scorecard_mod
     scorecard = globals().get("scorecard")
-    if scorecard is None:
-        from . import scorecard
+    if not (hasattr(scorecard, "parse_rows") and hasattr(scorecard, "Scorecard")
+            and hasattr(scorecard, "demoted_slots")):
+        scorecard = _scorecard_mod
         globals()["scorecard"] = scorecard
     # A lane the scorecard has demoted takes no build ticket, the same set
     # the factory reads (bus/scorecard.py): leave it out even where lane
-    # status still prints it as available.
-    demoted = {row["lane"] for row in scorecard.parse_rows(body)
-               if row.get("demoted")}
-    # The station also keeps the demoted set in its scorecard file; read it
-    # where this process can see the station's state directory.
+    # status still prints it as available. The scorecard is published in the
+    # lane status comment and also kept in the station's state directory.
+    try:
+        demoted_bases = {row["lane"] for row in scorecard.parse_rows(body)
+                         if row.get("demoted")}
+    except (OSError, ValueError, AttributeError, TypeError):
+        demoted_bases = set()
+    demoted = set()
+    for lane in rows:
+        if lane in demoted_bases or _labels_mod.base_lane(lane) in demoted_bases:
+            demoted.add(lane)
     home = os.environ.get("LOOM_HOME", "").strip()
     if home:
         state = os.path.join(home, "state", "station")
@@ -8309,7 +8318,12 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
                 if card.unreadable:
                     demoted |= set(rows)
                 else:
-                    demoted |= set(card.demoted())
+                    for slot in scorecard.demoted_slots(card.demoted(), rows):
+                        demoted.add(slot)
+                    for lane in card.demoted():
+                        for row in rows:
+                            if row == lane or _labels_mod.base_lane(row) == lane:
+                                demoted.add(row)
             except (OSError, ValueError):
                 pass
     return [lane for lane in rows if lane not in demoted]
