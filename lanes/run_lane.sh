@@ -2711,8 +2711,13 @@ note_load_failure() {  # exit, reason_var_name
   fi
 }
 
-# The temp dir a run gets, under its own scratch home: created here, so
-# the directory always exists before anything is handed the path. On the
+# The temp dir a run gets, owned by the runner and outside the agent's
+# scratch home: created here, so the directory always exists before
+# anything is handed the path, and it stays existing: drop_run_scratch
+# removes the agent home before every brief, and a sandboxed agent may
+# write its own home, so a temp dir inside that home can be removed or
+# replaced under the runner. This one sits beside the other slot
+# scratch under run/, which neither drop touches. On the
 # lane hosts an unset TMPDIR makes git ask the OS for the per-user temp
 # dir, and when that lookup fails git prints a confstr warning into every
 # call; the warning lands in run logs and in agent output that tests
@@ -2723,8 +2728,8 @@ note_load_failure() {  # exit, reason_var_name
 # created in contract_run_sandboxed, the one place every check passes
 # through.
 run_tmpdir() {
-  mkdir -p "$AGENT_HOME/tmp" || return 1
-  printf '%s\n' "$AGENT_HOME/tmp"
+  mkdir -p "$LOOM_HOME/run/$SLOT-tmp" || return 1
+  printf '%s\n' "$LOOM_HOME/run/$SLOT-tmp"
 }
 
 # Run one contract command in the tree the way an API-lane agent runs: an
@@ -4150,7 +4155,7 @@ CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
 # git calls and the subscription lanes' agents (which inherit this
 # environment) get a temp dir that exists, so git prints no confstr
 # warning on the lane hosts.
-TMPDIR="$(run_tmpdir)" || { echo "could not create the run temp dir $AGENT_HOME/tmp" >&2; exit 1; }
+TMPDIR="$(run_tmpdir)" || { echo "could not create the run temp dir $LOOM_HOME/run/$SLOT-tmp" >&2; exit 1; }
 export TMPDIR
 API_KEY=""
 LANE_ACCOUNT=""

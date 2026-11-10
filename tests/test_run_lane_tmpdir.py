@@ -8,7 +8,9 @@ it, with a check home whose tmp dir does not exist yet: on the base
 branch the check is handed TMPDIR naming that missing directory, so
 the test fails there. The run side extracts and runs run_tmpdir, the
 setup the runner exports for itself and the agents that inherit its
-environment; on the base branch that function does not exist.
+environment; on the base branch that function does not exist. The
+runner's temp dir is its own, outside the agent home, so a third test
+runs drop_run_scratch over it and asserts it still exists.
 """
 
 import re
@@ -23,8 +25,13 @@ RUNNER = Path(__file__).resolve().parent.parent / "lanes" / "run_lane.sh"
 
 
 def function_text(name):
+    text = RUNNER.read_text()
+    match = re.search(r"^%s\(\) \{[^\n]*\}\n" % re.escape(name),
+                      text, re.M)
+    if match:
+        return match.group(0)
     match = re.search(r"^%s\(\) \{\n.*?^\}\n" % re.escape(name),
-                      RUNNER.read_text(), re.S | re.M)
+                      text, re.S | re.M)
     return match.group(0) if match else None
 
 
@@ -66,15 +73,43 @@ class LaneTmpdirTest(unittest.TestCase):
         function = function_text("run_tmpdir")
         self.assertIsNotNone(function, "run_lane.sh has no run_tmpdir()")
         with tempfile.TemporaryDirectory() as tmp:
-            agent_home = Path(tmp) / "home"
+            loom_home = Path(tmp) / "loom"
             result = subprocess.run(
-                ["bash", "-c", '%s\nexport AGENT_HOME="$1"\nrun_tmpdir' % function,
-                 "bash", str(agent_home)],
+                ["bash", "-c",
+                 '%s\nexport LOOM_HOME="$1" SLOT="$2"\nrun_tmpdir' % function,
+                 "bash", str(loom_home), "codex-1"],
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             tmpdir = result.stdout.strip()
-            self.assertEqual(tmpdir, str(agent_home / "tmp"))
+            self.assertEqual(tmpdir, str(loom_home / "run" / "codex-1-tmp"))
             self.assertTrue(Path(tmpdir).is_dir())
+
+    def test_the_run_tmpdir_survives_drop_run_scratch(self):
+        funcs = ""
+        for name in ("run_tmpdir", "drop_check_home", "drop_run_scratch"):
+            function = function_text(name)
+            self.assertIsNotNone(function, "run_lane.sh has no %s()" % name)
+            funcs += function
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loom_home = root / "loom"
+            agent_home = root / "agent-home"
+            script = (funcs
+                      + 'export LOOM_HOME="$1" SLOT=codex-1 LANE=codex\n'
+                      + 'export LOOM_DROP_TREES=1 AGENT_HOME="$2" '
+                        'CHECK_HOME="$3" TICKET= WORKDIR=\n'
+                      + 'TMPDIR="$(run_tmpdir)" || exit 1\n'
+                      + 'drop_run_scratch\n'
+                      + 'printf "tmpdir=%s exists=%s\\n" "$TMPDIR" '
+                        '"$([ -d "$TMPDIR" ] && echo yes || echo no)"\n')
+            result = subprocess.run(
+                ["bash", "-c", script, "bash", str(loom_home),
+                 str(agent_home), str(root / "check")],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"tmpdir={loom_home / 'run' / 'codex-1-tmp'} exists=yes",
+                result.stdout)
 
 
 if __name__ == "__main__":
