@@ -8829,23 +8829,30 @@ class Station:
         A waiting step is reported once (`_no_change_pending` is False for
         it), so the report loop no longer drives its retry; this does, once
         per station pass, from the durable budget file alone."""
-        data = self._no_change_data()
-        for ticket, entry in sorted(data.items()):
-            for run, step in sorted(entry.get("runs", {}).items()):
-                if step.get("done") or not step.get("waiting"):
-                    continue
-                if self.now - step.get("tried_at", 0) < NO_CHANGE_RETRY_EVERY:
-                    continue
-                repo, _, number = ticket.rpartition("#")
-                lane, _, name = run.partition("/")
-                brief = "Model: %s\n" % step["model"] if step.get("model") else ""
-                try:
-                    if step.get("fix"):
-                        self._nothing_to_fix(repo, int(number), step["fix"], lane, name, brief)
-                    else:
-                        self._settle_no_change(repo, int(number), lane, name, brief)
-                except (GitHubError, OSError, StateError) as err:
-                    _say("could not retry the no-change plan for %s: %s" % (ticket, err))
+        listed = [(ticket, run) for ticket, entry in sorted(self._no_change_data().items())
+                  for run in sorted(entry.get("runs", {}))]
+        for ticket, run in listed:
+            # Each attempt writes the budget file through its own read, so
+            # the step is read afresh and stamped before the attempt: a raise
+            # inside it still restarts the window, and no stale copy is saved.
+            data = self._no_change_data()
+            step = data.get(ticket, {}).get("runs", {}).get(run, {})
+            if step.get("done") or not step.get("waiting"):
+                continue
+            if self.now - step.get("tried_at", 0) < NO_CHANGE_RETRY_EVERY:
+                continue
+            step["tried_at"] = self.now
+            self._save_no_change(data)
+            repo, _, number = ticket.rpartition("#")
+            lane, _, name = run.partition("/")
+            brief = "Model: %s\n" % step["model"] if step.get("model") else ""
+            try:
+                if step.get("fix"):
+                    self._nothing_to_fix(repo, int(number), step["fix"], lane, name, brief)
+                else:
+                    self._settle_no_change(repo, int(number), lane, name, brief)
+            except (GitHubError, OSError, StateError) as err:
+                _say("could not retry the no-change plan for %s: %s" % (ticket, err))
 
     def _reset_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
         if not self._pushed(lane, name):

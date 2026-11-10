@@ -727,6 +727,52 @@ class NoChangeWaitingReportTest(Base):
                 self.runner.retry_waiting_no_change()
         self.assertEqual(budget.call_args.args[-1], "model-x")
 
+    def test_retry_that_raises_restarts_the_window(self):
+        self.assertTrue(self.report(None))
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        with mock.patch.object(self.runner, "_no_change_planning_issue",
+                               side_effect=station.StateError("cannot establish claim timing")):
+            self.runner.report_outcomes()
+        self.runner.now += 1
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None) as planner:
+            reads = self.reads_for_ticket(self.runner.report_outcomes)
+        self.assertEqual(reads, [])
+        planner.assert_not_called()
+
+    def wait_second_ticket(self):
+        self.fake.add(13, body=SHIPPED_BODY, state="running")
+        labels = [{"name": n} for n in ("loom:ticket", "loom:running", "lane:codex")]
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
+            for name in ("spent-13", "waiting-13"):
+                self.fake.issues[13]["labels"] = list(labels)
+                self.write(os.path.join(self.home, "logs", "codex", name + ".answered"), "Nothing changed.")
+                self.runner._settle_no_change(REPO, 13, "codex", name)
+
+    def test_one_pass_keeps_the_first_promotion_and_stamps_the_second_step(self):
+        self.assertTrue(self.report(None))
+        self.wait_second_ticket()
+        self.relabel_running()
+        self.fake.issues[13]["labels"] = [{"name": n} for n in ("loom:ticket", "loom:running", "lane:codex")]
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        plan = {"lane": "claude", "model": "model-next", "rung": 2}
+        real = self.runner._no_change_planning_issue
+
+        def planning(repo, issue, lane, name):
+            if int(issue["number"]) == 13:
+                raise station.StateError("cannot establish claim timing")
+            return real(repo, issue, lane, name)
+
+        with mock.patch.object(self.runner, "_no_change_planning_issue", side_effect=planning), \
+                mock.patch.object(self.runner, "_no_change_plan", return_value=plan):
+            self.runner.report_outcomes()
+        runs = self.runner._no_change_data()
+        first = runs["%s#12" % REPO]["runs"]["codex/" + self.name]
+        second = runs["%s#13" % REPO]["runs"]["codex/waiting-13"]
+        self.assertTrue(first["done"])
+        self.assertEqual(first["plan"], plan)
+        self.assertTrue(second["waiting"])
+        self.assertEqual(second["tried_at"], self.runner.now)
+
     def test_fix_path_waiting_step_promotes_on_a_later_pass(self):
         self.relabel_running()
         with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
