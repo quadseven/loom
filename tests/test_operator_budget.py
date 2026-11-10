@@ -266,6 +266,28 @@ class IntegrationTests(unittest.TestCase):
                 station._locked_pass(SimpleNamespace(), "unused", gh, {})
         self.assertEqual(events, ["sample"])
 
+    def test_sampler_bug_is_logged_without_stopping_station_work(self):
+        from bus import station
+        st = object.__new__(station.Station)
+        st.state = "unused"
+        st.now = NOW
+        st.s = SimpleNamespace(authors=["operator"])
+        st.operator_reader = mock.Mock()
+        st._operator_lane_active = mock.Mock(return_value=False)
+        st.run_pass = mock.Mock()
+        st.end_pass = mock.Mock()
+        gh = SimpleNamespace(cache_dir="unused", app=None)
+        with mock.patch.object(station, "Station", return_value=st), \
+             mock.patch.object(station, "_trust_app_login") as trust, \
+             mock.patch.object(budget, "sample", side_effect=KeyError("private sample detail")), \
+             mock.patch.object(station, "_say") as say:
+            self.assertEqual(station._locked_pass(st.s, "unused", gh, {}), 0)
+        trust.assert_called_once_with(st.s, gh)
+        st.run_pass.assert_called_once_with()
+        st.end_pass.assert_called_once_with()
+        say.assert_called_once_with("operator budget sampler failed: KeyError")
+        self.assertNotIn("private sample detail", repr(say.call_args_list))
+
     def test_extreme_state_numbers_are_unknown_not_exceptions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / budget.FILE

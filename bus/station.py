@@ -16340,6 +16340,10 @@ class Station:
                 _say("operator core REST budget low during active work; durable factory signal pending")
         except (OSError, ValueError):
             _say("operator core budget activity unavailable; sampling deferred")
+        except Exception as err:
+            # Evidence gathering must not stop lane work, even if the sampler
+            # has a bug. Name the fault without logging private error details.
+            _say("operator budget sampler failed: %s" % type(err).__name__)
 
     def run_pass(self) -> None:
         self.sample_operator_budget()
