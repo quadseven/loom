@@ -7498,16 +7498,22 @@ def _goal_resume_lines(gh: GitHub, repo: str, issue: Dict[str, Any],
     latest: Optional[Dict[Tuple[str, Tuple[str, int], str], handoff.Mark]] = None,
                        skipped: Sequence[str] = (),
                        unread: Optional[Dict[str, str]] = None,
-                       faults: Optional[Dict[Tuple[str, int], str]] = None) -> List[str]:
+                       faults: Optional[Dict[Tuple[str, int], str]] = None,
+                       now: Optional[datetime] = None) -> List[str]:
     found_marks = handoff.marks(found)
-    items = sorted(handoff.resume_items(found_marks), key=lambda m: m.at)
+    items = sorted(handoff.resume_items(found_marks, now), key=lambda m: m.at)
     latest = latest or {_mark_key(m): m for m in found_marks}
+    dropped = [m for m in handoff.dropped_brief_defers(found_marks, now)
+               if latest.get(_mark_key(m)) == m]
     current, gone = _item_revisions(gh, items, unread or {}, faults)
     items = [m for m in items if m.item not in gone]
     alive = handoff.live(items, {k: v for k, v in current.items() if v is not None})
     held = _merge_holds(gh, [m for m in alive if latest[_mark_key(m)] == m])
     out = ["", "## %s#%s %s" % (repo, issue["number"], issue.get("title", ""))]
     out += handoff.stage_lines(found_marks) or ["- no stage handoffs"]
+    if dropped:
+        out.append("- dropped %d brief defers older than %g days"
+                   % (len(dropped), handoff.brief_defer_days()))
     if skipped:
         out.append("- skipped journals by logins not in LOOM_BRIEF_AUTHORS: %s"
                    % " ".join(skipped))
@@ -8013,7 +8019,7 @@ def _resume_repo(gh: GitHub, repo: str, goals: Sequence[GoalJournals],
             _issues(gh, repo)
         lines: List[str] = []
         for r, issue, found, skipped in mine:
-            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone, faults)
+            lines += _goal_resume_lines(gh, r, issue, found, latest, skipped, gone, faults, now)
         return lines
 
     # The five parts read different things, so they run side by side: one
