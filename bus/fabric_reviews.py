@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import shadow, tickets
+from . import shadow, status, tickets
 from .github import _OPENER
 
 FILTER_URL = "https://api.fabric.so/v2/resources/filter"
@@ -149,13 +149,55 @@ def _report(expected, key_ssm, region, read_secret):
     return "\n".join(lines)
 
 
-def _file_pending(gh, repo, state, save):
+def _reported_in_comments(gh, repo, number, marker):
+    allowed = status.logins(gh)
+    comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    for item in comments:
+        if not isinstance(item, dict):
+            continue
+        user = item.get("user")
+        if not isinstance(user, dict) or str(user.get("login") or "").lower() not in allowed:
+            continue
+        body = str(item.get("body") or "")
+        if item.get(status.EXPANDED):
+            texts = [body]
+        elif status.is_status(body):
+            texts = [text for _, text in status.parse(body)]
+        else:
+            continue
+        if any(marker in text for text in texts):
+            return True
+    return False
+
+
+def _file_pending(gh, repo, state, now, save):
     if not state.get("body") or state.get("reported") or shadow.active(repo):
         return
     marker = MARKER % state["day"]
     existing = gh.paginate("/repos/%s/issues?state=all&labels=loom:factory&per_page=100" % repo)
-    if not any(marker in str(item.get("body") or "") for item in existing
-               if isinstance(item, dict) and not item.get("pull_request")):
+    allowed = status.logins(gh)
+    incidents = [item for item in existing if isinstance(item, dict)
+                 and not item.get("pull_request")
+                 and isinstance(item.get("user"), dict)
+                 and str(item["user"].get("login") or "").lower() in allowed
+                 and re.search(r"<!-- loom:fabric-reviews day=\d{4}-\d{2}-\d{2} -->",
+                              str(item.get("body") or ""))]
+    if any(marker in str(item.get("body") or "") for item in incidents):
+        state["reported"] = True
+        save()
+        return
+    # Status events can live in a comment. Check closed incidents too: a
+    # write can land before its reply is lost, and the issue can close before
+    # the pending day's retry. That is still the same report, not a new one.
+    for incident in incidents:
+        if _reported_in_comments(gh, repo, incident["number"], marker):
+            state["reported"] = True
+            save()
+            return
+    opened = next((item for item in incidents if item.get("state") == "open"), None)
+    if opened is not None:
+        status.add(gh, repo, opened["number"], marker + "\n" + state["body"], now)
+    else:
         gh.rest("POST", "/repos/%s/issues" % repo, {
             "title": "Fabric review outputs need attention on %s" % state["day"],
             "body": marker + "\n\n## Why\nExpected Fabric review outputs need attention.\n\n"
@@ -171,7 +213,7 @@ def run_pass(gh, repo, raw, key_ssm, region, state, now, save, read_secret):
     if not raw or not tickets.REPO_RE.fullmatch(repo):
         return
     day, expected = windows(raw, now)
-    _file_pending(gh, repo, state, save)
+    _file_pending(gh, repo, state, now, save)
     if state.get("body") and not state.get("reported"):
         return
     if state.get("day") == day or not expected:
@@ -183,4 +225,4 @@ def run_pass(gh, repo, raw, key_ssm, region, state, now, save, read_secret):
     state["body"] = _report(expected, key_ssm, region, read_secret)
     state["reported"] = not bool(state["body"])
     save()
-    _file_pending(gh, repo, state, save)
+    _file_pending(gh, repo, state, now, save)
