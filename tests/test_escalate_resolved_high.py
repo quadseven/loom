@@ -40,6 +40,7 @@ class EscalateResolvedHighTests(unittest.TestCase):
                 "LOOM_REVIEW_CHECK": "",
                 "LOOM_BRIEF_AUTHORS": "trusted " + fixtures.BRAIN,
                 "LOOM_REPOS": "",
+                "LOOM_HOME": "",
                 # The lanes repo escalate reads is a setting (loom#2584);
                 # the fixtures serve it under quadseven/loom.
                 "LOOM_SELF_REPO": "quadseven/loom",
