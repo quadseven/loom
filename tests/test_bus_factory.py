@@ -2881,8 +2881,11 @@ class DeferredFindings(Base):
     def test_a_finding_the_merged_head_outdated_is_not_filed(self):
         self.finding(MEDIUM)
         self.go()
-        self.settle(outdated=True)
+        with mock.patch("bus.factory._say") as say:
+            self.settle(outdated=True)
         self.assertEqual(self.gh.filed, [])
+        self.assertIn(mock.call("settled the deferred findings of %s#50 (0 standing)" % REPO),
+                      say.call_args_list)
         self.assertTrue(any(factory.DEFERRED_FILED_MARKER % 50 in c["body"]
                             for c in self.gh.comments[5]))
 
@@ -2914,6 +2917,8 @@ class DeferredFindings(Base):
         said = [c.args[0] for c in say.call_args_list]
         self.assertIn("skipped follow-up for %s#50: 2 coverage-only (missing-test-coverage) finding(s)"
                       % REPO, said)
+        self.assertIn("settled the deferred findings of %s#50 (2 standing)" % REPO, said)
+        self.assertFalse(any("filed)" in line for line in said))
 
     def test_a_coverage_finding_beside_another_rule_still_files_both(self):
         coverage = "\U0001f7e0 medium | _testing_ | `missing-test-coverage` | quick win\n\nGrug see no test."
@@ -2921,8 +2926,12 @@ class DeferredFindings(Base):
         self.finding(coverage, asked=())
         self.add_finding(MEDIUM, "PRRT_2", "bus/b.py")
         self.go()
-        self.settle()
+        with mock.patch("bus.factory._say") as say:
+            self.settle()
         self.assertEqual(len(self.gh.filed), 1)
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertIn("settled the deferred findings of %s#50 (2 standing)" % REPO, said)
+        self.assertFalse(any("filed)" in line for line in said))
         body = self.gh.filed[0]["body"]
         self.assertIn("- medium | _testing_ | `missing-test-coverage` | quick win in `bus/a.py`:"
                       " https://example.invalid/pr/50#r1", body)
