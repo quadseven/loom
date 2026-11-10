@@ -200,6 +200,34 @@ class PickTest(unittest.TestCase):
         picked = muse_build.pick(gh, REPOS)
         self.assertEqual(picked.number, 2)
 
+    def test_pick_skips_a_ticket_released_as_satisfied_elsewhere(self):
+        # The fix shipped in another repo, so no pull request in this repo
+        # names the ticket; the builder's release note is the only record.
+        released = [{"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+                     + "\nReleased by Muse: satisfied elsewhere, the fix shipped in another repo"
+                     "\n\n-- muse"}]
+        gh = FakeGitHub([issue("example/alpha", 1), issue("example/alpha", 2,
+                                                          created="2026-01-05T00:00:00Z")],
+                        comments={("example/alpha", 1): released})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 2)
+
+    def test_a_ticket_released_for_a_non_terminal_reason_is_still_picked(self):
+        released = [{"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+                     + "\nReleased by Muse: claimed at the same time by claim:dot; let go"
+                     "\n\n-- muse"}]
+        gh = FakeGitHub([issue("example/alpha", 1)],
+                        comments={("example/alpha", 1): released})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 1)
+
+    def test_a_newer_claim_after_a_satisfied_release_is_picked_again(self):
+        comments = [
+            {"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+             + "\nReleased by Muse: satisfied elsewhere\n\n-- muse"},
+            {"id": 2, "user": {"login": MUSE}, "body": muse_build.CLAIM_MARKER
+             + "\nClaimed by Muse to build.\n\n-- muse"}]
+        gh = FakeGitHub([issue("example/alpha", 1)], comments={("example/alpha", 1): comments})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 1)
+
     def test_pick_skips_a_strangers_ticket_on_a_public_repo(self):
         # Anyone can file an issue on a public repo; an autonomous builder
         # must not take its instructions from a stranger.
