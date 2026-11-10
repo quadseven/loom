@@ -179,9 +179,7 @@ class Report(Tree):
 
 class Workflow(unittest.TestCase):
     ROOT = Path(__file__).resolve().parent.parent
-    # In docs/ until the operator moves it; an agent App cannot write workflows.
-    LIVE = ROOT / ".github" / "workflows" / "mutation.yml"
-    TEXT = (LIVE if LIVE.exists() else ROOT / "docs" / "mutation-workflow.yml").read_text()
+    TEXT = (ROOT / ".github" / "workflows" / "mutation.yml").read_text()
 
     def test_it_runs_weekly_on_main_only_on_a_hosted_runner(self):
         self.assertIn("cron:", self.TEXT)
