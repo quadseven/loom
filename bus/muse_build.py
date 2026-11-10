@@ -19,7 +19,9 @@ App. This module is the part of that loop a command can decide:
   sorts before every priority and skips the soft holds only (lane:*, loom:briefed,
   loom:triage). Then highest priority first (a P0..P3 label or a `Priority:` line;
   none counts as P2), then oldest. The scan walks down that order until one ticket
-  passes, checking at most CHECKS (120) for a naming pull request.
+  passes, checking at most CHECKS (120) for a naming pull request. A ticket
+  whose newest Muse release says it was satisfied or done elsewhere is also
+  excluded; ordinary releases remain pickable.
 - `claim` adds claim:muse and a marked comment, then reads the labels back
   and lets go when another holder's claim landed at the same time.
 - `push` pushes the muse/<n>-<slug> branch through the git-database API
@@ -257,6 +259,8 @@ def pick(gh: Any, repos: Sequence[str]) -> Optional[Work]:
             named[(repo, number)] = _named_by_pr(gh, repo, number)
         if named[(repo, number)]:
             continue
+        if _released_elsewhere(gh, repo, number):
+            continue
         title = str(item.get("title") or "")
         return Work("new", repo, number, title, str(item.get("html_url") or ""),
                     branch_for(number, title), number)
@@ -298,6 +302,22 @@ def _holds(gh: Any, repo: str, number: int) -> bool:
         elif body.startswith(RELEASE_MARKER):
             last = "release"
     return last == "claim"
+
+
+def _released_elsewhere(gh: Any, repo: str, number: int) -> bool:
+    """Whether Muse's newest build marker terminally released this ticket."""
+    last_release = None
+    for comment in gh.paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number)):
+        login = str((comment.get("user") or {}).get("login") or "")
+        if login.lower() != LOGIN.lower():
+            continue
+        body = str(comment.get("body") or "")
+        if body.startswith(CLAIM_MARKER):
+            last_release = None
+        elif body.startswith(RELEASE_MARKER):
+            last_release = body.lower()
+    return bool(last_release and ("satisfied elsewhere" in last_release
+                                  or "done elsewhere" in last_release))
 
 
 def holds_build_claim(gh: Any, repo: str, number: int) -> bool:
