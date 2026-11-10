@@ -203,9 +203,14 @@ class PickTest(unittest.TestCase):
     def test_pick_skips_a_ticket_released_as_satisfied_elsewhere(self):
         # The fix shipped in another repo, so no pull request in this repo
         # names the ticket; the builder's release note is the only record.
-        released = [{"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
-                     + "\nReleased by Muse: satisfied elsewhere, the fix shipped in another repo"
-                     "\n\n-- muse"}]
+        # An earlier non-terminal release was superseded by the terminal one.
+        released = [
+            {"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+             + "\nReleased by Muse: claimed at the same time by claim:dot; let go\n\n-- muse"},
+            {"id": 2, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+             + "\nReleased by Muse: satisfied elsewhere, the fix shipped in another repo"
+             "\n\n-- muse"},
+        ]
         gh = FakeGitHub([issue("example/alpha", 1), issue("example/alpha", 2,
                                                           created="2026-01-05T00:00:00Z")],
                         comments={("example/alpha", 1): released})
@@ -225,6 +230,15 @@ class PickTest(unittest.TestCase):
              + "\nReleased by Muse: satisfied elsewhere\n\n-- muse"},
             {"id": 2, "user": {"login": MUSE}, "body": muse_build.CLAIM_MARKER
              + "\nClaimed by Muse to build.\n\n-- muse"}]
+        gh = FakeGitHub([issue("example/alpha", 1)], comments={("example/alpha", 1): comments})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 1)
+
+    def test_a_newer_non_terminal_release_after_a_satisfied_release_is_picked(self):
+        comments = [
+            {"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+             + "\nReleased by Muse: satisfied elsewhere\n\n-- muse"},
+            {"id": 2, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+             + "\nReleased by Muse: claimed at the same time by claim:dot; let go\n\n-- muse"}]
         gh = FakeGitHub([issue("example/alpha", 1)], comments={("example/alpha", 1): comments})
         self.assertEqual(muse_build.pick(gh, REPOS).number, 1)
 

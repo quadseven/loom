@@ -22,7 +22,8 @@ App. This module is the part of that loop a command can decide:
   sorts before every priority and skips the soft holds only (lane:*, loom:briefed,
   loom:triage). Then highest priority first (a P0..P3 label or a `Priority:` line;
   none counts as P2), then oldest. The scan walks down that order until one ticket
-  passes, checking at most CHECKS (120) for a naming pull request.
+  passes, checking at most CHECKS (120) for a naming pull request or a terminal
+  release.
 - `claim` adds claim:muse and a marked comment, then reads the labels back
   and lets go when another holder's claim landed at the same time.
 - `push` pushes the muse/<n>-<slug> branch through the git-database API
