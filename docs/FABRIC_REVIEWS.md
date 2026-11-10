@@ -40,7 +40,12 @@ a name beginning with the prefix and `createdAt` inside the inclusive window.
 An older note that was merely modified does not count. Windows missed while
 the station was down are not backfilled.
 
-All missing outputs are grouped into one incident for the day. A 402 response
+All missing outputs are grouped into one incident. While that incident stays
+open, later days add findings as routine status events instead of opening
+another issue. Only incidents authored by a login trusted by the station's
+status allowlist count; a marker quoted by anyone outside that list cannot
+redirect or suppress findings. A later day can open a new incident after the
+earlier one is closed. A day with no findings adds nothing. A 402 response
 is reported as a Fabric credit-limit cause. Failed, malformed or truncated
 searches are marked "could not verify", never asserted to be missing. Search
 uses at most five pages per note, 1 MiB per page and a 45-second shared request
@@ -48,7 +53,8 @@ budget, with a 10-second timeout per request. No match after a limit is unknown.
 
 The daily attempt is saved before requests. A pending incident is retried
 without searching Fabric again; the day marker also prevents duplicate
-creation after an uncertain GitHub reply. Shadow mode holds incident writes.
+creation or a repeated status event after an uncertain GitHub reply. Shadow
+mode holds incident writes.
 An interrupted check reports that verification was interrupted, rather than
 silently pretending all notes exist. Invalid config or unreadable state stops
 the check with a local diagnostic. Other station work continues.
