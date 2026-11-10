@@ -14,6 +14,16 @@ label, never from a comment anyone could write: a login in LOOM_BRIEF_AUTHORS
 that is a GitHub App ("<slug>[bot]") is Loom; any other login is a person,
 whose hold is never lifted here. An event with no actor, or no event at all,
 leaves the setter unknown: that hold is left and counted.
+
+Triage issues (loom#1884): most held issues are not tickets at all but
+loom:triage issues, which the rewrite step itself held (bus/rewrite.py
+apply_answer adds needs-brain when it proposes a person) and then never
+retried, because its candidate list leaves held issues out. The same
+factory pass owns those holds: an old Loom-set hold on a triage issue is
+lifted once, with the hold's reason (the rewrite's last refusal) quoted in
+a RETRY_MARKER note, so the rewrite step tries once more; a triage issue
+whose hold comes back after that note goes to the hand-off pool instead,
+with one LIFT_MARKER note saying what the rewrite could not do.
 """
 
 from __future__ import annotations
@@ -42,6 +52,11 @@ LIFT_PER_RUN = 5
 LIFT_EVERY = 1800
 # On the ticket's status comment: the factory resolved this hold.
 LIFT_MARKER = "<!-- loom:hold-lifted -->"
+# On a triage issue's status comment: the factory freed its hold for one
+# more rewrite attempt (loom#1884). A hold that returns with this note
+# already on the issue goes to the hand-off pool instead.
+RETRY_MARKER = "<!-- loom:hold-retry -->"
+TRIAGE_LABEL = "loom:triage"
 # A note this close to the label event, before or after it, names the hold.
 REASON_WINDOW = 600
 REASON_MAX = 160
@@ -123,6 +138,23 @@ def handoff_note(found: Setter, hours: float, why: str, handoff: str) -> str:
             "off and put the ticket in the hand-off pool (%s), out of its goal's in-flight "
             "count: the second operator's session may claim it. Taking the label off returns "
             "it to this Loom's queue." % (LIFT_MARKER, hours, found.login, why, handoff))
+
+
+def triage_retry_note(found: Setter, hours: float, why: str) -> str:
+    return ("%s\nHeld for the brain (needs-brain) for %.0f hours, set by %s: %s. The factory "
+            "took the hold off this triage issue so the rewrite step tries once more, with "
+            "that refusal reason quoted here. If the rewrite holds it for the brain again, "
+            "the factory moves it to the hand-off pool instead of freeing it a second time."
+            % (RETRY_MARKER, hours, found.login, why))
+
+
+def triage_handoff_note(found: Setter, hours: float, why: str, handoff: str) -> str:
+    return ("%s\nHeld for the brain (needs-brain) for %.0f hours, set by %s: %s. This triage "
+            "issue already had its one more rewrite attempt, and the rewrite could not turn "
+            "it into a brief, for the reason quoted above. The factory took the hold off and "
+            "put the issue in the hand-off pool (%s): the second operator's session may "
+            "claim it. Taking the label off returns it to this Loom's queue."
+            % (LIFT_MARKER, hours, found.login, why, handoff))
 
 
 def repair_note(found: Setter, hours: float, why: str) -> str:
