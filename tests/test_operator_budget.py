@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from bus import operator_budget as budget
+from bus.github import GitHubError, RateLimited
 
 NOW = 1900000000
 CORE = {"remaining": 700, "limit": 5000, "reset": NOW + 3600}
@@ -86,8 +87,8 @@ class IdentityTests(unittest.TestCase):
         resolve.assert_not_called()
 
     def test_first_zero_without_identity_is_unknown(self):
-        with self.assertRaises(RuntimeError):
-            self.read(Client(RuntimeError("refused"), dict(CORE, remaining=0)))
+        with self.assertRaises(GitHubError):
+            self.read(Client(GitHubError("refused"), dict(CORE, remaining=0)))
 
     def test_invalid_core_is_refused(self):
         for core in ({}, dict(CORE, limit=0), dict(CORE, remaining=True),
@@ -121,7 +122,7 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(len(self.saved()["samples"]), 2)
 
     def test_failure_is_safe_nonfatal_and_retry_bounded(self):
-        self.reader.side_effect = RuntimeError("PRIVATE ERROR CONTENT")
+        self.reader.side_effect = GitHubError("PRIVATE ERROR CONTENT")
         self.run_sample()
         saved = self.saved()
         self.assertEqual(saved["failures"][-1]["reason"], "read-failed")
@@ -130,6 +131,33 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(self.reader.call_count, 1)
         self.run_sample(NOW + budget.RETRY)
         self.assertEqual(self.reader.call_count, 2)
+
+    def test_expected_read_errors_are_sanitized_and_nonfatal(self):
+        errors = (GitHubError("PRIVATE", body="PRIVATE BODY"), OSError("PRIVATE"),
+                  ValueError("PRIVATE"), RateLimited("PRIVATE", 429, "PRIVATE BODY", NOW + 60))
+        for index, error in enumerate(errors):
+            with self.subTest(error=type(error).__name__):
+                self.reader.side_effect = error
+                self.run_sample(NOW + index * budget.RETRY)
+                saved = self.saved()
+                self.assertEqual(len(saved["failures"]), index + 1)
+                self.assertEqual(saved["failures"][-1]["reason"], "read-failed")
+                self.assertNotIn("PRIVATE", json.dumps(saved) + repr(self.say.call_args_list))
+
+    def test_programming_error_escapes_without_becoming_a_read_failure(self):
+        self.reader.side_effect = NameError("PRIVATE programmer detail")
+        with self.assertRaises(NameError):
+            self.run_sample()
+        saved = self.saved()
+        self.assertEqual(saved["attempted_at"], NOW)
+        self.assertNotIn("failures", saved)
+        self.assertNotIn("PRIVATE", json.dumps(saved))
+        self.say.assert_not_called()
+
+    def test_typed_record_roundtrip_discards_unrecognized_text(self):
+        record = dict(CORE, at=NOW, active=True)
+        budget.save(self.path, {"samples": [dict(record, note="ordinary text")]})
+        self.assertEqual(budget.load(self.path)["samples"], [record])
 
     def test_low_active_flags_but_idle_does_not(self):
         self.reader.return_value = (dict(CORE, remaining=0), {})
@@ -142,7 +170,7 @@ class SamplerTests(unittest.TestCase):
     def test_failure_preserves_signal_and_recovery_clears_it(self):
         self.reader.return_value = (dict(CORE, remaining=0), {})
         self.run_sample(active=True)
-        self.reader.side_effect = RuntimeError("private")
+        self.reader.side_effect = GitHubError("private")
         self.run_sample(NOW + 3600)
         self.assertIn("signal", self.saved())
         self.reader.side_effect = None
@@ -173,7 +201,7 @@ class SamplerTests(unittest.TestCase):
     def test_attempt_is_durable_before_reader_runs(self):
         def read(*args):
             self.assertEqual(self.saved()["attempted_at"], NOW)
-            raise RuntimeError("failed")
+            raise GitHubError("failed")
         self.reader.side_effect = read
         self.run_sample()
 
@@ -190,9 +218,9 @@ class IntegrationTests(unittest.TestCase):
         for exhausted in (True, False):
             station = object.__new__(Station)
             events = []
-            station.sample_operator_budget = lambda: events.append("sample")
-            station._budget_exhausted = lambda: events.append("budget") or exhausted
-            station.check_repo_access = lambda: events.append("access") or False
+            station.sample_operator_budget = lambda events=events: events.append("sample")
+            station._budget_exhausted = lambda events=events, exhausted=exhausted: events.append("budget") or exhausted
+            station.check_repo_access = lambda events=events: events.append("access") or False
             station.run_pass()
             self.assertEqual(events, ["sample", "budget"] if exhausted else ["sample", "budget", "access"])
 
@@ -317,7 +345,7 @@ class IntegrationTests(unittest.TestCase):
             with self.subTest(assigned=assigned, pid=pid, alive=alive):
                 station = object.__new__(Station)
                 station.s = SimpleNamespace(home="unused")
-                station._operator_ticket_assigned = lambda current: assigned and current == lane
+                station._operator_ticket_assigned = lambda current, assigned=assigned: assigned and current == lane
                 station._lock_pid = mock.Mock(return_value=pid)
                 station._pid_alive = mock.Mock(return_value=alive)
                 self.assertEqual(station._operator_lane_active(), expected)

@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import tempfile
 
+from .github import GitHubError
+
 FILE = "operator-budget.json"
 EVERY = 3600
 RETRY = 300
@@ -154,7 +156,7 @@ def sample(path, now, operator, active, reader, say):
         try:
             core, binding = reader(operator, state.get("binding", {}), now)
             record = dict(core_values(core), at=now, active=bool(active))
-        except Exception:
+        except (GitHubError, OSError, ValueError):
             # Transport errors may contain secrets; only this fixed category is safe.
             state["failures"] = (state.get("failures", []) +
                                   [{"at": now, "reason": "read-failed"}])[-KEEP:]
