@@ -326,6 +326,22 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
 
+    def test_a_reinstall_keeps_anthropic_budget_and_no_topup_settings(self):
+        settings = {
+            "LOOM_ANTHROPIC_BUDGET_USD": "0",
+            "LOOM_ANTHROPIC_BUDGET_SINCE": "2026-10-18",
+            "LOOM_ANTHROPIC_BUDGET_EXPIRES": "",
+            "LOOM_NO_TOPUP": "anthropic",
+        }
+        result = self.run_install(**settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = {k: v for k, v in os.environ.items() if k not in settings}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, value in settings.items():
+            self.assertEqual(self.installed_setting(name)[0], value)
+
     def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
         self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)
         self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="lee-example").returncode, 0)
