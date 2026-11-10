@@ -12,17 +12,20 @@ ROOT = Path(__file__).resolve().parent.parent
 USERS = sorted(p.stem for p in (ROOT / "tests").glob("test_*.py")
                if "sandbox_caps" in p.read_text() and p.stem != "test_sandbox_caps")
 # Modules that start a localhost HTTP server, directly or through the tiers
-# page's Upstream fake. test_run_lane is left out: its run takes about three
-# minutes, and its servers already sit behind the probe.
-SERVES = re.compile(r'HTTPServer\(\("127\.0\.0\.1"|Upstream\(\)')
+# page's Upstream fake, or build the dashboard's own server. test_run_lane is
+# left out: its run takes about three minutes, and its servers already sit
+# behind the probe.
+SERVES = re.compile(r'HTTPServer\(\("127\.0\.0\.1"|Upstream\(\)|server_from_env\(|make_server\(')
 SERVERS = sorted(p.stem for p in (ROOT / "tests").glob("test_*.py")
                  if SERVES.search(p.read_text()) and p.stem != "test_run_lane")
-# Loaded first by the child Python, it refuses every connect the way the lane
-# check sandbox does, so the LOCALHOST probe reads False there too.
+# Loaded first by the child Python, it refuses every connect and every bind
+# the way the lane check sandbox does, so the LOCALHOST probe reads False there
+# too. A sandbox may deny bind and allow connect, or the reverse.
 DENY_CONNECT = """import socket
 def _deny(self, *args):
     raise PermissionError(1, "Operation not permitted")
 socket.socket.connect = _deny
+socket.socket.bind = _deny
 socket.socket.connect_ex = lambda self, *args: 1
 """
 
@@ -44,6 +47,8 @@ class SandboxCapsTest(unittest.TestCase):
         # every loom base check exited 1 and 14 tickets sat held behind a
         # factory incident while CI stayed green (2026-10-20).
         self.assertIn("test_dashboard_tiers_sources", SERVERS)
+        self.assertIn("test_dashboard_main", SERVERS)
+        self.assertIn("test_no_reverse_lookup", SERVERS)
         with tempfile.TemporaryDirectory() as shim:
             Path(shim, "sitecustomize.py").write_text(DENY_CONNECT)
             env = dict(os.environ, PYTHONPATH=shim)
