@@ -3814,6 +3814,8 @@ exec /usr/bin/git "$@"
     def api_lane(self, lane, extra="", difficulty="medium", brief_header="Demoted-Models: none", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
+        if not sandbox_caps.UNIX_SOCKET:
+            self.skipTest(sandbox_caps.NO_UNIX_SOCKET)
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")
