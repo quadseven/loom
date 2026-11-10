@@ -287,7 +287,9 @@ READY_FIELDS = (
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     # The pull request's own comments, for a fleet hold (loom#2393).
     " comments(last:100) { totalCount nodes { databaseId url createdAt body"
-    " author { __typename login } } }")
+    " author { __typename login } } }"
+    # Whether the pull request is a draft (loom#2931).
+    " isDraft")
 
 
 # What the "Past the last rung" section reads on top: the merge state and each
