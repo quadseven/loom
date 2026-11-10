@@ -8279,11 +8279,29 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
     return marks
 
 
+_SCORECARD_COLUMNS = 12
+_SCORECARD_ROW_RE = re.compile(
+    r"^\| (?!scorecard lane)([a-z0-9_.-]+) \| ([^|]*) \|((?: [0-9]+ \|){%d}) ([^|]*) \|$"
+    % _SCORECARD_COLUMNS)
+
+
+def _demoted_lanes_from_status(body: str) -> Set[str]:
+    """Parse the scorecard table from a lane status comment body and return
+    the set of demoted lane names."""
+    demoted = set()
+    for line in body.splitlines():
+        found = _SCORECARD_ROW_RE.match(line.strip())
+        if found and found.group(4).strip() == "yes":
+            demoted.add(found.group(1))
+    return demoted
+
+
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, authors),
-                      re.M)
-    return rows
+    body = _lane_status(gh, lanes_repo, authors)
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    demoted = _demoted_lanes_from_status(body)
+    return [lane for lane in rows if lane not in demoted]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,

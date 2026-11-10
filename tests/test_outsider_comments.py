@@ -143,6 +143,42 @@ class LaneStatusTests(unittest.TestCase):
         gh = lanes_gh([rest(brain.LANES_MARKER + "\n| claude | yes | - |", OUTSIDER)])
         self.assertEqual("no lane status yet", brain._lane_status(gh, REPO, AUTHORS))
 
+    def test_available_lanes_excludes_demoted_lanes_from_scorecard(self):
+        scorecard_table = (
+            brain.LANES_MARKER + "\n"
+            "Updated 2030-01-01T00:00:00Z\n\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 2030-01-01T00:00:00Z |\n"
+            "| claude | yes | 2030-01-01T00:00:00Z |\n"
+            "\n"
+            "Scorecard: the last 7 days of lane pull requests and failed proof audits.\n\n"
+            "| scorecard lane | model | prs | clean | findings | bad-work | sent back | merged | reverted | deploy failed | audit failed | audit good | audit useless | audit damaging | demoted |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+            "| codex | gpt-6 | 10 | 5 | 3 | 2 | 1 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | no |\n"
+            "| claude |  | 5 | 2 | 1 | 2 | 0 | 3 | 1 | 0 | 0 | 0 | 0 | 0 | yes |\n"
+        )
+        gh = lanes_gh([rest(scorecard_table, APP, "2030-01-01T00:00:00Z")])
+        self.assertEqual(["codex"], brain._available_lanes(gh, REPO, AUTHORS))
+
+    def test_available_lanes_includes_all_when_none_demoted(self):
+        scorecard_table = (
+            brain.LANES_MARKER + "\n"
+            "Updated 2030-01-01T00:00:00Z\n\n"
+            "| lane | available | heartbeat (UTC) |\n"
+            "|---|---|---|\n"
+            "| codex | yes | 2030-01-01T00:00:00Z |\n"
+            "| claude | yes | 2030-01-01T00:00:00Z |\n"
+            "\n"
+            "Scorecard: the last 7 days of lane pull requests and failed proof audits.\n\n"
+            "| scorecard lane | model | prs | clean | findings | bad-work | sent back | merged | reverted | deploy failed | audit failed | audit good | audit useless | audit damaging | demoted |\n"
+            "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+            "| codex | gpt-6 | 10 | 5 | 3 | 2 | 1 | 8 | 0 | 0 | 0 | 0 | 0 | 0 | no |\n"
+            "| claude |  | 5 | 2 | 1 | 2 | 0 | 3 | 1 | 0 | 0 | 0 | 0 | 0 | no |\n"
+        )
+        gh = lanes_gh([rest(scorecard_table, APP, "2030-01-01T00:00:00Z")])
+        self.assertEqual(["codex", "claude"], brain._available_lanes(gh, REPO, AUTHORS))
+
 
 class HistoryTests(unittest.TestCase):
     def test_forged_fix_and_claim_comments_do_not_count(self):
