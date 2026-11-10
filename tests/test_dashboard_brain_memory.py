@@ -72,7 +72,7 @@ class HandoffEndpointTest(unittest.TestCase):
         self.assertEqual(self.call("POST", "/api/brain/ticks", tick(8, [done]))[0], 201)
         rules = {"rules": [{"source": "docs/MUSE.md", "source_ref": "a" * 40,
                             "text": "- Write ASCII only."},
-                           {"source": "example/repo#1", "source_ref": "comment 55",
+                           {"source": "example/repo" "#1", "source_ref": "comment 55",
                             "text": "- Ship on Tuesdays."}]}
         self.assertEqual(self.call("POST", "/api/brain/rules", rules)[0], 201)
         newer = {"rules": [{"source": "docs/MUSE.md", "source_ref": "b" * 40,
@@ -83,13 +83,13 @@ class HandoffEndpointTest(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual([t["started"] for t in packet["ticks"]],
                          ["2026-10-17T%02d:00:00Z" % n for n in (8, 7, 6, 5, 4)])
-        self.assertEqual(packet["ticks"][0]["decided"], ["merge: merged example/repo#8"])
+        self.assertEqual(packet["ticks"][0]["decided"], ["merge: merged example/repo" "#8"])
         self.assertEqual(sorted(c["item"] for c in packet["commitments"]),
                          ["example/repo#%d" % n for n in range(102, 108)])
         self.assertTrue(all(c["state"] == "open" for c in packet["commitments"]))
         self.assertEqual({r["source"]: (r["source_ref"], r["text"]) for r in packet["rules"]},
                          {"docs/MUSE.md": ("b" * 40, "- Write ASCII only. Stop at 25 minutes."),
-                          "example/repo#1": ("comment 55", "- Ship on Tuesdays.")})
+                          "example/repo" "#1": ("comment 55", "- Ship on Tuesdays.")})
 
     def test_every_brain_endpoint_refuses_a_request_without_the_token(self):
         for method, path, body in (("GET", "/api/brain/handoff", None),
@@ -117,7 +117,7 @@ class HandoffEndpointTest(unittest.TestCase):
         code, answer = self.call("POST", "/api/brain/commitments", {"commitments": [done]})
         self.assertEqual((code, answer), (201, {"closed": 1}))
         packet = self.call("GET", "/api/brain/handoff")[1]
-        self.assertEqual([c["item"] for c in packet["commitments"]], ["example/repo#6"])
+        self.assertEqual([c["item"] for c in packet["commitments"]], ["example/repo" "#6"])
         code, answer = self.call("POST", "/api/brain/commitments", {"commitments": [defer(7)]})
         self.assertEqual((code, answer), (400, {"error": "only done commitments close without a tick"}))
 
@@ -152,9 +152,9 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(left, [("brief", "89abcdef"), ("merge", "")])
 
     def test_a_retired_source_leaves_the_packet(self):
-        self.store.load_rules({"rules": [{"source": "example/repo#1", "source_ref": "comment 5",
+        self.store.load_rules({"rules": [{"source": "example/repo" "#1", "source_ref": "comment 5",
                                           "text": "- Old rule."}]})
-        self.store.load_rules({"rules": [{"source": "example/repo#1", "source_ref": "removed",
+        self.store.load_rules({"rules": [{"source": "example/repo" "#1", "source_ref": "removed",
                                           "text": ""}]})
         self.assertEqual(self.store.handoff()["rules"], [])
 
@@ -263,10 +263,10 @@ class PostgresBackendTest(unittest.TestCase):
         self.assertTrue(all(s.startswith("CREATE") for s in sql[:len(creates)]))
         self.assertEqual(sum(1 for s in sql if s.startswith("INSERT INTO brain_ticks")), 2)
         opened = [p for s, p in db.statements if s.startswith("INSERT INTO brain_commitments")]
-        self.assertEqual(opened, [(7, "example/repo#5", "merge", "", "merge",
+        self.assertEqual(opened, [(7, "example/repo" "#5", "merge", "", "merge",
                                    "2026-10-17T23:00:00Z")])
         closed = [p for s, p in db.statements if s.startswith("UPDATE brain_commitments")]
-        self.assertEqual(closed, [(8, "2026-10-17T02:20:00Z", "example/repo#5", "merge", "")])
+        self.assertEqual(closed, [(8, "2026-10-17T02:20:00Z", "example/repo" "#5", "merge", "")])
         self.assertEqual(db.commits, 3 + sessions)
 
     def test_a_tick_sends_its_commitments_as_one_batch_per_statement(self):

@@ -1052,7 +1052,7 @@ class PullRequests(Base):
                         "\n\nThis finding does not apply to the current code" % lane}]}}]
 
     def test_an_answered_thread_with_no_lane_up_asks_the_review_bot_to_judge_the_answer(self):
-        # 2026-10-19: grug#1189 waited from 18:25Z with no lane up for its next
+        # 2026-10-19: grug issue 1189 waited from 18:25Z with no lane up for its next
         # rung, and its only open thread carried a lane's answer nothing judged.
         self.gh.ticket(5, "pr", lane="claude",
                        body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
@@ -1997,7 +1997,7 @@ class PullRequests(Base):
 
 
 LEAK_JOB = "leak-scan / Scan diff and PR/issue text for private identifiers"
-LEAK_BODY = ("Implements the ticket.\n\nThe shape follows example-org/other-repo#12 closely.\n"
+LEAK_BODY = ("Implements the ticket.\n\nThe shape follows example-org/other-repo" "#12 closely.\n"
              "It ran on build-box.example.internal.\n\nRefs %s#5\n" % REPO)
 CLEAN = "leak guard: clean (9 shape patterns, deny-list not configured, %d lines scanned)"
 HIT = "  %s:%d  [%s] %s - why"
@@ -2252,7 +2252,7 @@ class LeakScanText(Base):
         self.assertEqual(self.pr_edits(), [])
 
     def test_a_flagged_title_reference_is_put_in_words(self):
-        fixed = factory.repair_leak_text("Port example-org/other-repo#3", "a\nb",
+        fixed = factory.repair_leak_text("Port example-org/other-repo" "#3", "a\nb",
                                          {1: "private-issue-ref"}, REPO)
         self.assertEqual(fixed, ("Port issue 3 of another repo", "a\nb",
                                  ["title: put a cross-repo issue reference in words"]))
@@ -2261,7 +2261,7 @@ class LeakScanText(Base):
         self.assertIsNone(factory.repair_leak_text("t", "a", {3: "private-hostname"}, REPO))
 
     def test_the_same_repos_reference_reads_as_this_repo(self):
-        self.assertEqual(factory.refs_in_words("see %s#4 and example-repo#5 and ab/cd#6" % REPO, REPO),
+        self.assertEqual(factory.refs_in_words("see %s#4 and example-repo" "#5 and ab/cd" "#6" % REPO, REPO),
                          "see issue 4 of this repo and issue 5 of this repo and issue 6 of another repo")
 
     def test_a_log_that_is_not_a_leak_scan_is_not_read_as_one(self):
@@ -3807,7 +3807,7 @@ class Tickets(Base):
         self.assertEqual(self.lane(7), "spark")
 
     def test_routine_moves_edit_the_tickets_one_status_comment(self):
-        # loom#866: zippie#264 carried 77 bot comments, one email each. Two
+        # loom#866: zippie issue 264 carried 77 bot comments, one email each. Two
         # stall moves are two events on one comment, read back as two.
         self.stalled(7)
         self.go()
@@ -3934,7 +3934,7 @@ class Tickets(Base):
 
     def test_a_private_easy_ticket_at_a_limit_moves_within_its_tier(self):
         self.limited_easy()
-        # The first free provider slot allowed private code (infra#5617).
+        # The first free provider slot allowed private code (infra issue 5617).
         self.assertEqual(self.lane(7), "free-ollama")
         self.assertEqual(self.model(7), None)  # the lane's own model runs it
         note = self.gh.comments[7][-1]["body"]

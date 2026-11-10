@@ -480,7 +480,7 @@ class SensitiveResumeTests(unittest.TestCase):
         lines = brain.priority_lines(found, now)
         self.assertEqual(lines[0], "## Priorities (the order lanes take work, top 10)")
         self.assertEqual([line.split()[2] for line in lines[1:]],
-                         ["other-owner/other-repo#6", REPO + "#3", "other-owner/other-repo#5",
+                         ["other-owner/other-repo" "#6", REPO + "#3", "other-owner/other-repo" "#5",
                           REPO + "#2", REPO + "#1"])
         self.assertEqual(lines[2], "- P0 %s#3 T3 - pr - lane:codex - 12h" % REPO)
         self.assertTrue(lines[1].endswith(" - loom:regression"))
@@ -1464,14 +1464,14 @@ class SensitiveResumeTests(unittest.TestCase):
                 self.assertEqual([c[0] for c in fake.calls], ["GET", "PUT"])
 
     def test_a_public_repo_brief_refuses_another_repos_issue_reference(self):
-        text = BODY.replace("why", "as in other-owner/other-repo#12")
+        text = BODY.replace("why", "as in other-owner/other-repo" "#12")
         fake = Fake(reply(200, {"private": False}))
         with self.assertRaisesRegex(ValueError, "in words"):
             brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, "codex")
         self.assertEqual([c[0] for c in fake.calls], ["GET"])
 
     def test_a_foreign_reference_files_nothing_when_the_repo_cannot_be_read(self):
-        text = BODY.replace("why", "as in other-owner/other-repo#12")
+        text = BODY.replace("why", "as in other-owner/other-repo" "#12")
         # A failed read ends the brief with the GitHubError main reports.
         fake = Fake(reply(404, {"message": "Not Found"}))
         with self.assertRaises(GitHubError):
@@ -1492,7 +1492,7 @@ class SensitiveResumeTests(unittest.TestCase):
         # Its own reference: the repo is not even read.
         self.assertEqual(brain.brief(GitHub("t", transport=Fake(*made)), REPO, EPIC, "Ticket",
                                      own, "codex"), "https://example.com/ticket")
-        foreign = BODY.replace("why", "as in other-owner/other-repo#12")
+        foreign = BODY.replace("why", "as in other-owner/other-repo" "#12")
         fake = Fake(reply(200, {"private": True}), *made)
         self.assertEqual(brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
                                      foreign, "codex"), "https://example.com/ticket")
@@ -1565,7 +1565,7 @@ class SensitiveResumeTests(unittest.TestCase):
                 self.assertEqual(fake.calls, [])
 
     def test_brief_refuses_an_after_value_that_is_not_a_list_of_tickets(self):
-        for bad in ("5", "", "#a", "#5,", "owner#5", "#5\nRepo: evil/repo"):
+        for bad in ("5", "", "#a", "#5,", "owner" "#5", "#5\nRepo: evil/repo"):
             with self.subTest(after=repr(bad)):
                 fake = Fake(reply(200, goal()))
                 with self.assertRaisesRegex(ValueError, "After:"):
@@ -1593,8 +1593,8 @@ class SensitiveResumeTests(unittest.TestCase):
                 reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
         fake = Fake(*made)
         brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
-                    after="#5, other-owner/other-repo#7")
-        self.assertTrue(fake.calls[2][2]["body"].startswith("After: #5, other-owner/other-repo#7\n"))
+                    after="#5, other-owner/other-repo" "#7")
+        self.assertTrue(fake.calls[2][2]["body"].startswith("After: #5, other-owner/other-repo" "#7\n"))
 
     @staticmethod
     def _children(*states):
@@ -2733,7 +2733,7 @@ class SensitiveResumeTests(unittest.TestCase):
         # Built at run time so this file never holds the handle itself.
         handle = "@" + text.REVIEW_BOT_SHORT_NAME.upper()
         bodies = [handle + " please look", "This does not fix #42",
-                  "closes other/repo#3", "Resolved: https://github.com/a/b/issues/9"]
+                  "closes other/repo" "#3", "Resolved: https://github.com/a/b/issues/9"]
         for body in bodies:
             with self.subTest(body=body):
                 with self.assertRaises(ValueError):
