@@ -622,6 +622,8 @@ class NoChangeWaitingReportTest(Base):
         super().setUp()
         self.fake.add(12, body=SHIPPED_BODY, state="running")
         self.runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.runner.now = 1_000_000.0
+        self.fake.add(77, body="Pull request", state="pr")
         self.name = "waiting-run"
         self.brief = os.path.join(self.home, "waiting-brief.md")
         self.write(self.brief, "Repo: %s\nIssue: %s#12\nLane: codex\n" % (REPO, REPO))
@@ -658,6 +660,7 @@ class NoChangeWaitingReportTest(Base):
     def test_later_pass_with_a_plan_promotes_the_ticket(self):
         self.assertTrue(self.report(None))
         self.relabel_running()
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY
         plan = {"lane": "claude", "model": "model-next", "rung": 2}
         with mock.patch.object(self.runner, "_no_change_plan", return_value=plan):
             self.runner.retry_waiting_no_change()
@@ -679,6 +682,69 @@ class NoChangeWaitingReportTest(Base):
         step = self.runner._no_change_data()["%s#12" % REPO]["runs"]["codex/" + self.name]
         self.assertFalse(step["done"])
         self.assertTrue(step["waiting"])
+
+    def reads_for_ticket(self, call):
+        with mock.patch.object(self.runner.gh, "rest", wraps=self.runner.gh.rest) as rest:
+            call()
+        return [c for c in rest.call_args_list
+                if c.args[0] == "GET" and "/issues/12" in str(c.args[1])]
+
+    def test_retry_is_throttled_per_waiting_step(self):
+        self.assertTrue(self.report(None))
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY - 1
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None) as planner:
+            reads = self.reads_for_ticket(self.runner.report_outcomes)
+        self.assertEqual(reads, [])
+        planner.assert_not_called()
+
+    def test_retry_after_the_window_promotes_given_a_plan(self):
+        self.assertTrue(self.report(None))
+        self.relabel_running()
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        plan = {"lane": "claude", "model": "model-next", "rung": 2}
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=plan):
+            self.runner.report_outcomes()
+        self.assertIn("loom:briefed", self.fake.names(12))
+
+    def test_failed_retry_restarts_the_window(self):
+        self.assertTrue(self.report(None))
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
+            self.runner.report_outcomes()
+        self.runner.now += 1
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None) as planner:
+            self.runner.report_outcomes()
+        planner.assert_not_called()
+
+    def test_retry_hands_the_briefs_model_back_to_the_budget(self):
+        self.write(self.brief, "Repo: %s\nIssue: %s#12\nLane: codex\nModel: model-x\n" % (REPO, REPO))
+        self.assertTrue(self.report(None))
+        self.relabel_running()
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        with mock.patch.object(self.runner, "_no_change_budget",
+                               wraps=self.runner._no_change_budget) as budget:
+            with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
+                self.runner.retry_waiting_no_change()
+        self.assertEqual(budget.call_args.args[-1], "model-x")
+
+    def test_fix_path_waiting_step_promotes_on_a_later_pass(self):
+        self.relabel_running()
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
+            self.runner._nothing_to_fix(REPO, 12, 77, "codex", self.name)
+        self.assertIn("wait:no-change", self.fake.names(12))
+        step = self.runner._no_change_data()["%s#12" % REPO]["runs"]["codex/" + self.name]
+        self.assertEqual(step["fix"], 77)
+        self.relabel_running()
+        self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
+        plan = {"lane": "claude", "model": "model-next", "rung": 2}
+        with mock.patch.object(self.runner, "_no_change_plan", return_value=plan):
+            self.runner.retry_waiting_no_change()
+        self.assertIn("loom:pr", self.fake.names(12))
+        self.assertNotIn("wait:no-change", self.fake.names(12))
+        step = self.runner._no_change_data()["%s#12" % REPO]["runs"]["codex/" + self.name]
+        self.assertTrue(step["done"])
+        for key in ("waiting", "fix", "tried_at", "model"):
+            self.assertNotIn(key, step)
 
 
 from bus import no_change
