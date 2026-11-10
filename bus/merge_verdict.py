@@ -115,11 +115,25 @@ def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
     return None
 
 
-def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
+def _criteria_blocker(node: Dict[str, Any], ticket: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not ticket:
+        return None
+    from . import brain
+    pr = node.get("pull_request") if isinstance(node.get("pull_request"), dict) else node
+    pr_body = str(node.get("body") or (pr.get("body") if pr else "") or "")
+    if brain._unbuilt_boxes(pr_body, ticket):
+        return "criteria not ticked"
+    return None
+
+
+def ready_verdict(node: Optional[Dict[str, Any]], bot: str,
+                  ticket: Optional[Dict[str, Any]] = None) -> Verdict:
     """The merge-ready verdict for one pull request's READY_FIELDS (docs/BRAIN.md).
     It reads nothing else, so the same API data always gives the same verdict.
     Blockers keep their rule order, each with the actor who can clear it."""
     node = node or {}
+    if ticket is None and isinstance(node, dict):
+        ticket = node.get("ticket")
     head = head_commit(node)
     review_threads = node.get("reviewThreads") or {}
     threads = review_threads.get("nodes") or []
@@ -127,7 +141,8 @@ def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
                                               (_review_blocker(node, bot), LANE)]
     rules += [(blocker, OPERATOR) for blocker in person_blockers(node)]
     rules += [(_threads_blocker(threads, review_threads.get("totalCount")), LANE),
-              (_unfixed_blocker(threads, head, bot), LANE)]
+              (_unfixed_blocker(threads, head, bot), LANE),
+              (_criteria_blocker(node, ticket), LANE)]
     found = [(blocker, actor) for blocker, actor in rules if blocker]
-    return decide(node, blockers=[blocker for blocker, _ in found],
+    return decide(node, ticket=ticket, blockers=[blocker for blocker, _ in found],
                   actors=[actor for _, actor in found])

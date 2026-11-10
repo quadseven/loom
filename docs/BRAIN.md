@@ -1843,7 +1843,7 @@ branch after the merge instead (bus/revert.py, every pass, off with
 
 ## Merge-ready
 
-A lane pull request is merge-ready if and only if all five hold:
+A lane pull request is merge-ready if and only if all six hold:
 
 - its head commit's check rollup is `SUCCESS`;
 - the newest submitted review from the review bot (`LOOM_REVIEW_BOT`, else
@@ -1861,7 +1861,8 @@ A lane pull request is merge-ready if and only if all five hold:
   GitHub 405 every time;
 - it has no unresolved review thread;
 - every thread the review bot opened (a finding) is older than the head
-  commit, so a fix-up commit came after each finding.
+  commit, so a fix-up commit came after each finding;
+- its body leaves no ticket code criteria unticked (`criteria not ticked`).
 
 `python3 -m bus.brain status` prints this per pull request: `READY`, or
 `blocked:` and every blocker that applies, for example `blocked: checks
