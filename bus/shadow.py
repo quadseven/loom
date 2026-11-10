@@ -154,7 +154,7 @@ _GRAPHQL_HELD = re.compile(r"\b(%s)\b" % "|".join(_GRAPHQL_ACTIONS))
 _GRAPHQL_UPDATE = re.compile(r"\bupdateIssue\b")
 _GRAPHQL_LABEL_IDS = re.compile(r"\b(updateIssue|updatePullRequest)\b[\s\S]*\blabelIds\b")
 _GRAPHQL_REVIEW = re.compile(r"\b(addPullRequestReview|submitPullRequestReview)\b")
-_MERGE_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/merge$")
+_MERGE_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/pulls/([0-9]+)/(?:merge|merge-async)$")
 _MERGES_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/(merges|merge-upstream)$")
 _ISSUE_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/issues/([0-9]+)$")
 _LABELS_PATH = re.compile(r"^/repos/([^/]+/[^/]+)/issues/([0-9]+)/labels$")
@@ -206,6 +206,53 @@ def active(repo: Optional[str] = None, env: Optional[Mapping[str, str]] = None) 
         return str(repo).lower() in repos
     except Exception:  # noqa: BLE001
         return True
+
+
+def scope_problem(env: Optional[Mapping[str, str]] = None) -> str:
+    """Why the shadow scope is broader than a named list, or "" when it is
+    a clean list (or shadow is off): the scope source (scope) treats a
+    missing, empty or malformed REPOS list as every repo, and a caller
+    that reports a hold must be able to name that reason."""
+    try:
+        values = _env(env)
+        raw = values.get(SWITCH)
+        if raw is not None and str(raw).strip().lower() in OFF:
+            return ""
+        listed = values.get(REPOS)
+        names = [n for n in re.split(r"[\s,]+", str(listed or "")) if n]
+        if not names:
+            return "missing %s" % REPOS
+        if "*" in names:
+            return ""
+        bad = [n for n in names if not REPO_RE.fullmatch(n)]
+        return "malformed %s entry %s" % (REPOS, bad[0]) if bad else ""
+    except Exception:  # noqa: BLE001 - an unreadable scope is a problem
+        return "unreadable shadow scope"
+
+
+def merge_refusal(repo: Optional[str], env: Optional[Mapping[str, str]] = None) -> str:
+    """The handoff reason a merge of `repo` is held in shadow, or "" when
+    it is not: read from scope(), the one source the shadow reporting
+    (status, report, prompt) also reads, so no second repo list exists.
+    Fails closed: a missing or malformed scope holds every repo and the
+    reason names the problem."""
+    try:
+        on, repos = scope(env)
+    except Exception:  # noqa: BLE001 - scope() already fails closed
+        return ("shadow mode: %s is held because the shadow scope is "
+                "unreadable; handoff to the operator" % (repo or "every repo"))
+    if not on:
+        return ""
+    if repos is not None and repo and str(repo).lower() not in repos:
+        return ""
+    base = ("shadow mode: %s is in shadow; merge held, handoff to the "
+            "operator" % (repo or "every repo"))
+    problem = scope_problem(env)
+    if problem:
+        return base + " (shadow scope %s, so it fails closed for every repo)" % problem
+    if repos is None:
+        return base + " (shadow scope covers every repo)"
+    return base
 
 
 def describe(env: Optional[Mapping[str, str]] = None) -> str:

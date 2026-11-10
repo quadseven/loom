@@ -406,6 +406,49 @@ class CallSiteTest(ShadowCase):
                         env=dict(tmt.BrainMerge.ENV))
         self.assertFalse(tmt.BrainMerge.merged(fake))
 
+    def test_merge_env_shadow_repo_is_held_even_when_process_env_is_off(self):
+        # The merge helper must read the shadow scope its caller passed
+        # (env=), not only the process environment: a caller that names
+        # this repo in shadow must not merge it because the process
+        # environment says shadow is off.
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}):
+            fake = tmt.Route(tmt.routes(files=tmt.APP_CHANGE))
+            env = dict(tmt.BrainMerge.ENV, LOOM_SHADOW="1", LOOM_SHADOW_REPOS=REPO)
+            with self.assertRaisesRegex(ShadowHeld, "shadow"):
+                brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        self.assertFalse(tmt.BrainMerge.merged(fake))
+        self.assertTrue(shadow.merge_refusal(REPO, env))
+
+    def test_merge_env_out_of_shadow_repo_proceeds(self):
+        env = {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": "example-owner/other"}
+        self.assertEqual(shadow.merge_refusal(REPO, env), "")
+        self.assertEqual(shadow.merge_refusal("example-owner/other", env),
+                         shadow.merge_refusal("example-owner/other", env))
+        self.assertIn("shadow", shadow.merge_refusal("example-owner/other", env))
+
+    def test_missing_or_malformed_shadow_scope_fails_closed_with_reason(self):
+        for env in ({"LOOM_SHADOW": "1"},
+                    {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": ""},
+                    {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": "not-a-repo"}):
+            with self.subTest(env=env):
+                refusal = shadow.merge_refusal(REPO, env)
+                self.assertIn("shadow", refusal)
+                self.assertTrue("missing" in refusal or "malformed" in refusal, refusal)
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "0"}):
+            fake = tmt.Route(tmt.routes(files=tmt.APP_CHANGE))
+            env = dict(tmt.BrainMerge.ENV, LOOM_SHADOW="1", LOOM_SHADOW_REPOS="not-a-repo")
+            with self.assertRaisesRegex(ShadowHeld, "malformed"):
+                brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        self.assertFalse(tmt.BrainMerge.merged(fake))
+
+    def test_merge_async_is_held_in_shadow(self):
+        fake = Recorder()
+        with self.assertRaises(ShadowHeld) as caught:
+            GitHub("t", transport=fake).rest(
+                "PUT", "/repos/%s/pulls/8/merge-async" % REPO, {"sha": "a" * 40})
+        self.assertEqual(fake.sent, [])
+        self.assertEqual(caught.exception.entry["action"], shadow.MERGE)
+
     def test_bus_brain_close_records_before_it_posts_or_closes(self):
         older = tbb.ProofTests._proof_comment(proof_record=tbb.record(revision="0000000"))
         comments = [older, tbb.ProofTests._proof_comment(login="other")]
