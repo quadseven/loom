@@ -2890,6 +2890,42 @@ class DeferredFindings(Base):
         self.go()
         self.assertEqual(len(self.gh.filed), 1)
 
+    def add_finding(self, body, thread_id, path):
+        root = {"author": BOT, "body": body, "url": "https://example.invalid/pr/50#" + thread_id}
+        threads = self.gh.details[50]["reviewThreads"]
+        threads["nodes"].append(
+            {"id": thread_id, "isResolved": False, "isOutdated": False, "path": path,
+             "comments": {"nodes": [root]}, "root": {"nodes": [root]}})
+        threads["totalCount"] = len(threads["nodes"])
+
+    def test_a_coverage_only_deferral_files_no_follow_up(self):
+        coverage = "\U0001f7e0 medium | _testing_ | `missing-test-coverage` | quick win\n\nGrug see no test."
+        self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
+        self.finding(coverage, asked=())
+        self.add_finding(coverage, "PRRT_2", "bus/b.py")
+        self.go()
+        with mock.patch("bus.factory._say") as say:
+            self.settle()
+        self.assertEqual(self.gh.filed, [])
+        self.assertNotIn(("POST", "/repos/%s/issues" % REPO), [w[:2] for w in self.gh.writes])
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertIn("skipped follow-up for %s#50: 2 coverage-only (missing-test-coverage) finding(s)"
+                      % REPO, said)
+
+    def test_a_coverage_finding_beside_another_rule_still_files_both(self):
+        coverage = "\U0001f7e0 medium | _testing_ | `missing-test-coverage` | quick win\n\nGrug see no test."
+        self.gh.pulls[50]["labels"] = [{"name": "class:logic"}]
+        self.finding(coverage, asked=())
+        self.add_finding(MEDIUM, "PRRT_2", "bus/b.py")
+        self.go()
+        self.settle()
+        self.assertEqual(len(self.gh.filed), 1)
+        body = self.gh.filed[0]["body"]
+        self.assertIn("- medium | _testing_ | `missing-test-coverage` | quick win in `bus/a.py`:"
+                      " https://example.invalid/pr/50#r1", body)
+        self.assertIn("- medium | _robustness_ | `missing-error-handling` | quick win in `bus/b.py`:"
+                      " https://example.invalid/pr/50#PRRT_2", body)
+
     def test_closing_a_pull_request_unmerged_closes_its_open_follow_up(self):
         self.gh.pull(60, 5, state="closed")
         self.gh.pull(61, 5, state="closed", merged_at=iso(0))
