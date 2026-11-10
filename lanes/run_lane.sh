@@ -2256,7 +2256,9 @@ fetch_base_for_contract() {
 }
 
 load_contract() {
-  local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-HEAD}"
+  # A brief need not name a base, and the lane's clone has no origin/HEAD, so
+  # a fix round falls back to the default branch update_fix_branch fetched.
+  local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-${FIX_DEFAULT:-HEAD}}"
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
   if [ -n "$FIX_PR" ]; then
     if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then

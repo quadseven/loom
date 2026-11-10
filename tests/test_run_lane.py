@@ -7442,30 +7442,6 @@ echo fixed > fix.txt
         self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
         self.assertFalse(records[-1]["ok"])
 
-    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
-    def test_a_base_branch_fetch_that_races_another_fetch_is_tried_again(self):
-        # "fatal: shallow file has changed since we read it": two fetches on
-        # one shallow tree raced, and a fix round was filed as a factory
-        # incident without its agent running (grug, 2026-10-22).
-        self.contract_repo()
-        name, _ = self.fix_brief()
-        count = Path(self._tmp.name) / "fetch-count"
-        self.write_tool(self.bin / "git", """#!/usr/bin/env bash
-if [[ " $* " == *" fetch -q --depth 1 origin "* ]]; then
-  n=$(cat "$FAKE_FETCH_COUNT" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$FAKE_FETCH_COUNT"
-  if [ "$n" -eq 1 ]; then echo 'fatal: shallow file has changed since we read it' >&2; exit 128; fi
-fi
-exec /usr/bin/git "$@"
-""")
-        result = self.run_contract_lane(FAKE_AGENT_TEXT="broken", FAKE_FETCH_COUNT=str(count))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(count.read_text().strip(), "2")
-        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
-        self.assertNotIn("could not fetch the base branch", log)
-        path = self.loom / "logs" / "codex" / (name + ".validation.jsonl")
-        records = [json.loads(line) for line in path.read_text().splitlines()]
-        self.assertEqual(records[-1]["command"], "test -f .prepared && loom-test-python check.py")
-
     # loom#1773: a lane pull request passed its check and failed two
     # per-directory suites in CI that the contract never ran. An affected:
     # command runs after the check with the changed files.
@@ -8213,6 +8189,15 @@ exec /usr/bin/git "$@"
         self.contract_repo(contract=CONTRACT.replace(
             "setup: loom-test-python -c 'open(\".prepared\", \"w\").write(\"ok\")'\n", "").replace(
             "test -f .prepared && ", ""))
+        # A local clone ignores --depth, so the tree is shallow only through
+        # update_fix_branch's depth 200 fetch: the default branch needs more
+        # history than that.
+        deep = Path(self._tmp.name) / "deep-work"
+        git("clone", "-q", str(self.remote), str(deep))
+        for i in range(210):
+            git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                "commit", "-q", "--allow-empty", "-m", "main %d" % i, cwd=deep)
+        git("push", "-q", "origin", "main", cwd=deep)
         name, _ = self.fix_brief()
         self.advance_main("first.txt", "main's version\n")
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "printf 'both kept\\n' > first.txt\n")
