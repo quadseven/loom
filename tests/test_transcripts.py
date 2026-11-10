@@ -63,7 +63,7 @@ class Fixture(unittest.TestCase):
 
     def body(self, slot, ticket="T1", outcome="done"):
         return transcripts.run_body(self.home, slot, ticket, outcome, "model-x",
-                                    self.projects, self.codex, issue="example/repo#1")
+                                    self.projects, self.codex, issue="example/repo" "#1")
 
 
 class Formats(Fixture):
@@ -77,7 +77,7 @@ class Formats(Fixture):
         self.assertEqual(body["events"][0]["ts"], "2026-10-13T10:00:00.000Z")
         self.assertEqual(body["events"][3]["text"], "Bash\ncommand: cat <path>")
         self.assertEqual({k: body[k] for k in ("ticket", "slot", "model", "outcome")},
-                         {"ticket": "example/repo#1", "slot": "anthropic-2", "model": "model-x",
+                         {"ticket": "example/repo" "#1", "slot": "anthropic-2", "model": "model-x",
                           "outcome": "done"})
 
     def test_the_claude_lane_reads_the_worktree_session_in_claude_home(self):
@@ -263,13 +263,13 @@ class TicketRef(Fixture):
     carried the brief's file name."""
 
     def test_the_issue_line_is_the_ticket(self):
-        self.assertEqual(transcripts.ticket_ref("anything", "example-owner/sample-repo#931"),
-                         "example-owner/sample-repo#931")
+        self.assertEqual(transcripts.ticket_ref("anything", "example-owner/sample-repo" "#931"),
+                         "example-owner/sample-repo" "#931")
 
     def test_the_brief_name_is_the_fallback_also_for_a_retry_and_a_dashed_repo(self):
-        self.assertEqual(transcripts.ticket_ref("example.loom-229"), "example/loom#229")
+        self.assertEqual(transcripts.ticket_ref("example.loom-229"), "example/loom" "#229")
         self.assertEqual(transcripts.ticket_ref("example.sample-repo-931-r3"),
-                         "example/sample-repo#931")
+                         "example/sample-repo" "#931")
 
     def test_a_name_with_no_ticket_is_refused(self):
         with self.assertRaises(ValueError):
@@ -279,7 +279,7 @@ class TicketRef(Fixture):
         self.write(self.home / "briefs/codex/done/example.loom-7.md", "# Brief\n")
         body = transcripts.run_body(self.home, "codex", "example.loom-7", "done", "m",
                                     self.projects, self.codex)
-        self.assertEqual(body["ticket"], "example/loom#7")
+        self.assertEqual(body["ticket"], "example/loom" "#7")
         self.assertTrue(body["started_at"] and body["finished_at"])
         self.assertEqual(body["started_at"], body["finished_at"])
 

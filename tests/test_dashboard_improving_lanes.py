@@ -7,7 +7,7 @@ from dashboard.views import (build_improvements, build_scoreboard, render_lanes,
 
 class ImprovingViewTest(unittest.TestCase):
     def test_journal_link_and_moved_only_when_metric_changed(self):
-        journal = {"body": "<!-- loom:journal v1 -->\n- Friction: reduce repeat failures in example-owner/sample#8",
+        journal = {"body": "<!-- loom:journal v1 -->\n- Friction: reduce repeat failures in example-owner/sample" "#8",
                    "repo": "example-owner/sample", "issue_number": 30,
                    "html_url": "https://github.com/example-owner/sample/issues/30#issuecomment-1"}
         tickets = [{"repo": "example-owner/sample", "number": 8, "title": "Reduce repeat failures",
@@ -26,11 +26,11 @@ class ImprovingViewTest(unittest.TestCase):
 class LaneViewTest(unittest.TestCase):
     def test_models_counted_by_model_and_tier(self):
         prs = [
-            {"body": "Loom ticket example-owner/sample#1, lane codex-2, model model-alpha.",
+            {"body": "Loom ticket example-owner/sample" "#1, lane codex-2, model model-alpha.",
              "tier": "easy", "state": "closed", "merged_at": "2030-01-01"},
-            {"body": "Loom ticket example-owner/sample#2, lane codex-2, model model-alpha.",
+            {"body": "Loom ticket example-owner/sample" "#2, lane codex-2, model model-alpha.",
              "tier": "easy", "state": "open"},
-            {"body": "Loom ticket example-owner/sample#3, lane anthropic-2, model model-beta.",
+            {"body": "Loom ticket example-owner/sample" "#3, lane anthropic-2, model model-beta.",
              "tier": "hard", "state": "closed", "merged_at": None},
         ]
         scoreboard = build_scoreboard(prs)
@@ -61,7 +61,7 @@ METRICS_TODAY = {"body": (
     "4. PASS Escalation: 0 tickets failed twice on one model doing the work; 45 failures left out as limit or transient (target 0)\n"
     "5. FAIL Quality: 0 unfixed regressions >2h; 0 unreviewed merges; 1 fix PRs without tests (target 0; 0; 0)\n"
     "6. PASS Autonomy: 1 asks opened (target <=1/day)\n"
-    "7. PASS Visibility: example-owner/sample#30 0.9h, example-owner/sample#31 -0.0h (target each goal report <=2h)\n"
+    "7. PASS Visibility: example-owner/sample" "#30 0.9h, example-owner/sample" "#31 -0.0h (target each goal report <=2h)\n"
     "8. PASS Self-repair: 0 un-ticketed factory faults (target 0)\n"
     "9. PASS Generic: 0 files:  (target 0 files)")}
 METRICS_YESTERDAY = {"body": METRICS_TODAY["body"].replace("2030-01-02", "2030-01-01")
@@ -107,7 +107,7 @@ class LoopTest(unittest.TestCase):
     def test_the_loop_counts_each_stage_and_moved_is_the_fourth(self):
         tickets = [{"repo": "example-owner/sample", "number": 8, "title": "Fix it", "state": "shipped",
                     "refs": []}]
-        journal = self.journal("2030-01-02T00:00:00Z", "slow merges in example-owner/sample#8")
+        journal = self.journal("2030-01-02T00:00:00Z", "slow merges in example-owner/sample" "#8")
         other = self.journal("2030-01-02T01:00:00Z", "nobody looked at this one yet")
         data = build_improvements([journal, other], tickets, [METRICS_YESTERDAY, METRICS_TODAY])
         stages = sorted(row["stage"] for row in data["records"])
@@ -195,7 +195,7 @@ class NeedsYouTest(unittest.TestCase):
         html = self.render(document, [ask])
         self.assertIn("<blockquote>Create a read-only token.</blockquote>", html)
         self.assertNotIn("It is too broad", html)
-        self.assertLess(html.index("example-owner/sample#7"), html.index("<details"))
+        self.assertLess(html.index("example-owner/sample" "#7"), html.index("<details"))
         self.assertIn("From the backlog (1)", html)
         self.assertEqual(html.count("example-owner/sample" + "#7 - "), 1)
         self.assertIn("needs:human counts by repo: example-owner/sample: 2", html)

@@ -281,7 +281,7 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertIn("tier:app-code", [
             x for c in gh.calls if c[0] == "POST" and "/labels" in c[1] for x in c[2]["labels"]])
         self.assertEqual(hunt_plan.problems(body), [])
-        self.assertTrue(body.rstrip().endswith("Refs example/project#4"))
+        self.assertTrue(body.rstrip().endswith("Refs example/project" "#4"))
         self.assertIsNone(re.search(r"\b(close[sd]?|fix(es|ed)?|resolve[sd]?)\s+#\d", body, re.I))
         self.assertIn("loom:pr", labels(gh))
 

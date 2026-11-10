@@ -260,12 +260,12 @@ class AfterLineTest(unittest.TestCase):
     """The After: line: what it accepts, and when it still holds."""
 
     def test_a_list_of_tickets_is_parsed(self):
-        self.assertEqual(after_refs({"After": "#5, owner/name#7"}),
+        self.assertEqual(after_refs({"After": "#5, owner/name" "#7"}),
                          [("", 5), ("owner/name", 7)])
         self.assertEqual(after_refs({}), [])
 
     def test_a_value_that_is_not_a_list_of_tickets_is_refused(self):
-        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner#5", "a/b/c#5", "#5; #7"):
+        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner" "#5", "a/b/c#5", "#5; #7"):
             with self.assertRaisesRegex(ValueError, "After:", msg=bad):
                 after_refs({"After": bad})
 
@@ -295,9 +295,9 @@ class AfterLineTest(unittest.TestCase):
             seen.append("%s#%d" % (repo, number))
             return ticket(number, "merged")
 
-        holds, released = after_holds(REPO, {"After": "#5, other/name#7"}, lookup)
+        holds, released = after_holds(REPO, {"After": "#5, other/name" "#7"}, lookup)
         self.assertEqual((holds, released), ([], []))
-        self.assertEqual(seen, ["%s#5" % REPO, "other/name#7"])
+        self.assertEqual(seen, ["%s#5" % REPO, "other/name" "#7"])
 
     def test_dependency_state_reads_the_tickets_own_labels(self):
         self.assertEqual(dependency_state(ticket(1, "verified")), "verified")

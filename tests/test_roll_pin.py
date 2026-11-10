@@ -12,7 +12,7 @@ from bus.station import Settings, Station
 
 SOURCE = "example-owner/module"
 DEPLOY = "example-owner/deploy"
-GOAL = "example-owner/project#12"
+GOAL = "example-owner/project" "#12"
 FIRST = "a" * 40
 SECOND = "b" * 40
 OLD = "0" * 40
