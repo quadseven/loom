@@ -59,7 +59,7 @@ class LaneTmpdirTest(unittest.TestCase):
                  "\"$([ -d \"$TMPDIR\" ] && echo yes || echo no)\""],
                 env=env, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f"tmpdir={check_home}/tmp exists=yes",
+            self.assertIn(f"tmpdir={check_home / 'tmp'} exists=yes",
                           log.read_text())
 
     def test_the_run_tmpdir_the_agent_inherits_exists(self):
