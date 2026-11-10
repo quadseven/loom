@@ -129,6 +129,9 @@ class FakeGitHub:
             return list(self.pulls.values())
         if re.search(r"/issues\?labels=loom:(triage|factory)&state=open$", path):
             return list(self.filed)
+        if "labels=loom%3Atriage&state=open" in path:
+            return [i for i in self.issues.values() if i.get("state") == "open"
+                    and "loom:triage" in [x["name"] for x in i.get("labels") or []]]
         if "/issues?labels=loom%3Aanswer-pending&state=open" in path:
             return [i for i in self.issues.values() if i.get("state") == "open"
                     and "loom:answer-pending" in [x["name"] for x in i.get("labels") or []]]
