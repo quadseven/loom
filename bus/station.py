@@ -124,6 +124,9 @@ DEAD_LANE_RELEASED = "Runaway hold released"
 # How long a done brief whose pull request is not found is read again before
 # its run is reported as over with nothing to show (loom#2583).
 DONE_NO_PR_WAIT = 2 * 3600
+# How long a no-change step that waits for a plan is left alone between
+# planning attempts: each attempt reads the ticket, its comments and events.
+NO_CHANGE_RETRY_EVERY = 900
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -5534,6 +5537,7 @@ class Station:
         reported = _read_json(path, {})
         if not isinstance(reported, dict):
             raise StateError("state file %s does not hold an object" % path)
+        self.retry_waiting_no_change()
         for lane, kind, brief, name in self._finished_briefs():
             key = "%s/%s" % (lane, name)
             if key in reported:
@@ -8817,7 +8821,38 @@ class Station:
     def _no_change_pending(self, repo: str, number: int, lane: str, name: str) -> bool:
         entry = self._no_change_data().get("%s#%d" % (repo, number), {})
         step = entry.get("runs", {}).get(lane + "/" + name, {})
-        return bool(step) and not step.get("done")
+        return bool(step) and not step.get("done") and not step.get("waiting")
+
+    def retry_waiting_no_change(self) -> None:
+        """Re-attempt planning for every promote step that waits for a plan.
+
+        A waiting step is reported once (`_no_change_pending` is False for
+        it), so the report loop no longer drives its retry; this does, once
+        per station pass, from the durable budget file alone."""
+        listed = [(ticket, run) for ticket, entry in sorted(self._no_change_data().items())
+                  for run in sorted(entry.get("runs", {}))]
+        for ticket, run in listed:
+            # Each attempt writes the budget file through its own read, so
+            # the step is read afresh and stamped before the attempt: a raise
+            # inside it still restarts the window, and no stale copy is saved.
+            data = self._no_change_data()
+            step = data.get(ticket, {}).get("runs", {}).get(run, {})
+            if step.get("done") or not step.get("waiting"):
+                continue
+            if self.now - step.get("tried_at", 0) < NO_CHANGE_RETRY_EVERY:
+                continue
+            step["tried_at"] = self.now
+            self._save_no_change(data)
+            repo, _, number = ticket.rpartition("#")
+            lane, _, name = run.partition("/")
+            brief = "Model: %s\n" % step["model"] if step.get("model") else ""
+            try:
+                if step.get("fix"):
+                    self._nothing_to_fix(repo, int(number), step["fix"], lane, name, brief)
+                else:
+                    self._settle_no_change(repo, int(number), lane, name, brief)
+            except (GitHubError, OSError, StateError) as err:
+                _say("could not retry the no-change plan for %s: %s" % (ticket, err))
 
     def _reset_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
         if not self._pushed(lane, name):
@@ -8870,6 +8905,11 @@ class Station:
             plan = self._no_change_plan(repo, planning)
             if plan is None:
                 self._set_wait(repo, issue, "no-change")
+                # Reported once; retry_waiting_no_change drives the retry.
+                step.update(waiting=True, fix=fix, tried_at=self.now)
+                if model:
+                    step["model"] = model
+                self._save_no_change(data)
                 return True
             step["plan"] = plan
             self._save_no_change(data)
@@ -8877,6 +8917,8 @@ class Station:
         if step["action"] == "promote" and step["plan"]:
             entry["promoted"] = step["plan"]
         step["done"] = True
+        for key in ("waiting", "fix", "tried_at", "model"):
+            step.pop(key, None)
         self._save_no_change(data)
         self._log_no_change(repo, number, boxes, step, fix)
         return True
