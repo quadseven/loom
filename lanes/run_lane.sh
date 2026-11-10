@@ -2740,6 +2740,27 @@ note_load_failure() {  # exit, reason_var_name
   fi
 }
 
+# The temp dir a run gets, owned by the runner and outside the agent's
+# scratch home: created here, so the directory always exists before
+# anything is handed the path, and it stays existing: drop_run_scratch
+# removes the agent home before every brief, and a sandboxed agent may
+# write its own home, so a temp dir inside that home can be removed or
+# replaced under the runner. This one sits beside the other slot
+# scratch under run/, which neither drop touches. On the
+# lane hosts an unset TMPDIR makes git ask the OS for the per-user temp
+# dir, and when that lookup fails git prints a confstr warning into every
+# call; the warning lands in run logs and in agent output that tests
+# assert on, and a lane run is recorded as failed work the model did not
+# lose. The agy and API lanes already set a TMPDIR inside their own
+# sandboxes; this covers the runner itself (whose TMPDIR the
+# subscription agents inherit). The validation check's TMPDIR is
+# created in contract_run_sandboxed, the one place every check passes
+# through.
+run_tmpdir() {
+  mkdir -p "$LOOM_HOME/run/$SLOT-tmp" || return 1
+  printf '%s\n' "$LOOM_HOME/run/$SLOT-tmp"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2761,6 +2782,11 @@ contract_run() {
 }
 contract_run_sandboxed() {
   local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
+  # The check's TMPDIR is created here, in the one place every check
+  # (setup, base, final, affected, the base-test gate) passes through,
+  # so the final check's environment matches the base check's even when
+  # no earlier step prepared the check home.
+  mkdir -p "$CHECK_HOME/tmp" || { echo "contract_run: could not create the check temp dir" >> "$LOG"; return 125; }
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -4160,6 +4186,12 @@ fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
+# The run's own TMPDIR, exported before anything else runs: the runner's
+# git calls and the subscription lanes' agents (which inherit this
+# environment) get a temp dir that exists, so git prints no confstr
+# warning on the lane hosts.
+TMPDIR="$(run_tmpdir)" || { echo "could not create the run temp dir $LOOM_HOME/run/$SLOT-tmp" >&2; exit 1; }
+export TMPDIR
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
