@@ -2166,7 +2166,7 @@ class Factory:
                         + "\nDeferred findings of #%d: %d still standing on the merged head."
                         % (pr_number, len(standing)), notify.RECORD)
             self.actions += 1
-            _say("settled the deferred findings of %s#%d (%d filed)"
+            _say("settled the deferred findings of %s#%d (%d standing)"
                  % (repo, pr_number, len(standing)))
 
     def settle_merged(self, repo: str, issue: Dict[str, Any]) -> None:
