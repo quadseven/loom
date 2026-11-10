@@ -1147,8 +1147,19 @@ class Watcher:
     def _due(self, rec: Dict[str, Any]) -> Optional[str]:
         """What the signature is due: "file" (a new burst not yet filed),
         "count" (new hits on its issue, the last count an hour ago) or None."""
-        if rec.get("due") in ("file", "count"):
-            return str(rec["due"])
+        pending = rec.get("due")
+        if pending == "count":
+            return "count"
+        if pending == "file" and isinstance(rec.get("refusal"), dict):
+            return "file"
+        if pending == "file" and rec.get("incident_linked"):
+            return "file"
+        if pending == "file":
+            if self._new_burst(rec):
+                return "file"
+            rec.pop("due", None)
+            self.say("watch: expired pending signature file (%d hits remain in the %d-minute window)"
+                     % (self._window(rec), WINDOW // 60))
         if rec.get("incident_linked") and not rec.get("done"):
             return "file" if self._new_burst(rec) else None
         if rec.get("issue") is None and not rec.get("done") and self._new_burst(rec):

@@ -591,11 +591,19 @@ class FilingTest(WatchBase):
         self.assertEqual(len(self.gh.issues), 1)
         self.assertEqual([n for n, _ in self.gh.comments], [1])
 
-    def test_a_low_budget_scans_and_files_on_a_later_pass(self):
+    def test_a_pending_file_expires_when_its_burst_leaves_the_window(self):
         self.append(LINE_403, LINE_403, LINE_403)
         self.run_at(T0, write=False)
         self.assertEqual(self.gh.issues, {})
-        self.run_at(T0 + 3600)
+        self.run_at(T0 + watch.WINDOW + 1)
+        self.assertEqual(self.gh.issues, {})
+        self.assertTrue(any("expired pending" in line for line in self.said), self.said)
+
+    def test_a_low_budget_files_while_the_burst_is_still_current(self):
+        self.append(LINE_403, LINE_403, LINE_403)
+        self.run_at(T0, write=False)
+        self.assertEqual(self.gh.issues, {})
+        self.run_at(T0 + 60)
         self.assertEqual(len(self.gh.issues), 1)
 
     def test_a_failed_filing_does_not_skip_another_due_signature(self):

@@ -1379,8 +1379,10 @@ place, also for runs it did not hurt, and a quiet close after 24 hours.
 A signature seen 3 or more times within 30 minutes, and not seen in the 24
 hours before, files one `loom:triage` issue in `LOOM_STATUS_REPO` titled
 `<component>: <signature>`, with the count and the first and last example
-lines. An example keeps the whole line up to 2000 characters; a longer one
-keeps its start and its end around ` ... `. The examples have paths,
+lines. If a filing is held by the write budget, the watcher checks the burst
+again before filing; an expired burst is dropped and logged with its remaining
+window count. An example keeps the whole line up to 2000 characters; a longer
+one keeps its start and its end around ` ... `. The examples have paths,
 credential shapes, mail addresses, mentions, private hosts, IP addresses and
 repo names replaced, and each must pass the
 written-text check (`bus/text.py`) or is withheld. An open `loom:triage` issue
