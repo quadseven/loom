@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from dashboard.server import make_server
+from tests import sandbox_caps
 from tests.local_http import LocalHTTPServer
 
 TESTS = Path(__file__).resolve().parent
@@ -31,6 +32,7 @@ def _no_lookup(*args):
 
 
 class NoReverseLookupTest(unittest.TestCase):
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
     def test_the_dashboard_server_binds_without_a_reverse_lookup(self):
         with patch("socket.getfqdn", _no_lookup):
             server = make_server(port=0, store=_Store())
@@ -40,6 +42,7 @@ class NoReverseLookupTest(unittest.TestCase):
         finally:
             server.server_close()
 
+    @unittest.skipUnless(sandbox_caps.LOCALHOST, sandbox_caps.NO_LOCALHOST)
     def test_the_test_server_binds_without_a_reverse_lookup(self):
         with patch("socket.getfqdn", _no_lookup):
             server = LocalHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)

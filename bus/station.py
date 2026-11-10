@@ -5175,6 +5175,49 @@ class Station:
             _say("%s#%d is no longer held by %s, closed as not planned"
                  % (repo, number, dep.short))
 
+    def _triage_stray_brief(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Move a ticket whose body parse refuses for a header-like line to
+        loom:triage, with one comment naming the line (loom#1821). Such a
+        ticket was only logged on every claim pass and never repaired; in
+        triage the rewrite step and people see it. The move is once per
+        body, with the same guard _refuse uses: a ticket triage sends back
+        to the queue with its body unchanged is not moved again on the next
+        claim pass (only a reworded body, whose hash differs, moves again),
+        and the marker comment is once per ticket."""
+        field = tickets.stray_field_line(issue.get("body"))
+        if field is None:
+            return
+        number = int(issue["number"])
+        path = os.path.join(self.state, "stray-brief.json")
+        seen = _read_json(path, {})
+        if not isinstance(seen, dict):
+            seen = {}
+        key = "%s#%d" % (repo, number)
+        if (seen.get(key) or {}).get("sha") == _sha12(issue.get("body")):
+            return
+        names = _label_names(issue)
+        if "loom:triage" not in names:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["loom:triage"]})
+            for state in ("loom:queued", "loom:briefed"):
+                if state in names:
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                                 % (repo, number, quote(state, safe="")), ok=(404,))
+        said = any(str(c.get("body") or "").startswith("<!-- loom:stray-brief v1 -->")
+                   for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                   if isinstance(c, dict))
+        if not said:
+            notify.post(self.gh, repo, number,
+                        "<!-- loom:stray-brief v1 -->\nMoved to loom:triage: the body "
+                        "line %r looks like a brief header, so the brief parser "
+                        "refuses this ticket and no lane can claim it as written. "
+                        "Reword or remove that line, or let the rewrite step "
+                        "rewrite the ticket, and it can be briefed again." % field,
+                        notify.RECORD)
+        seen[key] = {"sha": _sha12(issue.get("body")),
+                     "updated_at": issue.get("updated_at")}
+        _write_json(path, seen)
+
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
@@ -5186,6 +5229,7 @@ class Station:
         try:
             headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
+            self._triage_stray_brief(repo, issue)
             self._refuse(repo, issue, "unusable brief: %s" % err)
             return False
         hold = tickets.not_before(headers)
