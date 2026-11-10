@@ -8286,6 +8286,23 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
     return rows
 
 
+def _demoted_lanes(gh: GitHub, lanes_repo: str,
+                   authors: Optional[Sequence[str]] = None) -> set:
+    """Lanes demoted by the scorecard, parsed from the lane status comment's
+    scorecard table (the 'demoted' column)."""
+    status = _lane_status(gh, lanes_repo, authors)
+    if "scorecard lane" not in status:
+        return set()
+    demoted = set()
+    for line in status.splitlines():
+        if not line.startswith("|") or "scorecard lane" in line or "---" in line:
+            continue
+        parts = [p.strip() for p in line.split("|")[1:-1]]
+        if len(parts) >= 2 and parts[-1].lower() == "yes":
+            demoted.add(parts[0])
+    return demoted
+
+
 def _open_pr(gh: GitHub, repo: str, number: int,
              env: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """The ticket's trusted, same-repository open pull request, or None."""
@@ -8524,6 +8541,8 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
     free = _available_lanes(gh, lanes_repo)
+    demoted = _demoted_lanes(gh, lanes_repo)
+    free = [lane for lane in free if lane not in demoted]
     load = _lane_load(gh, repo)
     choice, skipped_load = _rung_by_load(
         left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)

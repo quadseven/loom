@@ -3858,11 +3858,27 @@ class SendBackNeedsAFindingTests(unittest.TestCase):
 LANE_TABLE = "<!-- loom:lanes v1 -->\n| lane | available | heartbeat (UTC) |\n|---|---|---|\n%s"
 
 
-def lanes_routes(free):
+def lane_scorecard_table(demoted_lanes: Sequence[str]) -> str:
+    """Return a scorecard table snippet with the given lanes marked as demoted."""
+    header = "| scorecard lane | model | prs | clean | findings | bad-work | sent back | merged | reverted | deploy failed | audit failed | audit good | audit useless | audit damaging | demoted |"
+    sep = "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+    lanes = ("claude", "codex", "codex-2", "anthropic", "anthropic-2")
+    cols = ("claude", "claude-sonnet-5-5"), ("codex", "gpt-6-luna")
+    rows = [header, sep]
+    for lane in lanes:
+        model = next((m for l, m in cols if l == lane), "")
+        is_demoted = lane in demoted_lanes
+        demoted = "yes" if is_demoted else "no"
+        rows.append("| %s | %s | 5 | 3 | 2 | 1 | 0 | 4 | 0 | 0 | 0 | 0 | 0 | %s |" % (lane, model, demoted))
+    return "\n".join(rows)
+
+
+def lanes_routes(free, demoted=None):
     rows = "\n".join("| %s | %s | - |" % (lane, "yes" if lane in free else "no")
                      for lane in ("claude", "codex", "codex-2", "anthropic", "anthropic-2"))
+    scorecard = lane_scorecard_table(demoted if demoted else set())
     return {("GET", "/repos/quadseven/loom/issues"): reply(200, [{"number": 99, "labels": [{"name": "loom:lanes"}]}]),
-            ("GET", "/issues/99/comments"): reply(200, [{"body": LANE_TABLE % rows, "created_at": "2030-01-01T00:00:00Z",
+            ("GET", "/issues/99/comments"): reply(200, [{"body": LANE_TABLE % rows + "\n" + scorecard, "created_at": "2030-01-01T00:00:00Z",
                                                           "user": {"login": BRAIN}}])}
 
 
@@ -3890,8 +3906,8 @@ NOW = "2030-01-01T01:00:00Z"
 OLD = "2020-01-01T00:00:00Z"
 
 
-def ticket_routes(issue, events, comments, free=("claude", "codex", "codex-2")):
-    routes = lanes_routes(free)
+def ticket_routes(issue, events, comments, free=("claude", "codex", "codex-2"), demoted=None):
+    routes = lanes_routes(free, demoted)
     routes.update({("GET", "/repos/%s/issues/9" % REPO): reply(200, issue),
                    ("GET", "/issues/9/events"): reply(200, events),
                    ("GET", "/issues/9/comments"): reply(200, comments),
@@ -3931,11 +3947,12 @@ class LoadRouted(Routed):
     """Routed, answering each repo's open ticket list from `by_repo` (a
     GitHubError for a repo in `unreadable`) and recording the repos read."""
 
-    def __init__(self, routes, by_repo, unreadable=(), author=BRAIN):
+    def __init__(self, routes, by_repo, unreadable=(), author=BRAIN, demoted=None):
         super().__init__(routes)
         self.by_repo = by_repo
         self.author = author
         self.unreadable = unreadable
+        self.demoted = demoted or ()
         self.read = []
 
     def __call__(self, method, url, headers, body):
@@ -4142,22 +4159,22 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
         self.assertEqual(fake.sent("PATCH", "/issues/9"), [{"body": "Model: claude-opus-5-5\n\n" + BODY}])
 
-    def escalate_over_repos(self, by_repo, history=(), unreadable=()):
+    def escalate_over_repos(self, by_repo, history=(), unreadable=(), demoted=None):
         """escalate on a failed ticket with claude and codex free, LOOM_REPOS
         naming every repo in `by_repo`, and `by_repo[repo]` the open briefed
         tickets per lane in each: (fake, outcome, repos read)."""
         fake = LoadRouted(ticket_routes(stuck_ticket("failed"), TWICE, list(history),
-                                        free=("claude", "codex")), by_repo, unreadable)
+                                        free=("claude", "codex"), demoted=demoted), by_repo, unreadable=unreadable, demoted=demoted)
         authors = (os.environ.get("LOOM_BRIEF_AUTHORS", "") + " " + BRAIN).strip()
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": authors,
                                                    "LOOM_REPOS": " ".join(by_repo)}):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
         return fake, outcome, fake.read
 
-    def escalate_with_load(self, load, history=()):
+    def escalate_with_load(self, load, history=(), demoted=None):
         """escalate with `load[lane]` open briefed tickets on each lane of
         the ticket's own repo: (fake, outcome)."""
-        fake, outcome, _ = self.escalate_over_repos({REPO: load}, history)
+        fake, outcome, _ = self.escalate_over_repos({REPO: load}, history, unreadable=(), demoted=demoted)
         return fake, outcome
 
     def test_escalate_spreads_one_lane_overflow_to_a_less_loaded_rung(self):
@@ -4242,6 +4259,16 @@ class EscalateTests(unittest.TestCase):
         fake, outcome = self.escalate_with_load({"claude": 5, "codex": 3})
         self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
         self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
+
+    def test_escalate_skips_demoted_lanes(self):
+        """Lanes demoted by the scorecard should be excluded from available lanes."""
+        fake, outcome = self.escalate_with_load({"codex": 1}, [claim("2030-01-01T00:11:00Z")],
+                                                demoted=("codex",))
+        # codex is demoted, so it's excluded; claude has 0 tickets and is available
+        # rung 2 has no available lanes (codex demoted, codex-2 not free), so it goes to rung 3
+        self.assertEqual(outcome, "rung 3 claude-opus-5-5 on claude")
+        note = fake.sent("POST", "/issues/9/comments")[-1]["body"]
+        self.assertIn("Escalated to rung 3 of 3: claude-opus-5-5 on lane claude.", note)
 
     def test_escalate_keeps_rung_two_after_rung_one_was_tried(self):
         from bus import factory
