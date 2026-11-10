@@ -315,6 +315,47 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     return headers, "\n".join(rest).rstrip("\n")
 
 
+def stray_field_line(body: Optional[str]) -> Optional[str]:
+    """The field name of the first body line after the header block that
+    parse refuses as header-like ("body line 'Model' looks like a brief
+    header"), or None when parse would not refuse the body on that ground.
+    The station names this line when it moves such a ticket to triage
+    (loom#1821)."""
+    lines = status.strip_body(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines) and HEADER_RE.fullmatch(lines[i].rstrip()):
+        i += 1
+    for line in lines[i:]:
+        m = FIELD_LINE_RE.match(line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def defuse_stray_field_lines(body: str) -> str:
+    """The body with its stray field lines defused: a line after the header
+    block that FIELD_LINE_RE matches (and parse therefore refuses) keeps
+    every word it carried, with its colon replaced by a dash, so it reads
+    as prose and no longer looks like a brief header. Dropping such a line
+    instead would lose text without a trace: the line can be the only
+    statement of the problem ("Issue: the cache misses..."). A writer that
+    composes a body (the rewrite step, loom#1821) runs its text through
+    this first, so it never writes a body its own parser refuses; the
+    header block itself is kept exactly as it is, so a repeated or
+    conflicting real header still refuses in parse."""
+    lines = status.strip_body(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    i = 0
+    while i < len(lines) and HEADER_RE.fullmatch(lines[i].rstrip()):
+        i += 1
+    kept = lines[:i]
+    for line in lines[i:]:
+        m = FIELD_LINE_RE.match(line)
+        if m:
+            line = "%s -%s" % (m.group(1), line[m.end():])
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def priority_of(issue: Dict[str, Any]) -> str:
     """The ticket's Priority: header, or DEFAULT_PRIORITY when it has none or
     its headers do not parse."""

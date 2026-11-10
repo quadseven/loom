@@ -327,6 +327,29 @@ class DifficultyHeaderTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse(bad)
 
+    def test_a_stray_field_line_is_named_and_defused(self):
+        # loom#1821: the station names the line when it triages such a
+        # ticket, and a writer defuses the line (its words stay, only the
+        # header shape breaks) so its own parser accepts the body; a real
+        # header block is left exactly as it is.
+        from bus.tickets import defuse_stray_field_lines, stray_field_line
+        body = "Difficulty: easy\n\n## What\nModel: some-model\nDo it.\n"
+        self.assertEqual(stray_field_line(body), "Model")
+        self.assertIsNone(stray_field_line("Difficulty: easy\n\n## What\nDo it.\n"))
+        cleaned = defuse_stray_field_lines(body)
+        self.assertEqual(parse(cleaned)[0], {"Difficulty": "easy"})
+        self.assertIn("Model - some-model", cleaned)
+        self.assertIn("Do it.", cleaned)
+
+    def test_a_defused_line_keeps_the_only_statement_of_the_problem(self):
+        # The stray line can carry the whole ask ("Issue: the cache misses
+        # on the first page"); defusing must not lose those words.
+        from bus.tickets import defuse_stray_field_lines
+        body = "Difficulty: easy\n\n## What\nIssue: the cache misses on the first page\n"
+        cleaned = defuse_stray_field_lines(body)
+        self.assertIn("the cache misses on the first page", cleaned)
+        self.assertEqual(parse(cleaned)[0], {"Difficulty": "easy"})
+
 
 class PriorityTest(unittest.TestCase):
     """Priority: P0 to P3 orders every queue after the FIRST labels."""
