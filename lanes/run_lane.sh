@@ -2240,7 +2240,8 @@ parse_contract() {
     { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
-# A fix round's base branch, fetched into the shallow tree for its contract.
+# Read .loom/validation.conf from the already-fetched base branch when possible.
+# A fix round's base branch is fetched into the shallow tree for its contract.
 # Tried a second time after a pause: two fetches on one shallow tree race
 # ("shallow file has changed since we read it"), and the first such failure
 # filed a factory incident while nothing was wrong (2026-10-22).
@@ -2255,13 +2256,19 @@ fetch_base_for_contract() {
 }
 
 load_contract() {
-  local rev="$BASE" mode canon
+  # A brief need not name a base, and the lane's clone has no origin/HEAD, so
+  # a fix round falls back to the default branch update_fix_branch fetched.
+  local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-${FIX_DEFAULT:-HEAD}}"
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
-  if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
-       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
-    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
-    return 1
+  if [ -n "$FIX_PR" ]; then
+    if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
+      if ! { fetch_base_for_contract &&
+           rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+        HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+        note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+        return 1
+      fi
+    fi
   fi
   mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
   [ -n "$mode" ] || return 0
