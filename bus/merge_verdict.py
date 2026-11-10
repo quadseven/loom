@@ -123,8 +123,11 @@ def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
     head = head_commit(node)
     review_threads = node.get("reviewThreads") or {}
     threads = review_threads.get("nodes") or []
-    rules: List[Tuple[Optional[str], str]] = [(_checks_blocker(head), LANE),
-                                              (_review_blocker(node, bot), LANE)]
+    rules: List[Tuple[Optional[str], str]] = [
+        ("draft" if node.get("isDraft") else None, LANE),
+        (_checks_blocker(head), LANE),
+        (_review_blocker(node, bot), LANE),
+    ]
     rules += [(blocker, OPERATOR) for blocker in person_blockers(node)]
     rules += [(_threads_blocker(threads, review_threads.get("totalCount")), LANE),
               (_unfixed_blocker(threads, head, bot), LANE)]

@@ -280,7 +280,7 @@ def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
 # What merge_ready reads for one pull request: the head commit's time and
 # check rollup, the reviews, and each review thread's state and first comment.
 READY_FIELDS = (
-    "commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    "isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { totalCount nodes { isResolved"
