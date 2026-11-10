@@ -177,6 +177,7 @@ def anthropic_records(home: str, lanes: List[str], env: Dict[str, str], now: flo
     summary = spend.summarize(home, budget, now)
     if budget.usd is None:
         spent = "spent USD %.2f recorded" % summary.spent
+        no_topup = [w.lower() for w in env.get("LOOM_NO_TOPUP", "").replace(",", " ").split()]
         if lanes and all(OUT_OF_CREDIT in (_limit_hold(home, lane, now) or {}).get("reason", "")
                          for lane in lanes):
             # The provider itself refused every slot for low credit: the
@@ -184,6 +185,10 @@ def anthropic_records(home: str, lanes: List[str], env: Dict[str, str], now: flo
             return [_record("anthropic", lanes, "credit", 100.0, 0.0, "USD", None,
                             "lane heartbeats", now,
                             "every anthropic slot reports out of credit; %s; %s" % (spent, BUDGET_ASK))]
+        if "anthropic" in no_topup:
+            return [_record("anthropic", lanes, "credit", 100.0, 0.0, "USD", None,
+                            "LOOM_NO_TOPUP", now,
+                            "LOOM_NO_TOPUP lists anthropic; %s; %s" % (spent, BUDGET_ASK))]
         return [_record("anthropic", lanes, "credit", None, None, "USD", None,
                         "bus/spend.py", now, "%s; %s" % (BUDGET_ASK, spent))]
     pct = min(100.0, max(0.0, summary.spent / budget.usd * 100)) if budget.usd else 100.0

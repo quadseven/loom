@@ -53,7 +53,9 @@ class InstallScriptTest(unittest.TestCase):
         # leaves unset.
         full = {k: v for k, v in os.environ.items()
                 if k not in ("LOOM_REPOS", "LOOM_STATUS_REPO", "LOOM_BRIEF_AUTHORS",
-                             "LOOM_ASK_ANSWERERS", "LOOM_TRUSTED_BRIEFERS")
+                             "LOOM_ASK_ANSWERERS", "LOOM_TRUSTED_BRIEFERS",
+                             "LOOM_ANTHROPIC_BUDGET_USD", "LOOM_ANTHROPIC_BUDGET_SINCE",
+                             "LOOM_ANTHROPIC_BUDGET_EXPIRES", "LOOM_NO_TOPUP")
                 and not k.startswith(("LOOM_GITHUB_APP_", "LOOM_LANES_GITHUB_APP_",
                                        "LOOM_BRAIN_GITHUB_APP_"))}
         full.update(PATH="%s:/usr/bin:/bin" % self.bin,
@@ -371,6 +373,37 @@ class InstallScriptTest(unittest.TestCase):
                 self.assertEqual(self.installed_setting(name), ["lee-example"] * 2)
                 self.assertEqual(self.run_install(**{name: ""}).returncode, 0)
                 self.assertEqual(self.installed_setting(name), ["", ""])
+
+    def test_a_reinstall_with_budget_or_no_topup_unset_keeps_the_installed_values(self):
+        for name, value in (("LOOM_ANTHROPIC_BUDGET_USD", "0"),
+                            ("LOOM_ANTHROPIC_BUDGET_SINCE", "2026-10-18"),
+                            ("LOOM_ANTHROPIC_BUDGET_EXPIRES", "2026-11-01"),
+                            ("LOOM_NO_TOPUP", "anthropic")):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: value}).returncode, 0)
+                env = {k: v for k, v in os.environ.items() if k != name}
+                with unittest.mock.patch.dict(os.environ, env, clear=True):
+                    result = self.run_install()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                station_plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+                match = re.search(r"<key>%s</key><string>(.*?)</string>" % name, station_plist)
+                self.assertEqual(match.group(1) if match else "", value)
+
+    def test_a_reinstall_that_sets_budget_or_no_topup_replaces_them_even_with_empty(self):
+        for name, first, second in (("LOOM_ANTHROPIC_BUDGET_USD", "100", "0"),
+                                    ("LOOM_ANTHROPIC_BUDGET_SINCE", "2026-10-01", "2026-10-18"),
+                                    ("LOOM_ANTHROPIC_BUDGET_EXPIRES", "2026-10-31", "2026-11-01"),
+                                    ("LOOM_NO_TOPUP", "zen", "anthropic")):
+            with self.subTest(name):
+                self.assertEqual(self.run_install(**{name: first}).returncode, 0)
+                self.assertEqual(self.run_install(**{name: second}).returncode, 0)
+                station_plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+                match = re.search(r"<key>%s</key><string>(.*?)</string>" % name, station_plist)
+                self.assertEqual(match.group(1) if match else "", second)
+                self.assertEqual(self.run_install(**{name: ""}).returncode, 0)
+                station_plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
+                match = re.search(r"<key>%s</key><string>(.*?)</string>" % name, station_plist)
+                self.assertEqual(match.group(1) if match else "", "")
 
     def test_an_unreadable_installed_plist_names_each_unset_login_list(self):
         agents = self.home / "Library" / "LaunchAgents"

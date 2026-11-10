@@ -272,6 +272,20 @@ class UsageTests(unittest.TestCase):
         row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {}, now)[0]
         self.assertIsNone(row["used_pct"])
 
+    def test_anthropic_credit_reads_used_up_when_no_topup_lists_anthropic(self):
+        now = 1_800_000_000
+        # Neither budget nor heartbeats: LOOM_NO_TOPUP marks anthropic used up.
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"],
+                                      {"LOOM_NO_TOPUP": "anthropic"}, now)[0]
+        self.assertEqual((row["used_pct"], row["remaining"]), (100.0, 0.0))
+        self.assertEqual(row["source"], "LOOM_NO_TOPUP")
+        self.assertIn("LOOM_NO_TOPUP lists anthropic", row["note"])
+        # Case-insensitivity and comma separation:
+        row2 = usage.anthropic_records(self.home, ["anthropic"],
+                                       {"LOOM_NO_TOPUP": "zen, Anthropic"}, now)[0]
+        self.assertEqual((row2["used_pct"], row2["remaining"]), (100.0, 0.0))
+        self.assertEqual(row2["source"], "LOOM_NO_TOPUP")
+
     def test_runner_resources_are_collected_per_repo_for_the_usage_view(self):
         logs = Path(self.home) / "logs" / "opencode-go-2"
         logs.mkdir(parents=True)

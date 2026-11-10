@@ -168,6 +168,20 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("LOOM_ANTHROPIC_BUDGET_SINCE", asks)
         self.assertIn("1 of 2 lanes can take work: 1 held at a limit.", body)
 
+    def test_anthropic_reads_used_up_when_no_topup_or_out_of_credit(self):
+        rows = [reading("anthropic", ["anthropic", "anthropic-2"], "credit", 100.0, None,
+                        remaining=0.0, unit="USD", source="LOOM_NO_TOPUP",
+                        note="LOOM_NO_TOPUP lists anthropic; spent USD 0.00 recorded; budget is not configured")]
+        body = usage.render(usage.build(rows, NOW))
+        anthropic = provider_row(body, "anthropic")
+        self.assertIn("<strong>100%</strong> used", anthropic)
+        self.assertIn("<strong>0%</strong> left", anthropic)
+        self.assertIn("(USD 0.00 left)", anthropic)
+        self.assertIn("near limit", anthropic)
+        self.assertIn("Source: LOOM_NO_TOPUP", anthropic)
+        self.assertIn("anthropic credit is 100% used.", section(body, "usage-asks"))
+        self.assertNotIn("no API reads the prepaid balance", section(body, "usage-asks"))
+
     def test_a_snapshot_older_than_two_hours_is_marked_stale_everywhere(self):
         rows = [reading("codex", ["codex"], "weekly", 50, (NOW + timedelta(days=2)).isoformat(),
                         age=timedelta(hours=19)),
