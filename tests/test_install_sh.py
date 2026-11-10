@@ -208,6 +208,19 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
 
+    def test_fabric_review_config_is_preserved_for_station_only(self):
+        import plistlib
+        config = ('{"timezone":"America/New_York","notes":'
+                  '[{"title_prefix":"Loom morning review","start":"00:00","by":"14:00"}]}')
+        result = self.run_install(LOOM_FABRIC_REVIEW_NOTES=config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        plist = plistlib.loads((agents / "com.loom.station.plist").read_bytes())
+        self.assertEqual(plist["EnvironmentVariables"]["LOOM_FABRIC_REVIEW_NOTES"], config)
+        for name in ("brain", "codex"):
+            other = plistlib.loads((agents / ("com.loom.%s.plist" % name)).read_bytes())
+            self.assertNotIn("LOOM_FABRIC_REVIEW_NOTES", other["EnvironmentVariables"])
+
     def test_the_brain_plist_omits_the_fabric_key_without_the_opt_in(self):
         # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and
         # off by default, so its plist must not carry the key parameter name
@@ -234,7 +247,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", station)
 
     def test_roll_ship_documents_are_written_to_station_plist(self):
-        documents = '[{"goal":"example-owner/project#12","repo":"example-owner/project","path":"docs/ship.md"}]'
+        documents = '[{"goal":"example-owner/project' '#12","repo":"example-owner/project","path":"docs/ship.md"}]'
         result = self.run_install(LOOM_ROLL_SHIP_DOCS=documents)
         self.assertEqual(result.returncode, 0, result.stderr)
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
@@ -325,6 +338,22 @@ class InstallScriptTest(unittest.TestCase):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.trusted_briefers_entries(), ["dana-example app[bot]"] * 2)
+
+    def test_a_reinstall_keeps_anthropic_budget_and_no_topup_settings(self):
+        settings = {
+            "LOOM_ANTHROPIC_BUDGET_USD": "0",
+            "LOOM_ANTHROPIC_BUDGET_SINCE": "2026-10-18",
+            "LOOM_ANTHROPIC_BUDGET_EXPIRES": "",
+            "LOOM_NO_TOPUP": "anthropic",
+        }
+        result = self.run_install(**settings)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = {k: v for k, v in os.environ.items() if k not in settings}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, value in settings.items():
+            self.assertEqual(self.installed_setting(name)[0], value)
 
     def test_a_reinstall_that_sets_the_briefers_replaces_them_even_with_empty(self):
         self.assertEqual(self.run_install(LOOM_TRUSTED_BRIEFERS="dana-example").returncode, 0)

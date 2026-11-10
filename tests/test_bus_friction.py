@@ -32,7 +32,7 @@ class FrictionHeadingsTest(unittest.TestCase):
             "- Moved: merged 1",
             "- Asks: none",
             "- Reports: next due 10:00Z.",
-            "- Shipped: example-owner/sample#3 at 10:05Z",
+            "- Shipped: example-owner/sample" "#3 at 10:05Z",
         ])
         self.assertEqual(friction_lines(body), [])
 

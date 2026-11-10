@@ -9,9 +9,11 @@ The Linux CI job and the cluster lanes' pre-ticket check run with
 --allow-skips: off macOS the seatbelt and keychain tests skip on SEATBELT.
 """
 
+import os
 import shutil
 import socket
 import subprocess
+import tempfile
 
 
 def _runs(argv):
@@ -33,6 +35,17 @@ def _connects_to_localhost():
         return False
 
 
+def _binds_unix_socket():
+    # A short name in a temp directory: AF_UNIX paths top out near 104 bytes.
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(os.path.join(directory, "s"))
+                return True
+    except (OSError, AttributeError):
+        return False
+
+
 # macOS sandbox-exec is on PATH (it need not work: the lane check sandbox has
 # it but cannot nest it). Off macOS there is none, nor the security keychain.
 SEATBELT = bool(shutil.which("sandbox-exec"))
@@ -40,8 +53,11 @@ NESTED_SANDBOX = SEATBELT and _runs(
     ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"])
 PROCESS_TABLE = _runs(["ps", "-o", "pid=", "-p", "1"])
 LOCALHOST = _connects_to_localhost()
+# Independent of LOCALHOST: a sandbox may allow TCP binds and deny AF_UNIX binds.
+UNIX_SOCKET = _binds_unix_socket()
 
 NO_SEATBELT = "needs macOS sandbox-exec and the security keychain, which only the Mac lanes have"
 NO_NESTED_SANDBOX = "needs a working sandbox-exec: none on this host, or inside the lane check sandbox"
 NO_PROCESS_TABLE = "needs ps, which the lane check sandbox cannot run"
 NO_LOCALHOST = "needs a localhost connection, which the lane check sandbox denies"
+NO_UNIX_SOCKET = "needs to bind a Unix socket, which the lane check sandbox denies"

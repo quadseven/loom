@@ -25,6 +25,8 @@ from .github import GitHub, Response
 
 # A single issue, not its comments, events, sub-issues or a listing.
 ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/\d+$")
+# An issue or one of its writable subresources.
+ISSUE_RESOURCE = re.compile(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)")
 # An issue listing: its items are whole issues (pull requests included).
 LISTING = re.compile(r"^/repos/([^/]+/[^/]+)/issues\?")
 # The paginated reads kept for the pass: a listing, or one issue's comments,
@@ -53,6 +55,7 @@ class IssueReads:
         self._path_locks: Dict[str, threading.Lock] = {}
         self._answers: Dict[str, Response] = {}
         self._lists: Dict[str, List[Any]] = {}
+        self._list_versions: Dict[str, int] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._gh, name)
@@ -97,10 +100,35 @@ class IssueReads:
             return self._issue(path)
         if method == "GET" and body is None and etag is None and ISSUE_PATH.match(path):
             return self._issue_or_failure(path, ok)
+        written_issue = ISSUE_RESOURCE.match(path) if method != "GET" else None
+        if written_issue:
+            repo, number = written_issue.groups()
+            issue_path = "/repos/%s/issues/%s" % (repo, number)
+            with self._path_lock(issue_path):
+                try:
+                    return self._gh.rest(method, path, body, etag, ok)
+                finally:
+                    self._forget_issue(repo, number)
         if plain and isinstance(self._gh, GitHub):
             # A comments page reads its issue's body from this pass's answers.
             return self._gh.rest(method, path, issue=self._issue)
         return self._gh.rest(method, path, body, etag, ok)
+
+    def _forget_issue(self, repo: str, number: str) -> None:
+        """Drop pass-local answers that a write to one issue made stale."""
+        issue_path = "/repos/%s/issues/%s" % (repo, number)
+        issue_lists = (issue_path + "/comments", issue_path + "/events",
+                       issue_path + "/sub_issues")
+        listing_prefix = "/repos/%s/issues?" % repo
+        with self._lock:
+            self._answers.pop(issue_path, None)
+            keys = set(self._lists) | set(self._list_versions)
+            for key in keys:
+                if (key.startswith(listing_prefix)
+                        or any(key == prefix or key.startswith(prefix + "?")
+                               for prefix in issue_lists)):
+                    self._lists.pop(key, None)
+                    self._list_versions[key] = self._list_versions.get(key, 0) + 1
 
     def paginate(self, path: str) -> List[Any]:
         key = _with_per_page(path)
@@ -109,11 +137,15 @@ class IssueReads:
         with self._path_lock(key):
             with self._lock:
                 kept = self._lists.get(key)
+                version = self._list_versions.setdefault(key, 0)
             if kept is None:
                 kept = self._read_list(path)
-                self._keep_listed(key, kept)
                 with self._lock:
-                    self._lists[key] = kept
+                    if self._list_versions.get(key, 0) == version:
+                        found = LISTING.match(key)
+                        if found and isinstance(self._gh, GitHub):
+                            self._remember_listed(found.group(1), kept)
+                        self._lists[key] = kept
             return list(kept)
 
     def _read_list(self, path: str) -> List[Any]:
@@ -146,13 +178,17 @@ class IssueReads:
         found = LISTING.match(key)
         if not found or not isinstance(self._gh, GitHub):
             return
+        with self._lock:
+            self._remember_listed(found.group(1), items)
+
+    def _remember_listed(self, repo: str, items: List[Any]) -> None:
+        """Keep the listed issue answers while holding the cache lock."""
         for item in items:
             number = item.get("number") if isinstance(item, dict) else None
             if not isinstance(number, int) or isinstance(number, bool):
                 continue
-            path = "/repos/%s/issues/%d" % (found.group(1), number)
-            with self._lock:
-                self._answers.setdefault(path, Response(200, item))
+            path = "/repos/%s/issues/%d" % (repo, number)
+            self._answers.setdefault(path, Response(200, item))
 
 
 def once(gh: Any) -> Any:

@@ -32,6 +32,9 @@ _BOX = re.compile(r"^\s*[-*] \[([ xX])\]\s+(.*?)\s*$")
 _SHA = re.compile(r"[0-9a-f]{7,40}")
 _RECORD = re.compile(r"^```json\n(.*?)\n```$", re.S | re.M)
 FACTS_KEY = "station_facts"
+# A test function name cited in sources or evidence: test_ plus word chars,
+# not a test file name (a test_...py file stem is a path, not a function).
+_CITED_TEST = re.compile(r"\btest_[A-Za-z0-9_]+\b(?!\.py\b)")
 # Evidence prose that says every check passed: "all checks passed", "every
 # check passed", "all CI succeeded", "checks green".
 _ALL_PASSED = re.compile(
@@ -184,6 +187,32 @@ def render(record: Dict[str, Any], body: str, facts: Sequence[str] = ()) -> str:
         stored[FACTS_KEY] = facts
     lines += ["", "```json", json.dumps(stored, indent=2, sort_keys=True), "```"]
     return "\n".join(lines) + "\n"
+
+
+def cited_tests(record: Dict[str, Any]) -> List[str]:
+    """Every test_ function name the record's sources and evidence cite,
+    in first-seen order, once each. A test file stem is not a function."""
+    texts: List[str] = []
+    sources = record.get("sources")
+    if isinstance(sources, list):
+        texts.extend(x for x in sources if isinstance(x, str))
+    results = record.get("criteria")
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, dict):
+                texts.append(str(item.get("evidence", "")))
+    found: List[str] = []
+    for text in texts:
+        for name in _CITED_TEST.findall(text):
+            if name not in found:
+                found.append(name)
+    return found
+
+
+def missing_cited_tests(cited: Sequence[str], present: Sequence[str]) -> List[str]:
+    """The cited test names that are not in present, in cited order."""
+    have = set(present)
+    return [name for name in cited if name not in have]
 
 
 def contradicts(record: Dict[str, Any], failing_checks: Mapping[str, str]) -> str:

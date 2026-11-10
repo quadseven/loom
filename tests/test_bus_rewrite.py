@@ -277,6 +277,17 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_a_handed_off_triage_issue_is_not_a_candidate(self):
+        # loom#1884: the factory's hold pass puts a triage issue whose hold
+        # returned after its retry into the hand-off pool (handoff:claude,
+        # no needs-brain). The rewrite must leave it there: as a candidate
+        # it was held again the same day and handed off again the next,
+        # one rewrite run and one new hand-off note per day.
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"] = [{"name": "loom:triage"}, {"name": "handoff:claude"}]
+        self.fake.add_triage(7)
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
         # loom#34, a wayfinder decision question labelled loom:triage before
         # triage skipped wayfinder issues, became a ticket that churned for
@@ -678,6 +689,37 @@ class StationRewriteTest(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ValidateStrayFieldLineTest(unittest.TestCase):
+    """A rewrite answer whose body repeats a header-like line (a stray
+    "Model:" line in a section) was refused by the brief parser, so the
+    rewrite wrote nothing on every pass (loom#1821). The rewrite step
+    defuses the stray line before writing (its words stay, only the
+    header shape breaks), so its own parser accepts the body."""
+
+    def test_a_stray_field_line_is_defused_and_the_brief_is_written(self):
+        body = BODY.replace("## What\nCache the query.",
+                            "## What\nModel: some-model\nCache the query.")
+        action, fields = rewrite.validate(
+            {"action": "brief", "title": "Cache the page query",
+             "difficulty": "easy", "body": body})
+        self.assertEqual(action, "brief")
+        self.assertNotIn("Model:", fields["body"])
+        self.assertIn("Model - some-model", fields["body"])
+        self.assertIn("Cache the query.", fields["body"])
+        from bus import tickets
+        headers, _ = tickets.parse(fields["body"])
+        self.assertEqual(headers, {})
+
+    def test_the_words_of_a_stray_line_survive_the_rewrite(self):
+        body = BODY.replace("## What\nCache the query.",
+                            "## What\nIssue: the cache misses on the first page")
+        action, fields = rewrite.validate(
+            {"action": "brief", "title": "Cache the page query",
+             "difficulty": "easy", "body": body})
+        self.assertEqual(action, "brief")
+        self.assertIn("the cache misses on the first page", fields["body"])
+
 
 class AnswerShapeTest(unittest.TestCase):
     """An unusable answer is described by its shape, never its words: all

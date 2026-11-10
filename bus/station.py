@@ -46,7 +46,8 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
-from . import fabric
+from . import operator_budget
+from . import fabric, fabric_reviews
 from . import fixrounds
 from . import logrotate
 from . import flake
@@ -124,6 +125,9 @@ DEAD_LANE_RELEASED = "Runaway hold released"
 # How long a done brief whose pull request is not found is read again before
 # its run is reported as over with nothing to show (loom#2583).
 DONE_NO_PR_WAIT = 2 * 3600
+# How long a no-change step that waits for a plan is left alone between
+# planning attempts: each attempt reads the ticket, its comments and events.
+NO_CHANGE_RETRY_EVERY = 900
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
@@ -1123,7 +1127,8 @@ class Settings:
                  urgency_config: Optional[urgency.Config] = None,
                  pass_deadline: int = 0,
                  decision_window_days: int = 3,
-                 repo_pr_caps: Optional[Dict[str, int]] = None) -> None:
+                 repo_pr_caps: Optional[Dict[str, int]] = None,
+                 fabric_review_notes: str = "") -> None:
         self.home = home
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
@@ -1247,6 +1252,7 @@ class Settings:
         self.transcript_url = transcript_url
         # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
         self.fabric_key_ssm = fabric_key_ssm
+        self.fabric_review_notes = fabric_review_notes
         self.transcript_token_ssm = transcript_token_ssm
         # (component, log path) pairs bus/watch.py reads each pass.
         self.watched = watch.components(home) if watched is None else watched
@@ -1316,6 +1322,7 @@ class Settings:
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
+                   fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -2238,8 +2245,10 @@ class Station:
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None,
-                 urgency_client: Optional[urgency.Client] = None) -> None:
+                 urgency_client: Optional[urgency.Client] = None,
+                 operator_reader: Optional[Callable[..., Any]] = None) -> None:
         self.gh = gh
+        self.operator_reader = operator_reader
         # The urgency model's client; None reads the key from SSM when a score
         # is first wanted (Station._urgency_client).
         self._urgency_injected = urgency_client
@@ -5003,6 +5012,52 @@ class Station:
                     "%s" % self._note_text(err))
         return "Its proof was refused: %s." % mismatch if mismatch else ""
 
+    def _test_names_at(self, repo: str, revision: str, wanted: Set[str]) -> Optional[Set[str]]:
+        """The test functions defined in the test files at a revision, read
+        from GitHub; None when the tree or a file cannot be read. Stops
+        once every wanted name is found."""
+        try:
+            commit = self.gh.rest("GET", "/repos/%s/git/commits/%s" % (repo, revision)).data
+            tree_sha = str(commit["tree"]["sha"])
+            tree = self.gh.rest(
+                "GET", "/repos/%s/git/trees/%s?recursive=1" % (repo, tree_sha)).data
+        except RateLimited:
+            raise
+        except (GitHubError, KeyError, TypeError):
+            return None
+        if not isinstance(tree, dict) or tree.get("truncated") \
+                or not isinstance(tree.get("tree"), list):
+            return None
+        entries = [e for e in tree["tree"] if isinstance(e, dict)
+                   and e.get("type") == "blob"
+                   and verify_data.test_file(str(e.get("path") or ""))]
+        present: Set[str] = set()
+        for entry in entries:
+            text = self._blob_text(repo, str(entry.get("sha") or ""))
+            if text is None:
+                return None
+            present.update(verify_data.defined_tests([text]))
+            if wanted <= present:
+                break
+        return present
+
+    def _cited_test_gap(self, repo: str, record: Dict[str, Any]) -> str:
+        """Why the proof cites a test the station cannot find at its
+        revision, or "" when every cited test is there (or none is cited)."""
+        cited = proof.cited_tests(record)
+        if not cited:
+            return ""
+        revision = str(record.get("revision") or "")
+        present = self._test_names_at(repo, revision, set(cited))
+        if present is None:
+            return ("Checked by the station: the station could not check the "
+                    "cited tests at revision %s" % revision[:12])
+        missing = proof.missing_cited_tests(cited, sorted(present))
+        if missing:
+            return ("Checked by the station: cited test %s is not in the test "
+                    "files at revision %s" % (", ".join(missing), revision[:12]))
+        return ""
+
     def _proof_facts(self, repo: str, issue: Dict[str, Any], record: Dict[str, Any]
                      ) -> Tuple[str, List[str]]:
         """(why the lane's evidence contradicts the merged pull requests'
@@ -5012,6 +5067,9 @@ class Station:
         branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
         if error:
             return "the station could not read the merged pull requests (%s)" % error, []
+        gap = self._cited_test_gap(repo, record)
+        if gap:
+            return gap, []
         return (proof.contradicts(record, verify_data.failing_checks(pulls)),
                 verify_data.proof_facts(branch, pulls))
 
@@ -5123,6 +5181,49 @@ class Station:
             _say("%s#%d is no longer held by %s, closed as not planned"
                  % (repo, number, dep.short))
 
+    def _triage_stray_brief(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Move a ticket whose body parse refuses for a header-like line to
+        loom:triage, with one comment naming the line (loom#1821). Such a
+        ticket was only logged on every claim pass and never repaired; in
+        triage the rewrite step and people see it. The move is once per
+        body, with the same guard _refuse uses: a ticket triage sends back
+        to the queue with its body unchanged is not moved again on the next
+        claim pass (only a reworded body, whose hash differs, moves again),
+        and the marker comment is once per ticket."""
+        field = tickets.stray_field_line(issue.get("body"))
+        if field is None:
+            return
+        number = int(issue["number"])
+        path = os.path.join(self.state, "stray-brief.json")
+        seen = _read_json(path, {})
+        if not isinstance(seen, dict):
+            seen = {}
+        key = "%s#%d" % (repo, number)
+        if (seen.get(key) or {}).get("sha") == _sha12(issue.get("body")):
+            return
+        names = _label_names(issue)
+        if "loom:triage" not in names:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["loom:triage"]})
+            for state in ("loom:queued", "loom:briefed"):
+                if state in names:
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                                 % (repo, number, quote(state, safe="")), ok=(404,))
+        said = any(str(c.get("body") or "").startswith("<!-- loom:stray-brief v1 -->")
+                   for c in self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+                   if isinstance(c, dict))
+        if not said:
+            notify.post(self.gh, repo, number,
+                        "<!-- loom:stray-brief v1 -->\nMoved to loom:triage: the body "
+                        "line %r looks like a brief header, so the brief parser "
+                        "refuses this ticket and no lane can claim it as written. "
+                        "Reword or remove that line, or let the rewrite step "
+                        "rewrite the ticket, and it can be briefed again." % field,
+                        notify.RECORD)
+        seen[key] = {"sha": _sha12(issue.get("body")),
+                     "updated_at": issue.get("updated_at")}
+        _write_json(path, seen)
+
     def _try_ticket(self, repo: str, lane: str, issue: Dict[str, Any],
                     free: List[str]) -> bool:
         if RUNAWAY in _label_names(issue):
@@ -5134,6 +5235,7 @@ class Station:
         try:
             headers, _ = tickets.parse(issue.get("body"))
         except ValueError as err:
+            self._triage_stray_brief(repo, issue)
             self._refuse(repo, issue, "unusable brief: %s" % err)
             return False
         hold = tickets.not_before(headers)
@@ -5410,6 +5512,15 @@ class Station:
                     "criterion as a checkbox under `## Acceptance criteria`, stated as "
                     "an observable result: the brief restates each one as the check "
                     "that proves it."))
+            elif found.kind == brief_check.SPLIT:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once the brain has split it into "
+                    "one ticket per platform, with `After:` lines between the "
+                    "slices so each slice queues only when the one before it "
+                    "has merged."))
             else:
                 brain.human(self.gh, repo, number, brief_check.ask(found))
         except ValueError as err:
@@ -5485,6 +5596,7 @@ class Station:
         reported = _read_json(path, {})
         if not isinstance(reported, dict):
             raise StateError("state file %s does not hold an object" % path)
+        self.retry_waiting_no_change()
         for lane, kind, brief, name in self._finished_briefs():
             key = "%s/%s" % (lane, name)
             if key in reported:
@@ -5969,7 +6081,7 @@ class Station:
                      self.queue_stateless_tickets,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
-                     self.health_intake, self.intake_friction, self.report_review_debt,
+                     self.health_intake, self.check_fabric_reviews, self.intake_friction, self.report_review_debt,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -8768,7 +8880,38 @@ class Station:
     def _no_change_pending(self, repo: str, number: int, lane: str, name: str) -> bool:
         entry = self._no_change_data().get("%s#%d" % (repo, number), {})
         step = entry.get("runs", {}).get(lane + "/" + name, {})
-        return bool(step) and not step.get("done")
+        return bool(step) and not step.get("done") and not step.get("waiting")
+
+    def retry_waiting_no_change(self) -> None:
+        """Re-attempt planning for every promote step that waits for a plan.
+
+        A waiting step is reported once (`_no_change_pending` is False for
+        it), so the report loop no longer drives its retry; this does, once
+        per station pass, from the durable budget file alone."""
+        listed = [(ticket, run) for ticket, entry in sorted(self._no_change_data().items())
+                  for run in sorted(entry.get("runs", {}))]
+        for ticket, run in listed:
+            # Each attempt writes the budget file through its own read, so
+            # the step is read afresh and stamped before the attempt: a raise
+            # inside it still restarts the window, and no stale copy is saved.
+            data = self._no_change_data()
+            step = data.get(ticket, {}).get("runs", {}).get(run, {})
+            if step.get("done") or not step.get("waiting"):
+                continue
+            if self.now - step.get("tried_at", 0) < NO_CHANGE_RETRY_EVERY:
+                continue
+            step["tried_at"] = self.now
+            self._save_no_change(data)
+            repo, _, number = ticket.rpartition("#")
+            lane, _, name = run.partition("/")
+            brief = "Model: %s\n" % step["model"] if step.get("model") else ""
+            try:
+                if step.get("fix"):
+                    self._nothing_to_fix(repo, int(number), step["fix"], lane, name, brief)
+                else:
+                    self._settle_no_change(repo, int(number), lane, name, brief)
+            except (GitHubError, OSError, StateError) as err:
+                _say("could not retry the no-change plan for %s: %s" % (ticket, err))
 
     def _reset_no_change(self, repo: str, number: int, lane: str, name: str) -> None:
         if not self._pushed(lane, name):
@@ -8821,6 +8964,11 @@ class Station:
             plan = self._no_change_plan(repo, planning)
             if plan is None:
                 self._set_wait(repo, issue, "no-change")
+                # Reported once; retry_waiting_no_change drives the retry.
+                step.update(waiting=True, fix=fix, tried_at=self.now)
+                if model:
+                    step["model"] = model
+                self._save_no_change(data)
                 return True
             step["plan"] = plan
             self._save_no_change(data)
@@ -8828,6 +8976,8 @@ class Station:
         if step["action"] == "promote" and step["plan"]:
             entry["promoted"] = step["plan"]
         step["done"] = True
+        for key in ("waiting", "fix", "tried_at", "model"):
+            step.pop(key, None)
         self._save_no_change(data)
         self._log_no_change(repo, number, boxes, step, fix)
         return True
@@ -12617,6 +12767,22 @@ class Station:
                 self._restate_one(repo, key, issue, cmd)
             _write_json(path, state)
 
+    def check_fabric_reviews(self) -> None:
+        """Check expected Fabric note windows once per configured calendar day."""
+        if not self.s.fabric_review_notes:
+            return
+        path = os.path.join(self.state, fabric_reviews.STATE_FILE)
+        try:
+            state = _read_json(path, {})
+            if not isinstance(state, dict):
+                raise ValueError("invalid daily check state")
+            fabric_reviews.run_pass(
+                self.gh, self.s.self_repo, self.s.fabric_review_notes,
+                self.s.fabric_key_ssm, self.s.region, state, self.now,
+                lambda: _write_json(path, state), self.read_secret)
+        except (StateError, ValueError):
+            _say("Fabric review check stopped: invalid configuration or state")
+
     # -- health findings -------------------------------------------------
     def health_intake(self) -> None:
         """Read each goal home's health endpoint (LOOM_HEALTH_URLS) at most
@@ -16161,7 +16327,54 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("assign_queued failed: %s" % err)
 
+    def _operator_ticket_assigned(self, lane: str) -> bool:
+        try:
+            names = os.listdir(self.inbox(lane))
+        except OSError:
+            return False
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            try:
+                with open(os.path.join(self.inbox(lane), name), encoding="utf-8") as stream:
+                    if ISSUE_LINE_RE.search(stream.read()):
+                        return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _operator_lane_active(self) -> bool:
+        """A ticket and a live agent group, not an idle runner or queued brief."""
+        for lane in LANES:
+            if not self._operator_ticket_assigned(lane):
+                continue
+            lock = os.path.join(self.s.home, "run", lane + ".lock")
+            for name in ("pgid", "watchdog_pgid"):
+                pid = self._lock_pid(lock, name)
+                if isinstance(pid, int) and not isinstance(pid, bool) and 1 < pid <= 2147483647 and self._pid_alive(pid):
+                    return True
+        return False
+
+    def sample_operator_budget(self) -> None:
+        if self.operator_reader is None or getattr(self, "_operator_sampled", False):
+            return
+        self._operator_sampled = True
+        try:
+            active = self._operator_lane_active()
+            state = operator_budget.sample(
+                os.path.join(self.state, operator_budget.FILE), self.now,
+                tickets.operator_login(self.s.authors), active, self.operator_reader, _say)
+            if state.get("signal"):
+                _say("operator core REST budget low during active work; durable factory signal pending")
+        except (OSError, ValueError):
+            _say("operator core budget activity unavailable; sampling deferred")
+        except Exception as err:
+            # Evidence gathering must not stop lane work, even if the sampler
+            # has a bug. Name the fault without logging private error details.
+            _say("operator budget sampler failed: %s" % type(err).__name__)
+
     def run_pass(self) -> None:
+        self.sample_operator_budget()
         if self._budget_exhausted():
             return
         if not self.check_repo_access():
@@ -16437,7 +16650,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         from .github import auth_from_env
         gh = GitHub(auth_from_env())
         gh.status_in_body = True
-    _trust_app_login(settings, gh)
+        hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
@@ -16448,6 +16661,11 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         app.state_file = os.path.join(state, "station", "app-token.json")
     st = Station(gh, settings, **hooks)
     try:
+        st.sample_operator_budget()
+        _trust_app_login(settings, gh)
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers.update(settings.authors)
         st.run_pass()
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)

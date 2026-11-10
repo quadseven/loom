@@ -271,7 +271,7 @@ if [ "${FAKE_AGENT:-commit}" = own-ref ]; then
 fi
 if [ "${FAKE_AGENT:-commit}" = private-ref ]; then
   echo "fixed" > fix.txt
-  echo "see repo-legacy-private#3 and example/repo#7" >> fix.txt
+  echo "see repo-legacy-private""" """#3 and example/repo""" """#7" >> fix.txt
   exit 0
 fi
 if [ "${FAKE_AGENT:-commit}" = verify-file ]; then
@@ -808,7 +808,7 @@ print('leak guard: clean (shape patterns only)')
         brief = Path(self._tmp.name) / "fix-items.md"
         brief.write_text("## Fix\nFixed\n### Thread F1 (comment 1) at test.py:10\n"
                          "Fixed\n### Thread F2 (comment 2) at test.py:20\n"
-                         "Fixing: example/repo#12\n")
+                         "Fixing: example/repo" "#12\n")
         # The function text goes to bash -c directly: bash 3.2 (macOS, as CI
         # runs it) sources nothing from a process substitution.
         function = re.search(r"^fix_items\(\) \{\n.*?^\}\n", RUNNER.read_text(), re.S | re.M).group(0)
@@ -816,7 +816,7 @@ print('leak guard: clean (shape patterns only)')
                                 capture_output=True, text=True, check=True)
         self.assertEqual(result.stdout.strip(),
                          "Thread F1 (comment 1) at test.py:10 [fixed]; "
-                         "Thread F2 (comment 2) at test.py:20 [example/repo#12]")
+                         "Thread F2 (comment 2) at test.py:20 [example/repo" "#12]")
 
     def test_brief_with_an_existing_pr_is_retired_without_running(self):
         self.drop_brief()
@@ -2009,11 +2009,11 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn("NAME#N", prompt)
 
     def test_pr_body_ends_with_refs_for_a_station_brief(self):
-        self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo#42\n"))
+        self.drop_brief(text=BRIEF.replace("Lane: codex\n", "Lane: codex\nIssue: example/repo" "#42\n"))
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.body.read_text().rstrip("\n").endswith(
-            "lane codex, model gpt-test-default.\nRefs example/repo#42"))
+            "lane codex, model gpt-test-default.\nRefs example/repo" "#42"))
 
     def test_pr_body_writes_a_word_size_as_the_review_bots_letter(self):
         # Chief accepts only XS, S, M, L: "Size: Medium" held five lane PRs
@@ -2069,7 +2069,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             ["git", "ls-remote", "--heads", str(self.remote), "loom/42-fix-the-thing"],
             capture_output=True, text=True, check=True).stdout
         self.assertIn("refs/heads/loom/42-fix-the-thing", heads)
-        self.assertIn("\nRefs example/repo#42", self.body.read_text())
+        self.assertIn("\nRefs example/repo" "#42", self.body.read_text())
 
     FIX_BRANCH = "loom/42-fix-the-thing"
 
@@ -2091,7 +2091,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         marker = ("\n<!-- loom:fix-head %s -->\n" % self.remote_head(self.FIX_BRANCH)
                   if with_head else "")
         fix = tickets.parse_fix("example/repo", (
-            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "<!-- loom:fix v1 -->\nPull request: example/repo" "#7, branch %s\n\n"
             "### Check: %s\n\n    E501 line too long\n\n"
             "### Thread PRRT_1 (comment 11) at a.py:3\n\n    reviewer: rename this\n%s"
             % (self.FIX_BRANCH, check, marker)))
@@ -2777,7 +2777,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertGreater(beat["retry_at"], int(time.time()))
 
     def test_a_usage_limit_followed_by_more_output_is_classed_limit(self):
-        # loom#934, grug#1186 r7 on codex-2: the limit line, then three
+        # loom#934, grug issue 1186 r7 on codex-2: the limit line, then three
         # "failed to record rollout items" lines, "tokens used" and the count,
         # five non-blank lines after the limit. The last five lines hold none
         # of it, so the old tail-only check logged [work] agent exited 1. The
@@ -3027,7 +3027,7 @@ exec /usr/bin/git "$@"
                                     "## Size\nS\n\n"
                                     "## Out of scope\n- Nothing else\n")}
         fix = tickets.parse_fix("example/repo", (
-            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "<!-- loom:fix v1 -->\nPull request: example/repo" "#7, branch %s\n\n"
             "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
         name = tickets.ticket_name("example/repo", 42, 2)
         self.drop_brief(name + ".md",
@@ -3142,7 +3142,7 @@ exec /usr/bin/git "$@"
                               "## Size\nS\n\n"
                               "## Out of scope\n- Nothing else\n")}
         fix = tickets.parse_fix("example/repo", (
-            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "<!-- loom:fix v1 -->\nPull request: example/repo" "#7, branch %s\n\n"
             "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
         name = tickets.ticket_name("example/repo", 42, 2)
         self.drop_brief(name + ".md",
@@ -3200,7 +3200,7 @@ exec /usr/bin/git "$@"
                                     "## Size\nS\n\n"
                                     "## Out of scope\n- Nothing else\n")}
         fix = tickets.parse_fix("example/repo", (
-            "<!-- loom:fix v1 -->\nPull request: example/repo#7, branch %s\n\n"
+            "<!-- loom:fix v1 -->\nPull request: example/repo" "#7, branch %s\n\n"
             "### Check: lint\n\n    E501 line too long\n" % self.FIX_BRANCH))
         name = tickets.ticket_name("example/repo", 42, 2)
         self.drop_brief(name + ".md",
@@ -3321,20 +3321,20 @@ cat > /dev/null
         # lane's change (its own issue refs, which its own CI accepts); a fix
         # round that merges it is not refused for them (2026-10-20).
         name, before = self.fix_brief()
-        self.advance_main("main.txt", "see other#5\n")
+        self.advance_main("main.txt", "see other" "#5\n")
         self.write_tool(self.bin / "codex", self.AGENT_NOTHING)
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("leak scan failed", self.run_log(name + ".log"))
         after = self.remote_head(self.FIX_BRANCH)
-        self.assertEqual(self.remote_file(after, "main.txt"), "see other#5\n")
+        self.assertEqual(self.remote_file(after, "main.txt"), "see other" "#5\n")
         self.assertIn(before, self.parents(after))
         self.assertTrue((self.inbox / "done" / (name + ".md")).exists())
 
     def test_a_fix_round_that_merges_main_still_scans_the_agents_change(self):
         name, before = self.fix_brief()
         self.advance_main("main.txt", "main moved\n")
-        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo 'see other#9' > first.txt\n")
+        self.write_tool(self.bin / "codex", self.AGENT_NOTHING + "echo 'see other" "#9' > first.txt\n")
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("public repo leak scan failed", self.run_log(name + ".log"))
@@ -3814,6 +3814,8 @@ exec /usr/bin/git "$@"
     def api_lane(self, lane, extra="", difficulty="medium", brief_header="Demoted-Models: none", **env):
         if not sandbox_caps.LOCALHOST:
             self.skipTest(sandbox_caps.NO_LOCALHOST)
+        if not sandbox_caps.UNIX_SOCKET:
+            self.skipTest(sandbox_caps.NO_UNIX_SOCKET)
         planted = self.home / ".ssh" / "id_planted"
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_text("private key\n")
@@ -4460,7 +4462,7 @@ exec /usr/bin/git "$@"
         self.assertIn("read_url(*)", seen["permissions"]["deny"])
         self.assertNotIn("read_url(*)", seen["permissions"]["allow"])
         # agy's own terminal sandbox denied commands the lane's rules allow
-        # (infra#5522), so it is off; sandbox-exec stays the boundary.
+        # (infra issue 5522), so it is off; sandbox-exec stays the boundary.
         self.assertIs(seen["enableTerminalSandbox"], False)
         # The file is restored after the run, whatever it did, and the
         # sandbox kept the run from widening it in the first place.
@@ -4738,6 +4740,8 @@ echo fixed > fix.txt
 
     def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
                  zen=("flint-40b-free",), usage=1):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
         lists = {"/go.json": {"data": [{"id": m} for m in go]},
                  "/zen.json": {"data": [{"id": m} for m in zen]},
@@ -5193,7 +5197,7 @@ fi
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_free_provider_slot_is_its_own_lane_with_its_own_window(self):
-        # The free lane (infra#5617): one slot per free provider at the
+        # The free lane (infra issue 5617): one slot per free provider at the
         # spark-gateway's pinned route, declared as provider "free" (never
         # "spark"), with the ~128K window the free models serve beside a
         # Spark window of 262144.

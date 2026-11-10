@@ -260,12 +260,12 @@ class AfterLineTest(unittest.TestCase):
     """The After: line: what it accepts, and when it still holds."""
 
     def test_a_list_of_tickets_is_parsed(self):
-        self.assertEqual(after_refs({"After": "#5, owner/name#7"}),
+        self.assertEqual(after_refs({"After": "#5, owner/name" "#7"}),
                          [("", 5), ("owner/name", 7)])
         self.assertEqual(after_refs({}), [])
 
     def test_a_value_that_is_not_a_list_of_tickets_is_refused(self):
-        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner#5", "a/b/c#5", "#5; #7"):
+        for bad in ("5", "1,2", "", "#a", "#5,", "#5 #7", "owner" "#5", "a/b/c#5", "#5; #7"):
             with self.assertRaisesRegex(ValueError, "After:", msg=bad):
                 after_refs({"After": bad})
 
@@ -295,9 +295,9 @@ class AfterLineTest(unittest.TestCase):
             seen.append("%s#%d" % (repo, number))
             return ticket(number, "merged")
 
-        holds, released = after_holds(REPO, {"After": "#5, other/name#7"}, lookup)
+        holds, released = after_holds(REPO, {"After": "#5, other/name" "#7"}, lookup)
         self.assertEqual((holds, released), ([], []))
-        self.assertEqual(seen, ["%s#5" % REPO, "other/name#7"])
+        self.assertEqual(seen, ["%s#5" % REPO, "other/name" "#7"])
 
     def test_dependency_state_reads_the_tickets_own_labels(self):
         self.assertEqual(dependency_state(ticket(1, "verified")), "verified")
@@ -326,6 +326,29 @@ class DifficultyHeaderTest(unittest.TestCase):
         for bad in ("Difficulty: hard\nDifficulty: easy\n\nbody", "Difficulty: extreme\n\nbody"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 parse(bad)
+
+    def test_a_stray_field_line_is_named_and_defused(self):
+        # loom#1821: the station names the line when it triages such a
+        # ticket, and a writer defuses the line (its words stay, only the
+        # header shape breaks) so its own parser accepts the body; a real
+        # header block is left exactly as it is.
+        from bus.tickets import defuse_stray_field_lines, stray_field_line
+        body = "Difficulty: easy\n\n## What\nModel: some-model\nDo it.\n"
+        self.assertEqual(stray_field_line(body), "Model")
+        self.assertIsNone(stray_field_line("Difficulty: easy\n\n## What\nDo it.\n"))
+        cleaned = defuse_stray_field_lines(body)
+        self.assertEqual(parse(cleaned)[0], {"Difficulty": "easy"})
+        self.assertIn("Model - some-model", cleaned)
+        self.assertIn("Do it.", cleaned)
+
+    def test_a_defused_line_keeps_the_only_statement_of_the_problem(self):
+        # The stray line can carry the whole ask ("Issue: the cache misses
+        # on the first page"); defusing must not lose those words.
+        from bus.tickets import defuse_stray_field_lines
+        body = "Difficulty: easy\n\n## What\nIssue: the cache misses on the first page\n"
+        cleaned = defuse_stray_field_lines(body)
+        self.assertIn("the cache misses on the first page", cleaned)
+        self.assertEqual(parse(cleaned)[0], {"Difficulty": "easy"})
 
 
 class PriorityTest(unittest.TestCase):

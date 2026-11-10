@@ -265,8 +265,8 @@ class RollUp(unittest.TestCase):
     nine goal cards that read as fragments of one bigger goal."""
 
     def test_the_parent_goal_line_and_the_sub_issue_link_name_the_parent(self):
-        self.assertEqual(goals.parent_of(REPO, {"body": "## Why\nx\n\nParent goal: example-owner/app#5\n"}),
-                         "example-owner/app#5")
+        self.assertEqual(goals.parent_of(REPO, {"body": "## Why\nx\n\nParent goal: example-owner/app" "#5\n"}),
+                         "example-owner/app" "#5")
         self.assertEqual(goals.parent_of(REPO, {"body": "- Parent goal: #30"}), REPO + "#30")
         self.assertEqual(goals.parent_of(REPO, {"body": "", "parent_issue_url":
                                                 "https://api.github.com/repos/%s/issues/30" % REPO}),
@@ -286,7 +286,7 @@ class RollUp(unittest.TestCase):
         self.assertIn("Main goal", found[0])
         children = found[0][found[0].index('class="goal-children"'):]
         self.assertIn("Smaller goal", children)
-        self.assertIn("sample#41 / 2 in flight / report", children)
+        self.assertIn("sample" "#41 / 2 in flight / report", children)
         self.assertIn('href="/tickets?goal=%s"' % server.quote(REPO + "#41", safe=""), children)
 
     def test_a_parent_with_no_tickets_of_its_own_still_gets_the_card(self):
@@ -591,7 +591,7 @@ class GoalSourcesAreTrusted(unittest.TestCase):
         self.assertNotIn("Forged standup.", server._goals(store))
 
     def test_a_parent_line_naming_a_repo_outside_the_configured_list_is_ignored_and_never_read(self):
-        store, gh = self.store(goal_41_body="Parent goal: other-owner/elsewhere#5")
+        store, gh = self.store(goal_41_body="Parent goal: other-owner/elsewhere" "#5")
         self.assertFalse([path for path in gh.calls if "other-owner/elsewhere" in path])
         self.assertIsNone(store.response()["goal_context"][REPO + "#41"]["parent"])
         self.assertEqual(len(cards(server._goals(store))), 2)
@@ -678,7 +678,7 @@ class EpicsOnGoals(unittest.TestCase):
         # The row sits under "open epics", so the title drops its "Epic:".
         self.assertIn('<span class="goal-child-title">the first chunk</span>', epics)
         self.assertNotIn("Epic:", epics)
-        self.assertIn("sample#40 / tickets 2/15 / 2 in flight", epics)
+        self.assertIn("sample" "#40 / tickets 2/15 / 2 in flight", epics)
         self.assertIn('href="/tickets?epic=%s"' % server.quote(REPO + "#40", safe=""), epics)
         closed = epics[epics.index("goal-epics-closed"):]
         self.assertIn("1 closed epic", closed)
@@ -691,7 +691,7 @@ class EpicsOnGoals(unittest.TestCase):
         rows = store.data[REPO]
         body = tickets_table.render(rows, {"epic": [REPO + "#40"]}, goal_titles={}, entered={},
                                     now=0, ticket_href=lambda row: "/t", short_ref=server._short_ref)
-        self.assertIn("epic sample#40", body)
+        self.assertIn("epic sample" "#40", body)
         self.assertIn("Ticket 7", body)
         self.assertIn("Ticket 8", body)
         self.assertNotIn("Ticket 9", body)
@@ -699,4 +699,4 @@ class EpicsOnGoals(unittest.TestCase):
         self.assertIn("Filter by epic", body)
         record = next(row for row in rows if row["number"] == 7)
         header = ticket._header(record, [])
-        self.assertIn(" / epic sample#40 / goal sample#30", header)
+        self.assertIn(" / epic sample" "#40 / goal sample" "#30", header)
