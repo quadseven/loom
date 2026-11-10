@@ -244,6 +244,8 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     # unrun by the runner (loom#2249).
     if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
         return "no acceptance criteria"
+    if brief_check.split_hold(item):
+        return "spans more than one platform"
     # The factory's reading (its default tier for a ticket with no
     # Difficulty: line), so a ticket it reserved for this lane is one the
     # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
