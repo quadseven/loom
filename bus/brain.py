@@ -501,7 +501,11 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
-            loose, tree = goal_tree(gh, repo, int(issue["number"]), light=True)
+            warnings: List[str] = []
+            loose, tree = goal_tree(gh, repo, int(issue["number"]), light=True,
+                                   warnings=warnings)
+            lines.extend("  - warning: unresolved sub-issue %s" % warning
+                         for warning in warnings)
             if shares is not None:
                 shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree), issues)
             held, waiting = _count_unproven(_flatten(loose, tree))
@@ -2330,7 +2334,8 @@ def _goal_epics(gh: GitHub, repo: str, goal: int,
     return epics
 
 
-def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False
+def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
+              warnings: Optional[List[str]] = None
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
     """(the goal's direct children that are not epics, [(epic, its tickets)]).
 
@@ -2354,7 +2359,15 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False
         if isinstance(i, dict) and "pull_request" not in i]
     tree = []
     if light:
-        found = _sub_issue_tickets(gh, repo, [int(e.get("number") or 0) for e in epics])
+        found: Dict[int, List[Dict[str, Any]]] = {}
+        grouped: Dict[str, List[int]] = {}
+        for epic in epics:
+            number = int(epic.get("number") or 0)
+            home = epic.get("repository") or {}
+            epic_repo = home.get("nameWithOwner") or repo
+            grouped.setdefault(epic_repo, []).append(number)
+        for epic_repo, numbers in grouped.items():
+            found.update(_sub_issue_tickets(gh, epic_repo, numbers, warnings=warnings))
         subs = [found[int(e.get("number") or 0)] for e in epics]
     else:
         subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
@@ -2390,7 +2403,15 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     if not wanted:
         return [(epic, []) for epic in epics]
     open_tickets = _open_tickets(listed)
-    subs = _sub_issue_states(gh, repo, wanted)
+    grouped: Dict[str, List[int]] = {}
+    for epic in epics:
+        number = int(epic.get("number") or 0)
+        if number in wanted:
+            home = epic.get("repository") or {}
+            grouped.setdefault(home.get("nameWithOwner") or repo, []).append(number)
+    subs: Dict[int, List[Dict[str, Any]]] = {}
+    for epic_repo, numbers in grouped.items():
+        subs.update(_sub_issue_states(gh, epic_repo, numbers))
     return [(epic, _tree_tickets(int(epic.get("number") or 0), subs[n], open_tickets)
              if n in subs else [])
             for epic, n in ((e, int(e.get("number") or 0)) for e in epics)]
@@ -2464,7 +2485,8 @@ SUB_ISSUE_FIELDS = ("number title state createdAt closedAt updatedAt"
                     " labels(first:100) { nodes { name } }")
 
 
-def _sub_issue_tickets(gh: GitHub, repo: str, numbers: Sequence[int]
+def _sub_issue_tickets(gh: GitHub, repo: str, numbers: Sequence[int],
+                       warnings: Optional[List[str]] = None
                        ) -> Dict[int, List[Dict[str, Any]]]:
     """Each issue's sub-issues in sub-issue order, in GitHub's REST spelling
     (number, title, lower-case state, created_at, closed_at, updated_at,
@@ -2477,9 +2499,27 @@ def _sub_issue_tickets(gh: GitHub, repo: str, numbers: Sequence[int]
 
     def read(chunk: List[int]) -> Dict[str, Any]:
         fields = " ".join("e%d: issue(number:%d) { subIssues(first:100) { totalCount "
-                          "nodes { %s } } }" % (n, n, SUB_ISSUE_FIELDS) for n in chunk)
-        data = gh.graphql("query { repository(owner:%s,name:%s) { %s } }"
-                          % (_gql(owner), _gql(name), fields)) or {}
+                          "nodes { %s repository { nameWithOwner } } } }"
+                          % (n, n, SUB_ISSUE_FIELDS) for n in chunk)
+        try:
+            data = gh.graphql("query { repository(owner:%s,name:%s) { %s } }"
+                              % (_gql(owner), _gql(name), fields)) or {}
+        except GitHubError as err:
+            if not (warnings is not None and unreadable(err) == "GraphQL NOT_FOUND"):
+                raise
+            if len(chunk) > 1:
+                found: Dict[str, Any] = {}
+                for number in chunk:
+                    found.update(read([number]))
+                return found
+            missing_numbers = {int(n) for n in re.findall(
+                r"number of (\d+)", err.body or "", re.IGNORECASE)}
+            missing = [n for n in chunk if n in missing_numbers]
+            if not missing:
+                raise
+            warnings.extend("#%d" % n for n in missing)
+            data = {"repository": {"e%d" % n: {"subIssues": {"nodes": [], "totalCount": 0}}
+                                   for n in missing}}
         return data.get("repository") or {}
 
     out: Dict[int, List[Dict[str, Any]]] = {}
@@ -2491,7 +2531,7 @@ def _sub_issue_tickets(gh: GitHub, repo: str, numbers: Sequence[int]
                 out[n] = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
                                           % (repo, n)))
             else:
-                out[n] = [_rest_issue(x) for x in nodes]
+                out[n] = [_rest_issue(x) | {"repository": x.get("repository")} for x in nodes]
     return out
 
 
