@@ -1261,6 +1261,8 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
     if held:
         found.append(held.removeprefix("blocked: "))
+    if ticket is not None and _unbuilt_boxes(str(pr.get("body") or ""), issue):
+        found.append("criteria not ticked")
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
