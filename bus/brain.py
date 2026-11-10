@@ -2370,8 +2370,19 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
             found.update(_sub_issue_tickets(gh, epic_repo, numbers, warnings=warnings))
         subs = [found[int(e.get("number") or 0)] for e in epics]
     else:
-        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (repo, int(epic.get("number") or 0))), epics)
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for epic in epics:
+            number = int(epic.get("number") or 0)
+            home = epic.get("repository") or {}
+            epic_repo = home.get("nameWithOwner") or repo
+            grouped.setdefault(epic_repo, []).append(epic)
+        found: Dict[int, List[Dict[str, Any]]] = {}
+        for epic_repo, epic_list in grouped.items():
+            for epic in epic_list:
+                number = int(epic.get("number") or 0)
+                found[number] = list(gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                                                 % (epic_repo, number)))
+        subs = [found[int(e.get("number") or 0)] for e in epics]
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
     return loose, tree
