@@ -32,7 +32,7 @@ EPICS = list(range(100, 100 + brain.EPIC_STATES + 5))
 # What each sub-issue query asks of a sub-issue, spelled out here so that a
 # change to the field set shows as a failing test.
 PINNED_FIELDS = ("number title state createdAt closedAt updatedAt"
-                 " labels(first:100) { nodes { name } }")
+                 " labels(first:100) { nodes { name } } repository { nameWithOwner }")
 
 
 def _issue(number: int, labels: tuple, state: str = "open", **extra) -> dict:
@@ -111,7 +111,7 @@ def _lines(fake: Fake, light_off: bool = False) -> list:
     if light_off:
         full = brain.goal_tree
         with mock.patch.object(brain, "goal_tree",
-                               lambda g, r, n, light=False: full(g, r, n)):
+                               lambda g, r, n, light=False, warnings=None: full(g, r, n)):
             lines = brain._goal_lines([_goal()], {"goals": {}}, NOW, None, gh, REPO,
                                       issues, shares)
     else:
@@ -157,7 +157,7 @@ class StatusSubIssueReadTest(unittest.TestCase):
         for light_off in (True, False):
             gh = GitHub("t", transport=Fake(subs))
             patch = mock.patch.object(brain, "goal_tree",
-                                      lambda g, r, n, light=False, off=light_off, full=walk:
+                                      lambda g, r, n, light=False, warnings=None, off=light_off, full=walk:
                                       full(g, r, n, light=light and not off))
             with patch:
                 out.append(brain._goal_lines([_goal()], data, NOW, ["allowed"], gh, REPO))
