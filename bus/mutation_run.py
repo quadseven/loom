@@ -10,8 +10,8 @@ trial sandbox exists to run an outside author's code, and this runs only this
 repo's main, on a hosted runner, with no model call. The step that runs mutants
 holds no token; a later step reads its report and edits the rolling issue.
 
-The workflow text is docs/mutation-workflow.yml until the operator moves it to
-.github/workflows: an agent App cannot write workflows.
+The workflow is .github/workflows/mutation.yml. An agent App cannot write
+workflows, so a change to it is pushed from an account that can.
 
 The run is bounded in mutants and minutes, and every mutant of each seam runs,
 so one edit cannot reshuffle a sample. A run that stops at a cap reports partial
