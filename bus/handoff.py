@@ -217,12 +217,14 @@ BRIEF_DEFER_DAYS = 7.0
 
 def brief_defer_days() -> float:
     """The age in days past which a brief defer stops being a resume item,
-    from LOOM_BRIEF_DEFER_DAYS (default 7). An unreadable or negative value
-    keeps the default: a bad setting must not silently drop fresh work."""
+    from LOOM_BRIEF_DEFER_DAYS (default 7). An unreadable or negative value,
+    or one no duration can hold ("inf", "1e20"), keeps the default: a bad
+    setting must not silently drop fresh work, nor fail every resume."""
     raw = os.environ.get("LOOM_BRIEF_DEFER_DAYS", "").strip()
     try:
         days = float(raw)
-    except ValueError:
+        timedelta(days=days)
+    except (ValueError, OverflowError):
         return BRIEF_DEFER_DAYS
     return days if days >= 0 else BRIEF_DEFER_DAYS
 
