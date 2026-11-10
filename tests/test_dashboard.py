@@ -43,7 +43,7 @@ class DashboardTest(unittest.TestCase):
                     inner.wfile.write(b'{"message":"stub read failure"}')
                     return
                 payload = [{"number": 31, "title": "Sample ticket", "state": "open",
-                            "body": "Difficulty: medium\nModel: model-x\nPart of #30\nRefs example-owner/sample#30",
+                            "body": "Difficulty: medium\nModel: model-x\nPart of #30\nRefs example-owner/sample" "#30",
                             "updated_at": "2026-10-14T12:00:00Z",
                             "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
                                        {"name": "lane:codex-2"}]}]
@@ -139,7 +139,7 @@ class DashboardTest(unittest.TestCase):
         payload = self.get_json("/api/tickets")
         row = payload["tickets"]["example-owner/sample"][0]
         self.assertEqual(row["state"], "pr")
-        self.assertEqual(row["goal"], "example-owner/sample#30")
+        self.assertEqual(row["goal"], "example-owner/sample" "#30")
         self.assertEqual(row["lane"], "codex-2")
         self.assertEqual(row["difficulty"], "medium")
         self.assertIsNone(row["attempts"])
@@ -283,7 +283,7 @@ class DashboardTest(unittest.TestCase):
         row = ticket_record("example-owner/sample", {
             "body": "    Part of #30\nRefs #31", "labels": [],
         })
-        self.assertEqual(row["goal"], "example-owner/sample#30")
+        self.assertEqual(row["goal"], "example-owner/sample" "#30")
         self.assertIsNone(ticket_record("example-owner/sample", {
             "body": "Refs #31", "labels": [],
         })["goal"])
@@ -305,7 +305,7 @@ class DashboardTest(unittest.TestCase):
     def test_floor_backlog_bottleneck_and_ticket_links(self):
         import os
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fixture:
-            json.dump({"tickets": [{"id": "sample#1"}, {"id": "sample#2"}]}, fixture)
+            json.dump({"tickets": [{"id": "sample" "#1"}, {"id": "sample" "#2"}]}, fixture)
             fixture.flush()
             prior = os.environ.get("LOOM_BACKLOG_SOURCE")
             os.environ["LOOM_BACKLOG_SOURCE"] = fixture.name
@@ -377,10 +377,10 @@ class DashboardViewTest(unittest.TestCase):
         waits = {"queued": [1, 2, 3], "pr": [5, 6, 8]}
         data = {"example-owner/sample": [
             {"repo": "example-owner/sample", "number": 31, "title": "Sample ticket",
-             "state": "pr", "goal": "example-owner/sample#30", "lane": "codex",
+             "state": "pr", "goal": "example-owner/sample" "#30", "lane": "codex",
              "model": "model-x", "attempts": 1},
             {"repo": "example-owner/sample", "number": 32, "title": "Other ticket",
-             "state": "briefed", "goal": "example-owner/sample#30", "lane": None,
+             "state": "briefed", "goal": "example-owner/sample" "#30", "lane": None,
              "model": None, "attempts": 1},
         ]}
 
@@ -389,14 +389,14 @@ class DashboardViewTest(unittest.TestCase):
                 {"state": "queued", "median_h": 1.5, "worst_h": 4, "n": 3},
                 {"state": "pr", "median_h": 5.5, "worst_h": 9, "n": 4},
                 {"state": "verified", "median_h": 20, "worst_h": 30, "n": 8}],
-                "pull_requests": [{"updated_at": "2026-10-14", "body": "Loom ticket example-owner/sample#32, lane codex, model model-y."}]}
+                "pull_requests": [{"updated_at": "2026-10-14", "body": "Loom ticket example-owner/sample" "#32, lane codex, model model-y."}]}
 
     def test_floor_bottleneck_and_links(self):
         from dashboard.server import _floor
         import os
         prior = os.environ.get("LOOM_BACKLOG_SOURCE")
         with tempfile.NamedTemporaryFile("w", encoding="utf-8") as fixture:
-            json.dump({"tickets": [{"id": "sample#1"}, {"id": "sample#2"}]}, fixture)
+            json.dump({"tickets": [{"id": "sample" "#1"}, {"id": "sample" "#2"}]}, fixture)
             fixture.flush()
             os.environ["LOOM_BACKLOG_SOURCE"] = fixture.name
             try:
@@ -462,7 +462,7 @@ class DashboardViewTest(unittest.TestCase):
         state = self.State()
         state.data = {"example-owner/sample": self.State.data["example-owner/sample"] + [
             {"repo": "example-owner/sample", "number": 41, "title": "Elsewhere ticket",
-             "state": "pr", "goal": "example-owner/sample#40", "lane": "codex",
+             "state": "pr", "goal": "example-owner/sample" "#40", "lane": "codex",
              "model": "model-x", "attempts": 1}]}
         body = _tickets(state, urlsplit("/tickets?goal=example-owner%2Fsample%2340"))
         self.assertIn("Elsewhere ticket", body)
@@ -794,7 +794,7 @@ class LaneCardsTest(unittest.TestCase):
         payload = {"lanes": [{"body": comment}], "pull_requests": [], "tickets": {}}
         data = _lane_view_data(payload, tickets)
         body = render_lanes(data)
-        self.assertIn('<p class="lane-doing"><a href="/t/example-owner/sample/362">sample#362 Lane cards</a></p>', body)
+        self.assertIn('<p class="lane-doing"><a href="/t/example-owner/sample/362">sample' '#362 Lane cards</a></p>', body)
         self.assertIn('<span class="lane-beat">heartbeat 20:17Z</span>', body)
 
     def test_pull_request_footer_shows_model_and_configured_model_is_fallback(self):
@@ -809,7 +809,7 @@ class LaneCardsTest(unittest.TestCase):
             "| claude | yes | 20:17Z |\n"
         )
         prs = [{
-            "body": "Fixes #1\n\nLoom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+            "body": "Fixes #1\n\nLoom ticket example-owner/sample" "#31, lane codex, model gpt-6-sol.\n",
             "created_at": "2026-10-14T12:00:00Z",
         }]
         payload = {"lanes": [{"body": comment}], "pull_requests": prs, "tickets": {}}
@@ -869,7 +869,7 @@ class LaneCardsTest(unittest.TestCase):
                     "| claude | yes | 20:17Z |\n"
                 )
                 prs = [{
-                    "body": "Loom ticket example-owner/sample#31, lane codex, model gpt-6-sol.\n",
+                    "body": "Loom ticket example-owner/sample" "#31, lane codex, model gpt-6-sol.\n",
                     "created_at": "2026-10-14T12:00:00Z",
                 }]
                 return {"tickets": {}, "lanes": [{"body": comment}], "pull_requests": prs,

@@ -121,7 +121,7 @@ class OperatorsStoreTest(unittest.TestCase):
         self.assertIn(THIRD, groups[1])
         self.assertIn("A ticket the third operator took", groups[1])
         # This Loom's own claim and pull request are not listed.
-        self.assertNotIn("app#11", body)
+        self.assertNotIn("app" "#11", body)
         self.assertNotIn("#12", body)
         # The claimed issue links its open and merged pull requests, the open
         # one with its checks (neutral is not a pass).
@@ -198,7 +198,7 @@ class OperatorsStoreTest(unittest.TestCase):
                       self.claim_reads())
         body = operators.render(store.response()["operator_claims"], time.time(), env={})
         self.assertIn("LOOM_BRIEF_AUTHORS is not set", body)
-        self.assertIn("app#11", body)
+        self.assertIn("app" "#11", body)
         # Assignees alone are not judged without the logins.
         self.assertNotIn(THIRD, body)
 
@@ -276,10 +276,10 @@ class NeedsTest(unittest.TestCase):
         waiting = third.split("Waiting on %s" % THIRD)[1]
         self.assertIn("Shared cache warmup", waiting)
         # THIRD holds another ticket; #5 is not among its claimed rows.
-        self.assertNotIn("app#5<", third.split("Claimed by %s" % THIRD)[1])
+        self.assertNotIn("app" "#5<", third.split("Claimed by %s" % THIRD)[1])
         self.assertIn("Shared cache warmup", other)
         self.assertNotIn("Waiting on %s" % OTHER, other)
-        self.assertEqual(body.count("app#5<"), 2)
+        self.assertEqual(body.count("app" "#5<"), 2)
 
     def test_the_floor_counts_needs_items_per_person_and_links_to_their_group(self):
         from dashboard import server

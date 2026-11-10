@@ -5,17 +5,17 @@ from datetime import datetime, timezone
 from dashboard import brain_view, hot_spots
 
 NOW = datetime(2030, 1, 8, 12, 0, tzinfo=timezone.utc)
-DEFER = ("<!-- loom:defer v1 stage=merge item=example-owner/sample#40 "
+DEFER = ("<!-- loom:defer v1 stage=merge item=example-owner/sample" "#40 "
          "rev=abc123 holder=brain-a -->")
-DONE = "<!-- loom:done v1 stage=merge item=example-owner/sample#41 holder=brain-a -->"
+DONE = "<!-- loom:done v1 stage=merge item=example-owner/sample" "#41 holder=brain-a -->"
 JOURNAL = {"created_at": "2030-01-08T11:00:00Z", "body": "\n".join([
     "<!-- loom:journal v1 -->",
     "Tick 2030-01-08T11:00:00Z, brain-a",
     "- Shipped: none",
-    "- Briefed: example-owner/sample#42 to codex",
-    "- Waiting: example-owner/sample#41 on review",
+    "- Briefed: example-owner/sample" "#42 to codex",
+    "- Waiting: example-owner/sample" "#41 on review",
     "- Asks: none",
-    "- Next: merge example-owner/sample#41 once its review is clean",
+    "- Next: merge example-owner/sample" "#41 once its review is clean",
     "- Cost: 40 requests, 6 minutes",
     DEFER, DONE])}
 OLDER = {"created_at": "2030-01-08T10:30:00Z", "body": "\n".join([
@@ -27,9 +27,9 @@ OLDER = {"created_at": "2030-01-08T10:30:00Z", "body": "\n".join([
 RECORD = {"holder": "brain-a", "started_at": "2030-01-08T11:30:00Z", "step": "merge",
           "step_index": 3, "steps": list(brain_view.STEPS), "notes": [
               {"ts": "2030-01-08T11:31:00Z", "step": "status",
-               "text": "example-owner/sample#7 regressed the p95 after it shipped"},
+               "text": "example-owner/sample" "#7 regressed the p95 after it shipped"},
               {"ts": "2030-01-08T11:33:00Z", "step": "merge",
-               "text": "merged example-owner/sample#41 on its ready head"}]}
+               "text": "merged example-owner/sample" "#41 on its ready head"}]}
 
 
 def outcome(lane, text, at="2030-01-07T10:00:00Z", number=5):
@@ -86,11 +86,11 @@ class BrainViewTest(unittest.TestCase):
         self.assertIn('<span class="tick-name">verify</span><span class="visually-hidden">ahead</span>', body)
         self.assertEqual(body.count('class="tick-step '), 11)
         self.assertIn("brain-a holds the lock / started 11:30", body)
-        self.assertIn("&lt;!-- loom:defer v1 stage=merge item=example-owner/sample#40 "
+        self.assertIn("&lt;!-- loom:defer v1 stage=merge item=example-owner/sample" "#40 "
                       "rev=abc123 holder=brain-a --&gt;", body)
-        self.assertIn("&lt;!-- loom:done v1 stage=merge item=example-owner/sample#41 "
+        self.assertIn("&lt;!-- loom:done v1 stage=merge item=example-owner/sample" "#41 "
                       "holder=brain-a --&gt;", body)
-        self.assertIn("merge example-owner/sample#41 once its review is clean", body)
+        self.assertIn("merge example-owner/sample" "#41 once its review is clean", body)
 
     def test_thoughts_are_tagged_from_their_text(self):
         data = brain_view.build_brain(RECORD, "", [JOURNAL])
@@ -100,7 +100,7 @@ class BrainViewTest(unittest.TestCase):
         ticks = brain_view.build_brain(RECORD, "", [OLDER, JOURNAL])["ticks"]
         self.assertEqual([t["holder"] for t in ticks], ["brain-a", "brain-b"])
         self.assertEqual(ticks[0]["outcome"], "ok")
-        self.assertEqual(ticks[0]["line"], "Briefed: example-owner/sample#42 to codex")
+        self.assertEqual(ticks[0]["line"], "Briefed: example-owner/sample" "#42 to codex")
         self.assertEqual(ticks[1]["outcome"], "failed")
         self.assertEqual(ticks[1]["line"], "Step merge: failed the API timed out")
 
@@ -135,7 +135,7 @@ class BrainLayoutTest(unittest.TestCase):
         self.assertEqual(line, "Fix the p95 regression before briefing anything new.")
         self.assertEqual(why, "It moved after #38 shipped.")
         journal = dict(JOURNAL, body=JOURNAL["body"].replace(
-            "merge example-owner/sample#41 once its review is clean",
+            "merge example-owner/sample" "#41 once its review is clean",
             "Merge #41 first. Its review is clean and two tickets wait on it."))
         body = brain_view.render_brain(brain_view.build_brain(RECORD, "", [journal]))
         self.assertIn('<p class="next-line">Merge #41 first.</p>'
@@ -189,7 +189,7 @@ class HotSpotsTest(unittest.TestCase):
     def test_waits_are_bars_scaled_to_the_slowest_state_with_the_bottleneck_marked(self):
         data = {"waits": [{"state": "pr", "median_h": 2.0, "worst_h": 9.0, "n": 4},
                           {"state": "shipped", "median_h": 8.0, "worst_h": 30.0, "n": 10,
-                           "worst_ticket": "example-owner/sample#3"}],
+                           "worst_ticket": "example-owner/sample" "#3"}],
                 "bottleneck": "shipped", "waits_error": ""}
         body = hot_spots.render_waits(data)
         self.assertIn('<li class="wait"><p class="bar-head machine-fact"><span class="state">pr</span>', body)

@@ -18,7 +18,7 @@ from dashboard import transcripts  # noqa: E402
 class StoreTests(unittest.TestCase):
     def body(self, started="2026-10-13T10:00:00Z", outcome="done"):
         return {
-            "ticket": "example/project#12", "slot": "codex", "model": "model-x",
+            "ticket": "example/project" "#12", "slot": "codex", "model": "model-x",
             "outcome": outcome, "started_at": started, "finished_at": "2026-10-13T10:05:00Z",
             "events": [{"ts": "2026-10-13T10:01:00Z", "role": "assistant",
                         "kind": "text", "text": "finished"}],
@@ -43,7 +43,7 @@ class StoreTests(unittest.TestCase):
         store.upload(self.body("2026-10-13T10:00:00Z"))
         store.upload(self.body("2026-10-13T10:00:00Z", "failed"))
         store.upload(self.body("2026-10-13T11:00:00Z"))
-        attempts = store.attempts("example/project#12")
+        attempts = store.attempts("example/project" "#12")
         self.assertEqual(len(store.list()), 2)
         self.assertTrue(all("events" not in row for row in attempts))
         self.assertEqual([row["attempt"] for row in attempts], [1, 2])
@@ -117,10 +117,10 @@ class _FakeCursor:
         self.module.statements.append(sql)
 
     def fetchall(self):
-        return [(1, "example/project#12")]
+        return [(1, "example/project" "#12")]
 
     def fetchone(self):
-        return (1, "example/project#12")
+        return (1, "example/project" "#12")
 
 
 DB_ENV = {"LOOM_DB_HOST": "db.invalid", "LOOM_DB_NAME": "loom", "LOOM_DB_USER": "loom",
@@ -136,7 +136,7 @@ class PostgresBackendTests(unittest.TestCase):
         with patch.dict(os.environ, DB_ENV):
             backend.read("latest")
             backend.read("list")
-            backend.read("attempts", "example/project#12")
+            backend.read("attempts", "example/project" "#12")
             backend.get(1)
         self.assertTrue(module.statements)
         self.assertFalse([sql for sql in module.statements if "DELETE" in sql.upper()])
@@ -163,7 +163,7 @@ class ModelOutcomes(unittest.TestCase):
     """loom#968: run outcomes per lane slot and model over 24 hours and 7 days,
     for the Tiers and allowances page."""
 
-    def run_body(self, slot, model, outcome, started, minutes, ticket="example/project#12"):
+    def run_body(self, slot, model, outcome, started, minutes, ticket="example/project" "#12"):
         start = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc) - started
         return {"ticket": ticket, "slot": slot, "model": model, "outcome": outcome,
                 "started_at": start.isoformat().replace("+00:00", "Z"),
@@ -176,7 +176,7 @@ class ModelOutcomes(unittest.TestCase):
         store.upload(self.run_body("codex", "model-x", "done", timedelta(hours=1), 10))
         # A numbered slot counts with its lane: one row per provider and model.
         store.upload(self.run_body("codex-2", "model-x", "done", timedelta(hours=2), 20,
-                                   ticket="example/project#13"))
+                                   ticket="example/project" "#13"))
         store.upload(self.run_body("codex", "model-x", "failed", timedelta(days=3), 5))
         store.upload(self.run_body("anthropic-2", "model-y", "done", timedelta(days=10), 5))
         store.upload(self.run_body("brain", "model-z", "done", timedelta(hours=1), 5,

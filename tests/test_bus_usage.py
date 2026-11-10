@@ -148,6 +148,14 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(row["remaining"], 7.5)
         self.assertEqual(row["note"], "floor USD 1.00")
 
+    def test_anthropic_no_topup_without_budget_reads_as_used_up(self):
+        row = usage.anthropic_records(self.home, ["anthropic", "anthropic-2"], {
+            "LOOM_NO_TOPUP": "codex,anthropic",
+        }, 1000)[0]
+        self.assertEqual(row["used_pct"], 100.0)
+        self.assertEqual(row["remaining"], 0.0)
+        self.assertIn("no top-up", row["note"])
+
     def test_spark_hold_uses_absolute_end_time(self):
         directory = Path(self.home) / "state" / "usage"
         directory.mkdir(parents=True)

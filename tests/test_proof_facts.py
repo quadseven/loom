@@ -73,6 +73,31 @@ class ContradictsTest(unittest.TestCase):
         self.assertEqual(proof.contradicts({"criteria": "x"}, self.failing), "")
 
 
+class CitedTestsTest(unittest.TestCase):
+    def test_cited_tests_come_from_sources_and_evidence_once_each(self):
+        rec = record(evidence="ci run shows test_alpha_one passing",
+                     sources=["see test_alpha_one and test_beta_two",
+                              "https://example.com/logs/1"])
+        self.assertEqual(proof.cited_tests(rec), ["test_alpha_one", "test_beta_two"])
+
+    def test_a_test_file_stem_is_not_a_cited_function(self):
+        rec = record(evidence="test_gamma_three in tests/test_bus_health.py passed")
+        self.assertEqual(proof.cited_tests(rec), ["test_gamma_three"])
+
+    def test_missing_cited_tests_are_named_in_cited_order(self):
+        cited = ["test_present_one", "test_absent_one", "test_absent_two"]
+        self.assertEqual(proof.missing_cited_tests(cited, ["test_present_one"]),
+                         ["test_absent_one", "test_absent_two"])
+        self.assertEqual(proof.missing_cited_tests(["test_present_one"],
+                                                   ["test_present_one"]), [])
+
+    def test_defined_tests_are_the_def_lines_of_the_file_texts(self):
+        texts = ["def test_present_one():\n    pass\n",
+                 "class C:\n    def test_present_two(self):\n        pass\n"]
+        self.assertEqual(verify_data.defined_tests(texts),
+                         ["test_present_one", "test_present_two"])
+
+
 class ProofFactsTest(unittest.TestCase):
     def pull(self, **changes):
         out = {"number": 3, "title": "Fix it", "merge_commit_sha": SHA,

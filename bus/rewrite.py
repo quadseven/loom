@@ -16,7 +16,7 @@ import shlex
 import subprocess
 from typing import Any, Dict, List, Sequence, Tuple
 
-from . import brain, tickets
+from . import brain, labels, tickets
 from .kinds import HUMAN_KINDS, refused_as_hold
 from .text import SECRET_RE, scrub_paths
 from .github import GitHub
@@ -336,6 +336,13 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         if difficulty not in DIFFICULTIES:
             raise Invalid("difficulty is not easy, medium or hard")
         body = _text(answer, "body").strip()
+        # The agent sometimes repeats a header-like line inside a section
+        # (a stray "Model:" line); the brief parser refuses that body, so
+        # the rewrite wrote nothing on every pass (loom#1821). Defuse the
+        # stray lines before checking (their words stay, only the header
+        # shape breaks), so the rewrite never writes a body its own parser
+        # refuses and never loses a line's text without a trace.
+        body = tickets.defuse_stray_field_lines(body)
         headers, _ = tickets.parse(body)
         if headers:
             raise Invalid("body carries header lines (%s)" % ", ".join(headers))
@@ -351,15 +358,19 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
 
 def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
     """Open loom:triage issues (not pull requests), oldest first, leaving out
-    one assigned to another operator (docs/LANES.md, Two Looms) and one that is
-    not work for a lane (brain.not_work_reason: wayfinder, blocked, awaiting a
-    live check, a factory incident, an epic, a restating invariant report), as
-    triage does, so an issue labelled loom:triage before a rule existed is not
-    rewritten into a ticket."""
+    one assigned to another operator (docs/LANES.md, Two Looms), one in the
+    hand-off pool (labels.HANDOFF: the factory's hold pass put it there for
+    the second operator, loom#1884, and rewriting it would hold and hand it
+    off again every day) and one that is not work for a lane
+    (brain.not_work_reason: wayfinder, blocked, awaiting a live check, a
+    factory incident, an epic, a restating invariant report), as triage does,
+    so an issue labelled loom:triage before a rule existed is not rewritten
+    into a ticket."""
     found = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open"
                         "&sort=created&direction=asc&per_page=100" % repo)
     pool = [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
+            and labels.HANDOFF not in _names(i)
             and not brain.not_work_reason(i)]
     if not pool:
         return pool

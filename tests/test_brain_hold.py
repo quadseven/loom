@@ -188,6 +188,86 @@ class BrainHoldsTest(unittest.TestCase):
         self.assertEqual((report[REPO][brain_hold.LOOM], report[REPO]["lifted"]), (2, 0))
 
 
+def triage_issue(gh, number):
+    """An open loom:triage issue (not a loom:ticket) in the fake repo."""
+    gh.issues[number] = {"number": number, "state": "open", "user": ME,
+                         "body": "Difficulty: medium\n\n## Why\nx\n",
+                         "labels": [{"name": "loom:triage"}]}
+    gh.comments[number] = []
+    gh.events[number] = []
+
+
+class TriageBrainHoldsTest(unittest.TestCase):
+    """loom#1884: a triage issue's needs-brain hold has an owner too: an old
+    hold Loom set is given one more rewrite attempt (the refusal reason
+    quoted), and a hold that comes back after that attempt goes to the
+    hand-off pool. A person's hold is left and counted."""
+
+    def setUp(self):
+        self.gh = FakeGitHub()
+
+    def run_holds(self, limit=brain_hold.LIFT_PER_RUN, write=True):
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED)
+        return f.brain_holds(limit, write)
+
+    def names(self, number):
+        return factory._labels(self.gh.issues[number])
+
+    def events(self, number):
+        return [c["body"] for c in status.expand(self.gh.comments[number], [ME["login"]])]
+
+    def test_an_old_loom_triage_hold_is_freed_for_one_more_rewrite_with_the_reason_quoted(self):
+        triage_issue(self.gh, 5)
+        held_by(self.gh, 5, LOOM_APP)
+        self.gh.comments[5].append({"id": 70, "user": ME, "created_at": iso(30 * 3600 - 5),
+                                    "body": "Rewrite refused: no acceptance criteria named."})
+        report = self.run_holds()
+        names = self.names(5)
+        self.assertNotIn(brain_hold.LABEL, names)
+        self.assertIn("loom:triage", names)
+        self.assertNotIn(labels.HANDOFF, names)
+        notes = [e for e in self.events(5) if brain_hold.RETRY_MARKER in e]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Rewrite refused: no acceptance criteria named.", notes[0])
+        self.assertEqual(report[REPO]["lifted"], 1)
+        # Freed once: a later run posts no second retry note.
+        self.run_holds()
+        self.assertEqual(len([e for e in self.events(5) if brain_hold.RETRY_MARKER in e]), 1)
+
+    def test_a_triage_hold_that_returns_after_its_retry_goes_to_the_hand_off_pool(self):
+        triage_issue(self.gh, 5)
+        self.gh.comments[5].append({"id": 69, "user": ME, "created_at": iso(50 * 3600),
+                                    "body": brain_hold.RETRY_MARKER + "\nFreed for one more rewrite."})
+        held_by(self.gh, 5, LOOM_APP)
+        self.gh.comments[5].append({"id": 70, "user": ME, "created_at": iso(30 * 3600 - 5),
+                                    "body": "Rewrite refused again: still no acceptance criteria."})
+        report = self.run_holds()
+        names = self.names(5)
+        self.assertNotIn(brain_hold.LABEL, names)
+        self.assertIn(labels.HANDOFF, names)
+        notes = [e for e in self.events(5) if brain_hold.LIFT_MARKER in e]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("still no acceptance criteria", notes[0])
+        self.assertEqual(report[REPO]["lifted"], 1)
+        self.run_holds()
+        self.assertEqual(len([e for e in self.events(5) if brain_hold.LIFT_MARKER in e]), 1)
+
+    def test_a_persons_triage_hold_is_left_alone_and_counted(self):
+        triage_issue(self.gh, 5)
+        held_by(self.gh, 5, OPERATOR)
+        report = self.run_holds()
+        self.assertIn(brain_hold.LABEL, self.names(5))
+        self.assertEqual(self.gh.writes, [])
+        self.assertEqual((report[REPO]["old"], report[REPO]["person"]), (1, 1))
+
+    def test_a_triage_hold_younger_than_a_day_is_left_alone(self):
+        triage_issue(self.gh, 5)
+        held_by(self.gh, 5, LOOM_APP, seconds_ago=DAY - 60)
+        report = self.run_holds()
+        self.assertIn(brain_hold.LABEL, self.names(5))
+        self.assertEqual(report[REPO]["old"], 0)
+
+
 class SetterTest(unittest.TestCase):
     def test_the_newest_label_event_names_the_setter(self):
         events = [{"event": "labeled", "label": {"name": "needs-brain"},

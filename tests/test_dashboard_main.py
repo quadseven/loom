@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from dashboard.__main__ import server_from_env
+from tests import sandbox_caps
 
 
 class _Store:
@@ -72,6 +73,8 @@ class _ServerTest(unittest.TestCase):
     """A dashboard server on an ephemeral port, with no background reads."""
 
     def serve(self, **values):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         with _env(LOOM_DASHBOARD_PORT="0", **values):
             server = server_from_env(store=_Store())
         self.addCleanup(server.server_close)
