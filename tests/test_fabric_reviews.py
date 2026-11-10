@@ -38,6 +38,7 @@ class FabricReviewsTest(unittest.TestCase):
     def setUp(self):
         self.gh = mock.Mock()
         self.gh.paginate.return_value = []
+        self.gh._status_logins.return_value = {"example-station[bot]"}
         self.state = {}
         self.saved = []
         # Patch the actual no-redirect transport. Fail any unintended call
@@ -125,7 +126,8 @@ class FabricReviewsTest(unittest.TestCase):
         with self.assertRaises(station.GitHubError):
             self.run_check()
         body = self.body()
-        self.gh.paginate.return_value = [{"body": body}]
+        self.gh.paginate.return_value = [
+            {"body": body, "user": {"login": "example-station[bot]"}}]
         self.gh.rest.reset_mock()
         self.run_check()
         self.assertEqual(self.api.call_count, 2)
@@ -147,6 +149,54 @@ class FabricReviewsTest(unittest.TestCase):
 
         self.gh.rest.side_effect = rest
         return issue
+
+    def test_untrusted_issue_marker_is_not_reused_or_reported(self):
+        for day in ("2026-11-09", "2026-11-10"):
+            with self.subTest(day=day):
+                self.state.clear()
+                self.gh.rest.reset_mock()
+                issue = self.existing_incident(day=day)
+                issue["user"] = {"login": "untrusted-user"}
+                before = issue["body"]
+                self.api.return_value = page()
+                self.run_check()
+                self.gh.rest.assert_called_once()
+                self.assertEqual(self.gh.rest.call_args.args[:2],
+                                 ("POST", "/repos/example-owner/project/issues"))
+                self.assertEqual(issue["body"], before)
+                self.assertIn("Missing: Morning review", self.body())
+                self.assertTrue(self.state["reported"])
+
+    def test_untrusted_issue_cannot_mark_pending_day_reported_after_failed_post(self):
+        issue = self.existing_incident(day="2026-11-10")
+        issue["user"] = {"login": "untrusted-user"}
+        self.state.update(day="2026-11-10", body="- Missing: Morning review.", reported=False)
+        self.gh.rest.side_effect = station.GitHubError("unavailable")
+        with self.assertRaises(station.GitHubError):
+            self.run_check()
+        self.assertFalse(self.state["reported"])
+        self.api.assert_not_called()
+
+    def test_issue_without_valid_author_cannot_suppress_report(self):
+        for user in (None, "example-station[bot]", {}, {"login": None}):
+            with self.subTest(user=user):
+                self.state.clear()
+                self.gh.rest.reset_mock()
+                issue = self.existing_incident(day="2026-11-10")
+                issue["user"] = user
+                self.api.return_value = page()
+                self.run_check()
+                self.gh.rest.assert_called_once()
+                self.assertEqual(self.gh.rest.call_args.args[:2],
+                                 ("POST", "/repos/example-owner/project/issues"))
+
+    def test_station_issue_author_comparison_is_case_insensitive(self):
+        issue = self.existing_incident()
+        issue["user"]["login"] = "Example-Station[bot]"
+        self.api.return_value = page()
+        self.run_check()
+        self.assertEqual(len(status.body_events(issue["body"])), 1)
+        self.assertFalse(any(call.args[0] == "POST" for call in self.gh.rest.call_args_list))
 
     def test_next_day_updates_open_incident_as_status_without_new_issue(self):
         issue = self.existing_incident()

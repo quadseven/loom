@@ -175,8 +175,11 @@ def _file_pending(gh, repo, state, now, save):
         return
     marker = MARKER % state["day"]
     existing = gh.paginate("/repos/%s/issues?state=all&labels=loom:factory&per_page=100" % repo)
+    allowed = status.logins(gh)
     incidents = [item for item in existing if isinstance(item, dict)
                  and not item.get("pull_request")
+                 and isinstance(item.get("user"), dict)
+                 and str(item["user"].get("login") or "").lower() in allowed
                  and re.search(r"<!-- loom:fabric-reviews day=\d{4}-\d{2}-\d{2} -->",
                               str(item.get("body") or ""))]
     if any(marker in str(item.get("body") or "") for item in incidents):

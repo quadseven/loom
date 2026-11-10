@@ -42,8 +42,10 @@ the station was down are not backfilled.
 
 All missing outputs are grouped into one incident. While that incident stays
 open, later days add findings as routine status events instead of opening
-another issue. A later day can open a new incident after the earlier one is
-closed. A day with no findings adds nothing. A 402 response
+another issue. Only incidents authored by a login trusted by the station's
+status allowlist count; a marker quoted by anyone outside that list cannot
+redirect or suppress findings. A later day can open a new incident after the
+earlier one is closed. A day with no findings adds nothing. A 402 response
 is reported as a Fabric credit-limit cause. Failed, malformed or truncated
 searches are marked "could not verify", never asserted to be missing. Search
 uses at most five pages per note, 1 MiB per page and a 45-second shared request
