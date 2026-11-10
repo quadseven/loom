@@ -5459,6 +5459,15 @@ class Station:
                     "criterion as a checkbox under `## Acceptance criteria`, stated as "
                     "an observable result: the brief restates each one as the check "
                     "that proves it."))
+            elif found.kind == brief_check.SPLIT:
+                # Added, not put: the label list read before the move is stale.
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                self._routine(repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "A lane gets it once the brain has split it into "
+                    "one ticket per platform, with `After:` lines between the "
+                    "slices so each slice queues only when the one before it "
+                    "has merged."))
             else:
                 brain.human(self.gh, repo, number, brief_check.ask(found))
         except ValueError as err:

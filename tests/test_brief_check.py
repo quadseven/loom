@@ -655,5 +655,62 @@ class Criteria(unittest.TestCase):
         self.assertIsNone(brief_check.criteria_verdict(self.ANSWER))
 
 
+class Split(unittest.TestCase):
+    """A brief that spans more than one platform is split before it reaches
+    a lane (loom#1651): the multi-platform discovery brief behind this rule
+    burned five lane attempts and the whole model ladder before a person
+    split it by hand in minutes. The hold is at the same intake seam as the
+    criteria hold, so the ticket costs no claim and no lane run."""
+
+    MULTI = ("## Why\n\nDiscovery is missing on the phones the field team "
+             "carries, and the credentials it finds are never checked.\n\n"
+             "## What\n\n- Add iOS discovery.\n- Add Android discovery.\n"
+             "- Add Go credential checks.\n- Change the UI list.\n\n"
+             "## Acceptance criteria\n"
+             "- [ ] iOS discovery lists nearby devices.\n"
+             "- [ ] Android discovery lists nearby devices.\n"
+             "- [ ] The Go core verifies a found credential.\n")
+    APP_AND_CORE = ("## Why\n\nThe app shows stale results because the core "
+                    "never tells it a check finished.\n\n"
+                    "## What\n\n- Change the app code to refresh.\n"
+                    "- Change the Go core to emit the event.\n\n"
+                    "## Acceptance criteria\n"
+                    "- [ ] The app refreshes when the core emits.\n")
+    SINGLE = ("## Why\n\nDiscovery is missing on one phone platform the "
+              "field team carries.\n\n"
+              "## What\n\n- Add iOS discovery.\n- Show it in the iOS list.\n\n"
+              "## Acceptance criteria\n"
+              "- [ ] iOS discovery lists nearby devices.\n")
+
+    def setUp(self):
+        self.fake = Route({"/repos/%s/issues/206/timeline" % REPO: []})
+
+    def check(self, body):
+        gh = GitHub("t", transport=self.fake)
+        return brief_check.check(gh, REPO, ticket(body=body), [], TRUSTED, "main")
+
+    def test_a_brief_naming_two_platforms_is_refused_at_queue_time(self):
+        got = brief_check.split_verdict(self.MULTI)
+        self.assertEqual(got.kind, brief_check.SPLIT)
+        self.assertIn("split", got.reason)
+        self.assertEqual(self.check(self.MULTI).kind, brief_check.SPLIT)
+
+    def test_app_code_and_the_go_core_is_two_platforms(self):
+        self.assertEqual(brief_check.split_verdict(self.APP_AND_CORE).kind,
+                         brief_check.SPLIT)
+
+    def test_a_single_platform_brief_queues_unchanged(self):
+        self.assertIsNone(brief_check.split_verdict(self.SINGLE))
+        self.assertIsNone(self.check(self.SINGLE))
+
+    def test_platforms_named_only_in_the_why_do_not_split(self):
+        body = ("## Why\n\niOS and Android users both asked for this, but "
+                "the change itself is in the Go core only.\n\n"
+                "## What\n\n- Change the Go core event.\n\n"
+                "## Acceptance criteria\n"
+                "- [ ] The Go core emits the event.\n")
+        self.assertIsNone(brief_check.split_verdict(body))
+
+
 if __name__ == "__main__":
     unittest.main()

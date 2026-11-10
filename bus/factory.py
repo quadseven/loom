@@ -693,6 +693,11 @@ NO_AREA_NOTE = (
     "play, and this ticket carries no `area:` label. Add the one `area:` label that "
     "names its area; no lane takes it until then.")
 
+NO_SPLIT_NOTE = (
+    "Held for the brain (needs-brain): this brief spans more than one platform, so "
+    "it is more than one ticket. Split it into one ticket per platform, with "
+    "`After:` lines between the slices; no lane takes it until then.")
+
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
 # refuses to send alone.
@@ -5037,6 +5042,7 @@ class Factory:
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
+                or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
             return "waits: " + held
@@ -5082,6 +5088,27 @@ class Factory:
             self.actions += 1
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         reason = "has no acceptance criteria"
+        self._waiting(repo, number, reason)
+        return reason
+
+    def _no_split(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued brief that spans more than one platform gets no lane,
+        or "" (brief_check.split_verdict, the station's claim refusal). Like
+        _no_criteria it gains needs-brain and one note, once: a multi-platform
+        brief given a lane spent the whole model ladder before a person split
+        it by hand (loom#1651)."""
+        if brief_check.split_verdict(str(issue.get("body") or "")) is None:
+            return ""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, NO_SPLIT_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: spans more than one platform"
+                 % (repo, number))
+        reason = "spans more than one platform"
         self._waiting(repo, number, reason)
         return reason
 

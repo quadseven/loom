@@ -43,6 +43,12 @@ Before the station hands a ticket to a lane (`check`), it reads:
   failure. Writing criteria is the brain's rewrite work, so the ticket
   goes back the same way a health ticket does. An answer ticket opens no
   pull request and is exempt, as at the runner.
+- split: a brief whose What or acceptance criteria name more than one
+  platform gets no lane (`split_verdict`): it is more than one ticket,
+  and lanes spent a whole model ladder on one such brief before a person
+  split it by hand. Splitting it into one slice per platform, with
+  After: lines between the slices, is the brain's intake work, so the
+  ticket goes back the same way a health ticket does.
 
 A read that fails holds the ticket for the next pass: a gate that cannot
 read never lets the ticket through.
@@ -65,6 +71,7 @@ STALE = "stale"
 HEALTH = "health"
 CRITERIA = "criteria"
 AREA = "area"
+SPLIT = "split"
 AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
@@ -233,6 +240,58 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
     return Verdict(CRITERIA, "criteria-" + stamp,
                    "its body names no acceptance criteria, so no criterion can be "
                    "restated as the check that proves it")
+
+
+# -- split --------------------------------------------------------------------
+# The platform families a brief can span. A brief whose What or acceptance
+# criteria name two or more of them is more than one ticket: lanes spent a
+# whole model ladder on one such brief before a person split it by hand in
+# minutes (loom#1651). "App code" and the "Go core" count as two families,
+# as the ticket's own example names them.
+PLATFORM_PATTERNS = (
+    ("iOS", re.compile(r"\bios\b|\biphone\b|\bipad\b", re.I)),
+    ("Android", re.compile(r"\bandroid\b", re.I)),
+    ("macOS", re.compile(r"\bmacos\b|\bmac os\b", re.I)),
+    ("Windows", re.compile(r"\bwindows\b", re.I)),
+    ("Linux", re.compile(r"\blinux\b", re.I)),
+    ("the UI", re.compile(r"\bui\b", re.I)),
+    ("app code", re.compile(r"\bapp code\b", re.I)),
+    ("the Go core", re.compile(r"\bgo (?:core|backend|server|service|credential\w*)\b"
+                               r"|\bgolang\b", re.I)),
+)
+
+
+def platforms_named(body: str) -> List[str]:
+    """The distinct platform families the brief's What and acceptance
+    criteria name, in the order above. The Why is background, not scope:
+    platforms named only there do not split a brief. Reads nothing."""
+    text = brief_text(body or "")
+    scope = "\n".join(part for part in (_section(text, "What"),
+                                        _section(text, "Acceptance criteria"),
+                                        _section(text, "Acceptance")) if part)
+    return [name for name, pattern in PLATFORM_PATTERNS if pattern.search(scope)]
+
+
+def split_verdict(body: str) -> Optional[Verdict]:
+    """Why a brief naming more than one platform gets no lane, or None: it
+    is refused at queue time with a split request, and the brain files one
+    slice per platform with After: lines between them. Splitting is the
+    brain's intake work, so the ticket goes back the same way a health
+    ticket does. Reads nothing."""
+    found = platforms_named(body)
+    if len(found) < 2:
+        return None
+    stamp = hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
+    return Verdict(SPLIT, "split-" + stamp,
+                   "its What or acceptance criteria name more than one platform "
+                   "(%s): split it into one slice per platform, with After: lines "
+                   "between the slices, before it can be queued" % ", ".join(found))
+
+
+def split_hold(issue: Mapping[str, Any]) -> bool:
+    """Whether the factory gives the queued ticket no lane: a brief that
+    spans more than one platform. Reads nothing."""
+    return split_verdict(str(issue.get("body") or "")) is not None
 
 
 # -- area ---------------------------------------------------------------------
@@ -536,6 +595,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     # that verdict and its ask, and the criteria park still waits for every
     # ticket the stale reads pass over.
     criteria = criteria_verdict(body)
+    split = split_verdict(body)
     done = asked(comments, trusted)
     operator = tickets.operator_login(trusted) or ""
     # An answer an operator gave on the dashboard (bus/answer.py) reads as
@@ -553,7 +613,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
                 return found
     except (GitHubError, ValueError, KeyError, TypeError) as err:
         raise Unread(str(err)) from err
-    return criteria
+    return split if split is not None else criteria
 
 
 def ask(verdict: Verdict) -> str:
