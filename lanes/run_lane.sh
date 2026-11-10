@@ -2341,6 +2341,19 @@ check_failures() {  # log offset
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
 }
+# Error lines from a check's output for incident details: up to 8 lines
+# matching error|Error|FAILED|make: \*\*\*, each cut to 200 chars, or the
+# last 3 non-empty lines when none match (loom#2946).
+check_error_tail() {  # log offset
+  local out lines
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  # LC_ALL=C: a check's output may be any bytes.
+  lines="$(printf '%s\n' "$out" | LC_ALL=C grep -E 'error|Error|FAILED|make: \*\*\*' | tail -n 8 | LC_ALL=C cut -c1-200)"
+  if [ -z "$lines" ]; then
+    lines="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 3)"
+  fi
+  printf '%s' "$lines"
+}
 # Every test a check run names as failing since the log offset, one per
 # line and sorted: check_failures' test patterns with no cap and no
 # last-line fallback, so two runs compare as sets.
@@ -2614,14 +2627,23 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # retries the ticket on another lane, which files the incident if the base is
 # red there too: filed from the runner, it held nothing and waited for a
 # person to close it.
-note_base_check_failure() {  # kind, detail, reason_var_name
+# Optional 4th argument: log offset of the check run, to append error lines.
+note_base_check_failure() {  # kind, detail, reason_var_name [, log_offset]
   if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
     PARK_CLASS=factory
     printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
     echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
     return 0
   fi
-  note_factory_incident "$@"
+  local detail="$2"
+  if [ -n "${4:-}" ]; then
+    local tail
+    tail="$(check_error_tail "$4")"
+    if [ -n "$tail" ]; then
+      detail="${detail}"$'\n'"${tail}"
+    fi
+  fi
+  note_factory_incident "$1" "$detail" "$3"
 }
 
 # A host-wide counting semaphore around every check run (setup, base check,
@@ -2963,6 +2985,8 @@ prepare_validation() {
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
   if [ -n "$CONFLICTS" ]; then
+    local check_start
+    check_start="$(log_size)"
     check_default_branch || return 1
     BASELINE_EXIT="$DEFAULT_EXIT"
     if [ -n "$DEFAULT_CHANGED" ]; then
@@ -2973,7 +2997,7 @@ prepare_validation() {
       check_exit_is_load "$BASELINE_EXIT" && { note_load_failure "$BASELINE_EXIT" SETUP_REASON; return 1; }
       repair_baseline_allowed && return 0
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
       return 1
     fi
     return 0
@@ -3029,7 +3053,7 @@ prepare_validation() {
   case "$BASELINE_EXIT" in
     125|126|127)
       SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -3106,7 +3130,11 @@ prepare_validation() {
       return $?
     fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    if [ "$cached_verdict" -eq 0 ]; then
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
+    else
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
+    fi
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
