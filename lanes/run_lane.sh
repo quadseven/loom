@@ -2240,7 +2240,8 @@ parse_contract() {
     { SETUP_REASON="$CONTRACT_FILE affected: must be printable ASCII, at most 1000 characters"; return 1; }
 }
 
-# A fix round's base branch, fetched into the shallow tree for its contract.
+# Read .loom/validation.conf from the already-fetched base branch when possible.
+# A fix round's base branch is fetched into the shallow tree for its contract.
 # Tried a second time after a pause: two fetches on one shallow tree race
 # ("shallow file has changed since we read it"), and the first such failure
 # filed a factory incident while nothing was wrong (2026-10-22).
@@ -2255,13 +2256,19 @@ fetch_base_for_contract() {
 }
 
 load_contract() {
-  local rev="$BASE" mode canon
+  # A brief need not name a base, and the lane's clone has no origin/HEAD, so
+  # a fix round falls back to the default branch update_fix_branch fetched.
+  local rev="$BASE" mode canon base_ref="${BASE_BRANCH:-${FIX_DEFAULT:-HEAD}}"
   HAS_CONTRACT="" C_INTERP="" C_SUBMODULES=no C_SETUP="" C_CHECK="" C_AFFECTED=""
-  if [ -n "$FIX_PR" ] && ! { fetch_base_for_contract &&
-       rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
-    HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
-    note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
-    return 1
+  if [ -n "$FIX_PR" ]; then
+    if ! rev="$(safe_git rev-parse --verify -q "origin/$base_ref^{commit}")"; then
+      if ! { fetch_base_for_contract &&
+           rev="$(safe_git rev-parse --verify -q FETCH_HEAD)"; }; then
+        HAS_CONTRACT=1 SETUP_REASON="could not fetch the base branch for $CONTRACT_FILE"
+        note_factory_incident environment "could not fetch the base branch for $CONTRACT_FILE" SETUP_REASON
+        return 1
+      fi
+    fi
   fi
   mode="$(safe_git ls-tree "$rev" -- "$CONTRACT_FILE" | cut -d' ' -f1)"
   [ -n "$mode" ] || return 0
@@ -2340,6 +2347,19 @@ check_failures() {  # log offset
     awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
+}
+# Error lines from a check's output for incident details: up to 8 lines
+# matching error|Error|FAILED|make: \*\*\*, each cut to 200 chars, or the
+# last 3 non-empty lines when none match (loom#2946).
+check_error_tail() {  # log offset
+  local out lines
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  # LC_ALL=C: a check's output may be any bytes.
+  lines="$(printf '%s\n' "$out" | LC_ALL=C grep -E 'error|Error|FAILED|make: \*\*\*' | tail -n 8 | LC_ALL=C cut -c1-200)"
+  if [ -z "$lines" ]; then
+    lines="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 3)"
+  fi
+  printf '%s' "$lines"
 }
 # Every test a check run names as failing since the log offset, one per
 # line and sorted: check_failures' test patterns with no cap and no
@@ -2614,14 +2634,23 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # retries the ticket on another lane, which files the incident if the base is
 # red there too: filed from the runner, it held nothing and waited for a
 # person to close it.
-note_base_check_failure() {  # kind, detail, reason_var_name
+# Optional 4th argument: log offset of the check run, to append error lines.
+note_base_check_failure() {  # kind, detail, reason_var_name [, log_offset]
   if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
     PARK_CLASS=factory
     printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
     echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
     return 0
   fi
-  note_factory_incident "$@"
+  local detail="$2"
+  if [ -n "${4:-}" ]; then
+    local tail
+    tail="$(check_error_tail "$4")"
+    if [ -n "$tail" ]; then
+      detail="${detail}"$'\n'"${tail}"
+    fi
+  fi
+  note_factory_incident "$1" "$detail" "$3"
 }
 
 # A host-wide counting semaphore around every check run (setup, base check,
@@ -2711,6 +2740,27 @@ note_load_failure() {  # exit, reason_var_name
   fi
 }
 
+# The temp dir a run gets, owned by the runner and outside the agent's
+# scratch home: created here, so the directory always exists before
+# anything is handed the path, and it stays existing: drop_run_scratch
+# removes the agent home before every brief, and a sandboxed agent may
+# write its own home, so a temp dir inside that home can be removed or
+# replaced under the runner. This one sits beside the other slot
+# scratch under run/, which neither drop touches. On the
+# lane hosts an unset TMPDIR makes git ask the OS for the per-user temp
+# dir, and when that lookup fails git prints a confstr warning into every
+# call; the warning lands in run logs and in agent output that tests
+# assert on, and a lane run is recorded as failed work the model did not
+# lose. The agy and API lanes already set a TMPDIR inside their own
+# sandboxes; this covers the runner itself (whose TMPDIR the
+# subscription agents inherit). The validation check's TMPDIR is
+# created in contract_run_sandboxed, the one place every check passes
+# through.
+run_tmpdir() {
+  mkdir -p "$LOOM_HOME/run/$SLOT-tmp" || return 1
+  printf '%s\n' "$LOOM_HOME/run/$SLOT-tmp"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2732,6 +2782,11 @@ contract_run() {
 }
 contract_run_sandboxed() {
   local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
+  # The check's TMPDIR is created here, in the one place every check
+  # (setup, base, final, affected, the base-test gate) passes through,
+  # so the final check's environment matches the base check's even when
+  # no earlier step prepared the check home.
+  mkdir -p "$CHECK_HOME/tmp" || { echo "contract_run: could not create the check temp dir" >> "$LOG"; return 125; }
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -2963,6 +3018,8 @@ prepare_validation() {
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
   if [ -n "$CONFLICTS" ]; then
+    local check_start
+    check_start="$(log_size)"
     check_default_branch || return 1
     BASELINE_EXIT="$DEFAULT_EXIT"
     if [ -n "$DEFAULT_CHANGED" ]; then
@@ -2973,7 +3030,7 @@ prepare_validation() {
       check_exit_is_load "$BASELINE_EXIT" && { note_load_failure "$BASELINE_EXIT" SETUP_REASON; return 1; }
       repair_baseline_allowed && return 0
       SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
       return 1
     fi
     return 0
@@ -3029,7 +3086,7 @@ prepare_validation() {
   case "$BASELINE_EXIT" in
     125|126|127)
       SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -3106,7 +3163,11 @@ prepare_validation() {
       return $?
     fi
     SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON
+    if [ "$cached_verdict" -eq 0 ]; then
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
+    else
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
+    fi
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
@@ -4125,6 +4186,12 @@ fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
+# The run's own TMPDIR, exported before anything else runs: the runner's
+# git calls and the subscription lanes' agents (which inherit this
+# environment) get a temp dir that exists, so git prints no confstr
+# warning on the lane hosts.
+TMPDIR="$(run_tmpdir)" || { echo "could not create the run temp dir $LOOM_HOME/run/$SLOT-tmp" >&2; exit 1; }
+export TMPDIR
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
