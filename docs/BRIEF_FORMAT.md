@@ -14,6 +14,10 @@ it the runner uses the lane default (`LOOM_CODEX_MODEL` or
 pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
+When a ticket body says `Builds on #N`, briefing reads open pull request N and
+uses its head branch as `Base`. The runner starts from that branch and targets
+it when opening the lane pull request.
+
 `Repairs incident: #7` names an open base-check factory incident in the
 factory repository. `bus.brain brief --repairs-incident 7` writes this
 header, and the station preserves it in the lane brief. The runner verifies

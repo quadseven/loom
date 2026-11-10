@@ -1292,6 +1292,8 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
             base_pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         except GitHubError:
             return "stacked on #%d (base pull request unreadable)" % number
+        if base_pr.get("merged_at"):
+            return ""
         if base_pr.get("state") == "open":
             return "stacked on #%d" % number
     base = str((pr.get("base") or {}).get("ref") or "")
@@ -1307,7 +1309,14 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
     number = next((item.get("number") for item in matches
                    if item.get("number") != pr.get("number")
                    and str((item.get("head") or {}).get("ref") or "") == base), None)
-    return "stacked on #%s" % number if number is not None else "stacked on branch %s" % base
+    if number is not None:
+        return "stacked on #%s" % number
+    closed = gh.paginate("/repos/%s/pulls?state=closed&head=%s:%s" %
+                         (repo, owner, quote(base, safe="")))
+    landed = any(item.get("merged_at")
+                 and str((item.get("head") or {}).get("ref") or "") == base
+                 for item in closed if isinstance(item, dict))
+    return "" if landed else "stacked on branch %s" % base
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -3724,6 +3733,22 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M)
+
+
+def _builds_on_base(gh: GitHub, repo: str, body: str) -> Optional[str]:
+    """Return the open pull request head named by a Builds on line."""
+    match = BUILDS_ON_RE.search(body)
+    if not match:
+        return None
+    number = int(match.group(1))
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    head = (pr.get("head") or {}).get("ref")
+    if pr.get("state") != "open" or not isinstance(head, str) or not head:
+        raise ValueError("Builds on #%d must name an open pull request with a head ref" % number)
+    return head
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
@@ -3840,7 +3865,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     else:
         raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        base = goal_trunk(goal_issue)
+        base = _builds_on_base(gh, repo, body) or goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,

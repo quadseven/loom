@@ -590,6 +590,7 @@ CLASSES = change_class.CLASSES
 # station process reads the files once per commit.
 CLASS_RANK = {name: rank for rank, name in enumerate(reversed(CLASSES))}
 _CLASSED: Dict[Tuple[str, int, str], str] = {}
+_OVERLAP_MEMO: Dict[Tuple[Any, ...], Optional[int]] = {}
 # When the keep-current step last brought each held pull request up to date
 # (2026-10-27: the first behind pull request in landing order took the repo's
 # one slot every pass and the rest fell up to 71 commits behind).
@@ -1600,16 +1601,84 @@ def held_until(issue: Dict[str, Any]) -> float:
 
 def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
                   linked: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pull requests of loom:urgent, loom:regression and loom:revert tickets
-    first, then by their ticket's priority (P0 first), then the oldest."""
+    """Land stack bases first, then priority and age among available pulls."""
     urgent = {n for n, issue in tickets.items() if set(FIRST) & set(_labels(issue))}
     ticket_of = {int(pr["number"]): n for n, pr in linked.items()}
 
     def rank(pr: Dict[str, Any]) -> int:
         issue = tickets.get(ticket_of.get(int(pr["number"])) or 0)
         return PRIORITIES.index(priority_of(issue or {}))
-    return sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
-                                      rank(p), str(p.get("created_at") or "")))
+    ranked = sorted(prs, key=lambda p: (ticket_of.get(int(p["number"])) not in urgent,
+                                        rank(p), str(p.get("created_at") or "")))
+    by_head = {str((pr.get("head") or {}).get("ref") or ""): int(pr["number"])
+               for pr in prs}
+    remaining = list(ranked)
+    ordered: List[Dict[str, Any]] = []
+    while remaining:
+        ready = next((pr for pr in remaining
+                      if not _stack_parent(pr, by_head, {int(x["number"]) for x in remaining})), None)
+        if ready is None:
+            ordered.extend(remaining)
+            break
+        ordered.append(ready)
+        remaining.remove(ready)
+    return ordered
+
+
+def _stack_parent(pr: Dict[str, Any], by_head: Dict[str, int],
+                  remaining: set) -> Optional[int]:
+    """The still-open pull request this pull is based on, if present."""
+    declared = re.search(r"\bBuilds on #([1-9][0-9]*)\b", str(pr.get("body") or ""), re.I)
+    base_ref = str((pr.get("base") or {}).get("ref") or "")
+    parent = int(declared.group(1)) if declared else (by_head.get(base_ref) if base_ref else None)
+    return parent if parent in remaining and parent != int(pr["number"]) else None
+
+
+def link_stack(gh: Any, repo: str, bottom: int, upper: int) -> None:
+    """Link an upper pull request to its bottom through the stacks API."""
+    if bottom == upper:
+        return
+    path = "/repos/%s/stacks" % repo
+    data = gh.rest("GET", path).data
+    for stack in data if isinstance(data, list) else []:
+        numbers = [int(item.get("number") if isinstance(item, dict) else item)
+                   for item in stack.get("pull_requests", [])]
+        if bottom in numbers and upper in numbers:
+            return
+    gh.rest("POST", path, {"pull_requests": [bottom, upper]})
+
+
+def overlapping_peer(gh: Any, repo: str, pr: Dict[str, Any],
+                     candidates: List[Dict[str, Any]]) -> Optional[int]:
+    """Find the oldest open pull request on the same base with overlapping hunks."""
+    number = int(pr.get("number") or 0)
+    base = str((pr.get("base") or {}).get("ref") or "")
+    older = [other for other in candidates
+             if int(other.get("number") or 0) and int(other["number"]) < number
+             and str((other.get("base") or {}).get("ref") or "") == base]
+    older.sort(key=lambda item: int(item["number"]))
+    own_sha = str((pr.get("head") or {}).get("sha") or "")
+    peer_shas = tuple((int(other["number"]),
+                       str((other.get("head") or {}).get("sha") or "")) for other in older)
+    key = (repo, number, own_sha, base, peer_shas)
+    cacheable = bool(own_sha) and all(sha for _, sha in peer_shas)
+    if cacheable and key in _OVERLAP_MEMO:
+        return _OVERLAP_MEMO[key]
+    own_files: Optional[List[Dict[str, Any]]] = None
+    overlap = None
+    for other in older:
+        other_number = int(other.get("number") or 0)
+        if own_files is None:
+            own_files = hunk_overlap.pull_files(gh, repo, number)
+        right = hunk_overlap.pull_files(gh, repo, other_number)
+        if hunk_overlap.files_overlap(own_files, right):
+            overlap = other_number
+            break
+    if cacheable:
+        _OVERLAP_MEMO[key] = overlap
+        if len(_OVERLAP_MEMO) > 5000:
+            _OVERLAP_MEMO.pop(next(iter(_OVERLAP_MEMO)))
+    return overlap
 
 
 def with_model(body: str, model: str) -> str:
@@ -1847,6 +1916,7 @@ class Factory:
         self._merged_prs: Dict[str, Dict[int, int]] = {}
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._stack_checked: set = set()
         # Each repo's `area:` labels, read once a pass by _repo_areas.
         self._areas: Dict[str, Optional[List[str]]] = {}
 
@@ -2824,6 +2894,24 @@ class Factory:
             return
         number = int(pr["number"])
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        self._link_stack_for(repo, full)
+        overlap = None
+        if not re.search(r"^Builds on #[1-9][0-9]*[ \t]*$",
+                         str(full.get("body") or ""), re.M | re.I):
+            overlap = overlapping_peer(self.gh, repo, full,
+                                       self._open_pull_requests(repo))
+        if overlap is not None:
+            reason = "overlaps pull request #%d" % overlap
+            key = "%s#%d" % (repo, int(issue["number"]))
+            if self.known_waits.get(key) != reason:
+                self._status_note(repo, int(issue["number"]), "wait:gate: " + reason)
+            labels = [label for label in _labels(issue) if not label.startswith("wait:")]
+            if "wait:gate" not in _labels(issue):
+                self._relabel(repo, issue, labels + ["wait:gate"])
+            self._wait_said(repo, issue["number"], reason,
+                            "held %s#%d: overlaps pull request #%d"
+                            % (repo, number, overlap))
+            return
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
@@ -2845,6 +2933,25 @@ class Factory:
                 and self.now - ended <= REVIEW_GRACE):
             return  # the review the lane asked for has not answered yet
         self._judge(repo, number, full, issue, comments, review, sensitive)
+
+    def _link_stack_for(self, repo: str, pr: Dict[str, Any]) -> None:
+        """Link a newly opened pull request to the pull request it builds on."""
+        upper = int(pr.get("number") or 0)
+        if upper in self._stack_checked:
+            return
+        body_match = re.search(r"^Builds on #([1-9][0-9]*)[ \t]*$",
+                               str(pr.get("body") or ""), re.M | re.I)
+        base = int(body_match.group(1)) if body_match else None
+        if base is None:
+            ref = str((pr.get("base") or {}).get("ref") or "")
+            base = next((int(item["number"]) for item in self._open_pull_requests(repo)
+                         if int(item.get("number") or 0) != upper
+                         and str((item.get("head") or {}).get("ref") or "") == ref), None)
+        if base is None:
+            self._stack_checked.add(upper)
+            return
+        link_stack(self.gh, repo, base, upper)
+        self._stack_checked.add(upper)
 
     def _judge(self, repo: str, number: int, full: Dict[str, Any], issue: Dict[str, Any],
                comments: List[Dict[str, Any]], review: str, sensitive: bool = False) -> None:

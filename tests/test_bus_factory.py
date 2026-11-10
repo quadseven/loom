@@ -309,6 +309,7 @@ class Base(unittest.TestCase):
         # Each test's pull request reuses head shas; the reclass memo is per station process.
         factory._CLASSED.clear()
         factory._KEPT_AT.clear()
+        factory._OVERLAP_MEMO.clear()
         self.merged, self.fixed, self.moved, self.closed = [], [], [], []
         self.humans = []
         self.placed = []
@@ -378,6 +379,102 @@ class Base(unittest.TestCase):
 
 
 class PullRequests(Base):
+    def test_overlapping_peer_holds_by_number_and_disjoint_peer_does_not(self):
+        class Result:
+            def __init__(self, data):
+                self.data = data
+
+        class Client:
+            def __init__(self, patches):
+                self.patches = patches
+
+            def rest(self, method, path, body=None):
+                number = int(path.split("/pulls/")[1].split("/")[0])
+                filename, patch_text = self.patches[number]
+                return Result([{"filename": filename, "patch": patch_text}])
+
+        newer = {"number": 52, "base": {"ref": "main"}}
+        older = {"number": 51, "base": {"ref": "main"}}
+        overlap = "@@ -12,2 +12,2 @@\n-a\n+b"
+        disjoint = "@@ -40,2 +40,2 @@\n-a\n+b"
+        client = Client({51: ("bus/a.py", overlap), 52: ("bus/a.py", overlap)})
+        self.assertEqual(factory.overlapping_peer(client, REPO, newer, [older]), 51)
+        client = Client({51: ("bus/a.py", overlap), 52: ("bus/a.py", disjoint)})
+        self.assertIsNone(factory.overlapping_peer(client, REPO, newer, [older]))
+
+    def test_an_overlapping_new_pull_is_held_with_the_older_number(self):
+        class Result:
+            data = {"number": 52, "head": {"sha": "head52"},
+                    "base": {"ref": "main"}, "body": ""}
+
+        class Client:
+            def rest(self, method, path, body=None):
+                return Result()
+
+        issue = {"number": 9, "labels": [{"name": "loom:ticket"},
+                                          {"name": "loom:pr"}]}
+        handler = factory.Factory(Client(), [REPO], NOW)
+        with mock.patch.object(handler, "_lane_pr_ticket", return_value=issue), \
+                mock.patch.object(handler, "_link_stack_for"), \
+                mock.patch.object(handler, "_open_pull_requests", return_value=[]), \
+                mock.patch.object(factory, "overlapping_peer", return_value=51), \
+                mock.patch.object(handler, "_status_note") as note, \
+                mock.patch.object(handler, "_relabel") as relabel:
+            handler.pull_request(REPO, {"number": 52}, {})
+        self.assertEqual(note.call_args.args[2], "wait:gate: overlaps pull request #51")
+        self.assertIn("wait:gate", relabel.call_args.args[2])
+
+    def test_a_disjoint_new_pull_is_not_held(self):
+        class Result:
+            data = {"number": 52, "head": {"sha": "head52"},
+                    "base": {"ref": "main"}, "body": ""}
+
+        class Client:
+            def rest(self, method, path, body=None):
+                return Result()
+
+        issue = {"number": 9, "labels": [{"name": "loom:ticket"},
+                                          {"name": "loom:pr"}]}
+        handler = factory.Factory(Client(), [REPO], NOW)
+        with mock.patch.object(handler, "_lane_pr_ticket", return_value=issue), \
+                mock.patch.object(handler, "_link_stack_for"), \
+                mock.patch.object(handler, "_open_pull_requests", return_value=[]), \
+                mock.patch.object(factory, "overlapping_peer", return_value=None), \
+                mock.patch.object(handler, "_status_note") as note, \
+                mock.patch.object(handler, "_relabel") as relabel:
+            handler.pull_request(REPO, {"number": 52}, {})
+        note.assert_not_called()
+        relabel.assert_not_called()
+
+    def test_opening_an_upper_pull_links_the_bottom_and_upper_numbers(self):
+        class Result:
+            data = []
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def rest(self, method, path, body=None):
+                self.calls.append((method, path, body))
+                return Result()
+
+        client = Client()
+        handler = factory.Factory(client, [REPO], NOW)
+        handler._link_stack_for(REPO, {"number": 8, "body": "Builds on #7"})
+        self.assertEqual(client.calls, [
+            ("GET", "/repos/%s/stacks" % REPO, None),
+            ("POST", "/repos/%s/stacks" % REPO,
+             {"pull_requests": [7, 8]}),
+        ])
+
+    def test_landing_order_places_a_stack_base_before_its_upper_pull(self):
+        bottom = {"number": 50, "head": {"ref": "loom/bottom"},
+                  "base": {"ref": "main"}, "created_at": "2026-01-02"}
+        upper = {"number": 51, "head": {"ref": "loom/upper"},
+                 "base": {"ref": "loom/bottom"}, "created_at": "2026-01-01"}
+        ordered = factory.landing_order([upper, bottom], {}, {50: bottom, 51: upper})
+        self.assertEqual([pr["number"] for pr in ordered], [50, 51])
+
     def test_factory_refuses_an_incomplete_review_thread_list(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5)
@@ -1466,7 +1563,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, created=7200)
         self.gh.behind[50] = 2
         self.gh.ticket(6, "pr")
-        self.gh.pull(60, 6, created=3600)
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py", "tests/test_b.py"))
         self.gh.behind[60] = 2
         real = factory.Factory._operator_holds
         with mock.patch.object(factory.Factory, "_operator_holds", autospec=True,
@@ -1514,7 +1611,7 @@ class PullRequests(Base):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, created=7200)
         self.gh.ticket(6, "pr")
-        self.gh.pull(60, 6, created=3600)
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py", "tests/test_b.py"))
         self.gh.pulls = dict(reversed(list(self.gh.pulls.items())))
         self.go()
         self.assertEqual(self.merged, [(50, (REPO, 5))])
@@ -1524,7 +1621,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, created=7200)
         self.gh.ticket(6, "pr")
         self.gh.issues[6]["body"] = "Priority: P0\n\n" + str(self.gh.issues[6].get("body") or "")
-        self.gh.pull(60, 6, created=3600)
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py", "tests/test_b.py"))
         self.go()
         self.assertEqual(self.merged, [(60, (REPO, 6))])
 
@@ -1533,7 +1630,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, created=7200)
         self.gh.ticket(6, "pr")
         self.gh.issues[6]["labels"].append({"name": "loom:urgent"})
-        self.gh.pull(60, 6, created=3600)
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py", "tests/test_b.py"))
         self.go()
         self.assertEqual(self.merged, [(60, (REPO, 6))])
 
@@ -1542,7 +1639,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, created=7200)
         self.gh.ticket(6, "pr")
         self.gh.issues[6]["labels"].append({"name": "loom:regression"})
-        self.gh.pull(60, 6, created=3600)
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py", "tests/test_b.py"))
         self.go()
         self.assertEqual(self.merged, [(60, (REPO, 6))])
 
@@ -1551,7 +1648,7 @@ class PullRequests(Base):
         self.gh.pull(50, 5, created=7200)
         self.gh.ticket(6, "pr")
         self.gh.issues[6]["labels"].append({"name": "loom:revert"})
-        self.gh.pull(60, 6, created=3600, files=("bus/a.py",))
+        self.gh.pull(60, 6, created=3600, files=("bus/b.py",))
         self.go()
         self.assertEqual((self.merged, self.fixed), ([(60, (REPO, 6))], []))
 
@@ -2076,7 +2173,7 @@ class LandingLock(Base):
     def test_while_a_fresh_lock_is_held_no_other_pull_request_is_updated_or_landed(self):
         self.held_by_50()
         self.gh.ticket(6, "pr")
-        self.gh.pull(60, 6)
+        self.gh.pull(60, 6, files=("bus/b.py", "tests/test_b.py"))
         self.gh.behind[60] = 2
         self.gh.ticket(7, "pr")
         self.gh.pull(70, 7)
@@ -2102,7 +2199,7 @@ class LandingLock(Base):
     def test_a_lock_40_minutes_old_is_released_and_the_next_one_taken(self):
         self.held_by_50(seconds_ago=40 * 60)
         self.gh.ticket(6, "pr")
-        self.gh.pull(60, 6)
+        self.gh.pull(60, 6, files=("bus/b.py", "tests/test_b.py"))
         self.gh.behind[60] = 2
         self.go()
         self.assertFalse(self.carries(50))
