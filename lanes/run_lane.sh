@@ -2711,6 +2711,29 @@ note_load_failure() {  # exit, reason_var_name
   fi
 }
 
+# The temp dir a run gets, under its own scratch home: created here, so
+# the directory always exists before anything is handed the path. On the
+# lane hosts an unset TMPDIR makes git ask the OS for the per-user temp
+# dir, and when that lookup fails git prints a confstr warning into every
+# call; the warning lands in run logs and in agent output that tests
+# assert on, and a lane run is recorded as failed work the model did not
+# lose. The agy and API lanes already set a TMPDIR inside their own
+# sandboxes; these two cover the runner itself (whose TMPDIR the
+# subscription agents inherit) and every validation check.
+run_tmpdir() {
+  mkdir -p "$AGENT_HOME/tmp" || return 1
+  printf '%s\n' "$AGENT_HOME/tmp"
+}
+
+# The validation check's temp dir, under the check home. Every check
+# (setup, base, final, affected, the base-test gate) builds its own
+# through here, so the final check's environment matches the base
+# check's even when no earlier step prepared the check home.
+check_tmpdir() {
+  mkdir -p "$CHECK_HOME/tmp" || return 1
+  printf '%s\n' "$CHECK_HOME/tmp"
+}
+
 # Run one contract command in the tree the way an API-lane agent runs: an
 # emptied environment with a scratch HOME, under the sandbox profile (its
 # second argument is the interpreter, whose directory stays readable). The
@@ -2731,7 +2754,8 @@ contract_run() {
   return "$rc"
 }
 contract_run_sandboxed() {
-  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}"
+  local profile tool uv_bin uv_dir uv_path_dirs="" uv_bins="" changed_list="${2:-}" check_tmp=""
+  check_tmp="$(check_tmpdir)" || { echo "contract_run: could not create the check temp dir" >> "$LOG"; return 125; }
   contract_command_ok "$1" || { echo "contract_run: refusing a command that is not printable ASCII" >> "$LOG"; return 125; }
   # A contract that runs `uvx` failed every check with 127 on the unmodified
   # base: the lane machine keeps uv and uvx in the runner's .local/bin,
@@ -2763,7 +2787,7 @@ contract_run_sandboxed() {
     # (2026-10-16).
     # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
     # the scratch home, where agent_uv_cache copies them for a codex agent.
-    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$check_tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
@@ -4125,6 +4149,12 @@ fi
 
 AGENT_HOME="$LOOM_HOME/run/$SLOT-home"
 CHECK_HOME="$LOOM_HOME/run/$SLOT-check"
+# The run's own TMPDIR, exported before anything else runs: the runner's
+# git calls and the subscription lanes' agents (which inherit this
+# environment) get a temp dir that exists, so git prints no confstr
+# warning on the lane hosts.
+TMPDIR="$(run_tmpdir)" || { echo "could not create the run temp dir $AGENT_HOME/tmp" >&2; exit 1; }
+export TMPDIR
 API_KEY=""
 LANE_ACCOUNT=""
 READY_REASON=""
