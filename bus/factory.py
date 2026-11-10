@@ -5097,7 +5097,7 @@ class Factory:
         _no_criteria it gains needs-brain and one note, once: a multi-platform
         brief given a lane spent the whole model ladder before a person split
         it by hand (loom#1651)."""
-        if brief_check.split_verdict(str(issue.get("body") or "")) is None:
+        if not brief_check.split_hold(issue):
             return ""
         number = int(issue["number"])
         if "needs-brain" not in _labels(issue):

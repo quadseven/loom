@@ -703,6 +703,23 @@ class Split(unittest.TestCase):
         self.assertIsNone(brief_check.split_verdict(self.SINGLE))
         self.assertIsNone(self.check(self.SINGLE))
 
+    def test_the_ui_beside_one_platform_is_two_platforms(self):
+        body = ("## Why\n\nDiscovery is missing on one phone platform.\n\n"
+                "## What\n\n- Add iOS discovery.\n- Change the UI list.\n\n"
+                "## Acceptance criteria\n"
+                "- [ ] iOS discovery lists nearby devices.\n")
+        self.assertEqual(brief_check.split_verdict(body).kind,
+                         brief_check.SPLIT)
+
+    def test_a_ui_mention_in_a_criterion_is_not_a_second_platform(self):
+        body = ("## Why\n\nDiscovery is missing on one phone platform.\n\n"
+                "## What\n\n- Add iOS discovery.\n\n"
+                "## Acceptance criteria\n"
+                "- [ ] iOS discovery lists nearby devices.\n"
+                "- [ ] The UI test passes on the device list.\n")
+        self.assertIsNone(brief_check.split_verdict(body))
+        self.assertIsNone(self.check(body))
+
     def test_platforms_named_only_in_the_why_do_not_split(self):
         body = ("## Why\n\niOS and Android users both asked for this, but "
                 "the change itself is in the Go core only.\n\n"

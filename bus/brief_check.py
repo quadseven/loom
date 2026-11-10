@@ -254,7 +254,11 @@ PLATFORM_PATTERNS = (
     ("macOS", re.compile(r"\bmacos\b|\bmac os\b", re.I)),
     ("Windows", re.compile(r"\bwindows\b", re.I)),
     ("Linux", re.compile(r"\blinux\b", re.I)),
-    ("the UI", re.compile(r"\bui\b", re.I)),
+    # The UI counts only as a scope phrase (a change to it), never as a bare
+    # mention: a single-platform brief whose criterion says "the UI test
+    # passes" names one platform, not two.
+    ("the UI", re.compile(r"\bchange (?:the )?ui\b|\bui (?:change|changes|list|screen|screens|redesign)\b"
+                          r"|\bnew ui\b|\buser interface (?:change|changes|redesign)\b", re.I)),
     ("app code", re.compile(r"\bapp code\b", re.I)),
     ("the Go core", re.compile(r"\bgo (?:core|backend|server|service|credential\w*)\b"
                                r"|\bgolang\b", re.I)),
