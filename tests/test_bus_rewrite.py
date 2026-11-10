@@ -277,6 +277,17 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_a_handed_off_triage_issue_is_not_a_candidate(self):
+        # loom#1884: the factory's hold pass puts a triage issue whose hold
+        # returned after its retry into the hand-off pool (handoff:claude,
+        # no needs-brain). The rewrite must leave it there: as a candidate
+        # it was held again the same day and handed off again the next,
+        # one rewrite run and one new hand-off note per day.
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"] = [{"name": "loom:triage"}, {"name": "handoff:claude"}]
+        self.fake.add_triage(7)
+        self.assertEqual([i["number"] for i in rewrite.candidates(self.gh(), REPO)], [7])
+
     def test_work_that_is_not_for_a_lane_is_not_a_candidate(self):
         # loom#34, a wayfinder decision question labelled loom:triage before
         # triage skipped wayfinder issues, became a ticket that churned for

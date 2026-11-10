@@ -239,6 +239,8 @@ loom_env() {
   while IFS= read -r k; do
     case "$k" in
       LOOM_HOME|LOOM_REPO_OWNERS|LOOM_EVIDENCE_CMDS|LOOM_DB_*) continue ;;
+      # Review-output windows are station configuration, not agent input.
+      LOOM_FABRIC_REVIEW_NOTES) continue ;;
       # Each job gets its own writer's App from app_env, never another's.
       LOOM_GITHUB_APP_*|LOOM_LANES_GITHUB_APP_*|LOOM_BRAIN_GITHUB_APP_*) continue ;;
       LOOM_*) ;; *) continue ;;
@@ -507,6 +509,7 @@ cat > "$PLIST" <<EOF
     <key>LOOM_TRANSCRIPT_URL</key><string>$(xml "${LOOM_TRANSCRIPT_URL:-}")</string>
     <key>LOOM_TRANSCRIPT_TOKEN_SSM</key><string>$(xml "${LOOM_TRANSCRIPT_TOKEN_SSM:-}")</string>
     <key>LOOM_FABRIC_KEY_SSM</key><string>$(xml "${LOOM_FABRIC_KEY_SSM:-}")</string>
+    <key>LOOM_FABRIC_REVIEW_NOTES</key><string>$(xml "${LOOM_FABRIC_REVIEW_NOTES:-}")</string>
     <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
     <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>

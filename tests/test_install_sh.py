@@ -208,6 +208,19 @@ class InstallScriptTest(unittest.TestCase):
         plist = (self.home / "Library" / "LaunchAgents" / "com.loom.station.plist").read_text()
         self.assertIn("<key>LOOM_FABRIC_KEY_SSM</key><string>/example/fabric/key</string>", plist)
 
+    def test_fabric_review_config_is_preserved_for_station_only(self):
+        import plistlib
+        config = ('{"timezone":"America/New_York","notes":'
+                  '[{"title_prefix":"Loom morning review","start":"00:00","by":"14:00"}]}')
+        result = self.run_install(LOOM_FABRIC_REVIEW_NOTES=config)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        plist = plistlib.loads((agents / "com.loom.station.plist").read_bytes())
+        self.assertEqual(plist["EnvironmentVariables"]["LOOM_FABRIC_REVIEW_NOTES"], config)
+        for name in ("brain", "codex"):
+            other = plistlib.loads((agents / ("com.loom.%s.plist" % name)).read_bytes())
+            self.assertNotIn("LOOM_FABRIC_REVIEW_NOTES", other["EnvironmentVariables"])
+
     def test_the_brain_plist_omits_the_fabric_key_without_the_opt_in(self):
         # The brain's Fabric question is opt-in (LOOM_BRAIN_FABRIC_ASK) and
         # off by default, so its plist must not carry the key parameter name
