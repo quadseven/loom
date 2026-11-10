@@ -1648,36 +1648,61 @@ def link_stack(gh: Any, repo: str, bottom: int, upper: int) -> None:
     gh.rest("POST", path, {"pull_requests": [bottom, upper]})
 
 
-def overlapping_peer(gh: Any, repo: str, pr: Dict[str, Any],
-                     candidates: List[Dict[str, Any]]) -> Optional[int]:
-    """Find the oldest open pull request on the same base with overlapping hunks."""
+def _older_overlap_candidates(pr: Dict[str, Any],
+                              candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return older candidates on this pull request's base, oldest first."""
     number = int(pr.get("number") or 0)
     base = str((pr.get("base") or {}).get("ref") or "")
     older = [other for other in candidates
              if int(other.get("number") or 0) and int(other["number"]) < number
              and str((other.get("base") or {}).get("ref") or "") == base]
     older.sort(key=lambda item: int(item["number"]))
+    return older
+
+
+def _overlap_cache_key(repo: str, pr: Dict[str, Any],
+                       older: List[Dict[str, Any]]) -> Tuple[Tuple[Any, ...], bool]:
+    """Build the overlap cache key and whether all of its refs are stable."""
+    number = int(pr.get("number") or 0)
+    base = str((pr.get("base") or {}).get("ref") or "")
     own_sha = str((pr.get("head") or {}).get("sha") or "")
     peer_shas = tuple((int(other["number"]),
                        str((other.get("head") or {}).get("sha") or "")) for other in older)
     key = (repo, number, own_sha, base, peer_shas)
-    cacheable = bool(own_sha) and all(sha for _, sha in peer_shas)
-    if cacheable and key in _OVERLAP_MEMO:
-        return _OVERLAP_MEMO[key]
+    return key, bool(own_sha) and all(sha for _, sha in peer_shas)
+
+
+def _scan_overlapping_peer(gh: Any, repo: str, number: int,
+                           older: List[Dict[str, Any]]) -> Optional[int]:
+    """Return the first older pull request whose changed hunks overlap."""
     own_files: Optional[List[Dict[str, Any]]] = None
-    overlap = None
     for other in older:
         other_number = int(other.get("number") or 0)
         if own_files is None:
             own_files = hunk_overlap.pull_files(gh, repo, number)
         right = hunk_overlap.pull_files(gh, repo, other_number)
         if hunk_overlap.files_overlap(own_files, right):
-            overlap = other_number
-            break
+            return other_number
+    return None
+
+
+def _remember_overlap(key: Tuple[Any, ...], overlap: Optional[int]) -> None:
+    """Cache a stable overlap result, evicting the oldest entry at capacity."""
+    _OVERLAP_MEMO[key] = overlap
+    if len(_OVERLAP_MEMO) > 5000:
+        _OVERLAP_MEMO.pop(next(iter(_OVERLAP_MEMO)))
+
+
+def overlapping_peer(gh: Any, repo: str, pr: Dict[str, Any],
+                     candidates: List[Dict[str, Any]]) -> Optional[int]:
+    """Find the oldest open pull request on the same base with overlapping hunks."""
+    older = _older_overlap_candidates(pr, candidates)
+    key, cacheable = _overlap_cache_key(repo, pr, older)
+    if cacheable and key in _OVERLAP_MEMO:
+        return _OVERLAP_MEMO[key]
+    overlap = _scan_overlapping_peer(gh, repo, int(pr.get("number") or 0), older)
     if cacheable:
-        _OVERLAP_MEMO[key] = overlap
-        if len(_OVERLAP_MEMO) > 5000:
-            _OVERLAP_MEMO.pop(next(iter(_OVERLAP_MEMO)))
+        _remember_overlap(key, overlap)
     return overlap
 
 
