@@ -8287,9 +8287,32 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
 
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, authors),
-                      re.M)
-    return rows
+    body = _lane_status(gh, lanes_repo, authors)
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    scorecard = globals().get("scorecard")
+    if scorecard is None:
+        from . import scorecard
+        globals()["scorecard"] = scorecard
+    # A lane the scorecard has demoted takes no build ticket, the same set
+    # the factory reads (bus/scorecard.py): leave it out even where lane
+    # status still prints it as available.
+    demoted = {row["lane"] for row in scorecard.parse_rows(body)
+               if row.get("demoted")}
+    # The station also keeps the demoted set in its scorecard file; read it
+    # where this process can see the station's state directory.
+    home = os.environ.get("LOOM_HOME", "").strip()
+    if home:
+        state = os.path.join(home, "state", "station")
+        if os.path.isdir(state):
+            try:
+                card = scorecard.Scorecard(state, time.time())
+                if card.unreadable:
+                    demoted |= set(rows)
+                else:
+                    demoted |= set(card.demoted())
+            except (OSError, ValueError):
+                pass
+    return [lane for lane in rows if lane not in demoted]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,
