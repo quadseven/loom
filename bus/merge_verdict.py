@@ -115,6 +115,10 @@ def _unfixed_blocker(threads: List[Dict[str, Any]], head: Dict[str, Any],
     return None
 
 
+def _draft_blocker(node: Dict[str, Any]) -> Optional[str]:
+    return "draft" if node.get("isDraft") else None
+
+
 def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
     """The merge-ready verdict for one pull request's READY_FIELDS (docs/BRAIN.md).
     It reads nothing else, so the same API data always gives the same verdict.
@@ -123,7 +127,8 @@ def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
     head = head_commit(node)
     review_threads = node.get("reviewThreads") or {}
     threads = review_threads.get("nodes") or []
-    rules: List[Tuple[Optional[str], str]] = [(_checks_blocker(head), LANE),
+    rules: List[Tuple[Optional[str], str]] = [(_draft_blocker(node), LANE),
+                                              (_checks_blocker(head), LANE),
                                               (_review_blocker(node, bot), LANE)]
     rules += [(blocker, OPERATOR) for blocker in person_blockers(node)]
     rules += [(_threads_blocker(threads, review_threads.get("totalCount")), LANE),

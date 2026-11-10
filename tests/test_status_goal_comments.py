@@ -37,7 +37,8 @@ PINNED_QUERY = (
     " reviewThreads(first:100) { totalCount nodes { isResolved"
     " root: comments(first:1) { nodes { author { __typename login } createdAt } } } }"
     " comments(last:100) { totalCount nodes { databaseId url createdAt body"
-    " author { __typename login } } } }"
+    " author { __typename login } } }"
+    " isDraft }"
     " defaultBranchRef { name }"
     " merged: pullRequests(states:MERGED, first:10,"
     " orderBy:{field:UPDATED_AT, direction:DESC}) { nodes { baseRefName } } } }")
