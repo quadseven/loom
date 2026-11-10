@@ -1026,16 +1026,16 @@ class ReconcilePullRequestTest(Base):
             with self.subTest(claim=claim):
                 self.fake.add(12, state="queued")
                 if claim == "assignee":
-                    self.fake.issues[12]["assignees"] = [{"login": "dana-example"}]
+                    self.fake.issues[12]["assignees"] = [{"login": AUTHORS[0]}]
                 else:
-                    self.fake.issues[12]["labels"].append({"name": "claim:dana-example"})
-                self.fake.pulls = [self.contributor_pr()]
+                    self.fake.issues[12]["labels"].append({"name": "claim:%s" % AUTHORS[0]})
+                self.fake.pulls = [self.contributor_pr(author=AUTHORS[0])]
                 runner = station.Station(GitHub("token", transport=self.fake), self.settings)
                 runner.reconcile_pull_requests()
                 self.assertIn("loom:pr", self.fake.names(12))
                 self.assertNotIn("loom:queued", self.fake.names(12))
-                self.fake.pulls = [self.contributor_pr(state="closed",
-                                                       merged_at="2030-01-02T00:00:00Z")]
+                self.fake.pulls = [self.contributor_pr(author=AUTHORS[0], state="closed",
+                                                        merged_at="2030-01-02T00:00:00Z")]
                 station.Station(GitHub("token", transport=self.fake),
                                 self.settings).reconcile_pull_requests()
                 self.assertIn("loom:merged", self.fake.names(12))
@@ -1089,6 +1089,7 @@ class ReconcilePullRequestTest(Base):
         # The /pulls list endpoint returns merged_at but omits merged.
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
+                            "user": {"login": AUTHORS[0]},
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
         failed = [False]
@@ -1119,7 +1120,8 @@ class ReconcilePullRequestTest(Base):
             self.fake.add(12, state="pr", body=BODY + "\n" + self.CRITERIA)
         body = "Refs %s#12\n\n## Acceptance criteria\n\n%s" % (REPO, pull_criteria)
         self.fake.pulls.append({"number": number, "state": "closed", "merged_at": merged_at,
-                                "body": body, "head": {"ref": "loom/12-fix-the-thing"}})
+                                "body": body, "head": {"ref": "loom/12-fix-the-thing"},
+                                "user": {"login": AUTHORS[0]}})
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
 
     def requeued(self, at):
@@ -1431,6 +1433,7 @@ class ReconcilePullRequestTest(Base):
         self.fake.add(12, state="pr")
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
+                            "user": {"login": AUTHORS[0]},
                             "body": "Why it matters.\n\nRefs #12\n",
                             "head": {"ref": "fix/stray-files"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
@@ -1444,6 +1447,7 @@ class ReconcilePullRequestTest(Base):
                             "head": {"ref": "loom/12-fix-the-thing-r2"}},
                            {"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
+                            "user": {"login": AUTHORS[0]},
                             "body": "Refs #12", "head": {"ref": "fix/stray-files"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
@@ -1469,7 +1473,9 @@ class ReconcilePullRequestTest(Base):
         self.fake.events[12].append({"event": "labeled", "label": {"name": "loom:briefed"},
                                      "created_at": "2030-01-02T00:00:00Z"})
         self.fake.pulls = [{"number": 99, "state": "closed",
-                            "merged_at": "2030-01-03T00:00:00Z", "body": "Refs #12"}]
+                            "merged_at": "2030-01-03T00:00:00Z", 
+                            "user": {"login": AUTHORS[0]},
+                            "body": "Refs #12"}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
 
@@ -1526,8 +1532,8 @@ class ReconcilePullRequestTest(Base):
 
     def test_a_contributors_merged_pull_request_delivers_the_queued_ticket_they_own(self):
         self.fake.add(12, state="queued")
-        self.fake.issues[12]["labels"].append({"name": "claim:dana-example"})
-        self.fake.pulls = [self.contributor_pr(state="closed", merged_at="2030-01-02T00:00:00Z")]
+        self.fake.issues[12]["labels"].append({"name": "claim:%s" % AUTHORS[0]})
+        self.fake.pulls = [self.contributor_pr(author=AUTHORS[0], state="closed", merged_at="2030-01-02T00:00:00Z")]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
@@ -1554,6 +1560,7 @@ class ReconcilePullRequestTest(Base):
         self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
+                            "user": {"login": AUTHORS[0]},
                             "body": "Refs %s#12" % REPO,
                             "head": {"ref": "loom/12-fix-the-thing"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
@@ -1580,6 +1587,7 @@ class ReconcilePullRequestTest(Base):
         self.fake.issues[12]["labels"].append({"name": "loom:runaway"})
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
+                            "user": {"login": AUTHORS[0]},
                             "body": ("Refs %s#12\n\n## Acceptance criteria\n\n"
                                      "- [x] First works; test.\n- [ ] Second works.\n")
                             % REPO,

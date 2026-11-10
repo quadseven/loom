@@ -5683,8 +5683,11 @@ class Station:
             left = self._unbuilt_criteria(ticket, [pr, *landed])
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
-                if (tickets.merged_before_requeue(pr.get("merged_at"), events)
+                mbr = tickets.merged_before_requeue(pr.get("merged_at"), events)
+                print(f"DEBUG: merged_before_requeue={mbr}, events={events}, merged_at={pr.get('merged_at')}")
+                if (mbr
                         or "loom:queued" in labels):
+                    print("DEBUG: early return!")
                     return
                 target = "loom:queued"
         # ready and answered are states too: a ticket moved on from loom:pr kept
@@ -5694,7 +5697,7 @@ class Station:
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(
             name for name in labels
-            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
+            if name not in states and not ((target == "loom:queued" or target == "loom:merged") and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -5859,16 +5862,21 @@ class Station:
         all_closed = self._paginate("/repos/%s/pulls?state=closed&sort=updated"
                                     "&direction=desc&per_page=100" % repo)
         closed = all_closed[:100] if isinstance(all_closed, list) else []
+        trusted = {a.lower() for a in self.s.authors}
         for pr in closed:
-                merged = self._terminal_label(pr) == "loom:merged"
-                pool = tickets_by_number if merged else waiting
-                landed = [other for other in closed if other is not pr and isinstance(other, dict)
-                          and self._terminal_label(other) == "loom:merged"
-                          and self._pr_ticket_number(repo, other) == self._pr_ticket_number(repo, pr)
-                          ] if merged else []
-                self._reconcile_pr_ticket(repo, pr, pool, landed)
-                if merged:
-                    self._deliver_unlinked(repo, pr, unlinked)
+            merged = self._terminal_label(pr) == "loom:merged"
+            if merged:
+                author = tickets._login(pr.get("user"))
+                if author not in trusted:
+                    continue
+            pool = tickets_by_number if merged else waiting
+            landed = [other for other in closed if other is not pr and isinstance(other, dict)
+                      and self._terminal_label(other) == "loom:merged"
+                      and self._pr_ticket_number(repo, other) == self._pr_ticket_number(repo, pr)
+                      ] if merged else []
+            self._reconcile_pr_ticket(repo, pr, pool, landed)
+            if merged:
+                self._deliver_unlinked(repo, pr, unlinked)
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 
