@@ -46,6 +46,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import operator_budget
 from . import fabric
 from . import fixrounds
 from . import logrotate
@@ -2241,8 +2242,10 @@ class Station:
                  ancestor: Optional[Callable[[str, str], bool]] = None,
                  head: Optional[Callable[[], str]] = None,
                  fetch: Optional[Fetcher] = None,
-                 urgency_client: Optional[urgency.Client] = None) -> None:
+                 urgency_client: Optional[urgency.Client] = None,
+                 operator_reader: Optional[Callable[..., Any]] = None) -> None:
         self.gh = gh
+        self.operator_reader = operator_reader
         # The urgency model's client; None reads the key from SSM when a score
         # is first wanted (Station._urgency_client).
         self._urgency_injected = urgency_client
@@ -16296,7 +16299,54 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("assign_queued failed: %s" % err)
 
+    def _operator_ticket_assigned(self, lane: str) -> bool:
+        try:
+            names = os.listdir(self.inbox(lane))
+        except OSError:
+            return False
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            try:
+                with open(os.path.join(self.inbox(lane), name), encoding="utf-8") as stream:
+                    if ISSUE_LINE_RE.search(stream.read()):
+                        return True
+            except (OSError, ValueError):
+                continue
+        return False
+
+    def _operator_lane_active(self) -> bool:
+        """A ticket and a live agent group, not an idle runner or queued brief."""
+        for lane in LANES:
+            if not self._operator_ticket_assigned(lane):
+                continue
+            lock = os.path.join(self.s.home, "run", lane + ".lock")
+            for name in ("pgid", "watchdog_pgid"):
+                pid = self._lock_pid(lock, name)
+                if isinstance(pid, int) and not isinstance(pid, bool) and 1 < pid <= 2147483647 and self._pid_alive(pid):
+                    return True
+        return False
+
+    def sample_operator_budget(self) -> None:
+        if self.operator_reader is None or getattr(self, "_operator_sampled", False):
+            return
+        self._operator_sampled = True
+        try:
+            active = self._operator_lane_active()
+            state = operator_budget.sample(
+                os.path.join(self.state, operator_budget.FILE), self.now,
+                tickets.operator_login(self.s.authors), active, self.operator_reader, _say)
+            if state.get("signal"):
+                _say("operator core REST budget low during active work; durable factory signal pending")
+        except (OSError, ValueError):
+            _say("operator core budget activity unavailable; sampling deferred")
+        except Exception as err:
+            # Evidence gathering must not stop lane work, even if the sampler
+            # has a bug. Name the fault without logging private error details.
+            _say("operator budget sampler failed: %s" % type(err).__name__)
+
     def run_pass(self) -> None:
+        self.sample_operator_budget()
         if self._budget_exhausted():
             return
         if not self.check_repo_access():
@@ -16572,7 +16622,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         from .github import auth_from_env
         gh = GitHub(auth_from_env())
         gh.status_in_body = True
-    _trust_app_login(settings, gh)
+        hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
@@ -16583,6 +16633,11 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         app.state_file = os.path.join(state, "station", "app-token.json")
     st = Station(gh, settings, **hooks)
     try:
+        st.sample_operator_budget()
+        _trust_app_login(settings, gh)
+        writers = getattr(gh, "status_authors", None)
+        if isinstance(writers, set):
+            writers.update(settings.authors)
         st.run_pass()
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
