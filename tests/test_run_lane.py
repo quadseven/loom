@@ -4738,6 +4738,8 @@ echo fixed > fix.txt
 
     def pick_env(self, broken="none", go=("beam-free", "iceman-contributor-free", "mimo-v2.6-flash"),
                  zen=("flint-40b-free",), usage=1):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
         self.write_tool(self.bin / "opencode", self.FAKE_OPENCODE_PICK.replace("BROKEN", broken))
         lists = {"/go.json": {"data": [{"id": m} for m in go]},
                  "/zen.json": {"data": [{"id": m} for m in zen]},
