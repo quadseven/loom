@@ -712,19 +712,28 @@ class Scorecard:
             total_non_limit, done, _ = self.brief_counts(lane)
             if lane in self.data["demoted"]:
                 info = self.data["demoted"][lane]
-                if isinstance(info, dict) and info.get("kind") == "zero-done":
+                if not isinstance(info, dict):
+                    continue
+                kind = info.get("kind")
+                if kind == "zero-done":
                     if done > 0:
                         self.data["demoted"].pop(lane, None)
                         _say("cleared zero-done demotion for lane %s: %d done briefs" % (lane, done))
-                elif isinstance(info, dict) and info.get("kind") == "bad-outcomes":
+                    continue
+                if kind in (None, "bad-outcomes"):
                     # Re-scored on each completed refresh: once the bad
                     # outcomes age out of the window, the demotion lifts.
+                    # A kind-less entry predates demotion kinds and is treated
+                    # as bad-outcomes.
                     hit, count, total, _ = self.over(lane)
                     if not hit:
                         self.data["demoted"].pop(lane, None)
                         _say("lifted demotion of lane %s: %d bad outcomes in %d runs in %d days, "
                              "below LOOM_LANE_DEMOTE_AT=%d or LOOM_LANE_DEMOTE_RATE=%g"
                              % (lane, count, total, days, at, share))
+                    else:
+                        info["kind"] = "bad-outcomes"
+                    continue
                 continue
             hit, count, total, what = self.over(lane)
             if hit:
