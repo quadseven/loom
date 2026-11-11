@@ -3738,11 +3738,19 @@ exec /usr/bin/git "$@"
     def assert_next_occurrence(self, retry_at, hour, minute, before):
         """retry_at is the next hour:minute on the local clock, read from the
         clock before and after the run so it may cross that time, and by the
-        calendar so a day can be 23 or 25 hours."""
+        calendar so a day can be 23 or 25 hours. When that occurrence falls
+        within 60 seconds of now, agent_cli.sh floors the retry at now + 60."""
         def following(now):
             at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
             return int((at if at > now else at + timedelta(days=1)).timestamp())
-        self.assertIn(int(retry_at), (following(before), following(datetime.now())))
+        after = datetime.now()
+        expected = {following(before), following(after)}
+        for now in (before, after):
+            nxt = following(now)
+            if nxt < int(now.timestamp()) + 60:
+                expected.update(range(int(before.timestamp()) + 59,
+                                      int(after.timestamp()) + 62))
+        self.assertIn(int(retry_at), expected)
 
     def classified(self, whole, tail, status=1):
         script = (RUNNER.parent / "agent_cli.sh").read_text() + (
