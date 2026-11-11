@@ -51,7 +51,8 @@ class SettledStaleAsks(unittest.TestCase):
                        {"labels": ["needs:human"]}), fake.writes)
 
     def test_a_stated_wait_uses_no_remote_reads_or_repeated_run_logs(self):
-        issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n")
+        issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n",
+                       labels=("loom:ticket", "blocked"))
         fake = self.fixture.routes(issue)
         with mock.patch.object(fixtures.station, "_say") as say:
             for _ in range(2):
@@ -63,7 +64,9 @@ class SettledStaleAsks(unittest.TestCase):
         self.assertEqual(fake.writes, [])
 
     def test_closed_dependencies_and_empty_waits_do_not_park_a_fresh_ticket(self):
-        for blocker in ("#123", "None", "N/A", "-", ""):
+        for blocker in ("#123", "None", "None at this time", "No blockers known",
+                        "Nothing blocks this ticket", "TBD", "The next scheduled event",
+                        "N/A", "-", ""):
             with self.subTest(blocker=blocker):
                 issue = ticket(body="## Acceptance criteria\n- [ ] Build the dependent feature.\n"
                                "## Blocked on\n%s\n" % blocker)
@@ -74,12 +77,14 @@ class SettledStaleAsks(unittest.TestCase):
 
     def test_a_non_person_blocker_does_not_raise_another_ask(self):
         self.assert_held_without_ask(
-            "## Blocked on\nThe next scheduled event, not a person and not another ticket.\n")
+            "## Blocked on\nThe next scheduled event, not a person and not another ticket.\n",
+            labels=("loom:ticket", "blocked"))
 
     def test_all_supported_non_person_blocker_headings_settle_the_ask(self):
         for heading in ("### Blocked on", "# Blocked by", "**Blocked on**", "Blocked on:"):
             with self.subTest(heading=heading):
-                self.assert_held_without_ask(heading + "\nThe next scheduled event.\n")
+                self.assert_held_without_ask(heading + "\nThe next scheduled event.\n",
+                                             labels=("loom:ticket", "awaiting-live-check"))
 
     def test_a_person_blocker_takes_priority_over_an_earlier_decision(self):
         decision = "## Decision (%s, 2026-10-26)\nKeep it open.\n" % OPERATOR
@@ -130,3 +135,47 @@ class SettledStaleAsks(unittest.TestCase):
         fake = self.fixture.routes(issue)
         self.assertFalse(self.fixture.station(fake)._brief_holds(REPO, issue, []))
         self.assertEqual(fake.writes, [])
+
+    def test_a_stale_event_wait_gets_one_visible_label_then_no_more_reads_or_logs(self):
+        issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n")
+        fake = self.fixture.routes(issue)
+        worker = self.fixture.station(fake)
+        with mock.patch.object(fixtures.station, "_say") as say:
+            self.assertTrue(worker._brief_holds(REPO, issue, []))
+            first_reads = list(fake.reads)
+            self.assertTrue(first_reads, "unlabelled text is checked for stale evidence first")
+            self.assertTrue(worker._brief_holds(REPO, issue, []))
+            self.assertTrue(self.fixture.station(fake)._brief_holds(REPO, issue, []))
+            self.assertEqual(fake.reads, first_reads)
+            self.assertEqual(say.call_count, 1)
+            self.assertIn("blocked", say.call_args.args[0])
+        self.assertEqual(fake.writes, [
+            ("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["blocked"]})])
+        self.assertIn({"name": "blocked"}, issue["labels"])
+
+    def test_a_failed_wait_label_write_does_not_cache_the_unlabelled_hold(self):
+        issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n")
+        fake = self.fixture.routes(issue)
+        worker = self.fixture.station(fake)
+        real_rest = worker.gh.rest
+        def fail_label(method, path, *args, **kwargs):
+            if method == "POST" and path.endswith("/labels"):
+                raise fixtures.station.GitHubError("unavailable", status=503)
+            return real_rest(method, path, *args, **kwargs)
+        with mock.patch.object(worker.gh, "rest", side_effect=fail_label):
+            self.assertTrue(worker._brief_holds(REPO, issue, []))
+        self.assertNotIn({"name": "blocked"}, issue["labels"])
+        self.assertTrue(worker._brief_holds(REPO, issue, []))
+        self.assertEqual(fake.writes, [
+            ("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["blocked"]})])
+
+    def test_negative_or_placeholder_blockers_do_not_silently_park_stale_tickets(self):
+        for blocker in ("None at this time", "No blockers known", "Nothing blocks this ticket",
+                        "TBD", "To be determined", "Unknown"):
+            with self.subTest(blocker=blocker):
+                held, fake = self.check("## Blocked on\n%s\n" % blocker)
+                self.assertTrue(held)
+                self.assertNotIn(("POST", "/repos/%s/issues/206/labels" % REPO,
+                                  {"labels": ["blocked"]}), fake.writes)
+                self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO,
+                               {"labels": ["needs:human"]}), fake.writes)

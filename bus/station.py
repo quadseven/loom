@@ -5488,8 +5488,9 @@ class Station:
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
         one goes back to the queue with needs:human and one ask, unless its
-        body and labels state a non-person wait. That ticket stays held
-        before remote reads, without a label, comment or repeated log write.
+        body and labels state a non-person wait. A labelled ticket stays held
+        before remote reads. A stale event wait without the label gets blocked
+        once, making its hold visible without another person ask.
         A read the check needs that fails holds the ticket for the next pass.
         Otherwise a regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
@@ -5518,6 +5519,33 @@ class Station:
                 return True
         if found is None:
             return False
+        if self._label_stale_brief_wait(repo, issue, found):
+            return True
+        return self._apply_brief_hold(repo, number, found)
+
+    def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
+                               found: brief_check.Verdict) -> bool:
+        """Give a stale non-person wait one visible label, then use the read-free path."""
+        if found.kind != brief_check.STALE or not brief_check.settled_brief_wait(
+                issue, self.s.authors, stale=True):
+            return False
+        number = int(issue["number"])
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["blocked"]})
+        except GitHubError as err:
+            _say("%s#%d waits: recording its non-person blocked label failed (%s)"
+                 % (repo, number, err))
+            return True
+        # Later lanes in this run share the issue object. Do not repeat the
+        # evidence reads or label write before the next GitHub refresh.
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "blocked"}]
+        _say("%s#%d is blocked: its stale brief records a non-person event wait"
+             % (repo, number))
+        return True
+
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
