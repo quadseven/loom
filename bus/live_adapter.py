@@ -33,6 +33,14 @@ counted, for an archive that reports counts). It exits 0, or 1 for "nothing
 matched"; any other exit, a timeout or more than MAX_BYTES of output is no
 answer, with the reason. stderr is never read into a ticket.
 
+Log adapters may also print both `loom-evidence-observed-start: TIMESTAMP`
+and `loom-evidence-observed-end: TIMESTAMP`, ISO 8601 timestamps with a time
+zone for the first and last lines of the whole log read, before filtering
+matches. Loom caps this span to deploy-to-now and to the claimed hours.
+Neither boundary means the legacy hours-only contract; one missing, invalid,
+reversed or repeated boundary is no answer. Matching lines do not establish
+coverage, and an empty match set still needs coverage for an absence proof.
+
 Guards, in the order they apply:
 
 - the station runs an adapter only for repos the operator lists in
@@ -69,6 +77,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime
 from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from . import evidence, live_proof
@@ -462,13 +471,27 @@ class Runner:
         lines: List[str] = []
         hours: Optional[float] = None
         count: Optional[int] = None
+        observed: Dict[str, float] = {}
         for line in b"".join(chunks).decode("utf-8", "replace").splitlines():
             window = evidence.WINDOW_RE.match(line)
             counted = COUNT_RE.match(line)
-            if window:
+            if line.startswith("loom-evidence-observed-"):
+                key, separator, value = line.partition(":")
+                key = key.removeprefix("loom-evidence-observed-")
+                try:
+                    stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+                    if not separator or key not in ("start", "end") or key in observed or stamp.tzinfo is None:
+                        raise ValueError
+                    observed[key] = stamp.timestamp()
+                except (ValueError, OverflowError):
+                    return live_proof.Answer(None, error="invalid observed log boundaries")
+            elif window:
                 hours = float(window.group(1))
             elif counted:
                 count = int(counted.group(1))
             elif len(lines) < MAX_LINES:
                 lines.append(line)
-        return live_proof.Answer(lines, hours=hours, count=count)
+        if observed and (set(observed) != {"start", "end"} or observed["start"] > observed["end"]):
+            return live_proof.Answer(None, error="incomplete or reversed observed log boundaries")
+        return live_proof.Answer(lines, hours=hours, count=count,
+                                 observed_start=observed.get("start"), observed_end=observed.get("end"))

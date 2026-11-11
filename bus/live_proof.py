@@ -90,11 +90,14 @@ class Answer(NamedTuple):
     the lines it printed (None when it gave no answer, with `error` saying
     why), the hours of log it says it read (`loom-evidence-window-hours:`),
     and the matches it says it counted (`loom-evidence-count:`), each None
-    when it said nothing."""
+    when it said nothing. Optional observed_start/end are the epoch timestamps
+    of the first and last lines of the whole log read, not just its matches."""
     lines: Optional[List[str]]
     hours: Optional[float] = None
     count: Optional[int] = None
     error: str = ""
+    observed_start: Optional[float] = None
+    observed_end: Optional[float] = None
 
 
 class Sources(NamedTuple):
@@ -298,20 +301,25 @@ def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
         needle, step.source, hours)
 
 
-def _covered_hours(answer: Answer, since: float, now: float) -> float:
-    """Cap a claimed log span by timestamped lines and the requested window.
+def _covered_window(answer: Answer, since: float, now: float) -> Optional[Tuple[float, float]]:
+    """The adapter's whole-log boundaries, never the timestamps of matches."""
+    if answer.observed_start is None or answer.observed_end is None:
+        return None
+    first = max(since, answer.observed_start)
+    last = min(now, answer.observed_end)
+    # A smaller claimed duration limits coverage, ending at the last
+    # timestamp actually read, not at the time the proof runs.
+    if answer.hours is not None:
+        first = max(first, last - max(0.0, answer.hours) * 3600)
+    return first, last
 
-    Adapters may report only counts, with no timestamped lines. Their existing
-    hours contract is unchanged. When lines do carry timestamps, a single line
-    proves no elapsed span and neither pre-deploy nor future time adds coverage.
-    """
-    claimed = max(0.0, answer.hours or 0.0)
-    stamps = [at for line in answer.lines or []
-              if (at := evidence.line_time(line)) is not None]
-    if not stamps:
-        return claimed
-    first, last = max(since, min(stamps)), min(now, max(stamps))
-    return min(claimed, max(0.0, (last - first) / 3600))
+
+def _covered_hours(answer: Answer, since: float, now: float) -> float:
+    """Bound explicit coverage; preserve the legacy hours-only contract."""
+    window = _covered_window(answer, since, now)
+    if window is None:
+        return max(0.0, answer.hours or 0.0)
+    return max(0.0, (window[1] - window[0]) / 3600)
 
 
 def _quoted(safe: List[str]) -> str:
