@@ -16,10 +16,12 @@ Each acceptance criterion is one of three kinds (`kind`):
 - code: met by the merged change itself (a test, a file, a behavior in the
   code). Its evidence is the merge the station shipped.
 - live: met only on a running system: a `Live:` line, a check on a host or
-  network (bus/operator_hold.py), or a box that names live, deployed or
-  production behavior, a time window or an observed event (bus/claimed.py).
-  Its evidence is a passing station live check (`run`), and nothing else: a
-  tick in the ticket or pull request body, or a lane's prose, is not.
+  network (bus/operator_hold.py), a box that names live, deployed or
+  production behavior, a time window or an observed event (bus/claimed.py),
+  or a criterion that names a line or cast in a named log, a value that
+  changes over time, or a row that moves off a number. Its evidence is a
+  passing station live check (`run`), and nothing else: a tick in the ticket
+  or pull request body, or a lane's prose, is not.
 - operator: an action only a person takes: the operator signs off, approves
   or does a step by hand, or a check on a handset. It never closes on its
   own: the ticket goes to the operator. A decision box (`decision`) is one:
@@ -77,7 +79,9 @@ TEST_RE = re.compile(r"\btests?\b|\btest_\w+|\bfails? on main\b", re.I)
 # Words that ask for something done or seen on a running system, beyond the
 # wide live-box words bus/claimed.py reads: an imperative verify, a result
 # recorded on the ticket, a measurement, a round trip, a reboot, a refusal
-# seen, a pod's behavior. Each one closed a ticket wrongly in the audit.
+# seen, a pod's behavior, a line or cast in a named log, a value that rises
+# over time, a row that moves off a number. Each one closed a ticket wrongly
+# in the audit.
 LIVE_WORDS_RE = re.compile(
     r"^\W*(?:verify|confirm|observe|measure|retrieve|prove|demonstrate)\b"
     r"|\b(?:recorded|record|documented|posted)\b[^.\n]{0,80}\b(?:in|on) the (?:issue|ticket)\b"
@@ -86,7 +90,9 @@ LIVE_WORDS_RE = re.compile(
     r"|\bverified\b|\bverification\b|\bscored on\b|\bfirst automatic\b"
     r"|\brolls? (?:within|automatically)\b|\bend[- ]to[- ]end\b"
     r"|\bcompletes\b[^.\n]{0,60}\b(?:thread|request|run|job)\b"
-    r"|\b(?:the|a|its) pods?\b[^.\n]{0,40}\b(?:obtains?|sends?|serves?|becomes? ready)\b",
+    r"|\b(?:the|a|its) pods?\b[^.\n]{0,40}\b(?:obtains?|sends?|serves?|becomes? ready)\b"
+    r"|\bin (?:the|a) (?:[\w.-]+ )?logs?\b|\bday[- ]over[- ]day\b"
+    r"|\brises?\b|\bgrows?\b|\bmov(?:e|es|ed|ing) off \d+\b",
     re.I)
 
 _TICKED_RE = re.compile(r"^\s*[-*] \[([xX])\]\s+(.*?)\s*$")
