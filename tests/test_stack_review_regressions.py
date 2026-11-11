@@ -44,15 +44,19 @@ class TrustAndOverlap(TestCase):
         self.handler = factory.Factory(self.gh, [REPO], NOW, trusted=[ME["login"]])
         self.issue = self.gh.issues[9]
 
-    def run_pull(self):
+    def run_pull(self, note_error=None, guarded=False):
         patch = [{"filename": "bus/a.py", "patch": "@@ -1 +1 @@\n-old\n+new"}]
         with ExitStack() as stack:
-            for name in ("_reclass", "_status_note"):
-                stack.enter_context(mock.patch.object(self.handler, name))
+            stack.enter_context(mock.patch.object(self.handler, "_reclass"))
+            stack.enter_context(mock.patch.object(self.handler, "_status_note", side_effect=note_error))
             stack.enter_context(mock.patch.object(self.handler, "_review_state", return_value="reviewed"))
             stack.enter_context(mock.patch.object(factory.hunk_overlap, "pull_files", return_value=patch))
             judge = stack.enter_context(mock.patch.object(self.handler, "_judge"))
-            self.handler.pull_request(REPO, self.gh.pulls[52], self.gh.issues)
+            if guarded:
+                self.guard_completed = self.handler._guarded(
+                    self.handler.pull_request, REPO, self.gh.pulls[52], self.gh.issues)
+            else:
+                self.handler.pull_request(REPO, self.gh.pulls[52], self.gh.issues)
             return judge.call_count
 
     def test_untrusted_draft_and_unlinked_peers_cannot_hold(self):
@@ -153,3 +157,16 @@ class TrustAndOverlap(TestCase):
             self.handler._repo_pass(REPO, self.gh.issues)
             self.assertNotIn(52, [call.args[1] for call in judge.call_args_list])
             self.assertEqual(checks.call_count, 2)
+
+    def test_advisory_stack_failure_and_note_read_failure_still_judge(self):
+        self.gh.pulls[51]["state"] = "closed"
+        with mock.patch.object(self.handler, "_link_stack_for", side_effect=GitHubError("stack unavailable")), \
+                mock.patch.object(self.handler, "_comments", side_effect=[GitHubError("note read unavailable"), []]):
+            self.assertEqual(self.run_pull(guarded=True), 1)
+        self.assertTrue(self.guard_completed)
+
+    def test_advisory_stack_failure_and_note_write_failure_still_judge(self):
+        self.gh.pulls[51]["state"] = "closed"
+        with mock.patch.object(self.handler, "_link_stack_for", side_effect=GitHubError("stack unavailable")):
+            self.assertEqual(self.run_pull(note_error=GitHubError("note write unavailable"), guarded=True), 1)
+        self.assertTrue(self.guard_completed)

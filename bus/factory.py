@@ -2934,10 +2934,15 @@ class Factory:
             self._link_stack_for(repo, full)
         except GitHubError as err:
             note = "Could not link stack for pull request #%d; judgment continues" % number
-            if not any(note in str(c.get("body") or "")
-                       for c in self._comments(repo, int(issue["number"]))):
-                self._status_note(repo, int(issue["number"]), note)
-                _say("%s: %s" % (note, err))
+            # AI-REVIEW 2026-11-11 [codex/in-process/review] 2956-C4-report:
+            # Optional reporting must not turn an advisory error into a gate.
+            try:
+                if not any(note in str(c.get("body") or "")
+                           for c in self._comments(repo, int(issue["number"]))):
+                    self._status_note(repo, int(issue["number"]), note)
+                    _say("%s: %s" % (note, err))
+            except GitHubError as report_error:
+                _say("%s; stack error: %s; status unavailable: %s" % (note, err, report_error))
         overlap = None
         if not brain.BUILDS_ON_RE.search(str(full.get("body") or "")):
             overlap = overlapping_peer(self.gh, repo, full,
