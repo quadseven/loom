@@ -431,7 +431,15 @@ class Runners:
         home = self.env.get("HOME") or os.path.expanduser("~")
         path = os.path.join(home, "Library", "LaunchAgents", "com.loom.%s.plist" % slot)
         try:
-            with open(path, "rb") as stream:
+            try:
+                stream = open(path, "rb")
+            except FileNotFoundError:
+                if slot != "opencode-go-1":
+                    return None
+                base_path = os.path.join(home, "Library", "LaunchAgents",
+                                         "com.loom.opencode-go.plist")
+                stream = open(base_path, "rb")
+            with stream:
                 document = plistlib.load(stream)
             if not isinstance(document, dict):
                 raise ValueError("installed settings are not a map")
