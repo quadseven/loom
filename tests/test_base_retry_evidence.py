@@ -1,9 +1,11 @@
 """Whole-command baseline retry evidence, without live commands."""
+import json
 from pathlib import Path
 import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,9 +18,15 @@ class BaseRetryEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "check-dir").mkdir()
+            helper = re.search(r"^record_base_flake\(\) \{[^\n]*\n.*?^\}\n", source, re.S | re.M)
+            self.assertIsNotNone(helper, "the real flake event helper must be present")
             script = r'''
 set -u
 LOG="$ROOT/run.log"
+REPO=example/project
+TICKET=fixture-1
+LOOM_ROOT="$SOURCE_ROOT"
+[ "$MODE" != write-failed ] || mkdir "$ROOT/run.base-flakes.jsonl"
 CALLS="$ROOT/calls"
 CHECK_HOME="$ROOT/check-home"
 TREE="$ROOT"
@@ -64,6 +72,9 @@ flaky() {
   [ "$CHECK_STATE" = kept ] && [ "$PWD" = "$ROOT/check-dir" ] || return 9
   if [ "$MODE" = permanent ] || { [ "$MODE" != green ] && [ ! -e "$ROOT/failed-once" ]; }; then
     : > "$ROOT/failed-once"
+    if [ "$MODE" = long-line ]; then
+      printf '%10000s\n' x
+    fi
     if [ "$MODE" = flake ]; then
       for i in {1..25}; do printf 'first-output-%02d\n' "$i"; done
     fi
@@ -86,16 +97,34 @@ result=$?
 printf '%s' "$result" > "$ROOT/result"
 exit 0
 '''
-            result = subprocess.run(["/bin/bash", "-c", match.group(0) + script],
-                                    env={"PATH": "/usr/bin:/bin", "ROOT": str(root), "MODE": mode},
+            functions = helper.group(0) + match.group(0)
+            result = subprocess.run(["/bin/bash", "-c", functions + script],
+                                    env={"PATH": "/usr/bin:/bin", "ROOT": str(root),
+                                         "MODE": mode, "SOURCE_ROOT": str(ROOT)},
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "", "fixture must not hide shell errors")
-            return {"calls": (root / "calls").read_text().splitlines(),
+            event_file = root / "run.base-flakes.jsonl"
+            events = ([json.loads(line) for line in event_file.read_text().splitlines()]
+                      if event_file.is_file() else [])
+            return {"events": events, "calls": (root / "calls").read_text().splitlines(),
                     "log": (root / "run.log").read_text(),
                     "result": (root / "result").read_text(),
                     "incidents": (root / "incidents").read_text().splitlines()
                     if (root / "incidents").exists() else []}
+
+    def test_fixture_refuses_a_missing_real_flake_helper(self):
+        source_path = ROOT / "lanes/run_lane.sh"
+        source = source_path.read_text().replace(
+            "record_base_flake() {", "renamed_base_flake() {", 1)
+        read_text = Path.read_text
+
+        def read_source(path, *args, **kwargs):
+            return source if path == source_path else read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_source):
+            with self.assertRaisesRegex(AssertionError, "real flake event helper"):
+                self.run_baseline("green")
 
     def test_a_flake_repeats_the_whole_command_and_runs_later_checks(self):
         run = self.run_baseline()
@@ -109,8 +138,8 @@ exit 0
         line = "base check flaked: first exit 1; whole command passed on retry"
         self.assertIn(line, run["log"])
         summary = run["log"].split(line + "\n", 1)[1]
-        self.assertTrue(summary.startswith("first-run output (last 20 lines):\n"))
-        excerpt = summary.split("first-run output (last 20 lines):\n", 1)[1].splitlines()[:20]
+        self.assertTrue(summary.startswith("first-run output (up to 4096 bytes, last 20 lines):\n"))
+        excerpt = summary.split("first-run output (up to 4096 bytes, last 20 lines):\n", 1)[1].splitlines()[:20]
         expected = ["first-output-%02d" % i for i in range(7, 26)]
         expected.append("FAIL: test_flaky (tests.test_retry.Checks.test_flaky)")
         self.assertEqual(excerpt, expected)

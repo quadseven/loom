@@ -1296,11 +1296,20 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
             base_pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         except GitHubError:
             return "stacked on #%d (base pull request unreadable)" % number
+        if base_pr.get("merged_at"):
+            return ""
         if base_pr.get("state") == "open":
             return "stacked on #%d" % number
     base = str((pr.get("base") or {}).get("ref") or "")
     if not base or not default_branch or base == default_branch:
         return ""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-stack:
+    # Keep declared-parent handling separate from branch-parent lookup.
+    return _branch_stack_blocker(gh, repo, pr, base)
+
+
+def _branch_stack_blocker(gh: GitHub, repo: str, pr: Dict[str, Any], base: str) -> str:
+    """Check open and merged parents of a non-default base branch."""
     owner = repo.partition("/")[0]
     path = "/repos/%s/pulls?state=open&head=%s:%s" % (
         repo, owner, quote(base, safe=""))
@@ -1311,7 +1320,14 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
     number = next((item.get("number") for item in matches
                    if item.get("number") != pr.get("number")
                    and str((item.get("head") or {}).get("ref") or "") == base), None)
-    return "stacked on #%s" % number if number is not None else "stacked on branch %s" % base
+    if number is not None:
+        return "stacked on #%s" % number
+    closed = gh.paginate("/repos/%s/pulls?state=closed&head=%s:%s" %
+                         (repo, owner, quote(base, safe="")))
+    landed = any(item.get("merged_at")
+                 and str((item.get("head") or {}).get("ref") or "") == base
+                 for item in closed if isinstance(item, dict))
+    return "" if landed else "stacked on branch %s" % base
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -2290,10 +2306,9 @@ def _goal_children(gh: GitHub, repo: str, goal: int,
 # holds at most EPIC_TICKET_CAP tickets.
 EPIC_TICKET_CAP = 15
 GOAL_EPIC_CAP = 6
-# A rescue of tickets stranded under a closed epic may open one intake epic
-# past GOAL_EPIC_CAP, and no more: the goal holds at most cap + 1 open epics
-# through rescue, so a full rescue epic blocks the next one.
-RESCUE_EPIC_EXTRA = 1
+# A rescue of tickets stranded under a closed epic may open further intake
+# epics past GOAL_EPIC_CAP while existing rescue epics are full and stranded
+# closed-epic tickets remain (at most ceil(stranded / 15) per pass, loom#2993).
 
 
 def _epic_label(issue: Dict[str, Any]) -> bool:
@@ -2836,12 +2851,29 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     closing.close(gh, repo, number, note, "completed")
 
 
+def _rescue_allowed(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+                    area: Optional[str] = None) -> bool:
+    """A further rescue epic opens past the goal cap only when every open intake
+    epic the ticket can go to is full and at least one open ticket is still
+    stranded under a closed epic (loom#2993)."""
+    area_label = "area:" + area if area else None
+    targets = [held for epic, held in tree
+               if epic.get("state", "open") == "open"
+               and ((area_label in _labels(epic)) if area_label else is_intake_epic(epic))]
+    if not all(_open_count(held) >= EPIC_TICKET_CAP for held in targets):
+        return False
+    return bool(_closed_epic_tickets(tree))
+
+
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
-                     today: Optional[str] = None, rescue: bool = False) -> None:
+                     today: Optional[str] = None, rescue: bool = False,
+                     area: Optional[str] = None) -> None:
     _, tree = goal_tree(gh, repo, goal)
     count = sum(1 for e, _ in tree if e.get("state", "open") == "open" and not standing_epic(e))
     cap = goal_epic_cap(goal_issue, today)
-    if count >= (cap + RESCUE_EPIC_EXTRA if rescue else cap):
+    if count >= cap:
+        if rescue and _rescue_allowed(tree, area=area):
+            return
         raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
                          "record a one-time exception on the goal home as "
                          "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
@@ -2850,12 +2882,13 @@ def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any
 def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
               today: Optional[str] = None, standing: bool = False,
               labels: Optional[Sequence[str]] = None,
-              rescue: bool = False) -> Dict[str, Any]:
+              rescue: bool = False, area: Optional[str] = None) -> Dict[str, Any]:
     """File an epic under an open goal: the epic label, a done-when, a size
     line and a Part of #goal line, linked as the goal's sub-issue when GitHub
     allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
     a one-time exception ("Epic cap: N until DATE"), or unless rescue is set,
-    which allows one epic past that cap (RESCUE_EPIC_EXTRA). Returns the issue."""
+    which allows a rescue intake epic past that cap when every open intake epic
+    is full and tickets remain stranded under a closed epic. Returns the issue."""
     title = " ".join(title.split())
     if not title.startswith(EPIC_TITLE_PREFIX) or len(title) > EPIC_TITLE_MAX \
             or not title[len(EPIC_TITLE_PREFIX):].strip():
@@ -2869,7 +2902,9 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     _check_written_text(title + "\n" + body)
     goal_issue = _goal_issue(gh, repo, goal)
     if not standing:
-        _check_epic_room(gh, repo, goal, goal_issue, today, rescue=rescue)
+        if area is None and labels:
+            area = next((l[len("area:"):] for l in labels if l.startswith("area:")), None)
+        _check_epic_room(gh, repo, goal, goal_issue, today, rescue=rescue, area=area)
     made = gh.rest("POST", "/repos/%s/issues" % repo,
                    {"title": title, "body": body,
                     "labels": ["epic"] + list(labels or [])}).data or {}
@@ -2887,8 +2922,8 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
     contracts and adoption file their tickets. The newest, so intake never
     refills an older epic that tickets may since have been moved into
     (2026-10-19: one held 19). room is how many tickets the caller files at
-    once (the parts of a split). rescue lets the new epic open one past the
-    epic cap (file_epic)."""
+    once (the parts of a split). rescue lets the new epic open past the
+    epic cap when intake epics are full (file_epic)."""
     if not 1 <= room <= EPIC_TICKET_CAP:
         raise ValueError("%d tickets do not fit one epic (cap %d)" % (room, EPIC_TICKET_CAP))
     _, tree = goal_tree(gh, repo, goal)
@@ -2910,7 +2945,8 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
         title = next_intake_title(gh, repo)
         body = INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP)
     made = file_epic(gh, repo, goal, title, body,
-                     labels=[area_label] if area_label else None, rescue=rescue)
+                     labels=[area_label] if area_label else None, rescue=rescue,
+                     area=area)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
@@ -2970,9 +3006,9 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     open tickets moved to the goal's next intake epic (the epic retains its
     first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left).
 
-    A ticket stranded under a closed epic may open one intake epic past the
-    goal's open epic cap when every intake epic is full (RESCUE_EPIC_EXTRA):
-    the goal at its cap would otherwise strand it for good.
+    Tickets stranded under a closed epic may open further intake epics past the
+    goal's open epic cap when every open intake epic is full, at most
+    ceil(stranded / 15) per pass (loom#2993).
     """
     loose, tree = goal_tree(gh, repo, goal)
     tickets = _tickets_to_move(loose, tree, goal)
@@ -3020,7 +3056,7 @@ def _move_target(gh: GitHub, repo: str, goal: int, ticket: Dict[str, Any],
                  ) -> Tuple[Optional[int], Tuple[Optional[int], int]]:
     """Determine the target epic for a ticket moving into an epic.
     Returns (target, (epic, held)) or (None, state) when no epic can accept it.
-    rescue lets a new epic open one past the goal's epic cap (move_outside_tickets)."""
+    rescue lets a new epic open past the goal's epic cap (move_outside_tickets)."""
     epic, held = state
     area = _ticket_area(areas, ticket)
     if area:
@@ -3143,7 +3179,7 @@ def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
 def _open_intake_epic(gh: GitHub, repo: str, goal: int,
                       exclude: Sequence[int] = (), rescue: bool = False) -> Optional[Tuple[int, int]]:
     """The goal's newest open intake epic with room, opened when none has
-    room and the goal is under its open epic cap (or rescue allows one past
+    room and the goal is under its open epic cap (or rescue allows past
     it), and the tickets it holds; (None, 0) when the goal is at its cap and
     no intake epic has room."""
     try:
@@ -3788,6 +3824,41 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+
+
+def _builds_on_base(gh: GitHub, repo: str, body: str,
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return the trusted same-repo open pull request head named by Builds on."""
+    match = BUILDS_ON_RE.search(body)
+    if not match:
+        return None
+    number = int(match.group(1))
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    head = (pr.get("head") or {}).get("ref")
+    # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C3:
+    # A brief must never execute an untrusted or fork-provided base.
+    head_data = pr.get("head") or {}
+    authors, briefers = trusted_authors(env), trusted_briefers(env)
+    head_repo = (head_data.get("repo") or {}).get("full_name")
+    if (pr.get("state") != "open" or head_repo != repo
+            or pr.get("draft") or not str(head or "").startswith("loom/")
+            or not tickets.brief_author_trusted(pr, authors, briefers, as_ticket=True)
+            or tickets.owned_elsewhere(pr, authors, briefers) is not None
+            or not isinstance(head, str) or not head):
+        raise ValueError("Builds on #%d must name an open trusted same-repository pull request "
+                         "with a head ref" % number)
+    return head
+
+
+def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
+                env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Prefer a declared stack base, then the goal's default trunk."""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-brief-delta:
+    # Isolate the new choice without expanding the existing brief coordinator.
+    return _builds_on_base(gh, repo, body, env) or goal_trunk(goal_issue)
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
@@ -3904,7 +3975,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     else:
         raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        base = goal_trunk(goal_issue)
+        base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,

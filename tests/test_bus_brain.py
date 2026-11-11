@@ -1031,6 +1031,14 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
 
+    def test_a_stack_base_that_has_merged_no_longer_blocks_its_upper_pull(self):
+        closed = {"number": 7, "merged_at": "2026-11-10T12:00:00Z",
+                  "head": {"ref": "feature/base"}}
+        fake = Fake(reply(200, []), reply(200, [closed]))
+        gh = GitHub("t", transport=fake)
+        pr = {"number": 8, "base": {"ref": "feature/base"}}
+        self.assertEqual(brain._stacked_base_blocker(gh, REPO, pr, "main"), "")
+
     def test_merge_refuses_a_behind_pull_request_whose_hunks_overlap_its_base(self):
         # loom#2622: bus.brain merge applies the same hunk-overlap test as
         # the factory before its merge call.
@@ -1673,6 +1681,43 @@ class SensitiveResumeTests(unittest.TestCase):
         url2 = brain.brief(GitHub("t", transport=fake2), REPO, EPIC, "Ticket", BODY, "codex", base="explicit")
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
+
+    def test_brief_uses_the_head_of_the_open_pull_request_named_by_builds_on(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}),
+                    reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}),
+                    reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                    "Ticket", body, "codex", "hard", env=TRUSTED)
+        created = [call[2] for call in fake.calls if call[2] and "body" in call[2]]
+        self.assertTrue(any("Base: loom/base-change\n" in payload["body"]
+                            for payload in created))
+
+    def test_brief_refuses_builds_on_fork_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": "fork/example"}}}),
+                    reply(200, []), reply(201, {"id": 202}), reply(201, {}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
+
+    def test_brief_refuses_builds_on_untrusted_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": "stranger"},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}),
+                    reply(200, []), reply(201, {"id": 202}), reply(201, {}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
 
     def test_brief_remote_lane_on_public_repo_files_queued(self):
         fake = Fake(reply(200, goal()), reply(200, []),
@@ -6891,15 +6936,33 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(fake.issues[20]["state"], "closed")
         self.assertFalse([c for c in fake.writes() if c[1].endswith("/issues/20")])
 
-    def test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open(self):
-        # Past the cap by the one rescue epic: no intake epic may open.
+    def test_a_closed_epic_ticket_moves_into_a_new_rescue_epic_when_intake_epics_are_full(self):
+        # Past the cap by the one rescue epic: a new rescue epic opens.
         url = "https://api.github.com/repos/%s/issues/20" % REPO
         fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP)
-                                for n in range(brain.GOAL_EPIC_CAP + brain.RESCUE_EPIC_EXTRA)])
+                                for n in range(brain.GOAL_EPIC_CAP + 1)])
         self.epic_under_goal(fake, 20, state="closed",
                              tickets=[self.under(21, 20, parent_issue_url=url)])
-        self.assertEqual(self.move(fake), (0, 1))
-        self.assertEqual(fake.writes(), [])
+        self.assertEqual(self.move(fake), (1, 0))
+        opened = [n for n in fake.subs[1]
+                  if n not in range(60, 60 + brain.GOAL_EPIC_CAP + 1)
+                  and n != 20]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(fake.subs[opened[0]], [21])
+        self.assertEqual(fake.writes(), [
+            ('POST', '/repos/%s/issues' % REPO, {
+                'title': 'Epic: work that triage, rewrites and health intake find, batch 1',
+                'body': 'Done when: this intake epic holds 15 tickets, or every ticket in it is closed; the next intake opens a new epic.\n\nSize: at most 15 tickets.\n\nThe station files the tickets that triage, the rewriter, health intake, validation contracts and pull request adoption find under this goal here, so every ticket sits under an open epic (decision 0003).\n\nPart of #1\n',
+                'labels': ['epic'],
+            }),
+            ('POST', '/repos/%s/issues/1/sub_issues' % REPO, {'sub_issue_id': 1000 + opened[0]}),
+            ('POST', '/repos/%s/issues/%d/sub_issues' % (REPO, opened[0]), {'sub_issue_id': 1021, 'replace_parent': True}),
+            ('PATCH', '/repos/%s/issues/21' % REPO, {'body': '## Why\nwhy\n\nPart of #%d\n' % opened[0]}),
+        ])
+
+    test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open = (
+        test_a_closed_epic_ticket_moves_into_a_new_rescue_epic_when_intake_epics_are_full
+    )
 
     def test_open_epic_tickets_an_epic_an_ask_and_a_closed_ticket_never_move(self):
         closed_url = "https://api.github.com/repos/%s/issues/20" % REPO
