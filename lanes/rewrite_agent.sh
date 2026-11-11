@@ -59,6 +59,9 @@ mkdir -p "$LOOM_HOME/run" || fail "cannot create $LOOM_HOME/run"
 RUN_DIR="$(mktemp -d "$LOOM_HOME/run/rewrite.XXXXXX")" || fail "cannot create a run directory"
 # rm -rf removes links the agent left without following them.
 trap 'rm -rf "$RUN_DIR"' EXIT
+# A SIGKILL skips the trap: the station's disk sweep removes a stale folder
+# whose recorded pid is not running (loom#2966).
+echo "$$" > "$RUN_DIR/pid" || fail "cannot record the run's pid"
 AGENT_HOME="$RUN_DIR/home"
 mkdir -p "$AGENT_HOME/tmp" "$AGENT_HOME/work" || fail "cannot create the scratch home"
 AGENT_STDIN="$RUN_DIR/prompt"

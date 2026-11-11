@@ -2,8 +2,8 @@
 
 Tickets under a closed epic move into an open intake epic. When the goal is
 at GOAL_EPIC_CAP open epics and its intake epics are full, the rescue opens
-one intake epic past the cap for them, and no more than that: the goal never
-holds more than GOAL_EPIC_CAP + 1 open epics through rescue.
+further intake epics past the cap for them while stranded closed-epic tickets
+remain (at most ceil(stranded / 15) per pass).
 """
 
 from __future__ import annotations
@@ -84,11 +84,26 @@ class ClosedEpicRescueTests(unittest.TestCase):
         self.assertEqual(fake.issues[21]["body"], "## Why\nwhy\n\nPart of #%d\n" % made)
         self.assertEqual(fake.issues[22]["body"], "## Why\nwhy\n\nPart of #%d\n" % made)
 
-    def test_the_rescue_does_not_open_a_second_epic_past_the_bound(self):
+    def test_the_rescue_opens_a_second_epic_when_the_first_rescue_epic_is_full(self):
         # Seven open epics: one past the cap already, its intake epic full.
+        # Two stranded tickets open one further rescue epic, not two.
         fake = self.cap_repo(open_epics=brain.GOAL_EPIC_CAP)
-        self.assertEqual(self.move(fake), (0, 2))
-        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
+        before = set(fake.issues)
+        self.assertEqual(self.move(fake), (2, 0))
+        opened = [n for n in fake.subs[1] if n not in before and n != 60]
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(sorted(fake.subs[opened[0]]), [21, 22])
+        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [
+            ("POST", "/repos/%s/issues/1/sub_issues" % REPO, {"sub_issue_id": 1000 + opened[0]}),
+            ("POST", "/repos/%s/issues/%d/sub_issues" % (REPO, opened[0]),
+             {"sub_issue_id": 1021, "replace_parent": True}),
+            ("POST", "/repos/%s/issues/%d/sub_issues" % (REPO, opened[0]),
+             {"sub_issue_id": 1022, "replace_parent": True}),
+        ])
+
+    test_the_rescue_does_not_open_a_second_epic_past_the_bound = (
+        test_the_rescue_opens_a_second_epic_when_the_first_rescue_epic_is_full
+    )
 
     def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
         fake = self.cap_repo()

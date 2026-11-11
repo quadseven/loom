@@ -149,6 +149,12 @@ NAMED_PR_RE = re.compile(r"\b(?:PR|pull request) #([0-9]+)\b")
 # longer waiting or running is removed once it is this old. On 2026-10-13 the
 # 385 left behind held 7.8 GB and the disk filled.
 TREE_KEEP = 3600
+# A rewrite's scratch (lanes/rewrite_agent.sh, run/rewrite.*) is removed by
+# its EXIT trap, which a SIGKILL skips: on 2026-11-10 31 were left, 5.2 GB,
+# the oldest three weeks old (loom#2966). The disk sweep removes one unchanged
+# this long (an hour past the station's 600 second rewrite limit) whose
+# recorded wrapper pid is not running.
+REWRITE_SCRATCH_KEEP = 600 + 3600
 # The loom home is kept bounded (loom#643): a lane's logs (logs/<slot>/) are
 # removed once nothing in them changed for LOOM_LOG_KEEP_DAYS days (0 keeps
 # them all), unless a brief of that name is waiting or running or its
@@ -15964,6 +15970,7 @@ class Station:
         self.prune_logs()
         self.compress_sessions()
         self.limit_logs()
+        self.prune_rewrite_scratch()
         sizes: Dict[str, int] = {}
         try:
             names = os.listdir(self.s.home)
@@ -15982,6 +15989,41 @@ class Station:
         _say("loom home holds %s (%s); %s free on its disk"
              % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
         _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
+
+    def prune_rewrite_scratch(self) -> None:
+        """Remove run/rewrite.* folders a killed rewrite left (loom#2966):
+        real folders only, never a link, unchanged for REWRITE_SCRATCH_KEEP
+        seconds, and with no live pid in their pid file. A folder whose
+        rewrite is running is kept however old. Says the count and size."""
+        run = os.path.join(self.s.home, "run")
+        try:
+            names = [n for n in os.listdir(run) if n.startswith("rewrite.")]
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            _say("cannot list %s to remove stale rewrite scratch: %s" % (run, err))
+            return
+        removed = freed = 0
+        for name in sorted(names):
+            path = os.path.join(run, name)
+            try:
+                if not stat.S_ISDIR(os.lstat(path).st_mode):
+                    continue
+                newest, size = _tree_stat(path)
+            except OSError:
+                continue
+            if self.now - newest < REWRITE_SCRATCH_KEEP:
+                continue
+            pid = self._lock_pid(path, "pid")
+            if pid is not None and 1 < pid <= 2147483647 and self._pid_alive(pid):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            if not os.path.lexists(path):
+                removed += 1
+                freed += size
+        if removed:
+            _say("removed %d stale rewrite scratch folder(s), %s, from %s"
+                 % (removed, _gb(freed), run))
 
     def compress_sessions(self) -> None:
         """gzip each finished run's opencode session store (SESSION_DB_PARTS
