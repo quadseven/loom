@@ -8015,6 +8015,80 @@ class DiskGuardTest(Base):
                                                     "LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 20)
 
 
+class RewriteScratchTest(Base):
+    """A rewrite killed past its EXIT trap leaves run/rewrite.* behind; the
+    disk sweep removes it once stale and unowned (loom#2966)."""
+
+    def scratch(self, name, age, pid=None):
+        path = os.path.join(self.home, "run", name)
+        self.write(os.path.join(path, "home", "work", "big"), "x" * 4096)
+        if pid is not None:
+            self.write(os.path.join(path, "pid"), "%d\n" % pid)
+        old = time.time() - age
+        for root, dirs, files in os.walk(path):
+            for n in dirs + files:
+                os.utime(os.path.join(root, n), (old, old))
+        os.utime(path, (old, old))
+        return path
+
+    def setUp(self):
+        super().setUp()
+        self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
+
+    def tend(self):
+        usage = mock.Mock(free=100 * 1024 ** 3, total=500 * 1024 ** 3, used=0)
+        reader = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch("bus.station._say") as say:
+            reader.tend_disk()
+        return [c.args[0] for c in say.call_args_list]
+
+    def dead_pid(self):
+        child = subprocess.Popen(["true"])
+        child.wait()
+        return child.pid
+
+    def test_a_stale_unowned_scratch_goes_and_the_sweep_says_how_much(self):
+        stale = self.scratch("rewrite.AAAAAA", station.REWRITE_SCRATCH_KEEP + 60)
+        dead = self.scratch("rewrite.BBBBBB", station.REWRITE_SCRATCH_KEEP + 60, self.dead_pid())
+        said = self.tend()
+        self.assertFalse(os.path.exists(stale))
+        self.assertFalse(os.path.exists(dead))
+        line = [s for s in said if "rewrite scratch" in s]
+        self.assertEqual(len(line), 1, said)
+        self.assertIn("removed 2 stale rewrite scratch folder(s)", line[0])
+        self.assertIn("GB", line[0])
+
+    def test_a_fresh_scratch_is_kept(self):
+        fresh = self.scratch("rewrite.CCCCCC", 60)
+        said = self.tend()
+        self.assertTrue(os.path.exists(fresh))
+        self.assertFalse(any("rewrite scratch" in s for s in said), said)
+
+    def test_a_stale_scratch_whose_rewrite_is_alive_is_kept(self):
+        owned = self.scratch("rewrite.DDDDDD", 30 * 24 * 3600, os.getpid())
+        self.tend()
+        self.assertTrue(os.path.exists(owned))
+
+    def test_a_link_and_other_run_scratch_are_never_touched(self):
+        target = os.path.join(self.home, "elsewhere")
+        self.write(os.path.join(target, "keep"), "x\n")
+        lane = self.scratch("codex-home", station.REWRITE_SCRATCH_KEEP + 60)
+        link = os.path.join(self.home, "run", "rewrite.EEEEEE")
+        os.symlink(target, link)
+        self.tend()
+        self.assertTrue(os.path.exists(os.path.join(target, "keep")))
+        self.assertTrue(os.path.lexists(link))
+        self.assertTrue(os.path.exists(lane))
+
+    def test_the_rewrite_wrapper_records_its_pid_in_the_scratch(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "lanes", "rewrite_agent.sh")) as fh:
+            source = fh.read()
+        made = source.index('RUN_DIR="$(mktemp -d')
+        self.assertIn('echo "$$" > "$RUN_DIR/pid"', source[made:made + 400])
+
+
 class FixtureDiskTest(Base):
     """The shared fixture has no free-space floor, so a pass claims however
     little the host's disk has free (loom#2403)."""
