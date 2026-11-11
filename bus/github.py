@@ -682,6 +682,7 @@ class GitHub:
         self.cache_dir = cache_dir
         # Reads may run on several threads (brain.status): counts change under this lock.
         self._count_lock = threading.Lock()
+        self._in_flight = 0
         self.requests = 0
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
@@ -1205,6 +1206,8 @@ class GitHub:
         for attempt in range(len(delays) + 1):
             with self._count_lock:
                 self.requests += 1
+                if attempt == 0 and self._in_flight > 0:
+                    self._in_flight -= 1
             try:
                 status, raw_headers, raw = self.transport(method, url, headers, payload)
             except GitHubError as err:
@@ -1369,9 +1372,12 @@ class GitHub:
         with self._count_lock:
             target = self.target
             over = (isinstance(target, int) and not isinstance(target, bool)
-                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+                    and kind in DEFERRABLE_KINDS
+                    and (self.counted + self._in_flight) >= target)
             if over:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            elif isinstance(target, int) and not isinstance(target, bool) and kind in DEFERRABLE_KINDS:
+                self._in_flight += 1
         if over:
             raise TargetReached("%s read carried over at request target" % kind)
 

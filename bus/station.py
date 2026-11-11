@@ -673,6 +673,10 @@ MAX_FIX_BODY = 60000
 # it all stops claiming until the reset.
 BUDGET_FLOOR = 0.15
 PASS_REQUEST_TARGET = 500
+# Share of the pass request target reserved for claiming: the claim pass stops
+# at this share and carries the rest to the next pass, leaving the rotation room
+# in every pass (loom#3014).
+CLAIM_SHARE = 0.8
 # Requests the invariant filer may spend past the pass target once the
 # check's reads are done (loom#2505). The reads cost 70 to 480 counted
 # requests (warm or cold cache) and end in check-run and pull request
@@ -3374,6 +3378,8 @@ class Station:
         return not any(n.endswith((".md", ".claiming")) for n in names)
 
     def claim_new(self) -> None:
+        if self._claim_target_reached():
+            return
         free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         # This pass's unproven-work gate refusals (loom#564).
@@ -3403,7 +3409,8 @@ class Station:
             self._claim_for_lane(lane, by_lane[lane], free)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in free))
-        self._hand_verifies([lane for lane in free if not by_lane[lane]])
+        if not self._claim_target_reached():
+            self._hand_verifies([lane for lane in free if not by_lane[lane]])
 
     # -- dead-lane runaway release (loom#565) ------------------------------
     def _open_lane_no_success(self) -> Dict[str, Tuple[int, str]]:
@@ -3438,6 +3445,8 @@ class Station:
         With no free lane in its tier the ticket stays held and the comment
         says why. A runaway whose attempts spread across lanes keeps its hold
         for the brain, as before."""
+        if self._claim_target_reached():
+            return
         runaways: List[Tuple[str, Dict[str, Any]]] = []
         # The per-repo runaway listing only runs when a lane is actually
         # dead: with no open runs-and-none-done invariant there is nothing
@@ -3446,6 +3455,8 @@ class Station:
         if not dead:
             return
         for repo in self.scan_repos():
+            if self._claim_target_reached():
+                break
             try:
                 found = self._paginate("/repos/%s/issues?labels=%s&state=open"
                                          % (repo, RUNAWAY))
@@ -3573,8 +3584,12 @@ class Station:
             return None
         key = (repo, goal)
         if key not in counts:
+            if self._claim_target_reached():
+                return "claim request target reached; check waits for next pass"
             try:
                 counts[key] = brain.goal_unproven(self.gh, repo, goal)
+            except TargetReached:
+                return "claim request target reached; check waits for next pass"
             except ValueError as err:
                 # One ticket with a bad goal is skipped this pass; it must
                 # never end the pass for every other ticket.
@@ -3622,6 +3637,8 @@ class Station:
         gated = {lane: [] for lane in by_lane}
         for lane, found in by_lane.items():
             for repo, issue in found:
+                if self._claim_target_reached():
+                    break
                 reason = self._unproven_gate(repo, issue, limit, counts)
                 if reason is None:
                     gated[lane].append((repo, issue))
@@ -3670,6 +3687,10 @@ class Station:
             factory.REVERT_LABEL not in _label_names(c[1]),
             REGRESSION not in _label_names(c[1])) + tickets.work_order(*c))
         for repo, issue in cands:
+            if self._claim_target_reached():
+                _say("%s#%s waits for the next pass: claim request target reached"
+                     % (repo, issue["number"]))
+                return
             try:
                 if self._try_ticket(repo, lane, issue, free):
                     return
@@ -3688,6 +3709,8 @@ class Station:
             if not tickets.REPO_RE.fullmatch(repo):
                 _say("ignoring %r in LOOM_REPOS: not OWNER/NAME" % repo)
         for repo in self.scan_repos():
+            if self._claim_target_reached():
+                break
             try:
                 found = self._poll(repo)
             except RateLimited:
@@ -3696,6 +3719,8 @@ class Station:
                 _say("could not list %s: %s" % (repo, err))
                 continue
             for issue in found:
+                if self._claim_target_reached():
+                    break
                 self._add_claim_candidate(by_lane, free, repo, issue)
         return by_lane
 
@@ -3780,6 +3805,8 @@ class Station:
         shipped: List[Tuple[str, Dict[str, Any]]] = []
         counts: Dict[Tuple[str, int], int] = {}
         for repo in self._verify_repos():
+            if self._claim_target_reached():
+                break
             issues = self._tickets_open(repo)
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
@@ -3797,6 +3824,8 @@ class Station:
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
                                       missing, check_live=False):
+            if self._claim_target_reached():
+                break
             issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
             if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
                 continue
@@ -4092,7 +4121,7 @@ class Station:
         owner when no lane is ever idle. At most one lane per
         VERIFY_RESERVE_EVERY, so build work is delayed, never starved. Returns
         the free lanes that still have an empty inbox."""
-        if not free:
+        if not free or self._claim_target_reached():
             return free
         path = os.path.join(self.state, VERIFY_RESERVE_FILE)
         last = _read_json(path, {}, strict=False)
@@ -4131,7 +4160,7 @@ class Station:
 
     def _prioritize_verifies(self, free: List[str]) -> List[str]:
         """Drain overdue shipped work before new briefs while its median is high."""
-        if not free:
+        if not free or self._claim_target_reached():
             return free
         median = self._shipped_median()
         if median is None or median < VERIFY_PRIORITY_MEDIAN_H:
@@ -4256,7 +4285,7 @@ class Station:
         least that long ago, ignoring the lanes queued build work wants, and
         at most `limit` hand-outs."""
         lanes = [x for x in idle if provider(x) not in VERIFY_SKIP and self._inbox_empty(x)]
-        if not lanes:
+        if not lanes or self._claim_target_reached():
             return
         path = os.path.join(self.state, VERIFY_FILE)
         attempts = _read_json(path, {}, strict=False)
@@ -5265,8 +5294,10 @@ class Station:
         if hold is not None and self.now < hold:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
+        if self._claim_target_reached():
+            return False
         ok, reason = self._check_trust(repo, issue)
-        if self._target_reached():
+        if self._claim_target_reached() or self._target_reached():
             return False
         if not ok:
             self._refuse(repo, issue, reason)
@@ -6160,6 +6191,7 @@ class Station:
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
+        self._run_due_steps()
         paused = self._paused_steps(steps)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -6248,6 +6280,32 @@ class Station:
             _say("note_stale_shipped carried over to the next pass: %s" % err)
         except (GitHubError, OSError, ValueError) as err:
             _say("note_stale_shipped failed: %s" % err)
+
+    def _score_lanes_due(self) -> bool:
+        """True when the lane scorecard is due for its hourly refresh and
+        the factory is active."""
+        if not self.s.factory_on:
+            return False
+        if "score_lanes" in self._paused_steps([self.score_lanes]):
+            return False
+        try:
+            return scorecard.Scorecard(self.state, self.now).due()
+        except Exception:
+            return False
+
+    def _run_due_steps(self) -> None:
+        """Run steps with their own cadence that are now due, ahead of the
+        step rotation order, so an hourly step is not held behind a slow
+        rotation (loom#3014)."""
+        if self._deferred():
+            return
+        if self._score_lanes_due():
+            try:
+                self._timed(self.score_lanes)
+            except TargetReached as err:
+                _say("score_lanes carried over to the next pass: %s" % err)
+            except (GitHubError, OSError, ValueError) as err:
+                _say("score_lanes failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -16138,6 +16196,21 @@ class Station:
                if v[0] < BUDGET_FLOOR * v[1]]
         return min(low)[1:] if low else None
 
+    def _claim_target(self) -> int:
+        target = getattr(self.gh, "target", None)
+        if not isinstance(target, int) or isinstance(target, bool):
+            target = PASS_REQUEST_TARGET
+        return max(1, int(target * CLAIM_SHARE))
+
+    def _claim_target_reached(self) -> bool:
+        """True when the requests counted so far reach the claim share of the
+        pass request target: claim reads stop and carry over so the step rotation
+        has room in every pass (loom#3014)."""
+        target = getattr(self.gh, "target", None)
+        if not isinstance(target, int) or isinstance(target, bool):
+            return False
+        return self._pass_counted() >= self._claim_target()
+
     def _target_reached(self) -> bool:
         target = getattr(self.gh, "target", None)
         if not isinstance(target, int) or isinstance(target, bool):
@@ -16186,6 +16259,9 @@ class Station:
         target = getattr(gh, "target", None) or PASS_REQUEST_TARGET
         line += "; target %d counted (%s)" % (
             target, "over" if counted > target else "met")
+        claim_target = self._claim_target()
+        claim_used = getattr(self, "_claim_requests", 0)
+        line += "; claim share %d of %d" % (claim_used, claim_target)
         carried = ", ".join("%s %d" % (k, n) for k, n in
                             sorted(getattr(gh, "carried_over", {}).items(),
                                    key=lambda kv: (-kv[1], kv[0])))
@@ -16511,12 +16587,21 @@ class Station:
             # A disk under the floor takes no new work (loom#1808); a pass
             # still finishes half-done claims, reconciles and prunes.
             if not self.disk_low():
+                before_claim = self._pass_counted()
+                pass_target = getattr(self.gh, "target", None)
+                claim_target = self._claim_target()
+                self.gh.target = claim_target
                 try:
                     self._timed(self.claim_new)
                 except RateLimited:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
+                finally:
+                    self.gh.target = pass_target
+                    self._claim_requests = self._pass_counted() - before_claim
+                    _say("claim pass used %d requests of %d target share"
+                         % (self._claim_requests, claim_target))
             # Again after the claims, for a ticket claimed in this pass.
             self._feed_lanes()
             try:
