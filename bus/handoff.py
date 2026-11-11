@@ -8,6 +8,7 @@ while the deferring brain keeps journaling.
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
@@ -211,14 +212,74 @@ def marks(found: Iterable[Dict[str, Any]]) -> List[Mark]:
     return out
 
 
-def resume_items(found: Sequence[Mark]) -> List[Mark]:
-    """The defers no later marker replaced: for each stage and item, the newest
-    marker wins, so a done marker, or a newer defer, retires an older defer."""
+BRIEF_DEFER_DAYS = 7.0
+
+
+def brief_defer_days() -> float:
+    """The age in days past which a brief defer stops being a resume item,
+    from LOOM_BRIEF_DEFER_DAYS (default 7). An unreadable or negative value,
+    or one no duration can hold ("inf", "1e20"), keeps the default: a bad
+    setting must not silently drop fresh work, nor fail every resume."""
+    raw = os.environ.get("LOOM_BRIEF_DEFER_DAYS", "").strip()
+    try:
+        days = float(raw)
+        timedelta(days=days)
+    except (ValueError, OverflowError):
+        return BRIEF_DEFER_DAYS
+    return days if days >= 0 else BRIEF_DEFER_DAYS
+
+
+def _aged_brief_defer(mark: Mark, reference: datetime, days: float) -> bool:
+    """Whether a brief defer is older than the cap at `reference`. A defer
+    whose time cannot be read is not aged out: unreadable counts as fresh,
+    as in peer_journals, so a malformed time never drops work silently."""
+    if mark.stage != "brief":
+        return False
+    when = _parse(mark.at)
+    return when is not None and reference - when > timedelta(days=days)
+
+
+def _latest_defers(found: Sequence[Mark]) -> List[Mark]:
     latest: Dict[Tuple[str, Tuple[str, int], str], Mark] = {}
     for mark in found:
         identity = mark.key if mark.stage == "brief" else ""
         latest[(mark.stage, mark.item, identity)] = mark
     return [m for m in latest.values() if m.kind == "defer"]
+
+
+def _split_aged_brief(found: Sequence[Mark], now: datetime
+                      ) -> Tuple[List[Mark], List[Mark]]:
+    """(standing defers, brief defers aged out at `now`) among the latest
+    defers: the partition resume_items and dropped_brief_defers share."""
+    days = brief_defer_days()
+    kept: List[Mark] = []
+    dropped: List[Mark] = []
+    for mark in _latest_defers(found):
+        (dropped if _aged_brief_defer(mark, now, days) else kept).append(mark)
+    return kept, dropped
+
+
+def resume_items(found: Sequence[Mark], now: Optional[datetime] = None) -> List[Mark]:
+    """The defers no later marker replaced: for each stage and item, the newest
+    marker wins, so a done marker, or a newer defer, retires an older defer.
+    With a reference time `now`, a brief defer older than brief_defer_days at
+    it is not a resume item either: brief defers never got a done marker for
+    problems since fixed, so without an age cap they list forever. Without
+    `now` nothing ages out, so callers that retire defers (brief done
+    markers, may_act) see every standing defer exactly as before."""
+    if now is None:
+        return _latest_defers(found)
+    return _split_aged_brief(found, now)[0]
+
+
+def dropped_brief_defers(found: Sequence[Mark],
+                         now: Optional[datetime] = None) -> List[Mark]:
+    """The latest brief defers resume_items drops only for their age at
+    `now`, so a resume pass can count them in one summary line per goal.
+    Without a reference time, none."""
+    if now is None:
+        return []
+    return _split_aged_brief(found, now)[1]
 
 
 def live(items: Sequence[Mark], current: Dict[Tuple[str, int], str]) -> List[Mark]:
