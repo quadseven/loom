@@ -210,8 +210,9 @@ unset variables.
   `[transient]` once; the station counts a second check timeout in a row on
   the same ticket as `[work]`, as it does for agent timeouts. A final check
   that exits non-zero with only `TimeoutExpired` errors in unchanged test
-  files also parks `[transient]`; mixed failures, changed test files and
-  unrecognized test IDs keep the ordinary validation-failure class. The
+  files also parks `[transient]`, even when other tracked files changed;
+  mixed failures, a changed test file implicated in an error, and unrecognized
+  test IDs keep the ordinary validation-failure class. The
   runner passes `LOOM_CHECK_WORKERS` into each check. The host sets it to 2
   by default and can override it per host. A repo's test runner must read
   that variable to use the cap. The runner inventory available to Loom is:
