@@ -23,7 +23,11 @@ Before the station hands a ticket to a lane (`check`), it reads:
   the ticket to a verify run. A stale ticket goes back to the queue with
   `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
-  hold it again.
+  hold it again. A recorded decision by a configured person beside blocked
+  or awaiting-live-check, or a non-person Blocked on section beside those
+  labels, keeps waiting work held before stale-evidence reads. A stale event
+  wait without the label gets blocked once. This neither approves a build
+  nor clears an existing hold. A Decision alone can be a decision to build.
 - health: a ticket health intake filed (its health marker), or one whose Why
   names a health finding or the health endpoint, gets no lane until its body
   names the cause, on a `Cause:` line or under `## Cause`. A cause, or a
@@ -64,7 +68,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, proof, status, tickets
+from . import answer, decision_claim, proof, status, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -583,6 +587,87 @@ def already_built(gh: Any, repo: str, body: str, branch: str) -> Optional[Verdic
         " ".join(paths).encode("utf-8")).hexdigest()[:12],
         "every file its criteria ask to add already exists on %s: %s"
         % (branch, ", ".join("`%s`" % p for p in paths[:PATHS_READ])))
+
+
+def _visible_ask_body(body: str) -> str:
+    """Current prose only: examples, quotations and preserved originals settle no ask."""
+    body = re.sub(r"<!--.*?(?:-->|\Z)", "", brief_text(body), flags=re.S)
+    lines: List[str] = []
+    fence = ""
+    for line in body.splitlines():
+        boundary = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if fence:
+            if (boundary and boundary.group(1).startswith(fence)
+                    and not line[boundary.end():].strip()):
+                fence = ""
+        elif boundary:
+            fence = boundary.group(1)
+        elif not line.startswith(("    ", "\t")) and not line.lstrip().startswith(">"):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _recorded_ask_decision(body: str, trusted: Sequence[str]) -> bool:
+    """A nonempty Decision section naming a configured person, with an optional role."""
+    body = re.sub(r"(^#{2,3}[ \t]*Decision[ \t]*\()[ \t]*operator[ \t]+",
+                  r"\1", body, flags=re.M | re.I)
+    people = decision_claim.person_logins(trusted, answer.operators(trusted=trusted))
+    for heading in decision_claim.DECISION_HEADING.finditer(body):
+        if not decision_claim.body_decision(heading.group(0), None, people):
+            continue
+        section = re.split(r"^#{1,3}[ \t]+", body[heading.end():], maxsplit=1, flags=re.M)[0]
+        if section.strip():
+            return True
+    return False
+
+
+def _ask_blocker_text(body: str) -> str:
+    """All current blocker sections, using the same boundaries as blocked_on."""
+    found: List[str] = []
+    inside = False
+    for line in body.splitlines():
+        head = BLOCKED_HEAD_RE.match(line)
+        if head:
+            inside = True
+            line = head.group(1).strip(" *:\t")
+        elif inside and NEXT_HEAD_RE.match(line):
+            inside = False
+        if inside:
+            found.append(line)
+    return "\n".join(found).strip()
+
+
+def _non_person_event_wait(blocked: str) -> bool:
+    """Only a stated event wait, not no blocker or an issue dependency."""
+    plain = blocked.strip().strip("-* \t.").lower()
+    if (not re.search(r"\w", plain)
+            or plain in {"n/a", "nothing", "tbd", "todo", "unknown", "to be determined"}
+            or re.match(r"(?:none|no blockers|nothing blocks|not blocked)\b", plain)):
+        return False
+    if SAME_REPO_REF_RE.search(blocked) or REF_RE.search(blocked):
+        return False
+    return not re.search(r"https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+", blocked)
+
+
+def settled_brief_wait(issue: Mapping[str, Any], trusted: Sequence[str], *,
+                       stale: bool = False) -> bool:
+    """Recognize an explicit non-person wait without any remote evidence reads.
+
+    Before evidence reads, both branches require a visible wait label. After
+    a stale verdict, a non-person event wait may gain that label. A Decision
+    alone may authorize a build and always requires the existing wait label.
+    Person blockers and issue dependencies keep their existing evaluation.
+    This clears no hold and authorizes no build.
+    """
+    body = _visible_ask_body(str(issue.get("body") or ""))
+    blocked = _ask_blocker_text(body)
+    if re.search(r"(?<![\w.-])@[A-Za-z0-9][\w-]*|\bneeds:[A-Za-z0-9][\w-]*", blocked):
+        return False
+    names = {str(n.get("name") if isinstance(n, dict) else n)
+             for n in issue.get("labels") or []}
+    labelled = bool(names & {"blocked", "awaiting-live-check"})
+    return ((labelled or stale) and _non_person_event_wait(blocked)
+            or labelled and _recorded_ask_decision(body, trusted))
 
 
 def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]],
