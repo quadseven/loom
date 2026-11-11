@@ -2326,6 +2326,14 @@ slot does, with the settings the station's plist lacks. They deploy by merge,
 beside the Mac lane they will replace, because a plist changes only through a
 reinstall that replaces every lane. docs/LANE_RUNNERS_PLAN.md holds the plan.
 
+For tracked opencode-go slots only, a missing station key-path setting falls
+back to that slot's installed `com.loom.<slot>.plist` in
+`~/Library/LaunchAgents`. Only its slot/provider `KEY_SSM` parameter name is
+selected; other installed environment values are not forwarded. Explicit station
+settings win. Missing or invalid installed settings retain the existing
+missing-setting park; unreadable settings also report the error type without
+their contents. This fallback needs no installer run.
+
 To switch a slot over: set `LOOM_RUNNER_SLOTS` (for example
 `opencode-go-2`) and re-run `lanes/mac/install.sh`. The installer removes
 that slot's launchd runner and gives the station the slot's settings
