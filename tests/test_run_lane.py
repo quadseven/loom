@@ -221,6 +221,7 @@ fi
 # rewrites the validation contract.
 FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
+printf 'agent-tmpdir=%s tmpdir-exists=%s tmpdir-islink=%s stale=%s targetfile=%s\\n' "${TMPDIR:-}" "$([ -d "${TMPDIR:-/nonexistent}" ] && echo yes || echo no)" "$([ -L "${TMPDIR:-/nonexistent}" ] && echo yes || echo no)" "$([ -e "${TMPDIR:-/nonexistent}/stale.txt" ] && echo yes || echo no)" "$([ -e "${TMPDIR:-/nonexistent}/target-sentinel.txt" ] && echo yes || echo no)" >> "$FAKE_LOG"
 [ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" >> "$FAKE_AGENT_ENV"
 [ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
@@ -825,6 +826,52 @@ print('leak guard: clean (shape patterns only)')
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertFalse((self.inbox / "T042-fix-the-thing.md").exists())
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def agent_tmpdir_lines(self):
+        return [c for c in self.calls() if c.startswith("agent-tmpdir=")]
+
+    def test_the_agent_inherits_the_run_tmpdir_and_it_exists(self):
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = self.loom / "run" / "codex-tmp"
+        self.assertIn(
+            f"agent-tmpdir={expected} tmpdir-exists=yes tmpdir-islink=no "
+            "stale=no targetfile=no",
+            self.agent_tmpdir_lines())
+        self.assertTrue(expected.is_dir())
+        self.assertFalse(expected.is_symlink())
+
+    def test_a_file_left_in_the_run_tmpdir_is_gone_when_the_agent_starts(self):
+        tmpdir = self.loom / "run" / "codex-tmp"
+        tmpdir.mkdir(parents=True)
+        (tmpdir / "stale.txt").write_text("left behind\n")
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"agent-tmpdir={tmpdir} tmpdir-exists=yes tmpdir-islink=no "
+            "stale=no targetfile=no",
+            self.agent_tmpdir_lines())
+        self.assertFalse((tmpdir / "stale.txt").exists())
+
+    def test_a_symlink_in_place_of_the_run_tmpdir_is_removed_and_its_target_untouched(self):
+        target = Path(self._tmp.name) / "tmpdir-target"
+        target.mkdir()
+        (target / "target-sentinel.txt").write_text("keep me\n")
+        tmpdir = self.loom / "run" / "codex-tmp"
+        tmpdir.parent.mkdir(parents=True, exist_ok=True)
+        tmpdir.symlink_to(target, target_is_directory=True)
+        self.drop_brief()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            f"agent-tmpdir={tmpdir} tmpdir-exists=yes tmpdir-islink=no "
+            "stale=no targetfile=no",
+            self.agent_tmpdir_lines())
+        self.assertTrue(tmpdir.is_dir())
+        self.assertFalse(tmpdir.is_symlink())
+        self.assertEqual((target / "target-sentinel.txt").read_text(), "keep me\n")
 
     def pushed_files(self, branch="loom/T042-fix-the-thing"):
         clone = Path(self._tmp.name) / "pushed-clone"
