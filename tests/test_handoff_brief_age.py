@@ -43,6 +43,18 @@ class BriefAgeTests(unittest.TestCase):
         self.assertEqual([(REPO, 2)], [m.item for m in items])
         self.assertEqual([(REPO, 1)], [m.item for m in dropped])
 
+    def test_a_cap_too_large_for_a_duration_keeps_the_default(self):
+        # "inf" and "1e20" parse as non-negative floats but no duration can
+        # hold them, so resume raised OverflowError on a bad setting.
+        found = [defer("brief", 1, 8, "11111111"),
+                 defer("brief", 2, 1, "22222222")]
+        for raw in ("inf", "1e20"):
+            with self.subTest(raw=raw), unittest.mock.patch.dict(
+                    os.environ, {"LOOM_BRIEF_DEFER_DAYS": raw}):
+                self.assertEqual(handoff.BRIEF_DEFER_DAYS, handoff.brief_defer_days())
+                items = handoff.resume_items(found, NOW)
+                self.assertEqual([(REPO, 2)], [m.item for m in items])
+
     def test_without_a_reference_time_nothing_ages_out(self):
         # Callers that retire defers (brief done markers, may_act) call
         # resume_items with no reference time and must see every standing

@@ -79,5 +79,35 @@ class CrossRepoSubIssueTest(unittest.TestCase):
         self.assertEqual(["#88"], warning)
 
 
+class SharedNumberTest(unittest.TestCase):
+    """A local epic and a foreign epic can share an issue number."""
+
+    EPICS = [{"number": 2, "title": "Local epic", "state": "open",
+              "labels": [{"name": "epic"}], "repository": {"nameWithOwner": HOME}},
+             {"number": 2, "title": "Remote epic", "state": "open",
+              "labels": [{"name": "epic"}], "repository": {"nameWithOwner": OTHER}}]
+
+    @staticmethod
+    def _read(gh, repo, numbers, **kwargs):
+        return {n: [{"number": 20 if repo == HOME else 30, "state": "open"}] for n in numbers}
+
+    def test_goal_tree_keeps_same_numbered_epics_apart(self):
+        gh = GitHub("placeholder", transport=Fake())
+        with mock.patch.object(brain, "_direct_children", return_value=[]), \
+                mock.patch.object(brain, "_goal_epics", return_value=self.EPICS), \
+                mock.patch.object(brain, "_sub_issue_tickets", side_effect=self._read):
+            _, tree = brain.goal_tree(gh, HOME, 1, light=True)
+        self.assertEqual([[20], [30]], [[t["number"] for t in items] for _, items in tree])
+
+    def test_finishable_tree_keeps_same_numbered_epics_apart(self):
+        gh = GitHub("placeholder", transport=Fake())
+        with mock.patch.object(brain, "_issues", return_value=[]), \
+                mock.patch.object(brain, "_sub_issue_tickets", return_value={1: []}), \
+                mock.patch.object(brain, "_open_goal_epics", return_value=self.EPICS), \
+                mock.patch.object(brain, "_sub_issue_states", side_effect=self._read):
+            tree = brain._finishable_tree(gh, HOME, 1)
+        self.assertEqual([[20], [30]], [[t["number"] for t in items] for _, items in tree])
+
+
 if __name__ == "__main__":
     unittest.main()
