@@ -2382,15 +2382,13 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
         grouped: Dict[str, List[int]] = {}
         for epic in epics:
             number = int(epic.get("number") or 0)
-            home = epic.get("repository") or {}
-            epic_repo = home.get("nameWithOwner") or repo
+            epic_repo = _epic_repo(epic, repo)
             grouped.setdefault(epic_repo, []).append(number)
         for epic_repo, numbers in grouped.items():
             for number, tickets in _sub_issue_tickets(
                     gh, epic_repo, numbers, warnings=warnings).items():
                 found[(epic_repo, number)] = tickets
-        subs = [found[(((e.get("repository") or {}).get("nameWithOwner") or repo),
-                       int(e.get("number") or 0))] for e in epics]
+        subs = [found[(_epic_repo(e, repo), int(e.get("number") or 0))] for e in epics]
     else:
         subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
                                                    % (_epic_repo(epic, repo),
@@ -2428,8 +2426,7 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     open_tickets = _open_tickets(listed)
     grouped: Dict[str, List[int]] = {}
     for epic in wanted:
-        home = epic.get("repository") or {}
-        grouped.setdefault(home.get("nameWithOwner") or repo, []).append(
+        grouped.setdefault(_epic_repo(epic, repo), []).append(
             int(epic.get("number") or 0))
     subs: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     for epic_repo, numbers in grouped.items():
@@ -2438,7 +2435,7 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     tree = []
     for epic in epics:
         n = int(epic.get("number") or 0)
-        key = ((epic.get("repository") or {}).get("nameWithOwner") or repo, n)
+        key = (_epic_repo(epic, repo), n)
         tree.append((epic, _tree_tickets(n, subs[key], open_tickets) if key in subs else []))
     return tree
 
@@ -3286,7 +3283,8 @@ def sub_issue_count(gh: GitHub, repo: str, epic: Dict[str, Any],
         return total
     if held is None:
         held = [c for c in gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                       % (repo, int(epic["number"]))) if isinstance(c, dict)]
+                                       % (_epic_repo(epic, repo), int(epic["number"])))
+                if isinstance(c, dict)]
     return len(held)
 
 
