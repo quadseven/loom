@@ -3223,6 +3223,14 @@ final_base_tests() {
              -e 's/^base-timeout: /timed out on base: /p' \
              -e 's/^base-unrunnable: /could not run on base: /p' \
     | head -5 | tr '\n' ';')"
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 75 ] &&
+     [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ] &&
+     [ -z "${FIX_PR:-}" ] && [ -n "$names" ] &&
+     ! printf '%s' "$names" | grep -q 'timed out on base:\|could not run on base:'; then
+    VALIDATION_REASON="validation failed: every changed test passes on base; the ticket may already hold on the default branch: ${names%;}"
+    record base-tests "$command" "$rc" "$rev" false "$VALIDATION_REASON"
+    return "$rc"
+  fi
   record base-tests "$command" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
   case "$rc" in
     0) return 0 ;;

@@ -8344,6 +8344,21 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        done_check = re.match(
+            r"^validation failed: every changed test passes on base; "
+            r"the ticket may already hold on the default branch: passes on base: (.+)$",
+            bare)
+        if done_check and not fix_pr:
+            self._add_label(repo, number, "needs-brain")
+            comments = self._status_texts(repo, number)
+            note = ("Lane %s found changed tests that pass on the default branch (%s). "
+                    "Brain: please do a done-check." % (lane, done_check.group(1)))
+            if note not in comments:
+                self._routine(repo, number, note)
+            self._relabel(repo, number, "loom:failed")
+            _say("held %s#%d for a brain done-check: %s" %
+                 (repo, number, done_check.group(1)))
+            return True
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
