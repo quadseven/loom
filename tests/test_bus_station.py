@@ -1206,7 +1206,7 @@ class ReconcilePullRequestTest(Base):
     def test_merged_pr_outside_window_moves_ticket_to_loom_merged(self):
         # A merged pull request that fell outside the 100-item closed-pull
         # window should move the ticket to loom:merged, not loom:queued.
-        self.merged_with("- [x] First works; test.\n")
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n- [x] Third works.\n")
         self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"),
                                          created_at="2030-01-05T00:00:00Z"))
         self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
@@ -1251,7 +1251,7 @@ class ReconcilePullRequestTest(Base):
         # A merged pull request that fell outside BOTH the 100-item closed-pull
         # window AND the timeline window should still move the ticket to loom:merged.
         # Create 101 closed PRs, with the merged PR for this ticket at position 101 (page 2).
-        self.merged_with("- [x] First works; test.\n")
+        self.merged_with("- [x] First works; test.\n- [x] Second works.\n- [x] Third works.\n")
         self.fake.events[12].append(dict(labeled("loom:pr", "alice-example"),
                                          created_at="2030-01-05T00:00:00Z"))
         self.fake.issues[12]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:pr"},
@@ -1388,6 +1388,8 @@ class ReconcilePullRequestTest(Base):
                 raise station.GitHubError("server error", 500)
             if path == "/repos/%s/issues" % next_repo:
                 return reply(200, [next_ticket])
+            if path == "/repos/%s/issues/13/comments" % next_repo:
+                return reply(200, [])
             if path == "/repos/%s/pulls" % next_repo:
                 return reply(200, [next_pr])
             if method == "PUT" and path == "/repos/%s/issues/13/labels" % next_repo:

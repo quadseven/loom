@@ -2125,6 +2125,29 @@ def _covers_pr(issue: Dict[str, Any], repo: str, pr: Dict[str, Any]) -> bool:
     return source is not None and source in _refs_numbers(repo, str(pr.get("body") or ""))
 
 
+def _rejected_pull(pr: Dict[str, Any], repo: str, rejected: Set[int]) -> bool:
+    """Whether this repo's recorded rejection names the pull, not a foreign namesake."""
+    if not isinstance(pr, dict):
+        return False
+    source = str(pr.get("repository_url") or "").rstrip("/").lower()
+    if source and not source.endswith("/repos/" + repo.lower()):
+        return False
+    return pr.get("number") in rejected
+
+
+def _unrejected_timeline(events: Iterable[Any], repo: str, rejected: Set[int]) -> List[dict]:
+    """Keep timeline events except references to this ticket's rejected pulls."""
+    kept = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        source = event.get("source")
+        pull = source.get("issue") if isinstance(source, dict) else None
+        if not _rejected_pull(pull, repo, rejected):
+            kept.append(event)
+    return kept
+
+
 def adoption_body(pr: int) -> str:
     """The brief for an adoption ticket. It names the pull request in words
     and #N, never in a Refs line: the lane's own pull request carries the
@@ -5673,6 +5696,9 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
+                self._status_texts(repo, int(number))):
+            return
         if target == "loom:merged" and "loom:regression" in labels:
             events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
             if tickets.merged_before_regression_requeue(ticket, pr.get("merged_at"), events):
@@ -5888,7 +5914,12 @@ class Station:
                 or self._adopted_pull_number(ticket) is not None
                 or self._owned_elsewhere(repo, ticket)):
             return
+        rejected = set(tickets.rejected_pulls(self._status_texts(repo, number)))
         timeline = self._paginate("/repos/%s/issues/%d/timeline?per_page=100" % (repo, number))
+        # A rejected merge must neither deliver the ticket nor keep loom:pr
+        # through pull_gone's historical cross-reference fallback.
+        timeline = _unrejected_timeline(timeline, repo, rejected)
+        closed_prs = [pr for pr in closed_prs if not _rejected_pull(pr, repo, rejected)]
         merged_pr = self._find_merged_covering_pr(timeline, repo, ticket, allowed)
         if merged_pr is None:
             # Timeline didn't have it; check all closed PRs (paginated beyond 100)
@@ -8187,7 +8218,8 @@ class Station:
         branch = self._field(text, "Branch")
         prs = self.gh.rest("GET", "/repos/%s/pulls?head=%s:%s&state=all"
                            % (repo, repo.split("/")[0], branch)).data
-        url = prs[0].get("html_url") if isinstance(prs, list) and prs and isinstance(prs[0], dict) else None
+        pull = self._reported_pull(repo, number, prs)
+        url = pull.get("html_url") if pull else None
         if not url:
             return self._done_without_pr(repo, number, lane, path, name, branch)
         self._relabel(repo, number, "loom:pr")
@@ -8213,6 +8245,31 @@ class Station:
             self._routine(repo, number, "Lane %s opened a pull request: %s" % (lane, url))
         _say("reported %s#%d done: %s" % (repo, number, url))
         return True
+
+    def _reported_pull(self, repo: str, number: int, pulls: Any) -> Optional[Dict[str, Any]]:
+        """Prefer the retry's open pull; an already rejected merge is not its result."""
+        rows = [pr for pr in pulls if isinstance(pr, dict)] if isinstance(pulls, list) else []
+        opened = next((pr for pr in rows if pr.get("state") != "closed"), None)
+        if opened is not None:
+            return opened
+        merged = [pr for pr in rows if self._terminal_label(pr) == "loom:merged"]
+        if not merged:
+            return None
+        texts = self._status_texts(repo, number)
+        rejected = set(tickets.rejected_pulls(texts))
+        usable = next((pr for pr in merged if pr.get("number") not in rejected), None)
+        if usable is None:
+            self._note_rejected_retry(repo, number, merged, texts)
+        return usable
+
+    def _note_rejected_retry(self, repo: str, number: int, pulls: Sequence[dict],
+                             texts: Sequence[str]) -> None:
+        """Explain the stale result once while the normal no-current-PR path waits."""
+        refs = ", ".join("#%d" % pr["number"] for pr in pulls)
+        note = ("Ignored merged pull requests %s already rejected for unfinished work; "
+                "this retry has no current pull request." % refs)
+        if note not in texts:
+            self._routine(repo, number, note)
 
     def _done_without_pr(self, repo: str, number: int, lane: str, path: str, name: str,
                          branch: str) -> bool:
