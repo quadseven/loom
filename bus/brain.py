@@ -5117,10 +5117,13 @@ def merge(gh: GitHub, repo: str, number: int,
                          str((pr.get("user") or {}).get("login") or ""), hold_logins(env))
     if hold:
         raise ValueError("blocked: " + hold)
-    if shadow.active(repo):
+    shadow_env = _shadow_env(env)
+    refusal = shadow.merge_refusal(repo, shadow_env)
+    if refusal:
         _shadow_merge(repo, number, str(sha), association, adopt,
                       "" if adopt else tier,
-                      change_class.class_of(pr) == "sensitive")
+                      change_class.class_of(pr) == "sensitive",
+                      refusal=refusal, shadow_env=shadow_env)
     _refuse_behind_overlap(gh, repo, number, pr)
     if _is_stacked(gh, repo, number, pr):
         # A stack merges only through the asynchronous endpoint, and the
@@ -5204,8 +5207,27 @@ def _unbuilt_reason(gh: GitHub, repo: str, number: int, issue: Dict[str, Any]) -
         return ""
 
 
+def _shadow_env(env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """The shadow scope merge reads: the caller's env when it names any
+    shadow setting, over the process environment for the rest; None (the
+    process environment alone) when the caller names none. A caller that
+    passes its own env (deploy watch, roll pin) must not merge a repo its
+    env holds in shadow because the process environment says otherwise."""
+    if env is None:
+        return None
+    keys = (shadow.SWITCH, shadow.REPOS, shadow.LEDGER)
+    if not any(key in env for key in keys):
+        return None
+    merged = dict(os.environ)
+    for key in keys:
+        if key in env:
+            merged[key] = env[key]
+    return merged
+
+
 def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, int]],
-                  adopt: bool, tier: str, sensitive: bool) -> None:
+                  adopt: bool, tier: str, sensitive: bool, refusal: str = "",
+                  shadow_env: Optional[Dict[str, str]] = None) -> None:
     """Record the merge every gate allowed and refuse it: `repo` is in shadow
     mode (bus/shadow.py). The pull request stays open for the operator."""
     if adopt:
@@ -5219,10 +5241,12 @@ def _shadow_merge(repo: str, number: int, sha: str, ticket: Optional[Tuple[str, 
                      % (tier or "revert"))
     reason = ("ticket %s#%d" % ticket) if ticket else ("adopted" if adopt else "")
     entry = shadow.record_held(shadow.MERGE, repo, number, "pr", tier=tier, gates=gates,
-                          reason=reason, sha=sha, source="bus.brain merge")
-    raise ShadowHeld("shadow mode: would merge %s#%d at %s (tier %s); recorded in the shadow "
-                     "ledger and left open for the operator"
-                     % (repo, number, sha[:12], tier or ("adopt" if adopt else "revert")), entry)
+                          reason=reason, sha=sha, source="bus.brain merge",
+                          env=shadow_env)
+    message = ("shadow mode: would merge %s#%d at %s (tier %s); recorded in the shadow "
+               "ledger and left open for the operator"
+               % (repo, number, sha[:12], tier or ("adopt" if adopt else "revert")))
+    raise ShadowHeld(message + (("; " + refusal) if refusal else ""), entry)
 
 
 def _changed_files(details: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:

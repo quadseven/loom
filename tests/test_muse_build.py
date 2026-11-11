@@ -211,6 +211,23 @@ class PickTest(unittest.TestCase):
                         comments={("example/alpha", 1): released})
         self.assertEqual(muse_build.pick(gh, REPOS).number, 2)
 
+    def test_pick_distinguishes_retry_reasons_from_completed_work(self):
+        for note, expected in (
+                ("acceptance is not satisfied; retry after validation", 1),
+                ("runner is busy elsewhere; retry next duty", 1),
+                ("Already done elsewhere: the fix shipped earlier", 2),
+                ("Released a stale claim: the fix already landed elsewhere; satisfied elsewhere", 2),
+                ("Released again: criteria already met elsewhere; verification is pending", 2),
+                ("not yet satisfied elsewhere; retry after validation", 1),
+                ("Checking whether satisfied elsewhere; retry later", 1),
+                ("Is the work satisfied elsewhere? retry later", 1),
+                ("satisfied elsewhere if the verification passes", 1)):
+            with self.subTest(note=note):
+                gh = FakeGitHub([issue("example/alpha", 1),
+                                 issue("example/alpha", 2, created="2026-01-05T00:00:00Z")])
+                muse_build.release(gh, "example/alpha", 1, note)
+                self.assertEqual(muse_build.pick(gh, REPOS).number, expected)
+
     def test_pick_skips_a_strangers_ticket_on_a_public_repo(self):
         # Anyone can file an issue on a public repo; an autonomous builder
         # must not take its instructions from a stranger.

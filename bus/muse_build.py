@@ -16,9 +16,8 @@ App. This module is the part of that loop a command can decide:
   needs-brain, awaiting-live-check, wait:*, epic, a goal home, an active
   Loom state), a stated Size of XS, S or M, at least one acceptance
   checkbox, no open or merged pull request naming it, and no release by Muse
-  whose newest note says the work is satisfied or elsewhere (a terminal
-  release: the work is done in another place; a plain let-go stays
-  pickable). A ticket labelled for-muse
+  whose newest note declares completed work, such as already done elsewhere
+  or criteria already met elsewhere. A plain let-go stays pickable. A ticket labelled for-muse
   sorts before every priority and skips the soft holds only (lane:*, loom:briefed,
   loom:triage). Then highest priority first (a P0..P3 label or a `Priority:` line;
   none counts as P2), then oldest. The scan walks down that order until one ticket
@@ -73,9 +72,16 @@ HOLD_LABELS = {"epic", "loom:goal", "loom:backlog", "loom:human", "needs-brain",
                "loom:failed", "loom:awaiting-evidence", "loom:triage", "blocked",
                "wontfix", "duplicate", "question"}
 HOLD_PREFIXES = ("claim:", "lane:", "needs:", "wait:", "handoff:")
-# A release note that says the work is already done in another place: the
-# ticket is then a disposition, not a return to the queue.
-TERMINAL_NOTE = re.compile(r"(?i)\b(satisfied|elsewhere)\b")
+# AI-REVIEW 2026-11-11 [codex/in-process/review] R1 (review, PR #2959):
+# anchor the disposition; retry notes can mention these words without finishing work.
+# AI-REVIEW 2026-11-11 [codex/in-process/review] R2 (review, PR #2989):
+# recognize legacy status clauses, not only a status at the start of the note.
+TERMINAL_NOTE = re.compile(
+    r"(?i)^(?:(?:(?:the|all|this)[ \t]+)?"
+    r"(?:work|fix|ticket|issue|(?:acceptance[ \t]+)?criteria|requirements)[ \t]+)?"
+    r"(?:(?:is|are|was|were|has[ \t]+been|have[ \t]+been)[ \t]+)?"
+    r"(?:already[ \t]+)?"
+    r"(?:satisfied(?:[ \t]+elsewhere)?|(?:done|fixed|shipped|landed|met)[ \t]+elsewhere)\b")
 _PRIORITY_LINE = re.compile(r"(?im)^\s*Priority:\s*(P[0-3])\b")
 _PARENT_TITLE = re.compile(r"(?i)^\s*(?:\[[^\]]*\]\s*)?(?:epic|goal|backlog)\b")
 _BOX = re.compile(r"(?m)^\s*[-*]\s+\[ \]\s+\S")
@@ -312,12 +318,27 @@ def _holds(gh: Any, repo: str, number: int) -> bool:
 
 
 def _terminal_release(gh: Any, repo: str, number: int) -> bool:
-    """Whether the newest build marker is a release whose note says the work
-    is satisfied or done elsewhere: a disposition, so the pick skips it. A
-    plain let-go (another holder claimed at the same time) returns the
-    ticket to the queue."""
+    """Whether the newest release reason declares completed work.
+
+    Recognize affirmative status clauses, including the older explanatory
+    prefixes. A question, conditional promise or incidental mention does not
+    finish the work.
+    """
     last = _last_marker(gh, repo, number)
-    return last.startswith(RELEASE_MARKER) and TERMINAL_NOTE.search(last) is not None
+    if not last.startswith(RELEASE_MARKER):
+        return False
+    line = last[len(RELEASE_MARKER):].lstrip().partition("\n")[0]
+    if not line.startswith("Released by Muse:"):
+        return False
+    reason = line.partition(":")[2].strip()
+    for clause in re.split(r"[;:]", reason):
+        clause = clause.strip()
+        match = TERMINAL_NOTE.match(clause)
+        if match:
+            tail = clause[match.end():].lstrip(" \t,-")
+            if not tail.startswith("?") and not re.match(r"(?i)(?:if|unless|when|once)\b", tail):
+                return True
+    return False
 
 
 def holds_build_claim(gh: Any, repo: str, number: int) -> bool:
