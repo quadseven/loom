@@ -546,21 +546,66 @@ def _merged_at(gh: Any, where: str, number: int) -> str:
     return str(pr.get("merged_at") or "")
 
 
+def _pr_head_branch(gh: Any, where: str, number: int) -> str:
+    """The head branch of the pull request, or "" when unavailable."""
+    try:
+        pr = gh.rest("GET", "/repos/%s/pulls/%d" % (where, number)).data or {}
+    except GitHubError as err:
+        if err.status == 404:
+            return ""
+        raise
+    if not isinstance(pr, dict) or _is_revert(pr):
+        return ""
+    return str((pr.get("head") or {}).get("ref") or "")
+
+
+def _ticket_number(issue: Mapping[str, Any]) -> int:
+    """The ticket's issue number."""
+    return int(issue.get("number") or 0)
+
+
+def _own_loom_branch(head_branch: str, ticket_num: int) -> bool:
+    """Whether the head branch is the ticket's own loom/<N>- branch."""
+    prefix = "loom/%d-" % ticket_num
+    return head_branch.startswith(prefix)
+
+
 def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
                   comments: Sequence[Mapping[str, Any]], trusted: Iterable[str]) -> Optional[Verdict]:
     """A pull request in any repo of the owner, linked in the ticket or in a
     comment a person wrote (not one of Loom's own Apps), that merged after
-    the ticket was filed. A link to work merged before it is context."""
+    the ticket was filed. A link to work merged before it is context.
+
+    A pull request the station already judged via an unbuilt requeue
+    (tickets.rejected_pulls from the status section) is skipped. A pull
+    request from the ticket's own loom/<N>- branch is also skipped: it is
+    the lane's own work, not external evidence.
+    """
     owner = repo.partition("/")[0].lower()
     filed = _ts(issue.get("created_at"))
+    ticket_num = _ticket_number(issue)
+
+    # PRs the station already judged for this ticket (unbuilt requeue or refuted).
+    body = str(issue.get("body") or "")
+    events = status.body_events(body)
+    rejected = set(tickets.rejected_pulls(text for _, text in events))
+
     links = [(r, n) for r, n in _links(_person_texts(issue, comments, trusted))
-             if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
+             if r.partition("/")[0].lower() == owner and (r, n) != (repo, ticket_num)]
     for where, num in links[:LINKS_READ]:
         merged = _merged_at(gh, where, num)
-        if merged and _ts(merged) > filed:
-            return Verdict(STALE, "pr-%s#%d" % (where, num),
-                           "pull request %s#%d, linked on this ticket, merged at %s, after "
-                           "the ticket was filed" % (where, num, merged))
+        if not merged or _ts(merged) <= filed:
+            continue
+        # Skip if this PR was already judged via unbuilt requeue.
+        if num in rejected:
+            continue
+        # Skip if the PR's head branch is the ticket's own loom/<N>- branch.
+        head_branch = _pr_head_branch(gh, where, num)
+        if head_branch and _own_loom_branch(head_branch, ticket_num):
+            continue
+        return Verdict(STALE, "pr-%s#%d" % (where, num),
+                       "pull request %s#%d, linked on this ticket, merged at %s, after "
+                       "the ticket was filed" % (where, num, merged))
     return None
 
 
