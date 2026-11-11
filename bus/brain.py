@@ -1155,8 +1155,10 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                        hold: Sequence[str] = ()) -> str:
     """Build one status line, including brain and goal-home blockers."""
     node = data["prs"].get(int(pr["number"]))
-    line = _status_pr_line(gh, repo, pr, node, bot, check)
     ticket = _safe_ticket_association(repo, pr)
+    ticket_issue = (gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+                    if ticket is not None else None)
+    line = _status_pr_line(gh, repo, pr, node, bot, check, ticket=ticket_issue)
     line = _docs_criterion_override(gh, repo, ticket, line)
     stacked = _stacked_base_blocker(gh, repo, pr,
                                     str(data.get("trunk") or ""))
