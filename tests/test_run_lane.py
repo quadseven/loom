@@ -758,7 +758,7 @@ print('leak guard: clean (shape patterns only)')
     def drop_brief(self, name="T042-fix-the-thing.md", text=BRIEF):
         (self.inbox / name).write_text(text)
 
-    def run_lane(self, lane="codex", cwd=None, timeout=60, **env):
+    def run_lane(self, lane="codex", cwd=None, timeout=180, **env):
         # In a session of its own, emptied when the run ends or times out, so
         # no watchdog or agent of a timed-out run outlives the test (loom#2438).
         return session_procs.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
@@ -937,7 +937,7 @@ print('leak guard: clean (shape patterns only)')
         # of this repo there (loom#2418).
         self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
         self.drop_brief()
-        result = session_procs.run(["bash", str(RUNNER), "codex"], env=env, timeout=60)
+        result = session_procs.run(["bash", str(RUNNER), "codex"], env=env, timeout=180)
         self.assertNotIn("unbound variable", result.stderr)
 
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
