@@ -480,7 +480,11 @@ and anything with a `loom:` label. A ready issue (Why, What,
 Acceptance criteria with checkboxes, Size and Out of scope, and a body the
 runner accepts) gets `loom:ticket` and `loom:queued` and becomes a sub-issue
 of goal N's intake epic, while the goal is under `LOOM_GOAL_CAP`; past the cap it is left
-for a later run. In a repo with `area:` labels, ready tickets go under the
+for a later run. Only an issue whose author is a `LOOM_BRIEF_AUTHORS` or
+`LOOM_TRUSTED_BRIEFERS` login is queued: the station never claims anyone
+else's ticket and the factory drops it, so it would only hold the cap. A
+ready issue by any other author gets `loom:triage`, which no cap counts, and
+its log line names the untrusted author as what is missing. In a repo with `area:` labels, ready tickets go under the
 open epic carrying their area label. When no area label matches the issue,
 triage selects the area whose label name or description shares the most words
 with the title and body, adds that label, and uses that area's epic. Any other

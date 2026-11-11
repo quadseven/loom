@@ -4767,12 +4767,56 @@ class Routes:
 INTAKE = 3
 
 
+def trusted_triage(routes, env=None):
+    """The env triage reads, with every issue lacking an author written by
+    the trusted login: triage queues only a trusted author's issue
+    (loom#2576)."""
+    for issue in routes.issues:
+        issue.setdefault("user", {"login": "example-brain"})
+    return unittest.mock.patch.dict(os.environ, dict(TRUSTED, **(env or {})))
+
+
 class TriageTests(unittest.TestCase):
-    def run_triage(self, routes, limit=25):
+    def run_triage(self, routes, limit=25, env=None):
         # The goal's intake epic is #3 (intake_epic has its own tests).
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
-                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]), \
+                trusted_triage(routes, env):
             return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
+
+    def test_a_ready_issue_by_an_untrusted_author_stays_at_triage(self):
+        # loom#2576: an outsider's ready issue was queued under the goal and
+        # held its cap, though the station never claims it. It now stays at
+        # loom:triage, which no cap counts, and the goal keeps its room.
+        env = {"LOOM_TRUSTED_BRIEFERS": "example-fleet-brain", "LOOM_GOAL_CAP": "1"}
+        routes = Routes([item(5, user={"login": "example-outsider"}),
+                         item(6, user={"login": "example-outsider"}), item(7)])
+        lines = self.run_triage(routes, env=env)
+        self.assertEqual(routes.labelled(), {5: ["loom:triage"], 6: ["loom:triage"],
+                                             7: ["loom:ticket", "loom:queued"]})
+        self.assertEqual(lines[:2], ["#%d loom:triage, missing %s" % (n, brain.UNTRUSTED_AUTHOR)
+                                     for n in (5, 6)])
+        self.assertEqual(lines[2], "#7 queued under #3")
+        posts = [c for c in routes.calls if c[0] == "POST" and c[1].endswith("/sub_issues")]
+        self.assertEqual([c[2] for c in posts], [{"sub_issue_id": 1007}])
+        self.assertFalse(brain._in_flight(dict(item(5), labels=[{"name": "loom:triage"}])))
+        self.assert_never_edited(routes)
+
+    def test_an_issue_with_no_author_or_no_trusted_logins_stays_at_triage(self):
+        routes = Routes([item(5, user=None)])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {5: ["loom:triage"]})
+        routes = Routes([item(6)])
+        self.run_triage(routes, env={"LOOM_BRIEF_AUTHORS": ""})
+        self.assertEqual(routes.labelled(), {6: ["loom:triage"]})
+
+    def test_a_trusted_briefers_ready_issue_is_queued(self):
+        # A LOOM_TRUSTED_BRIEFERS login's issue becomes its loom:ticket here,
+        # which the station claims, so it is queued like the operator's.
+        routes = Routes([item(5, user={"login": "example-fleet-brain"})])
+        lines = self.run_triage(routes, env={"LOOM_TRUSTED_BRIEFERS": "example-fleet-brain"})
+        self.assertEqual(routes.labelled(), {5: ["loom:ticket", "loom:queued"]})
+        self.assertEqual(lines, ["#5 queued under #3"])
 
     def assert_never_edited(self, routes):
         # Only labels, sub-issue links and comments: no PATCH (close, retitle,
@@ -6533,7 +6577,8 @@ class MoveFromGoalTests(unittest.TestCase):
         routes = Routes([item(5, parent_issue_url=self.GOAL_URL)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
-            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+            with trusted_triage(routes):
+                brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
         self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
@@ -6542,7 +6587,8 @@ class MoveFromGoalTests(unittest.TestCase):
         areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
         with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
                 unittest.mock.patch.object(brain, "intake_epic", return_value=70) as epic:
-            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+            with trusted_triage(routes):
+                brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
         read.assert_called_once()
         self.assertEqual(epic.call_args_list,
                          [unittest.mock.call(unittest.mock.ANY, REPO, 1, area="stability")] * 2)
@@ -6554,7 +6600,8 @@ class MoveFromGoalTests(unittest.TestCase):
         routes = Routes([item(5, parent_issue_url=other), item(6)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
-            brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
+            with trusted_triage(routes):
+                brain.triage(GitHub("t", transport=routes), REPO, 1, 25)
         self.assertEqual([c[2] for c in self.sub_issue_posts(routes.calls)],
                          [{"sub_issue_id": 1005}, {"sub_issue_id": 1006}])
 
