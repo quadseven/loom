@@ -1409,10 +1409,26 @@ class Filer:
         rest within the same FOLD_MAX and WRITES_MAX."""
         if not self.write:
             return
+        if self._has_due_roll_clear():
+            return
         try:
             self._settle({})
         except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
             self.say("invariants: could not close settled issues: %s" % err)
+
+    def _has_due_roll_clear(self) -> bool:
+        """Whether a read tracking issue already needs its two clear writes."""
+        for key, number in self._listing().items():
+            if (self._rolls.get(key) != number or key in self._unread_keys
+                    or key.split("/", 1)[0] not in self.read
+                    or number in self._listed_closed or number in self._ticketed):
+                continue
+            body = self._texts.get(key, "")
+            cleared = CLEAR_SINCE_RE.search(body)
+            since = _epoch(cleared.group(1)) if cleared else None
+            if ROLL_NONE in body and since is not None and self.now - since >= CLEAR_AFTER:
+                return True
+        return False
 
     def _listing(self) -> Dict[str, int]:
         """Breach key -> issue number for every loom:invariant issue, open or
@@ -2251,16 +2267,16 @@ class Filer:
         self.pending = (len(current), len([k for k in self.subjects if k not in current]))
         if not self.write:
             return
-        # Settle first: it closes at most FOLD_MAX issues a pass, and filing
-        # below can spend every write (loom#2451).
-        try:
-            self._settle(current)
-        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
-            self.say("invariants: could not close settled issues: %s" % err)
+        # Close due tracking issues first: early settle has left their two
+        # writes available, and unrelated settled issues must not use them.
         try:
             self._clear_rolls_due(current)
         except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
             self.say("invariants: could not close cleared tracking issues: %s" % err)
+        try:
+            self._settle(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close settled issues: %s" % err)
         for b in current.values():
             if self.writes >= WRITES_MAX:
                 break
