@@ -2,7 +2,6 @@
 import unittest
 
 
-
 class ValidationTimeoutClass(unittest.TestCase):
     def setUp(self):
         from bus.validation_timeout import only_untouched_test_timeouts
@@ -51,6 +50,50 @@ AssertionError: mismatch
 """
         self.assertFalse(self.classify(
             output, set(), {"tests/test_example.py"}))
+
+    def test_timeout_cause_with_terminal_runtime_error_is_not_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    subprocess.run(command, timeout=60)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "tests/test_example.py", line 12, in test_case
+    raise RuntimeError("validation harness failed") from error
+RuntimeError: validation harness failed
+"""
+        self.assertFalse(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+    def test_terminal_timeout_after_runtime_error_stays_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    raise RuntimeError("earlier failure")
+RuntimeError: earlier failure
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "tests/test_example.py", line 12, in test_case
+    subprocess.run(command, timeout=60)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+"""
+        self.assertTrue(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+    def test_runtime_error_merely_mentioning_timeout_is_not_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    raise RuntimeError("subprocess.TimeoutExpired was expected")
+RuntimeError: subprocess.TimeoutExpired was expected
+"""
+        self.assertFalse(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
 
 
 class ValidationTimeoutStationOutcome(unittest.TestCase):
@@ -128,7 +171,8 @@ class ValidationTimeoutStationOutcome(unittest.TestCase):
 
 
 class ValidationTimeoutRunnerOutcome(unittest.TestCase):
-    def _run_validation_failure(self, *, mixed_failure=False, changed_test=False):
+    def _run_validation_failure(self, *, mixed_failure=False, changed_test=False,
+                                error_tail=""):
         import test_run_lane as fixtures
 
         helper = fixtures.LaneRunnerTest(methodName="runTest")
@@ -144,6 +188,7 @@ class ValidationTimeoutRunnerOutcome(unittest.TestCase):
         output = ("ERROR: test_case (test_example.Example.test_case)\n"
                   "Traceback (most recent call last):\n"
                   "subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds")
+        output += error_tail
         if mixed_failure:
             output += "\nFAIL: test_other (test_example.Example.test_other)\nAssertionError: mismatch"
         check = ("from pathlib import Path\nimport sys\n"
@@ -189,6 +234,17 @@ class ValidationTimeoutRunnerOutcome(unittest.TestCase):
         log = self._run_validation_failure(changed_test=True)
         self.assertIn("failed: [work] validation failed: the check exited 1", log)
         self.assertNotIn("failed: [transient]", log)
+
+    def test_final_validation_keeps_terminal_runtime_error_as_work(self):
+        tail = ("\n\nThe above exception was the direct cause of the following exception:\n\n"
+                "Traceback (most recent call last):\n"
+                "  File \"tests/test_example.py\", line 12, in test_case\n"
+                "    raise RuntimeError(\"validation harness failed\") from error\n"
+                "RuntimeError: validation harness failed")
+        log = self._run_validation_failure(error_tail=tail)
+        self.assertIn("failed: [work] validation failed: the check exited 1", log)
+        self.assertNotIn("failed: [transient]", log)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ from pathlib import Path
 
 ERROR = re.compile(r"^ERROR: (.+)$", re.MULTILINE)
 TEST_MODULE = re.compile(r"\(([A-Za-z_][A-Za-z0-9_.]*)\)")
+EXCEPTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):", re.MULTILINE)
 
 
 def only_untouched_test_timeouts(output: str, changed_paths: set[str],
@@ -19,9 +20,14 @@ def only_untouched_test_timeouts(output: str, changed_paths: set[str],
         return False
     sections = [output[match.start():failures[i + 1].start() if i + 1 < len(failures)
                        else len(output)] for i, match in enumerate(failures)]
-    if "FAIL:" in output or any("subprocess.TimeoutExpired" not in section
-                                for section in sections):
+    if "FAIL:" in output:
         return False
+    # AI-REVIEW 2026-11-11 [gpt-6.1-sol] R4 (PR #3019): a timeout cause
+    # must not hide the terminal error of a chained traceback.
+    for section in sections:
+        exceptions = EXCEPTION.findall(section)
+        if not exceptions or exceptions[-1] != "subprocess.TimeoutExpired":
+            return False
     modules = []
     for failure in failures:
         match = TEST_MODULE.search(failure.group(1))
