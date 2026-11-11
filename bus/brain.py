@@ -1303,6 +1303,13 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
     base = str((pr.get("base") or {}).get("ref") or "")
     if not base or not default_branch or base == default_branch:
         return ""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-stack:
+    # Keep declared-parent handling separate from branch-parent lookup.
+    return _branch_stack_blocker(gh, repo, pr, base)
+
+
+def _branch_stack_blocker(gh: GitHub, repo: str, pr: Dict[str, Any], base: str) -> str:
+    """Check open and merged parents of a non-default base branch."""
     owner = repo.partition("/")[0]
     path = "/repos/%s/pulls?state=open&head=%s:%s" % (
         repo, owner, quote(base, safe=""))
@@ -3824,6 +3831,14 @@ def _builds_on_base(gh: GitHub, repo: str, body: str,
     return head
 
 
+def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
+                env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Prefer a declared stack base, then the goal's default trunk."""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-brief-delta:
+    # Isolate the new choice without expanding the existing brief coordinator.
+    return _builds_on_base(gh, repo, body, env) or goal_trunk(goal_issue)
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
@@ -3940,7 +3955,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     else:
         raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        base = _builds_on_base(gh, repo, body, env) or goal_trunk(goal_issue)
+        base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,

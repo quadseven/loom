@@ -2928,44 +2928,11 @@ class Factory:
             return
         number = int(pr["number"])
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
-        # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C4:
-        # Advisory linking failure cannot stop independent PR judgment.
-        try:
-            self._link_stack_for(repo, full)
-        except GitHubError as err:
-            note = "Could not link stack for pull request #%d; judgment continues" % number
-            # AI-REVIEW 2026-11-11 [codex/in-process/review] 2956-C4-report:
-            # Optional reporting must not turn an advisory error into a gate.
-            try:
-                if not any(note in str(c.get("body") or "")
-                           for c in self._comments(repo, int(issue["number"]))):
-                    self._status_note(repo, int(issue["number"]), note)
-                    _say("%s: %s" % (note, err))
-            except GitHubError as report_error:
-                _say("%s; stack error: %s; status unavailable: %s" % (note, err, report_error))
-        overlap = None
-        if not brain.BUILDS_ON_RE.search(str(full.get("body") or "")):
-            overlap = overlapping_peer(self.gh, repo, full,
-                                       self._overlap_candidates(repo, full, tickets))
-        if overlap is not None:
-            reason = "overlaps pull request #%d" % overlap
-            if (repo, overlap) in self._overlap_unknown:
-                reason += " (health clock unavailable; no expiry inferred)"
-            key = "%s#%d" % (repo, int(issue["number"]))
-            if self.known_waits.get(key) != reason:
-                self._status_note(repo, int(issue["number"]), "wait:gate: " + reason)
-            labels = [label for label in _labels(issue) if not label.startswith("wait:")]
-            if "wait:gate" not in _labels(issue):
-                self._relabel(repo, issue, labels + ["wait:gate"])
-            self._wait_said(repo, issue["number"], reason,
-                            "held %s#%d: overlaps pull request #%d"
-                            % (repo, number, overlap))
+        # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-pull:
+        # Separate advisory linking and reversible waits from review judgment.
+        self._link_stack_advisory(repo, number, full, issue)
+        if self._wait_for_overlap(repo, number, full, issue, tickets):
             return
-        key = "%s#%d" % (repo, int(issue["number"]))
-        if ("wait:gate" in _labels(issue)
-                and self.known_waits.get(key, "").startswith("overlaps pull request #")):
-            self._relabel(repo, issue, [label for label in _labels(issue) if label != "wait:gate"])
-            self._status_note(repo, int(issue["number"]), "overlap hold released: its older peer no longer blocks")
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
@@ -2987,6 +2954,66 @@ class Factory:
                 and self.now - ended <= REVIEW_GRACE):
             return  # the review the lane asked for has not answered yet
         self._judge(repo, number, full, issue, comments, review, sensitive)
+
+    def _link_stack_advisory(self, repo: str, number: int, full: Dict[str, Any],
+                             issue: Dict[str, Any]) -> None:
+        """Link if possible; optional API and reporting failures do not gate review."""
+        # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C4:
+        # Advisory linking failure cannot stop independent PR judgment.
+        try:
+            self._link_stack_for(repo, full)
+        except GitHubError as err:
+            self._note_stack_failure(repo, number, issue, err)
+
+    def _note_stack_failure(self, repo: str, number: int, issue: Dict[str, Any],
+                            err: GitHubError) -> None:
+        """Record one advisory stack failure, falling back to the local log."""
+        note = "Could not link stack for pull request #%d; judgment continues" % number
+        # AI-REVIEW 2026-11-11 [codex/in-process/review] 2956-C4-report:
+        # Optional reporting must not turn an advisory error into a gate.
+        try:
+            if not any(note in str(c.get("body") or "")
+                       for c in self._comments(repo, int(issue["number"]))):
+                self._status_note(repo, int(issue["number"]), note)
+                _say("%s: %s" % (note, err))
+        except GitHubError as report_error:
+            _say("%s; stack error: %s; status unavailable: %s" % (note, err, report_error))
+
+    def _wait_for_overlap(self, repo: str, number: int, full: Dict[str, Any],
+                          issue: Dict[str, Any], tickets: Dict[int, Dict[str, Any]]) -> bool:
+        """Start or release the overlap wait before ordinary PR judgment."""
+        overlap = None
+        if not brain.BUILDS_ON_RE.search(str(full.get("body") or "")):
+            overlap = overlapping_peer(self.gh, repo, full,
+                                       self._overlap_candidates(repo, full, tickets))
+        if overlap is not None:
+            self._hold_overlap(repo, number, issue, overlap)
+            return True
+        self._release_overlap(repo, issue)
+        return False
+
+    def _hold_overlap(self, repo: str, number: int, issue: Dict[str, Any], overlap: int) -> None:
+        """Name an older eligible peer once and retain the overlap gate."""
+        reason = "overlaps pull request #%d" % overlap
+        if (repo, overlap) in self._overlap_unknown:
+            reason += " (health clock unavailable; no expiry inferred)"
+        key = "%s#%d" % (repo, int(issue["number"]))
+        if self.known_waits.get(key) != reason:
+            self._status_note(repo, int(issue["number"]), "wait:gate: " + reason)
+        labels = [label for label in _labels(issue) if not label.startswith("wait:")]
+        if "wait:gate" not in _labels(issue):
+            self._relabel(repo, issue, labels + ["wait:gate"])
+        self._wait_said(repo, issue["number"], reason,
+                        "held %s#%d: overlaps pull request #%d"
+                        % (repo, number, overlap))
+
+    def _release_overlap(self, repo: str, issue: Dict[str, Any]) -> None:
+        """Remove only an overlap gate after its peer stops blocking."""
+        key = "%s#%d" % (repo, int(issue["number"]))
+        if ("wait:gate" in _labels(issue)
+                and self.known_waits.get(key, "").startswith("overlaps pull request #")):
+            self._relabel(repo, issue, [label for label in _labels(issue) if label != "wait:gate"])
+            self._status_note(repo, int(issue["number"]), "overlap hold released: its older peer no longer blocks")
 
     def _overlap_candidates(self, repo: str, pr: Dict[str, Any],
                             tickets: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3015,17 +3042,25 @@ class Factory:
         failed = [run for run in runs if run.get("conclusion") in brain.FAILED_CONCLUSIONS]
         if not failed and full.get("mergeable") is not False:
             return False
+        # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-clocks:
+        # Keep health classification separate from clock fallback and validation.
+        clocks = self._overlap_clocks(repo, number, sha, failed, full.get("mergeable") is False)
+        return bool(clocks) and self.now - min(clocks) >= STUCK_AGE
+
+    def _overlap_clocks(self, repo: str, number: int, sha: str,
+                        failed: List[Dict[str, Any]], conflict: bool) -> Optional[List[float]]:
+        """Read valid health clocks, preserving an explicit unknown-clock hold."""
         clocks = [_ts(run.get("completed_at")) for run in failed]
         valid = [clock for clock in clocks if 0 < clock <= self.now]
-        if full.get("mergeable") is False or len(valid) != len(failed):
+        if conflict or len(valid) != len(failed):
             commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, sha)).data or {}
             clock = _ts(((commit.get("commit") or {}).get("committer") or {}).get("date"))
             if 0 < clock <= self.now:
                 valid.append(clock)
             else:
                 self._overlap_unknown.add((repo, number))
-                return False
-        return bool(valid) and self.now - min(valid) >= STUCK_AGE
+                return None
+        return valid
 
     def _link_stack_for(self, repo: str, pr: Dict[str, Any]) -> None:
         """Link a newly opened pull request to the pull request it builds on."""
@@ -3040,17 +3075,24 @@ class Factory:
         ref = str((pr.get("base") or {}).get("ref") or "")
         # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C2:
         # A fork's trunk-named head is not a local stack base.
+        # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-link:
+        # Name the trusted-parent predicate instead of nesting it in the scan.
         base = next((int(item["number"]) for item in self._open_pull_requests(repo)
-                     if self._is_lane_pr(item)
-                     and ((item.get("head") or {}).get("repo") or {}).get("full_name") == repo
-                     and int(item.get("number") or 0) != upper
-                     and (int(item["number"]) == declared if declared is not None
-                          else str((item.get("head") or {}).get("ref") or "") == ref)), None)
+                     if self._stack_base_matches(repo, item, upper, declared, ref)), None)
         if base is None:
             self._stack_checked.add(key)
             return
         link_stack(self.gh, repo, base, upper)
         self._stack_checked.add(key)
+
+    def _stack_base_matches(self, repo: str, item: Dict[str, Any], upper: int,
+                            declared: Optional[int], ref: str) -> bool:
+        """Require a distinct trusted local parent matching the declaration or base."""
+        return (self._is_lane_pr(item)
+                and ((item.get("head") or {}).get("repo") or {}).get("full_name") == repo
+                and int(item.get("number") or 0) != upper
+                and (int(item["number"]) == declared if declared is not None
+                     else str((item.get("head") or {}).get("ref") or "") == ref))
 
     def _judge(self, repo: str, number: int, full: Dict[str, Any], issue: Dict[str, Any],
                comments: List[Dict[str, Any]], review: str, sensitive: bool = False) -> None:
