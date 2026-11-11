@@ -219,6 +219,14 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
         name = LANES_APP.get(name, name)
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
             out[name] = str(value)
+    if slot in OPENCODE_GO_SLOTS and not out.get(OPENCODE_GO_KEY_SSM):
+        # run_lane.sh reads a lane's key setting slot first, then provider,
+        # so a slot may name its key only as LOOM_<SLOT>_KEY_SSM. The
+        # dispatch guard and the runner job read the provider name, so
+        # carry the slot's own name under it as well.
+        own = out.get(_prefix(slot) + "KEY_SSM")
+        if own:
+            out[OPENCODE_GO_KEY_SSM] = own
     return dict(sorted(out.items()))
 
 
