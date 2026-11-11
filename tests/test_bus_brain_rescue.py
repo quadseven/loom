@@ -84,7 +84,7 @@ class ClosedEpicRescueTests(unittest.TestCase):
         self.assertEqual(fake.issues[21]["body"], "## Why\nwhy\n\nPart of #%d\n" % made)
         self.assertEqual(fake.issues[22]["body"], "## Why\nwhy\n\nPart of #%d\n" % made)
 
-    def test_the_rescue_does_not_open_a_second_epic_past_the_bound(self):
+    def test_the_rescue_opens_a_second_epic_when_the_first_rescue_epic_is_full(self):
         # Seven open epics: one past the cap already, its intake epic full.
         # Two stranded tickets open one further rescue epic, not two.
         fake = self.cap_repo(open_epics=brain.GOAL_EPIC_CAP)
@@ -100,6 +100,12 @@ class ClosedEpicRescueTests(unittest.TestCase):
             ("POST", "/repos/%s/issues/%d/sub_issues" % (REPO, opened[0]),
              {"sub_issue_id": 1022, "replace_parent": True}),
         ])
+
+    def test_the_rescue_does_not_open_past_the_ceiling(self):
+        # At cap + RESCUE_EPIC_EXTRA open epics: no further rescue epic opens.
+        fake = self.cap_repo(open_epics=brain.GOAL_EPIC_CAP - 1 + brain.RESCUE_EPIC_EXTRA)
+        self.assertEqual(self.move(fake), (0, 2))
+        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
 
     def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
         fake = self.cap_repo()

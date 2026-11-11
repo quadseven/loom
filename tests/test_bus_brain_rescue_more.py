@@ -77,6 +77,50 @@ class ClosedEpicRescueMoreTests(unittest.TestCase):
         self.assertEqual(opened, [])
         self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
 
+    def test_goal_at_cap_with_room_in_intake_opens_area_epic_for_stranded_area_ticket(self):
+        # Goal at open-epic cap (6 epics):
+        # - intake epic #60 has room (0 tickets)
+        # - area epic #70 for "stability" is full (15 tickets)
+        # - 4 plain open epics
+        # Closed epic #20 holds stranded area ticket #21 (area:stability).
+        fake = OutsideEpicRepo()
+        fake.labels = [{"name": "area:stability", "description": "Service stability"}]
+        add_epic(fake, 60, brain.INTAKE_TITLE, tickets=[])
+        held_area = [add_ticket(fake, 700 + n, 70) for n in range(brain.EPIC_TICKET_CAP)]
+        add_epic(fake, 70, "Epic: stability", tickets=held_area)
+        fake.issues[70]["labels"].append({"name": "area:stability"})
+        for n in range(brain.GOAL_EPIC_CAP - 2):
+            add_epic(fake, 31 + n, "Epic: plain %d" % (31 + n))
+
+        add_epic(fake, 20, "Epic: closed work", state="closed",
+                 tickets=[add_ticket(fake, 21, 20)])
+        fake.issues[21]["labels"].append({"name": "area:stability"})
+        fake.open_tickets = [fake.issues[21]]
+
+        before = set(fake.issues)
+        self.assertEqual(self.move(fake), (1, 0))
+        opened = [n for n in fake.subs[1] if n not in before and n != 60]
+        self.assertEqual(len(opened), 1)
+        self.assertIn("area:stability", [l["name"] for l in fake.issues[opened[0]]["labels"]])
+        self.assertEqual(fake.subs[opened[0]], [21])
+
+    def test_refused_link_opens_no_further_epic_on_second_pass(self):
+        fake = self.full_epics_repo()
+        add_epic(fake, 20, "Epic: closed work", state="closed",
+                 tickets=[add_ticket(fake, 721, 20)])
+        fake.open_tickets = [fake.issues[721]]
+
+        before_pass1 = set(fake.issues)
+        with unittest.mock.patch.object(brain, "_move_to_epic", return_value=False):
+            self.assertEqual(self.move(fake), (0, 1))
+            opened_pass1 = [n for n in fake.subs[1] if n not in before_pass1 and n not in (60, 61)]
+            self.assertEqual(len(opened_pass1), 1)
+
+            before_pass2 = set(fake.issues)
+            self.assertEqual(self.move(fake), (0, 1))
+            opened_pass2 = [n for n in fake.subs[1] if n not in before_pass2]
+            self.assertEqual(opened_pass2, [])
+
 
 if __name__ == "__main__":
     unittest.main()
