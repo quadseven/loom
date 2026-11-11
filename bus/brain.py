@@ -2339,13 +2339,13 @@ def _goal_epics(gh: GitHub, repo: str, goal: int,
     """The goal's epics, open and closed: its sub-issues labelled epic, plus
     the repo's epics whose body says Part of #goal (one list read per walk)."""
     epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
-    seen = {int(e.get("number") or 0) for e in epics}
+    seen = {_issue_key(e, repo) for e in epics}
     for item in gh.paginate("/repos/%s/issues?labels=epic&state=all&per_page=100" % repo):
         number = int((item or {}).get("number") or 0) if isinstance(item, dict) else 0
-        if (number and number not in seen and number != goal and "pull_request" not in item
-                and _names_goal(item.get("body"), goal)):
+        if (number and (repo, number) not in seen and number != goal
+                and "pull_request" not in item and _names_goal(item.get("body"), goal)):
             epics.append(item)
-            seen.add(number)
+            seen.add((repo, number))
     return epics
 
 
@@ -2368,6 +2368,13 @@ def _epic_repo(epic: Dict[str, Any], repo: str) -> str:
     return repo
 
 
+def _issue_key(issue: Dict[str, Any], repo: str) -> Tuple[str, int]:
+    """(repository, number) of an issue, the repository as _epic_repo reads
+    it, so two issues that share a number in different repositories differ
+    (#2972)."""
+    return _epic_repo(issue, repo), int(issue.get("number") or 0)
+
+
 def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
               warnings: Optional[List[str]] = None
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
@@ -2383,9 +2390,9 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
     list per issue with every body (loom#2461)."""
     direct = _direct_children(gh, repo, goal, light)
     epics = _goal_epics(gh, repo, goal, direct)
-    epic_numbers = {int(e.get("number") or 0) for e in epics}
+    epic_keys = {_issue_key(e, repo) for e in epics}
     loose = [c for c in direct if isinstance(c, dict)
-             and int(c.get("number") or 0) not in epic_numbers]
+             and _issue_key(c, repo) not in epic_keys]
     if not epics:
         return loose, []
     open_tickets = [i for i in gh.paginate(
@@ -2409,7 +2416,8 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
                                                    % (_epic_repo(epic, repo),
                                                       int(epic.get("number") or 0))), epics)
     for epic, sub in zip(epics, subs, strict=True):
-        tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
+        tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets,
+                                         _epic_repo(epic, repo), repo)))
     return loose, tree
 
 
@@ -2434,7 +2442,7 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     On 2026-11-02 those reads were 2.1 MB of the 7.5 MB a resume of 19 repos
     moved."""
     listed = _issues(gh, repo)
-    epics = _open_goal_epics(_sub_issue_tickets(gh, repo, [goal])[goal], listed, goal)
+    epics = _open_goal_epics(_sub_issue_tickets(gh, repo, [goal])[goal], listed, goal, repo)
     wanted = [e for e in epics if not standing_epic(e)]
     if not wanted:
         return [(epic, []) for epic in epics]
@@ -2451,23 +2459,24 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     for epic in epics:
         n = int(epic.get("number") or 0)
         key = (_epic_repo(epic, repo), n)
-        tree.append((epic, _tree_tickets(n, subs[key], open_tickets) if key in subs else []))
+        tree.append((epic, _tree_tickets(n, subs[key], open_tickets, key[0], repo)
+                     if key in subs else []))
     return tree
 
 
-def _open_goal_epics(direct: Sequence[Any], listed: Sequence[Dict[str, Any]], goal: int
-                     ) -> List[Dict[str, Any]]:
+def _open_goal_epics(direct: Sequence[Any], listed: Sequence[Dict[str, Any]], goal: int,
+                     repo: str = "") -> List[Dict[str, Any]]:
     """The goal's open epics: its sub-issues labelled epic, then the open
     epics of the repo's open issue listing whose body says Part of #goal,
     each once, as _goal_epics finds them but without the closed ones."""
     epics = [c for c in direct if isinstance(c, dict) and _epic_label(c)]
-    seen = {int(e.get("number") or 0) for e in epics}
+    seen = {_issue_key(e, repo) for e in epics}
     for item in listed:
         number = int(item.get("number") or 0) if isinstance(item, dict) else 0
-        if (number and number not in seen and number != goal and _epic_label(item)
+        if (number and (repo, number) not in seen and number != goal and _epic_label(item)
                 and _names_goal(item.get("body"), goal)):
             epics.append(item)
-            seen.add(number)
+            seen.add((repo, number))
     return [e for e in epics if e.get("state", "open") == "open"]
 
 
@@ -2583,24 +2592,36 @@ def _rest_issue(node: Dict[str, Any]) -> Dict[str, Any]:
             "labels": [{"name": x.get("name")} for x in labels if isinstance(x, dict)]}
 
 
-def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]]
+def _tree_tickets(number: int, sub: Sequence[Any], open_tickets: Sequence[Dict[str, Any]],
+                  epic_repo: Optional[str] = None, repo: Optional[str] = None
                   ) -> List[Dict[str, Any]]:
     """The epic's sub-issues, then the open tickets whose Part of line names
     it that are not already among them. A ticket GitHub records as another
     issue's sub-issue belongs to that parent, so a Part of line left naming
     this epic is stale and does not count: two open sub-issues of an open
     epic were reported as stranded under a closed one whose number their
-    bodies still named (loom#2767, loom#1713)."""
+    bodies still named (#2767, #1713).
+
+    epic_repo is the repository the epic lives in and repo the repository of
+    the open tickets (the goal's own). A Part of line names an issue of the
+    ticket's own repository, so an epic elsewhere takes no ticket by it, and
+    a sub-issue parent counts only when its repository and number both name
+    the epic; without them every issue is read as one repository's
+    (#2972)."""
+    here = epic_repo or repo or ""
     tickets_ = [c for c in sub if isinstance(c, dict)]
-    seen = {int(c.get("number") or 0) for c in tickets_}
+    seen = {_issue_key(c, here) for c in tickets_}
+    if epic_repo is not None and repo is not None and epic_repo != repo:
+        return tickets_
     for item in open_tickets:
         n = int(item.get("number") or 0)
-        parent = _sub_issue_parent(item)
-        if parent is not None and parent != number:
+        parent = _sub_issue_parent_ref(item)
+        if parent is not None and (parent[1] != number
+                                   or (parent[0] and here and parent[0] != here)):
             continue
-        if n and n not in seen and _names_goal(item.get("body"), number):
+        if n and _issue_key(item, repo or "") not in seen and _names_goal(item.get("body"), number):
             tickets_.append(item)
-            seen.add(n)
+            seen.add(_issue_key(item, repo or ""))
     return tickets_
 
 
@@ -3412,6 +3433,14 @@ def _sub_issue_parent(issue: Dict[str, Any]) -> Optional[int]:
     """The number of the issue's sub-issue parent, from parent_issue_url."""
     match = re.search(r"/issues/(\d+)(?:[/?#]|$)", str(issue.get("parent_issue_url") or ""))
     return int(match.group(1)) if match else None
+
+
+def _sub_issue_parent_ref(issue: Dict[str, Any]) -> Optional[Tuple[str, int]]:
+    """(repository, number) of the issue's sub-issue parent, from
+    parent_issue_url; the repository is empty when the URL names none."""
+    match = re.search(r"(?:/repos/([^/]+/[^/]+))?/issues/(\d+)(?:[/?#]|$)",
+                      str(issue.get("parent_issue_url") or ""))
+    return (match.group(1) or "", int(match.group(2))) if match else None
 
 
 def _link_to_goal(gh: GitHub, repo: str, goal: int, issue: Dict[str, Any],
