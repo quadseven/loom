@@ -2199,6 +2199,17 @@ which that runner could never clear: the station retries the ticket on
 another lane as a transient ending, and that lane holds it if the base is
 red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
+A base command that fails once and passes unchanged on its whole-command retry
+also appends one private event to `logs/<slot>/<ticket>.base-flakes.jsonl`.
+It contains an occurrence ID and timestamp, the repo and base commit, the
+command, first exit code, and the first-run output tail (at most 4096 UTF-8
+bytes and 20 lines). Failed retries, interrupted or unavailable checks, and
+retries that change tracked files do not produce a flake event. A sidecar
+write failure is logged and does not fail the lane. Existing encrypted runner
+reports carry this sidecar back beside validation records; local lanes already
+write it in the shared home. These events do not yet count flakes or file
+tickets: the shared counter and safe publication are separate follow-up work.
+
 Each base check row in the validation record names what failed in its
 `detail`: the tests the check reported, a tool the shell could not find
 (`missing make`), else the check's last line. The record travels in the

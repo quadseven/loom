@@ -1,4 +1,5 @@
 """Whole-command baseline retry evidence, without live commands."""
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -16,9 +17,14 @@ class BaseRetryEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "check-dir").mkdir()
+            helper = re.search(r"^record_base_flake\(\) \{[^\n]*\n.*?^\}\n", source, re.S | re.M)
             script = r'''
 set -u
 LOG="$ROOT/run.log"
+REPO=example/project
+TICKET=fixture-1
+LOOM_ROOT="$SOURCE_ROOT"
+[ "$MODE" != write-failed ] || mkdir "$ROOT/run.base-flakes.jsonl"
 CALLS="$ROOT/calls"
 CHECK_HOME="$ROOT/check-home"
 TREE="$ROOT"
@@ -64,6 +70,9 @@ flaky() {
   [ "$CHECK_STATE" = kept ] && [ "$PWD" = "$ROOT/check-dir" ] || return 9
   if [ "$MODE" = permanent ] || { [ "$MODE" != green ] && [ ! -e "$ROOT/failed-once" ]; }; then
     : > "$ROOT/failed-once"
+    if [ "$MODE" = long-line ]; then
+      printf '%10000s\n' x
+    fi
     if [ "$MODE" = flake ]; then
       for i in {1..25}; do printf 'first-output-%02d\n' "$i"; done
     fi
@@ -86,12 +95,17 @@ result=$?
 printf '%s' "$result" > "$ROOT/result"
 exit 0
 '''
-            result = subprocess.run(["/bin/bash", "-c", match.group(0) + script],
-                                    env={"PATH": "/usr/bin:/bin", "ROOT": str(root), "MODE": mode},
+            functions = (helper.group(0) if helper else "") + match.group(0)
+            result = subprocess.run(["/bin/bash", "-c", functions + script],
+                                    env={"PATH": "/usr/bin:/bin", "ROOT": str(root),
+                                         "MODE": mode, "SOURCE_ROOT": str(ROOT)},
                                     capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stderr, "", "fixture must not hide shell errors")
-            return {"calls": (root / "calls").read_text().splitlines(),
+            event_file = root / "run.base-flakes.jsonl"
+            events = ([json.loads(line) for line in event_file.read_text().splitlines()]
+                      if event_file.is_file() else [])
+            return {"events": events, "calls": (root / "calls").read_text().splitlines(),
                     "log": (root / "run.log").read_text(),
                     "result": (root / "result").read_text(),
                     "incidents": (root / "incidents").read_text().splitlines()
