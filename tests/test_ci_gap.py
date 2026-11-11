@@ -108,6 +108,19 @@ class CoverageTest(unittest.TestCase):
                          "check: make lint && make t")
         self.assertEqual(ci_gap.suggestion("make t", [], {"check": "true"}), "check: make t")
 
+    def test_build_after_external_workspace_setup_is_not_runnable_in_module_lane(self):
+        workflow = """jobs:\n  build:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: example/core\n      - uses: actions/checkout@v4\n        with:\n          path: modules/target\n      - name: Configure\n        run: cmake -S . -B build\n      - name: Build\n        run: cmake --build build --target target_tests\n"""
+        steps = [
+            {"name": "Configure", "conclusion": "success"},
+            {"name": "Build", "conclusion": "failure"},
+        ]
+        gh = SetupGh(steps)
+        gh.workflow = workflow
+        gaps = ci_gap.find_gaps(gh, "example/target", 7, "a" * 40,
+                                {"check": "true"}, [dict(RunnerSetupTest.RUN)], lambda: [])
+        self.assertEqual(gaps, [])
+        self.assertIn("workspace/configuration", ci_gap.unsupported_context_notes(gh))
+
 
 SETUP_WORKFLOW = """name: adapter
 on:
