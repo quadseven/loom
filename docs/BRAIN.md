@@ -2344,6 +2344,17 @@ other item a literal or one whole placeholder (`{source}`, `{since}`,
 `{since_epoch}`, `{needle}`; `{sql}`). The command prints matching lines or
 rows, and may print `loom-evidence-window-hours: N` (log read in full) and
 `loom-evidence-count: N` (matches counted); it exits 0, or 1 for no match.
+A log adapter may additionally print both `loom-evidence-observed-start: TIMESTAMP`
+and `loom-evidence-observed-end: TIMESTAMP` (ISO 8601 with a time zone): the
+first and last timestamp of the whole log read, before filtering matches.
+Loom uses the smaller of the claimed hours and this span, limited to the deploy
+through now, for each absence check independently. The station's proof record
+still uses deploy-to-now; carrying actual coverage into that record is separate
+follow-up work.
+Missing, malformed, reversed or duplicate boundaries give no answer. An adapter
+emitting neither boundary retains the legacy hours-only contract: Loom cannot
+verify that claim from matching lines, including an empty match set. Existing
+adapters must emit the two boundaries to gain the actual-window check.
 A Live line names a step in a templated form: `log:<source>` with the strings
 that must appear in that log since the ship (or, worded as absent, must not
 appear over the window named, which the adapter must say it read), or

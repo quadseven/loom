@@ -90,11 +90,14 @@ class Answer(NamedTuple):
     the lines it printed (None when it gave no answer, with `error` saying
     why), the hours of log it says it read (`loom-evidence-window-hours:`),
     and the matches it says it counted (`loom-evidence-count:`), each None
-    when it said nothing."""
+    when it said nothing. Optional observed_start/end are the epoch timestamps
+    of the first and last lines of the whole log read, not just its matches."""
     lines: Optional[List[str]]
     hours: Optional[float] = None
     count: Optional[int] = None
     error: str = ""
+    observed_start: Optional[float] = None
+    observed_end: Optional[float] = None
 
 
 class Sources(NamedTuple):
@@ -287,14 +290,35 @@ def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
     if answer.hours is None:
         return False, ("the `%s` log adapter did not say how much log it read, so "
                        "`%s` cannot be shown absent" % (step.source, needle))
-    if answer.hours + 1e-6 < needed:
-        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
-                       "needed to show `%s` absent" % (step.source, answer.hours, needed, needle))
     if count or lines:
         return False, "the `%s` log names `%s` %d times since the deploy%s" % (
             step.source, needle, max(count, len(lines)), _quoted(safe))
+    hours = _covered_hours(answer, since, now)
+    if hours + 1e-6 < needed:
+        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
+                       "needed to show `%s` absent" % (step.source, hours, needed, needle))
     return True, "`%s` absent from the `%s` log over the %.1f hours read" % (
-        needle, step.source, answer.hours)
+        needle, step.source, hours)
+
+
+def _covered_window(answer: Answer, since: float, now: float) -> Optional[Tuple[float, float]]:
+    """The adapter's whole-log boundaries, never the timestamps of matches."""
+    if answer.observed_start is None or answer.observed_end is None:
+        return None
+    first = answer.observed_start
+    # Anchor the claimed duration to the actual end before clipping. A
+    # future end must not move a short claimed window into the past.
+    if answer.hours is not None:
+        first = max(first, answer.observed_end - max(0.0, answer.hours) * 3600)
+    return max(since, first), min(now, answer.observed_end)
+
+
+def _covered_hours(answer: Answer, since: float, now: float) -> float:
+    """Bound explicit coverage; preserve the legacy hours-only contract."""
+    window = _covered_window(answer, since, now)
+    if window is None:
+        return max(0.0, answer.hours or 0.0)
+    return max(0.0, (window[1] - window[0]) / 3600)
 
 
 def _quoted(safe: List[str]) -> str:
