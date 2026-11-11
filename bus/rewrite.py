@@ -125,6 +125,7 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "logs are briefs.",
         "Use skip when the issue is unclear, already done, or not a task.",
         "Write plain ASCII text. Do not name people, hostnames, IP addresses or local paths. "
+        "Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise. "
         "Do not write closing keywords such as fixes or closes next to an issue number.",
         "",
         "Brief format:",
