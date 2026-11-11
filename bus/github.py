@@ -390,15 +390,22 @@ def read_ssm(name: str, region: str) -> str:
     executable = shutil.which(configured or "aws")
     if not executable:
         raise AwsCliUnavailable("aws executable not found; set LOOM_AWS_CLI or fix PATH")
-    try:
-        out = subprocess.run(
-            [executable, "ssm", "get-parameter", "--region", region, "--name", name,
-             "--with-decryption", "--query", "Parameter.Value", "--output", "text"],
-            capture_output=True, text=True, timeout=TIMEOUT, env=_proxy_env_for_aws())
-    except subprocess.TimeoutExpired:
-        raise SsmReadError("SSM read timed out after %ds" % TIMEOUT) from None
-    except OSError:
-        raise AwsCliUnavailable("cannot execute aws; check LOOM_AWS_CLI or PATH") from None
+    argv = [executable, "ssm", "get-parameter", "--region", region, "--name", name,
+            "--with-decryption", "--query", "Parameter.Value", "--output", "text"]
+    for attempt in range(2):
+        try:
+            out = subprocess.run(
+                argv, capture_output=True, text=True, timeout=TIMEOUT,
+                env=_proxy_env_for_aws())
+        except subprocess.TimeoutExpired:
+            detail = "SSM read timed out after %ds" % TIMEOUT
+            if attempt:
+                detail += " (retried once)"
+                raise SsmReadError(detail) from None
+        except OSError:
+            raise AwsCliUnavailable("cannot execute aws; check LOOM_AWS_CLI or PATH") from None
+        else:
+            break
     if out.returncode != 0:
         name = ssm_error_name(out.stderr or "")
         raise SsmReadError("could not read the parameter from SSM: aws exited %d%s"
