@@ -2589,11 +2589,28 @@ incident_text_clean() {  # text
   rm -f "$text_file"
   return "$rc"
 }
+# Why a filing failed, for the ticket's hold note and the station's held
+# line, which said only "factory incident filing failed" (#2842): the
+# step, and the first line of its error ($2, a file) with local paths
+# replaced and leak-scanned; a refused scan withholds the line. The station
+# reads it as no incident (HELD_FOR_RE needs "factory incident <owner>/<repo>#N").
+incident_filing_failed() {  # step, error file
+  local line
+  line="$(sed -n '/[^[:space:]]/{p;q;}' "$2" 2>/dev/null | tr -d '\r' | cut -c1-200)"
+  line="$(printf '%s' "$line" |
+    sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g")"
+  [ -n "$line" ] || line="no error text"
+  incident_text_clean "$line" || line="error text withheld"
+  printf 'factory incident filing failed (%s: %s)' "$1" "$line"
+}
 file_factory_incident() {  # kind, detail
-  local kind="$1" detail="$2" title body number existing subject ticket
-  if ! subject="$(incident_subject)"; then
+  local kind="$1" detail="$2" title body number existing subject ticket err
+  err="$(mktemp "${TMPDIR:-/tmp}/loom-incident-err.XXXXXX")" || err=/dev/null
+  if ! subject="$(incident_subject 2>"$err")"; then
+    cat "$err" >> "$LOG" 2>/dev/null
     echo "could not name the incident for a private repo; nothing filed" >> "$LOG"
-    printf 'factory incident filing failed'
+    incident_filing_failed "alias write" "$err"
+    [ "$err" = /dev/null ] || rm -f "$err"
     return 0
   fi
   ticket="$(incident_ticket)"
@@ -2613,10 +2630,12 @@ file_factory_incident() {  # kind, detail
     printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
       --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
-    number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" --label loom:factory 2>>"$LOG" || \
-      gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" 2>>"$LOG")"
+    if ! number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" --label loom:factory 2>"$err")"; then
+      cat "$err" >> "$LOG" 2>/dev/null
+      number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+        --body "$body" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
+    fi
     number="${number##*/}"
     case "$number" in ''|*[!0-9]*) number="" ;; esac
   fi
@@ -2624,8 +2643,9 @@ file_factory_incident() {  # kind, detail
     mkdir -p "$INCIDENT_DIR" && printf '%s\n' "$number" > "$(incident_file "$kind")"
     printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
   else
-    printf 'factory incident filing failed'
+    incident_filing_failed "issue create" "$err"
   fi
+  [ "$err" = /dev/null ] || rm -f "$err"
 }
 
 # File or update the factory incident for the current failure, append its
