@@ -2343,6 +2343,25 @@ def _goal_epics(gh: GitHub, repo: str, goal: int,
     return epics
 
 
+def _epic_repo(epic: Dict[str, Any], repo: str) -> str:
+    """The repo an epic lives in, as the read that listed it names it: its
+    repository_url (ending /repos/OWNER/NAME), else a repository dict's
+    full_name or nameWithOwner, else the goal's own repo. A goal's
+    sub-issues can include an epic from another repo, and reading that
+    epic's sub-issues in the goal's repo answers 404."""
+    url = str(epic.get("repository_url") or "")
+    if "/repos/" in url:
+        found = url.split("/repos/", 1)[1].strip("/")
+        if found.count("/") == 1 and all(found.split("/")):
+            return found
+    home = epic.get("repository")
+    if isinstance(home, dict):
+        found = str(home.get("full_name") or home.get("nameWithOwner") or "")
+        if found.count("/") == 1 and all(found.split("/")):
+            return found
+    return repo
+
+
 def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
               warnings: Optional[List[str]] = None
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
@@ -2383,7 +2402,8 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
                        int(e.get("number") or 0))] for e in epics]
     else:
         subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (repo, int(epic.get("number") or 0))), epics)
+                                                   % (_epic_repo(epic, repo),
+                                                      int(epic.get("number") or 0))), epics)
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
     return loose, tree

@@ -200,6 +200,17 @@ class PickTest(unittest.TestCase):
         picked = muse_build.pick(gh, REPOS)
         self.assertEqual(picked.number, 2)
 
+    def test_pick_skips_a_ticket_released_as_satisfied_elsewhere(self):
+        # The fix shipped in another repo, so no pull request in this repo
+        # names the ticket; the builder's release note is the only record.
+        released = [{"id": 1, "user": {"login": MUSE}, "body": muse_build.RELEASE_MARKER
+                     + "\nReleased by Muse: satisfied elsewhere, the fix shipped in another repo"
+                     "\n\n-- muse"}]
+        gh = FakeGitHub([issue("example/alpha", 1), issue("example/alpha", 2,
+                                                          created="2026-01-05T00:00:00Z")],
+                        comments={("example/alpha", 1): released})
+        self.assertEqual(muse_build.pick(gh, REPOS).number, 2)
+
     def test_pick_skips_a_strangers_ticket_on_a_public_repo(self):
         # Anyone can file an issue on a public repo; an autonomous builder
         # must not take its instructions from a stranger.
