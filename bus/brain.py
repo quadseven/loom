@@ -2368,7 +2368,7 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
         if isinstance(i, dict) and "pull_request" not in i]
     tree = []
     if light:
-        found: Dict[int, List[Dict[str, Any]]] = {}
+        found: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
         grouped: Dict[str, List[int]] = {}
         for epic in epics:
             number = int(epic.get("number") or 0)
@@ -2376,8 +2376,11 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
             epic_repo = home.get("nameWithOwner") or repo
             grouped.setdefault(epic_repo, []).append(number)
         for epic_repo, numbers in grouped.items():
-            found.update(_sub_issue_tickets(gh, epic_repo, numbers, warnings=warnings))
-        subs = [found[int(e.get("number") or 0)] for e in epics]
+            for number, tickets in _sub_issue_tickets(
+                    gh, epic_repo, numbers, warnings=warnings).items():
+                found[(epic_repo, number)] = tickets
+        subs = [found[(((e.get("repository") or {}).get("nameWithOwner") or repo),
+                       int(e.get("number") or 0))] for e in epics]
     else:
         subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
                                                    % (repo, int(epic.get("number") or 0))), epics)
@@ -2408,22 +2411,25 @@ def _finishable_tree(gh: GitHub, repo: str, goal: int
     moved."""
     listed = _issues(gh, repo)
     epics = _open_goal_epics(_sub_issue_tickets(gh, repo, [goal])[goal], listed, goal)
-    wanted = [int(e.get("number") or 0) for e in epics if not standing_epic(e)]
+    wanted = [e for e in epics if not standing_epic(e)]
     if not wanted:
         return [(epic, []) for epic in epics]
     open_tickets = _open_tickets(listed)
     grouped: Dict[str, List[int]] = {}
-    for epic in epics:
-        number = int(epic.get("number") or 0)
-        if number in wanted:
-            home = epic.get("repository") or {}
-            grouped.setdefault(home.get("nameWithOwner") or repo, []).append(number)
-    subs: Dict[int, List[Dict[str, Any]]] = {}
+    for epic in wanted:
+        home = epic.get("repository") or {}
+        grouped.setdefault(home.get("nameWithOwner") or repo, []).append(
+            int(epic.get("number") or 0))
+    subs: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
     for epic_repo, numbers in grouped.items():
-        subs.update(_sub_issue_states(gh, epic_repo, numbers))
-    return [(epic, _tree_tickets(int(epic.get("number") or 0), subs[n], open_tickets)
-             if n in subs else [])
-            for epic, n in ((e, int(e.get("number") or 0)) for e in epics)]
+        for number, states in _sub_issue_states(gh, epic_repo, numbers).items():
+            subs[(epic_repo, number)] = states
+    tree = []
+    for epic in epics:
+        n = int(epic.get("number") or 0)
+        key = ((epic.get("repository") or {}).get("nameWithOwner") or repo, n)
+        tree.append((epic, _tree_tickets(n, subs[key], open_tickets) if key in subs else []))
+    return tree
 
 
 def _open_goal_epics(direct: Sequence[Any], listed: Sequence[Dict[str, Any]], goal: int
@@ -8358,9 +8364,32 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
 
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", _lane_status(gh, lanes_repo, authors),
-                      re.M)
-    return rows
+    body = _lane_status(gh, lanes_repo, authors)
+    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    scorecard = globals().get("scorecard")
+    if scorecard is None:
+        from . import scorecard
+        globals()["scorecard"] = scorecard
+    # A lane the scorecard has demoted takes no build ticket, the same set
+    # the factory reads (bus/scorecard.py): leave it out even where lane
+    # status still prints it as available.
+    demoted = {row["lane"] for row in scorecard.parse_rows(body)
+               if row.get("demoted")}
+    # The station also keeps the demoted set in its scorecard file; read it
+    # where this process can see the station's state directory.
+    home = os.environ.get("LOOM_HOME", "").strip()
+    if home:
+        state = os.path.join(home, "state", "station")
+        if os.path.isdir(state):
+            try:
+                card = scorecard.Scorecard(state, time.time())
+                if card.unreadable:
+                    demoted |= set(rows)
+                else:
+                    demoted |= set(card.demoted())
+            except (OSError, ValueError):
+                pass
+    return [lane for lane in rows if lane not in demoted]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,
