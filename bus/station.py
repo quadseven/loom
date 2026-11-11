@@ -5478,20 +5478,27 @@ class Station:
                 name, "unread" if count is None else count, cap))
         return lines
 
+    def _stated_brief_wait(self, issue: Dict[str, Any],
+                           health: Optional[brief_check.Verdict]) -> bool:
+        """Explicit waits need no remote reads, writes or repeated hold logs."""
+        return health is None and brief_check.settled_brief_wait(issue, self.s.authors)
+
     def _brief_holds(self, repo: str, issue: Dict[str, Any], comments: List[Any]) -> bool:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
         one goes back to the queue with needs:human and one ask, unless its
-        body settles the ask or names a non-person wait. That ticket stays
-        held without a label or comment write. A read the check needs that
-        fails holds the ticket for the next pass. A
-        regression or revert ticket is checked for its cause only: its merged
+        body and labels state a non-person wait. That ticket stays held
+        before remote reads, without a label, comment or repeated log write.
+        A read the check needs that fails holds the ticket for the next pass.
+        Otherwise a regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
         number = int(issue["number"])
         names = _label_names(issue)
         body = str(issue.get("body") or "")
         found = brief_check.health_verdict(body)
+        if self._stated_brief_wait(issue, found):
+            return True
         exempt = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         if found is None and not exempt:
             try:
@@ -5511,9 +5518,6 @@ class Station:
                 return True
         if found is None:
             return False
-        if brief_check.settled_stale_ask(found, body, self.s.authors):
-            _say("%s#%d stays held for stale evidence without another person ask" % (repo, number))
-            return True
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:

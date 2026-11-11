@@ -23,9 +23,10 @@ Before the station hands a ticket to a lane (`check`), it reads:
   the ticket to a verify run. A stale ticket goes back to the queue with
   `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
-  hold it again. A recorded decision by a configured person or a non-person
-  Blocked on section keeps stale work held without another person ask; this
-  does not approve a build or clear an existing hold.
+  hold it again. A recorded decision by a configured person beside blocked
+  or awaiting-live-check, or a non-person Blocked on section, keeps waiting
+  work held before stale-evidence reads; this does not approve a build or
+  clear an existing hold. A Decision alone can still be a decision to build.
 - health: a ticket health intake filed (its health marker), or one whose Why
   names a health finding or the health endpoint, gets no lane until its body
   names the cause, on a `Cause:` line or under `## Cause`. A cause, or a
@@ -635,19 +636,32 @@ def _ask_blocker_text(body: str) -> str:
     return "\n".join(found).strip()
 
 
-def settled_stale_ask(verdict: Verdict, body: str, trusted: Sequence[str]) -> bool:
-    """Keep stale work held without asking a person who has nothing left to decide.
-
-    This does not clear a hold, approve a build, or alter any other gate.
-    A current Blocked on section naming a person still needs that person.
-    """
-    if verdict.kind != STALE:
+def _non_person_event_wait(blocked: str) -> bool:
+    """Only a stated event wait, not no blocker or an issue dependency."""
+    plain = blocked.strip().strip("-* \t.").lower()
+    if not re.search(r"\w", plain) or plain in {"none", "n/a", "nothing", "no blockers", "not blocked"}:
         return False
-    body = _visible_ask_body(body)
+    if SAME_REPO_REF_RE.search(blocked) or REF_RE.search(blocked):
+        return False
+    return not re.search(r"https://github\.com/[\w.-]+/[\w.-]+/(?:issues|pull)/\d+", blocked)
+
+
+def settled_brief_wait(issue: Mapping[str, Any], trusted: Sequence[str]) -> bool:
+    """Recognize an explicit non-person wait without any remote evidence reads.
+
+    A Decision alone may authorize a build, so it settles an ask only beside
+    blocked or awaiting-live-check. A named person blocker still needs that
+    person. Issue dependencies keep their existing open/closed evaluation.
+    This clears no hold and authorizes no build.
+    """
+    body = _visible_ask_body(str(issue.get("body") or ""))
     blocked = _ask_blocker_text(body)
     if re.search(r"(?<![\w.-])@[A-Za-z0-9][\w-]*|\bneeds:[A-Za-z0-9][\w-]*", blocked):
         return False
-    return bool(blocked) or _recorded_ask_decision(body, trusted)
+    names = {str(n.get("name") if isinstance(n, dict) else n)
+             for n in issue.get("labels") or []}
+    return _non_person_event_wait(blocked) or (bool(names & {"blocked", "awaiting-live-check"})
+                                              and _recorded_ask_decision(body, trusted))
 
 
 def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]],

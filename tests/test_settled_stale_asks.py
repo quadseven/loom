@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,8 +17,8 @@ class SettledStaleAsks(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.StationClaim()
 
-    def check(self, extra, body=STALE_REWRITE):
-        issue = ticket(body=body + "\n" + extra)
+    def check(self, extra, body=STALE_REWRITE, labels=None):
+        issue = ticket(body=body + "\n" + extra, **({"labels": labels} if labels else {}))
         fake = self.fixture.routes(issue)
         fake.routes["/repos/%s/issues/124" % REPO] = {"number": 124, "state": "open"}
         fake.routes["/repos/%s/issues/206/timeline" % REPO] = [{
@@ -28,20 +29,48 @@ class SettledStaleAsks(unittest.TestCase):
         held = self.fixture.station(fake)._brief_holds(REPO, issue, [])
         return held, fake
 
-    def assert_held_without_ask(self, extra):
-        held, fake = self.check(extra)
+    def assert_held_without_ask(self, extra, labels=None):
+        held, fake = self.check(extra, labels=labels)
         self.assertTrue(held, "settling a person ask must not authorize a stale build")
         self.assertEqual(fake.writes, [], "keep labels and comments unchanged")
 
     def test_a_recorded_operator_decision_does_not_raise_another_ask(self):
         self.assert_held_without_ask(
             "## Decision (operator %s, 2026-10-26)\nKeep the ticket open for the live result.\n"
-            % OPERATOR)
+            % OPERATOR, labels=("loom:ticket", "blocked"))
 
     def test_the_existing_named_operator_decision_format_is_honoured(self):
         self.assert_held_without_ask(
             "## Decision (%s, 2026-10-26)\nKeep the ticket open for the live result.\n"
-            % OPERATOR)
+            % OPERATOR, labels=("loom:ticket", "awaiting-live-check"))
+
+    def test_a_decision_to_build_with_later_stale_evidence_still_asks(self):
+        held, fake = self.check("## Decision (%s, 2026-10-26)\nBuild option B.\n" % OPERATOR)
+        self.assertTrue(held)
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO,
+                       {"labels": ["needs:human"]}), fake.writes)
+
+    def test_a_stated_wait_uses_no_remote_reads_or_repeated_run_logs(self):
+        issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n")
+        fake = self.fixture.routes(issue)
+        with mock.patch.object(fixtures.station, "_say") as say:
+            for _ in range(2):
+                worker = self.fixture.station(fake)
+                self.assertTrue(worker._brief_holds(REPO, issue, []))
+                self.assertTrue(worker._brief_holds(REPO, issue, []))
+            say.assert_not_called()
+        self.assertEqual(fake.reads, [])
+        self.assertEqual(fake.writes, [])
+
+    def test_closed_dependencies_and_empty_waits_do_not_park_a_fresh_ticket(self):
+        for blocker in ("#123", "None", "N/A", "-", ""):
+            with self.subTest(blocker=blocker):
+                issue = ticket(body="## Acceptance criteria\n- [ ] Build the dependent feature.\n"
+                               "## Blocked on\n%s\n" % blocker)
+                fake = self.fixture.routes(issue)
+                fake.routes["/repos/%s/issues/123" % REPO] = {"number": 123, "state": "closed"}
+                self.assertFalse(self.fixture.station(fake)._brief_holds(REPO, issue, []))
+                self.assertEqual(fake.writes, [])
 
     def test_a_non_person_blocker_does_not_raise_another_ask(self):
         self.assert_held_without_ask(
@@ -72,7 +101,7 @@ class SettledStaleAsks(unittest.TestCase):
         for extra in ("## Blocked on\n", "## Decision (upstream, 2026-10-26)\nKeep it.\n",
                       "## Decision (operator %s, 2026-10-26)\n" % OPERATOR):
             with self.subTest(extra=extra):
-                _, fake = self.check(extra)
+                _, fake = self.check(extra, labels=("loom:ticket", "blocked"))
                 self.assertTrue(any(body == {"labels": ["needs:human"]}
                                     for _, _, body in fake.writes))
 
@@ -85,7 +114,7 @@ class SettledStaleAsks(unittest.TestCase):
                       "## Original issue\n" + decision,
                       "> ## Blocked on\n> The next scheduled event.\n"):
             with self.subTest(extra=extra):
-                _, fake = self.check(extra)
+                _, fake = self.check(extra, labels=("loom:ticket", "blocked"))
                 self.assertTrue(any(body == {"labels": ["needs:human"]}
                                     for _, _, body in fake.writes))
 
