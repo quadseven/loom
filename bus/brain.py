@@ -1296,11 +1296,20 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
             base_pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         except GitHubError:
             return "stacked on #%d (base pull request unreadable)" % number
+        if base_pr.get("merged_at"):
+            return ""
         if base_pr.get("state") == "open":
             return "stacked on #%d" % number
     base = str((pr.get("base") or {}).get("ref") or "")
     if not base or not default_branch or base == default_branch:
         return ""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-stack:
+    # Keep declared-parent handling separate from branch-parent lookup.
+    return _branch_stack_blocker(gh, repo, pr, base)
+
+
+def _branch_stack_blocker(gh: GitHub, repo: str, pr: Dict[str, Any], base: str) -> str:
+    """Check open and merged parents of a non-default base branch."""
     owner = repo.partition("/")[0]
     path = "/repos/%s/pulls?state=open&head=%s:%s" % (
         repo, owner, quote(base, safe=""))
@@ -1311,7 +1320,14 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
     number = next((item.get("number") for item in matches
                    if item.get("number") != pr.get("number")
                    and str((item.get("head") or {}).get("ref") or "") == base), None)
-    return "stacked on #%s" % number if number is not None else "stacked on branch %s" % base
+    if number is not None:
+        return "stacked on #%s" % number
+    closed = gh.paginate("/repos/%s/pulls?state=closed&head=%s:%s" %
+                         (repo, owner, quote(base, safe="")))
+    landed = any(item.get("merged_at")
+                 and str((item.get("head") or {}).get("ref") or "") == base
+                 for item in closed if isinstance(item, dict))
+    return "" if landed else "stacked on branch %s" % base
 
 
 def _add_blocker(line: str, blocker: str) -> str:
@@ -3788,6 +3804,41 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+
+
+def _builds_on_base(gh: GitHub, repo: str, body: str,
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return the trusted same-repo open pull request head named by Builds on."""
+    match = BUILDS_ON_RE.search(body)
+    if not match:
+        return None
+    number = int(match.group(1))
+    pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+    head = (pr.get("head") or {}).get("ref")
+    # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C3:
+    # A brief must never execute an untrusted or fork-provided base.
+    head_data = pr.get("head") or {}
+    authors, briefers = trusted_authors(env), trusted_briefers(env)
+    head_repo = (head_data.get("repo") or {}).get("full_name")
+    if (pr.get("state") != "open" or head_repo != repo
+            or pr.get("draft") or not str(head or "").startswith("loom/")
+            or not tickets.brief_author_trusted(pr, authors, briefers, as_ticket=True)
+            or tickets.owned_elsewhere(pr, authors, briefers) is not None
+            or not isinstance(head, str) or not head):
+        raise ValueError("Builds on #%d must name an open trusted same-repository pull request "
+                         "with a head ref" % number)
+    return head
+
+
+def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
+                env: Optional[Dict[str, str]]) -> Optional[str]:
+    """Prefer a declared stack base, then the goal's default trunk."""
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-brief-delta:
+    # Isolate the new choice without expanding the existing brief coordinator.
+    return _builds_on_base(gh, repo, body, env) or goal_trunk(goal_issue)
+
+
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
@@ -3904,7 +3955,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     else:
         raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        base = goal_trunk(goal_issue)
+        base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
