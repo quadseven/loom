@@ -415,7 +415,8 @@ class PullRequests(Base):
                                           {"name": "loom:pr"}]}
         handler = factory.Factory(Client(), [REPO], NOW)
         with mock.patch.object(handler, "_lane_pr_ticket", return_value=issue), \
-                mock.patch.object(handler, "_link_stack_for"), \
+                mock.patch.object(handler, "_link_stack_for",
+                                   side_effect=GitHubError("stack endpoint unavailable")), \
                 mock.patch.object(handler, "_open_pull_requests", return_value=[]), \
                 mock.patch.object(factory, "overlapping_peer", return_value=51), \
                 mock.patch.object(handler, "_status_note") as note, \
@@ -423,6 +424,23 @@ class PullRequests(Base):
             handler.pull_request(REPO, {"number": 52}, {})
         self.assertEqual(note.call_args.args[2], "wait:gate: overlaps pull request #51")
         self.assertIn("wait:gate", relabel.call_args.args[2])
+
+    def test_untrusted_overlapping_pull_is_not_an_overlap_candidate(self):
+        older = {"number": 51, "user": STRANGER, "head": {"ref": "loom/51-x"},
+                 "base": {"ref": "main"}}
+        newer = {"number": 52, "base": {"ref": "main"}}
+        self.gh.pull(52, 9)
+        handler = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"])
+        with mock.patch.object(handler, "_lane_pr_ticket", return_value={"number": 9}), \
+                mock.patch.object(handler, "_link_stack_for"), \
+                mock.patch.object(handler, "_open_pull_requests", return_value=[older]), \
+                mock.patch.object(factory, "overlapping_peer", return_value=None) as overlap, \
+                mock.patch.object(handler, "_status_note") as note, \
+                mock.patch.object(handler, "_relabel") as relabel:
+            handler.pull_request(REPO, newer, {})
+        self.assertEqual(overlap.call_args.args[3], [])
+        note.assert_not_called()
+        relabel.assert_not_called()
 
     def test_a_disjoint_new_pull_is_not_held(self):
         class Result:
@@ -459,13 +477,26 @@ class PullRequests(Base):
                 return Result()
 
         client = Client()
-        handler = factory.Factory(client, [REPO], NOW)
-        handler._link_stack_for(REPO, {"number": 8, "body": "Builds on #7"})
+        handler = factory.Factory(client, [REPO], NOW, trusted=["alice-example"])
+        base = {"number": 7, "user": ME,
+                "head": {"ref": "loom/base", "repo": {"full_name": REPO}}}
+        with mock.patch.object(handler, "_open_pull_requests", return_value=[base]):
+            handler._link_stack_for(REPO, {"number": 8, "body": "Builds on #7"})
         self.assertEqual(client.calls, [
             ("GET", "/repos/%s/stacks" % REPO, None),
             ("POST", "/repos/%s/stacks" % REPO,
              {"pull_requests": [7, 8]}),
         ])
+
+    def test_fork_with_trunk_named_head_is_not_linked_as_stack_base(self):
+        handler = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"])
+        fork = {"number": 7, "user": ME,
+                "head": {"ref": "loom/trunk", "repo": {"full_name": "fork/example"}}}
+        upper = {"number": 8, "base": {"ref": "loom/trunk"}, "body": ""}
+        with mock.patch.object(handler, "_open_pull_requests", return_value=[fork]), \
+                mock.patch.object(factory, "link_stack") as link:
+            handler._link_stack_for(REPO, upper)
+        link.assert_not_called()
 
     def test_landing_order_places_a_stack_base_before_its_upper_pull(self):
         bottom = {"number": 50, "head": {"ref": "loom/bottom"},

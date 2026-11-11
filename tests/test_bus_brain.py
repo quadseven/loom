@@ -1685,16 +1685,37 @@ class SensitiveResumeTests(unittest.TestCase):
     def test_brief_uses_the_head_of_the_open_pull_request_named_by_builds_on(self):
         body = BODY + "\nBuilds on #8\n"
         fake = Fake(reply(200, goal()),
-                    reply(200, {"number": 8, "state": "open",
-                                "head": {"ref": "loom/base-change"}}),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}),
                     reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}),
                     reply(201, {}))
         brain.brief(GitHub("t", transport=fake), REPO, EPIC,
-                    "Ticket", body, "codex", "hard")
+                    "Ticket", body, "codex", "hard", env=TRUSTED)
         created = [call[2] for call in fake.calls if call[2] and "body" in call[2]]
         self.assertTrue(any("Base: loom/base-change\n" in payload["body"]
                             for payload in created))
+
+    def test_brief_refuses_builds_on_fork_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": "fork/example"}}}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
+
+    def test_brief_refuses_builds_on_untrusted_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": "stranger"},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
 
     def test_brief_remote_lane_on_public_repo_files_queued(self):
         fake = Fake(reply(200, goal()), reply(200, []),
@@ -4254,10 +4275,10 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
         self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
 
-    def test_escalate_keeps_rung_order_when_one_lane_is_at_the_limit(self):
+    def test_escalate_skips_a_lane_that_is_at_its_limit(self):
         from bus import factory
         fake, outcome = self.escalate_with_load({"claude": factory.ONE_LANE_MAX, "codex": 0})
-        self.assertEqual(outcome, "rung 1 claude-sonnet-5-5 on claude")
+        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
         self.assertNotIn("Skipped rung", fake.sent("POST", "/issues/9/comments")[-1]["body"])
 
     def test_escalate_keeps_an_overflowing_rung_when_no_later_lane_is_three_lower(self):

@@ -1628,7 +1628,7 @@ def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
 def _stack_parent(pr: Dict[str, Any], by_head: Dict[str, int],
                   remaining: set) -> Optional[int]:
     """The still-open pull request this pull is based on, if present."""
-    declared = re.search(r"\bBuilds on #([1-9][0-9]*)\b", str(pr.get("body") or ""), re.I)
+    declared = brain.BUILDS_ON_RE.search(str(pr.get("body") or ""))
     base_ref = str((pr.get("base") or {}).get("ref") or "")
     parent = int(declared.group(1)) if declared else (by_head.get(base_ref) if base_ref else None)
     return parent if parent in remaining and parent != int(pr["number"]) else None
@@ -2919,12 +2919,16 @@ class Factory:
             return
         number = int(pr["number"])
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
-        self._link_stack_for(repo, full)
+        try:
+            self._link_stack_for(repo, full)
+        except GitHubError as err:
+            _say("could not link stack for %s#%d: %s" % (repo, number, err))
         overlap = None
-        if not re.search(r"^Builds on #[1-9][0-9]*[ \t]*$",
-                         str(full.get("body") or ""), re.M | re.I):
-            overlap = overlapping_peer(self.gh, repo, full,
-                                       self._open_pull_requests(repo))
+        if not brain.BUILDS_ON_RE.search(str(full.get("body") or "")):
+            overlap = overlapping_peer(
+                self.gh, repo, full,
+                [item for item in self._open_pull_requests(repo)
+                 if self._is_lane_pr(item)])
         if overlap is not None:
             reason = "overlaps pull request #%d" % overlap
             key = "%s#%d" % (repo, int(issue["number"]))
@@ -2964,12 +2968,17 @@ class Factory:
         upper = int(pr.get("number") or 0)
         if upper in self._stack_checked:
             return
-        body_match = re.search(r"^Builds on #([1-9][0-9]*)[ \t]*$",
-                               str(pr.get("body") or ""), re.M | re.I)
+        body_match = brain.BUILDS_ON_RE.search(str(pr.get("body") or ""))
         base = int(body_match.group(1)) if body_match else None
+        open_prs = self._open_pull_requests(repo)
+        trusted_prs = [item for item in open_prs if self._is_lane_pr(item)
+                       and ((item.get("head") or {}).get("repo") or {}).get("full_name") == repo]
+        if base is not None and not any(int(item.get("number") or 0) == base
+                                        for item in trusted_prs):
+            base = None
         if base is None:
             ref = str((pr.get("base") or {}).get("ref") or "")
-            base = next((int(item["number"]) for item in self._open_pull_requests(repo)
+            base = next((int(item["number"]) for item in trusted_prs
                          if int(item.get("number") or 0) != upper
                          and str((item.get("head") or {}).get("ref") or "") == ref), None)
         if base is None:
