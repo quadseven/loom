@@ -1,10 +1,14 @@
 """Host timeouts in unchanged tests are not lane work failures."""
 import unittest
 
-from bus.validation_timeout import only_untouched_test_timeouts
 
 
 class ValidationTimeoutClass(unittest.TestCase):
+    def setUp(self):
+        from bus.validation_timeout import only_untouched_test_timeouts
+
+        self.classify = only_untouched_test_timeouts
+
     def test_only_timeout_errors_in_untouched_test_files_are_transient(self):
         output = """ERROR: test_case (test_example.Example.test_case)
 Traceback (most recent call last):
@@ -12,7 +16,7 @@ Traceback (most recent call last):
     subprocess.run(command, timeout=60)
 subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 """
-        self.assertTrue(only_untouched_test_timeouts(
+        self.assertTrue(self.classify(
             output, {"bus/brain.py"}, {"tests/test_example.py"}))
 
     def test_changed_test_file_is_not_classified_as_transient(self):
@@ -20,7 +24,7 @@ subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 Traceback (most recent call last):
 subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 """
-        self.assertFalse(only_untouched_test_timeouts(
+        self.assertFalse(self.classify(
             output, {"tests/test_example.py"}, {"tests/test_example.py"}))
 
     def test_module_level_timeout_in_a_changed_test_file_is_not_transient(self):
@@ -28,7 +32,7 @@ subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 Traceback (most recent call last):
 subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 """
-        self.assertFalse(only_untouched_test_timeouts(
+        self.assertFalse(self.classify(
             output, {"tests/test_validation_timeout_class.py"},
             {"tests/test_validation_timeout_class.py"}))
 
@@ -38,14 +42,14 @@ subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
 FAIL: test_other (test_example.Example.test_other)
 AssertionError: mismatch
 """
-        self.assertFalse(only_untouched_test_timeouts(
+        self.assertFalse(self.classify(
             output, set(), {"tests/test_example.py"}))
 
     def test_assertion_failure_alone_is_not_transient(self):
         output = """FAIL: test_case (test_example.Example.test_case)
 AssertionError: mismatch
 """
-        self.assertFalse(only_untouched_test_timeouts(
+        self.assertFalse(self.classify(
             output, set(), {"tests/test_example.py"}))
 
 
