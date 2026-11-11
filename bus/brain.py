@@ -2290,9 +2290,9 @@ def _goal_children(gh: GitHub, repo: str, goal: int,
 # holds at most EPIC_TICKET_CAP tickets.
 EPIC_TICKET_CAP = 15
 GOAL_EPIC_CAP = 6
-# A rescue of tickets stranded under a closed epic may open one intake epic
-# past GOAL_EPIC_CAP, and no more: the goal holds at most cap + 1 open epics
-# through rescue, so a full rescue epic blocks the next one.
+# A rescue of tickets stranded under a closed epic may open further intake
+# epics past GOAL_EPIC_CAP while existing rescue epics are full and stranded
+# closed-epic tickets remain (at most ceil(stranded / 15) per pass, loom#2993).
 RESCUE_EPIC_EXTRA = 1
 
 
@@ -2839,12 +2839,25 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
     closing.close(gh, repo, number, note, "completed")
 
 
+def _rescue_allowed(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> bool:
+    """A further rescue epic opens past the goal cap only when every open intake
+    epic of the goal (rescue ones included) is full and at least one open ticket
+    is still stranded under a closed epic (loom#2993)."""
+    intakes = [held for epic, held in tree
+               if epic.get("state", "open") == "open" and is_intake_epic(epic)]
+    if not all(_open_count(held) >= EPIC_TICKET_CAP for held in intakes):
+        return False
+    return bool(_closed_epic_tickets(tree))
+
+
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
                      today: Optional[str] = None, rescue: bool = False) -> None:
     _, tree = goal_tree(gh, repo, goal)
     count = sum(1 for e, _ in tree if e.get("state", "open") == "open" and not standing_epic(e))
     cap = goal_epic_cap(goal_issue, today)
-    if count >= (cap + RESCUE_EPIC_EXTRA if rescue else cap):
+    if count >= cap:
+        if rescue and _rescue_allowed(tree):
+            return
         raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
                          "record a one-time exception on the goal home as "
                          "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
@@ -2858,7 +2871,8 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     line and a Part of #goal line, linked as the goal's sub-issue when GitHub
     allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
     a one-time exception ("Epic cap: N until DATE"), or unless rescue is set,
-    which allows one epic past that cap (RESCUE_EPIC_EXTRA). Returns the issue."""
+    which allows a rescue intake epic past that cap when every open intake epic
+    is full and tickets remain stranded under a closed epic. Returns the issue."""
     title = " ".join(title.split())
     if not title.startswith(EPIC_TITLE_PREFIX) or len(title) > EPIC_TITLE_MAX \
             or not title[len(EPIC_TITLE_PREFIX):].strip():
@@ -2890,8 +2904,8 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
     contracts and adoption file their tickets. The newest, so intake never
     refills an older epic that tickets may since have been moved into
     (2026-10-19: one held 19). room is how many tickets the caller files at
-    once (the parts of a split). rescue lets the new epic open one past the
-    epic cap (file_epic)."""
+    once (the parts of a split). rescue lets the new epic open past the
+    epic cap when intake epics are full (file_epic)."""
     if not 1 <= room <= EPIC_TICKET_CAP:
         raise ValueError("%d tickets do not fit one epic (cap %d)" % (room, EPIC_TICKET_CAP))
     _, tree = goal_tree(gh, repo, goal)
@@ -2973,9 +2987,9 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     open tickets moved to the goal's next intake epic (the epic retains its
     first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left).
 
-    A ticket stranded under a closed epic may open one intake epic past the
-    goal's open epic cap when every intake epic is full (RESCUE_EPIC_EXTRA):
-    the goal at its cap would otherwise strand it for good.
+    Tickets stranded under a closed epic may open further intake epics past the
+    goal's open epic cap when every open intake epic is full, at most
+    ceil(stranded / 15) per pass (loom#2993).
     """
     loose, tree = goal_tree(gh, repo, goal)
     tickets = _tickets_to_move(loose, tree, goal)
@@ -3023,7 +3037,7 @@ def _move_target(gh: GitHub, repo: str, goal: int, ticket: Dict[str, Any],
                  ) -> Tuple[Optional[int], Tuple[Optional[int], int]]:
     """Determine the target epic for a ticket moving into an epic.
     Returns (target, (epic, held)) or (None, state) when no epic can accept it.
-    rescue lets a new epic open one past the goal's epic cap (move_outside_tickets)."""
+    rescue lets a new epic open past the goal's epic cap (move_outside_tickets)."""
     epic, held = state
     area = _ticket_area(areas, ticket)
     if area:
@@ -3146,7 +3160,7 @@ def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
 def _open_intake_epic(gh: GitHub, repo: str, goal: int,
                       exclude: Sequence[int] = (), rescue: bool = False) -> Optional[Tuple[int, int]]:
     """The goal's newest open intake epic with room, opened when none has
-    room and the goal is under its open epic cap (or rescue allows one past
+    room and the goal is under its open epic cap (or rescue allows past
     it), and the tickets it holds; (None, 0) when the goal is at its cap and
     no intake epic has room."""
     try:
