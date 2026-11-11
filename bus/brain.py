@@ -2370,11 +2370,23 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
             found.update(_sub_issue_tickets(gh, epic_repo, numbers, warnings=warnings))
         subs = [found[int(e.get("number") or 0)] for e in epics]
     else:
-        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (repo, int(epic.get("number") or 0))), epics)
+        subs = _read_each(lambda epic: gh.paginate(
+            "/repos/%s/issues/%d/sub_issues?per_page=100"
+            % (_issue_repository(epic, repo), int(epic.get("number") or 0))), epics)
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets)))
     return loose, tree
+
+
+def _issue_repository(issue: Dict[str, Any], fallback: str) -> str:
+    """Repository owning an issue from either GraphQL or REST."""
+    repository = issue.get("repository") or {}
+    name = repository.get("nameWithOwner") if isinstance(repository, dict) else None
+    if name:
+        return str(name)
+    url = str(issue.get("repository_url") or "")
+    match = re.search(r"/repos/([^/]+/[^/]+)$", url)
+    return match.group(1) if match else fallback
 
 
 def _finishable_tree(gh: GitHub, repo: str, goal: int
