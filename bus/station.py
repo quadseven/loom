@@ -5384,8 +5384,41 @@ class Station:
         check holds (a fix round's brief is the ticket's own, so it is not
         checked again)."""
         return (self._fix_blocks(repo, issue, fix)
+                or (fix is not None and self._fix_overlap_still_blocks(repo, issue, fix))
                 or (fix is None and (self._repo_pr_held(repo, issue)
                                      or self._brief_holds(repo, issue, comments))))
+
+    def _fix_overlap_still_blocks(self, repo: str, issue: Dict[str, Any], fix: Any) -> bool:
+        """Keep an existing fix round held only while its canonical overlap
+        peer is still an eligible, open older PR with overlapping hunks."""
+        number = int(issue["number"])
+        pattern = re.compile(r"^wait:gate: overlaps pull request #([1-9][0-9]*)"
+                             r"(?: \(health clock unavailable; no expiry inferred\))?$")
+        peer_number = None
+        for text in self._status_texts(repo, number):
+            match = pattern.fullmatch(text.strip())
+            if match:
+                peer_number = int(match.group(1))
+        if peer_number is None:
+            return False
+        pulls = self.gh.paginate("/repos/%s/pulls?state=open" % repo)
+        peers = [pr for pr in pulls if isinstance(pr, dict)
+                 and pr.get("number") == peer_number
+                 and pr.get("state") == "open" and not pr.get("draft")
+                 and self._counted_pr_number(pr, {a.lower().removesuffix("[bot]")
+                                                  for a in (*self.s.authors, *self.s.briefers)})
+                 and ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo]
+        if not peers:
+            return False
+        current = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, fix.pr)).data
+        if not isinstance(current, dict) or current.get("state") != "open":
+            return False
+        overlap = factory.overlapping_peer(self.gh, repo, current, peers)
+        if overlap != peer_number:
+            return False
+        _say("%s#%d: fix round held; overlaps pull request #%d" %
+             (repo, number, peer_number))
+        return True
 
     def _repo_pr_count(self, repo: str) -> Optional[int]:
         """Count every page once per pass; unread is never an empty queue."""

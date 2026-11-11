@@ -5799,6 +5799,39 @@ class FixTest(Base):
         with open(self.inbox("codex", name + ".md")) as fh:
             return fh.read()
 
+    def test_fix_round_honors_only_a_live_canonical_overlap_hold(self):
+        self.fake.add(12)
+        fix = tickets.parse_fix(REPO, FIX_BODY)
+        peer = {"number": 50, "state": "open", "draft": False,
+                "user": {"login": AUTHORS[0], "type": "Bot"},
+                "base": {"ref": "main"}, "head": {"ref": "loom/peer", "sha": "a" * 40,
+                         "repo": {"full_name": REPO}}}
+        current = {"number": 99, "state": "open", "base": {"ref": "main"},
+                   "head": {"ref": "loom/12-fix-the-thing", "sha": "b" * 40,
+                            "repo": {"full_name": REPO}}}
+        self.fake.pulls = [peer, current]
+        patch = "@@ -12,2 +12,2 @@\n-old\n+new"
+        self.fake.pull_files.update({50: [{"filename": "bus/a.py", "patch": patch}],
+                                     99: [{"filename": "bus/a.py", "patch": patch}]})
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        issue = self.fake.issues[12]
+        comments = [{"body": FIX_BODY, "id": 1, "created_at": "2030-01-02T00:00:00Z",
+                     "updated_at": "2030-01-02T00:00:00Z",
+                     "user": {"login": AUTHORS[0]}}]
+        with mock.patch.object(runner, "_status_texts",
+                               return_value=["wait:gate: overlaps pull request #50"]), \
+                mock.patch.object(runner, "_claim_comments", return_value=comments):
+            self.assertTrue(runner._held_before_claim(REPO, issue, fix, comments))
+            self.assertFalse(runner._claim(REPO, "codex", issue))
+            self.assertEqual(self.listing(), [])
+            self.assertNotIn("loom:running", self.fake.names(12))
+            self.fake.pulls.remove(peer)
+            self.assertFalse(runner._held_before_claim(REPO, issue, fix, comments))
+            self.assertTrue(runner._claim(REPO, "codex", issue))
+            self.assertTrue(self.listing())
+            self.assertFalse(runner._held_before_claim(REPO, issue, fix, [
+                {"body": "wait:gate: review findings", "user": {"login": AUTHORS[0]}}]))
+
     def test_a_trusted_fix_after_the_last_claim_renders_a_fix_brief(self):
         self.fake.add(12)
         self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
