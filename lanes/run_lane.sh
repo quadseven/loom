@@ -3106,6 +3106,10 @@ prepare_validation() {
   # A cached red skips the rerun; a fresh red always reruns. The flag is set
   # once above, so a verdict another lane writes meanwhile cannot change it.
   if [ "$BASELINE_EXIT" -ne 0 ] && [ "$cached_verdict" -eq 0 ]; then
+    # Save this attempt before the retry appends its output. The contract is
+    # one shell command: report the exit and its tail, not guessed test names.
+    local first_output
+    first_output="$(tail -c "+$((check_start + 1))" "$LOG" | tail -n 20)"
     if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
       SETUP_REASON="could not restore tracked files changed by the baseline check"
       return 1
@@ -3126,7 +3130,13 @@ prepare_validation() {
       note_load_failure "$BASELINE_EXIT" SETUP_REASON
       return 1
     fi
-    [ "$BASELINE_EXIT" -ne 0 ] || echo "base check exited $first_exit, then passed on a second run" >> "$LOG"
+    if [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ]; then
+      {
+        printf 'base check flaked: first exit %s; whole command passed on retry\n' "$first_exit"
+        printf 'first-run output (last 20 lines):\n%s\n' "$first_output"
+        echo "base check exited $first_exit, then passed on a second run"
+      } >> "$LOG"
+    fi
   fi
   if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
      [ "$BASELINE_EXIT" -ne 126 ] && [ "$BASELINE_EXIT" -ne 127 ]; then
