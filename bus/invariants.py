@@ -1986,6 +1986,27 @@ class Filer:
                 count, self.repo, number, total))
         self._folded = {}
 
+    def _close_cleared_rolls(self, current: Dict[str, Breach]) -> None:
+        """Give an already-clear tracking issue its close before new filings
+        can spend every write. Current breaches and unread facts still win;
+        a newly empty list keeps the ordinary clearing path after filing."""
+        for key, number in self._listing().items():
+            if self.writes + 2 > WRITES_MAX:
+                return
+            if (key in current or self._rolls.get(key) != number
+                    or number in self._listed_closed or number in self._ticketed
+                    or key.split("/", 1)[0] not in self.read or key in self._unread_keys):
+                continue
+            issue = self._issue(number)
+            if (issue is None or issue.get("state") != "open"
+                    or TICKET_LABEL in self._label_names(issue)):
+                continue
+            body = str(issue.get("body") or "")
+            match = CLEAR_SINCE_RE.search(body)
+            since = _epoch(match.group(1)) if match else None
+            if ROLL_NONE in body and since is not None and self.now - since >= CLEAR_AFTER:
+                self._clear_roll(key, number, issue)
+
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
         try:
             self._clear_gone(current)
@@ -2229,6 +2250,10 @@ class Filer:
             self._settle(current)
         except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
             self.say("invariants: could not close settled issues: %s" % err)
+        try:
+            self._close_cleared_rolls(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close cleared tracking issues: %s" % err)
         for b in current.values():
             if self.writes >= WRITES_MAX:
                 break
