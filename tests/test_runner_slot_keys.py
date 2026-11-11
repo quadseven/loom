@@ -49,7 +49,7 @@ class RunnerSlotKeysTest(unittest.TestCase):
     def test_tracked_slot_without_provider_key_is_not_dispatched(self):
         runner = runners.Runners(
             self.gh, str(self.home), "example/project", [self.slot],
-            {"LOOM_REPO_OWNERS": "example"}, lambda _repo: True,
+            {"LOOM_REPO_OWNERS": "example", "HOME": str(self.home)}, lambda _repo: True,
             self.said.append, actor="example-app[bot]", now=1_800_000_000)
 
         runner.tend()

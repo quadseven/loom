@@ -45,6 +45,7 @@ import io
 import json
 import secrets
 import os
+import plistlib
 import re
 import subprocess
 import tarfile
@@ -58,6 +59,7 @@ import sys
 import zipfile
 import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from xml.parsers.expat import ExpatError
 
 from .github import RateLimited
 from .labels import LANES
@@ -413,6 +415,43 @@ class Runners:
         self.save(ledger)
         self._park(entry["slot"], entry["ticket"], reason, kind)
 
+    def _dispatch_settings(self, slot: str) -> Dict[str, str]:
+        """Keep explicit station settings; fill only a missing tracked Go key path."""
+        settings = lane_settings(slot, self.env)
+        if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
+            # AI-REVIEW 2026-11-11 [Dot review, model unreported] 2964-source:
+            # a slot's installed key path may be absent from the station environment.
+            installed = self._installed_go_key_setting(slot)
+            if installed:
+                settings = lane_settings(slot, {**self.env, OPENCODE_GO_KEY_SSM: installed})
+        return settings
+
+    def _installed_go_key_setting(self, slot: str) -> Optional[str]:
+        """Select the key-parameter setting, never forward the installed environment."""
+        home = self.env.get("HOME") or os.path.expanduser("~")
+        path = os.path.join(home, "Library", "LaunchAgents", "com.loom.%s.plist" % slot)
+        try:
+            with open(path, "rb") as stream:
+                document = plistlib.load(stream)
+            if not isinstance(document, dict):
+                raise ValueError("installed settings are not a map")
+            variables = document.get("EnvironmentVariables", {})
+            if not isinstance(variables, dict):
+                raise ValueError("installed environment is not a map")
+            for name in (_prefix(slot) + "KEY_SSM", OPENCODE_GO_KEY_SSM):
+                value = variables.get(name)
+                if value is None or value == "":
+                    continue
+                if not isinstance(value, str) or not VALUE_RE.fullmatch(value):
+                    raise ValueError("installed key setting is not printable text")
+                return value
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, TypeError, ExpatError) as err:
+            self.say("could not read installed key setting for %s: %s"
+                     % (slot, type(err).__name__))
+        return None
+
     def _dispatch(self, ledger: Dict[str, Any], slot: str, ticket: str) -> None:
         key = "%s/%s" % (slot, ticket)
         path = os.path.join(self.inbox(slot), ticket + ".md")
@@ -442,7 +481,7 @@ class Runners:
                      % (slot, ticket, repo, red.get("why") or "no reason"))
             self._refuse(ledger, entry, red_reason(repo, red))
             return
-        settings = lane_settings(slot, self.env)
+        settings = self._dispatch_settings(slot)
         if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
             self._refuse(ledger, entry, "missing required runner setting %s" % OPENCODE_GO_KEY_SSM)
             return
