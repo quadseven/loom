@@ -211,6 +211,15 @@ class PickTest(unittest.TestCase):
                         comments={("example/alpha", 1): released})
         self.assertEqual(muse_build.pick(gh, REPOS).number, 2)
 
+    def test_pick_keeps_retry_releases_that_mention_terminal_words(self):
+        for note in ("acceptance is not satisfied; retry after validation",
+                     "runner is busy elsewhere; retry next duty"):
+            with self.subTest(note=note):
+                gh = FakeGitHub([issue("example/alpha", 1),
+                                 issue("example/alpha", 2, created="2026-01-05T00:00:00Z")])
+                muse_build.release(gh, "example/alpha", 1, note)
+                self.assertEqual(muse_build.pick(gh, REPOS).number, 1)
+
     def test_pick_skips_a_strangers_ticket_on_a_public_repo(self):
         # Anyone can file an issue on a public repo; an autonomous builder
         # must not take its instructions from a stranger.
