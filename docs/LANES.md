@@ -1277,6 +1277,14 @@ The loom home is kept bounded by the station and the runner (loom#643).
   day after the run; the readers read either), and logs the home's size by top-level folder
   (`loom home holds ...`), kept in `state/station/disk.json`. A compressed
   store goes with its run's other logs after `LOOM_LOG_KEEP_DAYS`.
+- The same hourly sweep removes a ticket rewrite's scratch
+  (`run/rewrite.*`, made by `lanes/rewrite_agent.sh`) that a killed rewrite
+  left behind, since a SIGKILL skips the wrapper's EXIT trap (loom#2966). A
+  real folder goes once nothing in it changed for `REWRITE_SCRATCH_KEEP`
+  (an hour past the 600 second rewrite limit) and the wrapper pid it
+  recorded in its `pid` file is not running; a live rewrite's folder stays
+  however old, and a link is never followed. The station logs
+  `removed N stale rewrite scratch folder(s), X GB, from ...`.
 
 ## Pass deadline
 
