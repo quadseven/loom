@@ -5482,8 +5482,10 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask. A read the
-        check needs that fails holds the ticket for the next pass. A
+        one goes back to the queue with needs:human and one ask, unless its
+        body settles the ask or names a non-person wait. That ticket stays
+        held without a label or comment write. A read the check needs that
+        fails holds the ticket for the next pass. A
         regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
         number = int(issue["number"])
@@ -5509,6 +5511,9 @@ class Station:
                 return True
         if found is None:
             return False
+        if brief_check.settled_stale_ask(found, body, self.s.authors):
+            _say("%s#%d stays held for stale evidence without another person ask" % (repo, number))
+            return True
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:

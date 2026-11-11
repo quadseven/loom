@@ -23,7 +23,9 @@ Before the station hands a ticket to a lane (`check`), it reads:
   the ticket to a verify run. A stale ticket goes back to the queue with
   `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
-  hold it again.
+  hold it again. A recorded decision by a configured person or a non-person
+  Blocked on section keeps stale work held without another person ask; this
+  does not approve a build or clear an existing hold.
 - health: a ticket health intake filed (its health marker), or one whose Why
   names a health finding or the health endpoint, gets no lane until its body
   names the cause, on a `Cause:` line or under `## Cause`. A cause, or a
@@ -64,7 +66,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import answer, proof, status, tickets
+from . import answer, decision_claim, proof, status, tickets
 from .github import GitHubError
 
 STALE = "stale"
@@ -583,6 +585,69 @@ def already_built(gh: Any, repo: str, body: str, branch: str) -> Optional[Verdic
         " ".join(paths).encode("utf-8")).hexdigest()[:12],
         "every file its criteria ask to add already exists on %s: %s"
         % (branch, ", ".join("`%s`" % p for p in paths[:PATHS_READ])))
+
+
+def _visible_ask_body(body: str) -> str:
+    """Current prose only: examples, quotations and preserved originals settle no ask."""
+    body = re.sub(r"<!--.*?(?:-->|\Z)", "", brief_text(body), flags=re.S)
+    lines: List[str] = []
+    fence = ""
+    for line in body.splitlines():
+        boundary = re.match(r" {0,3}(`{3,}|~{3,})", line)
+        if fence:
+            if (boundary and boundary.group(1).startswith(fence)
+                    and not line[boundary.end():].strip()):
+                fence = ""
+        elif boundary:
+            fence = boundary.group(1)
+        elif not line.startswith(("    ", "\t")) and not line.lstrip().startswith(">"):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _recorded_ask_decision(body: str, trusted: Sequence[str]) -> bool:
+    """A nonempty Decision section naming a configured person, with an optional role."""
+    body = re.sub(r"(^#{2,3}[ \t]*Decision[ \t]*\()[ \t]*operator[ \t]+",
+                  r"\1", body, flags=re.M | re.I)
+    people = decision_claim.person_logins(trusted, answer.operators(trusted=trusted))
+    for heading in decision_claim.DECISION_HEADING.finditer(body):
+        if not decision_claim.body_decision(heading.group(0), None, people):
+            continue
+        section = re.split(r"^#{1,3}[ \t]+", body[heading.end():], maxsplit=1, flags=re.M)[0]
+        if section.strip():
+            return True
+    return False
+
+
+def _ask_blocker_text(body: str) -> str:
+    """All current blocker sections, using the same boundaries as blocked_on."""
+    found: List[str] = []
+    inside = False
+    for line in body.splitlines():
+        head = BLOCKED_HEAD_RE.match(line)
+        if head:
+            inside = True
+            line = head.group(1).strip(" *:\t")
+        elif inside and NEXT_HEAD_RE.match(line):
+            inside = False
+        if inside:
+            found.append(line)
+    return "\n".join(found).strip()
+
+
+def settled_stale_ask(verdict: Verdict, body: str, trusted: Sequence[str]) -> bool:
+    """Keep stale work held without asking a person who has nothing left to decide.
+
+    This does not clear a hold, approve a build, or alter any other gate.
+    A current Blocked on section naming a person still needs that person.
+    """
+    if verdict.kind != STALE:
+        return False
+    body = _visible_ask_body(body)
+    blocked = _ask_blocker_text(body)
+    if re.search(r"(?<![\w.-])@[A-Za-z0-9][\w-]*|\bneeds:[A-Za-z0-9][\w-]*", blocked):
+        return False
+    return bool(blocked) or _recorded_ask_decision(body, trusted)
 
 
 def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]],
