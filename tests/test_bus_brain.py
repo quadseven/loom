@@ -1031,6 +1031,14 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env={})
         self.assertFalse(any(call[0] == "PUT" for call in fake.calls))
 
+    def test_a_stack_base_that_has_merged_no_longer_blocks_its_upper_pull(self):
+        closed = {"number": 7, "merged_at": "2026-11-10T12:00:00Z",
+                  "head": {"ref": "feature/base"}}
+        fake = Fake(reply(200, []), reply(200, [closed]))
+        gh = GitHub("t", transport=fake)
+        pr = {"number": 8, "base": {"ref": "feature/base"}}
+        self.assertEqual(brain._stacked_base_blocker(gh, REPO, pr, "main"), "")
+
     def test_merge_refuses_a_behind_pull_request_whose_hunks_overlap_its_base(self):
         # loom#2622: bus.brain merge applies the same hunk-overlap test as
         # the factory before its merge call.
@@ -1673,6 +1681,43 @@ class SensitiveResumeTests(unittest.TestCase):
         url2 = brain.brief(GitHub("t", transport=fake2), REPO, EPIC, "Ticket", BODY, "codex", base="explicit")
         self.assertEqual(url2, "https://example.com/ticket2")
         self.assertTrue(fake2.calls[2][2]["body"].startswith("Base: explicit\n\n"))
+
+    def test_brief_uses_the_head_of_the_open_pull_request_named_by_builds_on(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}),
+                    reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}),
+                    reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                    "Ticket", body, "codex", "hard", env=TRUSTED)
+        created = [call[2] for call in fake.calls if call[2] and "body" in call[2]]
+        self.assertTrue(any("Base: loom/base-change\n" in payload["body"]
+                            for payload in created))
+
+    def test_brief_refuses_builds_on_fork_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": BRAIN},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": "fork/example"}}}),
+                    reply(200, []), reply(201, {"id": 202}), reply(201, {}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
+
+    def test_brief_refuses_builds_on_untrusted_pull_request(self):
+        body = BODY + "\nBuilds on #8\n"
+        fake = Fake(reply(200, goal()),
+                    reply(200, {"number": 8, "state": "open", "user": {"login": "stranger"},
+                                "head": {"ref": "loom/base-change",
+                                         "repo": {"full_name": REPO}}}),
+                    reply(200, []), reply(201, {"id": 202}), reply(201, {}))
+        with self.assertRaisesRegex(ValueError, "trusted same-repository"):
+            brain.brief(GitHub("t", transport=fake), REPO, EPIC,
+                        "Ticket", body, "codex", "hard", env=TRUSTED)
 
     def test_brief_remote_lane_on_public_repo_files_queued(self):
         fake = Fake(reply(200, goal()), reply(200, []),
