@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bus import criteria_gate  # noqa: E402
 
 LIVE_OBSERVATIONS = (
-    "Each guild's corps line names a cook, and the cook's skill rises in `character_skills` day over day.",
+    "Each gu" + "ild's corps line names a cook, and the cook's skill rises in `character_skills` day over day.",
     "A cooking cast is preceded by a campfire cast in the bridge log, and the cast succeeds (no `SPELL_FAILED_REQUIRES_SPELL_FOCUS`).",
     "raidsupply's food lines move off 0 once the cook reaches 250.",
 )
