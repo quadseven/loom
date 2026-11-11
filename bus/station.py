@@ -5721,6 +5721,18 @@ class Station:
             return "loom:closed-unmerged"
         return None
 
+    def _non_lane_merge_delivered(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any]) -> bool:
+        """A non-lane merge delivers work only into the default branch."""
+        if str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            return True
+        # AI-REVIEW 2026-11-11 [codex/in-process/runtime-trace] R2938-1:
+        # A feature-branch merge or an untrusted namesake must not deliver work.
+        base = str((pr.get("base") or {}).get("ref") or "")
+        return bool(base and base == self._default_branch(repo)
+                    and str(((pr.get("head") or {}).get("repo") or {}).get("full_name")) == repo
+                    and self._deliver_trusted_author(repo, ticket, pr))
+
     def _reconcile_pr_ticket(self, repo: str, pr: dict, tickets_by_number: dict,
                              landed: Sequence[dict] = ()) -> None:
         number = self._pr_ticket_number(repo, pr)
@@ -5732,6 +5744,8 @@ class Station:
             return
         target = self._terminal_label(pr)
         if target is None or target in labels:
+            return
+        if target == "loom:merged" and not self._non_lane_merge_delivered(repo, ticket, pr):
             return
         if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
                 self._status_texts(repo, int(number))):
@@ -5757,7 +5771,8 @@ class Station:
         states = {"loom:" + state for state in state_names}
         kept = self._drop_claim(
             name for name in labels
-            if name not in states and not (target == "loom:queued" and name.startswith("lane:")))
+            if name not in states and not (target in ("loom:queued", "loom:merged")
+                                          and name.startswith("lane:")))
         # A merged pull request lands the lane's run, so a runaway hold the run
         # caused is cleared even when the ticket is requeued to build criteria
         # the pull request left unbuilt; otherwise a runaway ticket can never
@@ -5769,6 +5784,8 @@ class Station:
         self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
                      {"labels": kept})
         ticket["labels"] = [{"name": name} for name in kept]
+        if target == "loom:merged":
+            self._log_non_lane_merge(repo, number, pr)
         if cleared:
             self._routine(repo, number,
                           "Pull request #%d merged, so this ticket's loom:runaway hold "
@@ -5907,7 +5924,7 @@ class Station:
                          {"labels": kept})
             ticket["labels"] = [{"name": name} for name in kept]
             _say("%s#%d: linked pull request #%d is open" % (repo, number, int(pr["number"])))
-        # A ticket still at queued or briefed whose pull request merged:
+        # A ticket still in an active pre-merge state whose pull request merged:
         # a brain fix round sent it back to briefed and the pull request
         # merged before a lane took the fix, or the pull request opened and
         # merged between two passes (loom#784).
@@ -5973,6 +5990,7 @@ class Station:
             self._routine(repo, number,
                           "Pull request #%d merged at %s and covers this ticket, "
                           "so it moved to loom:merged." % (pr_number, merged_at))
+            self._log_non_lane_merge(repo, number, merged_pr)
             _say("%s#%d: loom:pr with merged covering pull request #%d, moved to loom:merged"
                  % (repo, number, pr_number))
             return
@@ -6003,7 +6021,7 @@ class Station:
                 continue
             if tickets._login(pr.get("user")) not in allowed:
                 continue
-            if _covers_pr(ticket, repo, pr):
+            if _covers_pr(ticket, repo, pr) and self._non_lane_merge_delivered(repo, ticket, pr):
                 return pr
         return None
 
@@ -6026,14 +6044,29 @@ class Station:
             merged_at = str((pull.get("pull_request") or {}).get("merged_at") or "")
             if not merged_at:
                 continue
+            # AI-REVIEW 2026-11-11 [codex/in-process/runtime-trace] R2938-2:
+            # Timeline issues omit base/head and can name a foreign PR number.
+            source_repo = str(pull.get("repository_url") or "").rstrip("/")
+            if source_repo != "%s/repos/%s" % (self.gh.api, repo):
+                continue
             if _covers_pr(ticket, repo, pull):
-                return pull
+                full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, int(pull["number"]))).data
+                if self._historical_merge_delivers(repo, ticket, full, allowed):
+                    return full
         return None
+
+    def _historical_merge_delivers(self, repo: str, ticket: Dict[str, Any],
+                                    pr: Dict[str, Any], allowed: Set[str]) -> bool:
+        """Revalidate the real pull instead of relying on a timeline issue snapshot."""
+        return bool(isinstance(pr, dict) and pr.get("state") == "closed"
+                    and pr.get("merged_at") and tickets._login(pr.get("user")) in allowed
+                    and str(((pr.get("head") or {}).get("repo") or {}).get("full_name")) == repo
+                    and _covers_pr(ticket, repo, pr) and self._non_lane_merge_delivered(repo, ticket, pr))
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-        """The repo's open tickets at loom:queued or loom:briefed that a
-        briefing login filed, by number. The open-tickets list is the verify
+        """The repo's open pre-merge tickets that a briefing login filed,
+        by number. The open-tickets list is the verify
         runs' own read, so a pass that reads both pays for it once; with no
         such ticket and no loom:pr ticket, no closed pull request is read."""
         out: Dict[int, Dict[str, Any]] = {}
@@ -6041,7 +6074,8 @@ class Station:
             if (isinstance(issue, dict) and "pull_request" not in issue
                     and int(issue.get("number") or 0) not in linked
                     and "loom:ticket" in _label_names(issue)
-                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))
+                    and set(_label_names(issue)).intersection(
+                        ("loom:queued", "loom:briefed", "loom:running", "loom:answered", "loom:failed"))
                     and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)):
                 # The trust check reads the repo owner from repository_url.
                 issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
@@ -6063,7 +6097,7 @@ class Station:
 
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
-        """Move a queued or briefed ticket to loom:merged when this merged
+        """Move a pre-merge ticket to loom:merged when this merged
         pull request delivers it: a same-repo branch, linked to the ticket,
         by a trusted author of a trusted ticket or by the contributor who
         owns it, and merged after the ticket last went to queued or briefed."""
@@ -6080,13 +6114,21 @@ class Station:
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
             return
         labels = _label_names(ticket)
-        was = "loom:briefed" if "loom:briefed" in labels else "loom:queued"
+        was = next(name for name in labels if name in
+                   ("loom:queued", "loom:briefed", "loom:running", "loom:answered", "loom:failed"))
         self._reconcile_pr_ticket(repo, pr, {number: ticket})
         if "loom:merged" in _label_names(ticket):
             del unlinked[number]
             self._comment(repo, number, "Pull request #%d merged while this ticket was at %s, "
                           "so it moved to loom:merged." % (int(pr["number"]), was),
                           notify.MERGED)
+
+    def _log_non_lane_merge(self, repo: str, number: int, pr: Dict[str, Any]) -> None:
+        """Record one verified state transition, including its landed commit."""
+        if not str((pr.get("head") or {}).get("ref") or "").startswith("loom/"):
+            _say("%s#%d: pull request #%d merged from a non-lane branch at commit %s"
+                 % (repo, number, int(pr["number"]),
+                    str(pr.get("merge_commit_sha") or "unknown")))
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:

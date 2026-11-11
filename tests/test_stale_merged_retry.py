@@ -15,6 +15,7 @@ class StaleMergedRetryTest(Base):
         old = {"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
                "user": {"login": "alice-example"},
                "html_url": "https://example.com/pull/99",
+               "repository_url": "https://api.github.com/repos/" + REPO,
                "body": "Refs %s#12\n## Acceptance criteria\n- [x] First works.\n" % REPO,
                "head": {"ref": "loom/12-fix-the-thing", "repo": {"full_name": REPO}}}
         runner = self.reader()
@@ -64,6 +65,7 @@ class StaleMergedRetryTest(Base):
                    "created_at": "2030-01-05T00:00:00Z"}]
         closed = []
         if source == "timeline":
+            self.fake.pulls = [old]
             pull = deepcopy(old)
             pull["pull_request"] = {"merged_at": pull.pop("merged_at")}
             events.append({"event": "cross-referenced", "source": {"issue": pull}})

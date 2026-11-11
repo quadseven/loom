@@ -207,6 +207,7 @@ class FakeGitHub:
             body = self.default_body
         self.issues[number] = {
             "number": number, "title": title, "body": body, "state": "open",
+            "repository_url": "https://api.github.com/repos/" + REPO,
             "user": {"login": author}, "created_at": created,
             "updated_at": created,
             "labels": [{"name": "loom:ticket"}, {"name": "loom:" + state},
@@ -1014,7 +1015,8 @@ class ReconcilePullRequestTest(Base):
     def contributor_pr(self, author="dana-example", state="open", merged_at=None):
         pr = {"number": 99, "state": state, "user": {"login": author},
               "body": "Why.\n\nRefs #12\n",
-              "head": {"ref": "dana/12-fix", "repo": {"full_name": REPO}}}
+              "head": {"ref": "dana/12-fix", "repo": {"full_name": REPO}},
+              "base": {"ref": "main"}}
         if merged_at:
             pr["merged_at"] = merged_at
         return pr
@@ -1213,14 +1215,25 @@ class ReconcilePullRequestTest(Base):
                                           {"name": "lane:codex"}]
         merged_pr = {"event": "cross-referenced", "created_at": "2030-01-05T00:00:00Z",
                      "source": {"issue": {"number": 99, "state": "closed",
+                                          "repository_url": "https://api.github.com/repos/" + REPO,
                                           "pull_request": {"merged_at": "2030-01-03T00:00:00Z"},
                                           "user": {"login": "alice-example"},
                                           "body": "Refs %s#12" % REPO}}}
         self.fake.timelines = {12: list(self.fake.events[12]) + [merged_pr]}
         self.fake.pulls.clear()
         self.fake.calls.clear()
+
+        def transport(method, url, headers, body):
+            if method == "GET" and url.endswith("/pulls/99"):
+                return reply(200, {"number": 99, "state": "closed",
+                                   "merged_at": "2030-01-03T00:00:00Z",
+                                   "user": {"login": AUTHORS[0]}, "body": "Refs #12",
+                                   "head": {"ref": "fix/12", "repo": {"full_name": REPO}},
+                                   "base": {"ref": "main"}})
+            return self.fake(method, url, headers, body)
+
         with mock.patch("bus.station.time.time", return_value=4102444800.0):
-            station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
+            station.Station(GitHub("token", transport=transport), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
         note = [c["body"] for c in self.fake.comments[12]
@@ -1268,7 +1281,8 @@ class ReconcilePullRequestTest(Base):
         # The merged PR for our ticket (number 99) - this will be at index 100 (page 2)
         merged_pr = {"number": 99, "state": "closed", "merged_at": "2030-01-03T00:00:00Z",
                      "user": {"login": "alice-example"},
-                     "updated_at": "2030-01-02T00:00:00Z",
+                     "updated_at": "2030-01-02T00:00:00Z", "base": {"ref": "main"},
+                     "head": {"ref": "fix/12", "repo": {"full_name": REPO}},
                      "body": "Refs %s#12" % REPO}
         self.fake.pulls = older_pulls + [merged_pr]
         self.fake.calls.clear()
@@ -1434,7 +1448,8 @@ class ReconcilePullRequestTest(Base):
         self.fake.pulls = [{"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
                             "body": "Why it matters.\n\nRefs #12\n",
-                            "head": {"ref": "fix/stray-files"}}]
+                            "head": {"ref": "fix/stray-files", "repo": {"full_name": REPO}},
+                            "user": {"login": AUTHORS[0]}, "base": {"ref": "main"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
 
@@ -1446,7 +1461,8 @@ class ReconcilePullRequestTest(Base):
                             "head": {"ref": "loom/12-fix-the-thing-r2"}},
                            {"number": 99, "state": "closed",
                             "merged_at": "2030-01-02T00:00:00Z",
-                            "body": "Refs #12", "head": {"ref": "fix/stray-files"}}]
+                            "body": "Refs #12", "head": {"ref": "fix/stray-files", "repo": {"full_name": REPO}},
+                            "user": {"login": AUTHORS[0]}, "base": {"ref": "main"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
         self.assertNotIn("loom:pr", self.fake.names(12))
@@ -1469,9 +1485,12 @@ class ReconcilePullRequestTest(Base):
         self.fake.add(12, state="pr")
         self.fake.issues[12]["labels"].append({"name": "loom:regression"})
         self.fake.events[12].append({"event": "labeled", "label": {"name": "loom:briefed"},
-                                     "created_at": "2030-01-02T00:00:00Z"})
+                                     "actor": {"login": AUTHORS[0]}, "created_at": "2030-01-02T00:00:00Z"})
         self.fake.pulls = [{"number": 99, "state": "closed",
-                            "merged_at": "2030-01-03T00:00:00Z", "body": "Refs #12"}]
+                            "merged_at": "2030-01-03T00:00:00Z", "body": "Refs #12",
+                            "user": {"login": AUTHORS[0]},
+                            "head": {"ref": "fix/12", "repo": {"full_name": REPO}},
+                            "base": {"ref": "main"}}]
         station.Station(GitHub("token", transport=self.fake), self.settings).reconcile_pull_requests()
         self.assertIn("loom:merged", self.fake.names(12))
 
@@ -1488,7 +1507,8 @@ class ReconcilePullRequestTest(Base):
     def merged_pr(self, number=12, author="alice-example", head_repo=REPO):
         return {"number": 99, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
                 "user": {"login": author}, "body": "Why.\n\nRefs #%d\n" % number,
-                "head": {"ref": "fix/%d" % number, "repo": {"full_name": head_repo}}}
+                "head": {"ref": "fix/%d" % number, "repo": {"full_name": head_repo}},
+                "base": {"ref": "main"}}
 
     def test_a_pull_request_merged_while_the_ticket_waits_moves_it_to_merged(self):
         # loom#784: loom#633 sat at briefed after a fix round, its pull

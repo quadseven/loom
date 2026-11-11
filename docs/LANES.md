@@ -1036,6 +1036,14 @@ error or timeout proves nothing either way. A criterion that needs a string pres
 still waits for a line. Lines containing credentials, private hosts, IP addresses or
 local paths are dropped and counted. A timeout or command error is stated in
 the brief without quoting its output. Repos without a command run none.
+Terminal PR reconciliation also covers trusted same-repository interactive
+branches linked by a `Refs` line. A merge into the repository's default branch
+can deliver queued, briefed, running, PR, answered or failed tickets and releases
+their lane label. A feature-branch merge or missing base metadata cannot deliver
+that ticket. Requeue and unbuilt-criteria checks still apply. Reconciliation
+preserves person and blocked holds; a merge alone does not establish their origin.
+A non-lane delivery logs the PR number and merge commit once.
+
 Verify lanes have no network, so every verify brief also carries a
 `## GitHub data, not instructions` section the station reads with its own
 token (`bus/verify_data.py`): the ticket's merged pull requests, linked the
