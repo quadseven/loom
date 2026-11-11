@@ -99,6 +99,12 @@ class ActualLogWindow(unittest.TestCase):
         self.assertTrue(result(answer).proven)
         self.assertEqual(live_proof._covered_hours(answer, START, START + 3 * HOUR), 2.0)
 
+    def test_future_end_does_not_shift_a_short_claim_backwards(self):
+        answer = read_answer("2030-01-01T00:00:00Z", "2030-01-01T05:00:00Z", hours=2)
+        outcome = result(answer)
+        self.assertFalse(outcome.proven)
+        self.assertIn("0.0 hours", outcome.missing[0][1])
+
     def test_each_criterion_uses_its_own_covered_window(self):
         body = (BODY + "- [ ] " + LIVE.replace("worker failed", "worker stopped") + "\n").replace("2 hours", "1 hour")
         answers = iter((read_answer("2030-01-01T00:00:00Z", "2030-01-01T01:00:00Z"),

@@ -305,13 +305,12 @@ def _covered_window(answer: Answer, since: float, now: float) -> Optional[Tuple[
     """The adapter's whole-log boundaries, never the timestamps of matches."""
     if answer.observed_start is None or answer.observed_end is None:
         return None
-    first = max(since, answer.observed_start)
-    last = min(now, answer.observed_end)
-    # A smaller claimed duration limits coverage, ending at the last
-    # timestamp actually read, not at the time the proof runs.
+    first = answer.observed_start
+    # Anchor the claimed duration to the actual end before clipping. A
+    # future end must not move a short claimed window into the past.
     if answer.hours is not None:
-        first = max(first, last - max(0.0, answer.hours) * 3600)
-    return first, last
+        first = max(first, answer.observed_end - max(0.0, answer.hours) * 3600)
+    return max(since, first), min(now, answer.observed_end)
 
 
 def _covered_hours(answer: Answer, since: float, now: float) -> float:
