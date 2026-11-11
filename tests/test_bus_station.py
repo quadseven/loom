@@ -3296,7 +3296,8 @@ class TriageTest(Base):
                              now=self.start)
         with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
             st.triage_backlogs()
-        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT)
+        triage.assert_called_once_with(st.gh, REPO, 31, brain.TRIAGE_LIMIT,
+                                       authors=AUTHORS, briefers=[])
         self.assertIn("loom:queued", self.fake.names(102))
         triage_json = os.path.join(self.home, "state", "station", "triage.json")
         with open(triage_json) as fh:

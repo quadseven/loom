@@ -10883,7 +10883,8 @@ class Station:
                 and 0 <= self.now - last < TRIAGE_INTERVAL)
 
     def _run_triage(self, key: str, repo: str, number: int) -> None:
-        lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+        lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
+                             authors=self.s.authors, briefers=self.s.briefers)
         queued = sum(1 for line in lines if " queued under #" in line)
         triage_count = sum(1 for line in lines if " loom:triage" in line)
         held = sum(1 for line in lines if " held:" in line)
@@ -10915,7 +10916,8 @@ class Station:
                         "/repos/%s/issues?labels=loom:queued&state=open&per_page=100" % repo)
                     if len(queued if isinstance(queued, list) else []) >= 3:
                         continue
-                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT)
+                    lines = brain.triage(self.gh, repo, number, brain.TRIAGE_LIMIT,
+                                         authors=self.s.authors, briefers=self.s.briefers)
                     counts = (sum(" queued under #" in line for line in lines),
                               sum(" loom:triage" in line for line in lines),
                               sum(" held:" in line for line in lines))

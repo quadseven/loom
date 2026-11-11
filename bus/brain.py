@@ -4306,7 +4306,9 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
-def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
+           authors: Optional[Sequence[str]] = None,
+           briefers: Optional[Sequence[str]] = None) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
@@ -4320,14 +4322,17 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     an intake epic when one is needed are written, plus a Part of line at the
     end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
     retitled, and nothing else in it is edited.
+    The trusted logins are `authors` and `briefers` (the station passes its
+    own), else LOOM_BRIEF_AUTHORS and LOOM_TRUSTED_BRIEFERS from the
+    environment.
     Returns one line per issue looked at.
     """
     if limit < 1:
         raise ValueError("limit is at least 1")
     in_flight = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
-    authors = trusted_authors()
-    briefers = trusted_briefers()
+    authors = trusted_authors() if authors is None else list(authors)
+    briefers = trusted_briefers() if briefers is None else list(briefers)
     journals = goal_journals(gh, repo)
     lines: List[str] = []
     done = 0

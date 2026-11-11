@@ -272,7 +272,10 @@ class RemoteLaneTests(unittest.TestCase):
 
     def test_the_pr_body_is_the_lane_body_the_review_bot_accepts(self):
         gh = FakeGitHub()
-        made = self.open_pr(gh)
+        # No summary: a lane tree under check carries its own .loom/summary.md.
+        with tempfile.TemporaryDirectory() as tree, \
+                mock.patch.object(lane.change_class, "SUMMARY_FILE", os.path.join(tree, "none.md")):
+            made = self.open_pr(gh)
         self.assertEqual(made["number"], 9)
         body = next(c for c in gh.calls if c[0] == "POST" and c[1].endswith("/pulls"))[2]["body"]
         self.assertIn("## Intent", body)
