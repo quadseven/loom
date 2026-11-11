@@ -7,6 +7,7 @@ from unittest import TestCase, mock
 from bus import factory
 from bus.github import GitHubError
 from test_bus_factory import FakeGitHub, ME, NOW, REPO, STRANGER, iso
+from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
 class Client:
     def __init__(self, stacks):
@@ -170,3 +171,86 @@ class TrustAndOverlap(TestCase):
         with mock.patch.object(self.handler, "_link_stack_for", side_effect=GitHubError("stack unavailable")):
             self.assertEqual(self.run_pull(note_error=GitHubError("note write unavailable"), guarded=True), 1)
         self.assertTrue(self.guard_completed)
+
+
+class StackLanding(TestCase):
+    """Exercise the real factory landing boundary and its real merge backstop."""
+
+    # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-AC4:
+    # Helper ordering alone does not prove the real factory refuses an upper merge.
+
+    def land(self, number, ticket, base_ref, parent=None):
+        import json
+        from test_bus_brain import Fake, SensitiveResumeTests, reply
+        from bus import brain
+        from bus.github import GitHub
+
+        fixture = SensitiveResumeTests()
+        issue = {"number": ticket, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        body = "Refs %s#%d\n## Acceptance criteria\n- [x] built\n" % (REPO, ticket)
+        pr_reply, ready_reply = fixture._merge_replies({"pr": {
+            "number": number, "body": body, "stack": None,
+            "head": {"ref": "loom/%d-work" % ticket, "sha": "checked",
+                     "repo": {"full_name": REPO}},
+            "base": {"ref": base_ref, "repo": {"full_name": REPO, "default_branch": "main"}}},
+            "details": {"headRepository": {"nameWithOwner": REPO}}})
+        full = json.loads(pr_reply[2])
+        fake = Fake(pr_reply, ready_reply, reply(200, issue), reply(200, {"behind_by": 0}),
+                    reply(200, {"merged": True}), reply(204), reply(200, []),
+                    reply(200, issue), reply(200, {}))
+        calls = []
+
+        def transport(method, url, headers, payload):
+            calls.append((method, url, json.loads(payload) if payload else None))
+            if parent is not None and "/pulls?state=open&head=" in url:
+                return reply(200, [parent] if parent["state"] == "open" else [])
+            if parent is not None and "/pulls?state=closed&head=" in url:
+                return reply(200, [parent] if parent["state"] == "closed" else [])
+            return fake(method, url, headers, payload)
+
+        handler = factory.Factory(GitHub("fixture-token", transport=transport), [REPO], NOW)
+        self.assertIs(handler.merge, brain.merge)
+        # Lock, behind, scope and the existing brain fixture's risk-tier gate
+        # are neutral here: this tests stack order, not unrelated risk policy.
+        # Readiness, the real stack backstop, merge PUT and settlement execute.
+        import os
+        with mock.patch.object(handler, "_lock", return_value=None), \
+                mock.patch.object(handler, "_behind", return_value=False), \
+                mock.patch.object(handler, "_scope_holds", return_value=False), \
+                mock.patch.object(brain, "_refuse_risk_tier"), \
+                mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "", "LOOM_TRUSTED_BRIEFERS": ""}):
+            handler._land(REPO, number, full, issue, [])
+        return calls, handler
+
+    @staticmethod
+    def merge_puts(calls):
+        return [url for method, url, _ in calls
+                if method == "PUT" and (url.endswith("/merge") or "/merge-async" in url)]
+
+    def test_upper_cannot_land_while_parent_is_pending_or_failed(self):
+        for checks in ("PENDING", "FAILURE"):
+            with self.subTest(parent_checks=checks):
+                parent = {"number": 7, "state": "open", "head": {"ref": "loom/9-work"},
+                          "statusCheckRollup": {"state": checks}}
+                calls, handler = self.land(8, 10, "loom/9-work", parent)
+                self.assertEqual(self.merge_puts(calls), [])
+                self.assertEqual(handler.actions, 0)
+                self.assertNotIn(REPO, handler.landed)
+
+    def test_factory_lands_lower_then_upper_after_the_parent_is_merged(self):
+        parent = {"number": 7, "state": "open", "head": {"ref": "loom/9-work"}}
+        blocked, _ = self.land(8, 10, "loom/9-work", parent)
+        self.assertEqual(self.merge_puts(blocked), [])
+        lower, lower_handler = self.land(7, 9, "main")
+        self.assertIn(REPO, lower_handler.landed)
+        parent.update(state="closed", merged_at="2030-01-01T00:00:00Z")
+        upper, upper_handler = self.land(8, 10, "loom/9-work", parent)
+        self.assertIn(REPO, upper_handler.landed)
+        self.assertEqual([url.rsplit("/pulls/", 1)[1] for url in self.merge_puts(lower + upper)],
+                         ["7/merge", "8/merge"])
+
+    def test_an_unstacked_control_reaches_the_real_merge_put(self):
+        calls, handler = self.land(8, 10, "main")
+        self.assertEqual(len(self.merge_puts(calls)), 1)
+        self.assertIn(REPO, handler.landed)
