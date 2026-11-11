@@ -1628,7 +1628,9 @@ def landing_order(prs: List[Dict[str, Any]], tickets: Dict[int, Dict[str, Any]],
 def _stack_parent(pr: Dict[str, Any], by_head: Dict[str, int],
                   remaining: set) -> Optional[int]:
     """The still-open pull request this pull is based on, if present."""
-    declared = re.search(r"\bBuilds on #([1-9][0-9]*)\b", str(pr.get("body") or ""), re.I)
+    # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C5:
+    # Incidental prose must not reorder a stack.
+    declared = brain.BUILDS_ON_RE.search(str(pr.get("body") or ""))
     base_ref = str((pr.get("base") or {}).get("ref") or "")
     parent = int(declared.group(1)) if declared else (by_head.get(base_ref) if base_ref else None)
     return parent if parent in remaining and parent != int(pr["number"]) else None
@@ -1636,6 +1638,8 @@ def _stack_parent(pr: Dict[str, Any], by_head: Dict[str, int],
 
 def link_stack(gh: Any, repo: str, bottom: int, upper: int) -> None:
     """Link an upper pull request to its bottom through the stacks API."""
+    # AI-REVIEW 2026-11-11 [codex/in-process/review] 2956-R1 (PR #2956):
+    # A third member extends the existing stack instead of creating a second pair.
     if bottom == upper:
         return
     path = "/repos/%s/stacks" % repo
@@ -1643,7 +1647,10 @@ def link_stack(gh: Any, repo: str, bottom: int, upper: int) -> None:
     for stack in data if isinstance(data, list) else []:
         numbers = [int(item.get("number") if isinstance(item, dict) else item)
                    for item in stack.get("pull_requests", [])]
-        if bottom in numbers and upper in numbers:
+        if bottom in numbers:
+            if upper not in numbers:
+                gh.rest("POST", "%s/%d/add" % (path, int(stack["number"])),
+                        {"pull_requests": [upper]})
             return
     gh.rest("POST", path, {"pull_requests": [bottom, upper]})
 
@@ -1942,6 +1949,8 @@ class Factory:
         # Each repo's open pull requests, read once a pass by _open_lane_pull.
         self._open_pulls: Dict[str, List[Dict[str, Any]]] = {}
         self._stack_checked: set = set()
+        self._overlap_unknown: set = set()
+        self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
         # Each repo's `area:` labels, read once a pass by _repo_areas.
         self._areas: Dict[str, Optional[List[str]]] = {}
 
@@ -2919,14 +2928,24 @@ class Factory:
             return
         number = int(pr["number"])
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
-        self._link_stack_for(repo, full)
+        # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C4:
+        # Advisory linking failure cannot stop independent PR judgment.
+        try:
+            self._link_stack_for(repo, full)
+        except GitHubError as err:
+            note = "Could not link stack for pull request #%d; judgment continues" % number
+            if not any(note in str(c.get("body") or "")
+                       for c in self._comments(repo, int(issue["number"]))):
+                self._status_note(repo, int(issue["number"]), note)
+                _say("%s: %s" % (note, err))
         overlap = None
-        if not re.search(r"^Builds on #[1-9][0-9]*[ \t]*$",
-                         str(full.get("body") or ""), re.M | re.I):
+        if not brain.BUILDS_ON_RE.search(str(full.get("body") or "")):
             overlap = overlapping_peer(self.gh, repo, full,
-                                       self._open_pull_requests(repo))
+                                       self._overlap_candidates(repo, full, tickets))
         if overlap is not None:
             reason = "overlaps pull request #%d" % overlap
+            if (repo, overlap) in self._overlap_unknown:
+                reason += " (health clock unavailable; no expiry inferred)"
             key = "%s#%d" % (repo, int(issue["number"]))
             if self.known_waits.get(key) != reason:
                 self._status_note(repo, int(issue["number"]), "wait:gate: " + reason)
@@ -2937,6 +2956,11 @@ class Factory:
                             "held %s#%d: overlaps pull request #%d"
                             % (repo, number, overlap))
             return
+        key = "%s#%d" % (repo, int(issue["number"]))
+        if ("wait:gate" in _labels(issue)
+                and self.known_waits.get(key, "").startswith("overlaps pull request #")):
+            self._relabel(repo, issue, [label for label in _labels(issue) if label != "wait:gate"])
+            self._status_note(repo, int(issue["number"]), "overlap hold released: its older peer no longer blocks")
         sha = str((full.get("head") or {}).get("sha") or "")
         if not sha or full.get("mergeable") is None:
             return
@@ -2959,24 +2983,69 @@ class Factory:
             return  # the review the lane asked for has not answered yet
         self._judge(repo, number, full, issue, comments, review, sensitive)
 
+    def _overlap_candidates(self, repo: str, pr: Dict[str, Any],
+                            tickets: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Only trusted local pipeline peers may delay a newer lane pull."""
+        # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C1:
+        # Stranger or abandoned builds cannot indefinitely hold lane work.
+        candidates = [peer for peer in self._open_pull_requests(repo)
+                      if self._lane_pr_ticket(repo, peer, tickets) is not None
+                      and ((peer.get("head") or {}).get("repo") or {}).get("full_name") == repo]
+        return [peer for peer in _older_overlap_candidates(pr, candidates)
+                if not self._overlap_expired(repo, peer)]
+
+    def _overlap_expired(self, repo: str, peer: Dict[str, Any]) -> bool:
+        """Unhealthy peers stop blocking after the existing stuck-work window."""
+        key = (repo, int(peer["number"]), str((peer.get("head") or {}).get("sha") or ""))
+        if key not in self._overlap_health:
+            self._overlap_health[key] = self._read_overlap_expired(repo, peer)
+        return self._overlap_health[key]
+
+    def _read_overlap_expired(self, repo: str, peer: Dict[str, Any]) -> bool:
+        """Read the current head's health once in this factory pass."""
+        number = int(peer["number"])
+        full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        sha = str((full.get("head") or {}).get("sha") or "")
+        runs = self._check_runs(repo, sha) if sha else []
+        failed = [run for run in runs if run.get("conclusion") in brain.FAILED_CONCLUSIONS]
+        if not failed and full.get("mergeable") is not False:
+            return False
+        clocks = [_ts(run.get("completed_at")) for run in failed]
+        valid = [clock for clock in clocks if 0 < clock <= self.now]
+        if full.get("mergeable") is False or len(valid) != len(failed):
+            commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, sha)).data or {}
+            clock = _ts(((commit.get("commit") or {}).get("committer") or {}).get("date"))
+            if 0 < clock <= self.now:
+                valid.append(clock)
+            else:
+                self._overlap_unknown.add((repo, number))
+                return False
+        return bool(valid) and self.now - min(valid) >= STUCK_AGE
+
     def _link_stack_for(self, repo: str, pr: Dict[str, Any]) -> None:
         """Link a newly opened pull request to the pull request it builds on."""
         upper = int(pr.get("number") or 0)
-        if upper in self._stack_checked:
+        # AI-REVIEW 2026-11-11 [codex/in-process/review] 2956-R2 (PR #2956):
+        # Pull request numbers are local to a repository.
+        key = (repo, upper)
+        if key in self._stack_checked:
             return
-        body_match = re.search(r"^Builds on #([1-9][0-9]*)[ \t]*$",
-                               str(pr.get("body") or ""), re.M | re.I)
-        base = int(body_match.group(1)) if body_match else None
+        body_match = brain.BUILDS_ON_RE.search(str(pr.get("body") or ""))
+        declared = int(body_match.group(1)) if body_match else None
+        ref = str((pr.get("base") or {}).get("ref") or "")
+        # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C2:
+        # A fork's trunk-named head is not a local stack base.
+        base = next((int(item["number"]) for item in self._open_pull_requests(repo)
+                     if self._is_lane_pr(item)
+                     and ((item.get("head") or {}).get("repo") or {}).get("full_name") == repo
+                     and int(item.get("number") or 0) != upper
+                     and (int(item["number"]) == declared if declared is not None
+                          else str((item.get("head") or {}).get("ref") or "") == ref)), None)
         if base is None:
-            ref = str((pr.get("base") or {}).get("ref") or "")
-            base = next((int(item["number"]) for item in self._open_pull_requests(repo)
-                         if int(item.get("number") or 0) != upper
-                         and str((item.get("head") or {}).get("ref") or "") == ref), None)
-        if base is None:
-            self._stack_checked.add(upper)
+            self._stack_checked.add(key)
             return
         link_stack(self.gh, repo, base, upper)
-        self._stack_checked.add(upper)
+        self._stack_checked.add(key)
 
     def _judge(self, repo: str, number: int, full: Dict[str, Any], issue: Dict[str, Any],
                comments: List[Dict[str, Any]], review: str, sensitive: bool = False) -> None:
@@ -5819,6 +5888,9 @@ class Factory:
         self._no_lane_moves(tickets, before)
 
     def _repo_pass(self, repo: str, tickets: Dict[int, Dict[str, Any]]) -> None:
+        # Check results can recover on the same SHA between passes.
+        self._overlap_health.clear()
+        self._overlap_unknown.clear()
         # GitHub.paginate asks for 100 a page and follows every page.
         all_prs = [p for p in self.gh.paginate("/repos/%s/pulls?state=open" % repo)
                    if isinstance(p, dict)]

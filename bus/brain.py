@@ -3799,19 +3799,30 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
-BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M)
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
 
 
-def _builds_on_base(gh: GitHub, repo: str, body: str) -> Optional[str]:
-    """Return the open pull request head named by a Builds on line."""
+def _builds_on_base(gh: GitHub, repo: str, body: str,
+                    env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Return the trusted same-repo open pull request head named by Builds on."""
     match = BUILDS_ON_RE.search(body)
     if not match:
         return None
     number = int(match.group(1))
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     head = (pr.get("head") or {}).get("ref")
-    if pr.get("state") != "open" or not isinstance(head, str) or not head:
-        raise ValueError("Builds on #%d must name an open pull request with a head ref" % number)
+    # AI-REVIEW 2026-11-11 [claude-code/in-process/review] 2956-C3:
+    # A brief must never execute an untrusted or fork-provided base.
+    head_data = pr.get("head") or {}
+    authors, briefers = trusted_authors(env), trusted_briefers(env)
+    head_repo = (head_data.get("repo") or {}).get("full_name")
+    if (pr.get("state") != "open" or head_repo != repo
+            or pr.get("draft") or not str(head or "").startswith("loom/")
+            or not tickets.brief_author_trusted(pr, authors, briefers, as_ticket=True)
+            or tickets.owned_elsewhere(pr, authors, briefers) is not None
+            or not isinstance(head, str) or not head):
+        raise ValueError("Builds on #%d must name an open trusted same-repository pull request "
+                         "with a head ref" % number)
     return head
 
 
@@ -3931,7 +3942,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     else:
         raise ValueError("a brief files under an open epic: name one (--epic N)")
     if base is None:
-        base = _builds_on_base(gh, repo, body) or goal_trunk(goal_issue)
+        base = _builds_on_base(gh, repo, body, env) or goal_trunk(goal_issue)
     body = hunt_plan.with_size_letter(body)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,

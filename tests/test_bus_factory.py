@@ -459,8 +459,11 @@ class PullRequests(Base):
                 return Result()
 
         client = Client()
-        handler = factory.Factory(client, [REPO], NOW)
-        handler._link_stack_for(REPO, {"number": 8, "body": "Builds on #7"})
+        handler = factory.Factory(client, [REPO], NOW, trusted=[ME["login"]])
+        base = {"number": 7, "user": ME,
+                "head": {"ref": "loom/base", "repo": {"full_name": REPO}}}
+        with mock.patch.object(handler, "_open_pull_requests", return_value=[base]):
+            handler._link_stack_for(REPO, {"number": 8, "body": "Builds on #7"})
         self.assertEqual(client.calls, [
             ("GET", "/repos/%s/stacks" % REPO, None),
             ("POST", "/repos/%s/stacks" % REPO,
