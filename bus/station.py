@@ -5478,18 +5478,28 @@ class Station:
                 name, "unread" if count is None else count, cap))
         return lines
 
+    def _stated_brief_wait(self, issue: Dict[str, Any],
+                           health: Optional[brief_check.Verdict]) -> bool:
+        """Explicit waits need no remote reads, writes or repeated hold logs."""
+        return health is None and brief_check.settled_brief_wait(issue, self.s.authors)
+
     def _brief_holds(self, repo: str, issue: Dict[str, Any], comments: List[Any]) -> bool:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask. A read the
-        check needs that fails holds the ticket for the next pass. A
-        regression or revert ticket is checked for its cause only: its merged
+        one goes back to the queue with needs:human and one ask, unless its
+        body and labels state a non-person wait. A labelled ticket stays held
+        before remote reads. A stale event wait without the label gets blocked
+        once, making its hold visible without another person ask.
+        A read the check needs that fails holds the ticket for the next pass.
+        Otherwise a regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
         number = int(issue["number"])
         names = _label_names(issue)
         body = str(issue.get("body") or "")
         found = brief_check.health_verdict(body)
+        if self._stated_brief_wait(issue, found):
+            return True
         exempt = bool(set(names) & {REGRESSION, factory.REVERT_LABEL})
         if found is None and not exempt:
             try:
@@ -5509,6 +5519,33 @@ class Station:
                 return True
         if found is None:
             return False
+        if self._label_stale_brief_wait(repo, issue, found):
+            return True
+        return self._apply_brief_hold(repo, number, found)
+
+    def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
+                               found: brief_check.Verdict) -> bool:
+        """Give a stale non-person wait one visible label, then use the read-free path."""
+        if found.kind != brief_check.STALE or not brief_check.settled_brief_wait(
+                issue, self.s.authors, stale=True):
+            return False
+        number = int(issue["number"])
+        try:
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["blocked"]})
+        except GitHubError as err:
+            _say("%s#%d waits: recording its non-person blocked label failed (%s)"
+                 % (repo, number, err))
+            return True
+        # Later lanes in this run share the issue object. Do not repeat the
+        # evidence reads or label write before the next GitHub refresh.
+        issue["labels"] = list(issue.get("labels") or []) + [{"name": "blocked"}]
+        _say("%s#%d is blocked: its stale brief records a non-person event wait"
+             % (repo, number))
+        return True
+
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
