@@ -169,6 +169,7 @@ class PortProbeTest(_ServerTest):
     port held by some other process (issue 2916)."""
 
     def free_port(self):
+        """A loopback port number nothing holds right now."""
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             return probe.getsockname()[1]
