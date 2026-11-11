@@ -287,14 +287,31 @@ def _absence(step: Step, needle: str, answer: Answer, lines: List[str],
     if answer.hours is None:
         return False, ("the `%s` log adapter did not say how much log it read, so "
                        "`%s` cannot be shown absent" % (step.source, needle))
-    if answer.hours + 1e-6 < needed:
-        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
-                       "needed to show `%s` absent" % (step.source, answer.hours, needed, needle))
     if count or lines:
         return False, "the `%s` log names `%s` %d times since the deploy%s" % (
             step.source, needle, max(count, len(lines)), _quoted(safe))
+    hours = _covered_hours(answer, since, now)
+    if hours + 1e-6 < needed:
+        return False, ("the `%s` log adapter read %.1f hours, short of the %.1f "
+                       "needed to show `%s` absent" % (step.source, hours, needed, needle))
     return True, "`%s` absent from the `%s` log over the %.1f hours read" % (
-        needle, step.source, answer.hours)
+        needle, step.source, hours)
+
+
+def _covered_hours(answer: Answer, since: float, now: float) -> float:
+    """Cap a claimed log span by timestamped lines and the requested window.
+
+    Adapters may report only counts, with no timestamped lines. Their existing
+    hours contract is unchanged. When lines do carry timestamps, a single line
+    proves no elapsed span and neither pre-deploy nor future time adds coverage.
+    """
+    claimed = max(0.0, answer.hours or 0.0)
+    stamps = [at for line in answer.lines or []
+              if (at := evidence.line_time(line)) is not None]
+    if not stamps:
+        return claimed
+    first, last = max(since, min(stamps)), min(now, max(stamps))
+    return min(claimed, max(0.0, (last - first) / 3600))
 
 
 def _quoted(safe: List[str]) -> str:
