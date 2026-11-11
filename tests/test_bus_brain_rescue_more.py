@@ -121,6 +121,24 @@ class ClosedEpicRescueMoreTests(unittest.TestCase):
             opened_pass2 = [n for n in fake.subs[1] if n not in before_pass2]
             self.assertEqual(opened_pass2, [])
 
+    def test_more_than_seventy_five_stranded_tickets_open_more_than_five_rescue_epics(self):
+        # 80 stranded tickets under closed epic #20 with existing epics full:
+        # opens 6 rescue epics (ceil(80 / 15) = 6), not capped at 5.
+        fake = self.full_epics_repo()
+        closed_tickets = [add_ticket(fake, 700 + n, 20) for n in range(80)]
+        add_epic(fake, 20, "Epic: closed work", state="closed", tickets=closed_tickets)
+        fake.open_tickets = [fake.issues[700 + n] for n in range(80)]
+
+        before = set(fake.issues)
+        self.assertEqual(self.move(fake), (80, 0))
+        opened = [n for n in fake.subs[1] if n not in before and n not in (60, 61)]
+        self.assertEqual(len(opened), 6)
+        self.assertTrue(all(brain.is_intake_epic(fake.issues[o]) for o in opened))
+        placed = sum((fake.subs[o] for o in opened), [])
+        self.assertEqual(sorted(placed), list(range(700, 780)))
+        self.assertEqual(fake.subs[20], [])
+        self.assertEqual(fake.issues[20]["state"], "closed")
+
 
 if __name__ == "__main__":
     unittest.main()

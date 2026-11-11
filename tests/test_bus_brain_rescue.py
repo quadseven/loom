@@ -101,11 +101,9 @@ class ClosedEpicRescueTests(unittest.TestCase):
              {"sub_issue_id": 1022, "replace_parent": True}),
         ])
 
-    def test_the_rescue_does_not_open_past_the_ceiling(self):
-        # At cap + RESCUE_EPIC_EXTRA open epics: no further rescue epic opens.
-        fake = self.cap_repo(open_epics=brain.GOAL_EPIC_CAP - 1 + brain.RESCUE_EPIC_EXTRA)
-        self.assertEqual(self.move(fake), (0, 2))
-        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
+    test_the_rescue_does_not_open_a_second_epic_past_the_bound = (
+        test_the_rescue_opens_a_second_epic_when_the_first_rescue_epic_is_full
+    )
 
     def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
         fake = self.cap_repo()

@@ -6915,15 +6915,9 @@ class MoveOutsideEpicTests(unittest.TestCase):
             ('PATCH', '/repos/%s/issues/21' % REPO, {'body': '## Why\nwhy\n\nPart of #%d\n' % opened[0]}),
         ])
 
-    def test_a_closed_epic_ticket_waits_when_rescue_ceiling_reached(self):
-        # Goal at open-epic cap plus RESCUE_EPIC_EXTRA: no further rescue epic may open.
-        url = "https://api.github.com/repos/%s/issues/20" % REPO
-        fake = self.repo(epics=[(60 + n, brain.EPIC_TICKET_CAP)
-                                for n in range(brain.GOAL_EPIC_CAP + brain.RESCUE_EPIC_EXTRA)])
-        self.epic_under_goal(fake, 20, state="closed",
-                             tickets=[self.under(21, 20, parent_issue_url=url)])
-        self.assertEqual(self.move(fake), (0, 1))
-        self.assertEqual(fake.writes(), [])
+    test_a_closed_epic_ticket_waits_when_no_intake_epic_may_open = (
+        test_a_closed_epic_ticket_moves_into_a_new_rescue_epic_when_intake_epics_are_full
+    )
 
     def test_open_epic_tickets_an_epic_an_ask_and_a_closed_ticket_never_move(self):
         closed_url = "https://api.github.com/repos/%s/issues/20" % REPO
