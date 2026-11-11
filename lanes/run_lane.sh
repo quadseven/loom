@@ -2330,6 +2330,16 @@ record() {
     "$(date -u +%FT%TZ)" >> "$RECORD"
 }
 
+# Private run evidence: the encrypted runner report already carries ticket
+# sidecars back to the station. Losing a record must never lose a lane run.
+record_base_flake() {  # base commit, first exit, bounded first-run excerpt
+  if ! python3 "$LOOM_ROOT/bus/base_flakes.py" "${LOG%.log}.base-flakes.jsonl" \
+      "$REPO" "$1" "$C_CHECK" "$2" "$3" >> "$LOG" 2>&1; then
+    echo "base flake event helper failed; continuing the lane run" >> "$LOG"
+  fi
+  return 0
+}
+
 # What failed in a check, from the log past byte $1: the tests it named (unittest
 # FAIL:/ERROR:, pytest FAILED/ERROR, go --- FAIL:) and the tools the shell could
 # not find, else its last line, so a validation record says why (loom#2418).
@@ -3109,7 +3119,7 @@ prepare_validation() {
     # Save this attempt before the retry appends its output. The contract is
     # one shell command: report the exit and its tail, not guessed test names.
     local first_output
-    first_output="$(tail -c "+$((check_start + 1))" "$LOG" | tail -n 20)"
+    first_output="$(tail -c "+$((check_start + 1))" "$LOG" | tail -c 4096 | tail -n 20)"
     if [ -n "$changed" ] && ! safe_git reset --hard HEAD >> "$LOG" 2>&1; then
       SETUP_REASON="could not restore tracked files changed by the baseline check"
       return 1
@@ -3133,9 +3143,10 @@ prepare_validation() {
     if [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ]; then
       {
         printf 'base check flaked: first exit %s; whole command passed on retry\n' "$first_exit"
-        printf 'first-run output (last 20 lines):\n%s\n' "$first_output"
+        printf 'first-run output (up to 4096 bytes, last 20 lines):\n%s\n' "$first_output"
         echo "base check exited $first_exit, then passed on a second run"
       } >> "$LOG"
+      record_base_flake "$baseline_rev" "$first_exit" "$first_output"
     fi
   fi
   if [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] && [ "$BASELINE_EXIT" -ne 143 ] && [ "$BASELINE_EXIT" -ne 125 ] &&
