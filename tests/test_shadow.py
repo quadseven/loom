@@ -420,10 +420,18 @@ class CallSiteTest(ShadowCase):
         self.assertTrue(shadow.merge_refusal(REPO, env))
 
     def test_merge_env_out_of_shadow_repo_proceeds(self):
-        env = {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": "example-owner/other"}
-        self.assertEqual(shadow.merge_refusal(REPO, env), "")
-        self.assertEqual(shadow.merge_refusal("example-owner/other", env),
-                         shadow.merge_refusal("example-owner/other", env))
+        # Shadow is on and its scope names a different repo, so the real merge
+        # path sends the merge for this one and records nothing in the ledger.
+        # The scope is set in both places the path reads: the env the caller
+        # passes (the merge helper) and the process environment (the client's
+        # choke point). Either one alone still holds the merge.
+        fake = tmt.Route(tmt.routes(files=tmt.APP_CHANGE))
+        env = dict(tmt.BrainMerge.ENV, LOOM_SHADOW="1",
+                   LOOM_SHADOW_REPOS="example-owner/other")
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW_REPOS": "example-owner/other"}):
+            brain.merge(GitHub("t", transport=fake), REPO, 8, (REPO, 9), env=env)
+        self.assertTrue(tmt.BrainMerge.merged(fake))
+        self.assertEqual(self.entries(), [])
         self.assertIn("shadow", shadow.merge_refusal("example-owner/other", env))
 
     def test_missing_or_malformed_shadow_scope_fails_closed_with_reason(self):
