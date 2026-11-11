@@ -142,6 +142,12 @@ def judged_pulls(texts: Iterable[str]) -> List[int]:
                    for m in [rx.match(str(text))] if m})
 
 
+def rejected_pulls(texts: Iterable[str]) -> List[int]:
+    """Merged pulls sent back for unfinished work, not merely sent to verify."""
+    return sorted({int(m.group(1)) for text in texts for rx in (_UNBUILT_RE, _REFUTED_RE)
+                   for m in [rx.match(str(text))] if m})
+
+
 def pending_verifies(texts: Iterable[str]) -> List[int]:
     """The pull requests sent to a verify run before a build whose verify run
     has not yet found them wanting."""

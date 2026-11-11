@@ -2741,7 +2741,7 @@ note_load_failure() {  # exit, reason_var_name
 }
 
 # The temp dir a run gets, owned by the runner and outside the agent's
-# scratch home: created here, so the directory always exists before
+# scratch home: emptied and created here, so the directory always exists before
 # anything is handed the path, and it stays existing: drop_run_scratch
 # removes the agent home before every brief, and a sandboxed agent may
 # write its own home, so a temp dir inside that home can be removed or
@@ -2757,8 +2757,18 @@ note_load_failure() {  # exit, reason_var_name
 # created in contract_run_sandboxed, the one place every check passes
 # through.
 run_tmpdir() {
-  mkdir -p "$LOOM_HOME/run/$SLOT-tmp" || return 1
-  printf '%s\n' "$LOOM_HOME/run/$SLOT-tmp"
+  local dir="$LOOM_HOME/run/$SLOT-tmp"
+  # Empty what an earlier run left behind. This is called once, with
+  # the slot lock held, before a run starts, so nothing of this run
+  # is in there yet. A link in its place is removed as a link, never
+  # followed, so its target is untouched.
+  if [ -L "$dir" ]; then
+    rm -f "$dir" || return 1
+  elif [ -e "$dir" ]; then
+    rm -rf "$dir" || return 1
+  fi
+  mkdir -p "$dir" || return 1
+  printf '%s\n' "$dir"
 }
 
 # Run one contract command in the tree the way an API-lane agent runs: an

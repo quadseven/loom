@@ -326,6 +326,11 @@ pull request to `loom:pr` before assigning new lane work.
 For a re-queued regression, a merged pull request from before the latest
 `loom:queued` or `loom:briefed` label does not move the ticket or supersede
 its newer open pull request. The current attempt still needs to merge.
+A merge already sent back for unbuilt criteria or rejected by verification
+cannot stand in for a retry, even through the timeline or old closed-PR
+fallback. The station records why it ignored the stale result and follows
+the normal no-current-PR path. A new open PR is preferred over old merges
+on the same branch; a historical merge never rejected still counts.
 
 ### When a ticket may run
 
