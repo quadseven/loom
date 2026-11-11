@@ -3143,7 +3143,7 @@ prepare_validation() {
     if [ "$BASELINE_EXIT" -eq 0 ] && [ -z "$changed" ]; then
       {
         printf 'base check flaked: first exit %s; whole command passed on retry\n' "$first_exit"
-        printf 'first-run output (last 20 lines):\n%s\n' "$first_output"
+        printf 'first-run output (up to 4096 bytes, last 20 lines):\n%s\n' "$first_output"
         echo "base check exited $first_exit, then passed on a second run"
       } >> "$LOG"
       record_base_flake "$baseline_rev" "$first_exit" "$first_output"

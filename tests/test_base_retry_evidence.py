@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,6 +19,7 @@ class BaseRetryEvidenceTests(unittest.TestCase):
             root = Path(temp)
             (root / "check-dir").mkdir()
             helper = re.search(r"^record_base_flake\(\) \{[^\n]*\n.*?^\}\n", source, re.S | re.M)
+            self.assertIsNotNone(helper, "the real flake event helper must be present")
             script = r'''
 set -u
 LOG="$ROOT/run.log"
@@ -95,7 +97,7 @@ result=$?
 printf '%s' "$result" > "$ROOT/result"
 exit 0
 '''
-            functions = (helper.group(0) if helper else "") + match.group(0)
+            functions = helper.group(0) + match.group(0)
             result = subprocess.run(["/bin/bash", "-c", functions + script],
                                     env={"PATH": "/usr/bin:/bin", "ROOT": str(root),
                                          "MODE": mode, "SOURCE_ROOT": str(ROOT)},
@@ -111,6 +113,19 @@ exit 0
                     "incidents": (root / "incidents").read_text().splitlines()
                     if (root / "incidents").exists() else []}
 
+    def test_fixture_refuses_a_missing_real_flake_helper(self):
+        source_path = ROOT / "lanes/run_lane.sh"
+        source = source_path.read_text().replace(
+            "record_base_flake() {", "renamed_base_flake() {", 1)
+        read_text = Path.read_text
+
+        def read_source(path, *args, **kwargs):
+            return source if path == source_path else read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_source):
+            with self.assertRaisesRegex(AssertionError, "real flake event helper"):
+                self.run_baseline("green")
+
     def test_a_flake_repeats_the_whole_command_and_runs_later_checks(self):
         run = self.run_baseline()
         self.assertEqual(run["result"], "0")
@@ -123,8 +138,8 @@ exit 0
         line = "base check flaked: first exit 1; whole command passed on retry"
         self.assertIn(line, run["log"])
         summary = run["log"].split(line + "\n", 1)[1]
-        self.assertTrue(summary.startswith("first-run output (last 20 lines):\n"))
-        excerpt = summary.split("first-run output (last 20 lines):\n", 1)[1].splitlines()[:20]
+        self.assertTrue(summary.startswith("first-run output (up to 4096 bytes, last 20 lines):\n"))
+        excerpt = summary.split("first-run output (up to 4096 bytes, last 20 lines):\n", 1)[1].splitlines()[:20]
         expected = ["first-output-%02d" % i for i in range(7, 26)]
         expected.append("FAIL: test_flaky (tests.test_retry.Checks.test_flaky)")
         self.assertEqual(excerpt, expected)

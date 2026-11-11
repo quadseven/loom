@@ -2201,7 +2201,9 @@ red there too. The runner files no incident for it (`LOOM_CLUSTER_RUNNER`).
 
 A base command that fails once and passes unchanged on its whole-command retry
 also appends one private event to `logs/<slot>/<ticket>.base-flakes.jsonl`.
-It contains an occurrence ID and timestamp, the repo and base commit, the
+Its version-1 `at` field is numeric Unix epoch seconds (UTC, including a
+fractional part); consumers must not parse it as an ISO timestamp. It also
+contains an occurrence ID, the repo and base commit, the
 command, first exit code, and the first-run output tail (at most 4096 UTF-8
 bytes and 20 lines). Failed retries, interrupted or unavailable checks, and
 retries that change tracked files do not produce a flake event. A sidecar
