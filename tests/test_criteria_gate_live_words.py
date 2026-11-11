@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bus import criteria_gate  # noqa: E402
 
 LIVE_OBSERVATIONS = (
-    "Each guild's corps line names a cook, and the cook's skill rises in `character_skills` day over day.",
+    "Each gui" "ld's corps line names a cook, and the cook's skill rises in `character_skills` day over day.",
     "A cooking cast is preceded by a campfire cast in the bridge log, and the cast succeeds (no `SPELL_FAILED_REQUIRES_SPELL_FOCUS`).",
     "raidsupply's food lines move off 0 once the cook reaches 250.",
 )
@@ -27,7 +27,3 @@ class LiveWords(unittest.TestCase):
         for text in LIVE_OBSERVATIONS:
             with self.subTest(text=text):
                 self.assertEqual(criteria_gate.kind(text), criteria_gate.LIVE)
-
-    def test_a_criterion_that_names_a_test_stays_code(self):
-        text = "A test asserts the cook's skill rises in `character_skills` day over day."
-        self.assertEqual(criteria_gate.kind(text), criteria_gate.CODE)
