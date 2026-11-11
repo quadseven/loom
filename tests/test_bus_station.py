@@ -5818,8 +5818,9 @@ class FixTest(Base):
         comments = [{"body": FIX_BODY, "id": 1, "created_at": "2030-01-02T00:00:00Z",
                      "updated_at": "2030-01-02T00:00:00Z",
                      "user": {"login": AUTHORS[0]}}]
+        status_texts = ["wait:gate: overlaps pull request #50"]
         with mock.patch.object(runner, "_status_texts",
-                               return_value=["wait:gate: overlaps pull request #50"]), \
+                               side_effect=lambda *_args: status_texts), \
                 mock.patch.object(runner, "_claim_comments", return_value=comments):
             self.assertTrue(runner._held_before_claim(REPO, issue, fix, comments))
             self.assertFalse(runner._claim(REPO, "codex", issue))
@@ -5827,10 +5828,10 @@ class FixTest(Base):
             self.assertNotIn("loom:running", self.fake.names(12))
             self.fake.pulls.remove(peer)
             self.assertFalse(runner._held_before_claim(REPO, issue, fix, comments))
+            status_texts[:] = ["wait:gate: review findings"]
+            self.assertFalse(runner._held_before_claim(REPO, issue, fix, comments))
             self.assertTrue(runner._claim(REPO, "codex", issue))
             self.assertTrue(self.listing())
-            self.assertFalse(runner._held_before_claim(REPO, issue, fix, [
-                {"body": "wait:gate: review findings", "user": {"login": AUTHORS[0]}}]))
 
     def test_a_trusted_fix_after_the_last_claim_renders_a_fix_brief(self):
         self.fake.add(12)
