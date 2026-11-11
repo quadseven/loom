@@ -1,9 +1,7 @@
 """A goal at its open epic cap still gets its tickets out of a closed epic.
 
-Tickets under a closed epic move into an open intake epic. When the goal is
-at GOAL_EPIC_CAP open epics and its intake epics are full, the rescue opens
-one intake epic past the cap for them, and no more than that: the goal never
-holds more than GOAL_EPIC_CAP + 1 open epics through rescue.
+Rescue may open enough intake epics past the cap for the tickets stranded
+under closed epics, bounded by EPIC_TICKET_CAP tickets per rescue epic.
 """
 
 from __future__ import annotations
@@ -85,10 +83,11 @@ class ClosedEpicRescueTests(unittest.TestCase):
         self.assertEqual(fake.issues[22]["body"], "## Why\nwhy\n\nPart of #%d\n" % made)
 
     def test_the_rescue_does_not_open_a_second_epic_past_the_bound(self):
-        # Seven open epics: one past the cap already, its intake epic full.
+        # Two stranded tickets need one additional rescue epic.
         fake = self.cap_repo(open_epics=brain.GOAL_EPIC_CAP)
-        self.assertEqual(self.move(fake), (0, 2))
-        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [])
+        self.assertEqual(self.move(fake), (2, 0))
+        self.assertEqual(len([c for c in fake.writes()
+                              if c[1].endswith("/sub_issues")]), 3)
 
     def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
         fake = self.cap_repo()

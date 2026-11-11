@@ -2291,8 +2291,7 @@ def _goal_children(gh: GitHub, repo: str, goal: int,
 EPIC_TICKET_CAP = 15
 GOAL_EPIC_CAP = 6
 # A rescue of tickets stranded under a closed epic may open one intake epic
-# past GOAL_EPIC_CAP, and no more: the goal holds at most cap + 1 open epics
-# through rescue, so a full rescue epic blocks the next one.
+# past GOAL_EPIC_CAP; further rescue room is bounded by the stranded count.
 RESCUE_EPIC_EXTRA = 1
 
 
@@ -2840,11 +2839,12 @@ def close_epic(gh: GitHub, repo: str, number: int, note: str) -> None:
 
 
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
-                     today: Optional[str] = None, rescue: bool = False) -> None:
+                     today: Optional[str] = None, rescue: bool = False,
+                     rescue_extra: int = RESCUE_EPIC_EXTRA) -> None:
     _, tree = goal_tree(gh, repo, goal)
     count = sum(1 for e, _ in tree if e.get("state", "open") == "open" and not standing_epic(e))
     cap = goal_epic_cap(goal_issue, today)
-    if count >= (cap + RESCUE_EPIC_EXTRA if rescue else cap):
+    if count >= (cap + (RESCUE_EPIC_EXTRA + rescue_extra if rescue else 0)):
         raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
                          "record a one-time exception on the goal home as "
                          "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
@@ -2853,12 +2853,13 @@ def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any
 def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
               today: Optional[str] = None, standing: bool = False,
               labels: Optional[Sequence[str]] = None,
-              rescue: bool = False) -> Dict[str, Any]:
+              rescue: bool = False,
+              rescue_extra: int = RESCUE_EPIC_EXTRA) -> Dict[str, Any]:
     """File an epic under an open goal: the epic label, a done-when, a size
     line and a Part of #goal line, linked as the goal's sub-issue when GitHub
     allows it. Refused at GOAL_EPIC_CAP open epics unless the goal home records
     a one-time exception ("Epic cap: N until DATE"), or unless rescue is set,
-    which allows one epic past that cap (RESCUE_EPIC_EXTRA). Returns the issue."""
+    which allows bounded rescue epics past that cap. Returns the issue."""
     title = " ".join(title.split())
     if not title.startswith(EPIC_TITLE_PREFIX) or len(title) > EPIC_TITLE_MAX \
             or not title[len(EPIC_TITLE_PREFIX):].strip():
@@ -2872,7 +2873,8 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
     _check_written_text(title + "\n" + body)
     goal_issue = _goal_issue(gh, repo, goal)
     if not standing:
-        _check_epic_room(gh, repo, goal, goal_issue, today, rescue=rescue)
+        _check_epic_room(gh, repo, goal, goal_issue, today, rescue=rescue,
+                         rescue_extra=rescue_extra)
     made = gh.rest("POST", "/repos/%s/issues" % repo,
                    {"title": title, "body": body,
                     "labels": ["epic"] + list(labels or [])}).data or {}
@@ -2883,7 +2885,8 @@ def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
 
 def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
                 area: Optional[str] = None,
-                exclude: Sequence[int] = (), rescue: bool = False) -> int:
+                exclude: Sequence[int] = (), rescue: bool = False,
+                rescue_extra: int = RESCUE_EPIC_EXTRA) -> int:
     """The goal's newest open intake epic with room for `room` more tickets
     (EPIC_TICKET_CAP is the most one holds), opened (within the epic cap) when
     none has room: where triage, rewrites, health intake, validation
@@ -2913,7 +2916,8 @@ def intake_epic(gh: GitHub, repo: str, goal: int, room: int = 1,
         title = next_intake_title(gh, repo)
         body = INTAKE_BODY % (EPIC_TICKET_CAP, EPIC_TICKET_CAP)
     made = file_epic(gh, repo, goal, title, body,
-                     labels=[area_label] if area_label else None, rescue=rescue)
+                     labels=[area_label] if area_label else None, rescue=rescue,
+                     rescue_extra=rescue_extra)
     if not made.get("number"):
         raise ValueError("GitHub named no number for the new intake epic of goal #%d" % goal)
     return int(made["number"])
@@ -2973,9 +2977,9 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     open tickets moved to the goal's next intake epic (the epic retains its
     first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left).
 
-    A ticket stranded under a closed epic may open one intake epic past the
-    goal's open epic cap when every intake epic is full (RESCUE_EPIC_EXTRA):
-    the goal at its cap would otherwise strand it for good.
+    Tickets stranded under closed epics may open rescue intake epics past the
+    goal's cap. The initial exception is RESCUE_EPIC_EXTRA; further room is
+    bounded by the stranded ticket count and EPIC_TICKET_CAP.
     """
     loose, tree = goal_tree(gh, repo, goal)
     tickets = _tickets_to_move(loose, tree, goal)
@@ -2985,9 +2989,12 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     areas = _area_labels(gh, repo)
     closed = {int(e.get("number") or 0) for e, _ in tree if e.get("state", "open") == "closed"}
     epic, held = _intake_with_room(tree)
+    stranded = sum(1 for ticket, old in tickets if old in closed)
+    rescue_extra = (stranded + EPIC_TICKET_CAP - 1) // EPIC_TICKET_CAP
     for ticket, old in tickets:
         target, (epic, held) = _move_target(
-            gh, repo, goal, ticket, old, areas, (epic, held), rescue=old in closed)
+            gh, repo, goal, ticket, old, areas, (epic, held),
+            rescue=old in closed, rescue_extra=rescue_extra)
         # Do not stop at a ticket that cannot move: a rescue ticket behind it
         # may still open the one epic past the cap.
         if target is None:
@@ -3019,7 +3026,8 @@ def _tickets_to_move(loose: List[Dict[str, Any]],
 
 def _move_target(gh: GitHub, repo: str, goal: int, ticket: Dict[str, Any],
                  old: int, areas: Dict[str, Dict[str, Any]],
-                 state: Tuple[Optional[int], int], rescue: bool = False
+                 state: Tuple[Optional[int], int], rescue: bool = False,
+                 rescue_extra: int = RESCUE_EPIC_EXTRA
                  ) -> Tuple[Optional[int], Tuple[Optional[int], int]]:
     """Determine the target epic for a ticket moving into an epic.
     Returns (target, (epic, held)) or (None, state) when no epic can accept it.
@@ -3031,12 +3039,14 @@ def _move_target(gh: GitHub, repo: str, goal: int, ticket: Dict[str, Any],
             gh.rest("POST", "/repos/%s/issues/%d/labels" %
                     (repo, int(ticket["number"])), {"labels": ["area:" + area]})
         try:
-            target = intake_epic(gh, repo, goal, area=area, exclude=(old,), rescue=rescue)
+            target = intake_epic(gh, repo, goal, area=area, exclude=(old,), rescue=rescue,
+                                 rescue_extra=rescue_extra)
         except ValueError:
             return None, state
         return target, state
     if epic is None or held >= EPIC_TICKET_CAP or epic == old:
-        opened = _open_intake_epic(gh, repo, goal, exclude=(old,), rescue=rescue)
+        opened = _open_intake_epic(gh, repo, goal, exclude=(old,), rescue=rescue,
+                                   rescue_extra=rescue_extra)
         if opened is None:
             return None, state
         epic, held = opened
@@ -3144,13 +3154,15 @@ def _intake_with_room(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
 
 
 def _open_intake_epic(gh: GitHub, repo: str, goal: int,
-                      exclude: Sequence[int] = (), rescue: bool = False) -> Optional[Tuple[int, int]]:
+                      exclude: Sequence[int] = (), rescue: bool = False,
+                      rescue_extra: int = RESCUE_EPIC_EXTRA) -> Optional[Tuple[int, int]]:
     """The goal's newest open intake epic with room, opened when none has
-    room and the goal is under its open epic cap (or rescue allows one past
-    it), and the tickets it holds; (None, 0) when the goal is at its cap and
+    room and the goal is under its open epic cap (or rescue allows its bounded
+    exception), and the tickets it holds; (None, 0) when the goal is at its cap and
     no intake epic has room."""
     try:
-        number = intake_epic(gh, repo, goal, exclude=exclude, rescue=rescue)
+        number = intake_epic(gh, repo, goal, exclude=exclude, rescue=rescue,
+                             rescue_extra=rescue_extra)
     except ValueError as err:
         print("goal #%d: no intake epic has room and none may open (%s)" % (goal, err),
               file=sys.stderr)
