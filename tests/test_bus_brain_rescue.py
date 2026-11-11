@@ -93,6 +93,13 @@ class ClosedEpicRescueTests(unittest.TestCase):
         opened = [n for n in fake.subs[1] if n not in before and n != 60]
         self.assertEqual(len(opened), 1)
         self.assertEqual(sorted(fake.subs[opened[0]]), [21, 22])
+        self.assertEqual([c for c in fake.writes() if c[1].endswith("/sub_issues")], [
+            ("POST", "/repos/%s/issues/1/sub_issues" % REPO, {"sub_issue_id": 1000 + opened[0]}),
+            ("POST", "/repos/%s/issues/%d/sub_issues" % (REPO, opened[0]),
+             {"sub_issue_id": 1021, "replace_parent": True}),
+            ("POST", "/repos/%s/issues/%d/sub_issues" % (REPO, opened[0]),
+             {"sub_issue_id": 1022, "replace_parent": True}),
+        ])
 
     def test_a_loose_ticket_ahead_of_a_rescue_ticket_does_not_strand_it(self):
         fake = self.cap_repo()

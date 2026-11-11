@@ -6904,6 +6904,16 @@ class MoveOutsideEpicTests(unittest.TestCase):
                   and n != 20]
         self.assertEqual(len(opened), 1)
         self.assertEqual(fake.subs[opened[0]], [21])
+        self.assertEqual(fake.writes(), [
+            ('POST', '/repos/%s/issues' % REPO, {
+                'title': 'Epic: work that triage, rewrites and health intake find, batch 1',
+                'body': 'Done when: this intake epic holds 15 tickets, or every ticket in it is closed; the next intake opens a new epic.\n\nSize: at most 15 tickets.\n\nThe station files the tickets that triage, the rewriter, health intake, validation contracts and pull request adoption find under this goal here, so every ticket sits under an open epic (decision 0003).\n\nPart of #1\n',
+                'labels': ['epic'],
+            }),
+            ('POST', '/repos/%s/issues/1/sub_issues' % REPO, {'sub_issue_id': 1000 + opened[0]}),
+            ('POST', '/repos/%s/issues/%d/sub_issues' % (REPO, opened[0]), {'sub_issue_id': 1021, 'replace_parent': True}),
+            ('PATCH', '/repos/%s/issues/21' % REPO, {'body': '## Why\nwhy\n\nPart of #%d\n' % opened[0]}),
+        ])
 
     def test_open_epic_tickets_an_epic_an_ask_and_a_closed_ticket_never_move(self):
         closed_url = "https://api.github.com/repos/%s/issues/20" % REPO
