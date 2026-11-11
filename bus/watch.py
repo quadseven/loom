@@ -147,6 +147,7 @@ EXPECTED_RES = (
                r"(?:the edits are on branch [A-Za-z0-9_./-]+|the push of [A-Za-z0-9_./-]+ failed; the edits are committed in the lane tree|the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree|the edits are committed in the lane tree)(?:; no pull request opened)?[ \t]*"),
     re.compile(r"station: factory release: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ re-queued: "
                r"incident filing failed[ \t]*"),
+    re.compile(r"station: close audit: [0-9]+ closes read, [0-9]+ refused, [0-9]+ waiting; at most [0-9]+ reads a pass[ \t]*"),
 )
 # The brain's own status output, read back into its log: it names stages,
 # states and outcomes ("failed"), so the error words match, but none of it is
