@@ -1903,6 +1903,20 @@ Status prints `held by a fleet comment from LOGIN: <comment link>`, and
 `bus.brain merge` refuses with the same words. Comments that cannot be read
 block as `pull request comments unreadable`. Only the opener counts: no other
 comment text is read as a hold.
+A blocking comment blocks too (loom#2988, bus/comment_findings.py): a trusted
+login's plain pull request comment, by the API author and never by a name in
+its text (LOOM_BRIEF_AUTHORS), that is either a finding in the marker form
+`<!-- loom:finding v1 -->`, or the legacy form: a line opening with `Blocking`
+(not `Blocking: none`) that names a commit by 7 or more hex characters. A
+comment carrying any other `<!-- loom:` marker is never a legacy finding, so a
+Luna verdict for an older head does not block a newer one. A finding stays open
+across pushes: a commit, an empty commit or an unrelated one never clears it, and
+a newer head does not supersede it. Only a later trusted comment that links the
+finding as `#issuecomment-<id>` answers it, with the fix or an evidence-backed
+decline. Status prints `blocked: unanswered blocking comment from LOGIN: <comment
+link>`, and `bus.brain merge` refuses with the same words. Unreadable comments
+block as `pull request comments unreadable, so a blocking comment cannot be ruled
+out`. Ordinary comments, including `Nonblocking` or `Blocking: none`, never block.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:failed, not loom:pr`; at `loom:briefed`

@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -1026,6 +1026,35 @@ def _hold_blocker(gh: GitHub, repo: str, number: int, head: Dict[str, Any],
     return "held by a fleet comment from %s: %s" % (comment_login(held), _hold_name(held))
 
 
+def _read_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
+    """Every comment on a pull request, read once for the comment gates (the
+    fleet hold and the blocking-comment check, loom#2988). Raises ValueError
+    when they cannot be read: a gate the comments never reached cannot be
+    passed."""
+    try:
+        return gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request comments unreadable, so a fleet hold or a "
+                         "blocking comment cannot be ruled out (%s)" % err) from err
+
+
+def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
+                     known: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """The blocker an unanswered blocking comment from a trusted login puts on a
+    pull request, else None (bus/comment_findings.py, loom#2988). Status and
+    merge both call it, so they agree. `known` is every comment, already read;
+    else they are read from REST, and unreadable comments block."""
+    if not [a for a in authors if a]:
+        return None
+    if known is None:
+        try:
+            known = _read_comments(gh, repo, number)
+        except ValueError as err:
+            return str(err).removeprefix("blocked: ")
+    found = comment_findings.open_findings(list(known), authors)
+    return comment_findings.blocker(found) if found else None
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     line = " ".join(str(value or "").split())
     return line if len(line) <= limit else line[:limit - 3] + "..."
@@ -1165,6 +1194,9 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                          hold, _node_comments(node))
     if hold:
         line = _add_blocker(line, hold)
+    finding = _finding_blocker(gh, repo, int(pr["number"]), authors, _node_comments(node))
+    if finding:
+        line = _add_blocker(line, finding)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
         line = _add_blocker(line, "held for the operator: operator steps before merge")
     return _goal_rule_line(gh, repo, pr, ticket, line)
@@ -5113,10 +5145,17 @@ def merge(gh: GitHub, repo: str, number: int,
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    logins = hold_logins(env)
+    authors = trusted_authors(env)
+    # Neither gate reads anything without a trusted login, so none is read here.
+    comments = _read_comments(gh, repo, number) if (logins or authors) else []
     hold = _hold_blocker(gh, repo, number, _head_commit(details), str(sha),
-                         str((pr.get("user") or {}).get("login") or ""), hold_logins(env))
+                         str((pr.get("user") or {}).get("login") or ""), logins, comments)
     if hold:
         raise ValueError("blocked: " + hold)
+    finding = _finding_blocker(gh, repo, number, trusted_authors(env), comments)
+    if finding:
+        raise ValueError("blocked: " + finding)
     shadow_env = _shadow_env(env)
     refusal = shadow.merge_refusal(repo, shadow_env)
     if refusal:

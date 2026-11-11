@@ -7407,6 +7407,170 @@ class FleetHoldTests(unittest.TestCase):
         self.assertEqual(seen, [["example-brain", self.FLEET]])
 
 
+class FindingGateTests(unittest.TestCase):
+    """loom#2988: a trusted login's plain pull request comment that blocks (the
+    finding marker, or a "Blocking" line naming a commit) stays open until a
+    later trusted comment links it. Checks, commits and pushes do not clear it.
+    The regression fixture is the observed shape: a trusted builder's blocking
+    comment on the reviewed head, unanswered when the pull request merged with
+    green checks and review."""
+
+    SHA = "abc1234def5678abc1234def5678abc1234def56"
+    NEW = "fedcba9876543210fedcba9876543210fedcba98"
+    BRAIN = "example-brain"
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-fleet"}
+    URL = "https://github.com/%s/pull/8#issuecomment-601" % REPO
+    FINDING = ("Blocking: acceptance is not satisfied on head %s; retry after validation."
+               % SHA[:9])
+
+    def comment(self, login, body, at, ident=601):
+        return {"id": ident, "user": {"login": login}, "body": body, "created_at": at,
+                "html_url": "https://github.com/%s/pull/8#issuecomment-%d" % (REPO, ident)}
+
+    def finding(self, body=FINDING, at="2030-01-01T13:00:00Z", login=BRAIN):
+        return self.comment(login, body, at)
+
+    def routes(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z"):
+        pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO,
+              "user": {"login": "example-lane[bot]"},
+              "head": {"ref": "loom/9-work", "sha": head, "repo": {"full_name": REPO}},
+              "base": {"repo": {"full_name": REPO}}, "mergeable": True}
+        details = {"isDraft": False, "mergeable": "MERGEABLE", "headRefName": "loom/9-work",
+                   "headRefOid": head, "headRepository": {"nameWithOwner": REPO},
+                   "commits": {"nodes": [{"commit": {"committedDate": committed,
+                                                     "statusCheckRollup": {"state": "SUCCESS"}}}]},
+                   "reviewThreads": {"totalCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []},
+                   "files": {"totalCount": 1, "nodes": [{"path": "bus/a.py"}]}}
+        issue = {"number": 9, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        return Routed({
+            ("GET", "/pulls/8"): reply(200, pr),
+            ("POST", "/graphql"): reply(200, {"data": {"repository": {"pullRequest": details}}}),
+            ("GET", "/issues/9"): reply(200, issue),
+            ("GET", "/issues/9/comments"): reply(200, []),
+            ("GET", "/issues/8/comments"): reply(status, comments),
+            ("GET", "/pulls/8/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"},
+                                                   {"filename": "tests/test_a.py", "patch": "+x"}]),
+            ("GET", "/search/issues"): reply(200, {"total_count": 0}),
+            ("GET", "/check-runs"): reply(200, {"check_runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]}),
+            ("PUT", "/pulls/8/merge"): reply(200, {"merged": True}),
+        })
+
+    def merge(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z"):
+        transport = self.routes(comments, status, head, committed)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            try:
+                brain.merge(GitHub("t", transport=transport), REPO, 8, (REPO, 9), env=self.ENV)
+            except ValueError as err:
+                self.assertFalse(transport.sent("PUT", "/pulls/8/merge"))
+                return str(err)
+        self.assertTrue(transport.sent("PUT", "/pulls/8/merge"))
+        return "merged"
+
+    def status_line(self, comments, node=None, status=200):
+        pr = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": self.SHA},
+              "user": {"login": "example-lane[bot]"}, "labels": [{"name": "class:logic"}]}
+        issue = {"number": 7, "state": "open", "body": "",
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"}]}
+        routes = {
+            ("GET", "/issues/7"): reply(200, issue),
+            ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": True,
+                                             "mergeable_state": "clean"}),
+            ("GET", "/pulls/9/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"},
+                                                   {"filename": "tests/test_a.py", "patch": "+x"}]),
+            ("GET", "/search/issues"): reply(200, {"total_count": 0}),
+            ("GET", "/issues/9/comments"): reply(status, comments),
+        }
+        gh = GitHub("t", transport=Routed(routes))
+        env = {"LOOM_BRIEF_AUTHORS": self.BRAIN}
+        with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
+            return brain._pull_request_lines(gh, REPO, [pr], {"prs": {9: node or ready_node()}},
+                                             "grug-tribe", [self.BRAIN], hold=brain.hold_logins(env))[1]
+
+    def test_a_trusted_blocking_comment_refuses_the_merge_and_names_its_link(self):
+        said = self.merge([self.finding()])
+        self.assertIn("unanswered blocking comment from example-brain", said)
+        self.assertIn(self.URL, said)
+
+    def test_status_names_the_link_instead_of_ready(self):
+        self.assertEqual(self.status_line([self.finding()]),
+                         "- #9 Work - blocked: unanswered blocking comment from example-brain: "
+                         + self.URL)
+
+    def test_the_regression_fixture_is_green_on_checks_and_review_yet_refused(self):
+        # The observed shape: green CI and Elder, the blocking comment on the
+        # reviewed head, and no answer. Status and merge agree on the refusal.
+        self.assertIn(self.URL, self.merge([self.finding()]))
+        self.assertIn(self.URL, self.status_line([self.finding()]))
+
+    def test_a_linked_answer_after_the_finding_clears_it(self):
+        answer = self.comment(self.BRAIN, "Declined with evidence: the retry case is handled "
+                              "by the existing validation. " + self.URL,
+                              "2030-01-01T13:30:00Z", 602)
+        self.assertEqual(self.merge([self.finding(), answer]), "merged")
+        self.assertEqual(self.status_line([self.finding(), answer]), "- #9 Work - READY")
+
+    def test_an_answer_that_does_not_link_the_finding_does_not_clear_it(self):
+        answer = self.comment(self.BRAIN, "Fixed: the retry case is handled now.",
+                              "2030-01-01T13:30:00Z", 602)
+        self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
+
+    def test_an_answer_older_than_the_finding_does_not_clear_it(self):
+        answer = self.comment(self.BRAIN, "Declined: already handled. " + self.URL,
+                              "2030-01-01T12:30:00Z", 602)
+        self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
+
+    def test_an_untrusted_answer_does_not_clear_it(self):
+        answer = self.comment("example-stranger", "Declined: fine. " + self.URL,
+                              "2030-01-01T13:30:00Z", 602)
+        self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
+
+    def test_a_new_commit_or_empty_push_does_not_clear_it(self):
+        # A later head, committed after the finding, still has the finding open.
+        said = self.merge([self.finding()], head=self.NEW, committed="2030-01-01T14:00:00Z")
+        self.assertIn("unanswered blocking comment", said)
+        self.assertIn(self.URL, said)
+
+    def test_ordinary_comments_do_not_block(self):
+        for body in ("Looks good to me.", "Nonblocking: a naming nit at %s." % self.SHA[:9],
+                     "Blocking: none at %s." % self.SHA[:9], "This is not blocking at %s."
+                     % self.SHA[:9]):
+            with self.subTest(body=body):
+                self.assertEqual(self.merge([self.finding(body=body)]), "merged")
+
+    def test_an_untrusted_login_cannot_block_even_when_it_names_a_trusted_one(self):
+        stranger = self.finding(body=self.FINDING + " -- example-brain",
+                                login="example-stranger")
+        self.assertEqual(self.merge([stranger]), "merged")
+
+    def test_a_luna_verdict_for_an_older_head_does_not_block_a_newer_one(self):
+        verdict = self.comment("example-fleet", "<!-- loom:luna-review v1 sha=%s -->\n"
+                               "Elder markings - 1 blocking, 1 total\n\n"
+                               "Blocking findings:\n- old finding" % self.SHA,
+                               "2030-01-01T13:00:00Z", 603)
+        self.assertEqual(self.merge([verdict], head=self.NEW,
+                                    committed="2030-01-01T14:00:00Z"), "merged")
+
+    def test_the_marker_form_blocks_without_naming_a_commit(self):
+        body = "<!-- loom:finding v1 -->\nThe retry path is not handled."
+        self.assertIn(self.URL, self.merge([self.finding(body=body)]))
+
+    def test_unreadable_comments_refuse_the_merge_and_the_status_line(self):
+        self.assertIn("pull request comments unreadable", self.merge([], status=500))
+        self.assertIn("pull request comments unreadable",
+                      self.status_line({"message": "boom"}, status=500))
+
+    def test_status_reads_the_finding_from_its_one_graphql_read(self):
+        node = ready_node()
+        node["comments"] = {"totalCount": 1, "nodes": [
+            {"databaseId": 601, "url": self.URL, "createdAt": "2030-01-01T13:00:00Z",
+             "body": self.FINDING, "author": {"__typename": "User", "login": self.BRAIN}}]}
+        line = self.status_line({"message": "Not Found"}, node=node, status=404)
+        self.assertEqual(line, "- #9 Work - blocked: unanswered blocking comment from "
+                               "example-brain: " + self.URL)
+
+
 NOW_2393 = datetime(2030, 1, 1, 14, 0, tzinfo=timezone.utc)
 
 
