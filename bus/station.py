@@ -16209,7 +16209,9 @@ class Station:
         target = getattr(self.gh, "target", None)
         if not isinstance(target, int) or isinstance(target, bool):
             return False
-        return self._pass_counted() >= self._claim_target()
+        # run_pass sets gh.target to the already-computed claim share. Applying
+        # CLAIM_SHARE again here would stop at 64% of the pass target.
+        return self._pass_counted() >= target
 
     def _target_reached(self) -> bool:
         target = getattr(self.gh, "target", None)

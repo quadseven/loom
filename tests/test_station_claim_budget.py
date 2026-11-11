@@ -23,6 +23,16 @@ class StationClaimBudgetTest(Base):
     """The claim pass bounds its reads to leave room for the step rotation,
     and due steps run ahead of the rotation order."""
 
+    def test_claim_share_is_not_applied_twice(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.gh.target = int(station.PASS_REQUEST_TARGET * station.CLAIM_SHARE)
+        counted = [st.gh.target - 1]
+        st._pass_counted = lambda: counted[0]
+
+        self.assertFalse(st._claim_target_reached())
+        counted[0] += 1
+        self.assertTrue(st._claim_target_reached())
+
     def test_claim_step_leaves_rotation_room_when_it_would_spend_past_target(self):
         # A briefed ticket whose comments would cost well over the pass target (500 requests).
         self.heartbeat("codex")
