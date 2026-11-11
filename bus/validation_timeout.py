@@ -11,7 +11,8 @@ ERROR = re.compile(r"^ERROR: (.+)$", re.MULTILINE)
 TEST_MODULE = re.compile(r"\(([A-Za-z_][A-Za-z0-9_.]*)\)")
 
 
-def only_untouched_test_timeouts(output: str, changed_paths: set[str]) -> bool:
+def only_untouched_test_timeouts(output: str, changed_paths: set[str],
+                                 test_paths: set[str]) -> bool:
     """Whether unittest reported only TimeoutExpired errors in unchanged tests."""
     failures = list(ERROR.finditer(output))
     if not failures:
@@ -28,15 +29,22 @@ def only_untouched_test_timeouts(output: str, changed_paths: set[str]) -> bool:
             return False
         modules.append(match.group(1))
     for module in modules:
-        parts = module.split(".")
-        if parts[0] == "tests":
-            candidates = {"/".join(parts[:end]) + ".py"
-                          for end in range(2, len(parts) - 1)}
-        else:
-            candidates = {parts[0] + ".py", "tests/" + parts[0] + ".py"}
-        if candidates.intersection(changed_paths):
+        candidates = {path for path in test_paths
+                      if _module_matches_test_path(module, path)}
+        if not candidates or candidates.intersection(changed_paths):
             return False
     return True
+
+
+def _module_matches_test_path(module: str, path: str) -> bool:
+    """Match unittest IDs with or without their leading tests package."""
+    if not path.endswith(".py"):
+        return False
+    name = path[:-3].replace("/", ".")
+    aliases = {name}
+    if name.startswith("tests."):
+        aliases.add(name[len("tests."):])
+    return any(module == alias or module.startswith(alias + ".") for alias in aliases)
 
 
 def main() -> int:
@@ -45,12 +53,19 @@ def main() -> int:
     output = sys.stdin.read()
     tree, base, revision = sys.argv[1:]
     try:
+        repo = Path(tree)
         changed = subprocess.run(["git", "diff", "--name-only", base, revision],
-                                 cwd=Path(tree), check=True, capture_output=True,
+                                 cwd=repo, check=True, capture_output=True,
                                  text=True).stdout.splitlines()
+        tests = subprocess.run(["git", "ls-tree", "-r", "--name-only", revision,
+                                "--", "tests"], cwd=repo, check=True,
+                               capture_output=True, text=True).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError):
+        print("validation timeout classifier could not read git state", file=sys.stderr)
         return 1
-    return 0 if only_untouched_test_timeouts(output, set(changed)) else 1
+    test_paths = {path for path in tests
+                  if path.rsplit("/", 1)[-1].startswith("test") and path.endswith(".py")}
+    return 0 if only_untouched_test_timeouts(output, set(changed), test_paths) else 1
 
 
 if __name__ == "__main__":

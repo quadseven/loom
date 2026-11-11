@@ -761,6 +761,8 @@ print('leak guard: clean (shape patterns only)')
     def run_lane(self, lane="codex", cwd=None, timeout=180, **env):
         # In a session of its own, emptied when the run ends or times out, so
         # no watchdog or agent of a timed-out run outlives the test (loom#2438).
+        # Process-backed cases took up to 45 seconds in a 9-worker run; allow
+        # 3x headroom for several validation lanes sharing a host.
         return session_procs.run(["bash", str(RUNNER), lane], env=self.lane_env(**env), cwd=cwd,
                                  timeout=timeout)
 

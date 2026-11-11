@@ -3290,7 +3290,7 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
-  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] &&
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
      tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
        python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
     PARK_CLASS=transient
