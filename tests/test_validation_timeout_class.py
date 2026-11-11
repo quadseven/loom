@@ -50,5 +50,12 @@ AssertionError: mismatch
         self.assertFalse(only_untouched_test_timeouts(
             output, set(), {"tests/test_example.py"}))
 
+    def test_assertion_failure_alone_is_not_transient(self):
+        output = """FAIL: test_case (test_example.Example.test_case)
+AssertionError: mismatch
+"""
+        self.assertFalse(only_untouched_test_timeouts(
+            output, set(), {"tests/test_example.py"}))
+
 if __name__ == "__main__":
     unittest.main()
