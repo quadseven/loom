@@ -646,11 +646,12 @@ def held_lines(held: Dict[int, List[tickets.After]],
     return lines if held else lines + ["- none"]
 
 
-def merge_ready(node: Optional[Dict[str, Any]], bot: str) -> str:
+def merge_ready(node: Optional[Dict[str, Any]], bot: str,
+                ticket: Optional[Dict[str, Any]] = None) -> str:
     """The canonical merge-ready signal (docs/BRAIN.md): "READY", or
     "blocked: " and every blocker, from one pull request's READY_FIELDS
     (merge_verdict.ready_verdict owns the rules)."""
-    return merge_verdict.ready_verdict(node, bot).text
+    return merge_verdict.ready_verdict(node, bot, ticket=ticket).text
 
 
 _NOT_BUILT = re.compile(r";\s*not built:", re.I)
@@ -725,13 +726,19 @@ def _hold_box_reason(gh: GitHub, repo: str, pr: Dict[str, Any],
     return hold_boxes.refusal(str(pr.get("body") or ""), repo, read, known, own)
 
 
-def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str) -> str:
-    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""), merge_ready(node, bot))
+def _pr_line(pr: Dict[str, Any], node: Optional[Dict[str, Any]], bot: str,
+             ticket: Optional[Dict[str, Any]] = None) -> str:
+    ready_node = dict(node or {})
+    if "body" not in ready_node and "body" in pr:
+        ready_node["body"] = pr.get("body")
+    return "- #%s %s - %s" % (pr["number"], pr.get("title", ""),
+                              merge_ready(ready_node, bot, ticket=ticket))
 
 
 def _status_pr_line(gh: GitHub, repo: str, pr: Dict[str, Any],
-                    node: Optional[Dict[str, Any]], bot: str, check: str) -> str:
-    line = _pr_line(pr, node, bot)
+                    node: Optional[Dict[str, Any]], bot: str, check: str,
+                    ticket: Optional[Dict[str, Any]] = None) -> str:
+    line = _pr_line(pr, node, bot, ticket=ticket)
     needs_review_check = (change_class.class_of(pr) == "sensitive"
                           or _ticketless(repo, pr))
     if line.endswith(" - READY") and needs_review_check:
@@ -1365,9 +1372,12 @@ def _waiting_brain_lines(tickets: List[Dict[str, Any]], pr_of: Dict[int, Dict[st
     lines = [WAITING_BRAIN_HEADING]
     for _, issue, pr in sorted(rows, key=lambda r: (r[0], int(r[2]["number"]))):
         old = "%dh old" % _age(pr, now) if _stamp(str(pr.get("created_at") or "")) else "age unknown"
+        ready_node = dict(data["prs"].get(int(pr["number"])) or {})
+        if "body" not in ready_node and "body" in pr:
+            ready_node["body"] = pr.get("body")
         lines.append("- #%s %s - ticket #%s - %s - %s" % (
             pr["number"], pr.get("title", ""), issue["number"], old,
-            merge_ready(data["prs"].get(int(pr["number"])), bot)))
+            merge_ready(ready_node, bot, ticket=issue)))
     return lines if rows else lines + ["- none"]
 
 
