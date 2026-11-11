@@ -32,7 +32,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
-from . import change_class, close_audit, tickets
+from . import change_class, close_audit, handoff, tickets
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 
 STATE_FILE = "review-debt.json"
@@ -52,6 +52,7 @@ FILES_READ = 100
 LIVE_BUDGET = 2000
 FLEET_BRAINS = "agent-anthropic-claude-code[bot] agent-meta-muse[bot] agent-openai-dot[bot]"
 REVIEW_RE = re.compile(r"\A\s*(?:#+\s*)?Loom review\b", re.I)
+JOURNAL_TICK_RE = re.compile(r"^Tick \S+, [A-Za-z0-9._-]+\s*$", re.M)
 GUARD_RE = re.compile(r"^The guard\b", re.M)
 SHIPPED, NO_CHECK, OPEN = "shipped", "no-check", "open"
 _TEST_WRITES = ("added", "modified", "renamed", "changed", "copied")
@@ -64,14 +65,23 @@ def review_authors(env: Optional[Mapping[str, str]] = None) -> List[str]:
 
 
 def is_review(comment: Any, authors: Sequence[str]) -> bool:
-    if not isinstance(comment, dict) or not REVIEW_RE.match(str(comment.get("body") or "")):
+    if not isinstance(comment, dict):
+        return False
+    body = str(comment.get("body") or "")
+    if body.startswith(handoff.JOURNAL_MARKER):
+        tick = JOURNAL_TICK_RE.search(body)
+        if tick is None:
+            return False
+        body = body[tick.end():].lstrip("\r\n")
+    if not REVIEW_RE.match(body):
         return False
     login = str((comment.get("user") or {}).get("login") or "")
     return login.lower() in {a.lower() for a in authors}
 
 
 def newest_review(comments: Sequence[Any], authors: Sequence[str]) -> Optional[float]:
-    found = [close_audit.epoch(c.get("created_at")) for c in comments if is_review(c, authors)]
+    expanded = handoff.expand_journals(comments, at_key="created_at")
+    found = [close_audit.epoch(c.get("created_at")) for c in expanded if is_review(c, authors)]
     return max([at for at in found if at is not None], default=None)
 
 
