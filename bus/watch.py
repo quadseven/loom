@@ -137,6 +137,8 @@ HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for
 #   the earlier "held ... for the factory: ... incident filing failed" line,
 #   which stays kept (loom#1890, loom#2770 filed the recovery instead).
 EXPECTED_RES = (
+    re.compile(r"station: close audit: [0-9]+ closes read, [0-9]+ refused, [0-9]+ waiting; "
+               r"at most [0-9]+ reads a pass[ \t]*"),
     re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+: fix rounds stopped \(.+\); "
                r"left failed for the hand-off pool[ \t]*"),
     re.compile(r"station: lane [A-Za-z0-9_.-]+ takes no verify run until "
