@@ -69,6 +69,25 @@ def _other_interface_address():
     return None
 
 
+def port_free_on_other_address(start_dashboard, address, attempts=5):
+    """True when some dashboard, started by start_dashboard, leaves its port
+    number free on address.
+
+    A refused bind is ambiguous: the dashboard may hold the port on that
+    address, or another process may hold the same number there (a parallel
+    test run binds many ephemeral ports). Only a refusal on every attempt,
+    each against a fresh dashboard on a new port, shows the first."""
+    for _ in range(attempts):
+        port = start_dashboard().server_address[1]
+        with socket.socket() as probe:
+            try:
+                probe.bind((address, port))
+            except OSError:
+                continue
+        return True
+    return False
+
+
 class _ServerTest(unittest.TestCase):
     """A dashboard server on an ephemeral port, with no background reads."""
 
@@ -121,15 +140,12 @@ class DashboardInterfaceTest(_ServerTest):
         return address
 
     def test_a_given_address_leaves_the_other_interfaces_closed(self):
-        server = self.serve(LOOM_DASHBOARD_HOST="127.0.0.1")
         address = self.other_address()
-        port = server.server_address[1]
-        with socket.socket() as probe:
-            try:
-                probe.bind((address, port))
-            except OSError as exc:
-                self.fail("the dashboard holds %s:%d as well, so it serves that "
-                          "interface too (%s)" % (address, port, exc))
+        self.assertTrue(
+            port_free_on_other_address(
+                lambda: self.serve(LOOM_DASHBOARD_HOST="127.0.0.1"), address),
+            "the dashboard holds the same port on %s as well, so it serves that "
+            "interface too" % address)
 
     def test_without_an_address_the_other_interfaces_are_open(self):
         server = self.serve()
@@ -139,6 +155,56 @@ class DashboardInterfaceTest(_ServerTest):
             with self.assertRaises(OSError) as caught:
                 probe.bind((address, port))
         self.assertEqual(caught.exception.errno, errno.EADDRINUSE)
+
+
+class _Dashboard:
+    """A stand-in dashboard: only the port it reports."""
+
+    def __init__(self, port):
+        self.server_address = ("127.0.0.1", port)
+
+
+class PortProbeTest(_ServerTest):
+    """port_free_on_other_address tells a port held by the dashboard from a
+    port held by some other process (issue 2916)."""
+
+    def free_port(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    def test_a_foreign_socket_on_the_dashboards_port_number_is_not_a_failure(self):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        foreign = socket.socket()
+        self.addCleanup(foreign.close)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen()
+        ports = iter([foreign.getsockname()[1], self.free_port()])
+        self.assertTrue(port_free_on_other_address(
+            lambda: _Dashboard(next(ports)), "127.0.0.1"))
+
+    def test_a_port_refused_on_every_attempt_is_a_failure(self):
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        foreign = socket.socket()
+        self.addCleanup(foreign.close)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen()
+        started = []
+
+        def start():
+            started.append(1)
+            return _Dashboard(foreign.getsockname()[1])
+
+        self.assertFalse(port_free_on_other_address(start, "127.0.0.1", attempts=3))
+        self.assertEqual(len(started), 3)
+
+    def test_a_dashboard_on_every_interface_still_fails_the_check(self):
+        address = _other_interface_address()
+        if address is None:
+            self.skipTest("this machine has no other interface to probe")
+        self.assertFalse(port_free_on_other_address(self.serve, address))
 
 
 if __name__ == "__main__":
