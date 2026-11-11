@@ -2046,6 +2046,34 @@ class Filer:
             return True
         return self._roll_clear(key, number, issue)
 
+    def _clear_rolls_due(self, current: Dict[str, Breach]) -> None:
+        """Close long-cleared tracking issues before filing current breaches.
+
+        Filing can consume the pass's write cap before the ordinary clear
+        sweep runs. A tracking issue that already waited out CLEAR_AFTER gets
+        its two writes first, so unrelated new or changed breaches cannot
+        keep it open forever.
+        """
+        for key, number in self._listing().items():
+            if self.writes >= WRITES_MAX:
+                return
+            if (key in current or self._rolls.get(key) != number
+                    or number in self._listed_closed or number in self._ticketed):
+                continue
+            if key.split("/", 1)[0] not in self.read or key in self._unread_keys:
+                continue
+            body = self._texts.get(key, "")
+            if ROLL_NONE not in body:
+                continue
+            cleared = CLEAR_SINCE_RE.search(body)
+            since = _epoch(cleared.group(1)) if cleared else None
+            if since is not None and self.now - since < CLEAR_AFTER:
+                continue
+            issue = self._issue(number)
+            if issue is not None and issue.get("state") == "open":
+                if not self._clear_roll(key, number, issue):
+                    return
+
     def _fold_old(self, number: int, into: int, issue: Dict[str, Any], labels: List[str],
                   comments: List[Dict[str, Any]]) -> bool:
         """Fold an older issue into rolling issue #into. False when the pass
@@ -2229,6 +2257,10 @@ class Filer:
             self._settle(current)
         except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
             self.say("invariants: could not close settled issues: %s" % err)
+        try:
+            self._clear_rolls_due(current)
+        except (GitHubError, OSError, ValueError, KeyError, TypeError) as err:
+            self.say("invariants: could not close cleared tracking issues: %s" % err)
         for b in current.values():
             if self.writes >= WRITES_MAX:
                 break
