@@ -8,6 +8,60 @@ class ValidationTimeoutClass(unittest.TestCase):
 
         self.classify = only_untouched_test_timeouts
 
+    @staticmethod
+    def _timeout_report():
+        return ("ERROR: test_case (test_example.Example.test_case)\n"
+                "subprocess.TimeoutExpired: Command timed out\n")
+
+    def test_diagnostics_over_eight_megacharacters_are_not_transient(self):
+        output = self._timeout_report() + "x" * (8 * 1024 * 1024)
+        self.assertFalse(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_diagnostics_at_the_character_limit_still_classify(self):
+        report = self._timeout_report()
+        output = report + "x" * (8 * 1024 * 1024 - len(report))
+        self.assertTrue(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_more_than_512_error_sections_are_not_transient(self):
+        output = self._timeout_report() * 513
+        self.assertFalse(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_512_ordinary_timeout_sections_still_classify(self):
+        output = self._timeout_report() * 512
+        self.assertTrue(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_cli_rejects_oversized_diagnostics_before_reading_git(self):
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from bus import validation_timeout
+
+        output = self._timeout_report() + "x" * (8 * 1024 * 1024)
+        with patch.object(validation_timeout.sys, "argv", ["classifier", ".", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin", StringIO(output)), \
+                patch.object(validation_timeout.subprocess, "run",
+                             return_value=SimpleNamespace(stdout="")) as run:
+            self.assertEqual(validation_timeout.main(), 1)
+        run.assert_not_called()
+
+    def test_cli_bounds_its_read_and_accepts_an_ordinary_timeout(self):
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from bus import validation_timeout
+
+        stdin = Mock(wraps=StringIO(self._timeout_report()))
+        with patch.object(validation_timeout.sys, "argv", ["classifier", ".", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin", stdin), \
+                patch.object(validation_timeout.subprocess, "run", side_effect=[
+                    SimpleNamespace(stdout=""),
+                    SimpleNamespace(stdout="tests/test_example.py\n"),
+                ]):
+            self.assertEqual(validation_timeout.main(), 0)
+        stdin.read.assert_called_once_with(8 * 1024 * 1024 + 1)
+
     def test_only_timeout_errors_in_untouched_test_files_are_transient(self):
         output = """ERROR: test_case (test_example.Example.test_case)
 Traceback (most recent call last):
