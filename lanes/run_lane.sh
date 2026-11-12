@@ -2593,12 +2593,15 @@ incident_text_clean() {  # text
 # line, which said only "factory incident filing failed" (#2842): the
 # step, and the first line of its error ($2, a file) with local paths
 # replaced and leak-scanned; a refused scan withholds the line. The station
-# reads it as no incident (HELD_FOR_RE needs "factory incident <owner>/<repo>#N").
+# reads it as no incident (HELD_FOR_RE needs "factory incident <owner>/<repo>#N"),
+# so the phrase is broken up inside the error line: an error that quotes a
+# real incident marker must not turn the reason into that incident.
 incident_filing_failed() {  # step, error file
   local line
   line="$(sed -n '/[^[:space:]]/{p;q;}' "$2" 2>/dev/null | tr -d '\r' | cut -c1-200)"
   line="$(printf '%s' "$line" |
-    sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g")"
+    sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" |
+    sed -E 's/([Ff][Aa][Cc][Tt][Oo][Rr][Yy])[[:space:]]+([Ii][Nn][Cc][Ii][Dd][Ee][Nn][Tt])/\1-\2/g')"
   [ -n "$line" ] || line="no error text"
   incident_text_clean "$line" || line="error text withheld"
   printf 'factory incident filing failed (%s: %s)' "$1" "$line"

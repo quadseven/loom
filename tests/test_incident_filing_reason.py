@@ -108,6 +108,18 @@ class IncidentFilingReason(unittest.TestCase):
         bare = "base check exited 124; " + reason
         self.assertIsNone(station.HELD_FOR_RE.search(bare))
 
+    def test_an_error_line_carrying_a_full_incident_marker_is_still_no_incident(self):
+        # An error that quotes a real incident marker must not read as one:
+        # the station would wait for that issue to close instead of
+        # releasing the no-incident hold (review on #3021).
+        reason = self.file_incident(
+            self.tmp / "incidents",
+            gh_error="already filed as factory incident %s#%d\\n" % ("quadseven/loom", 12))
+        self.assertTrue(reason.startswith(FAILED + " (issue create: "), reason)
+        self.assertIn("quadseven/loom#12", reason)
+        held = "base check exited 124; " + reason
+        self.assertIsNone(station.HELD_FOR_RE.search(held), held)
+
 
 if __name__ == "__main__":
     unittest.main()
