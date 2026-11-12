@@ -89,6 +89,11 @@ class DualStateTest(unittest.TestCase):
                             now=time.time()).clean_labels()
         return [c.args[0] for c in said.call_args_list], self.fake.writes
 
+    def remaining_states(self, removed):
+        labels = {name for name in ("loom:shipped", "loom:failed")
+                  if not any(number == 1 and label == name for number, label in removed)}
+        return labels
+
     def test_shadow_repo_keeps_station_shipped_over_brain_failed(self):
         """In a shadow repo, the station's own loom:shipped beats a later
         loom:failed from a trusted briefer."""
@@ -101,6 +106,7 @@ class DualStateTest(unittest.TestCase):
         removals = [(e["number"], e["label"]) for e in ledger if e["action"] == "unlabel"]
         self.assertIn((1, "loom:failed"), removals)
         self.assertNotIn((1, "loom:shipped"), removals)
+        self.assertEqual({"loom:shipped"}, self.remaining_states(removals))
 
     def test_non_shadow_repo_keeps_station_shipped_over_brain_failed(self):
         """Out of shadow, same logic: station's own write wins, loom:failed removed."""
@@ -111,6 +117,8 @@ class DualStateTest(unittest.TestCase):
         self.assertIn(("DELETE", "issues/1/labels/loom:failed"), deletes)
         # Should NOT send DELETE for loom:shipped
         self.assertNotIn(("DELETE", "issues/1/labels/loom:shipped"), deletes)
+        removed_labels = {(1, path.rsplit("/", 1)[-1]) for _, path in deletes}
+        self.assertEqual({"loom:shipped"}, self.remaining_states(removed_labels))
 
 
 if __name__ == "__main__":
