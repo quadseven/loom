@@ -34,7 +34,9 @@ def only_untouched_test_timeouts(output: str, changed_paths: set[str],
     if len(output) > MAX_OUTPUT_CHARACTERS:
         return False
     failures = list(islice(ERROR.finditer(output), MAX_ERROR_SECTIONS + 1))
-    if not failures or len(failures) > MAX_ERROR_SECTIONS:
+    # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription + gpt-6.1-sol/native verification] C01 (PR #3019):
+    # State the allowed section-count range directly, retaining both bounds.
+    if not 1 <= len(failures) <= MAX_ERROR_SECTIONS:
         return False
     sections = [output[match.start():failures[i + 1].start() if i + 1 < len(failures)
                        else len(output)] for i, match in enumerate(failures)]
