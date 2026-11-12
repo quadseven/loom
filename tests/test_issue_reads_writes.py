@@ -153,6 +153,105 @@ class IssueReadsAfterWrites(unittest.TestCase):
         self.assertEqual(gh.paginate(path), [{"version": 2}])
         self.assertEqual(fake.list_calls, 2)
 
+    def test_a_comment_write_by_id_drops_every_comments_list_of_that_repo(self):
+        other = "example-owner/other-repo"
+        for method in ("PATCH", "DELETE", "POST"):
+            with self.subTest(method=method):
+                fake = PassReadWriteFake()
+                gh = once(fake)
+                dropped = ("/repos/%s/issues/1/comments" % REPO,
+                           "/repos/%s/issues/2/comments" % REPO)
+                kept = ("/repos/%s/issues/1/events" % REPO,
+                        "/repos/%s/issues/1/sub_issues" % REPO,
+                        "/repos/%s/issues" % REPO,
+                        "/repos/%s/issues/1/comments" % other)
+                for path in dropped + kept:
+                    gh.paginate(path)
+                gh.rest(method, "/repos/%s/issues/comments/77" % REPO, {"body": "x"})
+                for path in dropped + kept:
+                    gh.paginate(path)
+
+                for path in dropped:
+                    self.assertEqual(fake.calls[("paginate", path)], 2, path)
+                for path in kept:
+                    self.assertEqual(fake.calls[("paginate", path)], 1, path)
+
+    def test_a_comment_write_leaves_kept_single_issue_answers_alone(self):
+        fake = PassReadWriteFake()
+        gh = once(fake)
+        issue_path = "/repos/%s/issues/1" % REPO
+        gh.rest("GET", issue_path)
+        gh.rest("PATCH", "/repos/%s/issues/comments/77" % REPO, {"body": "x"})
+        gh.rest("POST", "/repos/%s/issues" % REPO, {"title": "New"})
+        gh.rest("GET", issue_path)
+
+        self.assertEqual(fake.calls[("GET", issue_path)], 1)
+
+    def test_a_comments_read_started_before_a_comment_write_is_not_kept(self):
+        fake = BlockingListFake()
+        gh = once(fake)
+        path = "/repos/%s/issues/1/comments" % REPO
+        result = []
+        reader = threading.Thread(target=lambda: result.extend(gh.paginate(path)))
+
+        reader.start()
+        self.assertTrue(fake.started.wait(timeout=10))
+        gh.rest("PATCH", "/repos/%s/issues/comments/77" % REPO, {"body": "x"})
+        fake.release.set()
+        reader.join(timeout=10)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(gh.paginate(path), [{"version": 2}])
+        self.assertEqual(fake.list_calls, 2)
+
+    def test_creating_an_issue_drops_only_that_repos_listing(self):
+        other = "example-owner/other-repo"
+        fake = PassReadWriteFake()
+        gh = once(fake)
+        dropped = ("/repos/%s/issues" % REPO,
+                   "/repos/%s/issues?state=open&per_page=100" % REPO)
+        kept = ("/repos/%s/issues/1/comments" % REPO,
+                "/repos/%s/issues/1/events" % REPO,
+                "/repos/%s/issues/1/sub_issues" % REPO,
+                "/repos/%s/issues" % other)
+        for path in dropped + kept:
+            gh.paginate(path)
+        gh.rest("POST", "/repos/%s/issues" % REPO, {"title": "New"})
+        for path in dropped + kept:
+            gh.paginate(path)
+
+        for path in dropped:
+            self.assertEqual(fake.calls[("paginate", path)], 2, path)
+        for path in kept:
+            self.assertEqual(fake.calls[("paginate", path)], 1, path)
+
+    def test_a_listing_read_started_before_an_issue_is_created_is_not_kept(self):
+        fake = BlockingListFake()
+        gh = once(fake)
+        path = "/repos/%s/issues" % REPO
+        result = []
+        reader = threading.Thread(target=lambda: result.extend(gh.paginate(path)))
+
+        reader.start()
+        self.assertTrue(fake.started.wait(timeout=10))
+        gh.rest("POST", "/repos/%s/issues" % REPO, {"title": "New"})
+        fake.release.set()
+        reader.join(timeout=10)
+
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(gh.paginate(path), [{"version": 2}])
+        self.assertEqual(fake.list_calls, 2)
+
+    def test_reading_a_comment_by_id_keeps_every_list(self):
+        fake = PassReadWriteFake()
+        gh = once(fake)
+        path = "/repos/%s/issues/1/comments" % REPO
+        gh.paginate(path)
+        gh.rest("GET", "/repos/%s/issues/comments/77" % REPO)
+        gh.paginate(path)
+
+        self.assertEqual(fake.calls[("paginate", path)], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
