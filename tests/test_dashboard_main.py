@@ -181,9 +181,36 @@ class PortProbeTest(_ServerTest):
         self.addCleanup(foreign.close)
         foreign.bind(("127.0.0.1", 0))
         foreign.listen()
-        ports = iter([foreign.getsockname()[1], self.free_port()])
         self.assertTrue(port_free_on_other_address(
-            lambda: _Dashboard(next(ports)), "127.0.0.1"))
+            self.ports_after(foreign.getsockname()[1]), "127.0.0.1"))
+
+    def ports_after(self, first):
+        """A dashboard starter whose first dashboard reports first, and every
+        later one a port free when it is asked for. It never runs out: a
+        parallel process may take a free port before the probe binds it, and
+        the check then asks for another dashboard, as it may up to its
+        attempts (codex review of a8f3ac21)."""
+        given = []
+
+        def start():
+            given.append(1)
+            return _Dashboard(first if len(given) == 1 else self.free_port())
+
+        return start
+
+    def test_the_starter_never_runs_out_while_later_ports_are_taken(self):
+        # Every later port is held by another process here, so each attempt
+        # after the first is refused too: the check must end False, not raise.
+        if not sandbox_caps.LOCALHOST:
+            self.skipTest(sandbox_caps.NO_LOCALHOST)
+        foreign = socket.socket()
+        self.addCleanup(foreign.close)
+        foreign.bind(("127.0.0.1", 0))
+        foreign.listen()
+        held = foreign.getsockname()[1]
+        with patch.object(self, "free_port", return_value=held):
+            self.assertFalse(port_free_on_other_address(
+                self.ports_after(held), "127.0.0.1"))
 
     def test_a_port_refused_on_every_attempt_is_a_failure(self):
         if not sandbox_caps.LOCALHOST:
