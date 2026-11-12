@@ -5799,39 +5799,131 @@ class FixTest(Base):
         with open(self.inbox("codex", name + ".md")) as fh:
             return fh.read()
 
-    def test_fix_round_honors_only_a_live_canonical_overlap_hold(self):
-        self.fake.add(12)
-        fix = tickets.parse_fix(REPO, FIX_BODY)
-        peer = {"number": 50, "state": "open", "draft": False,
+    def overlap_fix(self, held=True, wait="overlaps pull request #50"):
+        self.fake.add(12, state="pr")
+        self.fake.add(51, state="pr")
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.comment(12, "Lane codex opened a pull request: https://example.com/pull/99")
+        peer = {"number": 50, "state": "open", "draft": False, "body": "Refs #51",
                 "user": {"login": AUTHORS[0], "type": "Bot"},
-                "base": {"ref": "main"}, "head": {"ref": "loom/peer", "sha": "a" * 40,
+                "base": {"ref": "main"}, "mergeable": True,
+                "head": {"ref": "loom/51-peer", "sha": "a" * 40,
                          "repo": {"full_name": REPO}}}
-        current = {"number": 99, "state": "open", "base": {"ref": "main"},
+        current = {"number": 99, "state": "open", "body": "Refs #12",
+                   "user": {"login": AUTHORS[0], "type": "Bot"},
+                   "base": {"ref": "main"}, "mergeable": True,
                    "head": {"ref": "loom/12-fix-the-thing", "sha": "b" * 40,
                             "repo": {"full_name": REPO}}}
         self.fake.pulls = [peer, current]
         patch = "@@ -12,2 +12,2 @@\n-old\n+new"
         self.fake.pull_files.update({50: [{"filename": "bus/a.py", "patch": patch}],
                                      99: [{"filename": "bus/a.py", "patch": patch}]})
-        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
-        issue = self.fake.issues[12]
-        comments = [{"body": FIX_BODY, "id": 1, "created_at": "2030-01-02T00:00:00Z",
-                     "updated_at": "2030-01-02T00:00:00Z",
-                     "user": {"login": AUTHORS[0]}}]
-        status_texts = ["wait:gate: overlaps pull request #50"]
-        with mock.patch.object(runner, "_status_texts",
-                               side_effect=lambda *_args: status_texts), \
-                mock.patch.object(runner, "_claim_comments", return_value=comments):
-            self.assertTrue(runner._held_before_claim(REPO, issue, fix, comments))
-            self.assertFalse(runner._claim(REPO, "codex", issue))
-            self.assertEqual(self.listing(), [])
-            self.assertNotIn("loom:running", self.fake.names(12))
-            self.fake.pulls.remove(peer)
-            self.assertFalse(runner._held_before_claim(REPO, issue, fix, comments))
-            status_texts[:] = ["wait:gate: review findings"]
-            self.assertFalse(runner._held_before_claim(REPO, issue, fix, comments))
-            self.assertTrue(runner._claim(REPO, "codex", issue))
-            self.assertTrue(self.listing())
+        gh = GitHub("token", transport=self.fake)
+        if wait == "overlaps pull request #50":
+            factory.Factory(gh, [REPO], time.time(), trusted=AUTHORS).pull_request(
+                REPO, current, self.fake.issues)
+            self.assertIn("wait:gate", self.fake.names(12))
+        else:
+            self.comment(12, "wait:gate: " + wait)
+            self.fake.issues[12]["labels"].append({"name": "wait:gate"})
+        self.fake.issues[12]["labels"] = [
+            {"name": "loom:briefed" if label["name"] == "loom:pr" else label["name"]}
+            for label in self.fake.issues[12]["labels"]
+            if held or label["name"] != "wait:gate"]
+        self.comment(12, FIX_BODY)
+        return station.Station(gh, self.settings)
+
+    def test_claim_new_dispatches_a_released_overlap_with_its_peer_still_open(self):
+        runner = self.overlap_fix(held=False)
+        self.comment(12, "overlap hold released: its older peer no longer blocks")
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertEqual([pr["number"] for pr in self.fake.pulls], [50, 99])
+
+    def test_claim_new_keeps_a_current_overlap_hold_without_a_claim_or_brief(self):
+        runner = self.overlap_fix()
+
+        runner.claim_new()
+
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("claim:alice-example", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("wait:gate", self.fake.names(12))
+
+    def test_claim_new_dispatches_when_the_old_peer_has_no_pipeline_ticket(self):
+        runner = self.overlap_fix()
+        self.fake.pulls[0]["body"] = "Unrelated work."
+        self.fake.pulls[0]["head"]["ref"] = "topic/peer"
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+
+    def test_claim_new_dispatches_when_the_overlapping_peer_expired(self):
+        runner = self.overlap_fix()
+        failed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                  time.gmtime(time.time() - factory.STUCK_AGE - 60))
+        self.fake.check_runs["a" * 40] = [{"name": "unittest", "conclusion": "failure",
+                                         "completed_at": failed_at}]
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertEqual([pr["number"] for pr in self.fake.pulls], [50, 99])
+
+    def test_claim_new_does_not_restore_an_overlap_replaced_by_a_review_wait(self):
+        runner = self.overlap_fix()
+        self.comment(12, "overlap hold released: its older peer no longer blocks")
+        self.comment(12, "wait:gate: review findings")
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertEqual([pr["number"] for pr in self.fake.pulls], [50, 99])
+
+    def test_claim_new_dispatches_an_ordinary_review_wait_with_peer_present(self):
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R3 (PR #3026):
+        # Review 5866533069: keep the peer present through the ordinary-wait control.
+        runner = self.overlap_fix(wait="review findings")
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertEqual([pr["number"] for pr in self.fake.pulls], [50, 99])
+
+    def test_claim_new_dispatches_a_fix_explicitly_stacked_on_its_overlap_peer(self):
+        runner = self.overlap_fix()
+        self.fake.pulls[1]["body"] += "\nBuilds on #50\n"
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("claim:alice-example", self.fake.names(12))
+        self.assertEqual([pr["number"] for pr in self.fake.pulls], [50, 99])
+
+    def test_fix_round_honors_only_a_live_canonical_overlap_hold(self):
+        runner = self.overlap_fix()
+
+        runner.claim_new()
+
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertNotIn("claim:alice-example", self.fake.names(12))
+        self.fake.pulls.pop(0)
+
+        runner.claim_new()
+
+        self.assertIn("Fix-PR: 99", self.claimed_brief())
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("claim:alice-example", self.fake.names(12))
 
     def test_a_trusted_fix_after_the_last_claim_renders_a_fix_brief(self):
         self.fake.add(12)

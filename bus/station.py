@@ -129,6 +129,11 @@ DONE_NO_PR_WAIT = 2 * 3600
 # planning attempts: each attempt reads the ticket, its comments and events.
 NO_CHANGE_RETRY_EVERY = 900
 CLAIM_RE = re.compile(r"Claimed for lane [a-z0-9-]+ \(body sha256 [0-9a-f]{12}\)")
+# AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R5 (PR #3026):
+# Review 5866533069 (original model undisclosed): compile once; fullmatch anchors.
+_FIX_OVERLAP_WAIT_RE = re.compile(
+    r"wait:gate: overlaps pull request #([1-9][0-9]*)"
+    r"(?: \(health clock unavailable; no expiry inferred\))?")
 ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[ \t]*$", re.M)
 # The comment a ticket carries once a ticket it waited on was closed as not
 # planned and stopped holding it.
@@ -5394,31 +5399,43 @@ class Station:
                 or (fix is None and (self._repo_pr_held(repo, issue)
                                      or self._brief_holds(repo, issue, comments))))
 
+    # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription] 3026-Elder-complexity (PR #3026):
+    # Separate status ownership from peer judgment; native Sol verifies both caps.
+    def _active_fix_overlap(self, repo: str, issue: Dict[str, Any]) -> Optional[int]:
+        """The named peer of the current overlap-owned gate, never an old hold."""
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R1 (PR #3026):
+        # Confirms review 5866533069; original model was undisclosed.
+        # A removed or superseded gate must not be restored by its history.
+        if "wait:gate" not in _label_names(issue):
+            return None
+        peer = None
+        for text in self._status_texts(repo, int(issue["number"])):
+            text = text.strip()
+            if text.startswith(("wait:gate:", "overlap hold released:")):
+                match = _FIX_OVERLAP_WAIT_RE.fullmatch(text)
+                peer = int(match.group(1)) if match else None
+        return peer
+
     def _fix_overlap_still_blocks(self, repo: str, issue: Dict[str, Any], fix: Any) -> bool:
-        """Keep an existing fix round held only while its canonical overlap
-        peer is still an eligible, open older PR with overlapping hunks."""
-        number = int(issue["number"])
-        pattern = re.compile(r"^wait:gate: overlaps pull request #([1-9][0-9]*)"
-                             r"(?: \(health clock unavailable; no expiry inferred\))?$")
-        peer_number = None
-        for text in self._status_texts(repo, number):
-            match = pattern.fullmatch(text.strip())
-            if match:
-                peer_number = int(match.group(1))
+        """Recheck a current overlap hold through the factory's peer policy."""
+        peer_number = self._active_fix_overlap(repo, issue)
         if peer_number is None:
             return False
-        pulls = self.gh.paginate("/repos/%s/pulls?state=open" % repo)
-        peers = [pr for pr in pulls if isinstance(pr, dict)
-                 and pr.get("number") == peer_number
-                 and pr.get("state") == "open" and not pr.get("draft")
-                 and self._counted_pr_number(pr, {a.lower().removesuffix("[bot]")
-                                                  for a in (*self.s.authors, *self.s.briefers)})
-                 and ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo]
-        if not peers:
-            return False
+        number = int(issue["number"])
         current = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, fix.pr)).data
         if not isinstance(current, dict) or current.get("state") != "open":
             return False
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R4 (PR #3026):
+        # Confirms review 5866533069; original model was undisclosed.
+        # Explicit stacks share the factory's whole-line Builds on exemption.
+        if brain.BUILDS_ON_RE.search(str(current.get("body") or "")):
+            return False
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R2 (PR #3026):
+        # Confirms review 5866533069; original model was undisclosed.
+        # Dispatch must reuse the factory's linked-ticket and health policy.
+        judge = self._factory()
+        peers = [peer for peer in judge._overlap_candidates(repo, current, judge._tickets(repo))
+                 if peer.get("number") == peer_number]
         overlap = factory.overlapping_peer(self.gh, repo, current, peers)
         if overlap != peer_number:
             return False
