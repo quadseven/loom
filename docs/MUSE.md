@@ -210,12 +210,14 @@ and the health findings. Read them with the helper, not a hand-built URL:
     python3 -m bus.product_read health
 
 It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
-overseer host's `/dev` world, so the read is `/dev/api/v2/stuck` there. The
-base is never the Loom dashboard's host, which serves no product API and
-answers 404 for every `/dev` and `/api/v2` path (loom#2481: four ticks read
-"404" from it while the overseer's `/dev/api/v2/stuck` answered 200), and
-never the overseer host without `/dev`, whose bare `/api/v2/stuck` redirects
-to the HTML homepage. The helper takes the base from `LOOM_PRODUCT_URL`,
+overseer's own configured product URL, whatever mount the operator gave the
+site; the mount may be a secret path, so it is never written in a repository
+and no doc or test names one. The base is never the Loom dashboard's host,
+which serves no product API and answers 404 for every `/api/v2` path
+(loom#2481: four ticks read "404" from it while the overseer answered 200),
+and never the overseer host's bare root, which serves no product API: a bare
+`/api/v2/stuck` there is a redirect or a 404, not the stuck list.
+The helper takes the base from `LOOM_PRODUCT_URL`,
 else from the station's `LOOM_HEALTH_URLS` health entry, else from the SSM
 parameter `LOOM_PRODUCT_URL_SSM` names (default `/muse/product_url`, which
 this VM's identity reads). It refuses a base on the dashboard's host. Set

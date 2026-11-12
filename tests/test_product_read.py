@@ -173,15 +173,21 @@ class RedirectTest(unittest.TestCase):
 
 
 class MuseDocTest(unittest.TestCase):
-    """docs/MUSE.md pins the product watch read to the /dev world's base."""
+    """docs/MUSE.md says where the product watch read's base comes from."""
 
     def setUp(self):
         self.doc = (ROOT / "docs" / "MUSE.md").read_text(encoding="utf-8")
 
-    def test_the_doc_names_the_helper_and_the_dev_endpoint(self):
+    def test_the_doc_names_the_helper_and_where_the_base_comes_from(self):
         self.assertTrue("python3 -m bus.product_read stuck" in self.doc, "python3 -m bus.product_read stuck")
-        self.assertTrue("/dev/api/v2/stuck" in self.doc, "/dev/api/v2/stuck")
         self.assertTrue("LOOM_PRODUCT_URL" in self.doc, "LOOM_PRODUCT_URL")
+        self.assertTrue("never written in a repository" in self.doc, "never written in a repository")
+
+    def test_the_doc_names_no_literal_mount_path_for_the_read(self):
+        # The product's mount is configuration, and may be a secret path. A
+        # doc that spells one out sends the next brain to hard-code it.
+        self.assertNotIn("/dev/api", self.doc)
+        self.assertNotIn("overseer host's `/dev` world", self.doc)
 
     def test_the_doc_says_the_dashboard_host_is_not_the_base(self):
         self.assertTrue("never the Loom dashboard's host" in self.doc, "never the Loom dashboard's host")
