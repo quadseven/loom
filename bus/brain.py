@@ -3736,10 +3736,19 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
     Regression section with the brief's What, criteria and evidence, then its labels move."""
     number = int(issue["number"])
     body = str(issue.get("body") or "")
-    new = ("%s\n\n## Regression\n\n%s\n\nRegresses #%d\n%s\n\n"
-           "### What\n\n%s\n\n### Acceptance criteria\n\n%s\n") % (
-        body.rstrip("\n"), title, number, "\n".join(evidence),
-        what.strip(), acceptance.strip())
+    previous = re.search(r"(?ms)^## Acceptance criteria[ \t]*\n(.*?)(?=^## |\Z)", body)
+    history = previous.group(1).strip() if previous else ""
+    if previous:
+        body = body[:previous.start()] + body[previous.end():]
+    regression = ["## Regression", "", title, "", "Regresses #%d" % number,
+                  "\n".join(evidence)]
+    if what.strip():
+        regression.extend(["", "### What", "", what.strip()])
+    if history:
+        regression.extend(["", "### Previous acceptance criteria", "", history])
+    new = body.rstrip("\n") + "\n\n" + "\n".join(regression) + "\n"
+    if acceptance.strip():
+        new += "\n## Acceptance criteria\n\n%s\n" % acceptance.strip()
     if model is not None:
         new = _with_model(new, model)
     _check_written_text(new)
