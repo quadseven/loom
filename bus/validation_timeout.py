@@ -60,10 +60,12 @@ def main() -> int:
     tree, base, revision = sys.argv[1:]
     try:
         repo = Path(tree)
-        changed = subprocess.run(["git", "diff", "--name-only", base, revision],
+        git_safety = ["-c", "core.hooksPath=/dev/null",
+                      "-c", "core.fsmonitor=false"]
+        changed = subprocess.run(["git", *git_safety, "diff", "--name-only", base, revision],
                                  cwd=repo, check=True, capture_output=True,
                                  text=True).stdout.splitlines()
-        tests = subprocess.run(["git", "ls-tree", "-r", "--name-only", revision,
+        tests = subprocess.run(["git", *git_safety, "ls-tree", "-r", "--name-only", revision,
                                 "--", "tests"], cwd=repo, check=True,
                                capture_output=True, text=True).stdout.splitlines()
     except (OSError, subprocess.CalledProcessError):

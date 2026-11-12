@@ -406,7 +406,7 @@ $HOLDER, which edits your journal of the day there instead of emailing the \
 issue's watchers with a new comment; evidence whose blocker kind has no issue \
 of exactly that kind goes to the goal home's journal, never the closest \
 issue. This replaces the 15-minute limit in MUSE.md: stop within \
-$((TICK_MINUTES - 5)) minutes; you are cut off at $TICK_MINUTES. $SHADOW_LINE"
+$((TICK_MINUTES - 5)) minutes; you are cut off at $TICK_MINUTES. Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise. $SHADOW_LINE"
 if [ "$SCOPE" = live ]; then
   PROMPT="$PROMPT Muse does the GitHub steps, ships and rolls, and reads \
 live data through REST APIs, but has no cluster or database access. Do what \

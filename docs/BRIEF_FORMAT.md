@@ -114,6 +114,7 @@ Deliverable: answer (optional; the station also writes verify and review; any ot
 - [ ] Changes are left on the requested branch for the runner
 - [ ] Never merge, never close issues or PRs, never push to another branch
 - [ ] No personal names, hostnames, domains, IPs, or local paths; ASCII only
+- [ ] Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
 ```
 
 The `# T0001: <short title>` heading becomes the pull request title; without

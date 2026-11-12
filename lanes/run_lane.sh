@@ -499,7 +499,7 @@ summary_note() {
 # (its AGENTS.md rules), and another redid work its operator notes said had
 # shipped in other repos.
 work_note() {
-  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Never commit a real person'"'"'s mail or street address, in any repo, private ones included: use example.com and an invented value in tests. The push is refused otherwise.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
+  printf '\n\n## How to work\n- Before you change anything, read the repo'"'"'s AGENTS.md and CLAUDE.md and the docs they point to: they state rules its CI enforces, such as which packages a test may import.\n- When the Operator notes or a merged pull request under Linked pull requests show the work is already done or belongs elsewhere, change nothing and say why in the Intent summary.\n- Work test-first, as the implement skill says: write the test the acceptance criteria name, run it and see it fail, make the change, run it and see it pass.\n- Before you finish, run the repo'"'"'s full test suite (or the validation check below) and fix what fails. A pull request with red checks comes straight back.\n- The review bot checks every change: keep each new function small (cyclomatic complexity under 15), never swallow an error, leave no dead code, keep docs and comments in step with the code, and write ASCII only.\n- Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.\n- Do not poll pull request checks or reviews. Open or update the pull request, then stop; the station reads checks and hands work back.\n- For a public repo, use documentation-range IP addresses (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) in tests. If a range bound must appear deliberately, add leak-guard-allow to that line. In a public repo, never write a reference to another repo'"'"'s issue in the OWNER/NAME#<number> or NAME#<number> shape, not even a made-up one in a test fixture: write NAME#N, or add leak-guard-allow to that line when the shape is what the test is about.\n- Never commit a real person'"'"'s mail or street address, in any repo, private ones included: use example.com and an invented value in tests. The push is refused otherwise.\n- Add new files only where the ticket points: a new file the brief does not name, at the top level or under a new or hidden top-level directory, gets the commit refused and nothing pushed.\n- Commit your work. A run that ends with no commit fails the ticket, unless it says in the Intent summary why there is nothing to change.\n'
 }
 
 # Lists the sandbox probes and out-of-path scratch files the agent added
@@ -2589,11 +2589,31 @@ incident_text_clean() {  # text
   rm -f "$text_file"
   return "$rc"
 }
+# Why a filing failed, for the ticket's hold note and the station's held
+# line, which said only "factory incident filing failed" (#2842): the
+# step, and the first line of its error ($2, a file) with local paths
+# replaced and leak-scanned; a refused scan withholds the line. The station
+# reads it as no incident (HELD_FOR_RE needs "factory incident <owner>/<repo>#N"),
+# so the phrase is broken up inside the error line: an error that quotes a
+# real incident marker must not turn the reason into that incident.
+incident_filing_failed() {  # step, error file
+  local line
+  line="$(sed -n '/[^[:space:]]/{p;q;}' "$2" 2>/dev/null | tr -d '\r' | cut -c1-200)"
+  line="$(printf '%s' "$line" |
+    sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" |
+    sed -E 's/([Ff][Aa][Cc][Tt][Oo][Rr][Yy])[[:space:]]+([Ii][Nn][Cc][Ii][Dd][Ee][Nn][Tt])/\1-\2/g')"
+  [ -n "$line" ] || line="no error text"
+  incident_text_clean "$line" || line="error text withheld"
+  printf 'factory incident filing failed (%s: %s)' "$1" "$line"
+}
 file_factory_incident() {  # kind, detail
-  local kind="$1" detail="$2" title body number existing subject ticket
-  if ! subject="$(incident_subject)"; then
+  local kind="$1" detail="$2" title body number existing subject ticket err
+  err="$(mktemp "${TMPDIR:-/tmp}/loom-incident-err.XXXXXX")" || err=/dev/null
+  if ! subject="$(incident_subject 2>"$err")"; then
+    cat "$err" >> "$LOG" 2>/dev/null
     echo "could not name the incident for a private repo; nothing filed" >> "$LOG"
-    printf 'factory incident filing failed'
+    incident_filing_failed "alias write" "$err"
+    [ "$err" = /dev/null ] || rm -f "$err"
     return 0
   fi
   ticket="$(incident_ticket)"
@@ -2613,10 +2633,12 @@ file_factory_incident() {  # kind, detail
     printf '%s' "$detail" | upsert_sticky_comment "$FACTORY_REPO" "$number" "$INCIDENT_REPEAT_MARKER" repeat \
       --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
-    number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" --label loom:factory 2>>"$LOG" || \
-      gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" 2>>"$LOG")"
+    if ! number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+      --body "$body" --label loom:factory 2>"$err")"; then
+      cat "$err" >> "$LOG" 2>/dev/null
+      number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
+        --body "$body" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
+    fi
     number="${number##*/}"
     case "$number" in ''|*[!0-9]*) number="" ;; esac
   fi
@@ -2624,8 +2646,9 @@ file_factory_incident() {  # kind, detail
     mkdir -p "$INCIDENT_DIR" && printf '%s\n' "$number" > "$(incident_file "$kind")"
     printf 'factory incident %s#%s' "$FACTORY_REPO" "$number"
   else
-    printf 'factory incident filing failed'
+    incident_filing_failed "issue create" "$err"
   fi
+  [ "$err" = /dev/null ] || rm -f "$err"
 }
 
 # File or update the factory incident for the current failure, append its

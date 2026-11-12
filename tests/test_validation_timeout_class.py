@@ -68,6 +68,34 @@ RuntimeError: validation harness failed
         self.assertFalse(self.classify(
             output, {"bus/brain.py"}, {"tests/test_example.py"}))
 
+    def test_git_queries_disable_hooks_and_filesystem_monitor(self):
+        from unittest.mock import patch
+
+        from bus import validation_timeout
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            class Result:
+                stdout = "tests/test_example.py\n"
+            return Result()
+
+        with patch.object(validation_timeout.sys, "argv",
+                          ["validation_timeout", "/repo", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin") as stdin, \
+                patch.object(validation_timeout.subprocess, "run", fake_run), \
+                patch.object(validation_timeout, "only_untouched_test_timeouts",
+                              return_value=False):
+            stdin.read.return_value = ""
+            self.assertEqual(validation_timeout.main(), 1)
+
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            self.assertIn("-c", args)
+            self.assertIn("core.hooksPath=/dev/null", args)
+            self.assertIn("core.fsmonitor=false", args)
+
     def test_terminal_timeout_after_runtime_error_stays_transient(self):
         output = """ERROR: test_case (test_example.Example.test_case)
 Traceback (most recent call last):
