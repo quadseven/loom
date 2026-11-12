@@ -27,6 +27,10 @@ from .github import GitHub, Response
 ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/\d+$")
 # An issue or one of its writable subresources.
 ISSUE_RESOURCE = re.compile(r"^/repos/([^/]+/[^/]+)/issues/(\d+)(?:/|$)")
+# A comment named by its id alone: the path does not say which issue owns it.
+COMMENT_BY_ID = re.compile(r"^/repos/([^/]+/[^/]+)/issues/comments/\d+$")
+# The issue collection itself: a POST here creates an issue.
+ISSUE_COLLECTION = re.compile(r"^/repos/([^/]+/[^/]+)/issues$")
 # An issue listing: its items are whole issues (pull requests included).
 LISTING = re.compile(r"^/repos/([^/]+/[^/]+)/issues\?")
 # The paginated reads kept for the pass: a listing, or one issue's comments,
@@ -109,6 +113,17 @@ class IssueReads:
                     return self._gh.rest(method, path, body, etag, ok)
                 finally:
                     self._forget_issue(repo, number)
+        if method != "GET":
+            by_id = COMMENT_BY_ID.match(path)
+            created = ISSUE_COLLECTION.match(path)
+            if by_id or created:
+                try:
+                    return self._gh.rest(method, path, body, etag, ok)
+                finally:
+                    if by_id:
+                        self._forget_repo_comments(by_id.group(1))
+                    else:
+                        self._forget_listing(created.group(1))
         if plain and isinstance(self._gh, GitHub):
             # A comments page reads its issue's body from this pass's answers.
             return self._gh.rest(method, path, issue=self._issue)
@@ -122,13 +137,30 @@ class IssueReads:
         listing_prefix = "/repos/%s/issues?" % repo
         with self._lock:
             self._answers.pop(issue_path, None)
-            keys = set(self._lists) | set(self._list_versions)
-            for key in keys:
-                if (key.startswith(listing_prefix)
-                        or any(key == prefix or key.startswith(prefix + "?")
-                               for prefix in issue_lists)):
-                    self._lists.pop(key, None)
-                    self._list_versions[key] = self._list_versions.get(key, 0) + 1
+            self._drop_lists(lambda key: key.startswith(listing_prefix)
+                             or any(key == prefix or key.startswith(prefix + "?")
+                                    for prefix in issue_lists))
+
+    def _forget_repo_comments(self, repo: str) -> None:
+        """A comment written by id: its issue is not in the path, so every
+        kept comments list of the repository is stale."""
+        comments = re.compile(r"^/repos/%s/issues/\d+/comments(?:\?|$)" % re.escape(repo))
+        with self._lock:
+            self._drop_lists(lambda key: bool(comments.match(key)))
+
+    def _forget_listing(self, repo: str) -> None:
+        """An issue created: the kept listing of the repository lacks it."""
+        listing_prefix = "/repos/%s/issues?" % repo
+        with self._lock:
+            self._drop_lists(lambda key: key.startswith(listing_prefix))
+
+    def _drop_lists(self, stale: Any) -> None:
+        """Drop each kept list whose key is stale, and bump its version so a
+        read already in flight is not kept. Holds the cache lock."""
+        for key in set(self._lists) | set(self._list_versions):
+            if stale(key):
+                self._lists.pop(key, None)
+                self._list_versions[key] = self._list_versions.get(key, 0) + 1
 
     def paginate(self, path: str) -> List[Any]:
         key = _with_per_page(path)
