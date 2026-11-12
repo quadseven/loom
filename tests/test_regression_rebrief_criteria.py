@@ -17,7 +17,7 @@ class RegressionRebriefCriteriaTests(unittest.TestCase):
     def test_rebrief_writes_brief_what_and_unticked_criteria(self):
         issue = {"number": 5, "state": "open",
                  "body": "Difficulty: easy\n\n## Why\nThe shipped behavior regressed.",
-                 "labels": [{"name": "loom:ticket"}, {"name": "loom:verified"}]}
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
         calls = []
 
         def transport(method, url, headers, body):
