@@ -1212,6 +1212,7 @@ pages, and a list that cannot be read in full refuses the merge. The adopt path
   (`/grug recheck` re-runs only the format check).
 - Never use closing keywords with issue references, even in a negation.
 - Write ASCII only. Do not use em dashes.
+- Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
 - Public repos get no personal names, hostnames, domains, IPs, local paths or
   private repo names.
 - Put asks in a `needs:human` issue with one exact ask. Use `loom:urgent`
