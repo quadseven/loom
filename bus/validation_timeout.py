@@ -11,8 +11,14 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from itertools import islice
 from pathlib import Path
 
+
+# These character/section limits bound diagnostic parsing, not test execution.
+# Exceeding either limit keeps the ordinary work-failure classification.
+MAX_OUTPUT_CHARACTERS = 8 * 1024 * 1024
+MAX_ERROR_SECTIONS = 512
 
 ERROR = re.compile(r"^ERROR: (.+)$", re.MULTILINE)
 TEST_MODULE = re.compile(r"\(([A-Za-z_][A-Za-z0-9_.]*)\)")
@@ -22,8 +28,13 @@ EXCEPTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):", re.MULTILINE)
 def only_untouched_test_timeouts(output: str, changed_paths: set[str],
                                  test_paths: set[str]) -> bool:
     """Whether unittest reported only TimeoutExpired errors in unchanged tests."""
-    failures = list(ERROR.finditer(output))
-    if not failures:
+    # AI-REVIEW 2026-11-12 [deepseek-v4.1-flash/opencode-go + gpt-6.1-sol/native verification] E03 (PR #3019):
+    # Reject large diagnostics before allocating matches or sections.
+    # The section slices themselves are linear.
+    if len(output) > MAX_OUTPUT_CHARACTERS:
+        return False
+    failures = list(islice(ERROR.finditer(output), MAX_ERROR_SECTIONS + 1))
+    if not failures or len(failures) > MAX_ERROR_SECTIONS:
         return False
     sections = [output[match.start():failures[i + 1].start() if i + 1 < len(failures)
                        else len(output)] for i, match in enumerate(failures)]
@@ -63,7 +74,11 @@ def _module_matches_test_path(module: str, path: str) -> bool:
 def main() -> int:
     if len(sys.argv) != 4:
         return 2
-    output = sys.stdin.read()
+    # AI-REVIEW 2026-11-12 [deepseek-v4.1-flash/opencode-go + gpt-6.1-sol/native verification] E03 (PR #3019):
+    # Bound the initial read before the predicate can inspect its length.
+    output = sys.stdin.read(MAX_OUTPUT_CHARACTERS + 1)
+    if len(output) > MAX_OUTPUT_CHARACTERS:
+        return 1
     tree, base, revision = sys.argv[1:]
     try:
         repo = Path(tree)
