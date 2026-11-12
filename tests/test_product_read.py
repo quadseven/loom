@@ -191,6 +191,10 @@ class MuseDocTest(unittest.TestCase):
 
     def test_the_doc_says_the_dashboard_host_is_not_the_base(self):
         self.assertTrue("never the Loom dashboard's host" in self.doc, "never the Loom dashboard's host")
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3033-B1 (issue #3033):
+        # Pin both wrong-base warnings without naming the configured mount.
+        self.assertTrue("never the overseer host's bare root" in self.doc,
+                        "never the overseer host's bare root")
 
 
 if __name__ == "__main__":
