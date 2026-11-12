@@ -1,0 +1,333 @@
+"""Host timeouts in unchanged tests are not lane work failures."""
+import unittest
+
+
+class ValidationTimeoutClass(unittest.TestCase):
+    def setUp(self):
+        from bus.validation_timeout import only_untouched_test_timeouts
+
+        self.classify = only_untouched_test_timeouts
+
+    @staticmethod
+    def _timeout_report():
+        return ("ERROR: test_case (test_example.Example.test_case)\n"
+                "subprocess.TimeoutExpired: Command timed out\n")
+
+    def test_diagnostics_over_eight_megacharacters_are_not_transient(self):
+        output = self._timeout_report() + "x" * (8 * 1024 * 1024)
+        self.assertFalse(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_diagnostics_at_the_character_limit_still_classify(self):
+        report = self._timeout_report()
+        output = report + "x" * (8 * 1024 * 1024 - len(report))
+        self.assertTrue(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_more_than_512_error_sections_are_not_transient(self):
+        output = self._timeout_report() * 513
+        self.assertFalse(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_512_ordinary_timeout_sections_still_classify(self):
+        output = self._timeout_report() * 512
+        self.assertTrue(self.classify(output, set(), {"tests/test_example.py"}))
+
+    def test_cli_rejects_oversized_diagnostics_before_reading_git(self):
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from bus import validation_timeout
+
+        output = self._timeout_report() + "x" * (8 * 1024 * 1024)
+        with patch.object(validation_timeout.sys, "argv", ["classifier", ".", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin", StringIO(output)), \
+                patch.object(validation_timeout.subprocess, "run",
+                             return_value=SimpleNamespace(stdout="")) as run:
+            self.assertEqual(validation_timeout.main(), 1)
+        run.assert_not_called()
+
+    def test_cli_bounds_its_read_and_accepts_an_ordinary_timeout(self):
+        from io import StringIO
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+
+        from bus import validation_timeout
+
+        stdin = Mock(wraps=StringIO(self._timeout_report()))
+        with patch.object(validation_timeout.sys, "argv", ["classifier", ".", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin", stdin), \
+                patch.object(validation_timeout.subprocess, "run", side_effect=[
+                    SimpleNamespace(stdout=""),
+                    SimpleNamespace(stdout="tests/test_example.py\n"),
+                ]):
+            self.assertEqual(validation_timeout.main(), 0)
+        stdin.read.assert_called_once_with(8 * 1024 * 1024 + 1)
+
+    def test_only_timeout_errors_in_untouched_test_files_are_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File \"test_example.py\", line 1, in test_case
+    subprocess.run(command, timeout=60)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+"""
+        self.assertTrue(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+    def test_changed_test_file_is_not_classified_as_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+"""
+        self.assertFalse(self.classify(
+            output, {"tests/test_example.py"}, {"tests/test_example.py"}))
+
+    def test_module_level_timeout_in_a_changed_test_file_is_not_transient(self):
+        output = """ERROR: test_case (tests.test_validation_timeout_class)
+Traceback (most recent call last):
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+"""
+        self.assertFalse(self.classify(
+            output, {"tests/test_validation_timeout_class.py"},
+            {"tests/test_validation_timeout_class.py"}))
+
+    def test_mixed_timeout_and_assertion_failures_are_not_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+FAIL: test_other (test_example.Example.test_other)
+AssertionError: mismatch
+"""
+        self.assertFalse(self.classify(
+            output, set(), {"tests/test_example.py"}))
+
+    def test_assertion_failure_alone_is_not_transient(self):
+        output = """FAIL: test_case (test_example.Example.test_case)
+AssertionError: mismatch
+"""
+        self.assertFalse(self.classify(
+            output, set(), {"tests/test_example.py"}))
+
+    def test_timeout_cause_with_terminal_runtime_error_is_not_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    subprocess.run(command, timeout=60)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "tests/test_example.py", line 12, in test_case
+    raise RuntimeError("validation harness failed") from error
+RuntimeError: validation harness failed
+"""
+        self.assertFalse(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+    def test_git_queries_disable_hooks_and_filesystem_monitor(self):
+        from unittest.mock import patch
+
+        from bus import validation_timeout
+
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            class Result:
+                stdout = "tests/test_example.py\n"
+            return Result()
+
+        with patch.object(validation_timeout.sys, "argv",
+                          ["validation_timeout", "/repo", "base", "head"]), \
+                patch.object(validation_timeout.sys, "stdin") as stdin, \
+                patch.object(validation_timeout.subprocess, "run", fake_run), \
+                patch.object(validation_timeout, "only_untouched_test_timeouts",
+                              return_value=False):
+            stdin.read.return_value = ""
+            self.assertEqual(validation_timeout.main(), 1)
+
+        self.assertEqual(len(calls), 2)
+        for args in calls:
+            self.assertEqual(args[:5], [
+                "git", "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=false",
+            ])
+
+    def test_terminal_timeout_after_runtime_error_stays_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    raise RuntimeError("earlier failure")
+RuntimeError: earlier failure
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "tests/test_example.py", line 12, in test_case
+    subprocess.run(command, timeout=60)
+subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds
+"""
+        self.assertTrue(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+    def test_runtime_error_merely_mentioning_timeout_is_not_transient(self):
+        output = """ERROR: test_case (test_example.Example.test_case)
+Traceback (most recent call last):
+  File "tests/test_example.py", line 10, in test_case
+    raise RuntimeError("subprocess.TimeoutExpired was expected")
+RuntimeError: subprocess.TimeoutExpired was expected
+"""
+        self.assertFalse(self.classify(
+            output, {"bus/brain.py"}, {"tests/test_example.py"}))
+
+
+class ValidationTimeoutStationOutcome(unittest.TestCase):
+    def test_second_unchanged_test_timeout_is_reported_as_work(self):
+        import test_bus_station as fixtures
+        from bus import station
+        from bus.github import GitHub
+
+        helper = fixtures.RetryTest(methodName="runTest")
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        reason = ("[transient] validation failed: only unchanged test files reported "
+                  "TimeoutExpired errors at e992b44d7458 (base check exited 0)")
+        helper.failed(reason=reason, body=fixtures.BODY_WITH_CRITERIA)
+        helper.timeout_history(["Lane a stopped: " + reason])
+        runner = station.Station(
+            GitHub("fixture-only", transport=helper.fake), helper.settings)
+
+        runner.report_outcomes()
+
+        names = helper.fake.names(12)
+        bodies = helper.bodies()
+        self.assertIn("loom:failed", names, bodies)
+        self.assertNotIn("loom:running", names)
+        self.assertNotIn("loom:queued", names)
+        failures = [body for body in bodies if body.startswith(
+            "Lane codex failed: [work] validation failed: only unchanged test files "
+            "reported TimeoutExpired errors")]
+        self.assertEqual(len(failures), 1, bodies)
+        self.assertIn("timed out again on this ticket", failures[0])
+        self.assertFalse(any(body.startswith("Automatic retry") for body in bodies), bodies)
+
+    def _reported_timeout(self, prior, reason):
+        import test_bus_station as fixtures
+        from bus import station
+        from bus.github import GitHub
+
+        helper = fixtures.RetryTest(methodName="runTest")
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        helper.failed(reason=reason, body=fixtures.BODY_WITH_CRITERIA)
+        helper.timeout_history(prior)
+        station.Station(GitHub("fixture-only", transport=helper.fake),
+                        helper.settings).report_outcomes()
+        return helper.fake.names(12), helper.bodies()
+
+    def test_first_unchanged_test_timeout_stays_transient(self):
+        reason = ("[transient] validation failed: only unchanged test files reported "
+                  "TimeoutExpired errors at e992b44d7458 (base check exited 0)")
+        names, bodies = self._reported_timeout([], reason)
+        self.assertIn("loom:queued", names, bodies)
+        self.assertNotIn("loom:failed", names)
+        self.assertTrue(any(body.startswith("Lane codex stopped: " + reason)
+                            for body in bodies), bodies)
+
+    def test_second_ordinary_check_timeout_is_still_reported_as_work(self):
+        reason = ("[transient] validation failed: the check timed out after 1800s "
+                  "at e992b44d7458 (base check exited 0)")
+        names, bodies = self._reported_timeout(["Lane a stopped: " + reason], reason)
+        self.assertIn("loom:failed", names, bodies)
+        self.assertTrue(any(body.startswith("Lane codex failed: [work]")
+                            and "timed out again on this ticket" in body
+                            for body in bodies), bodies)
+
+    def test_non_timeout_ending_resets_unchanged_test_timeout_strikes(self):
+        reason = ("[transient] validation failed: only unchanged test files reported "
+                  "TimeoutExpired errors at e992b44d7458 (base check exited 0)")
+        prior = ["Lane a stopped: " + reason,
+                 "Lane a failed: [work] validation failed: the check exited 1"]
+        names, bodies = self._reported_timeout(prior, reason)
+        self.assertIn("loom:queued", names, bodies)
+        self.assertNotIn("loom:failed", names)
+        self.assertTrue(any(body.startswith("Lane codex stopped: " + reason)
+                            for body in bodies), bodies)
+
+
+class ValidationTimeoutRunnerOutcome(unittest.TestCase):
+    def _run_validation_failure(self, *, mixed_failure=False, changed_test=False,
+                                error_tail=""):
+        import test_run_lane as fixtures
+
+        helper = fixtures.LaneRunnerTest(methodName="runTest")
+        helper.setUp()
+        self.addCleanup(helper.tearDown)
+        helper.write_tool(helper.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        helper.contract_repo("interpreter: loom-test-python\ncheck: python3 check.py\n")
+        # The runner fixture keeps this checkout beside its synthetic remote.
+        work = helper.home.parent / "contract-work"
+        test_file = work / "tests" / "test_example.py"
+        test_file.parent.mkdir()
+        test_file.write_text("VALUE = 'original'\n")
+        output = ("ERROR: test_case (test_example.Example.test_case)\n"
+                  "Traceback (most recent call last):\n"
+                  "subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds")
+        output += error_tail
+        if mixed_failure:
+            output += "\nFAIL: test_other (test_example.Example.test_other)\nAssertionError: mismatch"
+        check = ("from pathlib import Path\nimport sys\n"
+                 "unchanged = Path('fix.txt').read_text().strip() == 'todo' and "
+                 "Path('tests/test_example.py').read_text() == \"VALUE = 'original'\\n\"\n"
+                 "if unchanged:\n    sys.exit(0)\n"
+                 "print(" + repr(output) + ")\nsys.exit(1)\n")
+        (work / "check.py").write_text(check)
+        fixtures.git("add", "check.py", "tests/test_example.py", cwd=work)
+        fixtures.git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                     "commit", "-qm", "Seed validation timeout fixture", cwd=work)
+        fixtures.git("push", "-q", "origin", "main", cwd=work)
+        brief = fixtures.BRIEF
+        env = {}
+        if changed_test:
+            brief += "\nChange tests/test_example.py.\n"
+            env = {"FAKE_AGENT": "source", "FAKE_SOURCE_PATH": "tests/test_example.py",
+                   "FAKE_SOURCE_TEXT": "VALUE = 'changed'"}
+        helper.drop_brief(text=brief)
+
+        result = helper.run_contract_lane(**env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((helper.inbox / "failed" / "T042-fix-the-thing.md").exists(),
+                        helper.lane_log())
+        self.assertFalse(any(call.startswith("gh pr create") for call in helper.calls()))
+        finals = [record for record in helper.records() if record["phase"] == "final"]
+        self.assertEqual([record["exit"] for record in finals], [1, 1], helper.lane_log())
+        return helper.lane_log()
+
+    def test_final_validation_reports_unchanged_test_timeouts_as_transient(self):
+        log = self._run_validation_failure()
+        self.assertIn("failed: [transient] validation failed: only unchanged test files "
+                      "reported TimeoutExpired errors", log)
+        self.assertNotIn("failed: [work]", log)
+
+    def test_final_validation_keeps_mixed_assertion_failures_as_work(self):
+        log = self._run_validation_failure(mixed_failure=True)
+        self.assertIn("failed: [work] validation failed: the check exited 1", log)
+        self.assertNotIn("failed: [transient]", log)
+
+    def test_final_validation_keeps_changed_test_timeouts_as_work(self):
+        log = self._run_validation_failure(changed_test=True)
+        self.assertIn("failed: [work] validation failed: the check exited 1", log)
+        self.assertNotIn("failed: [transient]", log)
+
+    def test_final_validation_keeps_terminal_runtime_error_as_work(self):
+        tail = ("\n\nThe above exception was the direct cause of the following exception:\n\n"
+                "Traceback (most recent call last):\n"
+                "  File \"tests/test_example.py\", line 12, in test_case\n"
+                "    raise RuntimeError(\"validation harness failed\") from error\n"
+                "RuntimeError: validation harness failed")
+        log = self._run_validation_failure(error_tail=tail)
+        self.assertIn("failed: [work] validation failed: the check exited 1", log)
+        self.assertNotIn("failed: [transient]", log)
+
+
+if __name__ == "__main__":
+    unittest.main()

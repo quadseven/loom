@@ -3272,7 +3272,7 @@ final_base_tests() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc host_red="" touched=""
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -3283,6 +3283,7 @@ final_validation() {
     drop_check_home
     return 1
   fi
+  output_offset="$(wc -c < "$LOG")"
   contract_run "$C_CHECK"; rc=$?
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
@@ -3333,6 +3334,12 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
+    PARK_CLASS=transient
+    VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
+  fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124)
@@ -3354,7 +3361,7 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
-    *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
+    *) [ -n "$VALIDATION_REASON" ] || VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
