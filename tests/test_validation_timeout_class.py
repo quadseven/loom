@@ -92,9 +92,10 @@ RuntimeError: validation harness failed
 
         self.assertEqual(len(calls), 2)
         for args in calls:
-            self.assertIn("-c", args)
-            self.assertIn("core.hooksPath=/dev/null", args)
-            self.assertIn("core.fsmonitor=false", args)
+            self.assertEqual(args[:5], [
+                "git", "-c", "core.hooksPath=/dev/null",
+                "-c", "core.fsmonitor=false",
+            ])
 
     def test_terminal_timeout_after_runtime_error_stays_transient(self):
         output = """ERROR: test_case (test_example.Example.test_case)

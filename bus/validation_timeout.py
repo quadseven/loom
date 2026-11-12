@@ -1,4 +1,11 @@
-"""Recognize validation failures made only of timeouts in untouched tests."""
+"""Recognize validation failures made only of timeouts in untouched tests.
+
+An untouched test file does not establish why it timed out: source changes
+can cause the hang too. The first matching failure is retried by design;
+the station's existing two-strike policy bounds consecutive retries. Check
+output is diagnostic input, not trusted attribution, and test-controlled
+text can influence that first classification.
+"""
 from __future__ import annotations
 
 import re
@@ -60,6 +67,9 @@ def main() -> int:
     tree, base, revision = sys.argv[1:]
     try:
         repo = Path(tree)
+        # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] R5 (PR #3019):
+        # The primary model was undisclosed; verified both calls retain the
+        # runner's Git safety overrides for an agent-controlled checkout.
         git_safety = ["-c", "core.hooksPath=/dev/null",
                       "-c", "core.fsmonitor=false"]
         changed = subprocess.run(["git", *git_safety, "diff", "--name-only", base, revision],
