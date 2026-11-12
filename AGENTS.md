@@ -165,6 +165,7 @@ Rules:
 - Briefs, logs, keys and the local `state/` tree never go to GitHub.
 - Keep README.md to the standard sections (Status, Quick start, How to test, How it deploys, Layout, Docs) with a last-checked date; a change that makes it false fixes it in the same PR.
 - GitHub text is ASCII and never puts a closing keyword next to an issue number, even to deny it.
+- Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
 - A file in `.loom/sensitive-paths` makes the change `class:sensitive`, which the factory never merges. `dashboard/` is on that list: a screen merges only after the brain has looked at it at phone and desktop widths.
 - Workflows and `.loom/` are the security tier (`bus/merge_tier.py`), so they wait for the operator.
 
