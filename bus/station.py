@@ -10694,7 +10694,7 @@ class Station:
                                                                   type(err).__name__))
                 continue
             summary = self._standup_summary(
-                self._standup_ticket_groups(brain._flatten(loose, tree), since))
+                self._standup_ticket_groups(brain._flatten(loose, tree, repo), since))
             lines.append("- **%s** %s" % (self._short_name(goal), summary or "nothing moved"))
         return lines
 
@@ -13999,7 +13999,7 @@ class Station:
         if not due:
             return
         loose, tree = brain.goal_tree(self.gh, repo, number)
-        children = brain._flatten(loose, tree)
+        children = brain._flatten(loose, tree, repo)
         named = self._open_breaches(repo, number)
         breaches = named if (repo, number) == self._invariant_goal() else None
         hold = self._gate_hold_for(repo, number)
@@ -14088,7 +14088,7 @@ class Station:
             if repo not in self._repo_privacy:
                 self._repo_privacy[repo] = brain.repo_private(self.gh, repo)
         private = {repo: self._repo_privacy[repo] for repo in set(counts) | {home}}
-        return journal.waiting_line(counts, brain.goal_human_share(children, asks.get(home, [])),
+        return journal.waiting_line(counts, brain.goal_human_share(children, asks.get(home, []), home),
                                     journal.nameable_repos(home, private))
 
     @staticmethod

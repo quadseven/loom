@@ -3,14 +3,22 @@
 A goal in one repository can hold epics that live in another, and two issues
 in different repositories can share a number. One fixture builds that goal:
 
-  goal #1 in HOME. Its direct children: a local epic #2, a local loose ticket
-  #7, a foreign epic #7 and a foreign epic #8. A local epic #8 names the goal
+  goal #1 in HOME. Its direct children: a local epic #2, local loose tickets
+  #7 and #9, a foreign epic #7 and a foreign epic #8. A local epic #8 names the goal
   in its body only. Open local tickets: #50 and #52 name epic 2 (#52 is a
   sub-issue of the foreign issue #2, so its Part of line is stale), #51 names
-  the loose ticket #7, and #53 names the local epic #8.
+  the loose ticket #7, and #53 names the local epic #8. The foreign epic #8
+  holds tickets #81, #9 and #60, and #9 shares its number with the loose ticket #9
+  of HOME; the foreign epic #7 holds #71 and #50, which shares its number with
+  the local ticket #50. HOME has open needs:human issues #9 (a child of the
+goal) and #60 (no child of the goal: the foreign ticket #60 only shares its
+number).
 
 Every reader of the goal tree is a row of READERS below, and each row must
-return the same tree. A new reader of the goal tree is added to that table
+return the same tree. Every flattening of it (the status read's unproven
+count, human share and quiet check all read the flat list) is a row of
+FLATTENERS, and each row must keep one entry per repository and number. A
+new reader or flattening of the goal tree is added to the matching table
 (#2972).
 """
 from __future__ import annotations
@@ -20,6 +28,7 @@ import os
 import re
 import sys
 import unittest
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -50,6 +59,7 @@ def node(item):
 
 LOCAL_EPIC = issue(HOME, 2, "Local epic 2", "epic", body="Part of #1\n")
 LOOSE = issue(HOME, 7, "Loose ticket 7", "loom:ticket")
+LOOSE_9 = issue(HOME, 9, "Loose ticket 9", "loom:ticket")
 FOREIGN_7 = issue(OTHER, 7, "Foreign epic 7", "epic")
 FOREIGN_8 = issue(OTHER, 8, "Foreign epic 8", "epic")
 LISTED_EPIC = issue(HOME, 8, "Local epic 8", "epic", body="Part of #1\n")
@@ -60,20 +70,31 @@ OPEN_TICKETS = [
     issue(HOME, 53, "Ticket 53", "loom:ticket", body="Part of #8\n"),
 ]
 SUBS = {
-    (HOME, 1): [LOCAL_EPIC, LOOSE, FOREIGN_7, FOREIGN_8],
+    (HOME, 1): [LOCAL_EPIC, LOOSE, LOOSE_9, FOREIGN_7, FOREIGN_8],
     (HOME, 2): [issue(HOME, 21, "Ticket 21", "loom:ticket")],
-    (OTHER, 7): [issue(OTHER, 71, "Ticket 71", "loom:ticket")],
-    (OTHER, 8): [issue(OTHER, 81, "Ticket 81", "loom:ticket")],
+    (OTHER, 7): [issue(OTHER, 71, "Ticket 71", "loom:ticket"),
+                 issue(OTHER, 50, "Ticket 50 elsewhere", "loom:ticket")],
+    (OTHER, 8): [issue(OTHER, 81, "Ticket 81", "loom:ticket"),
+                 issue(OTHER, 9, "Ticket 9 elsewhere", "loom:ticket"),
+                 issue(OTHER, 60, "Ticket 60 elsewhere", "loom:ticket")],
     (HOME, 8): [issue(HOME, 82, "Ticket 82", "loom:ticket")],
 }
 
 # What every reader must find: the goal's loose ticket, then each epic with
 # its tickets, in the order the walk meets them.
-LOOSE_NUMBERS = [7]
+LOOSE_NUMBERS = [7, 9]
 TREE = [("Local epic 2", [21, 50]),
-        ("Foreign epic 7", [71]),
-        ("Foreign epic 8", [81]),
+        ("Foreign epic 7", [71, 50]),
+        ("Foreign epic 8", [81, 9, 60]),
         ("Local epic 8", [82, 53])]
+# The flat list of the whole goal, as (repository, number): the loose tickets,
+# then each epic's tickets in walk order, each issue once. #9 and #50 of OTHER
+# keep their place beside #9 and #50 of HOME.
+FLAT = [(HOME, 7), (HOME, 9),
+        (HOME, 21), (HOME, 50),
+        (OTHER, 71), (OTHER, 50),
+        (OTHER, 81), (OTHER, 9), (OTHER, 60),
+        (HOME, 82), (HOME, 53)]
 
 
 def reply(body):
@@ -128,9 +149,34 @@ def _finishable(gh):
                 for epic, tickets in brain._finishable_tree(gh, HOME, 1)]
 
 
+def _flat_of_status(gh):
+    """What the status read feeds on: _flatten over the light goal_tree."""
+    return [_key(i) for i in brain._flatten(*brain.goal_tree(gh, HOME, 1, light=True),
+                                           repo=HOME)]
+
+
+def _flat_of_goal_children(gh):
+    return [_key(i) for i in brain.goal_children(gh, HOME, 1)]
+
+
+def _key(item):
+    """(repository, number) as the fixture spells it: a REST issue names its
+    repository_url, a light status read a repository node."""
+    if "repository_url" in item:
+        return (item["repository_url"].split("/repos/")[1], item["number"])
+    return (item["repository"]["nameWithOwner"], item["number"])
+
+
+FLATTENERS = (("_flatten over the status read", _flat_of_status),
+              ("goal_children", _flat_of_goal_children))
+
 READERS = (("goal_tree, full read", _goal_tree_full),
            ("goal_tree, status read", _goal_tree_status),
            ("_finishable_tree", _finishable))
+
+
+HUMAN_ISSUES = [issue(HOME, 9, "Loose ticket 9", "needs:human"),
+                issue(HOME, 60, "Not under the goal", "needs:human")]
 
 
 class SharedNumbersTest(unittest.TestCase):
@@ -145,9 +191,36 @@ class SharedNumbersTest(unittest.TestCase):
                 if name != "_finishable_tree":
                     self.assertEqual(LOOSE_NUMBERS, loose)
 
+    def test_every_flattening_keeps_one_entry_per_repository_and_number(self):
+        for name, flatten in FLATTENERS:
+            with self.subTest(flattening=name):
+                self.assertEqual(FLAT, self.read(flatten))
+
+    def test_a_foreign_ticket_sharing_a_number_with_a_loose_ticket_is_not_dropped(self):
+        for name, flatten in FLATTENERS:
+            with self.subTest(flattening=name):
+                flat = self.read(flatten)
+                self.assertIn((OTHER, 9), flat)
+                self.assertIn((OTHER, 50), flat)
+
+    def test_the_status_read_counts_only_the_goals_own_issues_as_waiting_on_a_person(self):
+        # _goal_lines is the status consumer: it reads the light goal tree,
+        # flattens it and counts how many of the home repository's needs:human
+        # issues are the goal's. Foreign ticket #60 shares its number with a
+        # needs:human issue of HOME that is no child of the goal, so it is not
+        # one of them; the goal's share is #9 alone.
+        shares = {}
+        goal = {"number": 1, "title": "Goal", "state": "open", "labels": [],
+                "created_at": "2026-11-01T00:00:00Z"}
+        now = datetime(2026, 11, 2, tzinfo=timezone.utc)
+        brain._goal_lines([goal], {"goals": {1: {}}}, now, None,
+                          GitHub("placeholder", transport=World()), HOME,
+                          HUMAN_ISSUES, shares)
+        self.assertEqual({1: 1}, shares)
+
     def test_a_loose_goal_ticket_is_kept_when_a_foreign_epic_shares_its_number(self):
         loose, _ = self.read(_goal_tree_full)
-        self.assertEqual([7], loose)
+        self.assertEqual([7, 9], loose)
 
     def test_a_local_epic_naming_the_goal_is_found_when_a_foreign_epic_shares_its_number(self):
         for name, reader in READERS:
