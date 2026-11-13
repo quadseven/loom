@@ -3779,14 +3779,25 @@ def _rewrite_in_place(gh: GitHub, repo: str, source: Dict[str, Any], epic: int,
 
 
 def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
-                       evidence: List[str], lane: Optional[str],
-                       model: Optional[str]) -> Dict[str, Any]:
+                       evidence: List[str], lane: Optional[str], model: Optional[str],
+                       what: str = "", acceptance: str = "") -> Dict[str, Any]:
     """Send the regressed ticket itself back to a lane: its body gains a
-    Regression section with the evidence, then its labels move."""
+    Regression section with the brief's What, criteria and evidence, then its labels move."""
     number = int(issue["number"])
     body = str(issue.get("body") or "")
-    new = "%s\n\n## Regression\n\n%s\n\nRegresses #%d\n%s\n" % (
-        body.rstrip("\n"), title, number, "\n".join(evidence))
+    previous = re.search(r"(?ms)^## Acceptance criteria[ \t]*\n(.*?)(?=^## |\Z)", body)
+    history = previous.group(1).strip() if previous else ""
+    if previous:
+        body = body[:previous.start()] + body[previous.end():]
+    regression = ["## Regression", "", title, "", "Regresses #%d" % number,
+                  "\n".join(evidence)]
+    if what.strip():
+        regression.extend(["", "### What", "", what.strip()])
+    if history:
+        regression.extend(["", "### Previous acceptance criteria", "", history])
+    new = body.rstrip("\n") + "\n\n" + "\n".join(regression) + "\n"
+    if acceptance.strip():
+        new += "\n## Acceptance criteria\n\n%s\n" % acceptance.strip()
     if model is not None:
         new = _with_model(new, model)
     _check_written_text(new)
@@ -3818,7 +3829,11 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
         count, cap = _regression_rebriefs(issue), regression_rebrief_cap()
         if count >= cap:
             raise ValueError(_hold_over_rebriefed(gh, repo, issue, count, cap))
-        made = _rebrief_regressed(gh, repo, issue, title, evidence, lane, model)
+        sections = _body_sections(full_body)
+        what = "\n".join(sections.get("what", [])).strip()
+        acceptance = "\n".join(sections.get("acceptance criteria", [])).strip()
+        made = _rebrief_regressed(gh, repo, issue, title, evidence, lane, model,
+                                  what, acceptance)
     else:
         if epic is None:
             epic = intake_epic(gh, repo, goal)
