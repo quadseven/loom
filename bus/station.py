@@ -12272,7 +12272,7 @@ class Station:
         closed = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=closed&per_page=100"
                               % (repo, quote(label_pass.TRIAGE, safe=":"))).data
         issues = list(issues or []) + list(closed if isinstance(closed, list) else [])
-        station_logins = list(self.s.authors) + sorted(self._own_apps())
+        station_logins = sorted(self._own_apps())
         seen = set()
         changed = 0
         for issue in issues:
