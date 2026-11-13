@@ -180,6 +180,10 @@ class Intake(Base):
         self.assertIn("Never make the finding stop by changing what the endpoint measures", body)
         self.assertIn("affected count falls", body)
 
+    def test_new_health_ticket_names_its_finding_as_the_cause(self):
+        body = health.ticket_body(health._finding(finding())[0])
+        self.assertIn("Cause: ana waits on slow search", body)
+
     def test_the_ticket_body_passes_the_brief_and_plan_checks(self):
         body = health.ticket_body(health._finding(finding())[0])
         self.assertEqual(brain.plan_problems(body), [])
