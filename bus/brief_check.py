@@ -256,7 +256,11 @@ PLATFORM_PATTERNS = (
     ("iOS", re.compile(r"\bios\b|\biphone\b|\bipad\b", re.I)),
     ("Android", re.compile(r"\bandroid\b", re.I)),
     ("macOS", re.compile(r"\bmacos\b|\bmac os\b", re.I)),
-    ("Windows", re.compile(r"\bwindows\b", re.I)),
+    # "usage windows" and "time windows" are the time sense, not the platform
+    # (loom#2929).
+    ("Windows", re.compile(r"(?<!usage )(?<!time )(?<!rate )(?<!reset )(?<!billing )"
+                           r"(?<!quota )(?<!maintenance )(?<!retry )(?<!backoff )"
+                           r"\bwindows\b", re.I)),
     ("Linux", re.compile(r"\blinux\b", re.I)),
     # The UI counts only as a scope phrase (a change to it), never as a bare
     # mention: a single-platform brief whose criterion says "the UI test
@@ -267,6 +271,10 @@ PLATFORM_PATTERNS = (
     ("the Go core", re.compile(r"\bgo (?:core|backend|server|service|credential\w*)\b"
                                r"|\bgolang\b", re.I)),
 )
+
+
+# `Split: no` lifts the hold only with a reason on the same line.
+SPLIT_NO_RE = re.compile(r"^[ \t]*Split:[ \t]*no\b[ \t:,.(-]*[^\s:,.(-]", re.I | re.M)
 
 
 def platforms_named(body: str) -> List[str]:
@@ -289,6 +297,8 @@ def split_verdict(body: str) -> Optional[Verdict]:
     found = platforms_named(body)
     if len(found) < 2:
         return None
+    if SPLIT_NO_RE.search(brief_text(body or "")):
+        return None    # the author says why this is one ticket
     stamp = hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
     return Verdict(SPLIT, "split-" + stamp,
                    "its What or acceptance criteria name more than one platform "
