@@ -24,6 +24,8 @@ AGENTS_REPO_MARKER = "<!-- repo-specific below -->"
 # scope for this test.
 PROMPT_SOURCES = (
     ROOT / "docs" / "MUSE.md",
+    ROOT / "docs" / "BRAIN.md",
+    ROOT / "docs" / "LANES.md",
     ROOT / "docs" / "BRIEF_FORMAT.md",
     ROOT / "lanes" / "mac" / "brain.sh",
     ROOT / "lanes" / "run_lane.sh",

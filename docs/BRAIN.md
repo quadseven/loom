@@ -240,6 +240,8 @@ the target repository. If pinning fails, the next station pass retries.
 
 ## Ticket issues
 
+Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
+
 Title: `<short title>`. The ticket id is the issue number; the branch is
 `loom/<number>-<slug>`, where the slug is the title in lower case with runs of
 anything but letters and digits turned into `-`, at most 40 characters.
