@@ -19,6 +19,10 @@ TARGETS = (
     ("bus/brain.py", "_status_pass"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
+    # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription] 3026-Elder-complexity (PR #3026):
+    # Native Sol verification: separated status parsing must stay below the cap.
+    ("bus/station.py", "Station._active_fix_overlap"),
+    ("bus/station.py", "Station._fix_overlap_still_blocks"),
     ("bus/station.py", "Station._apply_adapter_verify"),
     # The held pull request wait withdrawal: the review bot measured the
     # first shape at 27 against this cap, so the decomposed functions stay
