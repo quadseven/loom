@@ -32,7 +32,11 @@ After its brief, every agent gets a "How to work" note (lanes/run_lane.sh
 see it pass), run the full suite or the validation check before finishing,
 follow the review bot's checklist (new functions under cyclomatic
 complexity 15, no swallowed errors, no dead code, docs in step, ASCII
-only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
+only), and commit.
+
+Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
+
+On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
 Before pushing to a private repository, the lane runner runs the same scanner
