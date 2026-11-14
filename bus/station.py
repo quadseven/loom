@@ -182,6 +182,7 @@ LOG_ROTATE_KEEP = 5
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
 DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
+FIX_OVERLAP_FILE = "fix-overlap-holds.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
 # the 17 GB in logs/ (loom#1808). Compressed once its transcript is uploaded,
@@ -2327,6 +2328,8 @@ class Station:
         self._compare_memo: Optional[Dict[str, Any]] = None
         self._busy: set = set()
         self._pulls: Dict[str, List[Dict[str, Any]]] = {}
+        self._fix_overlap_cache: Dict[Tuple[str, int, int], bool] = {}
+        self._fix_overlap_announced: Optional[Dict[str, str]] = None
         # The tickets named by After: lines, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._remote_beats: Dict[str, Optional[float]] = {}
@@ -3385,8 +3388,14 @@ class Station:
         return not any(n.endswith((".md", ".claiming")) for n in names)
 
     def claim_new(self) -> None:
+        """Assign free lanes to ready tickets once per station pass.
+
+        Reset the fix-overlap memo here so all lane checks in this pass share
+        one GitHub read set without carrying a stale decision into the next.
+        """
         free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
+        self._fix_overlap_cache = {}
         # This pass's unproven-work gate refusals (loom#564).
         self._gate_holds = {}
         self._cap_held = set()
@@ -5418,17 +5427,26 @@ class Station:
 
     def _fix_overlap_still_blocks(self, repo: str, issue: Dict[str, Any], fix: Any) -> bool:
         """Recheck a current overlap hold through the factory's peer policy."""
+        number = int(issue["number"])
+        cache_key = (repo, number, int(fix.pr))
+        if cache_key in self._fix_overlap_cache:
+            return self._fix_overlap_cache[cache_key]
         peer_number = self._active_fix_overlap(repo, issue)
         if peer_number is None:
+            self._fix_overlap_cache[cache_key] = False
+            self._remember_fix_overlap(repo, number, int(fix.pr), None)
             return False
-        number = int(issue["number"])
         current = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, fix.pr)).data
         if not isinstance(current, dict) or current.get("state") != "open":
+            self._fix_overlap_cache[cache_key] = False
+            self._remember_fix_overlap(repo, number, int(fix.pr), None)
             return False
         # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R4 (PR #3026):
         # Confirms review 5866533069; original model was undisclosed.
         # Explicit stacks share the factory's whole-line Builds on exemption.
         if brain.BUILDS_ON_RE.search(str(current.get("body") or "")):
+            self._fix_overlap_cache[cache_key] = False
+            self._remember_fix_overlap(repo, number, int(fix.pr), None)
             return False
         # AI-REVIEW 2026-11-12 [gpt-6.1-sol/native verification] 3026-R2 (PR #3026):
         # Confirms review 5866533069; original model was undisclosed.
@@ -5437,11 +5455,29 @@ class Station:
         peers = [peer for peer in judge._overlap_candidates(repo, current, judge._tickets(repo))
                  if peer.get("number") == peer_number]
         overlap = factory.overlapping_peer(self.gh, repo, current, peers)
-        if overlap != peer_number:
-            return False
-        _say("%s#%d: fix round held; overlaps pull request #%d" %
-             (repo, number, peer_number))
-        return True
+        held = overlap == peer_number
+        self._fix_overlap_cache[cache_key] = held
+        self._remember_fix_overlap(repo, number, int(fix.pr), peer_number if held else None)
+        return held
+
+    def _remember_fix_overlap(self, repo: str, number: int, fix_pr: int,
+                              peer_pr: Optional[int]) -> None:
+        """Log one unchanged overlap hold and forget it when the hold clears."""
+        if self._fix_overlap_announced is None:
+            saved = _read_json(os.path.join(self.state, FIX_OVERLAP_FILE), {}, strict=False)
+            self._fix_overlap_announced = saved if isinstance(saved, dict) else {}
+        key = "%s#%d" % (repo, number)
+        signature = "%d#%d" % (fix_pr, peer_pr) if peer_pr is not None else None
+        old = self._fix_overlap_announced.get(key)
+        if signature == old:
+            return
+        if signature is None:
+            self._fix_overlap_announced.pop(key, None)
+        else:
+            _say("%s#%d: fix round held; overlaps pull request #%d" %
+                 (repo, number, peer_pr))
+            self._fix_overlap_announced[key] = signature
+        _write_json(os.path.join(self.state, FIX_OVERLAP_FILE), self._fix_overlap_announced)
 
     def _repo_pr_count(self, repo: str) -> Optional[int]:
         """Count every page once per pass; unread is never an empty queue."""
