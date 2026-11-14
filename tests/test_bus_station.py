@@ -5925,6 +5925,51 @@ class FixTest(Base):
         self.assertIn("loom:running", self.fake.names(12))
         self.assertIn("claim:alice-example", self.fake.names(12))
 
+    def test_two_lanes_rechecking_one_held_fix_share_reads_and_log_once(self):
+        runner = self.overlap_fix()
+        issue = self.fake.issues[12]
+        fix, _comment_id = runner._fix_for(REPO, self.fake.comments[12])
+        self.assertIsNotNone(fix)
+        output = io.StringIO()
+
+        with contextlib.redirect_stderr(output):
+            self.assertTrue(runner._fix_overlap_still_blocks(REPO, issue, fix))
+            first_reads = list(self.fake.paths("GET"))
+            self.assertTrue(runner._fix_overlap_still_blocks(REPO, issue, fix))
+
+        self.assertEqual(self.fake.paths("GET"), first_reads)
+        held_lines = [line for line in output.getvalue().splitlines()
+                      if "fix round held" in line]
+        self.assertEqual(len(held_lines), 1)
+
+    def test_fix_overlap_log_repeats_only_after_the_hold_changes(self):
+        runner = self.overlap_fix()
+        issue = self.fake.issues[12]
+        fix, _comment_id = runner._fix_for(REPO, self.fake.comments[12])
+        self.assertIsNotNone(fix)
+        first = io.StringIO()
+        with contextlib.redirect_stderr(first):
+            self.assertTrue(runner._fix_overlap_still_blocks(REPO, issue, fix))
+
+        next_pass = station.Station(runner.gh, self.settings)
+        repeated = io.StringIO()
+        with contextlib.redirect_stderr(repeated):
+            self.assertTrue(next_pass._fix_overlap_still_blocks(REPO, issue, fix))
+        self.assertEqual(len([line for line in first.getvalue().splitlines()
+                              if "fix round held" in line]), 1)
+        self.assertNotIn("fix round held", repeated.getvalue())
+
+        peer = self.fake.pulls.pop(0)
+        cleared_pass = station.Station(runner.gh, self.settings)
+        self.assertFalse(cleared_pass._fix_overlap_still_blocks(REPO, issue, fix))
+        self.fake.pulls.insert(0, peer)
+        changed_pass = station.Station(runner.gh, self.settings)
+        changed = io.StringIO()
+        with contextlib.redirect_stderr(changed):
+            self.assertTrue(changed_pass._fix_overlap_still_blocks(REPO, issue, fix))
+        self.assertEqual(len([line for line in changed.getvalue().splitlines()
+                              if "fix round held" in line]), 1)
+
     def test_a_trusted_fix_after_the_last_claim_renders_a_fix_brief(self):
         self.fake.add(12)
         self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)", author="station-example")
