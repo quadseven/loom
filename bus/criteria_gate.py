@@ -91,8 +91,10 @@ LIVE_WORDS_RE = re.compile(
     r"|\brolls? (?:within|automatically)\b|\bend[- ]to[- ]end\b"
     r"|\bcompletes\b[^.\n]{0,60}\b(?:thread|request|run|job)\b"
     r"|\b(?:the|a|its) pods?\b[^.\n]{0,40}\b(?:obtains?|sends?|serves?|becomes? ready)\b"
-    r"|\bin (?:the|a) (?:[\w.-]+ )?logs?\b|\bday[- ]over[- ]day\b"
-    r"|\brises?\b|\bgrows?\b|\bmov(?:e|es|ed|ing) off \d+\b",
+    r"|\b(?:seen|appears?|preceded by|shows?|observed)\b[^.\n]{0,80}\bin (?:the|a) (?:[\w.-]+ )?logs?\b"
+    r"|\bday[- ]over[- ]day\b"
+    r"|\b(?:rises?|grows?)\b[^.\n]{0,80}\b(?:over time|each day|per day|daily)\b"
+    r"|\bmov(?:e|es|ed|ing) off \d+\b",
     re.I)
 
 _TICKED_RE = re.compile(r"^\s*[-*] \[([xX])\]\s+(.*?)\s*$")

@@ -22,7 +22,23 @@ LIVE_OBSERVATIONS = (
 )
 
 
+# Ordinary code behavior that merely uses the same words: no live system is
+# needed to show any of these, so none may read as live (Elder, PR #3015).
+CODE_BEHAVIOR = (
+    "The retry delay grows by doubling up to 60 seconds.",
+    "When the queue rises above 10, the station pauses intake.",
+    "Disk use grows unbounded otherwise; the new limit caps logs/ at 2 GB.",
+    "The sweep writes one line in the station log naming the count.",
+    "The buffer rises to 4 MB before the log grows on rotation.",
+)
+
+
 class LiveWords(unittest.TestCase):
+    def test_a_code_criterion_naming_logs_or_growth_stays_code(self):
+        for text in CODE_BEHAVIOR:
+            with self.subTest(text=text):
+                self.assertEqual(criteria_gate.kind(text), criteria_gate.CODE)
+
     def test_each_criterion_naming_a_live_observation_is_live(self):
         for text in LIVE_OBSERVATIONS:
             with self.subTest(text=text):
