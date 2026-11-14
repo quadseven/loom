@@ -5926,6 +5926,7 @@ class FixTest(Base):
         self.assertIn("claim:alice-example", self.fake.names(12))
 
     def test_two_lanes_rechecking_one_held_fix_share_reads_and_log_once(self):
+        """The second lane reuses the first lane's pass-level overlap result."""
         runner = self.overlap_fix()
         issue = self.fake.issues[12]
         fix, _comment_id = runner._fix_for(REPO, self.fake.comments[12])
@@ -5943,6 +5944,7 @@ class FixTest(Base):
         self.assertEqual(len(held_lines), 1)
 
     def test_fix_overlap_log_repeats_only_after_the_hold_changes(self):
+        """A persistent hold stays quiet until it clears and becomes active again."""
         runner = self.overlap_fix()
         issue = self.fake.issues[12]
         fix, _comment_id = runner._fix_for(REPO, self.fake.comments[12])

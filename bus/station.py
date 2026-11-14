@@ -3388,6 +3388,11 @@ class Station:
         return not any(n.endswith((".md", ".claiming")) for n in names)
 
     def claim_new(self) -> None:
+        """Assign free lanes to ready tickets once per station pass.
+
+        Reset the fix-overlap memo here so all lane checks in this pass share
+        one GitHub read set without carrying a stale decision into the next.
+        """
         free = [lane for lane in LANES if lane not in REMOTE_LANES
                 if self._heartbeat_ok(lane) and self._inbox_empty(lane)]
         self._fix_overlap_cache = {}
