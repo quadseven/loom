@@ -1258,6 +1258,52 @@ agent_gh_calls() {
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
+# The last lines of a failed run's log, as one comment on its ticket, so a
+# reader who cannot reach the lane host sees why it failed (loom#3049). The
+# lines lose local paths and control characters, go through the leak scan
+# (the full scan for a repo not known to be private, the personal data scan
+# for a private one) and are posted only when it passes: a refused or
+# unavailable scan posts a note that the tail was withheld, never the text.
+# One comment, found by its marker and replaced by the next failure. A limit
+# or auth park is skipped (the station re-briefs those with the reason in
+# hand). A failed post is logged and never fails the park. LOOM_LOG_TAIL=off
+# turns it off; LOOM_LOG_TAIL_LINES sets the line count (default 40).
+# Only a brief whose repo passed the owner check and whose privacy is known
+# (LOG_TAIL_OK, set in the brief loop) gets one: a brief is input, and a
+# refused one must not make the lane write to a repo it names. A lane with
+# App settings and no minted token posts nothing, as nothing else does.
+LOG_TAIL_MARKER="<!-- loom:lane-log-tail v1 -->"
+LOG_TAIL_OK=0
+post_log_tail() {  # failure class
+  [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
+  [ -z "${LOOM_GITHUB_APP_ID:-}" ] || [ -n "${GH_TOKEN:-}" ] || return 0
+  case "${1:-work}" in limit|auth) return 0 ;; esac
+  [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] && [ -s "${LOG:-}" ] || return 0
+  local lines="${LOOM_LOG_TAIL_LINES:-40}" file scan=() rc=0 text
+  { [[ "$lines" =~ ^[0-9]+$ ]] && [ "$lines" -gt 0 ]; } || lines=40
+  file="$(mktemp "${TMPDIR:-/tmp}/loom-log-tail.XXXXXX")" || return 0
+  tail -c +"$((${LOG_START:-0} + 1))" "$LOG" 2>/dev/null | tr -d '\r' |
+    LC_ALL=C tr -d '\000-\010\013\014\016-\037' | tail -n "$lines" | cut -c1-300 |
+    sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" > "$file"
+  if [ "${REPO_PRIVATE:-}" = true ]; then
+    scan=(--personal-data)
+  else
+    scan=(--allow-repo-ref "$REPO" --allow-repo-ref "$FACTORY_REPO")
+  fi
+  leak_scan --text-file "$file" "${scan[@]}" >> "$LOG" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    text="$(cat "$file")"
+  else
+    text="The log tail was withheld: the leak scan refused it or could not run. The full log is on the lane host."
+  fi
+  rm -f "$file"
+  printf '%s\n' "$text" |
+    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" tail \
+      --headline "Last lines of the $LANE lane log for $TICKET" ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: could not post the log tail" >> "$LOG"
+  return 0
+}
+
 park() {
   local reason="$2"
   [ -z "${REPLIES_FILE:-}" ] || rm -f "$REPLIES_FILE"
@@ -1266,6 +1312,7 @@ park() {
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
   [ -z "${AGENT_GH_CALLS:-}" ] || printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
+  post_log_tail "${3:-work}"
   mv "$1" "$INBOX/failed/"
 }
 
@@ -4336,6 +4383,7 @@ for BRIEF in "$INBOX"/*.md; do
   [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || ISSUE_NUMBER="$(printf '%s' "$TICKET" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p')"
   [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && ISSUE_NUMBER="$((10#$ISSUE_NUMBER))"
   LOG="$LOGDIR/$TICKET.log"
+  LOG_TAIL_OK=0
 
   # Ticket names become paths in the sandbox profile and the clone.
   if ! [[ "$TICKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -4485,6 +4533,7 @@ for BRIEF in "$INBOX"/*.md; do
     true|false) ;;
     *) echo "$TICKET: unexpected privacy answer '$REPO_PRIVATE' for $REPO; will retry next pass" >&2; continue ;;
   esac
+  LOG_TAIL_OK=1
   # Providers that train on prompts take public repos only. Asked before the
   # clone; a failed lookup proves nothing, so the brief waits for the next pass.
   if trains_on_prompts; then

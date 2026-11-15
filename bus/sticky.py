@@ -11,6 +11,7 @@ comments with gh; nothing here touches the network.
     python3 -m bus.sticky rounds  --marker M --now T --old FILE < entry
     python3 -m bus.sticky repeat  --marker M --now T --old FILE --headline H
                                   --items-label L --item I < detail
+    python3 -m bus.sticky tail    --marker M --now T --headline H < log-tail
 
 Each prints the new body on stdout. FILE holds the current comment body and
 may be missing or empty, which starts a new comment.
@@ -28,6 +29,9 @@ MAX_ENTRY = 4000
 MAX_ROUNDS = 12
 MAX_ITEMS = 30
 MAX_DETAIL = 1500
+# The most of a failed run's log a ticket carries; the end is kept, because
+# that is where a run says why it stopped.
+MAX_TAIL = 6000
 
 ROUND_RE = re.compile(r"^<!-- loom:round ([0-9]+) -->$", re.M)
 REPEAT_RE = re.compile(r"^(?P<headline>.*?): (?P<count>[0-9]+) times since (?P<first>\S+), "
@@ -107,6 +111,19 @@ def merge_repeat(old: Optional[str], marker: str, headline: str, items_label: st
     return "\n".join(lines) + "\n"
 
 
+def merge_tail(old: Optional[str], marker: str, headline: str, text: str, now: str) -> str:
+    """The log-tail comment: the latest tail in a code block, replacing the
+    last run's, so a ticket that fails again keeps one comment, not one per
+    failure. The old body is not read; it is a parameter so every mode has
+    the same shape. The text cannot close the block, open a marker or
+    mention anyone."""
+    fence = "`" * 3
+    text = text.replace("<!--", "<!- -").replace(fence, "'''").replace("@", "@ ").strip()
+    if len(text) > MAX_TAIL:
+        text = "... " + text[-MAX_TAIL:].lstrip()
+    return "\n".join([marker, "%s, as of %s." % (headline, now), "", fence, text, fence]) + "\n"
+
+
 def _read(path: Optional[str]) -> str:
     if not path:
         return ""
@@ -120,13 +137,14 @@ def _read(path: Optional[str]) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="bus.sticky")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("rounds", "repeat"):
+    for name in ("rounds", "repeat", "tail"):
         p = sub.add_parser(name)
         p.add_argument("--marker", required=True)
         p.add_argument("--now", required=True)
         p.add_argument("--old")
-        if name == "repeat":
+        if name in ("repeat", "tail"):
             p.add_argument("--headline", required=True)
+        if name == "repeat":
             p.add_argument("--items-label", required=True)
             p.add_argument("--item", default="")
     args = parser.parse_args(argv)
@@ -134,6 +152,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     old = _read(args.old)
     if args.command == "rounds":
         out = merge_round(old, args.marker, text, args.now)
+    elif args.command == "tail":
+        out = merge_tail(old, args.marker, args.headline, text, args.now)
     else:
         out = merge_repeat(old, args.marker, args.headline, args.items_label,
                            args.item, text, args.now)
