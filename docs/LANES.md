@@ -161,6 +161,14 @@ unset variables.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
+- A passing base check closes the repo's open base-check and contract
+  incidents from any lane host. The host keeps one file per incident under
+  `state/incidents/`, but a host with no file looks the incident up on the
+  factory repo by its exact title and marker and closes it, so a pass on a
+  cluster runner or a second machine releases tickets an absent host filed.
+  Environment incidents describe the machine that filed them and still close
+  only from that machine's own file. A private repo's incident title carries
+  a per-host alias, so it still closes only from the host that filed it.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on
