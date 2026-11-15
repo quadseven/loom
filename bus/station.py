@@ -84,6 +84,7 @@ from . import roll_pin
 from . import revert
 from . import spend
 from . import state_store
+from . import station_lease
 from . import status
 from . import usage
 from . import verify_data
@@ -16842,6 +16843,19 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, ("%d\n" % os.getpid()).encode("ascii"))
+        # The cross-host guard (loom#3050), when LOOM_STATION_LEASE=1: only the
+        # station holding the lease runs, and its state writes are fenced by
+        # the lease's epoch. The flock above stays as the same-host guard.
+        try:
+            lease = station_lease.select(os.environ, settings.home)
+            if lease is not None:
+                if not lease.acquire():
+                    _say("another station holds the lease; standing down")
+                    return 0
+                state_store.use(station_lease.FencedStore(state_store.active(), lease))
+        except (ValueError, StateError) as err:
+            _say("stopping: %s" % err)
+            return 1
         deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
             return _locked_pass(settings, state, gh, hooks)
@@ -16877,7 +16891,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         st.run_pass()
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
-    except StateError as err:
+    except (StateError, station_lease.LeaseLost) as err:
         _say("stopping: %s" % err)
         return 1
     finally:
