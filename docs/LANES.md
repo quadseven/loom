@@ -1335,9 +1335,36 @@ default and nothing changes until it is set.
   its next pass if the peer has let it lapse.
 - Not fenced: a GitHub write already in flight when the lease was lost. The
   ledgers make a repeat of it a no-op.
-- The lease record is a file under `state/` today, which only proves the
-  protocol on one host. Two stations on two hosts need the shared state
-  backend (`LOOM_STATE_BACKEND`, `bus/state_store.py`).
+- With the default file backend the lease record is a file under `state/`,
+  which only proves the protocol on one host. Two stations on two hosts need
+  the shared backend below.
+
+### Shared state backend
+
+`LOOM_STATE_BACKEND` picks where the station's ledgers live
+(`bus/state_store.py`): `file` (the default, a JSON file each under
+`state/`) or `postgres` (`bus/state_postgres.py`). It is off until the
+setting is `postgres`, and a station asked for it that lacks a setting or the
+driver stops with a message instead of using files.
+
+- It reaches the dashboard's database the same way the dashboard does:
+  `LOOM_DB_HOST`, `LOOM_DB_NAME`, `LOOM_DB_USER`, `LOOM_DB_PASSWORD`, the
+  `pg8000` package, a 5 second connect and statement timeout, and tables made
+  on first use (`loom_state`, one row per ledger; `station_lease`, one row).
+- With `LOOM_STATION_LEASE=1` too, the lease lives in `station_lease` and is
+  timed by the database's clock. A ledger write is one conditional statement
+  that writes only while the lease row still holds the writer's epoch, so a
+  station that slept through its renewals cannot write over the one that
+  took over.
+- Only ledgers every station must see are shared. What describes one host
+  stays a file: the lane runners' heartbeats under `state/usage/`, the disk
+  and deploy records, the pass deadline marker, the token and ETag caches and
+  the brain tick's local status (`state_store.HOST_LOCAL_FILES`).
+- A lane runner on another host is seen through `remote-status.json`, which is
+  shared. A runner's own heartbeat files are read only by a station on that
+  host, so a standby station on another host sees that host's lanes as it does
+  today: not at all, until the lane posts its status itself.
+- With the database down a pass stops with a state error and writes nothing.
 
 ## Paused steps
 
