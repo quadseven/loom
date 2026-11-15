@@ -12,6 +12,7 @@ from bus import sticky  # noqa: E402
 
 ROUNDS = "<!-- loom:lane-round v1 -->"
 REPEAT = "<!-- loom:incident-repeat v1 -->"
+TAIL = "<!-- loom:lane-log-tail v1 -->"
 
 
 class RoundTests(unittest.TestCase):
@@ -93,6 +94,42 @@ class RepeatTests(unittest.TestCase):
             with mock.patch.object(sys, "stdin", StringIO("e")), mock.patch.object(sys, "stdout", StringIO()) as o2:
                 sticky.main(["rounds", "--marker", ROUNDS, "--now", "n", "--old", os.path.join(tmp, "missing")])
                 self.assertIn("### Round 1, n", o2.getvalue())
+
+
+class TailTests(unittest.TestCase):
+    """The last lines of a failed run's log: one comment, replaced each run."""
+
+    def test_a_new_tail_replaces_the_old_one_under_one_marker(self):
+        first = sticky.merge_tail(None, TAIL, "Last lines of the lane log", "first failure\nboom", "t1")
+        second = sticky.merge_tail(first, TAIL, "Last lines of the lane log", "second failure", "t2")
+        self.assertTrue(second.startswith(TAIL + "\n"))
+        self.assertEqual(second.count(TAIL), 1)
+        self.assertIn("second failure", second)
+        self.assertNotIn("first failure", second)
+        self.assertIn("t2", second)
+
+    def test_the_text_cannot_close_its_code_block_or_open_a_marker(self):
+        fence = "`" * 3
+        body = sticky.merge_tail(None, TAIL, "h", "x\n" + fence + "\n@someone <!-- loom:round 1 -->", "t")
+        self.assertEqual(body.count(fence), 2)
+        self.assertNotIn("<!--", body.replace(TAIL, ""))
+        self.assertNotIn("@someone", body)
+
+    def test_a_long_tail_keeps_its_end(self):
+        text = "\n".join("line %d" % n for n in range(2000))
+        body = sticky.merge_tail(None, TAIL, "h", text, "t")
+        self.assertLess(len(body), 8000)
+        self.assertIn("line 1999", body)
+        self.assertNotIn("line 0\n", body)
+
+    def test_the_command_line_builds_a_tail(self):
+        from io import StringIO
+        from unittest import mock
+        out = StringIO()
+        with mock.patch.object(sys, "stdin", StringIO("it broke")), mock.patch.object(sys, "stdout", out):
+            sticky.main(["tail", "--marker", TAIL, "--now", "n", "--headline", "Last lines"])
+        self.assertIn("it broke", out.getvalue())
+        self.assertTrue(out.getvalue().startswith(TAIL))
 
 
 if __name__ == "__main__":

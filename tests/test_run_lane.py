@@ -791,13 +791,23 @@ print('leak guard: clean (shape patterns only)')
             **env,
         }
 
-    def sticky_bodies(self):
-        """The bodies of the comments the fake gh holds, oldest first."""
+    LOG_TAIL_MARKER = "<!-- loom:lane-log-tail v1 -->"
+
+    def all_comment_bodies(self):
         store = Path(str(self.log) + ".comments")
         if not store.is_dir():
             return []
         return [p.read_text() for p in sorted((p for p in store.iterdir() if p.name.isdigit()),
                                               key=lambda p: int(p.name))]
+
+    def sticky_bodies(self):
+        """The bodies of the comments the fake gh holds, oldest first, apart
+        from the failed-run log tail (tail_bodies), which a parked run adds."""
+        return [b for b in self.all_comment_bodies() if not b.startswith(self.LOG_TAIL_MARKER)]
+
+    def tail_bodies(self):
+        """The failed-run log tail comments the fake gh holds."""
+        return [b for b in self.all_comment_bodies() if b.startswith(self.LOG_TAIL_MARKER)]
 
     def calls(self):
         extra = []
@@ -1373,6 +1383,68 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertIn("failed: [work] ticket has no acceptance criteria", self.run_log())
+
+    def run_failing_agent(self, output, **env):
+        # The agent edits the tree and exits 1: a work failure after the
+        # repo's owner and privacy were checked.
+        self.drop_brief()
+        return self.run_lane(FAKE_AGENT="say", FAKE_OUT=output, FAKE_EXIT="1", FAKE_EDIT="1", **env)
+
+    def test_a_failed_run_posts_the_last_lines_of_its_log_to_the_ticket(self):
+        # The lane host's log is the only detail of a failed run; the ticket
+        # now carries its tail, so a reader who cannot reach the host sees it.
+        result = self.run_failing_agent("FAILED tests/test_x.py::test_y - AssertionError at line 429")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.tail_bodies()
+        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
+        self.assertIn("AssertionError at line 429", note)
+        self.assertIn("failed: [work]", note)
+        # The tail went through the leak scan before it was posted.
+        self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
+
+    def test_a_log_tail_the_leak_scan_refuses_is_withheld(self):
+        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.tail_bodies()
+        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
+        self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
+        self.assertIn("withheld", note)
+
+    def test_the_log_tail_can_be_switched_off(self):
+        result = self.run_failing_agent("FAILED tests/test_x.py::test_y", LOOM_LOG_TAIL="off")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tail_bodies(), [])
+
+    def test_a_lane_that_cannot_mint_its_token_again_posts_no_log_tail(self):
+        # The token is minted again after the agent. When that fails the lane
+        # has no token, and gh would answer as the operator's own login, so
+        # nothing is posted.
+        count = Path(self._tmp.name) / "mints"
+        self.drop_brief()
+        result = self.run_lane(
+            LOOM_GITHUB_APP_ID="124", GH_TOKEN="ghp_personal",
+            LOOM_APP_TOKEN_CMD=self.app_token_cmd(
+                'n=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
+                '[ "$n" = 0 ] && echo ghs_first.tok-en || { echo "key not found" >&2; exit 2; }'
+                % (count, count)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tail_bodies(), [])
+        self.assertIn("could not mint the lane's GitHub App token", self.failure_line())
+
+    def test_the_scanners_words_stay_out_of_the_log_the_tail_is_cut_from(self):
+        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the leak scan refused the log tail", self.run_log())
+        self.assertNotIn("private-range IP address", self.run_log())
+
+    def test_a_brief_parked_before_its_repo_is_checked_posts_no_log_tail(self):
+        # A brief is input: one refused before the owner check must not make
+        # the lane write to the repo it names.
+        self.drop_brief()
+        result = self.run_lane(LOOM_REPO_OWNERS="someone-else")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tail_bodies(), [])
+        self.assertFalse(any("issues/42/comments" in call for call in self.calls()))
 
     def test_the_lanes_operator_steps_reach_the_pull_request_body(self):
         # A lane pull request whose deploy needed a VM resize and a data
@@ -2866,8 +2938,11 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
         self.assertIn("leak scan refused or could not check the edits", self.failure_line())
-        self.assertEqual(len(self.scanner_calls()), 1, self.scanner_calls())
-        self.assertTrue(self.scanner_calls()[0].endswith(self.DENY), self.scanner_calls())
+        # The scan of the edits refused; the failed run's log tail is then
+        # scanned too before any of it is posted.
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        self.assertTrue(calls[0].endswith(self.DENY), calls)
 
     def test_a_timeout_keeps_no_branch_on_a_public_repo_when_the_deny_list_is_unreadable(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -7852,7 +7927,9 @@ echo fixed > fix.txt
         self.assertEqual(self.run_contract_lane(FAKE_GH_SEARCH="7").returncode, 0)
         [note] = self.sticky_bodies()
         self.assertIn("Still failing: 2 times since ", note)
-        writes = [c for c in self.calls() if c.startswith("gh api -X ")]
+        # The incident's own comment writes, not the log tails on the tickets.
+        writes = [c for c in self.calls() if c.startswith("gh api -X ")
+                  and "repos/quadseven/loom/" in c]
         self.assertEqual([c.split()[3] for c in writes], ["POST", "PATCH"])
         self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
 

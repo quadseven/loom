@@ -1298,6 +1298,28 @@ The loom home is kept bounded by the station and the runner (loom#643).
   however old, and a link is never followed. The station logs
   `removed N stale rewrite scratch folder(s), X GB, from ...`.
 
+## Failed-run log tail
+
+A run that ends parked leaves its detail in the lane host's log, which a
+reader of the ticket often cannot reach. When a lane parks a brief after its
+repo passed the owner check, `post_log_tail` in `lanes/run_lane.sh` posts the
+last `LOOM_LOG_TAIL_LINES` lines (default 40) of this run's log as one comment
+on the ticket, found by `<!-- loom:lane-log-tail v1 -->` and replaced by the
+next failure (`bus/sticky.py tail`), so a ticket that keeps failing has one
+comment, not one per run.
+
+- Local paths and control characters are removed, then the text goes through
+  the leak scan: the full scan for a repo not known to be private, the
+  personal data scan for a private one. A refused or unavailable scan posts a
+  note that the tail was withheld, never the text.
+- Limit and auth parks post nothing (the station re-briefs them with the
+  reason). A brief refused before its owner check posts nothing, and neither
+  does a lane with App settings whose token could not be minted.
+- A failed post is logged and never fails the park. `LOOM_LOG_TAIL=off` turns
+  the comment off.
+- Not done here: uploading the whole log to object storage. That needs a
+  bucket and a credential, which the operator supplies.
+
 ## Pass deadline
 
 A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
@@ -1314,6 +1336,57 @@ marker is younger than its deadline (the pass was killed), `ended ...s into
 its ...s deadline without a clean finish`. The default sits above a daily
 metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
 its own (loom#1924).
+
+## Station lease
+
+The pass lock (`state/station.lock`) is a file lock, so it only keeps two
+passes apart on one host. With `LOOM_STATION_LEASE=1` a station must also hold
+a lease before it runs a pass, so a second station on another host can take
+over when the first stops (`bus/station_lease.py`). The lease is off by
+default and nothing changes until it is set.
+
+- One station holds it at a time, under a name (`LOOM_STATION_ID`, default the
+  host name). It lives `LOOM_STATION_LEASE_TTL` seconds (default 180) without
+  a renewal; a pass renews it as it writes state.
+- A station that finds a peer's live lease logs "another station holds the
+  lease; standing down" and exits 0, as it does for the file lock.
+- A peer takes an expired lease at a higher epoch. The epoch is the fencing
+  token: every state write checks it first, so a station that slept through
+  its renewals and wakes cannot write over the new holder. It stops its pass
+  with "stopping: lease ... was taken by ..." and takes the lease again on
+  its next pass if the peer has let it lapse.
+- Not fenced: a GitHub write already in flight when the lease was lost. The
+  ledgers make a repeat of it a no-op.
+- With the default file backend the lease record is a file under `state/`,
+  which only proves the protocol on one host. Two stations on two hosts need
+  the shared backend below.
+
+### Shared state backend
+
+`LOOM_STATE_BACKEND` picks where the station's ledgers live
+(`bus/state_store.py`): `file` (the default, a JSON file each under
+`state/`) or `postgres` (`bus/state_postgres.py`). It is off until the
+setting is `postgres`, and a station asked for it that lacks a setting or the
+driver stops with a message instead of using files.
+
+- It reaches the dashboard's database the same way the dashboard does:
+  `LOOM_DB_HOST`, `LOOM_DB_NAME`, `LOOM_DB_USER`, `LOOM_DB_PASSWORD`, the
+  `pg8000` package, a 5 second connect and statement timeout, and tables made
+  on first use (`loom_state`, one row per ledger; `station_lease`, one row).
+- With `LOOM_STATION_LEASE=1` too, the lease lives in `station_lease` and is
+  timed by the database's clock. A ledger write is one conditional statement
+  that writes only while the lease row still holds the writer's epoch, so a
+  station that slept through its renewals cannot write over the one that
+  took over.
+- Only ledgers every station must see are shared. What describes one host
+  stays a file: the lane runners' heartbeats under `state/usage/`, the disk
+  and deploy records, the pass deadline marker, the token and ETag caches and
+  the brain tick's local status (`state_store.HOST_LOCAL_FILES`).
+- A lane runner on another host is seen through `remote-status.json`, which is
+  shared. A runner's own heartbeat files are read only by a station on that
+  host, so a standby station on another host sees that host's lanes as it does
+  today: not at all, until the lane posts its status itself.
+- With the database down a pass stops with a state error and writes nothing.
 
 ## Paused steps
 
