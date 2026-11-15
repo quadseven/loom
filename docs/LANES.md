@@ -1337,6 +1337,30 @@ its ...s deadline without a clean finish`. The default sits above a daily
 metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
 its own (loom#1924).
 
+## Station lease
+
+The pass lock (`state/station.lock`) is a file lock, so it only keeps two
+passes apart on one host. With `LOOM_STATION_LEASE=1` a station must also hold
+a lease before it runs a pass, so a second station on another host can take
+over when the first stops (`bus/station_lease.py`). The lease is off by
+default and nothing changes until it is set.
+
+- One station holds it at a time, under a name (`LOOM_STATION_ID`, default the
+  host name). It lives `LOOM_STATION_LEASE_TTL` seconds (default 180) without
+  a renewal; a pass renews it as it writes state.
+- A station that finds a peer's live lease logs "another station holds the
+  lease; standing down" and exits 0, as it does for the file lock.
+- A peer takes an expired lease at a higher epoch. The epoch is the fencing
+  token: every state write checks it first, so a station that slept through
+  its renewals and wakes cannot write over the new holder. It stops its pass
+  with "stopping: lease ... was taken by ..." and takes the lease again on
+  its next pass if the peer has let it lapse.
+- Not fenced: a GitHub write already in flight when the lease was lost. The
+  ledgers make a repeat of it a no-op.
+- The lease record is a file under `state/` today, which only proves the
+  protocol on one host. Two stations on two hosts need the shared state
+  backend (`LOOM_STATE_BACKEND`, `bus/state_store.py`).
+
 ## Paused steps
 
 `LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
