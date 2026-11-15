@@ -79,12 +79,12 @@ class StationHelpersGoThroughTheActiveStoreTest(unittest.TestCase):
         self.addCleanup(state_store.use, self.previous)
 
     def test_read_and_write_json_use_the_active_store(self):
-        station._write_json("/home/state/station/a.json", {"n": 1})
-        self.assertEqual(station._read_json("/home/state/station/a.json", None), {"n": 1})
-        self.assertEqual(station._read_json("/home/state/station/b.json", "d"), "d")
-        self.assertEqual(self.store.calls, [("write", "/home/state/station/a.json"),
-                                            ("read", "/home/state/station/a.json"),
-                                            ("read", "/home/state/station/b.json")])
+        station._write_json("state/station/a.json", {"n": 1})
+        self.assertEqual(station._read_json("state/station/a.json", None), {"n": 1})
+        self.assertEqual(station._read_json("state/station/b.json", "d"), "d")
+        self.assertEqual(self.store.calls, [("write", "state/station/a.json"),
+                                            ("read", "state/station/a.json"),
+                                            ("read", "state/station/b.json")])
 
     def test_the_default_store_is_the_file_store(self):
         state_store.use(self.previous)
