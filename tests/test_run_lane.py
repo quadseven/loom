@@ -7197,6 +7197,61 @@ exit %d
         self.assertIn("gh issue close --repo quadseven/loom 99", calls.read_text())
         self.assertFalse((tmp / "incidents" / "example_repo-contract").exists())
 
+    def resolve_without_state_file(self, kinds="", repo_public=True, listed="77", gh_fails=False):
+        """Run resolve_factory_incidents on a host with an empty state dir
+        (the incident was filed from another machine). Returns the gh calls."""
+        text = RUNNER.read_text()
+        function = re.search(r"^resolve_factory_incidents\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        shared = re.search(r"^shared_incident_number\(\) \{[^\n]*\n.*?^\}\n", text, re.S | re.M).group(0)
+        tmp = Path(self._tmp.name)
+        calls = tmp / "calls"
+        calls.touch()
+        script = (shared + function +
+                  'incident_file() { printf "%s/%s-%s" "$INCIDENT_DIR" '
+                  '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
+                  'incident_ticket() { printf "a ticket"; }\n'
+                  'repo_is_public() { [ "$PUBLIC" = 1 ]; }\n'
+                  'python3() { return 0; }\n'
+                  'gh() { printf "gh %s TITLE=%s MARKER=%s\n" "$*" "$TITLE" "$MARKER" >> "$CALLS"; '
+                  '[ "$1 $2" = "issue list" ] && { [ "$GH_FAILS" = 1 ] && return 1; printf "%s\n" "$LISTED"; }; return 0; }\n'
+                  'mkdir -p "$INCIDENT_DIR"\nresolve_factory_incidents ' + kinds + '\n')
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"INCIDENT_DIR": str(tmp / "incidents"), "REPO": "example/repo",
+                 "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
+                 "INCIDENT_MARKER": "<!-- loom:factory-incident v1 -->",
+                 "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log),
+                 "PUBLIC": "1" if repo_public else "0", "LISTED": listed,
+                 "GH_FAILS": "1" if gh_fails else "0"},
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return calls.read_text()
+
+    def test_a_pass_closes_a_base_check_incident_another_host_filed(self):
+        calls = self.resolve_without_state_file()
+        self.assertIn("gh issue list --repo quadseven/loom --state open", calls)
+        self.assertIn("TITLE=Factory incident: example/repo validation base-check", calls)
+        self.assertIn("TITLE=Factory incident: example/repo validation contract", calls)
+        self.assertIn("MARKER=<!-- loom:factory-incident v1 -->", calls)
+        self.assertIn("gh issue close --repo quadseven/loom 77", calls)
+
+    def test_a_pass_with_no_open_incident_on_the_factory_repo_closes_nothing(self):
+        calls = self.resolve_without_state_file(listed="")
+        self.assertNotIn("gh issue close", calls)
+
+    def test_a_failed_incident_lookup_is_logged_not_read_as_no_incident(self):
+        calls = self.resolve_without_state_file(gh_fails=True)
+        self.assertNotIn("gh issue close", calls)
+        self.assertIn("could not read the open base-check incidents", self.log.read_text())
+
+    def test_a_pass_does_not_close_a_host_bound_environment_incident_it_never_filed(self):
+        calls = self.resolve_without_state_file(kinds="environment")
+        self.assertNotIn("gh issue", calls)
+
+    def test_a_pass_does_not_look_up_a_private_repo_incident_by_title(self):
+        calls = self.resolve_without_state_file(repo_public=False)
+        self.assertNotIn("gh issue", calls)
+
     def contract_repo(self, contract=CONTRACT):
         """Give the remote a submodule pinned behind its tip, the contract
         and check.py. Returns the pinned submodule commit."""
