@@ -7197,7 +7197,7 @@ exit %d
         self.assertIn("gh issue close --repo quadseven/loom 99", calls.read_text())
         self.assertFalse((tmp / "incidents" / "example_repo-contract").exists())
 
-    def resolve_without_state_file(self, kinds="", repo_public=True, listed="77"):
+    def resolve_without_state_file(self, kinds="", repo_public=True, listed="77", gh_fails=False):
         """Run resolve_factory_incidents on a host with an empty state dir
         (the incident was filed from another machine). Returns the gh calls."""
         text = RUNNER.read_text()
@@ -7213,7 +7213,7 @@ exit %d
                   'repo_is_public() { [ "$PUBLIC" = 1 ]; }\n'
                   'python3() { return 0; }\n'
                   'gh() { printf "gh %s TITLE=%s MARKER=%s\n" "$*" "$TITLE" "$MARKER" >> "$CALLS"; '
-                  '[ "$1 $2" = "issue list" ] && printf "%s\n" "$LISTED"; return 0; }\n'
+                  '[ "$1 $2" = "issue list" ] && { [ "$GH_FAILS" = 1 ] && return 1; printf "%s\n" "$LISTED"; }; return 0; }\n'
                   'mkdir -p "$INCIDENT_DIR"\nresolve_factory_incidents ' + kinds + '\n')
         result = subprocess.run(
             ["bash", "-c", script],
@@ -7221,7 +7221,8 @@ exit %d
                  "FACTORY_REPO": "quadseven/loom", "LOOM_ROOT": str(tmp),
                  "INCIDENT_MARKER": "<!-- loom:factory-incident v1 -->",
                  "PWD": str(tmp), "CALLS": str(calls), "LOG": str(self.log),
-                 "PUBLIC": "1" if repo_public else "0", "LISTED": listed},
+                 "PUBLIC": "1" if repo_public else "0", "LISTED": listed,
+                 "GH_FAILS": "1" if gh_fails else "0"},
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return calls.read_text()
@@ -7237,6 +7238,11 @@ exit %d
     def test_a_pass_with_no_open_incident_on_the_factory_repo_closes_nothing(self):
         calls = self.resolve_without_state_file(listed="")
         self.assertNotIn("gh issue close", calls)
+
+    def test_a_failed_incident_lookup_is_logged_not_read_as_no_incident(self):
+        calls = self.resolve_without_state_file(gh_fails=True)
+        self.assertNotIn("gh issue close", calls)
+        self.assertIn("could not read the open base-check incidents", self.log.read_text())
 
     def test_a_pass_does_not_close_a_host_bound_environment_incident_it_never_filed(self):
         calls = self.resolve_without_state_file(kinds="environment")

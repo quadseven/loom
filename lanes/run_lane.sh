@@ -2542,8 +2542,13 @@ incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr 
 # again. Only a public repo has a title another host can rebuild: a private
 # repo's subject is a random alias kept per host (incident_subject).
 shared_incident_number() {  # kind
+  local listed
   repo_is_public || return 1
-  TITLE="Factory incident: $REPO validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG" | head -1 | tr -cd '0-9'
+  if ! listed="$(TITLE="Factory incident: $REPO validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
+    echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
+    return 1
+  fi
+  printf '%s' "$listed" | head -1 | tr -cd '0-9'
 }
 # Close this repo's environment, contract and base-check incidents once the
 # check has passed on the unmodified base; the station then releases tickets.
