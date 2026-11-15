@@ -96,12 +96,6 @@ class AcquireTest(LeaseTestCase):
             t.join()
         self.assertEqual(results.count(True), 1)
 
-    def test_a_released_lease_is_free_at_once(self):
-        alpha = self.lease("alpha")
-        alpha.acquire()
-        alpha.release()
-        self.assertTrue(self.lease("beta").acquire())
-
 
 class FencingTest(LeaseTestCase):
     def test_a_woken_stale_holder_cannot_renew_or_check(self):

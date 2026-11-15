@@ -41,7 +41,7 @@ STATION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 class LeaseLost(state_store.StateError):
     """This station no longer holds the lease it took: a peer took it over
-    after a missed heartbeat, or it was released. A StateError, so every
+    after a missed heartbeat. A StateError, so every
     place the station already stops a pass on one stops it on this too."""
 
 
@@ -148,11 +148,6 @@ class StationLease:
         now = self.cell.now()
         if not self.cell.swap(self.epoch, Record(self.holder, self.epoch, now + self.ttl)):
             raise LeaseLost("lease at epoch %s changed hands during a renewal" % self.epoch)
-
-    def release(self) -> None:
-        """Give the lease up now, so a peer need not wait out the TTL."""
-        self._mine()
-        self.cell.swap(self.epoch, Record(self.holder, self.epoch, 0.0))
 
 
 class FencedStore(state_store.StateStore):
