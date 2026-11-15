@@ -78,6 +78,7 @@ Never edit or pull the runtime clone by hand: local changes stop the deploy.
 - `docs/DASHBOARD.md`: dashboard settings
 - `docs/EVIDENCE.md`: the optional evidence endpoint
 - `docs/HEALTH.md`: how a project reports live problems
+- `docs/BUSINESS-MODE.md`: design for pointing Loom at a private business repo (not built)
 
 ### Roll source pins
 
