@@ -1290,7 +1290,10 @@ post_log_tail() {  # failure class
   else
     scan=(--allow-repo-ref "$REPO" --allow-repo-ref "$FACTORY_REPO")
   fi
-  leak_scan --text-file "$file" "${scan[@]}" >> "$LOG" 2>&1 || rc=$?
+  # The scanner's words stay out of the log: a shape hit echoes the text it
+  # matched, and the log is where the next tail is cut from.
+  leak_scan --text-file "$file" "${scan[@]}" > /dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the log tail or could not run (exit $rc)" >> "$LOG"
   if [ "$rc" -eq 0 ]; then
     text="$(cat "$file")"
   else

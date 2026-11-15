@@ -1415,6 +1415,28 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.tail_bodies(), [])
 
+    def test_a_lane_that_cannot_mint_its_token_again_posts_no_log_tail(self):
+        # The token is minted again after the agent. When that fails the lane
+        # has no token, and gh would answer as the operator's own login, so
+        # nothing is posted.
+        count = Path(self._tmp.name) / "mints"
+        self.drop_brief()
+        result = self.run_lane(
+            LOOM_GITHUB_APP_ID="124", GH_TOKEN="ghp_personal",
+            LOOM_APP_TOKEN_CMD=self.app_token_cmd(
+                'n=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
+                '[ "$n" = 0 ] && echo ghs_first.tok-en || { echo "key not found" >&2; exit 2; }'
+                % (count, count)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.tail_bodies(), [])
+        self.assertIn("could not mint the lane's GitHub App token", self.failure_line())
+
+    def test_the_scanners_words_stay_out_of_the_log_the_tail_is_cut_from(self):
+        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("the leak scan refused the log tail", self.run_log())
+        self.assertNotIn("private-range IP address", self.run_log())
+
     def test_a_brief_parked_before_its_repo_is_checked_posts_no_log_tail(self):
         # A brief is input: one refused before the owner check must not make
         # the lane write to the repo it names.
