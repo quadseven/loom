@@ -161,6 +161,11 @@ class FencedStore(state_store.StateStore):
         self.lease = lease
         self.clock = clock
         self._renewed = clock()
+        # A shared backend also makes each write conditional on the epoch
+        # in one statement, so the database refuses a stale holder itself.
+        fence = getattr(inner, "fence", None)
+        if fence is not None and lease.epoch is not None:
+            fence(lease.epoch)
 
     def read_json(self, path: str, default: Any, strict: bool = True) -> Any:
         return self.inner.read_json(path, default, strict)
@@ -186,5 +191,9 @@ def select(env: Mapping[str, str], home: str, default_id: Optional[str] = None
     raw = (env.get("LOOM_STATION_LEASE_TTL") or str(DEFAULT_TTL)).strip()
     if not raw.isdigit() or int(raw) < 3:
         raise ValueError("LOOM_STATION_LEASE_TTL is a whole number of seconds, at least 3")
-    cell = FileCell(os.path.join(home, "state", "station.lease.json"))
+    if state_store.backend_name(env) == "postgres":
+        from . import state_postgres
+        cell: Any = state_postgres.PostgresCell(state_postgres.check_settings(env))
+    else:
+        cell = FileCell(os.path.join(home, "state", "station.lease.json"))
     return StationLease(cell, holder, int(raw))
