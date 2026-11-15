@@ -240,6 +240,8 @@ the target repository. If pinning fails, the next station pass retries.
 
 ## Ticket issues
 
+Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
+
 Title: `<short title>`. The ticket id is the issue number; the branch is
 `loom/<number>-<slug>`, where the slug is the title in lower case with runs of
 anything but letters and digits turned into `-`, at most 40 characters.
@@ -2276,9 +2278,10 @@ criterion is one of three kinds:
 - live: met only on a running system: a `Live:` line, a host or network
   check, a box that names live, deployed or production behavior, a time
   window or an observed event, an imperative verify or measure, a result
-  recorded on the ticket, a round trip, a reboot. Its evidence is a passing
-  station check, or, for a `Live:` line with log strings, the station's own
-  log search that dispatched the verify run.
+  recorded on the ticket, a round trip, a reboot, a line or cast in a named
+  log, a value that changes over time, a row that moves off a number. Its
+  evidence is a passing station check, or, for a `Live:` line with log
+  strings, the station's own log search that dispatched the verify run.
 - operator: something only a person does (signs off, approves, acts by
   hand, checks a handset). Loom never closes it. A decision box is one: its
   text starts with "Operator decides" or "Decision:", or carries

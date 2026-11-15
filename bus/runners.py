@@ -98,6 +98,9 @@ POOL_MAX_DEFAULT = 4
 # How long a slot stays held after a run reported it unavailable with no
 # reset time, or after no runner took its run.
 HOLD_SECONDS = 1800
+# A slot held for a missing setting stays held until the setting appears; the
+# bound only keeps the heartbeat's retry_at finite.
+SETTING_HOLD_SECONDS = 86400
 # The most bytes read for one report artifact.
 ARTIFACT_MAX = 64 * 1024 * 1024
 # Bounds on what one report may unpack to, checked before each read: the
@@ -372,12 +375,21 @@ class Runners:
             if entry.get("state") == "dispatched":
                 self._follow(ledger, entry)
                 self.save(ledger)
+        self._lift_setting_holds(ledger)
         for slot in self.slots:
             self._dispatch_slot(ledger, slot)
         for slot in self.slots:
             self._beat(ledger, slot)
         self._prune(ledger)
         self.save(ledger)
+
+    def _lift_setting_holds(self, ledger: Dict[str, Any]) -> None:
+        """Drop a hold set for a missing setting once the setting is present."""
+        for slot in self.slots:
+            hold = ledger["holds"].get(slot) or {}
+            needs = hold.get("needs")
+            if needs and self._dispatch_settings(slot).get(needs):
+                ledger["holds"].pop(slot, None)
 
     def _in_flight(self, ledger: Dict[str, Any], slot: str) -> bool:
         return any(e.get("slot") == slot and e.get("state") == "dispatched"
@@ -491,7 +503,13 @@ class Runners:
             return
         settings = self._dispatch_settings(slot)
         if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
-            self._refuse(ledger, entry, "missing required runner setting %s" % OPENCODE_GO_KEY_SSM)
+            why = "missing required runner setting %s" % OPENCODE_GO_KEY_SSM
+            self._refuse(ledger, entry, why)
+            # Hold the slot, or its heartbeat reads healthy and the factory
+            # assigns it work it refuses again (loom#2910). The hold lifts on
+            # the first pass that finds the setting (_lift_setting_holds).
+            self._hold(ledger, slot, self.now + SETTING_HOLD_SECONDS, why)
+            ledger["holds"][slot]["needs"] = OPENCODE_GO_KEY_SSM
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex

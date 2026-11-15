@@ -177,8 +177,17 @@ def goal_merge_constraints(issue: Dict[str, Any]) -> List[str]:
 
 def _repo(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
-        raise ValueError("repo must be OWNER/NAME")
+        raise ValueError("repo must be OWNER/NAME: %r" % value)
     return value
+
+
+def _repos(values: Sequence[str]) -> List[str]:
+    """Each repo argument split on spaces and commas, empty pieces dropped.
+
+    zsh passes an unquoted `$LOOM_REPOS` as one argument holding every repo
+    (loom#3040); one argument per repo still reads the same.
+    """
+    return [_repo(piece) for value in values for piece in re.split(r"[\s,]+", value) if piece]
 
 
 def _issues(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
@@ -8886,7 +8895,7 @@ def _cmd_status(gh: GitHub, args: argparse.Namespace) -> int:
     naming it on stdout and on stderr (loom#2415)."""
     _print_clock(gh, _repo(args.lanes_repo))
     missed: List[str] = []
-    status(gh, [_repo(x) for x in args.repos], _repo(args.lanes_repo),
+    status(gh, _repos(args.repos), _repo(args.lanes_repo),
            emit=_flushed, budget=args.repo_budget, deadline=args.deadline, missed=missed)
     if not missed:
         return 0
@@ -9043,7 +9052,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
     naming it on stdout and on stderr (loom#1578)."""
     _print_clock(gh, _repo(args.lock_repo))
     missed: List[str] = []
-    resume(gh, [_repo(x) for x in args.repos], args.holder, _repo(args.lock_repo),
+    resume(gh, _repos(args.repos), args.holder, _repo(args.lock_repo),
            emit=_flushed, budget=args.repo_budget, deadline=args.deadline, missed=missed)
     if not missed:
         return 0

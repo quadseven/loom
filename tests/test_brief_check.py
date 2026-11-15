@@ -720,6 +720,33 @@ class Split(unittest.TestCase):
         self.assertIsNone(brief_check.split_verdict(body))
         self.assertIsNone(self.check(body))
 
+    def test_windows_in_the_time_sense_is_not_a_platform(self):
+        # Usage windows and time windows beside one platform stay one ticket.
+        for phrase in ("the end of its usage windows", "its time windows",
+                       "the rate windows", "the reset windows"):
+            body = ("## Why\n\nA lane on the host stops early.\n\n"
+                    "## What\n\n- The Linux host stops at %s.\n\n"
+                    "## Acceptance criteria\n"
+                    "- [ ] The Linux host reports %s.\n" % (phrase, phrase))
+            self.assertIsNone(brief_check.split_verdict(body), phrase)
+
+    def test_windows_as_a_platform_still_splits(self):
+        body = ("## Why\n\nThe tool is missing on two hosts.\n\n"
+                "## What\n\n- Build it on Windows.\n- Build it on Linux.\n\n"
+                "## Acceptance criteria\n- [ ] Both builds pass.\n")
+        self.assertEqual(brief_check.split_verdict(body).kind, brief_check.SPLIT)
+
+    def test_a_split_no_line_with_a_reason_lifts_the_hold(self):
+        body = self.MULTI + "\nSplit: no, one script runs on every platform\n"
+        self.assertIsNone(brief_check.split_verdict(body))
+        self.assertIsNone(self.check(body))
+
+    def test_a_split_no_line_without_a_reason_does_not_count(self):
+        for line in ("Split: no", "Split: no.", "Split: no\n\nOther text"):
+            body = self.MULTI + "\n" + line + "\n"
+            self.assertEqual(brief_check.split_verdict(body).kind,
+                             brief_check.SPLIT, line)
+
     def test_platforms_named_only_in_the_why_do_not_split(self):
         body = ("## Why\n\niOS and Android users both asked for this, but "
                 "the change itself is in the Go core only.\n\n"
