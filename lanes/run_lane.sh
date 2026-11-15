@@ -2534,22 +2534,48 @@ open_issue() {
 # checks had passed again for hours (2026-10-19).
 INCIDENT_DIR="$LOOM_HOME/state/incidents"
 incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr '/' '_')" "$1"; }
+# The open incident of this kind that ANY lane host filed for this repo, found
+# on the factory repo itself (its exact title and marker), not in this host's
+# state dir. The state dir only knows what this machine filed, so a pass on
+# another host (a cluster runner, a second Mac) never closed an incident the
+# station host filed, and the tickets stayed held until that one host ran
+# again. Only a public repo has a title another host can rebuild: a private
+# repo's subject is a random alias kept per host (incident_subject).
+shared_incident_number() {  # kind
+  local listed
+  repo_is_public || return 1
+  if ! listed="$(TITLE="Factory incident: $REPO validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
+    echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
+    return 1
+  fi
+  printf '%s' "$listed" | head -1 | tr -cd '0-9'
+}
 # Close this repo's environment, contract and base-check incidents once the
 # check has passed on the unmodified base; the station then releases tickets.
 # A host-only red base (host_red_base) closes only the base-check one, with
 # its own reason. Arguments: the kinds, then the reason after "Cleared:".
+# The base-check and contract kinds describe the repo and its check, so a pass
+# on any host closes them, found by title when this host has no state file.
+# An environment incident describes the machine that filed it, so only that
+# machine's own file closes it.
 resolve_factory_incidents() {
   local kind file number kinds="${1:-environment contract base-check}"
   local text="${2:-the check passed on the unmodified base in $(incident_ticket).}"
   for kind in $kinds; do
     file="$(incident_file "$kind")"
-    [ -f "$file" ] || continue
-    number="$(tr -cd '0-9' < "$file")"
+    if [ -f "$file" ]; then
+      number="$(tr -cd '0-9' < "$file")"
+    else
+      number=""
+      case "$kind" in
+        base-check|contract) number="$(shared_incident_number "$kind")" ;;
+      esac
+      [ -n "$number" ] || continue
+    fi
     if [ -n "$number" ]; then
       # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
       # factory incident's close through; anything else it records and holds.
-      PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD" \
-        issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
+      PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD"         issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
       gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text" >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
@@ -3272,7 +3298,7 @@ final_base_tests() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc host_red="" touched=""
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -3283,6 +3309,7 @@ final_validation() {
     drop_check_home
     return 1
   fi
+  output_offset="$(wc -c < "$LOG")"
   contract_run "$C_CHECK"; rc=$?
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
@@ -3333,6 +3360,12 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
+    PARK_CLASS=transient
+    VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
+  fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124)
@@ -3354,7 +3387,7 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
-    *) VALIDATION_REASON="validation failed: the check exited $rc" ;;
+    *) [ -n "$VALIDATION_REASON" ] || VALIDATION_REASON="validation failed: the check exited $rc" ;;
   esac
   record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false

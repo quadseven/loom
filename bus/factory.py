@@ -1236,18 +1236,22 @@ ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
 
 # A run cut off at a timeout: the agent's (lanes/agent_cli.sh classes exit 124
 # [transient]) or the validation check's after the agent (lanes/run_lane.sh,
-# the final or affected check exiting 124 parks [transient]). The class may be
+# the final or affected check exiting 124 parks [transient]), or a check that
+# reports only TimeoutExpired errors in unchanged tests. The class may be
 # missing (an older reason) or [work] (the station's own reclassing of a
 # repeated timeout, below, or a check timeout parked before loom#2799), never
 # [limit].
 TIMEOUT_RE = re.compile(r"^(?:\[(?:transient|work)\] )?(?:agent exited 124(?!\d)"
-                        r"|validation failed: the (?:affected )?check timed out after )")
+                        r"|validation failed: the (?:affected )?check timed out after "
+                        r"|validation failed: only unchanged test files reported TimeoutExpired errors)")
+# AI-REVIEW 2026-11-11 [gpt-6.1-sol] R1 (PR #3019): inner test timeouts
+# retain the same bounded escalation as agent and validation-check timeouts.
 # Two runs in a row cut off on one ticket are the ticket's doing, not a lane's.
 TIMEOUT_STRIKES = 2
 
 
 def is_timeout(reason: str) -> bool:
-    """Whether a classed failure reason is an agent timeout (exit 124)."""
+    """Whether a classed timeout counts toward the ticket's strike limit."""
     return bool(TIMEOUT_RE.match(reason))
 
 

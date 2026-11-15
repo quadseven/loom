@@ -32,7 +32,11 @@ After its brief, every agent gets a "How to work" note (lanes/run_lane.sh
 see it pass), run the full suite or the validation check before finishing,
 follow the review bot's checklist (new functions under cyclomatic
 complexity 15, no swallowed errors, no dead code, docs in step, ASCII
-only), and commit. On 2026-10-14, 27 of 95 tickets took six or more
+only), and commit.
+
+Write American English spelling: enroll, color, behavior, canceled, organize, not enrol, colour, behaviour, cancelled, organise.
+
+On 2026-10-14, 27 of 95 tickets took six or more
 rounds, and no lane ran a test before opening its pull request.
 
 Before pushing to a private repository, the lane runner runs the same scanner
@@ -157,6 +161,14 @@ unset variables.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
+- A passing base check closes the repo's open base-check and contract
+  incidents from any lane host. The host keeps one file per incident under
+  `state/incidents/`, but a host with no file looks the incident up on the
+  factory repo by its exact title and marker and closes it, so a pass on a
+  cluster runner or a second machine releases tickets an absent host filed.
+  Environment incidents describe the machine that filed them and still close
+  only from that machine's own file. A private repo's incident title carries
+  a per-host alias, so it still closes only from the host that filed it.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on
