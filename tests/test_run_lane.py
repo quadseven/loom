@@ -2916,8 +2916,11 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
                                capture_output=True, text=True, check=True).stdout
         self.assertNotIn("-timedout-", heads)
         self.assertIn("leak scan refused or could not check the edits", self.failure_line())
-        self.assertEqual(len(self.scanner_calls()), 1, self.scanner_calls())
-        self.assertTrue(self.scanner_calls()[0].endswith(self.DENY), self.scanner_calls())
+        # The scan of the edits refused; the failed run's log tail is then
+        # scanned too before any of it is posted.
+        calls = self.scanner_calls()
+        self.assertEqual([c.split()[0] for c in calls], ["--diff", "--text-file"], calls)
+        self.assertTrue(calls[0].endswith(self.DENY), calls)
 
     def test_a_timeout_keeps_no_branch_on_a_public_repo_when_the_deny_list_is_unreadable(self):
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
