@@ -1298,6 +1298,28 @@ The loom home is kept bounded by the station and the runner (loom#643).
   however old, and a link is never followed. The station logs
   `removed N stale rewrite scratch folder(s), X GB, from ...`.
 
+## Failed-run log tail
+
+A run that ends parked leaves its detail in the lane host's log, which a
+reader of the ticket often cannot reach. When a lane parks a brief after its
+repo passed the owner check, `post_log_tail` in `lanes/run_lane.sh` posts the
+last `LOOM_LOG_TAIL_LINES` lines (default 40) of this run's log as one comment
+on the ticket, found by `<!-- loom:lane-log-tail v1 -->` and replaced by the
+next failure (`bus/sticky.py tail`), so a ticket that keeps failing has one
+comment, not one per run.
+
+- Local paths and control characters are removed, then the text goes through
+  the leak scan: the full scan for a repo not known to be private, the
+  personal data scan for a private one. A refused or unavailable scan posts a
+  note that the tail was withheld, never the text.
+- Limit and auth parks post nothing (the station re-briefs them with the
+  reason). A brief refused before its owner check posts nothing, and neither
+  does a lane with App settings whose token could not be minted.
+- A failed post is logged and never fails the park. `LOOM_LOG_TAIL=off` turns
+  the comment off.
+- Not done here: uploading the whole log to object storage. That needs a
+  bucket and a credential, which the operator supplies.
+
 ## Pass deadline
 
 A whole station pass is bounded by `LOOM_PASS_DEADLINE` seconds (default
