@@ -16827,7 +16827,11 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
     if not settings.repos:
         _say("LOOM_REPOS is empty; nothing to do")
         return 0
-    state_store.use(state_store.select(os.environ))
+    try:
+        state_store.use(state_store.select(os.environ, settings.home))
+    except ValueError as err:
+        _say("stopping: %s" % err)
+        return 1
     state = os.path.join(settings.home, "state")
     os.makedirs(state, exist_ok=True)
     fd = os.open(os.path.join(state, "station.lock"), os.O_RDWR | os.O_CREAT, 0o600)
