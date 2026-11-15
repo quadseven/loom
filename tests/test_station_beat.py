@@ -248,6 +248,19 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.run_station(LOOM_STATION_LEASE="1"), 0)
         self.assertEqual(self.ran, [])
 
+    def test_a_slow_pass_renews_its_beat_even_when_end_pass_raises(self):
+        clock = [NOW]
+
+        def slow_end_pass(this):
+            clock[0] += station_beat.BEAT_TTL
+            raise OSError("disk")
+
+        with mock.patch.object(station.Station, "end_pass", slow_end_pass), \
+                mock.patch.object(station_beat.time, "time", lambda: clock[0]):
+            with self.assertRaises(OSError):
+                self.run_station()
+        self.assertEqual([w[0] for w in self.gh.writes], ["POST", "PATCH"])
+
     def test_the_guard_can_be_turned_off(self):
         self.gh.add(beat_body("cluster", leased=True), age=30)
         self.assertEqual(self.run_station(LOOM_STATION_GUARD="0"), 0)

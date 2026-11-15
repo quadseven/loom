@@ -16913,7 +16913,11 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         _say("stopping: %s" % err)
         return 1
     finally:
-        st.end_pass()
-        if beat is not None:
-            beat.renew()
+        try:
+            st.end_pass()
+        finally:
+            # Even when end_pass raises, the beat is renewed, so a slow pass
+            # does not read as a stopped station.
+            if beat is not None:
+                beat.renew()
     return 0
