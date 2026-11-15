@@ -26,6 +26,7 @@ stops with a state error and writes nothing, as it does for an unreadable file.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -111,10 +112,9 @@ class _Database:
             return result
         except BaseException:
             if self._conn is not None:
-                try:
+                # The connection is already bad; a failed close adds nothing.
+                with contextlib.suppress(Exception):
                     self._conn.close()
-                except Exception:  # noqa: BLE001 - the connection is already bad
-                    pass
                 self._conn = None
             raise
 
