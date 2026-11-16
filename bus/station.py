@@ -12273,14 +12273,15 @@ class Station:
         (brain triage's own skip rules), no assignee and no claim: label. The
         brain then triages it as any other issue; nothing skips triage. At
         most READY_PER_RUN issues a run, oldest first, at most once an hour,
-        and no comment: one log line a run with the count."""
+        and no comment: one log line a run with the count. A run in which a
+        repo read failed leaves the hour unstamped, so the next pass retries."""
         path = os.path.join(self.state, READY_FILE)
         state = _read_json(path, {}, strict=False)
         state = state if isinstance(state, dict) else {}
         last = state.get("_at")
         if self._num(last) and 0 <= self.now - last < READY_EVERY:
             return
-        left = READY_PER_RUN
+        left, failed = READY_PER_RUN, False
         try:
             for repo in self._verify_repos():
                 if left <= 0 or self._deferred():
@@ -12290,10 +12291,12 @@ class Station:
                 except RateLimited:
                     raise
                 except GitHubError as err:
+                    failed = True
                     _say("ready-for-agent intake: could not read %s: %s" % (repo, err))
         finally:
-            state["_at"] = self.now
-            _write_json(path, state)
+            if not failed:
+                state["_at"] = self.now
+                _write_json(path, state)
             done = READY_PER_RUN - left
             _say("ready-for-agent intake: %d issue%s to loom:triage"
                  % (done, "" if done == 1 else "s"))

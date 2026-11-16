@@ -15773,6 +15773,18 @@ class ReadyForAgentIntakeTest(Base):
         said = [c.args[0] for c in say.call_args_list]
         self.assertEqual(said[-1], "ready-for-agent intake: 2 issues to loom:triage")
 
+    def test_a_failed_repo_read_lets_the_next_pass_retry_within_the_hour(self):
+        self.ready(21)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner.gh, "rest",
+                               side_effect=station.GitHubError("server error", 502)), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertTrue(any("could not read" in line for line in said), said)
+        self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+
     def test_eligible_issues_past_the_first_page_are_reached(self):
         # The oldest 100 ready issues are all claimed; the intake reads on.
         for n in range(100):

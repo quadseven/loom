@@ -956,7 +956,8 @@ and is not an epic, goal home or other issue triage skips
 (`intake_ready_for_agent`, loom#3092). The brain then triages it like any
 other issue: the label never skips triage. At most 20 issues a run
 (`READY_PER_RUN`), and the run stops when the pass's request budget is spent.
-It writes no comment and logs one line a run with the count.
+It writes no comment and logs one line a run with the count. A run in which
+a repo read failed does not count toward the hour, so the next pass retries.
 
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
