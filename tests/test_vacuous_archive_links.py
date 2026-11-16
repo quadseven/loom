@@ -101,6 +101,32 @@ class ArchiveLinksTests(unittest.TestCase):
             vacuous._archive(checkout, root, base)
             self.assertFalse(os.path.lexists(os.path.join(checkout, "link")))
 
+    def test_symlink_chain_through_another_link_that_leaves_is_skipped(self):
+        # alias -> . makes alias/.. the checkout's parent, so link escapes
+        # although its text looks contained; z_alias is a forward reference.
+        for alias, link in (("alias", "link"), ("z_alias", "a_link")):
+            with self.subTest(alias=alias, link=link), \
+                    tempfile.TemporaryDirectory() as root:
+                repo = Path(root, "repo")
+                repo.mkdir()
+                subprocess.run(["git", "-C", str(repo), "init", "-q"],
+                               check=True, capture_output=True)
+                Path(root, "outside.txt").write_text("marker\n")
+                (repo / alias).symlink_to(".")
+                (repo / link).symlink_to(alias + "/../outside.txt")
+                (repo / "safe").symlink_to(alias + "/data.txt")
+                (repo / "data.txt").write_text("content\n")
+                base = _commit_all(str(repo), "base")
+                checkout = os.path.join(root, "checkout")
+                os.mkdir(checkout)
+                vacuous._archive(checkout, str(repo), base)
+                self.assertFalse(os.path.lexists(os.path.join(checkout, link)))
+                self.assertEqual(os.readlink(os.path.join(checkout, alias)), ".")
+                safe = os.path.join(checkout, "safe")
+                self.assertEqual(os.readlink(safe), alias + "/data.txt")
+                with open(safe) as handle:
+                    self.assertEqual(handle.read(), "content\n")
+
 
 if __name__ == "__main__":
     unittest.main()

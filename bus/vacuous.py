@@ -543,26 +543,59 @@ def _commit(tree: str, revision: str) -> str:
     return value
 
 
-def _recreate_symlink(base_tree: str, target: str,
-                      member: tarfile.TarInfo) -> None:
-    """Recreate a symlink member as is, unless its target leaves the checkout.
+LINK_HOPS_MAX = 40  # As the kernel's own symlink-loop limit.
 
-    A link's text is read from the link's own directory, so the member's
-    linkname is written unchanged; the resolved path only decides containment.
+
+def _link_stays_inside(links: Dict[str, str], path: str) -> bool:
+    """Whether the link at path, followed through every other link in the
+    archive, stays inside the checkout.
+
+    Each component is resolved as the kernel does: a component that is
+    itself a link is replaced by its text before a later ".." applies, so
+    alias -> . then link -> alias/../x leaves the checkout. links maps every
+    symlink in the archive, so a forward reference resolves the same way.
+    An absolute text, a step above the root or a loop is refused.
     """
-    root = os.path.abspath(base_tree)
-    resolved = os.path.abspath(os.path.join(
-        os.path.dirname(target), member.linkname))
-    if os.path.commonpath([root, resolved]) != root:
-        return
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    if os.path.lexists(target):
-        os.remove(target)
-    os.symlink(member.linkname, target)
+    pending = path.split("/")[:-1] + links[path].split("/")
+    resolved: List[str] = []
+    hops = 0
+    while pending:
+        part = pending.pop(0)
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                return False
+            resolved.pop()
+            continue
+        here = "/".join(resolved + [part])
+        text = links.get(here)
+        if text is None:
+            resolved.append(part)
+            continue
+        hops += 1
+        if hops > LINK_HOPS_MAX or not text or text.startswith("/"):
+            return False
+        pending = text.split("/") + pending
+    return True
+
+
+def _recreate_symlinks(base_tree: str, links: Dict[str, str]) -> None:
+    """Recreate each symlink with its own relative text, unless its chain
+    leaves the checkout; a refused link is left out, never followed."""
+    for path, text in sorted(links.items()):
+        if text.startswith("/") or not _link_stays_inside(links, path):
+            continue
+        target = os.path.join(base_tree, *path.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.lexists(target):
+            os.remove(target)
+        os.symlink(text, target)
 
 
 def _archive(base_tree: str, tree: str, revision: str) -> None:
     raw = _git(tree, "archive", "--format=tar", revision, timeout=60)
+    links: Dict[str, str] = {}
     with tarfile.open(fileobj=BytesIO(raw), mode="r:") as archive:
         for member in archive.getmembers():
             path = safe_test_path(member.name)
@@ -570,9 +603,10 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
             if member.isdir():
                 os.makedirs(target, exist_ok=True)
                 continue
-            
             if member.issym():
-                _recreate_symlink(base_tree, target, member)
+                # Judged once every link is known, and made after every file
+                # is written, so no write passes through a link.
+                links[path] = member.linkname
                 continue
             if not member.isfile():
                 continue
@@ -583,6 +617,7 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
                 raise ValueError("base archive file could not be read")
             with open(target, "xb") as output:
                 shutil.copyfileobj(stream, output)
+    _recreate_symlinks(base_tree, links)
 
 
 def _source_at(tree: str, revision: str, path: str) -> str:
