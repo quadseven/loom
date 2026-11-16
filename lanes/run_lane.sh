@@ -2874,6 +2874,10 @@ run_tmpdir() {
   if [ -L "$dir" ]; then
     rm -f "$dir" || return 1
   elif [ -e "$dir" ]; then
+    # A run that died can leave a read-only skills snapshot in here
+    # (chmod -R a-w), which rm -rf alone cannot empty; chmod -R does not
+    # follow links, so a link inside never changes its target.
+    chmod -R u+w "$dir" 2> /dev/null
     rm -rf "$dir" || return 1
   fi
   mkdir -p "$dir" || return 1
