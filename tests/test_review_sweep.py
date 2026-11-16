@@ -482,6 +482,26 @@ class ReportTest(Base):
         self.assertIn(review_sweep.MARKER % ("APPROVE", HEAD), body["body"])
 
 
+    def test_a_refused_anchor_posts_the_review_without_comments(self):
+        path, name = self.brief("codex-2")
+        self.result("codex-2", name, {
+            "blocking": [{"file": "bus/x.py", "line": 900, "finding": "Off the diff."}],
+            "notes": [], "summary": "One problem."}, factory.LUNA_MODEL)
+        real = self.fake.answer
+
+        def answer(who, method, where, body):
+            if method == "POST" and body and "comments" in json.loads(body or "{}"):
+                self.fake.posts.append((who, method, where, json.loads(body)))
+                return reply(422, {"message": "Line could not be resolved"})
+            return real(who, method, where, body)
+        self.fake.answer = answer
+        self.report("codex-2", path, name)
+        writes = self.writes()
+        self.assertEqual(len(writes), 2)
+        self.assertNotIn("comments", writes[1][3])
+        self.assertEqual(writes[1][3]["event"], "REQUEST_CHANGES")
+        self.assertIn("Off the diff.", writes[1][3]["body"])
+
     def reviews_posted(self):
         return [w for w in self.writes() if w[2].endswith("/reviews")]
 

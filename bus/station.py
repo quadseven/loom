@@ -4592,12 +4592,13 @@ class Station:
         try:
             gh.rest("POST", path, request)
         except ShadowHeld:
-            gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, number),
-                    {"body": request["body"]})
+            notify.post(gh, repo, number, request["body"], notify.RECORD)
         except GitHubError as err:
             if err.status != 422 or "comments" not in request:
                 raise
-            gh.rest("POST", path, {k: v for k, v in request.items() if k != "comments"})
+            bare = dict(request)
+            bare.pop("comments", None)
+            gh.rest("POST", path, bare)
 
     def _verify_github_data(self, repo: str, issue: Dict[str, Any]) -> str:
         """The verify brief's GitHub section: the lane has no network, so the
