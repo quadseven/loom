@@ -607,6 +607,33 @@ class SupersededOrBlocked(unittest.TestCase):
         self.assertTrue(any(n.startswith("lane:") for n in self.names(7)))
         self.assertNotIn("wait:blocked", self.names(7))
 
+    def test_a_ticket_github_marks_blocked_by_an_open_issue_waits_until_it_closes(self):
+        # The issue's own "blocked by" relationship, not a section in the
+        # brief: a wayfinder ticket wired in the tracker carries only that.
+        self.queued(7, "Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] y\n")
+        self.gh.issues[7]["issue_dependencies_summary"] = {"blocked_by": 1, "total_blocked_by": 1}
+        self.gh.blockers = {7: [{"number": 15, "state": "open",
+                                 "repository_url": "https://api.github.com/repos/%s" % self.repo}]}
+        worker = self.assign()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "blocked on #15")
+        self.assertIn("wait:blocked", self.names(7))
+        self.assertFalse(any(n.startswith("lane:") for n in self.names(7)))
+        self.gh.issues[7]["issue_dependencies_summary"] = {"blocked_by": 0, "total_blocked_by": 1}
+        self.gh.blockers = {7: [{"number": 15, "state": "closed",
+                                 "repository_url": "https://api.github.com/repos/%s" % self.repo}]}
+        worker = self.assign()
+        self.assertNotIn("%s#7" % self.repo, worker.waits)
+        self.assertTrue(any(n.startswith("lane:") for n in self.names(7)))
+
+    def test_a_blocker_in_another_repo_is_named_with_its_repo(self):
+        self.queued(7, "Difficulty: medium\n\n## Why\nx\n\n## Acceptance criteria\n- [ ] y\n")
+        self.gh.issues[7]["issue_dependencies_summary"] = {"blocked_by": 1}
+        other = "example-owner/other"
+        self.gh.blockers = {7: [{"number": 4, "state": "open",
+                                 "repository_url": "https://api.github.com/repos/" + other}]}
+        worker = self.assign()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "blocked on %s#4" % other)
+
 class Criteria(unittest.TestCase):
     """A brief is not dispatchable until each acceptance criterion is
     restated as the check that proves it (loom#2162): a ticket with no
