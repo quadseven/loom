@@ -151,6 +151,53 @@ class ResumeSkipTests(unittest.TestCase):
         self.assertNotIn("Skipped repos", out)
 
 
+class VerifyDueUnreadableEventsTests(unittest.TestCase):
+    """One shipped ticket whose events GitHub will not show (a moved or
+    transferred issue) must not drop the repo's other verify-due tickets,
+    nor fail the repo: the brain's verify step then read as degraded on two
+    ticks in a row (loom#644)."""
+
+    def shipped(self, number):
+        return {"number": number, "title": "Ticket %d" % number, "state": "open",
+                "updated_at": "2029-12-01T00:00:00Z",
+                "labels": [{"name": "loom:ticket"}, {"name": "loom:shipped"}]}
+
+    def routes(self, status=301, body=MOVED_BODY):
+        routes = lock_routes()
+        routes.update({
+            ("GET", "/repos/%s/issues" % REPO): (200, [self.shipped(21), self.shipped(22)]),
+            ("GET", "/repos/%s/issues/21/events" % REPO): (status, body),
+            ("GET", "/repos/%s/issues/22/events" % REPO): (200, []),
+            ("GET", "/repos/%s/issues/21/comments" % REPO): (200, []),
+            ("GET", "/repos/%s/issues/22/comments" % REPO): (200, []),
+        })
+        return routes
+
+    def test_verify_due_keeps_the_ticket_whose_events_moved(self):
+        gh = GitHub("t", transport=Routes(self.routes()))
+        due, err = quiet(brain.verify_due, gh, REPO, self.shipped_issues(), NOW)
+        self.assertEqual([21, 22], [issue["number"] for _, issue in due])
+        self.assertIn("events of %s#21 unreadable (HTTP 301 Moved Permanently: renamed or "
+                      "transferred); shipped time taken from its update time" % REPO, err)
+
+    def shipped_issues(self):
+        return [self.shipped(21), self.shipped(22)]
+
+    def test_resume_lists_both_and_does_not_fail_the_repo(self):
+        missed = []
+        out, _ = quiet(brain.resume, GitHub("t", transport=Routes(self.routes())), [REPO],
+                       "lane-machine", LOCK_REPO, NOW, ENV, missed=missed)
+        self.assertEqual([], missed)
+        self.assertNotIn("Failed repos", out)
+        self.assertIn("- resume verify %s#21 " % REPO, out)
+        self.assertIn("- resume verify %s#22 " % REPO, out)
+
+    def test_a_fault_in_the_events_still_fails(self):
+        gh = GitHub("t", transport=Routes(self.routes(500, {"message": "boom"})))
+        with self.assertRaises(GitHubError):
+            quiet(brain.verify_due, gh, REPO, self.shipped_issues(), NOW)
+
+
 class StatusSkipTests(unittest.TestCase):
     def test_a_moved_repo_gets_a_skipped_line_and_the_others_finish(self):
         routes = {("GET", "/repos/%s/issues" % MOVED): (301, MOVED_BODY),

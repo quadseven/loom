@@ -1588,8 +1588,19 @@ def _read_each(fn: Callable[[Any], Any], items: Sequence[Any]) -> List[Any]:
 
 def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[datetime]:
     """When loom:shipped was last applied; the issue's update time if the
-    events do not say."""
-    events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+    events do not say or GitHub will not show them (a moved, gone or forbidden
+    issue, named on stderr). One such ticket used to raise out of the whole
+    verify listing, so its repo read as failed and its other shipped tickets
+    went unverified, tick after tick (loom#644). Any other fault is raised."""
+    try:
+        events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+    except GitHubError as err:
+        reason = unreadable(err)
+        if reason is None:
+            raise
+        _progress("events of %s#%s unreadable (%s); shipped time taken from its update time"
+                  % (repo, issue["number"], reason))
+        return _stamp(issue.get("updated_at"))
     stamps = [_stamp(e.get("created_at")) for e in events
               if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "loom:shipped"]
     stamps = [x for x in stamps if x]
