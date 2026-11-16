@@ -7896,7 +7896,7 @@ class IncidentProbeTest(Base):
         self.assertIn("wait:incident", self.fake.names(13))
 
     def test_a_ticket_the_incident_comment_names_as_its_fix_runs(self):
-        cause = {"body": "Cause: the lane host lacks a tool. The fix is %s#13." % REPO,
+        cause = {"body": "Cause: the lane host lacks a tool.\nFix: %s#13\n" % REPO,
                  "created_at": "2030-01-01T00:05:00Z", "user": {"login": "alice-example"}}
         self.open_incident(comments=[cause])
         self.hold(12, 13)
@@ -7906,9 +7906,9 @@ class IncidentProbeTest(Base):
 
     def test_a_strangers_comment_naming_a_ticket_does_not_lift_its_hold(self):
         # The factory repo is public: any account may comment on an incident.
-        stranger = {"body": "The fix is %s#13." % REPO,
+        stranger = {"body": "Fix: %s#13" % REPO,
                     "created_at": "2030-01-01T00:05:00Z", "user": {"login": "stranger-example"}}
-        trusted = dict(stranger, body="The fix is %s#12." % REPO,
+        trusted = dict(stranger, body="Fix: %s#12" % REPO,
                        user={"login": AUTHORS[1]})
         self.open_incident(comments=[stranger, trusted])
         self.hold(12, 13)
@@ -7916,6 +7916,48 @@ class IncidentProbeTest(Base):
         self.assertIn("loom:running", self.fake.names(13))
         self.assertIn("wait:incident", self.fake.names(13))
         self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_trusted_comment_that_only_mentions_a_ticket_does_not_lift_its_hold(self):
+        # Only a "Fix:" line designates the fix; a mention in passing is not one.
+        mention = {"body": "Cause unknown. %s#13 hit the same red base." % REPO,
+                   "created_at": "2030-01-01T00:05:00Z", "user": {"login": AUTHORS[1]}}
+        self.open_incident(comments=[mention])
+        self.hold(13)
+        self.probe(lanes=())
+        self.assertIn("wait:incident", self.fake.names(13))
+        self.assertIsNone(tickets.parse(self.fake.issues[13]["body"])[0].get("Repairs incident"))
+
+    def finish_probe(self, outcome, stamp):
+        """A probe brief the runner finished in `outcome` (done or failed),
+        with its Base-check-exit stamp or none; the ledger's ran after."""
+        self.open_incident(created="2020-01-01T00:00:00Z")
+        self.hold(12)
+        self.assertEqual(self.probe(), [])
+        (name,) = self.briefs()
+        with open(self.inbox("codex", name), "a", encoding="utf-8") as fh:
+            fh.write(stamp)
+        os.makedirs(self.inbox("codex", outcome), exist_ok=True)
+        os.replace(self.inbox("codex", name), self.inbox("codex", outcome, name))
+        runner = self.station()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), mock.patch("bus.station._say"):
+            runner.report_outcomes()
+        path = os.path.join(self.home, "state", "station", incident_probe.LEDGER)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["%s#99" % REPO].get("ran")
+
+    def test_a_probe_whose_check_ran_records_the_run(self):
+        self.assertIsNotNone(self.finish_probe("done", "Base-check-exit: 0\n"))
+
+    def test_a_red_probe_whose_check_ran_records_the_run(self):
+        self.assertIsNotNone(self.finish_probe("failed", "Base-check-exit: 1\n"))
+
+    def test_a_probe_that_failed_before_its_check_ran_records_no_run(self):
+        # Setup failed (or the repo has no contract): no base check ran, so
+        # the incident-unprobed invariant must still see the incident.
+        self.assertIsNone(self.finish_probe("failed", ""))
+
+    def test_a_done_probe_with_no_check_stamp_records_no_run(self):
+        self.assertIsNone(self.finish_probe("done", ""))
 
     def test_a_strangers_repeat_marked_comment_is_not_the_last_repeat(self):
         fake_repeat = {"body": incident_probe.REPEAT_MARKER + "\nStill failing",

@@ -8043,6 +8043,8 @@ echo fixed > fix.txt
         self.assertIn("--repo quadseven/loom 41", closes[0])
         self.assertFalse(marker.exists())
         self.assertIn("base check passed", log)
+        done = (self.inbox / "done" / "example.repo-base-check-1.md").read_text()
+        self.assertIn("\nBase-check-exit: 0\n", done)
 
     def test_a_red_base_check_brief_updates_its_incident_and_runs_no_agent(self):
         log, marker = self.run_base_check_brief("exit 2")
@@ -8051,6 +8053,20 @@ echo fixed > fix.txt
         self.assertIn("factory incident quadseven/loom#", log)
         self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
         self.assertTrue(marker.exists())
+        failed = (self.inbox / "failed" / "example.repo-base-check-1.md").read_text()
+        self.assertIn("\nBase-check-exit: 2\n", failed)
+
+    def test_a_base_check_brief_for_a_repo_with_no_contract_is_not_a_pass(self):
+        # The default remote carries no .loom/validation.conf.
+        self.drop_brief(name="example.repo-base-check-1.md", text=self.BASE_CHECK_BRIEF)
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = (self.loom / "logs" / "codex" / "example.repo-base-check-1.log").read_text()
+        self.assertFalse((self.inbox / "done" / "example.repo-base-check-1.md").exists(), log)
+        failed = (self.inbox / "failed" / "example.repo-base-check-1.md").read_text()
+        self.assertNotIn("Base-check-exit:", failed)
+        self.assertIn("no validation contract", log)
+        self.assertFalse(any(c.startswith("gh issue close") for c in self.calls()))
 
     def test_a_base_check_brief_posts_no_log_tail_on_any_issue(self):
         self.run_base_check_brief("exit 2")

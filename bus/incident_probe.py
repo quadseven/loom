@@ -67,11 +67,18 @@ def _names(text: str, repo: str, number: int) -> bool:
     return re.search(pattern, text) is not None
 
 
+def _designates(comment: str, repo: str, number: int) -> bool:
+    """Whether an incident comment has a "Fix: <ref>" line naming issue
+    `number` of `repo`: a mention in passing designates nothing."""
+    return any(_names(m.group(1), repo, number)
+               for m in re.finditer(r"^Fix:[ \t]*(\S+)[ \t]*$", comment, re.M))
+
+
 def is_fix(ref: str, ticket_key: str, body: Any, comments: Iterable[Any]) -> bool:
     """Whether the ticket `ticket_key` is the fix of incident `ref`: its body
     names the incident (its station status section aside, which names it on
     every held ticket), or a comment on the incident other than the
-    runner's repeat count names the ticket."""
+    runner's repeat count has a "Fix:" line naming the ticket."""
     incident_repo, _, raw = ref.rpartition("#")
     repo, _, number = ticket_key.rpartition("#")
     if not raw.isdigit() or not number.isdigit():
@@ -82,7 +89,7 @@ def is_fix(ref: str, ticket_key: str, body: Any, comments: Iterable[Any]) -> boo
     if re.search(r"^Repairs incident:[ \t]*#%s[ \t]*$" % raw, text, re.M):
         return True
     return any(isinstance(c, dict) and not str(c.get("body") or "").startswith(REPEAT_MARKER)
-               and _names(str(c.get("body") or ""), repo, int(number))
+               and _designates(str(c.get("body") or ""), repo, int(number))
                for c in comments)
 
 

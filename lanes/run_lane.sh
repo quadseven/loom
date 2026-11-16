@@ -4643,12 +4643,21 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # A verify or review run changes no code, so there is nothing to validate.
   if [ "$DELIVERABLE" != verify ] && [ "$DELIVERABLE" != review ] && ! prepare_validation >> "$LOG" 2>&1; then
+    # A probe brief carries the check's exit only when the check ran: the
+    # station counts the probe as run on that stamp alone (loom#3084).
+    [ "$DELIVERABLE" != base-check ] || [ -z "$BASELINE_EXIT" ] ||
+      printf 'Base-check-exit: %s\n' "$BASELINE_EXIT" >> "$BRIEF"
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
   fi
   if [ "$DELIVERABLE" = base-check ]; then
     # The station's probe of a repo an open base-check incident holds: the
     # base check above already closed the incident on a pass, or updated its
-    # repeat count and parked the brief on a fail. No agent runs.
+    # repeat count and parked the brief on a fail. No agent runs. A repo
+    # with no validation contract has no base check, so nothing passed.
+    if [ -z "$HAS_CONTRACT" ] || [ -z "$BASELINE_EXIT" ]; then
+      park "$BRIEF" "base check: $REPO has no validation contract, so no base check ran"; continue
+    fi
+    printf 'Base-check-exit: %s\n' "$BASELINE_EXIT" >> "$BRIEF"
     echo "[$(date -u +%FT%TZ)] $TICKET done, base check passed on $BASE" >> "$LOG"
     mv "$BRIEF" "$INBOX/done/"
     continue

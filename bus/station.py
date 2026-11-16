@@ -7791,11 +7791,15 @@ class Station:
 
     def _report_base_check(self, lane: str, kind: str, name: str, text: str) -> bool:
         """A finished base-check brief: the runner already closed or updated
-        the incident, so the station records when the probe ran."""
+        the incident, so the station records when the probe ran. Only a
+        brief the runner stamped with the check's exit counts as a run: a
+        setup failure or a repo with no contract ran no check, and the
+        incident-unprobed invariant must still see its incident."""
         ref = self._field(text, "Incident")
         path = os.path.join(self.state, incident_probe.LEDGER)
         ledger = _read_json(path, {}, strict=False)
-        if isinstance(ledger, dict) and isinstance(ledger.get(ref), dict):
+        ran = self._field(text, "Base-check-exit").isdigit()
+        if ran and isinstance(ledger, dict) and isinstance(ledger.get(ref), dict):
             ledger[ref]["ran"] = self.now
             _write_json(path, ledger)
         outcome = "passed" if kind == "done" else "failed: %s" % self._failure_reason(lane, name)
