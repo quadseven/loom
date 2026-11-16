@@ -6523,7 +6523,6 @@ class Station:
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.check_fabric_reviews, self.intake_friction, self.report_review_debt,
-                     self.sweep_reviews,
                      # The packet after the tick's row, so it renders that tick.
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
@@ -17047,6 +17046,17 @@ class Station:
             # request target, and on 2026-11-07 assign_queued carried over
             # behind them pass after pass, leaving free lanes idle.
             self._feed_lanes()
+            # The review sweep too: it throttles itself to one run per
+            # LOOM_REVIEW_SWEEP_EVERY and costs a list read per repo, and as
+            # a loop step it never ran on 2026-11-16 because claim_new spent
+            # the request target first, pass after pass.
+            if not self._deferred():
+                try:
+                    self._timed(self.sweep_reviews)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("review sweep failed: %s" % err)
             if not self._deferred():
                 try:
                     self._timed(self.reconcile_pull_requests)
