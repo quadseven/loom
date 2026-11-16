@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+"""
+Loom GitHub wrapper - fail-closed gh command handler.
+
+This wrapper ensures that only GitHub Apps can call GitHub API, preventing
+personal login fallbacks. It refuses access when no token is available or
+for commands that should not be used.
+"""
+
+# Fail-closed: only run if we have a GitHub App token
+has_token() {
+    # Check for token from environment variables
+    if [ -n "${GH_TOKEN:-}" ]; then
+        return 0
+    fi
+
+    # Check for LOOM_GITHUB_APP_* settings (GitHub App installed)
+    if [ -n "${LOOM_GITHUB_APP_ID:-}" ] && \
+       [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ]; then
+        # Try to mint the token using the token helper
+        if LOOM_GITHUB_APP_KEY_FILE=${LOOM_GITHUB_APP_KEY_FILE:-} \
+           LOOM_GITHUB_APP_KEY_SSM=${LOOM_GITHUB_APP_KEY_SSM:-} \
+           LOOM_GITHUB_APP_ID=${LOOM_GITHUB_APP_ID} \
+           LOOM_GITHUB_APP_INSTALLATION_ID=${LOOM_GITHUB_APP_INSTALLATION_ID} \
+           python3 -B "bus.token_helper" 2>/dev/null >/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Commands that are explicitly refused
+refused_commands() {
+    case "$1" in
+        auth|auth.*|login|refresh|setup-git|switch|token)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Main wrapper logic
+if ! has_token; then
+    # No token available - fail closed
+    echo "error: no GitHub App token available" >&2
+    exit 1
+fi
+
+if refused_commands "$1"; then
+    # Command explicitly refused - fail closed
+    echo "error: gh command '$1' is not allowed without operator approval" >&2
+    exit 1
+fi
+
+# If we got here, execute the real gh command
+# Use exec to replace this script with gh
+exec "$(command -v gh)" "$@"

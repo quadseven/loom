@@ -346,7 +346,7 @@ if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RU
 [ "$LANE" = agy ] && WORKDIR="${LOOM_AGY_WORKDIR:-$AGY_HOME/lanes}"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+PATH="$LOOM_ROOT/bus:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
 # A check that hashes a file needs a sha256sum this machine can execute. The
 # lane plist puts the Intel Homebrew bin directory ahead of everything but the
@@ -1214,7 +1214,12 @@ lane_app_token() {
   if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
     token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
   else
-    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
+    # Use the fail-closed token helper
+    if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+      token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B bus.token_helper 2>> "$LOG")" || return 1
+    else
+      return 1
+    fi
   fi
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1

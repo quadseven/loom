@@ -101,7 +101,7 @@ ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+PATH="$REPO_ROOT/bus:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
 
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
@@ -331,19 +331,27 @@ if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
   [ "$MINUTES" -le 50 ] ||
     { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
   unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
-  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
-    beat failed 1
-    exit 1
-  fi
-  export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
-  unset app_token
-  # GET /user refuses an installation token, so the agent's journal is told
-  # the App's login; without it the journal fails, not the tick.
-  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
-    export LOOM_GITHUB_LOGIN="$app_login"
-  else
-    say "could not read the brain's GitHub App login; its journal may not post"
+  # Use the fail-closed token helper to mint the token
+  if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
+    app_token="$(python3 -B bus.token_helper 2>> "$LOG")" || {
+      say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
+      beat failed 1
+      exit 1
+    }
+    [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+      say "tick failed: the brain's GitHub App token has invalid characters"
+      beat failed 1
+      exit 1
+    }
+    export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
+    unset app_token
+    # GET /user refuses an installation token, so the agent's journal is told
+    # the App's login; without it the journal fails, not the tick.
+    if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+      export LOOM_GITHUB_LOGIN="$app_login"
+    else
+      say "could not read the brain's GitHub App login; its journal may not post"
+    fi
   fi
 fi
 
