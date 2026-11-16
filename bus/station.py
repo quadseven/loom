@@ -4484,21 +4484,22 @@ class Station:
         return review_sweep_mod.pending(runs or [], required)
 
     def _sweep_lane(self, pr: Dict[str, Any], blockers: Sequence[str] = ()) -> Optional[str]:
-        """The first review lane that may take this pull request: not
-        demoted by the scorecard, not held after failed runs, beating, and
-        not the lane of the App that wrote the pull request. The lane of an
+        """The first review lane that may take this pull request: not held
+        after failed runs, beating, and not the lane of the App that wrote
+        the pull request. A scorecard demotion does not stop a review: it
+        judges the lane's builds, and a review is not one (2026-11-16, the
+        codex demotion and agy's spent quota left no lane at all). The lane of an
         App whose stale block stands goes first: only its own new review
         replaces that block on GitHub."""
         config = self.s.review_sweep
         author = rest_login(pr.get("user")).lower()
-        demoted = self.demoted_lanes()
         lanes = sorted(config.lanes, key=lambda x: review_sweep_mod.bot(config.app(x) or x)
                        not in blockers)
         for lane in lanes:
             slug = config.app(lane)
             if not slug or author == review_sweep_mod.bot(slug):
                 continue
-            if lane in demoted or self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
+            if self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
                 continue
             return lane
         return None
