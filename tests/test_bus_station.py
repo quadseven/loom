@@ -427,6 +427,12 @@ class FakeGitHub:
             if "labels=%s&" % label in query:
                 return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                    and label in self.names(i["number"])])
+        if "labels=ready-for-agent&" in query:
+            ready = sorted((i for i in self.issues.values() if i["state"] == "open"
+                            and "ready-for-agent" in self.names(i["number"])),
+                           key=lambda i: i.get("created_at") or "")
+            page = int((re.search(r"[?&]page=(\d+)", query) or [0, "1"])[1])
+            return reply(200, ready[(page - 1) * 100:page * 100])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -3220,8 +3226,10 @@ class TriageTest(Base):
         return err.getvalue()
 
     def triage_reads(self):
+        # The ready-for-agent intake (loom#3092) reads its label oldest
+        # first too; it is not brain triage.
         return [p for p in self.fake.paths("GET")
-                if "sort=created&direction=asc" in p]
+                if "sort=created&direction=asc" in p and "labels=ready-for-agent" not in p]
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -5049,9 +5057,10 @@ class CorruptStateTest(Base):
         # and the verify-note pass's own pool listing (loom#2092), and the
         # held pull request wait withdrawal's read of the open tickets
         # (loom#1857), and the invariant pass's read of the queued tickets
-        # for ones with no brief headers (loom#2571).
+        # for ones with no brief headers (loom#2571), and the hourly read of
+        # ready-for-agent issues (loom#3092).
         # The last-pass shipped wait stamp adds one canonical all-repo read.
-        self.assertEqual(self.run_pass().requests, 20)
+        self.assertEqual(self.run_pass().requests, 21)
 
 
 class TicketsTest(unittest.TestCase):
@@ -15668,3 +15677,123 @@ class LunaReviewResultTest(Base):
         self.assertTrue(self.report())
         self.assertEqual(self.verdicts(), [])
         self.assertEqual(self.fake.reviews_posted, [])
+
+
+class ReadyForAgentIntakeTest(Base):
+    """loom#3092: Loom never read the ready-for-agent label, so an issue
+    marked ready for an agent with no Loom label never entered the queue.
+    The station gives each such issue loom:triage, so the brain triages it."""
+
+    def ready(self, number, labels=(), created="2030-01-01T00:00:00Z", **fields):
+        self.fake.add_open_issue(number, created=created)
+        self.fake.issues[number]["labels"] = [{"name": "ready-for-agent"}] + [
+            {"name": name} for name in labels]
+        self.fake.issues[number].update(fields)
+
+    def intake(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_a_ready_for_agent_issue_with_no_loom_label_goes_to_triage(self):
+        self.ready(21)
+        said = self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:triage"})
+        self.assertEqual(self.fake.comments[21], [])
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+    def test_a_claimed_or_assigned_ready_issue_is_left_alone(self):
+        self.ready(21, labels=("claim:someone",))
+        self.ready(22, assignees=[{"login": "someone"}])
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_epic_is_left_alone(self):
+        self.ready(21, labels=("epic",))
+        self.ready(22, sub_issues_summary={"total": 3})
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_issue_loom_already_labeled_is_left_alone(self):
+        self.ready(21, labels=("loom:queued", "loom:ticket"))
+        self.ready(22, labels=("loom:triage",))
+        self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:queued", "loom:ticket"})
+        self.assertEqual(set(self.fake.names(22)), {"ready-for-agent", "loom:triage"})
+        self.assertFalse([p for m, p in self.fake.calls if m != "GET"], self.fake.calls)
+
+    def test_one_run_labels_at_most_the_cap_oldest_first(self):
+        cap = station.READY_PER_RUN
+        for n in range(cap + 3):
+            self.ready(100 + n, created="2030-01-%02dT00:00:00Z" % (cap + 3 - n))
+        said = self.intake()
+        labeled = [100 + n for n in range(cap + 3) if "loom:triage" in self.fake.names(100 + n)]
+        self.assertEqual(labeled, [100 + n for n in range(3, cap + 3)])
+        self.assertEqual(said, ["ready-for-agent intake: %d issues to loom:triage" % cap])
+
+    def test_the_intake_runs_at_most_once_an_hour(self):
+        self.ready(21)
+        self.intake()
+        self.ready(22)
+        self.fake.calls.clear()
+        self.assertEqual(self.intake(), [])
+        self.assertNotIn("loom:triage", self.fake.names(22))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_budget_spent_partway_through_a_repo_stops_the_labeling(self):
+        self.ready(21, created="2030-01-01T00:00:00Z")
+        self.ready(22, created="2030-01-02T00:00:00Z")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # Not deferred at the repo, nor before the first issue; spent after it.
+        with mock.patch.object(runner, "_deferred", side_effect=[False, False] + [True] * 9), \
+                mock.patch("bus.station._say"):
+            runner.intake_ready_for_agent()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertNotIn("loom:triage", self.fake.names(22))
+
+    def test_a_failed_label_write_still_counts_what_was_labeled_against_the_cap(self):
+        for n in range(4):
+            self.ready(21 + n, created="2030-01-0%dT00:00:00Z" % (n + 1))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        real, posts = runner.gh.rest, []
+
+        def rest(method, path, *args, **kw):
+            if method == "POST":
+                posts.append(path)
+                if len(posts) == 2:
+                    raise station.GitHubError("server error", 500)
+            return real(method, path, *args, **kw)
+        with mock.patch.object(runner.gh, "rest", side_effect=rest), \
+                mock.patch.object(station, "READY_PER_RUN", 2), \
+                mock.patch.object(runner, "_verify_repos", return_value=[REPO, REPO]), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        labeled = [n for n in range(21, 25) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(len(labeled), 2, labeled)
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertEqual(said[-1], "ready-for-agent intake: 2 issues to loom:triage")
+
+    def test_a_failed_repo_read_lets_the_next_pass_retry_within_the_hour(self):
+        self.ready(21)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner.gh, "rest",
+                               side_effect=station.GitHubError("server error", 502)), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertTrue(any("could not read" in line for line in said), said)
+        self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+
+    def test_eligible_issues_past_the_first_page_are_reached(self):
+        # The oldest 100 ready issues are all claimed; the intake reads on.
+        for n in range(100):
+            self.ready(200 + n, labels=("claim:someone",),
+                       created="2030-01-01T00:%02d:%02dZ" % (n // 60, n % 60))
+        self.ready(21, created="2030-02-01T00:00:00Z")
+        said = self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
