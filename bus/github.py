@@ -690,6 +690,12 @@ class GitHub:
         self.target = target
         # Deferrable reads carried over when counted reached the target.
         self.carried_over: Dict[str, int] = {}
+        # Deferrable reads let through the target gate and not yet counted:
+        # without them two threads at one under the target both passed the
+        # gate and the pass went one over (loom#3014). A thread holds at
+        # most one, marked in _slot, until its request is counted.
+        self._reserved = 0
+        self._slot = threading.local()
         self.issue_writes: set[Tuple[str, int]] = set()
         self.comment_edits = False
         # resource (core, graphql, ...) -> (remaining, limit, reset epoch),
@@ -1205,6 +1211,7 @@ class GitHub:
         for attempt in range(len(delays) + 1):
             with self._count_lock:
                 self.requests += 1
+                self._release_slot_locked()
             try:
                 status, raw_headers, raw = self.transport(method, url, headers, payload)
             except GitHubError as err:
@@ -1357,21 +1364,44 @@ class GitHub:
         if "per_page=" not in path:
             path += ("&" if "?" in path else "?") + "per_page=100"
         self._stop_at_target(request_kind("GET", path))
-        return self._paginate_from(path, self.rest("GET", path))
+        try:
+            first = self.rest("GET", path)
+        finally:
+            self._drop_slot()
+        return self._paginate_from(path, first)
 
     def _has_target(self) -> bool:
         return isinstance(self.target, int) and not isinstance(self.target, bool)
 
+    def _drop_slot(self) -> None:
+        """Give back the gate slot of a read that raised before it went on
+        the wire; a sent read gave its slot back when it was counted."""
+        with self._count_lock:
+            self._release_slot_locked()
+
+    def _release_slot_locked(self) -> None:
+        """Give back this thread's gate slot, if it holds one. The caller
+        holds _count_lock."""
+        if getattr(self._slot, "held", False):
+            self._slot.held = False
+            self._reserved -= 1
+
     def _stop_at_target(self, kind: str) -> None:
         """Raise TargetReached, counting the read as carried over, when a
-        deferrable read would go past the pass target. The check and the
-        count share one hold of the lock so threads read one snapshot."""
+        deferrable read would go past the pass target. Reads let through and
+        not yet sent count against the target too, and the check and the
+        slot share one hold of the lock, so threads at one under the target
+        cannot both pass (loom#3014)."""
         with self._count_lock:
             target = self.target
-            over = (isinstance(target, int) and not isinstance(target, bool)
-                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+            gated = (isinstance(target, int) and not isinstance(target, bool)
+                     and kind in DEFERRABLE_KINDS)
+            over = gated and self.counted + self._reserved >= target
             if over:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            elif gated and not getattr(self._slot, "held", False):
+                self._slot.held = True
+                self._reserved += 1
         if over:
             raise TargetReached("%s read carried over at request target" % kind)
 
@@ -1394,7 +1424,10 @@ class GitHub:
             url = nxt
             if url:
                 self._stop_at_target(kind)
-                resp = self.rest("GET", url)
+                try:
+                    resp = self.rest("GET", url)
+                finally:
+                    self._drop_slot()
         return status.resort(items)
 
     def paginate_parallel(self, path: str, workers: int = 8) -> List[Any]:

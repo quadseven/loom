@@ -7,12 +7,15 @@ import io
 import json
 import os
 import sys
+import threading
+import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_bus_station import Base, REPO, GitHub, station
 from bus import scorecard
+from bus.github import TargetReached
 
 
 def spend_comments(this, free):
@@ -70,3 +73,38 @@ class ClaimBudgetTest(Base):
                 mock.patch.object(station.Station, "score_lanes", refresh):
             self.run_pass()
         refresh.assert_not_called()
+
+
+class ThreadedTargetGateTest(unittest.TestCase):
+    """The rotation's shipped-row step reads ticket events on a thread pool
+    (bus/metrics.py). Two reads at one under the target both passed the gate
+    before either was counted, and the pass went one over the target."""
+
+    def test_a_read_let_through_and_not_yet_sent_holds_its_place_under_the_target(self):
+        def transport(method, url, headers, payload):
+            return 200, {}, b"[]"
+
+        gh = GitHub("token", transport=transport, target=1)
+        entered, go = threading.Event(), threading.Event()
+        real = gh.rest
+
+        def paused(method, url, *args, **kwargs):
+            if threading.current_thread().name == "first-read":
+                entered.set()
+                go.wait(5)
+            return real(method, url, *args, **kwargs)
+
+        gh.rest = paused
+        first = threading.Thread(
+            target=gh.paginate, args=("/repos/%s/issues/12/events" % REPO,),
+            name="first-read")
+        first.start()
+        self.assertTrue(entered.wait(5))
+        try:
+            with self.assertRaises(TargetReached):
+                gh.paginate("/repos/%s/issues/13/events" % REPO)
+        finally:
+            go.set()
+            first.join(5)
+        self.assertEqual(gh.counted, 1)
+        self.assertEqual(gh.carried_over, {"events": 1})
