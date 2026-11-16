@@ -1059,12 +1059,14 @@ def review_name(repo: str, number: int, stamp: int) -> str:
 
 def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
                         pr_number: int, head_branch: str, base_branch: str,
-                        head_sha: str) -> str:
-    """The brief that hands a codex lane slot one pull request to review
-    while the Elder's model route is degraded (loom#2142): the tree is the
-    pull request's own branch, no branch is pushed, and the result is
-    review.json, not a pull request. The Model: line pins the slot to
-    gpt-6-luna, the only model the codex lanes run."""
+                        head_sha: str, model: str = "gpt-6-luna", mode: str = "") -> str:
+    """The brief that hands a lane slot one pull request to review: a codex
+    slot while the Elder's model route is degraded (loom#2142), or a review
+    lane the station's review sweep picked (mode "sweep", bus/review_sweep.py).
+    The tree is the pull request's own branch, no branch is pushed, and the
+    result is review.json, not a pull request. The Model: line pins a codex
+    slot to gpt-6-luna, the only model the codex lanes run; an empty model
+    leaves the lane its own."""
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     head = ["# Brief: %s" % review_name(repo, number, stamp), "",
@@ -1074,10 +1076,11 @@ def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
             "Issue: %s#%d" % (repo, number),
             "Review-PR: %d" % pr_number,
             "Head-Sha: %s" % head_sha,
-            "Base: %s" % base_branch,
-            "Model: gpt-6-luna",
-            "Deliverable: review", "",
-            "# T%d: Review pull request #%d: %s" % (number, pr_number, title), ""]
+            "Base: %s" % base_branch] + \
+        (["Model: %s" % model] if model else []) + \
+        (["Review-Mode: %s" % mode] if mode else []) + \
+        ["Deliverable: review", "",
+         "# T%d: Review pull request #%d: %s" % (number, pr_number, title), ""]
     text = "\n".join(head) + "\n" + REVIEW_BRIEF % (pr_number, base_branch, base_branch)
     body = str(issue.get("body") or "").rstrip("\n")
     if body:
