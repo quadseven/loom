@@ -1651,6 +1651,31 @@ class InvariantTest(unittest.TestCase):
         short = [Wait(Ref("%s#1" % REPO, "#1"), "no free lane in tier medium", T0 - 60)]
         self.assertEqual(invariants.ticket_waiting(Facts(T0, waits=short)), [])
 
+    def test_an_incident_open_a_day_with_no_base_check_run_is_named(self):
+        # loom#3084: an incident that holds a repo's tickets closes only on a
+        # base-check pass, so one nothing re-checks holds them for good.
+        ref = Ref("%s#99" % REPO, "#99")
+        day = invariants.DAY
+        never = invariants.Incident(ref, T0 - day - 60, T0 - day - 60, None)
+        (b,) = invariants.incident_unprobed(Facts(T0, incidents=[never]))
+        self.assertEqual((b.invariant, b.subject), ("incident-unprobed", ref.key))
+        self.assertIn("#99", b.title)
+        self.assertIn("no base-check run", " ".join(b.evidence))
+        before = invariants.Incident(ref, T0 - 2 * day, T0 - day, T0 - day - 60)
+        self.assertEqual(len(invariants.incident_unprobed(Facts(T0, incidents=[before]))), 1)
+
+    def test_an_incident_re_checked_since_its_last_repeat_or_younger_than_a_day_is_no_breach(self):
+        ref = Ref("%s#99" % REPO, "#99")
+        day = invariants.DAY
+        ran = invariants.Incident(ref, T0 - 2 * day, T0 - day, T0 - day + 60)
+        young = invariants.Incident(ref, T0 - day + 60, T0 - day + 60, None)
+        # A repeat a lane run just wrote: the next probe has not had its hour.
+        fresh = invariants.Incident(ref, T0 - 2 * day, T0 - 60, T0 - 2 * day)
+        for incident in (ran, young, fresh):
+            with self.subTest(incident=incident):
+                self.assertEqual(invariants.incident_unprobed(Facts(T0, incidents=[incident])), [])
+        self.assertEqual(invariants.incident_unprobed(Facts(T0)), [])
+
     def test_a_queued_lane_ticket_with_no_brief_headers_is_named(self):
         ticket = Ref("%s#9" % REPO, "#9")
         (b,) = invariants.queued_ticket_no_headers(Facts(T0, headerless=[ticket]))

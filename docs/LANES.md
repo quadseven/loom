@@ -169,6 +169,32 @@ unset variables.
   Environment incidents describe the machine that filed them and still close
   only from that machine's own file. A private repo's incident title carries
   a per-host alias, so it still closes only from the host that filed it.
+- An open base-check incident holds every ticket of its repo, so no ticket
+  run would ever check that repo again (loom#3084). While an incident holds
+  tickets, the station gives one free local lane (never a cluster runner
+  slot) a `Deliverable: base-check` brief for the repo at most once an hour:
+  `Repo:`, a `loom/base-check-<time>` branch, no `Issue:` and no `Base:`,
+  and `Incident:` naming the incident. The runner clones the default
+  branch, runs setup and the base check only, and runs no agent: a pass
+  closes the incident through the close path above and the station
+  re-queues the held tickets, and a fail updates the incident's repeat
+  count and parks the brief. The runner stamps the brief
+  `Base-check-exit: <code>` only when the check ran, and the station counts
+  a probe as run on that stamp alone; a repo with no validation contract
+  parks the brief with no stamp, since nothing was checked. Nothing is posted on any ticket. The station
+  reads each held incident and its comments at most once an hour and keeps
+  `state/station/incident_probe.json` (`bus/incident_probe.py`).
+- The incident's fix is not held by it. When that hourly read finds a held
+  ticket whose body (its status section aside) names the incident, as
+  `owner/name#N`, `name#N`, its URL or a `Repairs incident: #N` header, or
+  a comment on the incident other than the runner's repeat count has a line
+  `Fix: <ref>` naming the ticket (a mention in passing names no fix), the
+  station adds `Repairs incident: #N` to the ticket's header
+  block and moves it back to `loom:queued` on its lane. Its run then passes
+  the red base only if its final check passes (docs/BRIEF_FORMAT.md). The
+  repo's other tickets stay held. The factory repo is public, so only
+  comments by a `LOOM_BRIEF_AUTHORS` login count, for the fix and for the
+  last repeat alike: a stranger's comment lifts no hold.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on
@@ -1551,6 +1577,9 @@ Each invariant is one function returning breaches with evidence:
   commit deployed, because the move to `loom:shipped` failed
   (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
   Shipping through a downstream roll).
+- A base-check incident open over 24 hours with no base-check run since its
+  last repeat, two hours after that repeat (`incident-unprobed`, one issue
+  per incident): the probe above is not reaching it.
 - The newest Loom review journal is over 7 days old (`review-overdue`), a
   guard ticket closed with no merged pull request that changes a test
   (`guard-no-check`), or a guard ticket unreadable after 5 tries
