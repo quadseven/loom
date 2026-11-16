@@ -687,6 +687,12 @@ MAX_FIX_BODY = 60000
 # it all stops claiming until the reset.
 BUDGET_FLOOR = 0.15
 PASS_REQUEST_TARGET = 500
+# The share of one pass's request target the claim pass (claim_new) may
+# spend. Past it, its deferrable reads carry over to the next pass, so the
+# step rotation keeps room: on 2026-11-11 claim_new spent about 1000 requests
+# a pass, the rotation ran a step or two, and a full turn took four hours
+# (loom#3014).
+CLAIM_REQUEST_SHARE = 2 / 3
 # Requests the invariant filer may spend past the pass target once the
 # check's reads are done (loom#2505). The reads cost 70 to 480 counted
 # requests (warm or cold cache) and end in check-run and pull request
@@ -3374,6 +3380,27 @@ class Station:
         return not any(n.endswith((".md", ".claiming")) for n in names)
 
     def claim_new(self) -> None:
+        """Assign free lanes to ready tickets once per station pass, within
+        CLAIM_REQUEST_SHARE of the pass's request target: past it a read carries over to
+        the next pass and the step rotation keeps the rest of the target. The
+        pass logs what the claim spent (loom#3014)."""
+        target = getattr(self.gh, "target", None)
+        started = self._pass_counted()
+        capped = isinstance(target, int) and not isinstance(target, bool)
+        budget = 0
+        if capped:
+            budget = int(target * CLAIM_REQUEST_SHARE)
+            self.gh.target = min(target, started + budget)
+        try:
+            self._claim_new_pass()
+        finally:
+            if capped:
+                self.gh.target = target
+            _say("claim pass: %d of %s requests (share %d)"
+                 % (self._pass_counted() - started, target if capped else "no target",
+                    budget))
+
+    def _claim_new_pass(self) -> None:
         """Assign free lanes to ready tickets once per station pass.
 
         Reset the fix-overlap memo here so all lane checks in this pass share
@@ -6239,6 +6266,7 @@ class Station:
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
         paused = self._paused_steps(steps)
+        self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
         start = rotation.get("next") if isinstance(rotation, dict) else 0
@@ -6326,6 +6354,23 @@ class Station:
             _say("note_stale_shipped carried over to the next pass: %s" % err)
         except (GitHubError, OSError, ValueError) as err:
             _say("note_stale_shipped failed: %s" % err)
+
+    def _run_due_steps(self, paused: Set[str]) -> None:
+        """score_lanes ahead of the rotation when its hour is up, so a slow
+        rotation does not hold an hourly step for hours (loom#3014: the
+        scorecard went 4.5 hours unrefreshed). The step stays in the rotation,
+        where a refresh that is not due only sends notices."""
+        if ("score_lanes" in paused or self._deferred()
+                or not scorecard.Scorecard(self.state, self.now).due()):
+            return
+        try:
+            self.score_lanes()
+        except TargetReached as err:
+            _say("step score_lanes carried over to the next pass: %s" % err)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("score_lanes failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
