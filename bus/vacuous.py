@@ -552,8 +552,29 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
             if member.isdir():
                 os.makedirs(target, exist_ok=True)
                 continue
+            
+            if member.type == b'2':
+                member_dir = os.path.dirname(member.name)
+                link_target = member.linkname
+                
+                from pathlib import PurePosixPath
+                resolved_target = str(PurePosixPath(member_dir) / link_target).lstrip("/")
+                
+                abs_resolved = os.path.abspath(os.path.join(base_tree, resolved_target))
+                abs_base_tree = os.path.abspath(base_tree)
+                
+                if abs_resolved.startswith(abs_base_tree):
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    if os.path.exists(target) or os.path.islink(target):
+                        os.remove(target)
+                    os.symlink(link_target, target)
+                    continue
+                else:
+                    continue
+            
             if not member.isfile():
-                raise ValueError("base archive contains a non-file entry")
+                continue
+            
             os.makedirs(os.path.dirname(target), exist_ok=True)
             stream = archive.extractfile(member)
             if stream is None:
