@@ -812,6 +812,14 @@ SLOW_STEP_SECONDS = 60
 STATELESS_EVERY = 3600
 STATELESS_PER_RUN = 5
 STATELESS_FILE = "stateless.json"
+# Issues other brains and people mark ready for an agent (loom#3092): Loom
+# read no such label, so about 80 of them never entered the queue. Each one
+# with no Loom label goes to loom:triage, at most READY_PER_RUN a run and at
+# most once every READY_EVERY, so the reads stay inside the request budget.
+READY_LABEL = "ready-for-agent"
+READY_EVERY = 3600
+READY_PER_RUN = 20
+READY_FILE = "ready_for_agent.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
 # Labels that mean someone or something already holds a ticket: any Loom
@@ -6546,7 +6554,7 @@ class Station:
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
                      self.withdraw_held_pr_waits, self.clean_labels,
-                     self.queue_stateless_tickets,
+                     self.queue_stateless_tickets, self.intake_ready_for_agent,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.check_fabric_reviews, self.intake_friction, self.report_review_debt,
@@ -12596,6 +12604,81 @@ class Station:
         finally:
             state["_at"] = self.now
             _write_json(path, state)
+
+    def intake_ready_for_agent(self) -> None:
+        """Give loom:triage to each open ready-for-agent issue of each repo
+        that Loom has not seen: no loom: label, not an epic or other non-work
+        (brain triage's own skip rules), no assignee and no claim: label. The
+        brain then triages it as any other issue; nothing skips triage. At
+        most READY_PER_RUN issues a run, oldest first, at most once an hour,
+        and no comment: one log line a run with the count. A run in which a
+        repo read failed leaves the hour unstamped, so the next pass retries."""
+        path = os.path.join(self.state, READY_FILE)
+        state = _read_json(path, {}, strict=False)
+        state = state if isinstance(state, dict) else {}
+        last = state.get("_at")
+        if self._num(last) and 0 <= self.now - last < READY_EVERY:
+            return
+        left, failed = READY_PER_RUN, False
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                try:
+                    left -= self._intake_ready_repo(repo, left)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    failed = True
+                    _say("ready-for-agent intake: could not read %s: %s" % (repo, err))
+        finally:
+            if not failed:
+                state["_at"] = self.now
+                _write_json(path, state)
+            done = READY_PER_RUN - left
+            _say("ready-for-agent intake: %d issue%s to loom:triage"
+                 % (done, "" if done == 1 else "s"))
+
+    def _intake_ready_repo(self, repo: str, left: int) -> int:
+        """Label up to `left` of one repo's unseen ready-for-agent issues
+        loom:triage; how many it labeled. It stops when the pass budget is
+        spent, and a failed label write ends the repo with the count so far,
+        so the run's cap still holds. It reads page after page, oldest
+        first, until `left` are labeled or the pages run out, so issues it
+        skips (claimed, epics, already Loom's) never hide later ones."""
+        done = 0
+        for issue in self._ready_issues(repo):
+            if done >= left or self._deferred():
+                break
+            if (not isinstance(issue, dict) or issue.get("assignees") or issue.get("assignee")
+                    or any(name.startswith("claim:") for name in _label_names(issue))
+                    or brain._triage_skip(issue, self.s.authors, self.s.briefers)):
+                continue
+            number = int(issue["number"])
+            try:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["loom:triage"]})
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("ready-for-agent intake: could not label %s#%d: %s" % (repo, number, err))
+                break
+            done += 1
+        return done
+
+    def _ready_issues(self, repo: str) -> Iterator[Any]:
+        """The repo's open ready-for-agent issues, oldest first, one page
+        read at a time as the caller asks for more."""
+        page = 1
+        while True:
+            found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&sort=created"
+                                 "&direction=asc&per_page=100&page=%d"
+                                 % (repo, READY_LABEL, page)).data
+            found = found if isinstance(found, list) else []
+            yield from found
+            if len(found) < 100:
+                return
+            page += 1
 
     def release_stale_claims(self) -> None:
         """Take back another operator's claims their claimer left alone for
