@@ -69,6 +69,7 @@ Never edit or pull the runtime clone by hand: local changes stop the deploy.
 - `docs/SDLC.md`: the life cycle from ticket to verified
 - `docs/ARCHITECTURE.md`: the components
 - `docs/BRAIN.md`: labels, tickets and the brain's commands
+- `docs/LANDING.md`: every automated merge path and the gates it checks first
 - `docs/MUSE.md`: what one brain tick does
 - `docs/LANES.md`: lanes, the station and the installer
 - `docs/USAGE_ROUTING.md`: how work follows usage limits
