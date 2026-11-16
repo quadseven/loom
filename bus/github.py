@@ -682,6 +682,10 @@ class GitHub:
         self.cache_dir = cache_dir
         # Reads may run on several threads (brain.status): counts change under this lock.
         self._count_lock = threading.Lock()
+        # A deferrable read's request, counted in the same lock hold as its
+        # target check, so two threads cannot both pass the check one under
+        # the target and land one over it (loom#3014).
+        self._prepaid = threading.local()
         self.requests = 0
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
@@ -1204,7 +1208,10 @@ class GitHub:
         delays = RETRY_DELAYS if method in ("GET", "HEAD") else ()
         for attempt in range(len(delays) + 1):
             with self._count_lock:
-                self.requests += 1
+                if getattr(self._prepaid, "n", 0):
+                    self._prepaid.n -= 1
+                else:
+                    self.requests += 1
             try:
                 status, raw_headers, raw = self.transport(method, url, headers, payload)
             except GitHubError as err:
@@ -1365,13 +1372,20 @@ class GitHub:
     def _stop_at_target(self, kind: str) -> None:
         """Raise TargetReached, counting the read as carried over, when a
         deferrable read would go past the pass target. The check and the
-        count share one hold of the lock so threads read one snapshot."""
+        count share one hold of the lock so threads read one snapshot; a read
+        that passes is counted in that same hold, so two threads one under
+        the target cannot both pass it (loom#3014). The thread's next request
+        uses that count. A reservation no request used (the read failed
+        before it was sent) stays counted: an over-count, never an under-count."""
         with self._count_lock:
             target = self.target
-            over = (isinstance(target, int) and not isinstance(target, bool)
-                    and kind in DEFERRABLE_KINDS and self.counted >= target)
+            capped = isinstance(target, int) and not isinstance(target, bool)
+            over = capped and kind in DEFERRABLE_KINDS and self.counted >= target
             if over:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
+            elif capped and kind in DEFERRABLE_KINDS:
+                self.requests += 1
+                self._prepaid.n = 1
         if over:
             raise TargetReached("%s read carried over at request target" % kind)
 
