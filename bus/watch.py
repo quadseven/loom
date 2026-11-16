@@ -594,6 +594,14 @@ def _num(value: Any) -> Optional[float]:
     return None
 
 
+def _burst_hits(rec: Dict[str, Any]) -> float:
+    """The hits a record's held burst counts, or 0 when it holds none."""
+    burst = rec.get("burst")
+    if not isinstance(burst, list) or len(burst) != 2:
+        return 0
+    return _num(burst[1]) or 0
+
+
 def _checked(line: str) -> str:
     try:
         _text.check(line)
@@ -1028,7 +1036,7 @@ class Watcher:
         target["total"] += source["total"]
         if not target.get("done") and source.get("due") == "file":
             target["due"] = "file"
-            if isinstance(source.get("burst"), list):
+            if _burst_hits(source) > _burst_hits(target):
                 target["burst"] = source["burst"]
         stages = set(target.get("stages") or []) | set(source.get("stages") or [])
         if stages:
@@ -1136,10 +1144,8 @@ class Watcher:
         rec["due"] = kind
         if kind != "file":
             return
-        burst = rec.get("burst")
-        held = (_num(burst[1]) if isinstance(burst, list) and len(burst) == 2 else None) or 0
         window = self._window(rec)
-        if window > held:
+        if window > _burst_hits(rec):
             rec["burst"] = [self.now, window]
 
     def _burst(self, rec: Dict[str, Any]) -> Optional[Tuple[float, int]]:

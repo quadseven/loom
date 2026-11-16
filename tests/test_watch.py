@@ -623,6 +623,21 @@ class FilingTest(WatchBase):
                             for s in self.said), self.said)
         self.assertNotIn("burst", self.saved()["sigs"]["station: " + watch.signature(LINE_403)])
 
+    def test_a_merge_keeps_the_larger_held_burst(self):
+        watcher = watch.Watcher(self.gh, LANES_REPO, [(self.COMPONENT, self.log)], self.state,
+                                T0, self.said.append, write=False, private=self.PRIVATE)
+
+        def rec(burst):
+            return {"first": T0 - 60, "first_line": "a", "last": T0 - 60, "last_line": "a",
+                    "hits": [], "total": burst[1], "due": "file", "burst": list(burst)}
+
+        target = rec([T0 - 600, 7])
+        watcher._merge_observations(target, rec([T0 - 60, 3]))
+        self.assertEqual(target["burst"], [T0 - 600, 7])
+        target = rec([T0 - 600, 3])
+        watcher._merge_observations(target, rec([T0 - 60, 7]))
+        self.assertEqual(target["burst"], [T0 - 60, 7])
+
     def test_a_late_filing_after_a_failed_post_keeps_its_burst(self):
         self.append(LINE_403, LINE_403, LINE_403)
         rest = self.gh.rest
