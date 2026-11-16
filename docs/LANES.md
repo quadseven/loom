@@ -2089,9 +2089,10 @@ A stale block also qualifies, before the age bound: a fleet reviewer App's
 GitHub after its fix is pushed, so the new head is reviewed.
 
 Each qualifying pull request goes to the first lane in `LOOM_REVIEW_LANES`
-that is not demoted by the scorecard, not held after transient failures,
-has a fresh heartbeat, and whose reviewer App did not write the pull
-request; a stale block goes first to the lane of the App that blocked,
+that is not held after transient failures, has a fresh heartbeat, and
+whose reviewer App did not write the pull request. A scorecard demotion
+does not stop a review: it judges the lane's builds, and a review is not
+one; a stale block goes first to the lane of the App that blocked,
 since only that App's new review replaces its block. The brief is the Luna
 review brief with `Review-Mode: sweep`; a codex slot is pinned to
 `gpt-6-luna`, and agy runs its own model. The station records each

@@ -264,11 +264,22 @@ class SweepTest(Base):
         self.station().sweep_reviews()
         self.assertEqual(self.briefs("codex-2"), [])
 
-    def test_a_demoted_lane_is_skipped_for_the_next(self):
+    def test_a_build_demotion_does_not_stop_a_lanes_reviews(self):
+        # A scorecard demotion judges a lane's build outcomes; a review is
+        # not a build. On 2026-11-16 the codex demotion and agy's spent quota
+        # left the sweep with no lane at all, and no pull request got one.
         self.fake.add(7)
         st = self.station()
-        st.demoted_lanes = lambda: {"codex-2": "demoted"}
+        st.demoted_lanes = lambda: {"codex-2": "demoted", "codex": "demoted"}
         st.sweep_reviews()
+        briefs = self.briefs("codex-2")
+        self.assertEqual(len(briefs), 1)
+        self.assertIn("Model: gpt-6-luna", briefs[0])
+
+    def test_a_lane_not_beating_is_skipped_for_the_next(self):
+        self.beating = {"agy"}
+        self.fake.add(7)
+        self.station().sweep_reviews()
         self.assertEqual(self.briefs("codex-2"), [])
         briefs = self.briefs("agy")
         self.assertEqual(len(briefs), 1)
@@ -282,9 +293,9 @@ class SweepTest(Base):
         self.assertEqual(len(self.briefs("agy")), 1)
 
     def test_no_lane_free_dispatches_nothing(self):
+        self.beating = set()
         self.fake.add(7)
         st = self.station()
-        st.demoted_lanes = lambda: {"codex-2": "demoted", "agy": "demoted"}
         st.sweep_reviews()
         self.assertEqual(self.briefs("codex-2") + self.briefs("agy"), [])
 
@@ -334,8 +345,8 @@ class ReportTest(Base):
     def brief(self, lane, number=7):
         """A sweep brief the station dispatched itself, moved to done."""
         self.fake.add(number)
+        self.beating = {lane}
         st = self.station()
-        st.demoted_lanes = lambda: {x: "demoted" for x in ("codex-2", "agy") if x != lane}
         st.sweep_reviews()
         return self.done(lane)
 
