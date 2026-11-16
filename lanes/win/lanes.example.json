@@ -1,0 +1,31 @@
+{
+  "lanes": [
+    {
+      "name": "codex",
+      "kind": "codex",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "codex",
+      "model": "gpt-4o",
+      "launch_flags": ["--resume"],
+      "restore_policy": "resume"
+    },
+    {
+      "name": "antigravity",
+      "kind": "antigravity",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "antigravity",
+      "model": "gemini-1.5-pro",
+      "launch_flags": ["--conversation"],
+      "restore_policy": "resume"
+    },
+    {
+      "name": "claude",
+      "kind": "claude",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "claude",
+      "model": "claude-3.5-sonnet",
+      "launch_flags": ["--resume"],
+      "restore_policy": "resume"
+    }
+  ]
+}

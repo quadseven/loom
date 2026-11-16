@@ -2549,3 +2549,92 @@ refuses while any line is rejected, with a reason asking the lane to file
 the issue and cite it, or drop the line; a round whose summary has no such
 section keeps the body's earlier one. In a public repo another repo's
 citation is written as "issue N of another repo".
+
+## Restore after a reboot
+
+Windows lanes are restored after a reboot by `lanes/win/restore-lanes.ps1`, driven from a snapshot written periodically by `lanes/win/snapshot-lanes.ps1`.
+
+### Snapshot (`lanes/win/snapshot-lanes.ps1`)
+
+- Reads `lanes/win/lanes.example.json` for the lane manifest (name, kind, cwd, identity, model, launch_flags, restore_policy).
+- Queries the workspace CLI (`agent list --json`) for each lane's active session ID.
+- Writes an atomic snapshot to `state/lanes-snapshot.json` with timestamp and per-lane session IDs.
+- **Never writes tokens or credentials** to the snapshot; the identity wrapper is re-minted at restore time.
+- Run periodically via Task Scheduler or similar mechanism.
+
+### Restore (`lanes/win/restore-lanes.ps1`)
+
+- Waits for the workspace server to be ready (configurable timeout, default 60s).
+- Reads `state/lanes-snapshot.json` and the lane manifest.
+- For each lane with `restore_policy: "resume"` and a captured `session_id`:
+  - Idempotent: skips if the lane is already running (checked via `agent list`).
+  - Starts the agent with the correct resume flags per kind:
+    - `codex`: `codex resume <session-id>` (via `agent start --resume <id>`)
+    - `antigravity`: `--conversation <session-id>` (via `agent start --conversation <id>`)
+    - `claude`: `--resume <session-id>` (via `agent start --resume <id>`)
+  - Restores identity, cwd, and model from the manifest.
+- Lanes with `restore_policy: "awaiting-decision"` are not auto-resumed; a `waiting:` line is posted to the ticket (or the claim is released per the agent's guide).
+- Lanes with `restore_policy: "oneshot"` are listed as unfinished for the operator to decide; they are not re-run.
+- The restored lane keeps its `claim:<name>` label.
+
+### Lane manifest (`lanes/win/lanes.example.json`)
+
+```json
+{
+  "lanes": [
+    {
+      "name": "codex",
+      "kind": "codex",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "codex",
+      "model": "gpt-4o",
+      "launch_flags": ["--resume"],
+      "restore_policy": "resume"
+    },
+    {
+      "name": "antigravity",
+      "kind": "antigravity",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "antigravity",
+      "model": "gemini-1.5-pro",
+      "launch_flags": ["--conversation"],
+      "restore_policy": "resume"
+    },
+    {
+      "name": "claude",
+      "kind": "claude",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "claude",
+      "model": "claude-3.5-sonnet",
+      "launch_flags": ["--resume"],
+      "restore_policy": "resume"
+    }
+  ]
+}
+```
+
+### Snapshot format (`state/lanes-snapshot.json`)
+
+```json
+{
+  "timestamp": "2026-11-16T10:30:00.0000000Z",
+  "lanes": [
+    {
+      "name": "codex",
+      "kind": "codex",
+      "cwd": "C:\\workspace\\loom",
+      "identity": "codex",
+      "model": "gpt-4o",
+      "launch_flags": ["--resume"],
+      "restore_policy": "resume",
+      "session_id": "session-abc123"
+    }
+  ]
+}
+```
+
+### Deployment
+
+- Install `snapshot-lanes.ps1` as a scheduled task (e.g., every 5 minutes).
+- Install `restore-lanes.ps1` as a startup task (run at boot, after network).
+- Ensure the workspace CLI (`agent`) is on PATH for the task's user context.
