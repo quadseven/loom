@@ -567,7 +567,7 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     if os.path.exists(target) or os.path.islink(target):
                         os.remove(target)
-                    os.symlink(link_target, target)
+                    os.symlink(resolved_target, target)
                     continue
                 else:
                     continue
