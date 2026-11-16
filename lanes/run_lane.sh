@@ -32,6 +32,9 @@
 # folder with the run's model beside it (<ticket>.verify.model), and the
 # station checks it and moves the ticket, naming lane and model as the proof's
 # maker. No pull request.
+# A base-check brief (Deliverable: base-check, from the station, loom#3084)
+# runs only the base check on the default branch: a pass closes the repo's
+# base-check incident, a fail updates it. No agent and no pull request.
 # A review brief (Deliverable: review, from the station, loom#2142) also
 # changes no code: its tree is the reviewed pull request's own branch (a
 # Review-PR: <number> line names it, cloned like a fix brief's), the agent
@@ -2874,6 +2877,10 @@ run_tmpdir() {
   if [ -L "$dir" ]; then
     rm -f "$dir" || return 1
   elif [ -e "$dir" ]; then
+    # A run that died can leave a read-only skills snapshot in here
+    # (chmod -R a-w), which rm -rf alone cannot empty; chmod -R does not
+    # follow links, so a link inside never changes its target.
+    chmod -R u+w "$dir" 2> /dev/null
     rm -rf "$dir" || return 1
   fi
   mkdir -p "$dir" || return 1
@@ -4385,6 +4392,8 @@ for BRIEF in "$INBOX"/*.md; do
   ISSUE_NUMBER="${ISSUE_REF##*#}"
   [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || ISSUE_NUMBER="$(printf '%s' "$TICKET" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p')"
   [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && ISSUE_NUMBER="$((10#$ISSUE_NUMBER))"
+  # A base-check brief names no ticket: nothing is posted on any issue.
+  [ "$DELIVERABLE" != base-check ] || ISSUE_NUMBER=""
   LOG="$LOGDIR/$TICKET.log"
   LOG_TAIL_OK=0
 
@@ -4403,8 +4412,8 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "brief Base: is not a branch name"; continue
   fi
   if [ -n "$DELIVERABLE" ] && [ "$DELIVERABLE" != answer ] && [ "$DELIVERABLE" != verify ] \
-     && [ "$DELIVERABLE" != review ]; then
-    park "$BRIEF" "brief Deliverable: must be answer, verify or review"; continue
+     && [ "$DELIVERABLE" != review ] && [ "$DELIVERABLE" != base-check ]; then
+    park "$BRIEF" "brief Deliverable: must be answer, verify, review or base-check"; continue
   fi
   if [ "$DELIVERABLE" = answer ] && ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     park "$BRIEF" "answer brief needs Issue: owner/name#number"; continue
@@ -4579,7 +4588,10 @@ for BRIEF in "$INBOX"/*.md; do
   # brief handed on before anything is cloned. A slot that picks its model
   # asks the picker, which probes each model it tries.
   MODEL_PICKED="" MODEL_KIND="" MODEL_NOTE=""
-  if picks_model; then
+  # A base-check run asks no provider anything, so no limit stops it.
+  if [ "$DELIVERABLE" = base-check ]; then
+    :
+  elif picks_model; then
     if ! pick_run_model; then
       # The paid models may still serve build work: only that kind of brief
       # holds the slot.
@@ -4631,7 +4643,24 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # A verify or review run changes no code, so there is nothing to validate.
   if [ "$DELIVERABLE" != verify ] && [ "$DELIVERABLE" != review ] && ! prepare_validation >> "$LOG" 2>&1; then
+    # A probe brief carries the check's exit only when the check ran: the
+    # station counts the probe as run on that stamp alone (loom#3084).
+    [ "$DELIVERABLE" != base-check ] || [ -z "$BASELINE_EXIT" ] ||
+      printf 'Base-check-exit: %s\n' "$BASELINE_EXIT" >> "$BRIEF"
     park "$BRIEF" "setup failed: $SETUP_REASON; the agent did not run" "$PARK_CLASS"; continue
+  fi
+  if [ "$DELIVERABLE" = base-check ]; then
+    # The station's probe of a repo an open base-check incident holds: the
+    # base check above already closed the incident on a pass, or updated its
+    # repeat count and parked the brief on a fail. No agent runs. A repo
+    # with no validation contract has no base check, so nothing passed.
+    if [ -z "$HAS_CONTRACT" ] || [ -z "$BASELINE_EXIT" ]; then
+      park "$BRIEF" "base check: $REPO has no validation contract, so no base check ran"; continue
+    fi
+    printf 'Base-check-exit: %s\n' "$BASELINE_EXIT" >> "$BRIEF"
+    echo "[$(date -u +%FT%TZ)] $TICKET done, base check passed on $BASE" >> "$LOG"
+    mv "$BRIEF" "$INBOX/done/"
+    continue
   fi
   resume_earlier_attempt
   [ "$LANE" = opencode-go ] && { catalogue_cmd record-call "$MODEL" >> "$LOG" 2>&1 || true; }
