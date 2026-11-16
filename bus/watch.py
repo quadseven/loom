@@ -23,7 +23,9 @@ closes an incident that the watcher only observed.
 A signature seen REPEAT times within WINDOW seconds, and not in the DAY before,
 files one loom:triage issue in the lanes repo titled "<component>: <signature>"
 with the count and the first and last example lines (redacted, then passed
-through the written-text check). A signature already open as an issue gets a
+through the written-text check). A filing held to a later pass (no write
+budget, or a failed post) keeps the burst that made it due, so its issue counts
+those hits rather than the window it was pruned to. A signature already open as an issue gets a
 count comment at most once an hour, with when it was last seen: one rolling
 issue per signature. A signature not seen for a DAY has its open issue closed as
 not planned, with one comment that says when it was last seen; an issue that
@@ -136,6 +138,9 @@ HOLD_RE = re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ waits for
 #   failed once its hold runs out: that is the recovery. The fault itself is
 #   the earlier "held ... for the factory: ... incident filing failed" line,
 #   which stays kept (loom#1890, loom#2770 filed the recovery instead).
+# - bus/factory.py says "re-briefed failed <ticket> on <lane>" when it moves a
+#   failed ticket up the model ladder to its next lane: "failed" is the state
+#   it leaves, and the climb is the recovery (loom#2233 filed it).
 EXPECTED_RES = (
     re.compile(r"station: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+: fix rounds stopped \(.+\); "
                r"left failed for the hand-off pool[ \t]*"),
@@ -147,6 +152,8 @@ EXPECTED_RES = (
                r"(?:the edits are on branch [A-Za-z0-9_./-]+|the push of [A-Za-z0-9_./-]+ failed; the edits are committed in the lane tree|the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree|the edits are committed in the lane tree)(?:; no pull request opened)?[ \t]*"),
     re.compile(r"station: factory release: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ re-queued: "
                r"incident filing failed[ \t]*"),
+    re.compile(r"factory: re-briefed failed [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ "
+               r"on [A-Za-z0-9_.-]+[ \t]*"),
 )
 # The brain's own status output, read back into its log: it names stages,
 # states and outcomes ("failed"), so the error words match, but none of it is
@@ -1003,6 +1010,8 @@ class Watcher:
         target["total"] += source["total"]
         if not target.get("done") and source.get("due") == "file":
             target["due"] = "file"
+            if isinstance(source.get("burst"), list):
+                target["burst"] = source["burst"]
         stages = set(target.get("stages") or []) | set(source.get("stages") or [])
         if stages:
             target["stages"] = sorted(stages)[:STAGES_MAX]
@@ -1102,6 +1111,39 @@ class Watcher:
             "",
             "Filed by bus/watch.py without a model."])
 
+    def _hold(self, rec: Dict[str, Any], kind: str) -> None:
+        """Hold what the signature is due for a later pass. A held filing
+        keeps its burst (when, and the most hits in its window) because the
+        hits are pruned before that pass writes the body (loom#2233)."""
+        rec["due"] = kind
+        if kind != "file":
+            return
+        burst = rec.get("burst")
+        held = (_num(burst[1]) if isinstance(burst, list) and len(burst) == 2 else None) or 0
+        window = self._window(rec)
+        if window > held:
+            rec["burst"] = [self.now, window]
+
+    def _burst(self, rec: Dict[str, Any]) -> Optional[Tuple[float, int]]:
+        """The held burst when it counts more than the window does now, else
+        None: the window is the count to tell."""
+        burst = rec.get("burst")
+        if not isinstance(burst, list) or len(burst) != 2:
+            return None
+        at, hits = _num(burst[0]), _num(burst[1])
+        if at is None or hits is None or hits <= self._window(rec):
+            return None
+        return at, int(hits)
+
+    def _how_often(self, rec: Dict[str, Any]) -> str:
+        burst = self._burst(rec)
+        if burst is None:
+            return "%d times in the last %d minutes" % (self._window(rec), WINDOW // 60)
+        at, hits = burst
+        return ("%d times in %d minutes up to %s (held %d minutes before it was filed)"
+                % (hits, WINDOW // 60, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at)),
+                   (self.now - at) // 60))
+
     def _body(self, key: str, rec: Dict[str, Any]) -> str:
         if isinstance(rec.get("refusal"), dict):
             return self._refusal_body(key, rec)
@@ -1109,8 +1151,8 @@ class Watcher:
         return "\n".join([
             MARKER,
             "The station's log watcher saw a new repeated error in the `%s` log: "
-            "%d times in the last %d minutes, and not in the %d hours before."
-            % (name, self._window(rec), WINDOW // 60, DAY // 3600),
+            "%s, and not in the %d hours before."
+            % (name, self._how_often(rec), DAY // 3600),
             "",
             "Signature: `%s`" % sig,
             ""] + self._stages(rec) + [
@@ -1143,6 +1185,7 @@ class Watcher:
         rec["told"] = self.now
         rec["told_total"] = rec.get("total", 0)
         rec.pop("due", None)
+        rec.pop("burst", None)
 
     def _due(self, rec: Dict[str, Any]) -> Optional[str]:
         """What the signature is due: "file" (a new burst not yet filed),
@@ -1191,6 +1234,11 @@ class Watcher:
             rec["issue"] = self.issues[key] = int(number)
             return self._count(rec)
         body = self._body(key, rec)
+        burst = self._burst(rec)
+        if burst is not None:
+            self.say("watch: filing a %s signature held %d minutes: %d hits in its burst, "
+                     "%d in the window now" % (key.split(": ", 1)[0], (self.now - burst[0]) // 60,
+                                               burst[1], self._window(rec)))
         try:
             _text.check(key + "\n" + body)
         except ValueError as err:
@@ -1284,18 +1332,18 @@ class Watcher:
         for key, rec in sorted(sigs.items(), key=lambda kv: kv[1].get("first", 0)):
             if rec.get("incident") is not None and not rec.get("incident_linked"):
                 if self._new_burst(rec):
-                    rec["due"] = "file"
+                    self._hold(rec, "file")
                 continue  # Its lookup is still unknown; never file a twin.
             kind = self._due(rec)
             if kind is None:
                 continue
             if not self.write or self.writes >= WRITES_MAX:
-                rec["due"] = kind
+                self._hold(rec, kind)
                 continue
             try:
                 what = self._file(key, rec, kind)
             except (GitHubError, OSError, ValueError) as err:
-                rec["due"] = kind
+                self._hold(rec, kind)
                 self.say("watch: could not tell a %s signature: %s" % (key.split(": ", 1)[0], err))
                 continue
             done[what] = done.get(what, 0) + 1
