@@ -84,6 +84,35 @@ class LaneTmpdirTest(unittest.TestCase):
             self.assertEqual(tmpdir, str(loom_home / "run" / "codex-1-tmp"))
             self.assertTrue(Path(tmpdir).is_dir())
 
+    def test_a_read_only_snapshot_left_in_the_run_tmpdir_is_cleared(self):
+        # The skills snapshot is made read-only (chmod -R a-w), and a
+        # run that died left one under the slot's tmpdir: rm -rf alone
+        # cannot empty it, so every later run of the slot stopped at
+        # "could not create the run temp dir".
+        function = function_text("run_tmpdir")
+        self.assertIsNotNone(function, "run_lane.sh has no run_tmpdir()")
+        with tempfile.TemporaryDirectory() as tmp:
+            loom_home = Path(tmp) / "loom"
+            stale = loom_home / "run" / "claude-tmp" / "tmpabc" / "home" / "loom" / "skills" / "tdd"
+            stale.mkdir(parents=True)
+            (stale / "SKILL.md").write_text("x\n")
+            for path in (stale, stale.parent):
+                path.chmod(0o555)
+            try:
+                result = subprocess.run(
+                    ["bash", "-c",
+                     '%s\nexport LOOM_HOME="$1" SLOT="$2"\nrun_tmpdir' % function,
+                     "bash", str(loom_home), "claude"],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                tmpdir = Path(result.stdout.strip())
+                self.assertTrue(tmpdir.is_dir())
+                self.assertEqual(list(tmpdir.iterdir()), [])
+            finally:
+                for path in (stale, stale.parent):
+                    if path.exists():
+                        path.chmod(0o755)
+
     def test_the_run_tmpdir_survives_drop_run_scratch(self):
         funcs = ""
         for name in ("run_tmpdir", "drop_check_home", "drop_run_scratch"):
