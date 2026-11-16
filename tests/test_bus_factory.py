@@ -156,6 +156,9 @@ class FakeGitHub:
         return self._write(method, path, body)
 
     def _get(self, path):
+        m = re.search(r"/issues/(\d+)/dependencies/blocked_by", path)
+        if m:
+            return Response(200, getattr(self, "blockers", {}).get(int(m.group(1)), []))
         if "/rules/branches/main" in path:
             if isinstance(self.rules, Exception):
                 raise self.rules
