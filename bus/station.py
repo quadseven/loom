@@ -65,6 +65,7 @@ from .labels import HUMAN_LABELS, NEEDS_HUMAN, OVERFLOW_CLAIM, needs_human
 from . import factory
 from . import merge_verdict
 from . import history
+from . import incident_probe
 from . import friction_intake
 from . import review_debt
 from . import evidence
@@ -3391,6 +3392,8 @@ class Station:
         self._release_dead_lane_runaways(free)
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
+        # A repo a base-check incident holds gets its check run (loom#3084).
+        free = self._probe_incidents(free)
         free = self._not_demoted(free)
         free = self._prioritize_verifies(free)
         if not free:
@@ -7681,6 +7684,136 @@ class Station:
             del held[key]
             _write_json(os.path.join(self.state, "factory_held.json"), held)
 
+    # -- base-check incident probe (loom#3084) -----------------------------
+    def _probe_incidents(self, free: List[str]) -> List[str]:
+        """Give one free lane a base-check-only brief for each repo an open
+        base-check incident holds tickets of, at most once an hour per
+        incident: with every ticket held no lane ran the check that closes
+        it, and three repos sat frozen for days. Each incident and its
+        comments are read at most once an hour too; a ticket named as its
+        fix goes back to the queue then. Returns the lanes still free."""
+        by_ref: Dict[str, List[str]] = {}
+        for key, info in sorted(self._held_tickets().items()):
+            ref = info.get("incident") if isinstance(info, dict) else None
+            if isinstance(ref, str) and self._invariant_ref_parts(ref):
+                by_ref.setdefault(ref, []).append(key)
+        path = os.path.join(self.state, incident_probe.LEDGER)
+        ledger = _read_json(path, {}, strict=False)
+        if not by_ref and not ledger:
+            return free
+        ledger = {ref: entry for ref, entry in (ledger.items() if isinstance(ledger, dict) else ())
+                  if ref in by_ref and isinstance(entry, dict)}
+        every = incident_probe.PROBE_EVERY
+        for ref, keys in by_ref.items():
+            entry = ledger.setdefault(ref, {})
+            checked = entry.get("checked")
+            if not (self._num(checked) and 0 <= self.now - checked < every) \
+                    and not self._read_probed_incident(ref, entry, keys):
+                del ledger[ref]
+                continue
+            at = entry.get("at")
+            if not entry.get("open") or (self._num(at) and 0 <= self.now - at < every):
+                continue
+            lane = self._probe_lane(free, keys[0].rpartition("#")[0])
+            if lane is None:
+                continue
+            name, text = incident_probe.brief(keys[0].rpartition("#")[0], lane, ref, int(self.now))
+            claiming = self._write_brief(lane, name, text)
+            os.replace(claiming, claiming[:-len(".claiming")] + ".md")
+            entry["at"] = self.now
+            free = [x for x in free if x != lane]
+            _say("handed lane %s a base check of %s for factory incident %s"
+                 % (lane, keys[0].rpartition("#")[0], ref))
+        _write_json(path, ledger)
+        return free
+
+    def _read_probed_incident(self, ref: str, entry: Dict[str, Any], keys: List[str]) -> bool:
+        """Read one held incident into its ledger entry and release its fix
+        tickets. False when it is no open base-check incident (the release
+        path re-queues its tickets once it is closed); a failed read keeps
+        the entry as it was, to read again next pass."""
+        repo, number = self._invariant_ref_parts(ref) or ("", 0)
+        try:
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data
+            if not incident_probe.open_base_check(issue):
+                return False
+            comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident probe: could not read incident %s: %s" % (ref, err))
+            return True
+        entry.update(checked=self.now, open=True,
+                     opened=incident_probe.epoch(issue.get("created_at")),
+                     repeat=incident_probe.last_repeat(issue, comments))
+        for key in keys:
+            self._release_fix(ref, key, comments)
+        return True
+
+    def _release_fix(self, ref: str, key: str, comments: List[Any]) -> None:
+        """Re-queue a held ticket that is the open incident's fix, with a
+        Repairs incident header so its lane runs past the red base."""
+        repo, _, raw = key.rpartition("#")
+        try:
+            issue = self._issue(repo, int(raw))
+            if RUNNING not in _label_names(issue) or not incident_probe.is_fix(
+                    ref, key, issue.get("body"), comments):
+                return
+            incident_repo, _, incident = ref.rpartition("#")
+            body = (incident_probe.with_repairs_header(issue.get("body"), int(incident))
+                    if incident_repo == FACTORY_REPO else None)
+            if body is not None:
+                self.gh.rest("PATCH", "/repos/%s/issues/%s" % (repo, raw), {"body": body})
+                issue["body"] = body
+            self._release_one(key, repo, int(raw), issue, RUNAWAY in _label_names(issue),
+                              "Factory incident %s is still open, but this ticket is its fix, so "
+                              "it is back in the queue on its lane and its run may start from "
+                              "the red base." % ref)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident probe: could not release %s: %s" % (key, err))
+            return
+        _say("incident probe: %s re-queued as the fix of incident %s" % (key, ref))
+
+    def _probe_lane(self, free: List[str], repo: str) -> Optional[str]:
+        """A free local lane for a base-check brief: not a cluster runner
+        slot, whose red check files no incident, and public-only lanes for
+        public repos only."""
+        slots = set(runners.runner_slots())
+        return next((lane for lane in free if lane not in slots and self._inbox_empty(lane)
+                     and (not needs_public_repo(lane, "") or self._public(repo))), None)
+
+    def _report_base_check(self, lane: str, kind: str, name: str, text: str) -> bool:
+        """A finished base-check brief: the runner already closed or updated
+        the incident, so the station records when the probe ran."""
+        ref = self._field(text, "Incident")
+        path = os.path.join(self.state, incident_probe.LEDGER)
+        ledger = _read_json(path, {}, strict=False)
+        if isinstance(ledger, dict) and isinstance(ledger.get(ref), dict):
+            ledger[ref]["ran"] = self.now
+            _write_json(path, ledger)
+        outcome = "passed" if kind == "done" else "failed: %s" % self._failure_reason(lane, name)
+        _say("base check of %s on lane %s for factory incident %s %s"
+             % (self._field(text, "Repo"), lane, ref, outcome))
+        return True
+
+    def _invariant_incidents(self) -> List[invariants.Incident]:
+        """Each open base-check incident the probe ledger knows of, for the
+        incident-unprobed invariant. No GitHub read."""
+        ledger = _read_json(os.path.join(self.state, incident_probe.LEDGER), {}, strict=False)
+        out = []
+        for ref, entry in sorted(ledger.items() if isinstance(ledger, dict) else ()):
+            parts = self._invariant_ref_parts(ref)
+            if (parts is None or not isinstance(entry, dict) or not entry.get("open")
+                    or not self._num(entry.get("opened")) or not self._num(entry.get("repeat"))):
+                continue
+            ran = entry.get("ran")
+            out.append(invariants.Incident(self._invariant_ref(*parts), float(entry["opened"]),
+                                           float(entry["repeat"]),
+                                           float(ran) if self._num(ran) else None))
+        return out
+
     def _pr_tickets(self, repo: str) -> List[Dict[str, Any]]:
         issues = self.gh.rest("GET", "/repos/%s/issues?labels=loom:pr&state=open&per_page=100" % repo).data or []
         self._remember_issues(repo, issues)
@@ -8299,6 +8432,8 @@ class Station:
     def _report(self, lane: str, kind: str, path: str, name: str) -> bool:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
+        if self._field(text, "Deliverable") == incident_probe.DELIVERABLE:
+            return self._report_base_check(lane, kind, name, text)
         m = ISSUE_LINE_RE.search(text)
         if not m:
             return True  # not a station brief: nothing to report
@@ -13444,6 +13579,7 @@ class Station:
                            ("silent_runs", self._invariant_silent),
                            ("waits", self._invariant_waits),
                            ("headerless", self._invariant_headerless),
+                           ("incidents", self._invariant_incidents),
                            ("unshipped", self._invariant_unshipped),
                            ("beats", lambda: {lane: self._remote_heartbeat(lane)
                                               for lane in REMOTE_LANES})):

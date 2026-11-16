@@ -89,6 +89,10 @@ RUNS_MIN = 5
 # expired key, is failing now even with a success earlier in the day.
 FAILING_STREAK = 5
 HELD_MAX = 2 * 3600
+# A base-check incident open this long with no base-check run since its last
+# repeat, past two probe intervals, is one nothing re-checks (loom#3084).
+INCIDENT_OPEN_MAX = DAY
+INCIDENT_PROBE_GRACE = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
@@ -388,6 +392,17 @@ class SilentRun(NamedTuple):
     at: float
 
 
+class Incident(NamedTuple):
+    """An open base-check factory incident the station probes (loom#3084):
+    when it was filed, when a base check last failed on it (its repeat
+    comment's last edit, else its filing), and when a station probe last
+    finished, None for never."""
+    incident: Ref
+    opened: float
+    repeat: float
+    ran: Optional[float]
+
+
 class Event(NamedTuple):
     at: float
     kind: str
@@ -450,6 +465,8 @@ class Facts:
     # Open tickets carrying loom:queued and a lane: label whose body parses
     # to no brief headers: no lane can ever claim them.
     headerless: Optional[List[Ref]] = None
+    # Each open base-check incident the station probes (loom#3084).
+    incidents: Optional[List[Incident]] = None
 
 
 @dataclass(frozen=True)
@@ -1113,6 +1130,29 @@ def queued_ticket_no_headers(f: Facts) -> List[Breach]:
             for ref in f.headerless]
 
 
+def incident_unprobed(f: Facts) -> List[Breach]:
+    """A base-check incident open over INCIDENT_OPEN_MAX with no base-check
+    run since its last repeat, once the probe has had INCIDENT_PROBE_GRACE
+    to run one: it holds its repo's tickets and closes only on a pass, so
+    nothing will close it (loom#3084: three repos sat frozen for days)."""
+    if f.incidents is None:
+        return []
+    return [Breach("incident-unprobed", i.incident.key,
+                   "Factory incident %s has had no base-check run for %s"
+                   % (i.incident.label, _hours(f.now - i.repeat)),
+                   ("Factory incident %s is open %s and has had no base-check run since its "
+                    "last repeat at %s" % (i.incident.label, _hours(f.now - i.opened),
+                                           utc(i.repeat)),
+                    "It holds its repo's tickets and closes only when a base check passes",
+                    "Check that a free local lane takes the station's base-check brief, or "
+                    "close the incident once the default branch's check passes"),
+                   i.repeat)
+            for i in f.incidents
+            if f.now - i.opened > INCIDENT_OPEN_MAX
+            and (i.ran is None or i.ran < i.repeat)
+            and f.now - i.repeat > INCIDENT_PROBE_GRACE]
+
+
 def merged_not_shipped(f: Facts) -> List[Breach]:
     """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
     found their merge commit deployed: the move to loom:shipped failed, and
@@ -1203,7 +1243,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
     untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
-    guard_unreadable, queued_ticket_no_headers)
+    guard_unreadable, queued_ticket_no_headers, incident_unprobed)
 
 
 def check(facts: Facts, say: Say,

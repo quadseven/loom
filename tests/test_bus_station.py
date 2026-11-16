@@ -7785,6 +7785,143 @@ class FactoryIncidentTest(Base):
         self.assertIn("loom:queued", self.fake.names(12))
 
 
+class IncidentProbeTest(Base):
+    """loom#3084: a base-check incident holds its repo's tickets and closes
+    only on a base-check pass, so the station gives one free lane a
+    base-check-only run at most once an hour, and lets the incident's fix
+    ticket run while the incident is open."""
+
+    def open_incident(self, created="2030-01-01T00:00:00Z", kind="base-check", comments=()):
+        self.fake.issues[99] = {
+            "number": 99, "title": "Factory incident: %s validation %s" % (REPO, kind),
+            "state": "open", "created_at": created, "closed_at": None,
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: %s\n"
+                     "Ticket: a ticket\n\ncheck: make check (exit 1)\n" % (REPO, kind)),
+            "labels": [{"name": "loom:factory"}]}
+        self.fake.comments[99] = list(comments)
+
+    def hold(self, *numbers, bodies=None):
+        held = {}
+        for number in numbers:
+            self.fake.add(number, lane="muse", body=(bodies or {}).get(number, PLAIN),
+                          state="running")
+            issue = self.fake.issues[number]
+            issue["labels"] = [{"name": "loom:ticket"}, {"name": "lane:muse"},
+                               {"name": "loom:running"}, {"name": "wait:incident"}]
+            issue["body"] = status.with_body_events(issue["body"], [(
+                "2030-01-01T00:00:00Z", "Lane muse held: factory incident %s#99" % REPO)])
+            held["%s#%d" % (REPO, number)] = {"incident": "%s#99" % REPO, "at": time.time()}
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(held, fh)
+
+    def station(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def probe(self, lanes=("codex",), runner=None):
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            return (runner or self.station())._probe_incidents(list(lanes))
+
+    def briefs(self, lane="codex"):
+        return [n for n in self.listing(lane) if n.endswith(".md")]
+
+    def test_a_held_repo_gets_a_base_check_run_and_a_pass_requeues_its_tickets(self):
+        self.open_incident()
+        self.hold(12, 13)
+        self.assertEqual(self.probe(), [])
+        (name,) = self.briefs()
+        with open(self.inbox("codex", name), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("Deliverable: base-check\n", text)
+        self.assertIn("Repo: %s\n" % REPO, text)
+        self.assertIn("Incident: %s#99\n" % REPO, text)
+        self.assertNotIn("Issue:", text)
+        self.assertNotIn("Base:", text)
+        for number in (12, 13):
+            self.assertIn("wait:incident", self.fake.names(number))
+        # The lane's base check passes: lanes/run_lane.sh closes the
+        # incident and moves the brief to done/.
+        os.makedirs(self.inbox("codex", "done"), exist_ok=True)
+        os.replace(self.inbox("codex", name), self.inbox("codex", "done", name))
+        self.fake.issues[99].update(state="closed", closed_at="2030-01-01T00:10:00Z")
+        runner = self.station()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                mock.patch("bus.station._say") as say:
+            runner.report_outcomes()
+            runner.release_factory_held()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertTrue(any("base check of %s" % REPO in s and "passed" in s for s in said), said)
+        for number in (12, 13):
+            self.assertIn("loom:queued", self.fake.names(number))
+            self.assertIn("lane:muse", self.fake.names(number))
+
+    def test_the_probe_runs_at_most_once_an_hour(self):
+        self.open_incident()
+        self.hold(12)
+        self.assertEqual(self.probe(), [])
+        for name in self.briefs():
+            os.remove(self.inbox("codex", name))
+        self.fake.calls.clear()
+        self.assertEqual(self.probe(), ["codex"])
+        self.assertEqual(self.briefs(), [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_no_free_lane_writes_no_brief_and_the_next_pass_probes(self):
+        self.open_incident()
+        self.hold(12)
+        self.assertEqual(self.probe(lanes=()), [])
+        self.assertEqual(self.probe(), [])
+        self.assertEqual(len(self.briefs()), 1)
+
+    def test_an_environment_incident_gets_no_base_check_run(self):
+        self.open_incident(kind="environment")
+        self.hold(12)
+        self.assertEqual(self.probe(), ["codex"])
+        self.assertEqual(self.briefs(), [])
+
+    def test_a_ticket_naming_the_incident_runs_while_the_others_stay_held(self):
+        self.open_incident()
+        fix = PLAIN + "\nRepairs the base check of factory incident %s#99.\n" % REPO
+        self.hold(12, 13, bodies={12: fix})
+        self.probe(lanes=())
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("lane:muse", self.fake.names(12))
+        self.assertNotIn("wait:incident", self.fake.names(12))
+        self.assertEqual(tickets.parse(self.fake.issues[12]["body"])[0].get("Repairs incident"),
+                         "#99")
+        self.assertIn("Repairs incident: #99\n", tickets.render_brief(
+            REPO, self.fake.issues[12], "muse"))
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertIn("wait:incident", self.fake.names(13))
+
+    def test_a_ticket_the_incident_comment_names_as_its_fix_runs(self):
+        cause = {"body": "Cause: the lane host lacks a tool. The fix is %s#13." % REPO,
+                 "created_at": "2030-01-01T00:05:00Z", "user": {"login": "alice-example"}}
+        self.open_incident(comments=[cause])
+        self.hold(12, 13)
+        self.probe(lanes=())
+        self.assertIn("loom:queued", self.fake.names(13))
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_the_held_note_on_a_ticket_does_not_make_it_the_fix(self):
+        # Every held ticket's status section names the incident.
+        self.open_incident()
+        self.hold(12)
+        self.probe(lanes=())
+        self.assertIn("wait:incident", self.fake.names(12))
+
+    def test_an_old_incident_no_lane_re_checked_is_an_invariant(self):
+        self.open_incident(created="2020-01-01T00:00:00Z")
+        self.hold(12)
+        runner = self.station()
+        self.probe(lanes=(), runner=runner)
+        found = runner._invariant_incidents()
+        self.assertEqual([i.incident.key for i in found], ["%s#99" % REPO])
+        (b,) = invariants.incident_unprobed(invariants.Facts(time.time(), incidents=found))
+        self.assertEqual(b.invariant, "incident-unprobed")
+
+
 class FactoryNoIncidentHoldTest(Base):
     """A [factory] hold whose reason names no incident (the incident filing
     failed) is released after HELD_NO_INCIDENT_FOR instead of being held
