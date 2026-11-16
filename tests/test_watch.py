@@ -637,6 +637,24 @@ class FilingTest(WatchBase):
         self.run_at(T0 + 1800)
         self.assertIn("3 times in 30 minutes up to", self.gh.issues[1]["body"])
 
+    def test_merging_held_filings_keeps_the_larger_burst_in_either_order(self):
+        # A fold must not swap a held burst of ten for a later one of three.
+        def rec(burst):
+            return {"first": T0 - 600, "first_line": "a", "last": T0 - 60, "last_line": "b",
+                    "hits": [], "total": burst[1], "due": "file", "burst": list(burst)}
+
+        big, small = (T0 - 500, 10), (T0 - 400, 3)
+        watcher = watch.Watcher(self.gh, LANES_REPO, [], self.state, T0, self.said.append)
+        for target, source in ((big, small), (small, big)):
+            with self.subTest(target=target, source=source):
+                held = rec(target)
+                watcher._merge_observations(held, rec(source))
+                self.assertEqual(held["burst"], [T0 - 500, 10])
+        held = rec(small)
+        held.pop("burst")
+        watcher._merge_observations(held, rec(small))
+        self.assertEqual(held["burst"], [T0 - 400, 3])
+
     def test_a_failed_filing_does_not_skip_another_due_signature(self):
         other = "Connection refused"
         self.append(LINE_403, LINE_403, LINE_403, other, other, other)
