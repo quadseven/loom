@@ -427,6 +427,10 @@ class FakeGitHub:
             if "labels=%s&" % label in query:
                 return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                    and label in self.names(i["number"])])
+        if "labels=ready-for-agent&" in query:
+            return reply(200, sorted((i for i in self.issues.values() if i["state"] == "open"
+                                      and "ready-for-agent" in self.names(i["number"])),
+                                     key=lambda i: i.get("created_at") or ""))
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -15665,3 +15669,68 @@ class LunaReviewResultTest(Base):
         self.assertTrue(self.report())
         self.assertEqual(self.verdicts(), [])
         self.assertEqual(self.fake.reviews_posted, [])
+
+
+class ReadyForAgentIntakeTest(Base):
+    """loom#3092: Loom never read the ready-for-agent label, so an issue
+    marked ready for an agent with no Loom label never entered the queue.
+    The station gives each such issue loom:triage, so the brain triages it."""
+
+    def ready(self, number, labels=(), created="2030-01-01T00:00:00Z", **fields):
+        self.fake.add_open_issue(number, created=created)
+        self.fake.issues[number]["labels"] = [{"name": "ready-for-agent"}] + [
+            {"name": name} for name in labels]
+        self.fake.issues[number].update(fields)
+
+    def intake(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_a_ready_for_agent_issue_with_no_loom_label_goes_to_triage(self):
+        self.ready(21)
+        said = self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:triage"})
+        self.assertEqual(self.fake.comments[21], [])
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+    def test_a_claimed_or_assigned_ready_issue_is_left_alone(self):
+        self.ready(21, labels=("claim:someone",))
+        self.ready(22, assignees=[{"login": "someone"}])
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_epic_is_left_alone(self):
+        self.ready(21, labels=("epic",))
+        self.ready(22, sub_issues_summary={"total": 3})
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_issue_loom_already_labelled_is_left_alone(self):
+        self.ready(21, labels=("loom:queued", "loom:ticket"))
+        self.ready(22, labels=("loom:triage",))
+        self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:queued", "loom:ticket"})
+        self.assertEqual(set(self.fake.names(22)), {"ready-for-agent", "loom:triage"})
+        self.assertFalse([p for m, p in self.fake.calls if m != "GET"], self.fake.calls)
+
+    def test_one_run_labels_at_most_the_cap_oldest_first(self):
+        cap = station.READY_PER_RUN
+        for n in range(cap + 3):
+            self.ready(100 + n, created="2030-01-%02dT00:00:00Z" % (cap + 3 - n))
+        said = self.intake()
+        labelled = [100 + n for n in range(cap + 3) if "loom:triage" in self.fake.names(100 + n)]
+        self.assertEqual(labelled, [100 + n for n in range(3, cap + 3)])
+        self.assertEqual(said, ["ready-for-agent intake: %d issues to loom:triage" % cap])
+
+    def test_the_intake_runs_at_most_once_an_hour(self):
+        self.ready(21)
+        self.intake()
+        self.ready(22)
+        self.fake.calls.clear()
+        self.assertEqual(self.intake(), [])
+        self.assertNotIn("loom:triage", self.fake.names(22))
+        self.assertEqual(self.fake.calls, [])

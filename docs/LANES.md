@@ -948,6 +948,16 @@ comment on the issue. `loom:triage` and `loom:rewritten` alone do not hold
 an issue. An issue whose covering ticket is closed or merged is listed apart,
 to verify and close; so is a `loom:rewritten` issue whose ticket is not found.
 
+Other brains and people mark an issue ready for an agent with the
+`ready-for-agent` label. Once an hour the station reads the open issues
+carrying it in each `LOOM_REPOS` repo, oldest first, and gives `loom:triage`
+to each that carries no `loom:` label, has no assignee and no `claim:` label,
+and is not an epic, goal home or other issue triage skips
+(`intake_ready_for_agent`, loom#3092). The brain then triages it like any
+other issue: the label never skips triage. At most 20 issues a run
+(`READY_PER_RUN`), and the run stops when the pass's request budget is spent.
+It writes no comment and logs one line a run with the count.
+
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
 
