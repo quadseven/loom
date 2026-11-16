@@ -4422,6 +4422,22 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
     return not_work_reason(issue) or protected_reason(issue, journals, authors)
 
 
+UNTRUSTED_AUTHOR = "an author in LOOM_BRIEF_AUTHORS or LOOM_TRUSTED_BRIEFERS"
+
+
+def _triage_missing(issue: Dict[str, Any], authors: Sequence[str],
+                    briefers: Sequence[str]) -> List[str]:
+    """What keeps the issue from being a queued ticket: its missing sections
+    and, when its author is not trusted to brief this Loom, that. The station
+    never claims such a ticket and the factory drops it, so queueing it would
+    only hold the goal's cap (loom#2576); it stays at loom:triage for a person
+    or a brain to rewrite."""
+    missing = missing_sections(issue.get("body"))
+    if not tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
+        missing.append(UNTRUSTED_AUTHOR)
+    return missing
+
+
 def _oldest_open_issues(gh: GitHub, repo: str):
     """Open issues and pull requests, oldest first, one page at a time, so a
     run that reaches its limit early reads no further."""
@@ -4434,27 +4450,33 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
-def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
+def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT,
+           authors: Optional[Sequence[str]] = None,
+           briefers: Optional[Sequence[str]] = None) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
     anything with a loom: label. A ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
-    the goal, while the goal has room; the rest get loom:triage, and the
-    returned line names what is missing. No comment: each one emailed the
+    the goal, while the goal has room, when its author is a LOOM_BRIEF_AUTHORS
+    or LOOM_TRUSTED_BRIEFERS login; the rest get loom:triage, and the
+    returned line names what is missing (an untrusted author included). No comment: each one emailed the
     issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
     intake epic (intake_epic). Only labels, sub-issue links and
     an intake epic when one is needed are written, plus a Part of line at the
     end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
     retitled, and nothing else in it is edited.
+    The trusted logins are `authors` and `briefers` (the station passes its
+    own), else LOOM_BRIEF_AUTHORS and LOOM_TRUSTED_BRIEFERS from the
+    environment.
     Returns one line per issue looked at.
     """
     if limit < 1:
         raise ValueError("limit is at least 1")
     in_flight = _goal_in_flight(gh, repo, goal)
     cap = goal_cap()
-    authors = trusted_authors()
-    briefers = trusted_briefers()
+    authors = trusted_authors() if authors is None else list(authors)
+    briefers = trusted_briefers() if briefers is None else list(briefers)
     journals = goal_journals(gh, repo)
     lines: List[str] = []
     done = 0
@@ -4467,7 +4489,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         skip = _triage_skip(issue, authors, briefers, journals)
         if skip:
             continue
-        missing = missing_sections(issue.get("body"))
+        missing = _triage_missing(issue, authors, briefers)
         if not missing:
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
