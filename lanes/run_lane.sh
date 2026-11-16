@@ -650,28 +650,83 @@ bugs_part() {
 }
 
 pr_body() {
+  REBUILT_BRIEF=""
   local size issue refs="" criteria ops bugs why summary
-  issue="$(field Issue "$1" || true)"
+  local brief="$1"
+  # When the brief file is gone, rebuild a brief from the ticket body the
+  # runner can read, so the pull request body carries its sections instead
+  # of coming out empty (loom#3124).
+  if [ ! -f "$brief" ]; then
+    local ticket_body="" tmp_brief="" issue_number="${ISSUE_NUMBER:-}"
+    if [ -z "$issue_number" ]; then
+      issue_number="$(printf '%s' "${TICKET:-}" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p')"
+    fi
+    if [ -n "${TICKET_BODY:-}" ]; then
+      ticket_body="$TICKET_BODY"
+    elif [ -n "${TICKET_BODY_FILE:-}" ] && [ -f "${TICKET_BODY_FILE:-}" ]; then
+      ticket_body="$(cat "$TICKET_BODY_FILE")"
+    elif [ -n "${TICKET_FILE:-}" ] && [ -f "${TICKET_FILE:-}" ]; then
+      ticket_body="$(cat "$TICKET_FILE")"
+    else
+      for cand in "${WORKDIR:-}/$TICKET.body" "${WORKDIR:-}/$TICKET.md" \
+                  "${WORKDIR:-}/$TICKET" "${TREE:-}/$TICKET.md" "$TICKET"; do
+        if [ -f "$cand" ]; then ticket_body="$(cat "$cand")"; break; fi
+      done
+    fi
+    if [ -z "$ticket_body" ] && [[ "$issue_number" =~ ^[0-9]+$ ]] && [ -n "${REPO:-}" ]; then
+      local repo="$REPO"
+      local out=""
+      for cmd in \
+        "gh issue view $issue_number -R $repo --json body -q .body" \
+        "gh issue view $issue_number -R $repo --json body --jq .body" \
+        "gh issue view $issue_number --repo $repo --json body -q .body" \
+        "gh issue view $issue_number --repo $repo --json body --jq .body" \
+        "gh issue view $issue_number --json body -q .body" \
+        "gh issue view $issue_number --json body --jq .body" \
+        "gh api repos/$repo/issues/$issue_number --jq .body" \
+        "gh api repos/$repo/issues/$issue_number -q .body"; do
+        out="$(eval "$cmd" 2>/dev/null)" || out=""
+        if [ -n "$out" ]; then ticket_body="$out"; break; fi
+      done
+    fi
+    if [ -n "$ticket_body" ]; then
+      tmp_brief="$(mktemp "${TMPDIR:-/tmp}/loom-brief.XXXXXX" 2>/dev/null || mktemp -t loom-brief)"
+      {
+        printf 'Repo: %s\n' "${REPO:-}"
+        printf 'Branch: %s\n' "${BRANCH:-loom/${TICKET:-x}}"
+        printf 'Lane: %s\n' "${LANE:-lane}"
+        printf 'Issue: %s\n' "${ISSUE_REF:-${REPO:-}#${issue_number:-}}"
+        printf '\n'
+        printf '%s\n' "$ticket_body"
+      } > "$tmp_brief"
+      brief="$tmp_brief"
+      REBUILT_BRIEF="$tmp_brief"
+    else
+      echo "[$(date -u +%FT%TZ)] ${TICKET:-} brief file missing: $1" >> "${LOG:-/dev/stderr}"
+      return 0
+    fi
+  fi
+  issue="$(field Issue "$brief" || true)"
   [[ "$issue" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]] && refs="$(printf '\nRefs %s' "$issue")"
   # The size as the review bot's letter (Medium -> M), so its plan check
   # passes whatever word the brief used; an unknown size is kept as written.
   # bus.hunt_plan reads a ## Size section or an inline "Size: S" line.
-  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$1" 2>/dev/null ||
-    section Size "$1" | head -1 | awk '{print $1}' | tr -d ':')"
+  size="$(PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan brief-size "$brief" 2>/dev/null ||
+    section Size "$brief" | head -1 | awk '{print $1}' | tr -d ':')"
   local validated=""
   [ -n "$HAS_CONTRACT" ] && validated="$(printf '\nValidation: %s (%s).' "$(validation_summary)" "$CONTRACT_FILE")"
-  [ -n "$INTENT_TEXT" ] || prepare_intent "$1"
+  [ -n "$INTENT_TEXT" ] || prepare_intent "$brief"
   # The lane's checklist, from the summary the runner moved out of the tree
   # before committing: read from the tree, every lane pull request carried
   # the ticket's unticked criteria and went back for them (2026-10-20).
   criteria="$(criteria_section "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$criteria" ] || criteria="$(criteria_section "$TREE/$SUMMARY_FILE" 2>/dev/null)"
-  [ -n "$criteria" ] || criteria="$(criteria_section "$1")"
+  [ -n "$criteria" ] || criteria="$(criteria_section "$brief")"
   # The lane's own word on operator steps, else the ticket's; a body with
   # neither says so, and the factory's keyword backstop still reads both.
   ops="$(section "$OPERATOR_SECTION" "$WORKDIR/$TICKET.summary.md" 2>/dev/null)"
   [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$TREE/$SUMMARY_FILE" 2>/dev/null)"
-  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$1")"
+  [ -n "$ops" ] || ops="$(section "$OPERATOR_SECTION" "$brief")"
   [ -n "$ops" ] || ops="none stated"
   # Command substitution drops the trailing blank line the format needs.
   bugs="$(bugs_part)"
@@ -679,13 +734,13 @@ pr_body() {
   # Briefs write the change under "## What" or "## Summary"; an empty Why
   # takes that change, so the plan check's ## Why is not empty (loom#1468).
   # Keep in step with bus/pr_repair.py::_render_generated.
-  why="$(section Why "$1")"
-  summary="$(section What "$1")"
-  [ -n "$summary" ] || summary="$(section Summary "$1")"
+  why="$(section Why "$brief")"
+  summary="$(section What "$brief")"
+  [ -n "$summary" ] || summary="$(section Summary "$brief")"
   [ -n "$why" ] || why="$summary"
   printf '%s\n\n## Why\n%s\n\n## Summary\n%s\n\n## Acceptance criteria\n%s\n\nSize: %s\n\n## Out of scope\n%s\n\n## %s\n%s\n\n%s---\nLoom ticket %s, lane %s, model %s.%s%s\n' \
     "$INTENT_TEXT" "$why" "$summary" "$criteria" \
-    "$size" "$(section 'Out of scope' "$1")" "$OPERATOR_SECTION" "$ops" "$bugs" \
+    "$size" "$(section 'Out of scope' "$brief")" "$OPERATOR_SECTION" "$ops" "$bugs" \
     "$2" "$LANE" "$MODEL" "$validated" "$refs"
 }
 
@@ -703,7 +758,15 @@ PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
 compose_pr_body() {
   local problems body_file out_file summary=() private=()
   PLAN_GAPS=""
+  REBUILT_BRIEF=""
   PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  if [ ! -f "$BRIEF" ]; then
+    if [ -f "${REBUILT_BRIEF:-}" ]; then
+      BRIEF="$REBUILT_BRIEF"
+    else
+      return 0
+    fi
+  fi
   problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
   echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
   if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
