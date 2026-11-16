@@ -49,7 +49,9 @@ LANE_SETTINGS = (
 )
 # Settings this change adds.
 NEW_SETTINGS = ("LOOM_SWEEP_REPOS", "LOOM_FACTORY_REPO", "LOOM_INFRA_PUBLIC_REPO",
-                "LOOM_SEND_BACK_REPO")
+                "LOOM_SEND_BACK_REPO", "LOOM_REVIEW_SWEEP_EVERY", "LOOM_REVIEW_SWEEP_HOURS",
+                "LOOM_REVIEW_SWEEP_PER_RUN", "LOOM_REVIEW_SWEEP_RETRY", "LOOM_REVIEW_LANES",
+                "LOOM_REVIEW_APPS", "LOOM_FLEET_REVIEWERS")
 # Set by one Loom script for another, or by tests: not operator settings,
 # so .env.example names them in a comment instead of as keys.
 INTERNAL_SETTINGS = ("LOOM_BRAIN_NOW", "LOOM_BRAIN_WAIT_STEP", "LOOM_POD_ONCE")
