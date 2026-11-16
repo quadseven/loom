@@ -7969,6 +7969,13 @@ class Station:
         held = self._held_tickets()
         held["%s#%d" % (repo, number)] = {"incident": incident, "at": self.now}
         _write_json(os.path.join(self.state, "factory_held.json"), held)
+        # Add the hold event to the issue body so the release logic can see it
+        issue = self._issue(repo, number)
+        body_events = status.body_events(issue.get("body", ""))
+        body_events.append((self._epoch_str(self.now), "Lane %s held: factory incident %s" % (self._lane_of_issue(repo, number), incident or "unknown")))
+        issue["body"] = status.with_body_events(issue.get("body", ""), body_events)
+        self.gh.rest("PUT", "/repos/%s/issues/%d" % (repo, number), {"body": issue.get("body")})
+        self.gh.rest("PUT", "/repos/%s/issues/%d" % (repo, number), {"body": issue.get("body")})
 
     def _forget_held(self, key: str) -> None:
         held = self._held_tickets()
@@ -8964,7 +8971,13 @@ class Station:
         match = HELD_FOR_RE.search(bare)
         incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
         self._note_held(repo, number, incident_ref)
-        self._set_wait(repo, self._issue(repo, number), "incident")
+        # Add the hold event to the issue body so the release logic can see it
+        issue = self._issue(repo, number)
+        body_events = status.body_events(issue.get("body", ""))
+        body_events.append((self._epoch_str(self.now), "Lane %s held: factory incident %s" % (lane, incident_ref or "unknown")))
+        issue["body"] = status.with_body_events(issue.get("body", ""), body_events)
+        self.gh.rest("PUT", "/repos/%s/issues/%d" % (repo, number), {"body": issue.get("body")})
+        self._set_wait(repo, issue, "incident")
         if incident_ref is None:
             self._routine(repo, number,
                           "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
