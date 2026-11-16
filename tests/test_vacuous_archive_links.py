@@ -71,6 +71,36 @@ class ArchiveLinksTests(unittest.TestCase):
             self.assertEqual(result.passed_on_base,
                              ["tests.test_new.TestNew.test_passes_on_base"])
 
+    def test_nested_symlink_keeps_its_own_relative_text(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root)
+            subprocess.run(["git", "-C", root, "init", "-q"], check=True,
+                           capture_output=True)
+            (repo / "data").mkdir()
+            (repo / "data" / "file.txt").write_text("content\n")
+            (repo / "pkg").mkdir()
+            (repo / "pkg" / "link").symlink_to("../data/file.txt")
+            base = _commit_all(root, "base")
+            checkout = os.path.join(root, "checkout")
+            os.mkdir(checkout)
+            vacuous._archive(checkout, root, base)
+            link = os.path.join(checkout, "pkg", "link")
+            self.assertEqual(os.readlink(link), "../data/file.txt")
+            with open(link) as handle:
+                self.assertEqual(handle.read(), "content\n")
+
+    def test_symlink_into_a_sibling_with_a_shared_prefix_is_skipped(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root)
+            subprocess.run(["git", "-C", root, "init", "-q"], check=True,
+                           capture_output=True)
+            (repo / "link").symlink_to("../checkout-other/file.txt")
+            base = _commit_all(root, "base")
+            checkout = os.path.join(root, "checkout")
+            os.mkdir(checkout)
+            vacuous._archive(checkout, root, base)
+            self.assertFalse(os.path.lexists(os.path.join(checkout, "link")))
+
 
 if __name__ == "__main__":
     unittest.main()

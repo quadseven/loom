@@ -543,6 +543,24 @@ def _commit(tree: str, revision: str) -> str:
     return value
 
 
+def _recreate_symlink(base_tree: str, target: str,
+                      member: tarfile.TarInfo) -> None:
+    """Recreate a symlink member as is, unless its target leaves the checkout.
+
+    A link's text is read from the link's own directory, so the member's
+    linkname is written unchanged; the resolved path only decides containment.
+    """
+    root = os.path.abspath(base_tree)
+    resolved = os.path.abspath(os.path.join(
+        os.path.dirname(target), member.linkname))
+    if os.path.commonpath([root, resolved]) != root:
+        return
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if os.path.lexists(target):
+        os.remove(target)
+    os.symlink(member.linkname, target)
+
+
 def _archive(base_tree: str, tree: str, revision: str) -> None:
     raw = _git(tree, "archive", "--format=tar", revision, timeout=60)
     with tarfile.open(fileobj=BytesIO(raw), mode="r:") as archive:
@@ -553,28 +571,12 @@ def _archive(base_tree: str, tree: str, revision: str) -> None:
                 os.makedirs(target, exist_ok=True)
                 continue
             
-            if member.type == b'2':
-                member_dir = os.path.dirname(member.name)
-                link_target = member.linkname
-                
-                from pathlib import PurePosixPath
-                resolved_target = str(PurePosixPath(member_dir) / link_target).lstrip("/")
-                
-                abs_resolved = os.path.abspath(os.path.join(base_tree, resolved_target))
-                abs_base_tree = os.path.abspath(base_tree)
-                
-                if abs_resolved.startswith(abs_base_tree):
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    if os.path.exists(target) or os.path.islink(target):
-                        os.remove(target)
-                    os.symlink(resolved_target, target)
-                    continue
-                else:
-                    continue
-            
+            if member.issym():
+                _recreate_symlink(base_tree, target, member)
+                continue
             if not member.isfile():
                 continue
-            
+
             os.makedirs(os.path.dirname(target), exist_ok=True)
             stream = archive.extractfile(member)
             if stream is None:
