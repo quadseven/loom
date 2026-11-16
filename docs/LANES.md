@@ -1414,6 +1414,29 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Standing by for another station
+
+The lease cannot stop a station that does not use it: one started by launchd
+on a host that was asleep, on the file backend. So every station also reads
+and writes a signal on the lane status issue (`bus/station_beat.py`), with the
+GitHub credentials it already has.
+
+- At the start of each pass a station edits one beat comment (created on the
+  first pass). A station that finds another station's beat younger than five
+  minutes logs "another station is running; standing by", runs no pass and
+  writes no beat. Freshness is the comment's own `updated_at`, so no two
+  clocks are compared.
+- The lane table carries a `Station:` stamp. A station on the lease also
+  stands by when the table was written in the last 20 minutes by a station
+  that did not stamp it with its own tag. Code from before this guard writes
+  an unstamped table and no beat, so this is how the cluster station yields to
+  a woken old station. A running station republishes the table at least every
+  15 minutes, so after the old station stops the cluster station resumes within
+  20 minutes.
+- A station is named on GitHub only by a short hash of its `LOOM_STATION_ID`.
+  A read that fails lets the pass run. `LOOM_STATION_GUARD=0` turns the guard
+  off.
+
 ## Paused steps
 
 `LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list

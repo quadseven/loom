@@ -242,7 +242,7 @@ class IntegrationTests(unittest.TestCase):
         from bus import station
         for supplied in (False, True):
             gh = SimpleNamespace(cache_dir="unused", app=None)
-            settings = SimpleNamespace()
+            settings = SimpleNamespace(status_repo="")
             with mock.patch.object(station, "Station") as constructor, \
                  mock.patch.object(station, "_trust_app_login"), \
                  mock.patch.object(station, "GitHub", return_value=gh), \
@@ -263,7 +263,7 @@ class IntegrationTests(unittest.TestCase):
              mock.patch.object(station, "_trust_app_login", side_effect=RuntimeError("app unavailable")):
             constructor.return_value.sample_operator_budget.side_effect = lambda: events.append("sample")
             with self.assertRaises(RuntimeError):
-                station._locked_pass(SimpleNamespace(), "unused", gh, {})
+                station._locked_pass(SimpleNamespace(status_repo=""), "unused", gh, {})
         self.assertEqual(events, ["sample"])
 
     def test_sampler_bug_is_logged_without_stopping_station_work(self):
@@ -271,7 +271,7 @@ class IntegrationTests(unittest.TestCase):
         st = object.__new__(station.Station)
         st.state = "unused"
         st.now = NOW
-        st.s = SimpleNamespace(authors=["operator"])
+        st.s = SimpleNamespace(authors=["operator"], status_repo="")
         st.operator_reader = mock.Mock()
         st._operator_lane_active = mock.Mock(return_value=False)
         st.run_pass = mock.Mock()
