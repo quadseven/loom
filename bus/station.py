@@ -53,6 +53,7 @@ from . import logrotate
 from . import flake
 from . import rebuttal
 from . import runners
+from . import station_beat
 from . import scope_fit
 from . import shadow
 from . import urgency
@@ -9820,7 +9821,8 @@ class Station:
         summary = self._spend_shown()
         disk = self._disk_status_line()
         body = "\n".join(
-            [LANES_MARKER, "Updated " + self._utc(self.now), ""]
+            [LANES_MARKER, "Updated " + self._utc(self.now),
+             station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
             + ([disk, ""] if disk else [])
             + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
@@ -17030,6 +17032,18 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         # GitHub's ETags differ per token: keep the App token across
         # passes (0600) so last pass's ETags still answer 304 (loom#1306).
         app.state_file = os.path.join(state, "station", "app-token.json")
+    beat = None
+    if settings.status_repo and station_beat.enabled(os.environ):
+        # The cross-station guard (loom#3050): stand by while another
+        # station's beat is fresh, whatever backend either one uses.
+        station_id, leased = station_beat.station_settings(os.environ)
+        beat = station_beat.Guard(gh, settings.status_repo, station_id, leased,
+                                  LANES_MARKER, say=_say)
+        reason = beat.verdict()
+        if reason:
+            _say("another station is running: %s; standing by" % reason)
+            return 0
+        beat.stamp()
     st = Station(gh, settings, **hooks)
     try:
         st.sample_operator_budget()
@@ -17044,5 +17058,11 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         _say("stopping: %s" % err)
         return 1
     finally:
-        st.end_pass()
+        try:
+            st.end_pass()
+        finally:
+            # Even when end_pass raises, the beat is renewed, so a slow pass
+            # does not read as a stopped station.
+            if beat is not None:
+                beat.renew()
     return 0
