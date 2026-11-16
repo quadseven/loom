@@ -12302,11 +12302,11 @@ class Station:
         """Label up to `left` of one repo's unseen ready-for-agent issues
         loom:triage; how many it labeled. It stops when the pass budget is
         spent, and a failed label write ends the repo with the count so far,
-        so the run's cap still holds."""
-        found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&sort=created"
-                             "&direction=asc&per_page=100" % (repo, READY_LABEL)).data
+        so the run's cap still holds. It reads page after page, oldest
+        first, until `left` are labeled or the pages run out, so issues it
+        skips (claimed, epics, already Loom's) never hide later ones."""
         done = 0
-        for issue in found if isinstance(found, list) else []:
+        for issue in self._ready_issues(repo):
             if done >= left or self._deferred():
                 break
             if (not isinstance(issue, dict) or issue.get("assignees") or issue.get("assignee")
@@ -12324,6 +12324,20 @@ class Station:
                 break
             done += 1
         return done
+
+    def _ready_issues(self, repo: str) -> Iterator[Any]:
+        """The repo's open ready-for-agent issues, oldest first, one page
+        read at a time as the caller asks for more."""
+        page = 1
+        while True:
+            found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&sort=created"
+                                 "&direction=asc&per_page=100&page=%d"
+                                 % (repo, READY_LABEL, page)).data
+            found = found if isinstance(found, list) else []
+            yield from found
+            if len(found) < 100:
+                return
+            page += 1
 
     def release_stale_claims(self) -> None:
         """Take back another operator's claims their claimer left alone for

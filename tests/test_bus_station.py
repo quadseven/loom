@@ -428,9 +428,11 @@ class FakeGitHub:
                 return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                    and label in self.names(i["number"])])
         if "labels=ready-for-agent&" in query:
-            return reply(200, sorted((i for i in self.issues.values() if i["state"] == "open"
-                                      and "ready-for-agent" in self.names(i["number"])),
-                                     key=lambda i: i.get("created_at") or ""))
+            ready = sorted((i for i in self.issues.values() if i["state"] == "open"
+                            and "ready-for-agent" in self.names(i["number"])),
+                           key=lambda i: i.get("created_at") or "")
+            page = int((re.search(r"[?&]page=(\d+)", query) or [0, "1"])[1])
+            return reply(200, ready[(page - 1) * 100:page * 100])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -15770,3 +15772,13 @@ class ReadyForAgentIntakeTest(Base):
         self.assertEqual(len(labeled), 2, labeled)
         said = [c.args[0] for c in say.call_args_list]
         self.assertEqual(said[-1], "ready-for-agent intake: 2 issues to loom:triage")
+
+    def test_eligible_issues_past_the_first_page_are_reached(self):
+        # The oldest 100 ready issues are all claimed; the intake reads on.
+        for n in range(100):
+            self.ready(200 + n, labels=("claim:someone",),
+                       created="2030-01-01T00:%02d:%02dZ" % (n // 60, n % 60))
+        self.ready(21, created="2030-02-01T00:00:00Z")
+        said = self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
