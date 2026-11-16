@@ -5463,8 +5463,8 @@ class Factory:
             return []
         number = int(issue["number"])
         try:
-            found = self.gh.rest("GET", "/repos/%s/issues/%d/dependencies/blocked_by?per_page=100"
-                                 % (repo, number)).data
+            found = list(self.gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by"
+                                          % (repo, number)))
         except RateLimited:
             raise
         except GitHubError:
