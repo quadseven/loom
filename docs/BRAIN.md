@@ -1870,6 +1870,11 @@ A lane pull request is merge-ready if and only if all five hold:
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.
 
+Review is `grug`'s alone on every repo (operator decision, 2026-11-16).
+The station's review sweep, which handed unreviewed pull requests to codex
+and agy review lanes, is off unless `LOOM_REVIEW_SWEEP=on` (docs/LANES.md,
+"The review sweep").
+
 `python3 -m bus.brain status` prints this per pull request: `READY`, or
 `blocked:` and every blocker that applies, for example `blocked: checks
 failure, grug changes_requested, 3 unresolved threads`. It is computed by

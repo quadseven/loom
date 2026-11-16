@@ -1162,7 +1162,7 @@ class Settings:
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None) -> None:
         self.home = home
-        # The review sweep (bus/review_sweep.py); off unless from_env built it.
+        # The review sweep (bus/review_sweep.py); off unless LOOM_REVIEW_SWEEP=on.
         self.review_sweep = review_sweep or review_sweep_mod.Config()
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its

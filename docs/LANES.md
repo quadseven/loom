@@ -2063,6 +2063,13 @@ again after an hour.
 
 ## The review sweep: independent reviews by the reviewer Apps
 
+The sweep is off. Review is `grug`'s alone: the `Grug - Elder` check is the
+one reviewer on every repo (operator decision, 2026-11-16).
+`Config.from_env` leaves the sweep off unless the station environment sets
+`LOOM_REVIEW_SWEEP=on`, and the installer does not set it, so no pull
+request goes to a review lane. The code and the settings below stay for a
+later decision; they describe what the sweep does once turned on.
+
 The station's `sweep_reviews` duty (`bus/review_sweep.py`) gives open pull
 requests an independent review without waiting for a brain to ask. At most
 once per `LOOM_REVIEW_SWEEP_EVERY` seconds it lists the open, non-draft

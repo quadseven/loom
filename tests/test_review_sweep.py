@@ -111,7 +111,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = Fake()
-        self.config = review_sweep.Config.from_env({})
+        self.config = review_sweep.Config.from_env({"LOOM_REVIEW_SWEEP": "on"})
         self.beating = {"codex-2", "agy"}
         self.minted = []
 
@@ -149,8 +149,20 @@ class Base(unittest.TestCase):
 
 
 class ConfigTest(unittest.TestCase):
+    def test_the_default_environment_leaves_the_sweep_off(self):
+        # Review is the Elder's alone (2026-11-16): a station without
+        # LOOM_REVIEW_SWEEP=on hands no pull request to a review lane.
+        for env in ({}, {"LOOM_REVIEW_SWEEP": "off"}, {"LOOM_REVIEW_SWEEP": ""},
+                    {"LOOM_REVIEW_SWEEP_EVERY": "900", "LOOM_REVIEW_LANES": "agy"}):
+            self.assertFalse(review_sweep.Config.from_env(env).on, env)
+
+    def test_settings_from_the_station_env_leave_the_sweep_off(self):
+        settings = station.Settings.from_env({"LOOM_HOME": "/example/home",
+                                              "LOOM_REPOS": REPO})
+        self.assertFalse(settings.review_sweep.on)
+
     def test_defaults(self):
-        config = review_sweep.Config.from_env({})
+        config = review_sweep.Config.from_env({"LOOM_REVIEW_SWEEP": "on"})
         self.assertEqual(config.every, 900)
         self.assertEqual(config.hours, 2)
         self.assertEqual(config.per_run, 6)
@@ -165,7 +177,7 @@ class ConfigTest(unittest.TestCase):
 
     def test_env_overrides(self):
         config = review_sweep.Config.from_env({
-            "LOOM_REVIEW_SWEEP_EVERY": "0", "LOOM_REVIEW_LANES": "agy",
+            "LOOM_REVIEW_SWEEP": "on", "LOOM_REVIEW_SWEEP_EVERY": "0", "LOOM_REVIEW_LANES": "agy",
             "LOOM_REVIEW_APPS": "agy=agent-example", "LOOM_REVIEW_SWEEP_PER_RUN": "2",
             "LOOM_AGY_MODEL": "gemini-9-high"})
         self.assertFalse(config.on)
@@ -327,8 +339,14 @@ class SweepTest(Base):
     def test_off_reads_nothing(self):
         self.fake.add(7)
         self.station(config=review_sweep.Config.from_env(
-            {"LOOM_REVIEW_SWEEP_EVERY": "0"})).sweep_reviews()
+            {"LOOM_REVIEW_SWEEP": "on", "LOOM_REVIEW_SWEEP_EVERY": "0"})).sweep_reviews()
         self.assertEqual(self.fake.gets, [])
+
+    def test_a_default_environment_station_dispatches_nothing(self):
+        self.fake.add(7, age=5 * 3600)
+        self.station(config=review_sweep.Config.from_env({})).sweep_reviews()
+        self.assertEqual(self.fake.gets, [])
+        self.assertEqual(self.briefs("codex-2") + self.briefs("agy"), [])
 
     def test_the_step_runs_in_the_pass(self):
         # In run_pass ahead of the heavy reads, not in the step loop, which a
