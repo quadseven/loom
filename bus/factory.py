@@ -197,7 +197,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -4341,6 +4341,9 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             blockers.append("another pull request holds the landing lock")
+        open_findings = comment_findings.open_findings(comments, self.trusted)
+        if open_findings:
+            blockers.append("unanswered blocking findings from trusted reviewers")
         decision = merge_verdict.decide(full, issue, blockers,
                                         ("factory",) if blockers else ())
         if not decision.ready:

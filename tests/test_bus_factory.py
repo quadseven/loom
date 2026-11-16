@@ -11,7 +11,7 @@ from unittest import mock
 
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
-from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, comment_findings, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
@@ -5994,6 +5994,109 @@ class AbandonedReview(Base):
         self.assertIn("> " + finding_line, body)
         self.assertIn("> Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
                       "from EARLIER in its review that never got a reply.", body)
+
+
+class BlockingFindings(Base):
+    """Factory merge refusal for PRs with unanswered blocking findings."""
+
+    def setUp(self):
+        super().setUp()
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.pull(50, 5, mergeable=True, green=True)
+
+    def test_unanswered_blocking_finding_refuses_merge(self):
+        """A blocking finding from a trusted author without an answer blocks merge."""
+        sha = "abc1234def5678abc1234def5678abc1234def56"
+        finding_body = "Blocking: test fails on %s." % sha[:9]
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "alice-example"},
+            "body": finding_body,
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_answered_blocking_finding_allows_merge(self):
+        """A blocking finding with a linked answer from a trusted author allows merge."""
+        sha = "abc1234def5678abc1234def5678abc1234def56"
+        finding_body = "Blocking: test fails on %s." % sha[:9]
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "alice-example"},
+            "body": finding_body,
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        answer_body = "Fixed in the test. https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        self.gh.comments[5].append({
+            "id": 101,
+            "user": {"login": "alice-example"},
+            "body": answer_body,
+            "created_at": "2030-01-01T13:30:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-101"
+        })
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_stranger_blocking_comment_does_not_block(self):
+        """A blocking comment from an untrusted author does not block merge."""
+        sha = "abc1234def5678abc1234def5678abc1234def56"
+        finding_body = "Blocking: test fails on %s." % sha[:9]
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "mallory-example"},
+            "body": finding_body,
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_blocking_without_commit_sha_does_not_block(self):
+        """A blocking comment without a commit SHA is not a finding."""
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "alice-example"},
+            "body": "Blocking: test fails.",
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_marker_form_finding_blocks_merge(self):
+        """The marker form finding blocks merge even without a commit SHA."""
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "alice-example"},
+            "body": "<!-- loom:finding v1 -->\nTest fails.",
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_marker_form_finding_answered_allows_merge(self):
+        """The marker form finding with an answer allows merge."""
+        self.gh.comments[5].append({
+            "id": 100,
+            "user": {"login": "alice-example"},
+            "body": "<!-- loom:finding v1 -->\nTest fails.",
+            "created_at": "2030-01-01T13:00:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        })
+        answer_body = "Fixed. https://github.com/example-org/example-repo/pull/8#issuecomment-100"
+        self.gh.comments[5].append({
+            "id": 101,
+            "user": {"login": "alice-example"},
+            "body": answer_body,
+            "created_at": "2030-01-01T13:30:00Z",
+            "html_url": "https://github.com/example-org/example-repo/pull/8#issuecomment-101"
+        })
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
 
 
 if __name__ == "__main__":
