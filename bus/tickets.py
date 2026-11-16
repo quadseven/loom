@@ -1060,9 +1060,8 @@ def review_name(repo: str, number: int, stamp: int) -> str:
 def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
                         pr_number: int, head_branch: str, base_branch: str,
                         head_sha: str, model: str = "gpt-6-luna", mode: str = "") -> str:
-    """The brief that hands a lane slot one pull request to review: a codex
-    slot while the Elder's model route is degraded (loom#2142), or a review
-    lane the station's review sweep picked (mode "sweep", bus/review_sweep.py).
+    """The brief that hands a review lane the station's review sweep picked
+    (mode "sweep", bus/review_sweep.py) one pull request to review.
     The tree is the pull request's own branch, no branch is pushed, and the
     result is review.json, not a pull request. The Model: line pins a codex
     slot to gpt-6-luna, the only model the codex lanes run; an empty model

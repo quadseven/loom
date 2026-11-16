@@ -35,7 +35,7 @@
 # A base-check brief (Deliverable: base-check, from the station, loom#3084)
 # runs only the base check on the default branch: a pass closes the repo's
 # base-check incident, a fail updates it. No agent and no pull request.
-# A review brief (Deliverable: review, from the station, loom#2142) also
+# A review brief (Deliverable: review, from the station's review sweep) also
 # changes no code: its tree is the reviewed pull request's own branch (a
 # Review-PR: <number> line names it, cloned like a fix brief's), the agent
 # leaves review.json in its tree, and the runner copies it to the lane's log

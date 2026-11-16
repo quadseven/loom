@@ -2041,25 +2041,20 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
-## Elder fallback reviews: the codex-2 slot on Luna
+## A degraded Elder check: held, with no fallback reviewer
 
-When the review bot's model route is exhausted, its check on a lane pull
-request concludes as a degraded review - not a verdict - and the re-ask
-degrades the same way (loom#2142). The factory then dispatches one review
-brief to the `codex-2` slot instead of another fix round: a
-`Deliverable: review` brief in the verify brief's shape, whose tree is the
-pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
-codex lanes run), through `codex exec` on the operator's Codex login, on
-the same lane machine as the other codex slots. The lane changes no code;
-it writes `review.json` (blocking findings, notes, a summary). The station
-posts the verdict on the pull request in the Elder's markings shape
-(`Elder markings - N blocking, M total`, under a
-`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
-also posted as review threads, and the factory's merge gate reads the
-verdict for that head in the degraded check's place: a clean verdict lets
-the pull request land, a blocking one sends it back through the ordinary
-fix rounds. A dispatched review that produces no verdict is dispatched
-again after an hour.
+Review is `grug`'s alone (operator decision, 2026-11-16). When the review
+bot's model route is exhausted, its check on a lane pull request concludes
+as a degraded review, which is not a verdict. The factory asks the bot to
+review the head again once (`/grug improve`, docs/BRAIN.md). When the re-run
+degrades too, the pull request is held at `loom:pr` until the check reruns
+with a verdict. It is not sent to a fix round, since no lane can fix a
+degraded review by editing code.
+
+The codex-2 Luna fallback that once reviewed such a head (loom#2142) is
+gone. The factory dispatches no review brief, the station posts no Luna
+verdict, and neither the factory nor `bus.brain merge` reads an old
+`<!-- loom:luna-review v1 sha=... -->` comment in the check's place.
 
 ## The review sweep: independent reviews by the reviewer Apps
 
@@ -2093,8 +2088,8 @@ that is not held after transient failures, has a fresh heartbeat, and
 whose reviewer App did not write the pull request. A scorecard demotion
 does not stop a review: it judges the lane's builds, and a review is not
 one; a stale block goes first to the lane of the App that blocked,
-since only that App's new review replaces its block. The brief is the Luna
-review brief with `Review-Mode: sweep`; a codex slot is pinned to
+since only that App's new review replaces its block. The brief is a review
+brief with `Review-Mode: sweep`; a codex slot is pinned to
 `gpt-6-luna`, and agy runs its own model. The station records each
 dispatch (brief name, lane, pull request, head) in its state, and that
 record, not the brief's text, makes a finished run a sweep run: a pull
@@ -2102,9 +2097,8 @@ request body copied into the brief cannot choose the posting mode, and
 the pull request and head are read from the brief's header block only and
 must match the record. A sweep verdict counts only from the lane the
 record names, running that lane's model: `gpt-6-luna` on a codex slot,
-and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
-a degraded-Elder Luna run and counts only from the `codex-2` slot on
-`gpt-6-luna`.
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run
+posts nothing.
 
 The verdict is posted as one formal review on the head commit by the
 lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
