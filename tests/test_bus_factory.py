@@ -119,6 +119,9 @@ class FakeGitHub:
 
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
+        m = re.search(r"/issues/(\d+)/dependencies/blocked_by$", path)
+        if m:
+            return getattr(self, "blockers", {}).get(int(m.group(1)), [])
         if re.search(r"/issues\?labels=loom:ticket", path):
             return [i for i in self.issues.values() if i.get("state") == "open"]
         if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
