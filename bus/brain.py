@@ -1165,7 +1165,8 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     if stacked:
         line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
-        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
+        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now,
+                                       check=check, node=node):
             line = _add_blocker(line, blocker)
     line = _pending_fix_blocker(gh, repo, int(pr["number"]), ticket, authors, line)
     hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
@@ -1253,10 +1254,14 @@ def _repo_cap_refusal(gh: GitHub, repo: str, caps: Optional[Dict[str, str]],
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                     ticket: Optional[Tuple[str, int]],
                     caps: Optional[Dict[str, str]] = None,
-                    now: Optional[datetime] = None) -> List[str]:
+                    now: Optional[datetime] = None,
+                    check: str = "Grug - Elder",
+                    node: Optional[Dict[str, Any]] = None) -> List[str]:
     """What bus.brain merge would refuse a READY pull request for, read with
     the functions merge uses (loom#1643): its ticket's state, a conflict,
-    a risk tier held for the operator, and the hourly merge cap."""
+    a risk tier held for the operator, the review check on its head (the same
+    rule _refuse_risk_tier applies, with its Luna stand-in), and the hourly
+    merge cap."""
     number = int(pr["number"])
     issue: Dict[str, Any] = {}
     found = []
@@ -1285,11 +1290,22 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     except ValueError as err:
         found.append(str(err))
         return list(merge_verdict.decide(pr, issue, found, ("operator",)).blockers)
-    if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
+    auto = tier != merge_tier.REVERT and tier in merge_tier.auto_tiers(None)
+    if tier != merge_tier.REVERT and not auto:
         found.append("held for the operator: %s" % tier)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
+    if auto:
+        # The review-check rule merge applies to a tier it merges on its own
+        # (loom#3100): a completed success on this head, or a clean Luna
+        # verdict standing in for it, is required before status says READY.
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        details = dict(node or {})
+        details.setdefault("headRefOid", sha)
+        luna = _luna_stands_in(gh, repo, number, details, None, _pr_author(pr)) if sha else False
+        if not sha or (not luna and not _review_check_passed(gh, repo, sha, check)):
+            found.append("review check %s not success on head" % check)
     return list(merge_verdict.decide(pr, issue, found,
                                      ("operator",) if found else ()).blockers)
 

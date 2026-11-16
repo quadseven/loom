@@ -77,6 +77,8 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
             ("GET", "/pulls/9"): reply(200, {"number": 9, "mergeable": True,
                                              "mergeable_state": "clean"}),
             ("GET", "/pulls/9/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"}]),
+            ("GET", "/check-runs"): reply(200, {"check_runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]}),
         }
 
     def test_overall_cap_blocks_ready_pull_request(self):

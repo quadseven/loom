@@ -3633,6 +3633,8 @@ class StatusMergeRefusalTests(unittest.TestCase):
             ("GET", "/pulls"): reply(200, [{"number": 8, "head": {"ref": base_ref}}]
                                           if base_ref != "main" else []),
             ("GET", "/search/issues"): reply(200, {"total_count": search_count}),
+            ("GET", "/check-runs"): reply(200, {"check_runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]}),
         }
         gh = GitHub("t", transport=Routed(routes))
         with unittest.mock.patch.dict(os.environ, env or {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
@@ -7404,6 +7406,8 @@ class FleetHoldTests(unittest.TestCase):
                                                    {"filename": "tests/test_a.py", "patch": "+x"}]),
             ("GET", "/search/issues"): reply(200, {"total_count": 0}),
             ("GET", "/issues/9/comments"): reply(status, comments),
+            ("GET", "/check-runs"): reply(200, {"check_runs": [
+                {"name": "Grug - Elder", "status": "completed", "conclusion": "success"}]}),
         }
         gh = GitHub("t", transport=Routed(routes))
         env = {"LOOM_BRIEF_AUTHORS": " ".join(authors)} if env is None else env
