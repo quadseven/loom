@@ -7579,13 +7579,21 @@ class FindingGateTests(unittest.TestCase):
                               "2030-01-01T13:30:00Z", 602)
         self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
 
+    def test_a_linked_reply_that_resolves_nothing_does_not_clear_it(self):
+        # A link alone is not a resolution: the reply must say Fixed in a
+        # commit, or Declined with its reason.
+        answer = self.comment(self.BRAIN, "Still broken, investigating: " + self.URL,
+                              "2030-01-01T13:30:00Z", 602)
+        self.assertIn(self.URL, self.merge([self.finding(), answer]))
+        self.assertIn(self.URL, self.status_line([self.finding(), answer]))
+
     def test_an_answer_older_than_the_finding_does_not_clear_it(self):
-        answer = self.comment(self.BRAIN, "Declined: already handled. " + self.URL,
+        answer = self.comment(self.BRAIN, "Declined: the retry test covers it. " + self.URL,
                               "2030-01-01T12:30:00Z", 602)
         self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
 
     def test_an_untrusted_answer_does_not_clear_it(self):
-        answer = self.comment("example-stranger", "Declined: fine. " + self.URL,
+        answer = self.comment("example-stranger", "Declined: the retry test covers it. " + self.URL,
                               "2030-01-01T13:30:00Z", 602)
         self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
 

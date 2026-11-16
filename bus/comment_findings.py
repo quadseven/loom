@@ -16,13 +16,15 @@ The convention:
   comment with any other loom machine marker is never a legacy finding, so a
   Luna verdict for an older head does not block a newer one.
 - A finding is answered by a later trusted comment that links it as
-  #issuecomment-<id> (its own URL works too). The answer carries the fix or the
-  evidence-backed decline, and it is the only thing that clears a finding.
-  A comment without the link, an older one, or one from an untrusted login
-  answers nothing.
+  #issuecomment-<id> (its own URL works too) and states a resolution: a line
+  opening with "Fixed in <commit>", or one opening with "Declined" and giving
+  its reason in three or more words. It is the only thing that clears a
+  finding. A link alone answers nothing, so an acknowledgement or a "still
+  broken, investigating" reply leaves it open, as do a comment without the
+  link, an older one, and one from an untrusted login.
 - A finding stays open across pushes. No commit clears it, empty or unrelated,
   and a newer head does not supersede it. A later trusted finding that links an
-  older one answers it, the same as any other linking comment.
+  older one is a repeated objection: both stay open.
 """
 from __future__ import annotations
 
@@ -40,6 +42,13 @@ _BLOCKING_LINE = re.compile(
 # A commit named by 7 to 40 hex characters with a letter and a digit, so a
 # plain number or a date is not a commit.
 _COMMIT = re.compile(r"\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b", re.I)
+# The two resolutions, each a line of its own after markdown marks: a fix
+# that names its commit, or a decline with its reason.
+_FIXED = re.compile(r"^[ \t>*_#-]*fixed[ \t]+(?:in|at|by)[ \t]+(?:commit[ \t]+)?[`]?"
+                    r"(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b", re.I | re.M)
+_DECLINED = re.compile(r"^[ \t>*_#-]*declined\b(.*)$", re.I | re.M)
+_URL = re.compile(r"https?://\S+")
+DECLINE_WORDS_MIN = 3
 
 
 def opens_finding(body: str) -> bool:
@@ -57,15 +66,34 @@ def _links(body: str, ident: str) -> bool:
                                      body) is not None
 
 
+def resolves(body: str) -> bool:
+    """Whether a body states a resolution: a line opening with "Fixed in" (or
+    at, by) that names the fixing commit, or one opening with "Declined" that
+    gives a reason of DECLINE_WORDS_MIN or more words besides links. A
+    finding never resolves another, so a repeated objection stays open."""
+    if opens_finding(body):
+        return False
+    if _FIXED.search(body):
+        return True
+    return any(len(re.findall(r"[A-Za-z0-9]+", _URL.sub(" ", reason))) >= DECLINE_WORDS_MIN
+               for reason in _DECLINED.findall(body))
+
+
 def _answered(finding: Mapping[str, Any], trusted: Sequence[Mapping[str, Any]]) -> bool:
-    """A trusted comment made after the finding that links it. A finding
-    with no id or no time cannot be answered, so it stays open."""
+    """A trusted comment made after the finding that links it and resolves
+    it. A link alone, an acknowledgement or a repeated objection is no
+    answer. A finding with no id or no time cannot be answered, so it stays
+    open."""
     ident = str(finding.get("id") or "")
     created = str(finding.get("created_at") or "")
     if not ident or not created:
         return False
-    return any(str(c.get("created_at") or "") > created
-               and _links(str(c.get("body") or ""), ident) for c in trusted)
+    for c in trusted:
+        body = str(c.get("body") or "")
+        if (str(c.get("created_at") or "") > created and _links(body, ident)
+                and resolves(body)):
+            return True
+    return False
 
 
 def open_findings(comments: Sequence[Any], authors: Sequence[str]) -> List[Dict[str, Any]]:

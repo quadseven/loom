@@ -1914,8 +1914,12 @@ comment carrying any other `<!-- loom:` marker is never a legacy finding, so a
 Luna verdict for an older head does not block a newer one. A finding stays open
 across pushes: a commit, an empty commit or an unrelated one never clears it, and
 a newer head does not supersede it. Only a later trusted comment that links the
-finding as `#issuecomment-<id>` answers it, with the fix or an evidence-backed
-decline. Status prints `blocked: unanswered blocking comment from LOGIN: <comment
+finding as `#issuecomment-<id>` and states a resolution answers it: a line
+opening with `Fixed in <commit>`, or one opening with `Declined` and giving its
+reason in three or more words. A link alone, an acknowledgement, a "still
+broken, investigating" reply or a repeated objection (a later finding that
+links it) leaves it open. The factory reads the pull request's own comments,
+never its ticket's, and names each open finding's link when it waits. Status prints `blocked: unanswered blocking comment from LOGIN: <comment
 link>`, and `bus.brain merge` refuses with the same words. Unreadable comments
 block as `pull request comments unreadable, so a blocking comment cannot be ruled
 out`. Ordinary comments, including `Nonblocking` or `Blocking: none`, never block.

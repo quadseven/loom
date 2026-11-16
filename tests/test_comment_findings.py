@@ -59,16 +59,42 @@ class OpenFindingsTests(unittest.TestCase):
                          "2030-01-01T13:30:00Z", 2)
         self.assertEqual(comment_findings.open_findings([finding, answer], AUTHORS), [])
 
+    def test_a_fix_naming_its_commit_answers_the_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Fixed in %s: the retry test covers it. %s"
+                         % (SHA[:10], url(1)), "2030-01-01T13:30:00Z", 2)
+        self.assertEqual(comment_findings.open_findings([finding, answer], AUTHORS), [])
+
+    def test_a_link_without_a_resolution_does_not_answer_the_finding(self):
+        # A link alone is not a resolution: an acknowledgement, a repeated
+        # objection, a fix with no commit or a bare decline leaves it open.
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        for body in ("Still broken, investigating: " + url(1),
+                     "Acknowledged, looking at it. " + url(1),
+                     "Fixed. " + url(1),
+                     "Not fixed in %s yet. %s" % (SHA[:10], url(1)),
+                     "Declined. " + url(1),
+                     "Blocking: retry still fails on %s. %s" % (SHA[:9], url(1))):
+            with self.subTest(body=body):
+                found = comment_findings.open_findings(
+                    [finding, comment("example-brain", body, "2030-01-01T13:30:00Z", 2)],
+                    AUTHORS)
+                self.assertIn(1, [c["id"] for c in found])
+
     def test_an_answer_needs_the_link_the_time_and_a_trusted_author(self):
         finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
                           "2030-01-01T13:00:00Z", 1)
+        declined = "Declined: the retry test covers it. "
         for label, answer in (
-                ("unlinked", comment("example-brain", "Fixed.", "2030-01-01T13:30:00Z", 2)),
-                ("older", comment("example-brain", "Declined. " + url(1),
+                ("unlinked", comment("example-brain", "Fixed in %s." % SHA[:10],
+                                     "2030-01-01T13:30:00Z", 2)),
+                ("older", comment("example-brain", declined + url(1),
                                   "2030-01-01T12:30:00Z", 2)),
-                ("untrusted", comment("example-stranger", "Declined. " + url(1),
+                ("untrusted", comment("example-stranger", declined + url(1),
                                       "2030-01-01T13:30:00Z", 2)),
-                ("untimed", comment("example-brain", "Declined. " + url(1), "", 2))):
+                ("untimed", comment("example-brain", declined + url(1), "", 2))):
             with self.subTest(answer=label):
                 found = comment_findings.open_findings([finding, answer], AUTHORS)
                 self.assertEqual([c["id"] for c in found], [1])
@@ -76,7 +102,8 @@ class OpenFindingsTests(unittest.TestCase):
     def test_a_link_to_a_longer_comment_id_does_not_answer_a_shorter_one(self):
         finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
                           "2030-01-01T13:00:00Z", 1)
-        answer = comment("example-brain", "Declined. " + url(12), "2030-01-01T13:30:00Z", 2)
+        answer = comment("example-brain", "Declined: the retry test covers it. " + url(12),
+                         "2030-01-01T13:30:00Z", 2)
         self.assertEqual([c["id"] for c in comment_findings.open_findings(
             [finding, answer], AUTHORS)], [1])
 

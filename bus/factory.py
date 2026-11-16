@@ -4320,6 +4320,24 @@ class Factory:
         _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
              % (repo, number, sha[:12]))
 
+    def _finding_blocker(self, repo: str, number: int) -> Optional[str]:
+        """The refusal an unanswered blocking comment on pull request `number`
+        puts on its merge, naming each finding's link, else None (loom#2988).
+        Read from the pull request's own comments, never its ticket's; comments
+        that cannot be read refuse, since a finding cannot be ruled out. With
+        no trusted login nothing is a finding, so nothing is read, as in
+        brain._finding_blocker."""
+        if not self.trusted:
+            return None
+        try:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except (GitHubError, OSError) as err:
+            return ("pull request comments unreadable, so a blocking comment cannot be "
+                    "ruled out (%s)" % err)
+        found = comment_findings.open_findings(
+            [c for c in comments if isinstance(c, dict)], sorted(self.trusted))
+        return comment_findings.blocker(found) if found else None
+
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
         base = str((full.get("base") or {}).get("ref") or "")
         head = str((full.get("head") or {}).get("sha") or "")
@@ -4341,9 +4359,10 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             blockers.append("another pull request holds the landing lock")
-        open_findings = comment_findings.open_findings(comments, self.trusted)
-        if open_findings:
-            blockers.append("unanswered blocking findings from trusted reviewers")
+        finding = self._finding_blocker(repo, number)
+        if finding:
+            _say("%s#%d waits: %s" % (repo, number, finding))
+            blockers.append(finding)
         decision = merge_verdict.decide(full, issue, blockers,
                                         ("factory",) if blockers else ())
         if not decision.ready:
