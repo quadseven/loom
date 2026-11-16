@@ -19,6 +19,13 @@
 # (bus/station.py ship_deployed).
 set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# Prepend the lanes directory so gh-wrapper, gh-token, and git-credential-loom are found first.
+LANES_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PATH="$LANES_DIR:$PATH"
+
+# Configure git to use the Loom credential helper for GitHub.
+git config --global credential.helper "!$LANES_DIR/git-credential-loom" || true
+
 BRANCH="${LOOM_DEPLOY_BRANCH:-main}"
 CHECK="${LOOM_DEPLOY_CHECK:-unittest}"
 DEPLOY_LOOKBACK=8

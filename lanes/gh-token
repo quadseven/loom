@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gh-token: prints a GitHub App installation token, or exits non-zero.
+# This is the shared token helper for Loom processes (lane, brain, station).
+# It never falls back to a personal token; if the App settings are present
+# but the token cannot be minted, it fails closed.
+
+set -uo pipefail
+
+# The repo root is two levels up from this script.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Use the repo's Python to call auth_from_env and get the App token.
+# We call GitHub(app).app_token() which mints the installation token.
+PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" exec python3 -B -c '
+import sys
+from bus.github import GitHub, auth_from_env, GitHubError
+
+try:
+    auth = auth_from_env()
+    gh = GitHub(auth)
+    # This raises GitHubError if auth is a personal token (no .app_token())
+    # or if the App token cannot be minted.
+    token = gh.app_token()
+    print(token)
+except GitHubError as e:
+    # Fail closed: do not fall back to personal token.
+    print(f"gh-token: {e}", file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    # Any other error (import, config) also fails closed.
+    print(f"gh-token: unexpected error: {e}", file=sys.stderr)
+    sys.exit(1)
+'

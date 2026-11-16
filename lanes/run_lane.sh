@@ -346,7 +346,12 @@ if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RU
 [ "$LANE" = agy ] && WORKDIR="${LOOM_AGY_WORKDIR:-$AGY_HOME/lanes}"
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+# Prepend the lanes directory so gh-wrapper, gh-token, and git-credential-loom are found first.
+LANES_DIR="$(cd "$(dirname "$0")" && pwd)"
+PATH="$LANES_DIR:$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+
+# Configure git to use the Loom credential helper for GitHub.
+git config --global credential.helper "!$LANES_DIR/git-credential-loom" || true
 
 # A check that hashes a file needs a sha256sum this machine can execute. The
 # lane plist puts the Intel Homebrew bin directory ahead of everything but the

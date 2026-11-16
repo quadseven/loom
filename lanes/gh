@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# gh: Loom's gh wrapper that enforces GitHub App authentication.
+# - Sets empty GH_CONFIG_DIR so no stored personal login is reachable.
+# - Refuses `gh auth login`.
+# - For `gh auth token`, prints the App installation token via gh-token.
+# - For other commands, sets GH_TOKEN from gh-token and runs real gh.
+# - Fails closed: if gh-token fails, the command fails.
+
+set -uo pipefail
+
+# The lanes directory (where this script and gh-token live).
+LANES_DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL_GH="$(command -v gh)" || { echo "gh: real gh not found in PATH" >&2; exit 1; }
+
+# Empty GH_CONFIG_DIR: no stored hosts, no stored logins.
+export GH_CONFIG_DIR="${LOOM_HOME:-$HOME/loom}/.gh-config"
+mkdir -p "$GH_CONFIG_DIR" || { echo "gh: could not create GH_CONFIG_DIR" >&2; exit 1; }
+
+# Refuse gh auth login - no personal logins in Loom processes.
+if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+    echo "gh: auth login is not permitted in Loom processes" >&2
+    exit 1
+fi
+
+# gh auth token -> print the App token via gh-token.
+if [[ "${1:-}" == "auth" && "${2:-}" == "token" ]]; then
+    exec "$LANES_DIR/gh-token"
+fi
+
+# For all other gh commands, get the App token and run real gh with GH_TOKEN.
+token="$("$LANES_DIR/gh-token")" || exit $?
+export GH_TOKEN="$token"
+exec "$REAL_GH" "$@"

@@ -101,7 +101,12 @@ ORIGIN="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null)"
 LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')}"
 mkdir -p "$WORK" "$(dirname "$LOG")"
 # launchd starts with a bare PATH; the agent CLIs live in these.
-PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+# Prepend the lanes directory so gh-wrapper, gh-token, and git-credential-loom are found first.
+LANES_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PATH="$LANES_DIR:$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+
+# Configure git to use the Loom credential helper for GitHub.
+git config --global credential.helper "!$LANES_DIR/git-credential-loom" || true
 
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
