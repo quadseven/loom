@@ -1414,6 +1414,29 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Standing by for another station
+
+The lease cannot stop a station that does not use it: one started by launchd
+on a host that was asleep, on the file backend. So every station also reads
+and writes a signal on the lane status issue (`bus/station_beat.py`), with the
+GitHub credentials it already has.
+
+- At the start of each pass a station edits one beat comment (created on the
+  first pass). A station that finds another station's beat younger than five
+  minutes logs "another station is running; standing by", runs no pass and
+  writes no beat. Freshness is the comment's own `updated_at`, so no two
+  clocks are compared.
+- The lane table carries a `Station:` stamp. A station on the lease also
+  stands by when the table was written in the last 20 minutes by a station
+  that did not stamp it with its own tag. Code from before this guard writes
+  an unstamped table and no beat, so this is how the cluster station yields to
+  a woken old station. A running station republishes the table at least every
+  15 minutes, so after the old station stops the cluster station resumes within
+  20 minutes.
+- A station is named on GitHub only by a short hash of its `LOOM_STATION_ID`.
+  A read that fails lets the pass run. `LOOM_STATION_GUARD=0` turns the guard
+  off.
+
 ## Paused steps
 
 `LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
@@ -2026,6 +2049,74 @@ verdict for that head in the degraded check's place: a clean verdict lets
 the pull request land, a blocking one sends it back through the ordinary
 fix rounds. A dispatched review that produces no verdict is dispatched
 again after an hour.
+
+## The review sweep: independent reviews by the reviewer Apps
+
+The station's `sweep_reviews` duty (`bus/review_sweep.py`) gives open pull
+requests an independent review without waiting for a brain to ask. At most
+once per `LOOM_REVIEW_SWEEP_EVERY` seconds it lists the open, non-draft
+pull requests of each `LOOM_REPOS` repo and dispatches at most
+`LOOM_REVIEW_SWEEP_PER_RUN` review briefs. It waits while the GitHub
+budget is low or the pass request target is reached, like the other
+deferrable duties. A pull request from a fork is skipped: a lane cannot
+check its branch out.
+
+A pull request qualifies when all of these hold:
+
+- Its head commit is older than `LOOM_REVIEW_SWEEP_HOURS`.
+- No required check of its base branch (the branch rules) has a run on the
+  head that is still queued or in progress.
+- No fleet reviewer App (`LOOM_FLEET_REVIEWERS`) has a verdict on the head:
+  an `APPROVED` or `CHANGES_REQUESTED` review on that commit, or a
+  `<!-- fleet:review v1 verdict=APPROVE|REQUEST_CHANGES head=<sha> -->`
+  marker for that sha in a review or a comment.
+- No sweep review of that head was dispatched within
+  `LOOM_REVIEW_SWEEP_RETRY` seconds.
+
+A stale block also qualifies, before the age bound: a fleet reviewer App's
+`CHANGES_REQUESTED` on an older commit keeps the pull request blocked on
+GitHub after its fix is pushed, so the new head is reviewed.
+
+Each qualifying pull request goes to the first lane in `LOOM_REVIEW_LANES`
+that is not demoted by the scorecard, not held after transient failures,
+has a fresh heartbeat, and whose reviewer App did not write the pull
+request; a stale block goes first to the lane of the App that blocked,
+since only that App's new review replaces its block. The brief is the Luna
+review brief with `Review-Mode: sweep`; a codex slot is pinned to
+`gpt-6-luna`, and agy runs its own model. The station records each
+dispatch (brief name, lane, pull request, head) in its state, and that
+record, not the brief's text, makes a finished run a sweep run: a pull
+request body copied into the brief cannot choose the posting mode, and
+the pull request and head are read from the brief's header block only and
+must match the record. A sweep verdict counts only from the lane the
+record names, running that lane's model: `gpt-6-luna` on a codex slot,
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
+a degraded-Elder Luna run and counts only from the `codex-2` slot on
+`gpt-6-luna`.
+
+The verdict is posted as one formal review on the head commit by the
+lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
+with no blocking finding, else `REQUEST_CHANGES` with each blocking finding
+that names a file and a line as a review comment. The body carries the
+summary, every finding and the `fleet:review` marker line. The station
+mints the App's installation token from SSM
+(`/fleet/github-apps/<slug>/app_id` and `/fleet/github-apps/<slug>/private_key`,
+for the App's first installation) and never logs it. When the token cannot
+be minted, nothing is posted and the station logs one line; the next sweep
+dispatches the head again after the retry window. Shadow mode holds an
+approving review, so a held `APPROVE` lands as a comment by the same App
+with the same marker. A reviewer App never reviews a pull request its own
+App wrote.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LOOM_REVIEW_SWEEP_EVERY` | 900 | Seconds between sweeps; 0 turns the sweep off. |
+| `LOOM_REVIEW_SWEEP_HOURS` | 2 | Hours a head must age before it is reviewed. |
+| `LOOM_REVIEW_SWEEP_PER_RUN` | 6 | Review briefs a sweep dispatches at most. |
+| `LOOM_REVIEW_SWEEP_RETRY` | 14400 | Seconds before a head with no verdict is dispatched again. |
+| `LOOM_REVIEW_LANES` | `codex-2 agy` | Review lanes, in order of preference. |
+| `LOOM_REVIEW_APPS` | `codex-2=agent-openai-codex-luna agy=agent-google-gemini` | The reviewer App that posts each lane's verdict. |
+| `LOOM_FLEET_REVIEWERS` | `agent-meta-muse agent-openai-codex-luna agent-google-gemini agent-openai-dot agent-xai-grok` | The Apps whose verdict counts as independent. |
 
 ## opencode/ - volume
 

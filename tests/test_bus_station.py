@@ -3057,13 +3057,15 @@ class BudgetTest(Base):
         _, err = self.passes(gh=gh)
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertEqual(self.gets("loom:pr"), [])
-        self.assertEqual(self.gets("loom:lanes"), [])
+        # Only the station guard's lookup of the status issue, which runs
+        # whatever the budget: it keeps two stations from claiming at once.
+        self.assertEqual(len(self.gets("loom:lanes")), 1)
         self.assertEqual(err.count("budget low"), 1)
         self.assertIn("500 of 5000 left", err)
         # The next pass knows from the station's state, and does not say it again.
         _, err = self.passes(transport)
         self.assertEqual(self.gets("loom:pr"), [])
-        self.assertEqual(self.gets("loom:lanes"), [])
+        self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
 
     def test_below_the_floor_the_daily_metrics_line_still_goes_out(self):
@@ -3082,9 +3084,10 @@ class BudgetTest(Base):
         transport, _ = self.low(remaining=4000)
         _, err = self.passes(transport)
         self.assertEqual(len(self.gets("loom:pr")), 2)
-        # One lookup finds the status issue; the other reads the remote
-        # lane heartbeat from that issue's comments.
-        self.assertEqual(len(self.gets("loom:lanes")), 2)
+        # One lookup finds the status issue for the station guard, one finds
+        # it for the lane table, and one reads the remote lane heartbeat
+        # from that issue's comments.
+        self.assertEqual(len(self.gets("loom:lanes")), 3)
         self.assertNotIn("budget low", err)
         self.assertIn("budget 4000 of 5000 left", err)
 
