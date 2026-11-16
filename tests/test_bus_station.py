@@ -15712,7 +15712,7 @@ class ReadyForAgentIntakeTest(Base):
         for number in (21, 22):
             self.assertNotIn("loom:triage", self.fake.names(number), number)
 
-    def test_a_ready_issue_loom_already_labelled_is_left_alone(self):
+    def test_a_ready_issue_loom_already_labeled_is_left_alone(self):
         self.ready(21, labels=("loom:queued", "loom:ticket"))
         self.ready(22, labels=("loom:triage",))
         self.intake()
@@ -15725,8 +15725,8 @@ class ReadyForAgentIntakeTest(Base):
         for n in range(cap + 3):
             self.ready(100 + n, created="2030-01-%02dT00:00:00Z" % (cap + 3 - n))
         said = self.intake()
-        labelled = [100 + n for n in range(cap + 3) if "loom:triage" in self.fake.names(100 + n)]
-        self.assertEqual(labelled, [100 + n for n in range(3, cap + 3)])
+        labeled = [100 + n for n in range(cap + 3) if "loom:triage" in self.fake.names(100 + n)]
+        self.assertEqual(labeled, [100 + n for n in range(3, cap + 3)])
         self.assertEqual(said, ["ready-for-agent intake: %d issues to loom:triage" % cap])
 
     def test_the_intake_runs_at_most_once_an_hour(self):
@@ -15737,3 +15737,36 @@ class ReadyForAgentIntakeTest(Base):
         self.assertEqual(self.intake(), [])
         self.assertNotIn("loom:triage", self.fake.names(22))
         self.assertEqual(self.fake.calls, [])
+
+    def test_a_budget_spent_partway_through_a_repo_stops_the_labeling(self):
+        self.ready(21, created="2030-01-01T00:00:00Z")
+        self.ready(22, created="2030-01-02T00:00:00Z")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # Not deferred at the repo, nor before the first issue; spent after it.
+        with mock.patch.object(runner, "_deferred", side_effect=[False, False] + [True] * 9), \
+                mock.patch("bus.station._say"):
+            runner.intake_ready_for_agent()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertNotIn("loom:triage", self.fake.names(22))
+
+    def test_a_failed_label_write_still_counts_what_was_labeled_against_the_cap(self):
+        for n in range(4):
+            self.ready(21 + n, created="2030-01-0%dT00:00:00Z" % (n + 1))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        real, posts = runner.gh.rest, []
+
+        def rest(method, path, *args, **kw):
+            if method == "POST":
+                posts.append(path)
+                if len(posts) == 2:
+                    raise station.GitHubError("server error", 500)
+            return real(method, path, *args, **kw)
+        with mock.patch.object(runner.gh, "rest", side_effect=rest), \
+                mock.patch.object(station, "READY_PER_RUN", 2), \
+                mock.patch.object(runner, "_verify_repos", return_value=[REPO, REPO]), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        labeled = [n for n in range(21, 25) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(len(labeled), 2, labeled)
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertEqual(said[-1], "ready-for-agent intake: 2 issues to loom:triage")

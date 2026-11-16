@@ -12300,19 +12300,28 @@ class Station:
 
     def _intake_ready_repo(self, repo: str, left: int) -> int:
         """Label up to `left` of one repo's unseen ready-for-agent issues
-        loom:triage; how many it labelled."""
+        loom:triage; how many it labeled. It stops when the pass budget is
+        spent, and a failed label write ends the repo with the count so far,
+        so the run's cap still holds."""
         found = self.gh.rest("GET", "/repos/%s/issues?labels=%s&state=open&sort=created"
                              "&direction=asc&per_page=100" % (repo, READY_LABEL)).data
         done = 0
         for issue in found if isinstance(found, list) else []:
-            if done >= left:
+            if done >= left or self._deferred():
                 break
             if (not isinstance(issue, dict) or issue.get("assignees") or issue.get("assignee")
                     or any(name.startswith("claim:") for name in _label_names(issue))
                     or brain._triage_skip(issue, self.s.authors, self.s.briefers)):
                 continue
-            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
-                         {"labels": ["loom:triage"]})
+            number = int(issue["number"])
+            try:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["loom:triage"]})
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("ready-for-agent intake: could not label %s#%d: %s" % (repo, number, err))
+                break
             done += 1
         return done
 
