@@ -154,13 +154,20 @@ def verdict_on_head(reviews: Iterable[Any], comments: Iterable[Any], head: str,
                for c in comments if isinstance(c, dict))
 
 
-def stale_block(reviews: Iterable[Any], head: str, reviewers: Sequence[str]) -> bool:
-    """Whether a fleet reviewer App's CHANGES_REQUESTED stands on an older
-    commit: it keeps the pull request blocked on GitHub after the fix."""
+def stale_blockers(reviews: Iterable[Any], head: str, reviewers: Sequence[str]) -> List[str]:
+    """The fleet reviewer App logins whose standing review is a
+    CHANGES_REQUESTED on an older commit: as on GitHub, an App's newest
+    APPROVED, CHANGES_REQUESTED or DISMISSED review is the one that stands,
+    and a stale one keeps the pull request blocked after the fix."""
     logins = {bot(slug) for slug in reviewers}
-    return any(isinstance(r, dict) and _login(r) in logins
-               and r.get("state") == "CHANGES_REQUESTED" and r.get("commit_id") != head
-               for r in reviews)
+    standing: Dict[str, Dict[str, Any]] = {}
+    for review in reviews:
+        if (isinstance(review, dict) and _login(review) in logins
+                and review.get("state") in _VERDICT_STATES + ("DISMISSED",)):
+            standing[_login(review)] = review
+    return sorted(login for login, review in standing.items()
+                  if review.get("state") == "CHANGES_REQUESTED"
+                  and review.get("commit_id") != head)
 
 
 def commit_time(commit: Any) -> Optional[float]:

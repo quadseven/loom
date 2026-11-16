@@ -4424,37 +4424,42 @@ class Station:
                 or (sent.get(key) or {}).get("sha") == sha):
             return False
         try:
-            if not self._sweep_qualifies(repo, pr, sha):
-                return False
+            blockers = self._sweep_qualifies(repo, pr, sha)
         except RateLimited:
             raise
         except GitHubError as err:
             _say("review sweep: could not read %s: %s" % (key, err))
             return False
-        lane = self._sweep_lane(pr)
+        lane = None if blockers is None else self._sweep_lane(pr, blockers)
         if lane is None:
             return False
-        self._write_sweep_brief(repo, pr, lane)
-        sent[key] = {"sha": sha, "at": self.now, "lane": lane}
+        # The record is what makes a run's verdict a sweep verdict when it
+        # reports (_sweep_record): never a line of the brief's free text.
+        brief = self._write_sweep_brief(repo, pr, lane)
+        sent[key] = {"sha": sha, "at": self.now, "lane": lane, "brief": brief,
+                     "number": int(pr["number"])}
         return True
 
-    def _sweep_qualifies(self, repo: str, pr: Dict[str, Any], sha: str) -> bool:
-        """Whether a pull request needs an independent review of its head:
-        no fleet reviewer App's verdict on it, no required check pending, and
-        the head older than the age bound, unless a fleet App's block stands
-        on an older commit (a stale block, which keeps it blocked on GitHub)."""
+    def _sweep_qualifies(self, repo: str, pr: Dict[str, Any], sha: str) -> Optional[List[str]]:
+        """None when a pull request needs no independent review of its head,
+        else the fleet App logins whose block stands on an older commit
+        (possibly none). It needs one when no fleet reviewer App's verdict is
+        on the head, no required check is pending, and the head is older than
+        the age bound, unless a stale block keeps it blocked on GitHub."""
         number = int(pr["number"])
         reviewers = self.s.review_sweep.reviewers
         reviews = self.gh.paginate("/repos/%s/pulls/%d/reviews?per_page=100" % (repo, number))
         if review_sweep_mod.verdict_on_head(reviews, [], sha, reviewers):
-            return False
-        if not (review_sweep_mod.stale_block(reviews, sha, reviewers)
-                or self._sweep_old_enough(repo, sha)):
-            return False
+            return None
+        blockers = review_sweep_mod.stale_blockers(reviews, sha, reviewers)
+        if not (blockers or self._sweep_old_enough(repo, sha)):
+            return None
         if self._sweep_checks_pending(repo, str((pr.get("base") or {}).get("ref") or ""), sha):
-            return False
+            return None
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        return not review_sweep_mod.verdict_on_head([], comments, sha, reviewers)
+        if review_sweep_mod.verdict_on_head([], comments, sha, reviewers):
+            return None
+        return blockers
 
     def _sweep_old_enough(self, repo: str, sha: str) -> bool:
         commit = self.gh.rest("GET", "/repos/%s/commits/%s" % (repo, sha)).data
@@ -4477,14 +4482,18 @@ class Station:
         runs = data.get("check_runs") if isinstance(data, dict) else None
         return review_sweep_mod.pending(runs or [], required)
 
-    def _sweep_lane(self, pr: Dict[str, Any]) -> Optional[str]:
+    def _sweep_lane(self, pr: Dict[str, Any], blockers: Sequence[str] = ()) -> Optional[str]:
         """The first review lane that may take this pull request: not
         demoted by the scorecard, not held after failed runs, beating, and
-        not the lane of the App that wrote the pull request."""
+        not the lane of the App that wrote the pull request. The lane of an
+        App whose stale block stands goes first: only its own new review
+        replaces that block on GitHub."""
         config = self.s.review_sweep
         author = rest_login(pr.get("user")).lower()
         demoted = self.demoted_lanes()
-        for lane in config.lanes:
+        lanes = sorted(config.lanes, key=lambda x: review_sweep_mod.bot(config.app(x) or x)
+                       not in blockers)
+        for lane in lanes:
             slug = config.app(lane)
             if not slug or author == review_sweep_mod.bot(slug):
                 continue
@@ -4493,7 +4502,7 @@ class Station:
             return lane
         return None
 
-    def _write_sweep_brief(self, repo: str, pr: Dict[str, Any], lane: str) -> None:
+    def _write_sweep_brief(self, repo: str, pr: Dict[str, Any], lane: str) -> str:
         """Hand one pull request's head to a review lane. The pull request
         stands in for the ticket: its title and description are what the
         change serves."""
@@ -4505,10 +4514,23 @@ class Station:
             repo, issue, lane, stamp, number, str(head.get("ref") or ""),
             str((pr.get("base") or {}).get("ref") or ""), str(head.get("sha") or ""),
             model=review_sweep_mod.brief_model(lane), mode="sweep")
-        claiming = self._write_brief(lane, tickets.review_name(repo, number, stamp), text)
+        name = tickets.review_name(repo, number, stamp)
+        claiming = self._write_brief(lane, name, text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("review sweep: handed %s#%d head %s to lane %s"
              % (repo, number, str(head.get("sha") or "")[:12], lane))
+        return name
+
+    def _sweep_record(self, name: str) -> Optional[Dict[str, Any]]:
+        """The sweep's own record of the brief `name`, or None when the
+        sweep never dispatched it (or its retry window passed)."""
+        saved = _read_json(os.path.join(self.state, review_sweep_mod.STATE_FILE), {},
+                           strict=False)
+        sent = saved.get("sent") if isinstance(saved, dict) else None
+        for entry in (sent.values() if isinstance(sent, dict) else ()):
+            if isinstance(entry, dict) and entry.get("brief") == name:
+                return entry
+        return None
 
     def _reviewer_client(self, slug: str) -> Optional[GitHub]:
         """The client that posts as reviewer App `slug`, minted once a pass;
@@ -4532,7 +4554,14 @@ class Station:
         head moved, the App wrote the pull request, or its token cannot be
         minted; the next sweep dispatches again."""
         slug = self.s.review_sweep.app(lane)
-        pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        try:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("review sweep: could not read %s#%d before posting; nothing posted: %s"
+                 % (repo, number, err))
+            return
         if (not slug or pr.get("state", "open") != "open"
                 or str((pr.get("head") or {}).get("sha") or "") != sha
                 or rest_login(pr.get("user")).lower() == review_sweep_mod.bot(slug)):
@@ -4988,48 +5017,63 @@ class Station:
         dispatches again after its retry window. A result also posts
         nothing when it did not come from the review slot's own Luna run:
         the gate trusts the posted verdict, so no other lane or model may
-        speak it. A review lane is the Luna slot or a lane in
-        LOOM_REVIEW_LANES, and its run must have recorded that lane's own
-        model (review_sweep.model_ok). A sweep run's verdict (Review-Mode:
-        sweep) is posted by the lane's reviewer App as a formal review
-        (_post_sweep_review), never as the station."""
+        speak it.
+
+        Two kinds of review run report here. A sweep run (one the station's
+        review sweep dispatched, by its own record of the brief: never a
+        line of the brief's text, which carries a pull request body) is
+        posted by the lane's reviewer App as a formal review
+        (_post_sweep_review), and only from the lane the record names,
+        running that lane's model (review_sweep.model_ok). Any other review
+        run is a degraded-Elder Luna run: posted as the station's Luna
+        verdict only from the Luna slot on gpt-6-luna. The pull request and
+        head come from the brief's header block only."""
         if kind == "failed":
             _say("review run %s on lane %s failed; %s#%d keeps waiting for "
                  "a verdict" % (name, lane, repo, number))
             return True
-        if not self._review_run_trusted(lane, name):
+        header = text.split("\n## ", 1)[0]
+        record = self._sweep_record(name)
+        if not self._review_run_trusted(lane, name, header, record):
             return True
-        found = self._review_result(lane, name, text)
+        found = self._review_result(lane, name, header)
         if found is None:
             return True
         pr_number, sha, blocking, notes, summary = found
-        if self._field(text, "Review-Mode") == "sweep":
+        if record is not None:
+            if (record.get("sha"), record.get("number")) != (sha, pr_number):
+                _say("review run %s names %s#%d head %s, not what the sweep sent; "
+                     "nothing posted" % (name, repo, pr_number, sha[:12]))
+                return True
             self._post_sweep_review(lane, repo, pr_number, sha, (blocking, notes, summary))
             return True
         self._post_luna_verdict(lane, repo, pr_number, sha, blocking, notes, summary)
         return True
 
-    def _review_run_trusted(self, lane: str, name: str) -> bool:
-        """Whether a review run came from a review lane running its own
-        model; says why not."""
-        config = self.s.review_sweep
-        if lane != factory.LUNA_REVIEW_LANE and lane not in config.lanes:
-            _say("review run %s reported on lane %s, not a review lane (%s); its "
-                 "verdict is not posted" % (name, lane, " ".join(
-                     [factory.LUNA_REVIEW_LANE] + [x for x in config.lanes
-                                                   if x != factory.LUNA_REVIEW_LANE])))
-            return False
+    def _review_run_trusted(self, lane: str, name: str, header: str,
+                            record: Optional[Dict[str, Any]]) -> bool:
+        """Whether a review run may speak: a sweep run from the lane the
+        sweep sent it to, on that lane's model; any other run from the Luna
+        slot on gpt-6-luna. Says why not."""
         model = self._review_model(lane, name)
-        if not review_sweep_mod.model_ok(lane, model, config):
-            _say("review run %s recorded model %s, not lane %s's review model; its "
-                 "verdict is not posted" % (name, model or "none", lane))
+        if record is None and self._field(header, "Review-Mode") == "sweep":
+            _say("review run %s is marked as a sweep review the sweep has no record "
+                 "of; its verdict is not posted" % name)
             return False
-        return True
+        if record is not None:
+            trusted = (record.get("lane") == lane and lane in self.s.review_sweep.lanes
+                       and review_sweep_mod.model_ok(lane, model, self.s.review_sweep))
+        else:
+            trusted = lane == factory.LUNA_REVIEW_LANE and model == factory.LUNA_MODEL
+        if not trusted:
+            _say("review run %s on lane %s (model %s) is not from the lane and model "
+                 "its brief went to; its verdict is not posted" % (name, lane, model or "none"))
+        return trusted
 
-    def _review_result(self, lane: str, name: str, text: str) -> Optional[
+    def _review_result(self, lane: str, name: str, header: str) -> Optional[
             Tuple[int, str, List[Dict[str, Any]], List[Dict[str, Any]], str]]:
         """(pull request, head, blocking, notes, summary) of a review run, or
-        None when its review.json or brief cannot be used; says why."""
+        None when its review.json or brief header cannot be used; says why."""
         result, why = self._read_review(lane, name)
         if result is None:
             _say("review run %s left no usable verdict: %s" % (name, why))
@@ -5037,8 +5081,8 @@ class Station:
         blocking = self._review_findings(result.get("blocking"))
         notes = self._review_findings(result.get("notes"))
         summary = result.get("summary")
-        pr_field = self._field(text, "Review-PR")
-        sha = self._field(text, "Head-Sha")
+        pr_field = self._field(header, "Review-PR")
+        sha = self._field(header, "Head-Sha")
         if (blocking is None or notes is None or not isinstance(summary, str)
                 or not pr_field.isdigit() or not sha):
             _say("review run %s wrote a verdict in the wrong shape; "

@@ -2057,11 +2057,19 @@ GitHub after its fix is pushed, so the new head is reviewed.
 Each qualifying pull request goes to the first lane in `LOOM_REVIEW_LANES`
 that is not demoted by the scorecard, not held after transient failures,
 has a fresh heartbeat, and whose reviewer App did not write the pull
-request. The brief is the Luna review brief with `Review-Mode: sweep`; a
-codex slot is pinned to `gpt-6-luna`, and agy runs its own model. The
-station accepts a review run's verdict only from a review lane whose run
-recorded that lane's model: `gpt-6-luna` on a codex slot, and
-`LOOM_AGY_MODEL` or a `gemini-` model on agy.
+request; a stale block goes first to the lane of the App that blocked,
+since only that App's new review replaces its block. The brief is the Luna
+review brief with `Review-Mode: sweep`; a codex slot is pinned to
+`gpt-6-luna`, and agy runs its own model. The station records each
+dispatch (brief name, lane, pull request, head) in its state, and that
+record, not the brief's text, makes a finished run a sweep run: a pull
+request body copied into the brief cannot choose the posting mode, and
+the pull request and head are read from the brief's header block only and
+must match the record. A sweep verdict counts only from the lane the
+record names, running that lane's model: `gpt-6-luna` on a codex slot,
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
+a degraded-Elder Luna run and counts only from the `codex-2` slot on
+`gpt-6-luna`.
 
 The verdict is posted as one formal review on the head commit by the
 lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
