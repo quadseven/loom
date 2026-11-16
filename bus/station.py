@@ -202,6 +202,13 @@ TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
 # A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
 # this is never removed: a runner may have just made it.
 RUN_SCRATCH_SETTLE = 600
+# How long a loom:running ticket's newest brief must have sat in its lane's
+# done or failed folder, with none in the inbox and no runner on the lane,
+# before the station calls the run ended (settle_ended_runs). The run's own
+# report moves the ticket within a pass or two; this is the backstop.
+ENDED_RUN_SETTLE = 2 * 3600
+# At most this many ended runs are settled a pass: each is a read and two writes.
+ENDED_RUN_MAX = 10
 # The folders an idle lane's run home drops each pass: package caches and
 # temp files a run rebuilds.
 RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
@@ -8892,6 +8899,63 @@ class Station:
         self._never_left_running(repo, number, lane)
         return True
 
+    def settle_ended_runs(self) -> None:
+        """Move each loom:running ticket whose run has ended to loom:failed,
+        through _never_left_running, so it stops holding its lane. Ended
+        means the newest brief of the ticket in its lane's folders sits in
+        done or failed for ENDED_RUN_SETTLE, none waits in the inbox, and no
+        runner holds the lane. Remote lanes, factory incident holds and a
+        ticket with no brief on record are left alone. The factory counts a
+        running ticket as lane load: on 2026-11-16 six such tickets, ended
+        4 hours to 14 days before, kept three live lanes from 49 queued
+        tickets. One open-issues list a repo, a 304 when unchanged."""
+        run = os.path.join(self.s.home, "run")
+        left = ENDED_RUN_MAX
+        for repo in self.scan_repos():
+            if left <= 0 or self._deferred():
+                return
+            try:
+                found = self._paginate("/repos/%s/issues?labels=loom:running&state=open"
+                                       "&per_page=100" % repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not list running tickets in %s: %s" % (repo, err))
+                continue
+            for issue in found:
+                if left <= 0:
+                    return
+                lane = _lane_of(issue) if isinstance(issue, dict) else ""
+                if (not lane or lane in REMOTE_LANES or "pull_request" in issue
+                        or WAIT + "incident" in _label_names(issue)
+                        or self._lane_locked(run, lane)
+                        or not self._run_ended(repo, int(issue["number"]), lane)):
+                    continue
+                self._never_left_running(repo, int(issue["number"]), lane)
+                left -= 1
+
+    def _run_ended(self, repo: str, number: int, lane: str) -> bool:
+        """The ticket's newest build brief on the lane is in done or failed,
+        at least ENDED_RUN_SETTLE old, and no brief of it is in the inbox."""
+        stem = re.compile(r"%s(?:-r[0-9]+)?\.(?:md|claiming)$"
+                          % re.escape(tickets.ticket_name(repo, number)))
+        newest = None
+        for folder in ("", "done", "failed"):
+            path = os.path.join(self.inbox(lane), folder)
+            try:
+                entries = [e for e in os.listdir(path) if stem.fullmatch(e)]
+            except OSError:
+                continue
+            if entries and not folder:
+                return False
+            for entry in entries:
+                try:
+                    stamp = os.path.getmtime(os.path.join(path, entry))
+                except OSError:
+                    continue
+                newest = stamp if newest is None else max(newest, stamp)
+        return newest is not None and self.now - newest >= ENDED_RUN_SETTLE
+
     def _never_left_running(self, repo: str, number: int, lane: str) -> None:
         """A reported failure ends the run, so a ticket still loom:running on
         that lane goes to loom:failed, where the factory acts on it. A path
@@ -17170,6 +17234,15 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # A ticket left loom:running after its run ended counts as lane
+            # load, so it is settled before queued tickets look for a lane.
+            if not self._deferred():
+                try:
+                    self._timed(self.settle_ended_runs)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("settle_ended_runs failed: %s" % err)
             # Briefing a queued ticket onto a free lane comes before the heavy
             # reads: reconcile_pull_requests and claim_new spend the pass's
             # request target, and on 2026-11-07 assign_queued carried over

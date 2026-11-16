@@ -442,6 +442,9 @@ class FakeGitHub:
         if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:merged" in self.names(i["number"])])
+        if "labels=loom:running&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:running" in self.names(i["number"])])
         if "labels=loom:runaway" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:runaway" in self.names(i["number"])])
@@ -5059,8 +5062,9 @@ class CorruptStateTest(Base):
         # (loom#1857), and the invariant pass's read of the queued tickets
         # for ones with no brief headers (loom#2571), and the hourly read of
         # ready-for-agent issues (loom#3092).
-        # The last-pass shipped wait stamp adds one canonical all-repo read.
-        self.assertEqual(self.run_pass().requests, 21)
+        # The last-pass shipped wait stamp adds one canonical all-repo read,
+        # and the ended-run sweep one read of the running tickets (loom#3134).
+        self.assertEqual(self.run_pass().requests, 22)
 
 
 class TicketsTest(unittest.TestCase):
@@ -5666,9 +5670,10 @@ class ClaimTest(Base):
         # The held pull request wait withdrawal reads the open tickets too,
         # to find a person wait whose pull request is over (loom#1857); its
         # read is conditional like the verify runs', so the second pass
-        # answers it 304 as well.
-        self.assertEqual(len(self.fake.calls), first + 7)
-        self.assertEqual(gh.requests, 10)
+        # answers it 304 as well. The ended-run sweep lists the running
+        # tickets each pass (loom#3134).
+        self.assertEqual(len(self.fake.calls), first + 8)
+        self.assertEqual(gh.requests, 11)
         self.assertEqual(gh.not_modified, 2)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
