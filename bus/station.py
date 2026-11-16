@@ -13654,34 +13654,67 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003). One log line per goal."""
+        seconds (decision 0003). One log line per goal. Progress is saved to
+        outside-epic.json so a pass that processes a subset of goal homes
+        resumes on the next run within the same interval."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
-        checked = state.get("checked")
-        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+        last_run = state.get("checked")
+        interval_elapsed = not (self._num(last_run) and 0 <= self.now - last_run < OUTSIDE_EPIC_EVERY)
+        if interval_elapsed:
+            state = {}
+        homes = state.get("homes")
+        if not homes:
+            if interval_elapsed:
+                try:
+                    homes = self._goal_homes()
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("outside-epic: could not read the goal homes: %s" % err)
+                    return
+                homes = [[repo, int(goal["number"])] for repo, goal in homes]
+                state["homes"] = homes
+                state["processed"] = []
+            else:
+                return
+        processed = set(state.get("processed", []))
+        if len(processed) >= len(homes):
+            state.pop("homes", None)
+            state.pop("processed", None)
+            state["checked"] = self.now
+            _write_json(path, state)
             return
-        try:
-            homes = self._goal_homes()
-        except RateLimited:
-            raise
-        except (GitHubError, OSError) as err:
-            _say("outside-epic: could not read the goal homes: %s" % err)
-            return
-        for repo, goal in homes:
-            number = int(goal["number"])
+        for repo, number in homes:
+            key = "%s#%d" % (repo, number)
+            if key in processed:
+                continue
             try:
                 moved, left = brain.move_outside_tickets(self.gh, repo, number)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
-                continue
+                processed.add(key)
+                state["processed"] = list(processed)
+                state["checked"] = self.now
+                if len(processed) >= len(homes):
+                    state.pop("homes", None)
+                    state.pop("processed", None)
+                _write_json(path, state)
+                return
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
-        state["checked"] = self.now
-        _write_json(path, state)
+            processed.add(key)
+            state["processed"] = list(processed)
+            state["checked"] = self.now
+            if len(processed) >= len(homes):
+                state.pop("homes", None)
+                state.pop("processed", None)
+            _write_json(path, state)
+            return
 
     # -- invariants -------------------------------------------------------
     def check_invariants(self) -> None:
