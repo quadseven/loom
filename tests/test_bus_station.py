@@ -3221,8 +3221,10 @@ class TriageTest(Base):
         return err.getvalue()
 
     def triage_reads(self):
+        # The ready-for-agent intake (loom#3092) reads its label oldest
+        # first too; it is not brain triage.
         return [p for p in self.fake.paths("GET")
-                if "sort=created&direction=asc" in p]
+                if "sort=created&direction=asc" in p and "labels=ready-for-agent" not in p]
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -5050,9 +5052,10 @@ class CorruptStateTest(Base):
         # and the verify-note pass's own pool listing (loom#2092), and the
         # held pull request wait withdrawal's read of the open tickets
         # (loom#1857), and the invariant pass's read of the queued tickets
-        # for ones with no brief headers (loom#2571).
+        # for ones with no brief headers (loom#2571), and the hourly read of
+        # ready-for-agent issues (loom#3092).
         # The last-pass shipped wait stamp adds one canonical all-repo read.
-        self.assertEqual(self.run_pass().requests, 20)
+        self.assertEqual(self.run_pass().requests, 21)
 
 
 class TicketsTest(unittest.TestCase):
