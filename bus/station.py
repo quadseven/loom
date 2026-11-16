@@ -256,6 +256,8 @@ REASON_MAX = 300
 LANES_MARKER = "<!-- loom:lanes v1 -->"
 LANES_LABEL = "loom:lanes"
 LANES_TITLE = "Loom lane status"
+READY_FOR_AGENT_LABEL = "ready-for-agent"
+TRIAGE_LABEL = "loom:triage"
 URGENT = "loom:urgent"
 REGRESSION = "loom:regression"
 DISCORD_MAX = 2000
@@ -384,6 +386,7 @@ CLOSE_DONE_PER_PASS = 25
 # read from its rewrite comment once and kept in SOURCES_FILE.
 SETTLE_EVERY = 3600
 SETTLE_PER_RUN = 25
+INTAKE_PER_RUN = 20
 REPO_ACCESS_EVERY = 3600
 REPO_ACCESS_FILE = "repo_access.json"
 SOURCES_FILE = "sources.json"
@@ -3175,6 +3178,58 @@ class Station:
                     raise
                 except (GitHubError, ValueError, OSError) as err:
                     _say("could not finish %s: %s" % (entry, err))
+
+    def _intake_ready_for_agent(self) -> None:
+        """Add loom:triage to ready-for-agent issues that have no Loom labels,
+        are not epics, have no assignee, and no claim:* label.
+        Processes at most INTAKE_PER_RUN issues per run, oldest first."""
+        triaged = 0
+        for repo in self.s.repos:
+            if triaged >= INTAKE_PER_RUN:
+                break
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                resp = self.gh.rest(
+                    "GET",
+                    "/repos/%s/issues?labels=%s&state=open&per_page=100&sort=created&direction=asc"
+                    % (repo, READY_FOR_AGENT_LABEL))
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("intake failed for %s: %s" % (repo, err))
+                continue
+            items = resp.data if isinstance(resp.data, list) else []
+            for item in items:
+                if triaged >= INTAKE_PER_RUN:
+                    break
+                if not isinstance(item, dict) or "pull_request" in item:
+                    continue
+                names = _label_names(item)
+                # Skip if any loom:* label
+                if any(n.startswith("loom:") for n in names):
+                    continue
+                # Skip if epic
+                if "epic" in names:
+                    continue
+                # Skip if assignee
+                if item.get("assignees"):
+                    continue
+                # Skip if claim:* label
+                if any(n.startswith("claim:") for n in names):
+                    continue
+                number = item.get("number")
+                if not isinstance(number, int):
+                    continue
+                try:
+                    self._add_label(repo, number, TRIAGE_LABEL)
+                    triaged += 1
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("intake label failed for %s#%d: %s" % (repo, number, err))
+        if triaged:
+            _say("intake: added loom:triage to %d ready-for-agent issue(s)" % triaged)
 
     def _finish_one(self, lane: str, path: str) -> None:
         with open(path, encoding="utf-8") as fh:
@@ -17034,6 +17089,12 @@ class Station:
             self._publish_lanes_when_old()
             self.sync_labels()
             self.finish_claims()
+            try:
+                self._timed(self._intake_ready_for_agent)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError) as err:
+                _say("intake failed: %s" % err)
             try:
                 self._timed(self.tend_runners)
             except RateLimited:

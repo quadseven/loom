@@ -81,6 +81,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:ticket": {"color": "0e8a16", "description": "A ticket issue"},
     "loom:queued": {"color": "c5def5", "description": "Written by the brain, no lane chosen yet"},
     "loom:briefed": {"color": "1d76db", "description": "Assigned to a lane, waiting for the station"},
+    "ready-for-agent": {"color": "c5def5", "description": "Ready for an agent to pick up; not yet a Loom ticket"},
     "loom:running": {"color": "fbca04", "description": "Handed to the lane's runner"},
     "loom:pr": {"color": "0075ca", "description": "The runner opened a pull request"},
     "loom:answered": {"color": "5319e7", "description": "The runner posted an answer for brain review"},

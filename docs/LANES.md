@@ -570,6 +570,15 @@ A new App is easiest made from
 
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
+
+Intake: after finish_claims and before tend_runners, the station reads open
+issues labelled `ready-for-agent` from each `LOOM_REPOS` repo (ETag-paged,
+oldest first). An issue gets `loom:triage` when it has no `loom:*` label, is
+not an epic, has no assignee, and has no `claim:*` label. Issues with any of
+those are skipped. At most `INTAKE_PER_RUN` (20) issues are processed per
+pass. One log line is emitted when any are triaged: `intake: added loom:triage
+to N ready-for-agent issue(s)`.
+
 A free lane takes work: not at a limit, its heartbeat says available, and not
 down or demoted (bus/scorecard.py: `LOOM_LANE_DEMOTE_AT` bad outcomes in
 the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull

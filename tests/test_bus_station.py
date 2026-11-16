@@ -220,6 +220,18 @@ class FakeGitHub:
         self.editors[number] = "<ghost>" if ghost_edit else editor
         self.version += 1
 
+    def add_ready_for_agent(self, number, title="Ready for agent", body="",
+                            author="alice-example", created="2030-01-01T00:00:00Z"):
+        self.issues[number] = {
+            "number": number, "title": title, "body": body, "state": "open",
+            "user": {"login": author}, "created_at": created,
+            "updated_at": created,
+            "labels": [{"name": "ready-for-agent"}],
+        }
+        self.events[number] = []
+        self.comments[number] = []
+        self.version += 1
+
     def names(self, number):
         return [lab["name"] for lab in self.issues[number]["labels"]]
 
@@ -467,6 +479,9 @@ class FakeGitHub:
             return reply(200, self.lanes_issues)
         if "loom:digest" in query:
             return reply(200, self.digest_issues)
+        if "ready-for-agent" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "ready-for-agent" in self.names(i["number"])])
         if "sort=created&direction=asc" in query:
             return reply(200, self.open_issues)
         return self._list_briefed(headers)
@@ -5658,8 +5673,9 @@ class ClaimTest(Base):
         # to find a person wait whose pull request is over (loom#1857); its
         # read is conditional like the verify runs', so the second pass
         # answers it 304 as well.
-        self.assertEqual(len(self.fake.calls), first + 7)
-        self.assertEqual(gh.requests, 10)
+        # +1 for the intake ready-for-agent call (loom#3092)
+        self.assertEqual(len(self.fake.calls), first + 8)
+        self.assertEqual(gh.requests, 11)
         self.assertEqual(gh.not_modified, 2)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
@@ -15668,3 +15684,82 @@ class LunaReviewResultTest(Base):
         self.assertTrue(self.report())
         self.assertEqual(self.verdicts(), [])
         self.assertEqual(self.fake.reviews_posted, [])
+
+
+class ReadyForAgentIntakeTest(Base):
+    """The station adds loom:triage to ready-for-agent issues that have no
+    Loom labels, are not epics, have no assignee, and no claim:* label.
+    Per-run cap is INTAKE_PER_RUN (20), oldest first. One log line per run."""
+
+    def setUp(self):
+        super().setUp()
+        # Ensure the label exists for sync_labels
+        self.settings.repos = [REPO]
+
+    def runner(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def add_ready_issue(self, number, created="2030-01-01T00:00:00Z", **kwargs):
+        self.fake.add_ready_for_agent(number, created=created, **kwargs)
+        return self.fake.issues[number]
+
+    def test_basic_triage_labeling(self):
+        """A ready-for-agent issue with no Loom labels gets loom:triage."""
+        self.add_ready_issue(101)
+        self.runner()._intake_ready_for_agent()
+        self.assertIn("loom:triage", self.fake.names(101))
+        self.assertIn("ready-for-agent", self.fake.names(101))
+
+    def test_skips_issue_with_loom_label(self):
+        """An issue with any loom:* label is skipped."""
+        issue = self.add_ready_issue(102)
+        issue["labels"].append({"name": "loom:ticket"})
+        self.runner()._intake_ready_for_agent()
+        self.assertNotIn("loom:triage", self.fake.names(102))
+
+    def test_skips_epic(self):
+        """An issue with the epic label is skipped."""
+        issue = self.add_ready_issue(103)
+        issue["labels"].append({"name": "epic"})
+        self.runner()._intake_ready_for_agent()
+        self.assertNotIn("loom:triage", self.fake.names(103))
+
+    def test_skips_assigned_issue(self):
+        """An issue with an assignee is skipped."""
+        issue = self.add_ready_issue(104)
+        issue["assignees"] = [{"login": "some-user"}]
+        self.runner()._intake_ready_for_agent()
+        self.assertNotIn("loom:triage", self.fake.names(104))
+
+    def test_skips_claimed_issue(self):
+        """An issue with a claim:* label is skipped."""
+        issue = self.add_ready_issue(105)
+        issue["labels"].append({"name": "claim:codex"})
+        self.runner()._intake_ready_for_agent()
+        self.assertNotIn("loom:triage", self.fake.names(105))
+
+    def test_per_run_cap_oldest_first(self):
+        """At most INTAKE_PER_RUN issues are processed, oldest first."""
+        # Create 25 issues with different created dates
+        base = "2030-01-01T00:00:00Z"
+        for i in range(25):
+            # Each issue 1 hour apart
+            created = f"2030-01-01T{i:02d}:00:00Z"
+            self.add_ready_issue(i + 1, created=created)
+        self.runner()._intake_ready_for_agent()
+        # Only first 20 (oldest) should get loom:triage
+        triaged = [n for n in range(1, 26) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(len(triaged), station.INTAKE_PER_RUN)
+        # Should be the oldest 20 (numbers 1-20)
+        self.assertEqual(triaged, list(range(1, station.INTAKE_PER_RUN + 1)))
+
+    def test_logs_one_line_per_run(self):
+        """One log line with count of issues triaged."""
+        self.add_ready_issue(1)
+        self.add_ready_issue(2)
+        with mock.patch("bus.station._say") as say:
+            self.runner()._intake_ready_for_agent()
+            say.assert_called()
+            args = say.call_args[0][0]
+            self.assertIn("intake", args.lower())
+            self.assertIn("2", args)
