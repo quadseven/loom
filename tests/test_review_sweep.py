@@ -320,8 +320,11 @@ class SweepTest(Base):
         self.assertEqual(self.fake.gets, [])
 
     def test_the_step_runs_in_the_pass(self):
+        # In run_pass ahead of the heavy reads, not in the step loop, which a
+        # spent request target kept from running (#3120).
         import inspect
-        self.assertIn("self.sweep_reviews", inspect.getsource(station.Station._run_steps))
+        self.assertIn("self.sweep_reviews", inspect.getsource(station.Station.run_pass))
+        self.assertNotIn("self.sweep_reviews", inspect.getsource(station.Station._run_steps))
 
 
 class ReportTest(Base):
