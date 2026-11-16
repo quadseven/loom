@@ -188,7 +188,9 @@ unset variables.
   ticket, the station adds `Repairs incident: #N` to the ticket's header
   block and moves it back to `loom:queued` on its lane. Its run then passes
   the red base only if its final check passes (docs/BRIEF_FORMAT.md). The
-  repo's other tickets stay held.
+  repo's other tickets stay held. The factory repo is public, so only
+  comments by a `LOOM_BRIEF_AUTHORS` login count, for the fix and for the
+  last repeat alike: a stranger's comment lifts no hold.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on

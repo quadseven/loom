@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import lock, rebuttal, urgency  # noqa: E402
+from bus import incident_probe, lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -7903,6 +7903,30 @@ class IncidentProbeTest(Base):
         self.probe(lanes=())
         self.assertIn("loom:queued", self.fake.names(13))
         self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_strangers_comment_naming_a_ticket_does_not_lift_its_hold(self):
+        # The factory repo is public: any account may comment on an incident.
+        stranger = {"body": "The fix is %s#13." % REPO,
+                    "created_at": "2030-01-01T00:05:00Z", "user": {"login": "stranger-example"}}
+        trusted = dict(stranger, body="The fix is %s#12." % REPO,
+                       user={"login": AUTHORS[1]})
+        self.open_incident(comments=[stranger, trusted])
+        self.hold(12, 13)
+        self.probe(lanes=())
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertIn("wait:incident", self.fake.names(13))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_strangers_repeat_marked_comment_is_not_the_last_repeat(self):
+        fake_repeat = {"body": incident_probe.REPEAT_MARKER + "\nStill failing",
+                       "created_at": "2030-01-01T00:05:00Z",
+                       "updated_at": "2030-01-01T00:05:00Z", "user": {"login": "stranger-example"}}
+        self.open_incident(created="2020-01-01T00:00:00Z", comments=[fake_repeat])
+        self.hold(12)
+        runner = self.station()
+        self.probe(lanes=(), runner=runner)
+        (found,) = runner._invariant_incidents()
+        self.assertEqual(found.repeat, incident_probe.epoch("2020-01-01T00:00:00Z"))
 
     def test_the_held_note_on_a_ticket_does_not_make_it_the_fix(self):
         # Every held ticket's status section names the incident.

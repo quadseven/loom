@@ -7738,6 +7738,11 @@ class Station:
             if not incident_probe.open_base_check(issue):
                 return False
             comments = self._paginate("/repos/%s/issues/%d/comments?per_page=100" % (repo, number))
+            # The factory repo is public: anyone may comment there, so only a
+            # trusted login's comment names a fix or counts as a repeat.
+            trusted = {a.lower() for a in self.s.authors}
+            comments = [c for c in comments if isinstance(c, dict)
+                        and tickets._login(c.get("user")).lower() in trusted]
         except RateLimited:
             raise
         except GitHubError as err:
