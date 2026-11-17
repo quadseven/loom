@@ -2467,7 +2467,9 @@ image (a fingerprint of the image's packages and tools, `<ticket>.image`).
 When the last failure exited 125 to 127 (the check could not run: a tool the
 image lacks, such as `ruff`), a moved head does not lift the stop, because no
 commit on the repo can add a tool to the image; only a new image or the day
-probe below does. One run records two failures, because a red check runs twice. A failed `setup:`
+probe below does. A red check runs twice, so one run of it records two
+failures. A check that cannot start records one row, so it stops the repo on
+that slot after one run, since no retry can add the tool. A failed `setup:`
 counts too. A check that passed on its second run counts for nothing, and only
 a fix round's default-branch rows count. A day with no report from the slot
 lets one run through, because only a run can show a new image.
