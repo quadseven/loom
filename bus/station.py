@@ -5967,16 +5967,23 @@ class Station:
             return False
         number = int(issue["number"])
         reason = "held: %s has %d open pull requests (cap %d)" % (repo, count, cap)
+        if not self._build_only(repo, number) or self._last_repo_pr_hold(repo, number) != reason:
+            return False
+        _say(reason)
+        self._cap_held.add("%s#%d" % (repo, number))
+        return True
+
+    def _build_only(self, repo: str, number: int) -> bool:
+        """The ticket has no live fix round, so the cap holds it: a fix round
+        is claimed over the cap. An unusable fix comment is not build-only;
+        it takes the full claim path. Reads its comments, which the station
+        keeps per issue stamp."""
         comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
         try:
             fix, _ = self._live_fix(repo, number, self._fix_for(repo, comments))
         except ValueError:
             return False
-        if fix is not None or self._last_repo_pr_hold(repo, number) != reason:
-            return False
-        _say(reason)
-        self._cap_held.add("%s#%d" % (repo, number))
-        return True
+        return fix is None
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
         notes = []
@@ -16241,10 +16248,23 @@ class Station:
         """The factory for the steps that count lane load (run and
         assign_queued), told which repos are at their open pull request cap.
         Only these read the counts, so a factory built for one ticket's check
-        costs no pull request list."""
+        costs no pull request list. Each briefed build ticket of a capped repo
+        is held, so the factory neither counts it as lane load nor moves it as
+        stalled; a briefed fix round is claimed over the cap and stays load."""
         runner = self._factory()
         runner.capped = set(self._capped_repos(
             [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]))
+        for repo in sorted(runner.capped):
+            try:
+                for issue in self._poll(repo):
+                    if self._build_only(repo, int(issue["number"])):
+                        runner.held.add("%s#%d" % (repo, int(issue["number"])))
+            except RateLimited:
+                raise
+            except TargetReached:
+                break
+            except GitHubError as err:
+                _say("could not read the cap-held tickets of %s: %s" % (repo, err))
         return runner
 
     def _capped_repos(self, repos: Sequence[str]) -> List[str]:

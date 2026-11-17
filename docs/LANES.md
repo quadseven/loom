@@ -589,9 +589,10 @@ inbox never means a briefed ticket is stale. Not load:
 
 - a ticket the station holds for a factory incident (`factory_held.json`);
 - a ticket the unproven-work gate refused this pass;
-- a briefed ticket of a repo whose counted open pull requests reach its cap
-  (`LOOM_REPO_OPEN_PR_CAP`, default 8), read from the station's per-pass
-  count, not from how far the claim pass got. A queued ticket of such a repo
+- a briefed build ticket of a repo whose counted open pull requests reach its
+  cap (`LOOM_REPO_OPEN_PR_CAP`, default 8), read from the station's per-pass
+  count, not from how far the claim pass got. A briefed fix round is claimed
+  over the cap, so it stays load. A queued ticket of such a repo
   waits (`its repo is at its open pull request cap`) instead of being briefed
   onto a lane. An unread count is no cap here.
 

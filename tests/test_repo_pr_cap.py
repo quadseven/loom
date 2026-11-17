@@ -303,6 +303,16 @@ class CapLoadBeforeClaimTest(Base):
         counter.count_load({REPO: {12: self.fake.issues[12]}})
         self.assertEqual(counter.load.get("codex", 0), 0)
 
+    def test_briefed_fix_round_over_cap_is_still_load(self):
+        # The station claims a fix round over the cap
+        # (test_fix_round_still_dispatches_over_cap), so its lane is busy.
+        self.pulls(9)
+        self.fake.add(12)
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
     def test_briefed_ticket_under_cap_is_still_load(self):
         self.pulls(7)
         self.fake.add(12)

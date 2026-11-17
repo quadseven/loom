@@ -1991,8 +1991,8 @@ class Factory:
         # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
         # The repos at their open pull request cap by the station's count this
-        # pass: it claims none of their build tickets, so a briefed one is not
-        # lane load and a queued one is not briefed (loom#3158).
+        # pass: it claims none of their build tickets, so a queued one is not
+        # briefed (loom#3158). Their briefed build tickets come in `held`.
         self.capped = set(capped)
         # Lane -> seconds since its last heartbeat, for each local lane
         # without a live one; silent_running is the lanes found holding a
@@ -4857,7 +4857,7 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
-        if "%s#%s" % (repo, issue["number"]) in self.held or repo in self.capped:
+        if "%s#%s" % (repo, issue["number"]) in self.held:
             # The station holds it (a factory incident, the unproven-work
             # gate this pass, or its repo's open pull request cap): no lane is
             # late, so it is neither spread nor moved as stalled. Moving it
@@ -5235,16 +5235,15 @@ class Factory:
         """Count the briefed and running tickets on each lane, reading every
         repo's tickets unless they are given. A ticket the station holds is
         not load: one held for a factory incident kept its idle lane from
-        every queued ticket until the incident closed (2026-10-18). Nor is a
-        briefed ticket of a repo at its open pull request cap: known only as
-        far as the claim pass got, 68 such tickets kept nine medium lanes idle
-        on 2026-11-17 (loom#3158). A running ticket is always load."""
+        every queued ticket until the incident closed (2026-10-18). The
+        station holds each briefed build ticket of a repo at its open pull
+        request cap (Station._load_factory): known only as far as the claim
+        pass got, 68 such tickets kept nine medium lanes idle on 2026-11-17
+        (loom#3158)."""
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for repo, issue in ((r, i) for r, found in tickets.items() for i in found.values()):
             if "%s#%s" % (repo, issue["number"]) in self.held:
-                continue
-            if repo in self.capped and _state(issue) == "briefed":
                 continue
             if (_state(issue) in ("briefed", "running")
                     or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
