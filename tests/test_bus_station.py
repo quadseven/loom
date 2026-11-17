@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import incident_probe, lock, rebuttal, urgency  # noqa: E402
+from bus import human_claims, incident_probe, lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -15797,3 +15797,58 @@ class ReadyForAgentIntakeTest(Base):
         said = self.intake()
         self.assertIn("loom:triage", self.fake.names(21))
         self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+
+class HumanClaimTest(Base):
+    """A second operator's session claims an issue by assigning its login and
+    commenting a fixed phrase (bus/human_claims.py). The ready-for-agent
+    intake and a lane claim both leave such an issue alone."""
+
+    LOGIN = "ccqw"
+    PHRASE = human_claims.DEFAULT.split(":", 1)[1]
+
+    def setUp(self):
+        super().setUp()
+        self.fake.default_body = BODY_WITH_CRITERIA
+
+    def claim(self, number, by=None):
+        self.fake.comments[number].append({"user": {"login": by or self.LOGIN},
+                                           "body": self.PHRASE + ", working it now."})
+        self.fake.issues[number]["comments"] = len(self.fake.comments[number])
+
+    def quiet(self, step):
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch("bus.station._say"):
+            step()
+
+    def test_the_intake_skips_a_ready_issue_with_the_claim_comment(self):
+        for number in (21, 22):
+            self.fake.add_open_issue(number)
+            self.fake.issues[number]["labels"] = [{"name": "ready-for-agent"}]
+        self.claim(21)
+        self.claim(22, by="stranger")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.quiet(runner.intake_ready_for_agent)
+        self.assertNotIn("loom:triage", self.fake.names(21))
+        self.assertIn("loom:triage", self.fake.names(22))
+
+    def test_the_intake_reads_no_comments_of_an_issue_with_none(self):
+        self.fake.add_open_issue(21)
+        self.fake.issues[21].update(labels=[{"name": "ready-for-agent"}], comments=0)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.quiet(runner.intake_ready_for_agent)
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertFalse([p for p in self.fake.paths("GET") if "/issues/21/comments" in p])
+
+    def test_a_lane_never_claims_a_ticket_with_the_claim_comment(self):
+        self.fake.add(12)
+        self.claim(12)
+        self.quiet(self.run_pass)
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+
+    def test_a_lane_never_claims_a_ticket_assigned_to_the_claim_login(self):
+        self.settings.briefers = [self.LOGIN]
+        self.fake.add(12, author=self.LOGIN)
+        self.fake.issues[12]["assignees"] = [{"login": self.LOGIN}]
+        self.quiet(self.run_pass)
+        self.assertEqual(self.listing(), [])

@@ -196,7 +196,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import no_change
+from . import human_claims, no_change
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
@@ -2010,6 +2010,17 @@ class Factory:
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
 
+    def _human_holder(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+        """The login of a person's session that claims the issue by
+        assignment or by its claim comment (bus/human_claims.py), else None.
+        Asked only of a ticket about to get a lane; its comments are read
+        once a pass, and only when it has any."""
+        reader = getattr(self, "_human_reader", None)
+        if reader is None:
+            reader = self._human_reader = human_claims.Reader(
+                lambda r, n: self.gh.paginate("/repos/%s/issues/%d/comments" % (r, n)))
+        return reader.holder(repo, issue)
+
     def _trusted_comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """A pull request's comments by trusted logins, in order: anyone can
         comment on a public repo, so a marker counts only from these. By
@@ -3631,7 +3642,7 @@ class Factory:
         conflict round once per head after 24 hours. Explicit claims,
         brain holds and running tickets always keep their work."""
         labels = _labels(issue)
-        if self._conflict_hygiene_held(labels):
+        if self._conflict_hygiene_held(labels) or self._human_holder(repo, issue):
             return
         handoff = HANDOFF_LABEL in labels
         if handoff and not self._handoff_is_aged(repo, issue):
@@ -5203,6 +5214,9 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        person = self._human_holder(repo, issue)
+        if person:
+            return "%s is claimed by %s" % (ref, person)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)

@@ -876,6 +876,17 @@ only what is its own, and adding an operator is configuration:
   theirs names it, the station removes the claim label and unassigns them,
   at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
   Loom's like any unowned one. A label removal sends no email.
+- A person's session may claim by assignment and a comment instead of a
+  label (`bus/human_claims.py`). `LOOM_HUMAN_CLAIMS` names each such claim as
+  `<login>:<phrase>`, entries split by `;`; unset is the built-in default and
+  `off` turns it off. An issue assigned to that login, or with a comment by
+  that login carrying the phrase (any case), is never taken: the
+  ready-for-agent intake, brain triage, a brief that rewrites it, a lane claim,
+  the factory's lane assignment, the hand-off pool return and conflict
+  recovery all skip it. The comments are read only for an issue about to be
+  taken that has any, once per issue state. No reaper releases such a claim:
+  the stale-claim release never unassigns that login, and the claim referee
+  leaves every claim on such an issue.
 - A Loom's own claim lapses too. The same hourly step reads each open ticket
   carrying this Loom's `claim:<login>` label and a Loom label (`loom:*`,
   `wait:*` or `needs-brain`). When it is not `loom:running`, nothing on its

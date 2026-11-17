@@ -48,6 +48,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
+from . import human_claims
 from .stale_claims import CLAIM_PREFIX, OVERFLOW_CLAIM, outside_hold, _login, _made_by, _stamp, loom_managed, running
 
 ENGINE_CLAIMS = ("claim:claude-code", "claim:muse", "claim:dot", "claim:ccqw")
@@ -232,10 +233,14 @@ def plan(issue: Dict[str, Any], timeline: Iterable[Any], now: float,
     one put on first. The one kept: when the issue may expire, it was idle
     IDLE seconds, and no stated wait or open pull request holds it. Only the claimer and `trusted`
     count, never `station`. A claim whose putting-on the timeline does not
-    show leaves the issue for a later pass, however many claims it has."""
+    show leaves the issue for a later pass, however many claims it has.
+    An issue a person's session holds (bus/human_claims.py) keeps every
+    claim it carries."""
     if outside_hold(issue):
         return []
     events = [e for e in timeline if isinstance(e, dict)]
+    if human_claims.holder(issue, events):
+        return []
     claims = engine_claims(issue, engine_labels)
     put: Dict[str, PutOn] = {}
     for label in claims:

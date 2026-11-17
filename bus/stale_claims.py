@@ -32,6 +32,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
+from . import human_claims
+
 CLAIM_PREFIX = "claim:"
 # Outside work under the Overflow ledger. A person's claim, not an engine's: it
 # never expires, nothing removes it, and every path that briefs, escalates or
@@ -114,8 +116,12 @@ def stale(issue: Dict[str, Any], timeline: Iterable[Any], login: str, label: str
           now: float, idle_seconds: float) -> bool:
     """The claim is idle: no act of the claimer's on the issue, the claim
     label's last putting-on, nor the issue's creation is within idle_seconds,
-    and no open pull request of theirs names it."""
+    and no open pull request of theirs names it. A person's session's claim
+    (bus/human_claims.py: an assignment or its claim comment) is never
+    stale."""
     events = [e for e in timeline if isinstance(e, dict)]
+    if human_claims.holder(issue, events):
+        return False
     if any(_open_pull_of(e, login.lower()) for e in events):
         return False
     newest = [t for t in (last_touch(events, login), _claimed_at(events, label),
@@ -130,8 +136,10 @@ def claimers(issue: Dict[str, Any], ours: Iterable[str],
     assignment to one of `operators` (LOOM_TRUSTED_BRIEFERS) or to a login a
     claim label names. Empty when the issue is also assigned to anyone else:
     a person this Loom knows nothing of owns it, and it is never released.
-    Empty under outside_hold too: no claim on a held issue is released."""
-    if outside_hold(issue):
+    Empty under outside_hold too: no claim on a held issue is released. Empty
+    on an issue assigned to a person's session's claim login
+    (bus/human_claims.py): that login is never unassigned."""
+    if outside_hold(issue) or human_claims.assigned(issue):
         return {}
     mine = {x.lower() for x in ours}
     known = {x.lower() for x in operators}

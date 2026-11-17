@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -4224,7 +4224,19 @@ def _check_rewritable(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     names = _labels(issue)
     if "loom:ticket" in names or "loom:rewritten" in names:
         raise ValueError("#%d is already a ticket or already rewritten" % number)
+    person = _human_holder(gh, repo, issue)
+    if person:
+        raise ValueError("#%d is claimed by %s, a person's session; leave it to them"
+                         % (number, person))
     return issue
+
+
+def _human_holder(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+    """The login of a person's session that claims the issue by assignment
+    or by its claim comment (bus/human_claims.py). The comments are read only
+    when the issue has some."""
+    return human_claims.Reader(
+        lambda r, n: gh.paginate("/repos/%s/issues/%d/comments" % (r, n))).holder(repo, issue)
 
 
 def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
@@ -4465,7 +4477,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             break
         number = int(issue["number"])
         skip = _triage_skip(issue, authors, briefers, journals)
-        if skip:
+        if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
         if not missing:
