@@ -3897,7 +3897,9 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
-BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+# A body edited in the GitHub web editor ends its lines in CRLF, so the
+# line may end in a carriage return before the newline (loom#3115).
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*\r?$", re.M | re.I)
 
 
 def _builds_on_base(gh: GitHub, repo: str, body: str,
