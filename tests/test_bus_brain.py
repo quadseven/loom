@@ -1524,6 +1524,16 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
         self.assertEqual(tickets.priority_of(made), "P1")
 
+    def test_brief_foundational_writes_the_foundational_line(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
+                    difficulty="medium", priority="P1", foundational=True)
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        self.assertTrue(made["body"].startswith(
+            "Difficulty: medium\nPriority: P1\nFoundational: yes\n\n"))
+        self.assertTrue(tickets.foundational(made))
+
     def test_brief_repair_marker_survives_ticket_rendering(self):
         fake = Fake(reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))

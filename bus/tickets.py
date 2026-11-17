@@ -167,7 +167,7 @@ def rewritten_source(body: Any) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Foundational|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -264,6 +264,8 @@ _HEADER_RULES = {
     "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
               lambda v: "After: %r is not a list of tickets like '#5' or "
                         "'owner/name#7, #8'" % v),
+    "Foundational": (lambda v: v == "yes",
+                     lambda v: "Foundational: must be yes"),
     "Deliverable": (lambda v: v == "answer",
                     lambda v: "Deliverable: must be answer"),
 }
@@ -376,10 +378,33 @@ def _names(issue: Dict[str, Any]) -> set:
             for x in issue.get("labels") or []}
 
 
+def blocking_count(issue: Dict[str, Any]) -> int:
+    """How many open issues wait on this one, from the dependency summary the
+    issue listing already carries (no request of its own); 0 when it has none
+    or the value is not a count."""
+    summary = issue.get("issue_dependencies_summary")
+    count = summary.get("blocking") if isinstance(summary, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+
+
+def foundational(issue: Dict[str, Any]) -> bool:
+    """Whether the ticket's brief carries `Foundational: yes`: the brain
+    marks an epic child its siblings build on (docs/BRIEF_FORMAT.md)."""
+    try:
+        return parse(issue.get("body"))[0].get("Foundational") == "yes"
+    except ValueError:
+        return False
+
+
 def work_order(repo: str, issue: Dict[str, Any]) -> Tuple[Any, ...]:
     """The sort key every queue uses: a FIRST_LABELS ticket first, then by
-    priority (P0 first), then the oldest."""
+    priority (P0 first), then the ticket that blocks the most open issues,
+    then a Foundational: yes ticket, then the oldest. Priority stays ahead
+    of the blocking terms: a P3 blocker never jumps a P1 leaf. 2026-11-16:
+    a leaf filed earlier took the only free lane while the ticket others
+    waited on stayed queued (loom#3130)."""
     return (not (_names(issue) & set(FIRST_LABELS)), PRIORITIES.index(priority_of(issue)),
+            -blocking_count(issue), not foundational(issue),
             str(issue.get("created_at") or ""), repo, int(issue.get("number") or 0))
 
 
@@ -831,7 +856,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if demoted_models:
         out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
-            if k not in ("Not before", "After", "Priority")]
+            if k not in ("Not before", "After", "Priority", "Foundational")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":
         # A hard ticket runs the lane's strongest model, not its default.
         from .factory import HARD_MODELS  # factory imports this module

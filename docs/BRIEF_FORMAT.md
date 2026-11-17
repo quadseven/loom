@@ -62,9 +62,14 @@ request: a pass closes the incident and moves the brief to `done/`, a fail
 updates the incident and parks the brief (docs/LANES.md). Any `Deliverable:`
 value other than `answer`, `verify`, `review` or `base-check` parks the brief.
 
-The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
-what order the station claims it (docs/BRAIN.md); they stay on the ticket and
-are not written into the brief.
+The ticket's `Not before:`, `After:`, `Priority:` and `Foundational:` lines
+decide when and in what order the station claims it (docs/BRAIN.md); they
+stay on the ticket and are not written into the brief.
+
+`Foundational: yes` marks an epic child that its siblings build on.
+`bus.brain brief --foundational` writes it in the ticket's header block; any
+other value is refused. At the same priority, a ticket that blocks more open issues
+goes first, then a `Foundational: yes` ticket, then the oldest.
 
 Right after the ticket body, a build brief carries a `## Proof checks`
 section: each acceptance criterion restated as the check that proves it
