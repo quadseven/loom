@@ -218,6 +218,9 @@ class FakeGitHub:
         m = re.search(r"/actions/jobs/(\d+)/logs$", path)
         if m:
             return Response(302, None, headers={"location": "https://logs.example.com/" + m.group(1)})
+        if re.search(r"/pulls\?state=open&per_page=100&page=\d+$", path):
+            # The station's open pull request count for the cap (loom#3158).
+            return Response(200, [])
         raise AssertionError("unexpected GET %s" % path)
 
     def transport(self, method, url, headers, body):
