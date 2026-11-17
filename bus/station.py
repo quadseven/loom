@@ -5642,6 +5642,8 @@ class Station:
             _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
                 "%s (%s)" % (a.short, a.why) for a in waiting)))
             return False
+        if self._blocked(repo, issue):
+            return False
         fresh = self._issue(repo, int(issue["number"]))
         labelled_lane = _lane_of(issue)
         if not self._still_ours(fresh, labelled_lane or lane):
@@ -5677,6 +5679,28 @@ class Station:
                  % (repo, fresh["number"], lane))
             return False
         return self._claim(repo, lane, fresh)
+
+    def _blocked(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a briefed ticket waits on an open blocker: its brief's
+        Blocked on section, or GitHub's "blocked by" relationship, through the
+        factory's reader (factory.open_blockers), so a ticket with neither
+        costs no request and a blocker read that fails holds. A held ticket
+        keeps its lane and gets wait:blocked and one status note naming its
+        blockers; the claim clears the label on the first pass after they
+        close. 2026-11-16: the blocked-by hold ran only when the factory laned
+        a queued ticket, so a ticket briefed straight to a lane was claimed on
+        a base that lacked its prerequisite (loom#3129)."""
+        blockers = factory.open_blockers(self.gh, repo, issue, self._dependency)
+        if not blockers:
+            return False
+        number = int(issue["number"])
+        reason = "blocked on %s" % ", ".join(blockers)
+        if WAIT + "blocked" not in _label_names(issue):
+            self._set_wait(repo, issue, "blocked")
+            self._routine(repo, number, "Waits: %s. A lane claims it on the first pass "
+                                        "after they close." % reason)
+        _say("%s#%s waits: %s" % (repo, number, reason))
+        return True
 
     def _status_texts(self, repo: str, number: int) -> List[str]:
         """The texts of the ticket's comments and status events written by a
