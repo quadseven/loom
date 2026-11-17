@@ -200,6 +200,13 @@ SESSION_UNSENT_KEEP = 24 * 3600
 # check copy and idle run scratch go at once, not after TREE_KEEP.
 TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
                               "loom:closed-unmerged"))
+# The ticket states a merged pull request that names the ticket may deliver
+# straight to loom:merged (Station._deliver_unlinked). Running, answered and
+# failed only from a branch outside loom/: a lane run reports its own pull
+# request. 2026-11-10: a fix merged from a muse/ branch left its ticket at
+# loom:queued on a lane for 3 days (loom#2938).
+UNLINKED_STATES = ("loom:queued", "loom:briefed", "loom:running", "loom:answered",
+                   "loom:failed")
 # A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
 # this is never removed: a runner may have just made it.
 RUN_SCRATCH_SETTLE = 600
@@ -6550,16 +6557,17 @@ class Station:
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-        """The repo's open tickets at loom:queued or loom:briefed that a
-        briefing login filed, by number. The open-tickets list is the verify
-        runs' own read, so a pass that reads both pays for it once; with no
-        such ticket and no loom:pr ticket, no closed pull request is read."""
+        """The repo's open tickets at a state a merged pull request may
+        deliver (UNLINKED_STATES) that a briefing login filed, by number. The
+        open-tickets list is the verify runs' own read, so a pass that reads
+        both pays for it once; with no such ticket and no loom:pr ticket, no
+        closed pull request is read."""
         out: Dict[int, Dict[str, Any]] = {}
         for issue in found:
             if (isinstance(issue, dict) and "pull_request" not in issue
                     and int(issue.get("number") or 0) not in linked
                     and "loom:ticket" in _label_names(issue)
-                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))
+                    and set(_label_names(issue)).intersection(UNLINKED_STATES)
                     and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)):
                 # The trust check reads the repo owner from repository_url.
                 issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
@@ -6581,30 +6589,68 @@ class Station:
 
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
-        """Move a queued or briefed ticket to loom:merged when this merged
-        pull request delivers it: a same-repo branch, linked to the ticket,
-        by a trusted author of a trusted ticket or by the contributor who
-        owns it, and merged after the ticket last went to queued or briefed."""
+        """Move a waiting ticket (UNLINKED_STATES) to loom:merged when this
+        merged pull request delivers it: a same-repo branch, linked to the
+        ticket, by a trusted author of a trusted ticket or by the contributor
+        who owns it, and merged after the ticket last went to queued or
+        briefed. A running, answered or failed ticket only from a branch
+        outside loom/. A branch outside loom/ also takes the lane label off,
+        and its note names the merge commit (loom#2938)."""
         number = self._pr_ticket_number(repo, pr)
         ticket = unlinked.get(number) if number is not None else None
-        if ticket is None or not _linked_pr(ticket, repo, pr):
+        was = self._deliverable(repo, pr, ticket) if ticket is not None else None
+        if was is None:
             return
-        head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-        if head_repo != repo:
+        self._reconcile_pr_ticket(repo, pr, {number: ticket})
+        if "loom:merged" not in _label_names(ticket):
             return
+        del unlinked[number]
+        note = ("Pull request #%d merged while this ticket was at %s, so it moved to "
+                "loom:merged." % (int(pr["number"]), was))
+        branch = str((pr.get("head") or {}).get("ref") or "")
+        if not branch.startswith("loom/"):
+            self._drop_lane_label(repo, ticket)
+            note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
+                     "ticket no longer holds a lane." % (
+                         branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
+            _say("%s#%d merged from a non-lane branch: pull request #%d"
+                 % (repo, number, int(pr["number"])))
+        self._comment(repo, number, note, notify.MERGED)
+
+    def _deliverable(self, repo: str, pr: Dict[str, Any],
+                     ticket: Dict[str, Any]) -> Optional[str]:
+        """The state (UNLINKED_STATES) the ticket leaves when this merged pull
+        request delivers it, or None when it may not: another repo's branch,
+        no link, a lane branch for a ticket past briefed (its run reports its
+        own pull request), an author who may not deliver it, or a merge before
+        the ticket last went back to queued or briefed."""
+        number = int(ticket["number"])
+        head = pr.get("head") or {}
+        if (str((head.get("repo") or {}).get("full_name") or "") != repo
+                or not _linked_pr(ticket, repo, pr)):
+            return None
+        labels = _label_names(ticket)
+        was = next((s for s in UNLINKED_STATES if s in labels), "loom:queued")
+        if str(head.get("ref") or "").startswith("loom/") and was not in (
+                "loom:queued", "loom:briefed"):
+            return None
         if not self._deliver_trusted_author(repo, ticket, pr):
-            return
+            return None
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
+            return None
+        return was
+
+    def _drop_lane_label(self, repo: str, ticket: Dict[str, Any]) -> None:
+        """Take the lane: labels off a ticket a pull request outside loom/
+        delivered: no lane run holds it, and the label read as lane load."""
+        names = _label_names(ticket)
+        kept = [n for n in names if not n.startswith("lane:")]
+        if kept == names:
             return
-        labels = _label_names(ticket)
-        was = "loom:briefed" if "loom:briefed" in labels else "loom:queued"
-        self._reconcile_pr_ticket(repo, pr, {number: ticket})
-        if "loom:merged" in _label_names(ticket):
-            del unlinked[number]
-            self._comment(repo, number, "Pull request #%d merged while this ticket was at %s, "
-                          "so it moved to loom:merged." % (int(pr["number"]), was),
-                          notify.MERGED)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(ticket["number"])),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": n} for n in kept]
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
