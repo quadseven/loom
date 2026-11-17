@@ -2232,9 +2232,24 @@ READY_SHADOW_TEXT = ("Ready: checks and review passed on head %s; shadow mode ho
 # The newest merged pull requests of a repo, for the digest's count of lane
 # merges by actor (Station._digest_merge_line). REST lists carry no merged_by.
 MERGED_PULLS_QUERY = (
-    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
-    "pullRequests(states:MERGED,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){"
-    "nodes{headRefName mergedAt mergedBy{login}}}}}")
+    "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
+    "pullRequests(states:MERGED,first:100,after:$after,"
+    "orderBy:{field:UPDATED_AT,direction:DESC}){"
+    "nodes{headRefName mergedAt updatedAt mergedBy{login}} "
+    "pageInfo{hasNextPage endCursor}}}}")
+# Pages of MERGED_PULLS_QUERY read a repo at most: the pages come newest
+# update first and stop at the first pull request updated before the window,
+# so this bounds only a window with more merges than it covers.
+MERGED_PULLS_PAGES = 10
+
+
+def merge_actor(login: str, own: str, bots: Set[str]) -> str:
+    """Who merged a lane pull request: "factory" for the station's own login,
+    "brain" for another App login among the trusted authors, else "other"."""
+    login = _bare_login(login)
+    if login and login == own:
+        return "factory"
+    return "brain" if login in bots else "other"
 
 
 def _bare_login(login: str) -> str:
@@ -11430,43 +11445,57 @@ class Station:
         """How many lane pull requests (head loom/...) merged since `since`,
         by actor: the factory (this station's own login), the brain (another
         App login among the trusted authors) or other (a person or an outside
-        session). One GraphQL read a repo. 2026-11-01: 30 of 36 lane merges
-        in a day were by outside sessions while the Ready line said the
-        factory lands them, and nothing measured it (loom#2432). The own
-        login is the App's or LOOM_GITHUB_LOGIN; a station on a personal token
-        sets neither, and its merges count as other."""
+        session). 2026-11-01: 30 of 36 lane merges in a day were by outside
+        sessions while the Ready line said the factory lands them, and nothing
+        measured it (loom#2432). The own login is the App's or
+        LOOM_GITHUB_LOGIN; a station on a personal token sets neither, and its
+        merges count as other. A repo whose read fails is named on the line."""
         own = _bare_login(self.gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", ""))
         bots = {_bare_login(a) for a in self.s.authors if a.lower().endswith("[bot]")} - {own}
         counts = {"factory": 0, "brain": 0, "other": 0}
         unread = []
-        for repo in self.s.repos:
-            if not tickets.REPO_RE.fullmatch(repo):
-                continue
-            owner, name = repo.split("/")
+        for repo in (r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)):
             try:
-                data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name})
+                mergers = self._lane_mergers(repo, since)
             except RateLimited:
                 raise
             except GitHubError:
                 unread.append(repo)
                 continue
-            nodes = ((((data or {}).get("repository") or {}).get("pullRequests") or {})
-                     .get("nodes") or [])
-            for node in nodes if isinstance(nodes, list) else []:
-                if not isinstance(node, dict) or not str(node.get("headRefName") or "").startswith("loom/"):
-                    continue
-                merged = self._epoch(str(node.get("mergedAt") or ""))
-                if merged is None or merged < since:
-                    continue
-                login = _bare_login(str((node.get("mergedBy") or {}).get("login") or ""))
-                counts["factory" if login and login == own
-                       else "brain" if login in bots else "other"] += 1
+            for login in mergers:
+                counts[merge_actor(login, own, bots)] += 1
         line = ("Lane pull requests merged since the last digest: %d (factory %d, brain %d, "
                 "other %d)." % (sum(counts.values()), counts["factory"], counts["brain"],
                                 counts["other"]))
         if unread:
             line += " Not read: %s." % ", ".join(unread)
         return line
+
+    def _lane_mergers(self, repo: str, since: float) -> List[str]:
+        """The merger login of each lane pull request (head loom/...) of the
+        repo merged since `since`, paging MERGED_PULLS_QUERY newest update
+        first until a pull request was last updated before `since` (a merge
+        updates it, so none older can have merged in the window), at most
+        MERGED_PULLS_PAGES pages. Raises GitHubError when a read fails."""
+        owner, name = repo.split("/")
+        found: List[str] = []
+        after: Optional[str] = None
+        for _ in range(MERGED_PULLS_PAGES):
+            data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name,
+                                                        "after": after})
+            pulls = (((data or {}).get("repository") or {}).get("pullRequests") or {})
+            nodes = pulls.get("nodes") if isinstance(pulls.get("nodes"), list) else []
+            for node in (n for n in nodes if isinstance(n, dict)):
+                merged = self._epoch(str(node.get("mergedAt") or ""))
+                if (str(node.get("headRefName") or "").startswith("loom/")
+                        and merged is not None and merged >= since):
+                    found.append(str((node.get("mergedBy") or {}).get("login") or ""))
+            page = pulls.get("pageInfo") or {}
+            oldest = self._epoch(str((nodes[-1] if nodes else {}).get("updatedAt") or ""))
+            if not page.get("hasNextPage") or oldest is None or oldest < since:
+                return found
+            after = page.get("endCursor")
+        return found
 
     def _digest_shadow_lines(self, since: float) -> List[str]:
         """What shadow mode held since the last digest (bus/shadow.py): at

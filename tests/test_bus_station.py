@@ -511,8 +511,12 @@ class FakeGitHub:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
         if "mergedBy" in query:
             # The digest's lane merge count (loom#2432).
+            pages = getattr(self, "merged_pages", None) or [getattr(self, "merged_pulls", [])]
+            index = int(variables.get("after") or 0)
             return reply(200, {"data": {"repository": {"pullRequests": {
-                "nodes": getattr(self, "merged_pulls", [])}}}})
+                "nodes": pages[index],
+                "pageInfo": {"hasNextPage": index + 1 < len(pages),
+                             "endCursor": str(index + 1)}}}}})
         editor = self.editors[data["variables"]["number"]]
         # GitHub's GraphQL names an App by its slug, typed Bot, without "[bot]".
         actor = ({"__typename": "Bot", "login": editor[:-len("[bot]")]}
@@ -10821,6 +10825,31 @@ class ReportDigestTest(Base):
             self.at(10, 1)
         self.assertIn("Lane pull requests merged since the last digest: 4 "
                       "(factory 2, brain 1, other 1).", self.sent[0]["content"])
+
+    def test_the_merge_count_pages_until_the_window_ends(self):
+        # Elder review of the PR for loom#2432: a repo with over 100 merged
+        # pull requests hid lane merges past the first page.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base + 9.5 * 3600))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 3 * 86400))
+        fresh = {"headRefName": "loom/1-a", "mergedAt": stamp, "updatedAt": stamp,
+                 "mergedBy": {"login": "someone-else"}}
+        stale = {"headRefName": "loom/9-z", "mergedAt": old, "updatedAt": old,
+                 "mergedBy": {"login": "someone-else"}}
+        # Three pages: two in the window, then one past it; a fourth page
+        # would never be read.
+        self.fake.merged_pages = [[fresh, fresh], [fresh, stale], [fresh], [fresh]]
+        self.at(10, 1)
+        self.assertIn("Lane pull requests merged since the last digest: 3 "
+                      "(factory 0, brain 0, other 3).", self.sent[0]["content"])
+
+    def test_a_merger_is_factory_brain_or_other(self):
+        bots = {"loom-brain"}
+        self.assertEqual(station.merge_actor("loom-station[bot]", "loom-station", bots), "factory")
+        self.assertEqual(station.merge_actor("Loom-Brain", "loom-station", bots), "brain")
+        self.assertEqual(station.merge_actor("a-person", "loom-station", bots), "other")
+        self.assertEqual(station.merge_actor("", "", bots), "other")
 
     def test_a_backlog_goal_is_one_digest_line_from_its_tickets(self):
         # 2026-10-25: a per-repo backlog goal posts no report on GitHub; its
