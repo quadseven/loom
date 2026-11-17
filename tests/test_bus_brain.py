@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, hold_boxes, human_claims, journal, metrics, proof, station, text, tickets
+from bus import brain, factory, hold_boxes, journal, metrics, proof, station, text, tickets
 from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -4829,7 +4829,7 @@ class TriageTests(unittest.TestCase):
     def test_triage_leaves_an_issue_a_person_claimed(self):
         # A second operator's session claims by assignment or by a comment
         # carrying its phrase (bus/human_claims.py).
-        phrase = human_claims.DEFAULT.split(":", 1)[1]
+        phrase = "Claimed by ccqw's Claude Code"
 
         class Commented(Routes):
             def _read(self, path):
@@ -5172,7 +5172,7 @@ class HumanAndRefsTests(unittest.TestCase):
     def test_brief_refs_refuses_an_original_a_person_claimed(self):
         # A second operator's session claims by assignment or by a comment
         # carrying its phrase (bus/human_claims.py); no brief takes it.
-        phrase = human_claims.DEFAULT.split(":", 1)[1]
+        phrase = "Claimed by ccqw's Claude Code"
         said = [{"user": {"login": "ccqw"}, "body": phrase}]
         for issue, replies in ((item(6, assignees=[{"login": "ccqw"}]), ()),
                                (item(6, comments=1), (reply(200, said),))):

@@ -6,13 +6,17 @@ phrase. Lanes of this Loom must never take such an issue, and no reaper may
 unassign the login or remove a claim from it.
 
 LOOM_HUMAN_CLAIMS names the claims: entries split by ";" or new lines, each
-`<login>:<phrase>`. Unset or blank is DEFAULT, so the rule holds with no
-change to the station's environment; "off" (or "none") turns it off. The
-phrase is matched case-insensitively anywhere in a comment body, and only in
-a comment the login wrote: anyone can comment on a public repo.
+`<login>:<phrase>|<phrase>...`. A `*` in a phrase stands for any short run
+of text on one line. Unset or blank is DEFAULT, so the rule holds with no
+change to the station's environment; "off" (or "none") turns it off. DEFAULT
+takes both forms the session writes: its hidden claim marker, or "Claimed by
+<anyone>'s Claude Code". A phrase is matched case-insensitively anywhere in
+a comment body, with runs of white space as one space and a typographic
+apostrophe as a plain one, and only in a comment the login wrote: anyone can
+comment on a public repo.
 
 An issue is held (holder) when it is assigned to a claim login, or when the
-claim login wrote a comment carrying its phrase. The assignment is free to
+claim login wrote a comment carrying one of its phrases. The assignment is free to
 check; the comment needs a read, so Reader reads an issue's comments only
 when asked about one that is otherwise about to be taken and only when the
 issue's comment count (GitHub sends it with every issue) is above zero, and
@@ -20,47 +24,74 @@ keeps each answer for the issue's updated_at (a new comment moves it).
 """
 from __future__ import annotations
 
+import functools
 import os
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+import re
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Pattern, Tuple
 
 ENV = "LOOM_HUMAN_CLAIMS"
-DEFAULT = "ccqw:Claimed by Cait's Claude Code"
+DEFAULT = "ccqw:<!-- ccqw:claim v1 -->|Claimed by *'s Claude Code"
 OFF = ("off", "none", "0")
+# The most text a `*` in a phrase stands for.
+WILD_MAX = 80
 # Cached answers kept before the cache is emptied.
 CACHE_MAX = 2000
 
+Claims = Mapping[str, Pattern[str]]
 
-def parse(raw: Optional[str]) -> Dict[str, str]:
-    """{login: phrase}, both lowercased, from a LOOM_HUMAN_CLAIMS value. An
-    entry with no login or no phrase is skipped."""
+
+def _normal(text: str) -> str:
+    """Lowercased, white space runs as one space, a typographic apostrophe as
+    a plain one."""
+    return " ".join(text.replace("\u2019", "'").split()).lower()
+
+
+def _pattern(phrases: List[str]) -> Pattern[str]:
+    """One pattern matching any of `phrases` (already normal)."""
+    wild = "[^\n]{1,%d}?" % WILD_MAX
+    return re.compile("|".join(wild.join(re.escape(part) for part in phrase.split("*"))
+                               for phrase in phrases))
+
+
+def parse(raw: Optional[str]) -> Dict[str, Pattern[str]]:
+    """{login: the pattern its phrases make}, from a LOOM_HUMAN_CLAIMS value.
+    The login is lowercased. An entry with no login or no phrase is skipped.
+    Only the first `:` splits an entry, so a phrase may hold one."""
     raw = (raw or "").strip()
     if not raw:
         raw = DEFAULT
     if raw.lower() in OFF:
         return {}
-    found: Dict[str, str] = {}
+    found: Dict[str, Pattern[str]] = {}
     for entry in raw.replace("\n", ";").split(";"):
-        login, sep, phrase = entry.partition(":")
-        login, phrase = login.strip().lower(), " ".join(phrase.split()).lower()
-        if sep and login and phrase:
-            found[login] = phrase
+        login, sep, rest = entry.partition(":")
+        login = login.strip().lower()
+        phrases = [p for p in (_normal(x) for x in rest.split("|")) if p.strip("* ")]
+        if sep and login and phrases:
+            found[login] = _pattern(phrases)
     return found
 
 
-def configured(env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+@functools.lru_cache(maxsize=8)
+def _parsed(raw: str) -> Dict[str, Pattern[str]]:
+    """parse, once per setting value: ownership asks it of every issue."""
+    return parse(raw)
+
+
+def configured(env: Optional[Mapping[str, str]] = None) -> Dict[str, Pattern[str]]:
     """The claims the environment names (os.environ when env is None)."""
-    return parse((os.environ if env is None else env).get(ENV))
+    return _parsed((os.environ if env is None else env).get(ENV) or "")
 
 
 def _login(value: Any) -> str:
     return str(value.get("login") or "").lower() if isinstance(value, dict) else ""
 
 
-def _claims(claims: Optional[Mapping[str, str]]) -> Mapping[str, str]:
+def _claims(claims: Optional[Claims]) -> Claims:
     return configured() if claims is None else claims
 
 
-def assigned(issue: Dict[str, Any], claims: Optional[Mapping[str, str]] = None) -> Optional[str]:
+def assigned(issue: Dict[str, Any], claims: Optional[Claims] = None) -> Optional[str]:
     """The claim login the issue is assigned to, else None."""
     held = _claims(claims)
     if not held or not isinstance(issue, dict):
@@ -72,7 +103,7 @@ def assigned(issue: Dict[str, Any], claims: Optional[Mapping[str, str]] = None) 
 
 
 def commented(comments: Iterable[Any],
-              claims: Optional[Mapping[str, str]] = None) -> Optional[str]:
+              claims: Optional[Claims] = None) -> Optional[str]:
     """The claim login that wrote a comment carrying its phrase, else None.
     Takes issue comments (user) and timeline commented events (actor)."""
     held = _claims(claims)
@@ -83,15 +114,15 @@ def commented(comments: Iterable[Any],
             continue
         if comment.get("event") not in (None, "commented"):
             continue
-        body = " ".join(str(comment.get("body") or "").split()).lower()
+        body = _normal(str(comment.get("body") or ""))
         for login in {_login(comment.get("user")), _login(comment.get("actor"))}:
-            if login in held and held[login] in body:
+            if login in held and held[login].search(body):
                 return login
     return None
 
 
 def holder(issue: Dict[str, Any], comments: Iterable[Any] = (),
-           claims: Optional[Mapping[str, str]] = None) -> Optional[str]:
+           claims: Optional[Claims] = None) -> Optional[str]:
     """The claim login holding the issue, by assignment or comment."""
     held = _claims(claims)
     return assigned(issue, held) or commented(comments, held)
@@ -108,7 +139,7 @@ class Reader:
     `read` returns an issue's comments: read(repo, number)."""
 
     def __init__(self, read: Callable[[str, int], List[Any]],
-                 claims: Optional[Mapping[str, str]] = None) -> None:
+                 claims: Optional[Claims] = None) -> None:
         self.read = read
         self.claims = claims
         self.cache: Dict[Tuple[str, int, str], Optional[str]] = {}
