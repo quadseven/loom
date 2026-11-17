@@ -87,7 +87,9 @@ class RollClearCloseTest(StationBase):
         self.assertEqual(len(notes), 1)
         self.assertIn(invariants.ROLL_CLEARED_MARKER, notes[0]["body"])
         self.assertTrue(any("closed cleared tracking issue" in line for line in self.said))
-        self.assertTrue(any(i["title"].startswith("Goal home")
+        # The goal-epics-over-cap breaches roll into one tracking issue of
+        # their own (loom#2099).
+        self.assertTrue(any(i["title"].startswith("Invariant: goal-epics-over-cap in ")
                             for i in self.gh.issues.values()))
 
     def test_under_six_hours_stays_open_in_same_busy_pass(self):
