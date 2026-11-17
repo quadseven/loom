@@ -1909,8 +1909,14 @@ A fleet hold blocks too (loom#2393): a plain pull request comment from a
 `LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
 commit, whose text opens with `Not merging` or `Hold` (any letter case, after
 optional whitespace or markdown marks such as `**`, `>` or `#`). A later
-comment by the pull request's author lifts it, as does a later trusted comment
-naming the head commit's sha (7 or more hex characters), or a newer push.
+plain comment by the pull request's author lifts it, as does a later plain
+trusted comment naming the head commit's sha (7 or more hex characters), or
+a newer push. A comment carrying a Loom marker never lifts a hold, whoever
+posts it and whatever sha the marker names: the factory and the brain post
+marker comments (a review-again ask, a reviewer ask, a Luna note, a scope
+hold, a rebuttal refusal) under the same App login that opens lane pull
+requests, so those machine notes leave the hold standing. Only a plain,
+marker-free reply lifts a hold by comment.
 Status prints `held by a fleet comment from LOGIN: <comment link>`, and
 `bus.brain merge` refuses with the same words. Comments that cannot be read
 block as `pull request comments unreadable`. Only the opener counts: no other

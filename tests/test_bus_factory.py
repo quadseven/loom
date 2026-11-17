@@ -1362,6 +1362,17 @@ class PullRequests(Base):
         self.assertEqual(updates, [])
         self.assertIsNone(self.lock_holder)
 
+    def test_a_factory_marker_comment_by_the_author_does_not_lift_a_hold(self):
+        self.hold()
+        self.gh.comments[50].append(
+            {"id": 902, "user": {"login": "alice-example"},
+             "body": "<!-- loom:review-again v1 sha=sha50 -->\n/grug improve",
+             "created_at": "2030-01-01T01:00:00Z"})
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405))
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
     def test_a_hold_stops_the_update_on_a_strict_base(self):
         self.hold()
         with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
