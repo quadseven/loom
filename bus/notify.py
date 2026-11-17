@@ -19,6 +19,8 @@ any direct post to an issue's comments outside this module and its allowlist.
 
 from __future__ import annotations
 
+import re
+import sys
 from typing import Any
 
 # Outcomes a person reads.
@@ -81,14 +83,48 @@ class UnknownKind(ValueError):
     """A comment was offered under a kind outside KINDS."""
 
 
+class EmptyComment(ValueError):
+    """A comment body that renders as nothing on GitHub. GitHub still emails
+    the operator a blank notification for it, so it is never posted."""
+
+
+# An HTML comment, or an unclosed one that hides the rest of the body.
+_HTML_COMMENT = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
+# The tags of a <details> or <summary> shell; any text inside them stays.
+_SHELL_TAG = re.compile(r"</?(?:details|summary)\b[^>]*>", re.I)
+# Characters GitHub renders as nothing.
+_INVISIBLE = re.compile("[%s]|&nbsp;|&#160;|&ZeroWidthSpace;" % "".join(map(chr, (0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF))))
+
+
+def visible_text(body: Any) -> str:
+    """What a reader sees of `body`: the text left after HTML comments,
+    <details>/<summary> tags and invisible characters are removed."""
+    text = _HTML_COMMENT.sub("", str(body or ""))
+    text = _INVISIBLE.sub("", _SHELL_TAG.sub("", text))
+    return text.strip()
+
+
+def check_visible(body: Any, where: str = "a comment") -> None:
+    """Raise EmptyComment, after a line on stderr, when `body` shows nothing.
+    Every new comment Loom posts passes here first."""
+    if visible_text(body):
+        return
+    head = " ".join(str(body or "").split())[:120]
+    print("notify: refused %s with no visible text: %r" % (where, head), file=sys.stderr)
+    raise EmptyComment("%s has no visible text (only markers, empty <details> or "
+                       "whitespace): %r; add a line a reader sees" % (where, head))
+
+
 def post(gh: Any, repo: str, number: Any, body: str, kind: str) -> Any:
     """Post a new comment on issue or pull request `number` of `repo`.
 
     `kind` must be a key of KINDS: any other raises UnknownKind and nothing is
-    sent. Returns the GitHub client's response.
+    sent. A body with no visible text raises EmptyComment and nothing is sent.
+    Returns the GitHub client's response.
     """
     if kind not in KINDS:
         raise UnknownKind("%r is not a comment kind (%s); a routine event is a status "
                           "event, see bus/notify.py" % (kind, ", ".join(sorted(KINDS))))
+    check_visible(body, "a %s comment on %s#%s" % (kind, repo, number))
     return gh.rest("POST", "/repos/%s/issues/%d/comments" % (repo, int(number)),
                    {"body": body})

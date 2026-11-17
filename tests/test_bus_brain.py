@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, hold_boxes, journal, metrics, proof, station, text, tickets
+from bus import brain, factory, hold_boxes, journal, metrics, notify, proof, station, text, tickets
 from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -2783,6 +2783,14 @@ class SensitiveResumeTests(unittest.TestCase):
         fake = Fake(reply(200, {}))
         brain.reply_to_review(GitHub("t", transport=fake), REPO, 8, 42, "Thanks")
         self.assertEqual(len(fake.calls), 1)
+
+    def test_a_reply_with_no_visible_text_is_refused_and_posts_nothing(self):
+        for body in ("<!-- loom:marker -->", "  \n", "<details><summary></summary></details>"):
+            with self.subTest(body=body):
+                fake = Fake()
+                with self.assertRaises(notify.EmptyComment):
+                    brain.reply_to_review(GitHub("t", transport=fake), REPO, 8, 42, body)
+                self.assertEqual(fake.calls, [])
 
     def test_shared_body_checks_refuse_in_reply_brief_and_move(self):
         # Built at run time so this file never holds the handle itself.

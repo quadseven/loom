@@ -15723,6 +15723,12 @@ class RemoteClaimCountTest(unittest.TestCase):
         self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
         self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
 
+    def test_a_heartbeat_with_a_visible_line_after_its_marker_is_read(self):
+        beat = ("<!-- loom:remote-heartbeat v1 muse %d -->\nRemote lane muse is available."
+                % int(self.now))
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
+        self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
+
     def test_lanes_body_builds_and_shows_remote_claims(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -15911,6 +15917,16 @@ class LunaReviewResultTest(Base):
         self.assertEqual(thread, {"commit_id": self.SHA, "path": "src/app.py",
                                   "line": 9, "side": "RIGHT",
                                   "body": "The null check is missing."})
+
+    def test_an_anchored_finding_with_no_visible_text_posts_no_review_thread(self):
+        self.result({"blocking": [
+                         {"file": "src/app.py", "line": 9, "finding": "<!-- x -->"},
+                         {"file": "src/app.py", "line": 12,
+                          "finding": "The null check is missing."}],
+                     "notes": [], "summary": "Two problems."})
+        self.assertTrue(self.report())
+        self.assertEqual(len(self.verdicts()), 1)
+        self.assertEqual([t["line"] for _, t in self.fake.reviews_posted], [12])
 
     def test_a_missing_review_json_posts_nothing(self):
         self.assertTrue(self.report())
