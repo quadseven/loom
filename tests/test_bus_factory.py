@@ -218,9 +218,6 @@ class FakeGitHub:
         m = re.search(r"/actions/jobs/(\d+)/logs$", path)
         if m:
             return Response(302, None, headers={"location": "https://logs.example.com/" + m.group(1)})
-        if re.search(r"/pulls\?state=open&per_page=100&page=\d+$", path):
-            # The station's open pull request count for the cap (loom#3158).
-            return Response(200, [])
         raise AssertionError("unexpected GET %s" % path)
 
     def transport(self, method, url, headers, body):
@@ -323,7 +320,7 @@ class Base(unittest.TestCase):
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
            no_lane_since=None, review_brief=None, lint_run=None, now=NOW,
-           fix_accept=True):
+           fix_accept=True, in_inbox=()):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
             if any(r["state"] == "CHANGES_REQUESTED" for r in gh.reviews.get(number, [])):
@@ -373,6 +370,7 @@ class Base(unittest.TestCase):
                             known_waits=known_waits, demoted=demoted,
                             no_lane_since=no_lane_since, review_brief=review_brief,
                             lint_run=lint_run or merge_tier.run_ruff)
+        f.in_inbox = set(in_inbox)
         f.run()
         return f
 
@@ -3956,22 +3954,29 @@ class Tickets(Base):
             f = self.go(known_waits=known_waits)
         return f, [s for s in said if "stalled on lane" in s]
 
-    def test_a_stall_with_no_other_lane_is_said_once_not_every_pass(self):
-        # 716 identical lines in two days (loom#1280).
+    def test_a_stall_with_no_other_lane_goes_back_to_the_queue(self):
+        # loom#3158: on 2026-11-17 briefed tickets no lane claimed sat for
+        # days "stalled ... no other lane", each holding its lane as load, and
+        # 33 lanes idled while 79 tickets were queued. Unclaimed past the
+        # stall, with no lane to move to, the ticket waits in the queue.
         self.stalled(7, lane="claude",
                      body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
-        f, said = self.one_lane_stall()
-        self.assertEqual(len(said), 1, said)
-        self.assertEqual(list(f.waits), ["%s#7" % REPO])
-        again, said = self.one_lane_stall(known_waits=f.waits)
-        self.assertEqual(said, [])
-        self.assertEqual(again.waits, f.waits)
+        f, _ = self.one_lane_stall()
+        names = [x["name"] for x in self.gh.issues[7]["labels"]]
+        self.assertIn("loom:queued", names)
+        self.assertNotIn("loom:briefed", names)
+        self.assertFalse([n for n in names if n.startswith("lane:")], names)
+        self.assertEqual(f.load.get("claude", 0), 0)
+        self.assertIn("back to the queue", self.gh.comments[7][0]["body"])
+        self.assertNotIn("loom:rung", "".join(c["body"] for c in self.gh.comments[7]))
 
-    def test_a_stall_with_a_new_reason_is_said_again(self):
+    def test_a_stall_whose_brief_is_in_the_inbox_is_not_requeued(self):
+        # The station wrote the brief and has yet to move the label: a run
+        # is starting, not stalled.
         self.stalled(7, lane="claude",
                      body="Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n")
-        _, said = self.one_lane_stall(known_waits={"%s#7" % REPO: "some older reason"})
-        self.assertEqual(len(said), 1, said)
+        self.go(in_inbox=["%s#7" % REPO])
+        self.assertEqual((self.lane(7), self.gh.comments[7]), ("claude", []))
 
     def test_a_briefed_ticket_nobody_claims_moves_within_its_tier(self):
         self.stalled(7)
@@ -4040,13 +4045,15 @@ class Tickets(Base):
         for number, lane in enumerate([x for x in factory.CODEX[2:] for _ in (1, 2)], 30):
             self.gh.ticket(number, "briefed", lane=lane, body=body)
         self.go()
-        self.assertEqual(self.lane(7), "codex")
-        self.assertEqual(self.gh.comments[7], [])
+        # Not moved to a lane that waits as long: back to the queue (loom#3158).
+        self.assertEqual(self.lane(7), "")
+        self.assertIn("loom:queued", [x["name"] for x in self.gh.issues[7]["labels"]])
 
-    def test_a_stall_with_no_available_lane_stays_briefed(self):
+    def test_a_stall_with_no_available_lane_goes_back_to_the_queue(self):
         self.stalled(7)
         self.go(available=["codex"])
-        self.assertEqual((self.lane(7), self.moved, self.gh.comments[7]), ("codex", [], []))
+        self.assertEqual((self.lane(7), self.moved), ("", []))
+        self.assertIn("loom:queued", [x["name"] for x in self.gh.issues[7]["labels"]])
 
     def test_a_ticket_the_station_holds_is_never_moved_as_stalled(self):
         # 2026-10-18: loom#633, refused every pass by the unproven-work gate,
@@ -4531,7 +4538,9 @@ class Tickets(Base):
         body = "Model: gpt-6-luna\nDifficulty: easy\n\n## Why\nx\n"
         self.stalled(7, lane="spark", body=body)
         self.go(available=["agy"])
-        self.assertEqual((self.lane(7), self.model(7)), ("spark", "gpt-6-luna"))
+        # No lane of its own to move to: back to the queue, not to agy (loom#3158).
+        self.assertEqual((self.lane(7), self.model(7)), ("", "gpt-6-luna"))
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
     def test_a_ticket_on_a_lane_that_is_not_limited_waits_as_before(self):
         self.gh.ticket(7, "briefed", lane="spark", body="Model: spark/coder\nDifficulty: easy\n\n## Why\nx\n")
@@ -5000,6 +5009,8 @@ class Helpers(unittest.TestCase):
                                             factory_on=True, review_check="Review",
                                             no_test_repos=["example-org/no-tests"])
                 st = station.Station(FakeGitHub(), settings, now=NOW)
+                # No repo at its open pull request cap (loom#3158).
+                st._capped_repos = lambda repos: []
                 os.makedirs(st.state, exist_ok=True)
                 st.run_factory()
                 st.run_factory()
@@ -5015,6 +5026,8 @@ class Helpers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
             st = station.Station(FakeGitHub(), settings, now=NOW)
+            # No repo at its open pull request cap (loom#3158).
+            st._capped_repos = lambda repos: []
             with mock.patch.object(st, "_factory") as make_factory:
                 st.assign_queued()
                 st.assign_queued()
@@ -5425,8 +5438,10 @@ class NoLane(Base):
         self.gh.private = False
         self.stalled(7)
         f = self.go(available=["claude", "codex"], no_lane_since={"%s#7" % REPO: NOW - 7 * 3600})
-        self.assertEqual((self.lane(7), self.model(7)), ("codex", "gpt-6-luna"))
-        self.assertIn("%s#7" % REPO, f.settled)
+        # A stalled briefed ticket now waits in the queue, off its lane
+        # (loom#3158); the queued reroute takes it from there.
+        self.assertEqual((self.lane(7), factory._state(self.gh.issues[7])), ("", "queued"))
+        self.assertEqual(f.load.get("claude", 0), 0)
 
     def stalled(self, number):
         self.gh.ticket(number, "briefed", lane="claude", body=self.SONNET)

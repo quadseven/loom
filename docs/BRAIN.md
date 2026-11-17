@@ -1702,8 +1702,9 @@ failed step is journalled and left for the next tick.
 ## Tickets no lane takes
 
 A ticket the factory leaves waiting because no lane takes it (no free lane
-takes its model, no free lane in its tier, stalled with no other lane of its
-rung or tier, or on a lane at a limit with no free lane in its rung or tier)
+takes its model, no free lane in its tier, or on a lane at a limit with no
+free lane in its rung or tier; a briefed ticket stalled with no other lane of
+its rung or tier goes back to the queue instead, docs/LANES.md)
 holds its goal's in-flight cap without moving. On 2026-10-25, 89 tickets
 waited so, some for two days, and a goal at its cap had every triage rewrite
 skipped (loom#1831). The station keeps when each such ticket first waited
