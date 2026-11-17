@@ -113,6 +113,12 @@ PROVIDER_FAULT_RE='prompt_rendering_failed'
 # itself dropped, "[Cohere] missing required parameter: 'messages[60].content'".
 # Eight run logs ended on it from 2026-10-31, five parked as work (loom#2754).
 PROVIDER_PARAM_FAULT_RE="missing required parameter: 'messages\\[[0-9]+\\]"
+# The agy CLI's own ending: its root agent went idle, it waited on a
+# background task it had left running, and the wait was interrupted. Two runs
+# that had finished their work and a green suite ended this way and were
+# parked as the ticket's work (loom#2984). Both lines must be in the tail.
+CLI_BACKGROUND_WAIT_RE='root agent idle; waiting up to [^[:cntrl:]]* background task'
+CLI_INTERRUPTED_RE='(^|[[:cntrl:]])error: interrupted'
 LIMIT_WAIT=3600
 LIMIT_WAIT_MAX=86400
 # A reset time the provider states ("try again at 11:46 PM", "try again at
@@ -213,6 +219,9 @@ classify_failure() {
     FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt (prompt_rendering_failed)"
   elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_PARAM_FAULT_RE ]]; then
     FAIL_CLASS=transient FAIL_REASON="provider fault: the provider rejected its own request (missing required parameter in messages)"
+  elif [ "$status" -ne 0 ] && [[ "$tail" =~ $CLI_BACKGROUND_WAIT_RE ]] &&
+       [[ "$tail" =~ $CLI_INTERRUPTED_RE ]]; then
+    FAIL_CLASS=transient FAIL_REASON="the agent CLI was interrupted while it waited on a background task after its root agent went idle"
   elif [[ "$whole" =~ $MODEL_GONE_RE ]]; then
     FAIL_CLASS=limit RETRY_AT=$((now + LIMIT_WAIT))
   elif [ "${LANE:-}" = copilot ] && [[ "$tail" =~ $COPILOT_ALLOWANCE_RE ]]; then
