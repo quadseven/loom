@@ -15874,7 +15874,7 @@ class Station:
         factory.FACTORY_CHECK seconds. LOOM_FACTORY=0 turns it off."""
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
-        runner = self._factory()
+        runner = self._load_factory()
         try:
             runner.run()
         finally:
@@ -16058,7 +16058,7 @@ class Station:
     def assign_queued(self) -> None:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
-            runner = self._factory()
+            runner = self._load_factory()
             runner.assign_queued()
             self._record_waits(runner.waits, runner.settled)
 
@@ -16236,6 +16236,33 @@ class Station:
                                known_waits=self._saved_waits(),
                                no_lane_since=self._no_lane_since(),
                                review_brief=self._write_review_brief, **extra)
+
+    def _load_factory(self) -> factory.Factory:
+        """The factory for the steps that count lane load (run and
+        assign_queued), told which repos are at their open pull request cap.
+        Only these read the counts, so a factory built for one ticket's check
+        costs no pull request list."""
+        runner = self._factory()
+        runner.capped = set(self._capped_repos(
+            [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]))
+        return runner
+
+    def _capped_repos(self, repos: Sequence[str]) -> List[str]:
+        """The repos whose counted open pull requests reach their cap, from
+        the count read once a pass (_repo_pr_count), so the factory knows
+        which briefed tickets the station will not claim however far the
+        claim pass got (loom#3158). An unread count is no cap here: the
+        factory keeps counting those tickets as load, as before."""
+        capped = []
+        for repo in repos:
+            try:
+                count = self._repo_pr_count(repo)
+            except TargetReached:
+                break
+            cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
+            if count is not None and count >= cap:
+                capped.append(repo)
+        return capped
 
     def _no_lane_since(self) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""

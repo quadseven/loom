@@ -278,5 +278,72 @@ class RepoPrCapTest(Base):
         self.assertEqual(runner._repo_pr_counts, {})
 
 
+class CapLoadBeforeClaimTest(Base):
+    """The factory reads the cap from the repo count, not from how far the
+    claim pass got (loom#3158). On 2026-11-17, 68 of 97 briefed tickets sat
+    in a repo over its cap; the first assign_queued of each pass runs before
+    claim_new and a claim pass stopped at its share never reached the rest,
+    so each counted as lane load and nine medium lanes idled."""
+
+    pulls = RepoPrCapTest.pulls
+
+    def setUp(self):
+        super().setUp()
+        self.fake.default_body = BODY_WITH_CRITERIA
+
+    def factory(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        return runner, runner._load_factory()
+
+    def test_briefed_ticket_over_cap_is_not_load_before_any_claim_pass(self):
+        self.pulls(9)
+        self.fake.add(12)
+        runner, counter = self.factory()
+        self.assertEqual(runner._gate_held(), [])
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 0)
+
+    def test_briefed_ticket_under_cap_is_still_load(self):
+        self.pulls(7)
+        self.fake.add(12)
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_running_ticket_over_cap_is_still_load(self):
+        self.pulls(9)
+        self.fake.add(12, state="running")
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_unread_count_is_not_a_cap_for_the_load(self):
+        self.fake.add(12)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner, "_read_repo_pr_count", side_effect=GitHubError("unread")):
+            counter = runner._load_factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_queued_ticket_over_cap_waits_and_stays_queued(self):
+        self.pulls(9)
+        self.fake.add(12, state="queued")
+        _, counter = self.factory()
+        reason = counter._assign_queued_ticket(REPO, self.fake.issues[12])
+        self.assertEqual(reason, "%s#12 waits: its repo is at its open pull request cap" % REPO)
+        self.assertEqual(counter.waits.get("%s#12" % REPO),
+                         "its repo is at its open pull request cap")
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.fake.paths("PUT") + self.fake.paths("POST"), [])
+
+    def test_briefed_ticket_over_cap_is_not_moved_as_stalled(self):
+        self.pulls(9)
+        self.fake.add(12)
+        _, counter = self.factory()
+        with mock.patch.object(counter, "_spread", side_effect=AssertionError("moved")), \
+                mock.patch.object(counter, "_step_aside", side_effect=AssertionError("moved")):
+            counter.briefed(REPO, self.fake.issues[12])
+
+
 if __name__ == "__main__":
     unittest.main()
