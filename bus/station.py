@@ -9145,6 +9145,15 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        # Distinct reason when all changed tests pass on base (no timeout/unrunnable, not a fix round).
+        # Add needs-brain with a done-check comment instead of climbing the ladder.
+        if bare.startswith("validation failed: every changed test passes on base"):
+            self._add_label(repo, number, "needs-brain")
+            self._routine(repo, number,
+                          "Lane %s failed: %s. The ticket is held for the brain (needs-brain) "
+                          "because every changed test passes on the default branch." % (lane, reason))
+            _say("reported %s#%d base-pass hold for brain: %s" % (repo, number, reason))
+            return True
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True

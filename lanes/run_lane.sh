@@ -3340,10 +3340,20 @@ final_base_tests() {
              -e 's/^base-timeout: /timed out on base: /p' \
              -e 's/^base-unrunnable: /could not run on base: /p' \
     | head -5 | tr '\n' ';')"
+  # Check if only base-pass names are present (no base-timeout or base-unrunnable)
+  has_timeout=$(tail -c +$((log_offset + 1)) "$LOG" | grep -q '^base-timeout:' && echo yes || echo no)
+  has_unrunnable=$(tail -c +$((log_offset + 1)) "$LOG" | grep -q '^base-unrunnable:' && echo yes || echo no)
+  only_base_pass=$([ "$has_timeout" = "no" ] && [ "$has_unrunnable" = "no" ] && echo yes || echo no)
   record base-tests "$command" "$rc" "$rev" "$([ "$rc" -eq 0 ] && echo true || echo false)"
   case "$rc" in
     0) return 0 ;;
-    124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
+    124)
+      if [ "$only_base_pass" = "yes" ] && [ -z "${FIX_PR:-}" ]; then
+        VALIDATION_REASON="validation failed: every changed test passes on base"
+      else
+        VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out"
+      fi
+      ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free for the base-test gate" ;;
     125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
     *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
