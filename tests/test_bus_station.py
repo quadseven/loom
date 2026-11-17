@@ -7404,6 +7404,33 @@ class SilentLaneTest(Base):
         self.assertEqual([w.ticket.label for w in st._invariant_waits()],
                          [st._invariant_ref(REPO, 13).label])
 
+    def test_a_silent_move_is_recorded_when_the_factory_step_carries_over(self):
+        # loom#2094: on 2026-11-07 the factory moved twelve running tickets
+        # off silent lanes, and every one of those passes carried the step
+        # over at the request target. The moves were made on GitHub, but the
+        # record (the "runner seen as" line and the invariant fact) and the
+        # return of the moved tickets' briefs never ran.
+        st = self.station()
+        st.s.factory_on = True
+        self.write(self.inbox("codex", "example-owner.example-repo-12.md"), "brief")
+
+        class Runner:
+            silent_running = {"codex": [(REPO, 12)]}
+            silent = {"codex": 1860.0}
+            waits: dict = {}
+            settled: tuple = ()
+
+            def run(self):
+                raise TargetReached("comments read carried over at request target")
+
+        with mock.patch.object(factory, "due", return_value=True), \
+                mock.patch.object(st, "_factory", return_value=Runner()):
+            self.assertFalse(st._timed(st.run_factory))
+        (run,) = st._invariant_silent()
+        self.assertEqual((run.lane, run.silent_for), ("codex", 1860.0))
+        self.assertEqual(os.listdir(self.inbox("codex", "returned")),
+                         ["example-owner.example-repo-12.md"])
+
     def test_nothing_found_records_nothing(self):
         st = self.station()
         st._record_silent({}, {})
