@@ -3119,9 +3119,10 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     line then names the new epic; the closed epic stays closed (loom#1925).
     A ticket that also sits under an open epic stays there.
 
-    An open epic that holds more than EPIC_TICKET_CAP tickets has its excess
-    open tickets moved to the goal's next intake epic (the epic retains its
-    first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left).
+    An open epic that holds more than EPIC_TICKET_CAP open tickets has its
+    excess open tickets moved to the goal's next intake epic (the epic
+    retains its first EPIC_TICKET_CAP open tickets, loom#2085; closed tickets
+    do not count, loom#1925). Returns (moved, left).
 
     Tickets stranded under a closed epic may open further intake epics past the
     goal's open epic cap when every open intake epic is full, at most
@@ -3251,17 +3252,20 @@ def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
 def _over_capacity_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
                                ) -> List[Tuple[Dict[str, Any], int]]:
     """(ticket, its epic) for each excess open ticket of an open epic that
-    holds more than EPIC_TICKET_CAP tickets. The epic retains its first
-    EPIC_TICKET_CAP tickets, and excess open tickets move to the next epic."""
+    holds more than EPIC_TICKET_CAP open tickets. The epic retains its first
+    EPIC_TICKET_CAP open tickets, and excess open tickets move to the next
+    epic. Closed tickets do not count, as for an epic's room (_open_count):
+    counted, two intake epics full of closed tickets traded their open ones
+    back and forth on every pass (loom#1925)."""
     out: List[Tuple[Dict[str, Any], int]] = []
     seen = set()
     for epic, held in tree:
         if epic.get("state", "open") != "open" or standing_epic(epic):
             continue
-        if len(held) <= EPIC_TICKET_CAP:
+        if _open_count(held) <= EPIC_TICKET_CAP:
             continue
         number = int(epic.get("number") or 0)
-        excess = len(held) - EPIC_TICKET_CAP
+        excess = _open_count(held) - EPIC_TICKET_CAP
         movable = [t for t in held if _movable_ticket(t)]
         if not movable:
             continue

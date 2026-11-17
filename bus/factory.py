@@ -212,6 +212,9 @@ from .tickets import FIX_MARKER, PRIORITIES, priority_of
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+# Why a queued ticket of a repo at its open pull request cap gets no lane. One
+# fixed text, so its wait keeps its start while the count moves (loom#3158).
+CAP_WAIT = "its repo is at its open pull request cap"
 # A ticket the factory leaves waiting with no lane that takes it (NO_LANE_RE)
 # this long is rerouted to another rung of the model ladder with a free lane
 # in its tier; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
@@ -1927,6 +1930,7 @@ class Factory:
                  available: Optional[Sequence[str]] = None,
                  close: Optional[Callable[..., Any]] = None,
                  held: Sequence[str] = (),
+                 capped: Sequence[str] = (),
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
@@ -1986,6 +1990,10 @@ class Factory:
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
+        # The repos at their open pull request cap by the station's count this
+        # pass: it claims none of their build tickets, so a queued one is not
+        # briefed (loom#3158). Their briefed build tickets come in `held`.
+        self.capped = set(capped)
         # Lane -> seconds since its last heartbeat, for each local lane
         # without a live one; silent_running is the lanes found holding a
         # running ticket past SILENT_MAX, with those tickets.
@@ -4877,10 +4885,11 @@ class Factory:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
         if "%s#%s" % (repo, issue["number"]) in self.held:
-            # The station holds it (a factory incident, or the unproven-work
-            # gate this pass): no lane is late, so it is neither spread nor
-            # moved as stalled. Moving it rotated loom#633 through every rung
-            # with a comment each time while the gate held it (2026-10-18).
+            # The station holds it (a factory incident, the unproven-work
+            # gate this pass, or its repo's open pull request cap): no lane is
+            # late, so it is neither spread nor moved as stalled. Moving it
+            # rotated loom#633 through every rung with a comment each time
+            # while the gate held it (2026-10-18).
             return
         waiting = self.held_by(repo, issue)
         if waiting:
@@ -5251,9 +5260,13 @@ class Factory:
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
         """Count the briefed and running tickets on each lane, reading every
-        repo's tickets unless they are given. A ticket held for a factory
-        incident is not load: counted, it kept its idle lane from every
-        queued ticket until the incident closed (2026-10-18)."""
+        repo's tickets unless they are given. A ticket the station holds is
+        not load: one held for a factory incident kept its idle lane from
+        every queued ticket until the incident closed (2026-10-18). The
+        station holds each briefed build ticket of a repo at its open pull
+        request cap (Station._load_factory): known only as far as the claim
+        pass got, 68 such tickets kept nine medium lanes idle on 2026-11-17
+        (loom#3158)."""
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for repo, issue in ((r, i) for r, found in tickets.items() for i in found.values()):
@@ -5451,6 +5464,11 @@ class Factory:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
+        if repo in self.capped:
+            # Briefed, the station would hold it at the cap and its lane would
+            # take nothing else (loom#3158). Reads nothing.
+            self._waiting(repo, issue["number"], CAP_WAIT)
+            return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
                 or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
