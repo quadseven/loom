@@ -5398,6 +5398,21 @@ class ClaimTest(Base):
                 for _, text in status.parse(c["body"])]
         self.assertTrue(any("names no acceptance criteria" in text for text in said), said)
 
+    def test_a_two_platform_brief_at_claim_goes_back_to_the_queue_with_the_split_note(self):
+        # loom#2929: the split hold (loom#1651) at the station's claim check.
+        self.fake.add(12, body=("Difficulty: medium\n\n## Why\nThe tool is missing.\n\n"
+                                "## What\n\n- Build it on iOS.\n- Build it on Android.\n\n"
+                                "## Acceptance criteria\n- [ ] Both builds pass.\n"))
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("needs-brain", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        said = [text for c in self.fake.comments[12] if status.is_status(c["body"])
+                for _, text in status.parse(c["body"])]
+        self.assertTrue(any("more than one platform" in text and "one ticket per platform"
+                            in text for text in said), said)
+
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
         # The lane is up (its ladder has another model), but not for this
         # ticket's Model: until the limit lifts; a claim was parked at once and

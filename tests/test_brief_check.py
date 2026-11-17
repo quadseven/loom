@@ -453,6 +453,22 @@ class FactoryQueue(unittest.TestCase):
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
         self.assertNotIn("%s#9" % self.repo, worker.waits)
 
+    def test_a_queued_two_platform_brief_gains_needs_brain_and_one_note(self):
+        # loom#2929: the split hold (loom#1651) at the factory queue gate.
+        self.queued(7, "Difficulty: medium\n\n" + Split.MULTI)
+        self.queued(9, "Difficulty: medium\n\n" + Split.SINGLE)
+        for _ in range(2):
+            worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+            worker.assign_queued()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "spans more than one platform")
+        self.assertEqual(self.lane_of(7), [])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issues[7]["labels"]])
+        notes = [c for c in self.gh.comments.get(7, [])
+                 if "more than one platform" in str(c.get("body"))]
+        self.assertEqual(len(notes), 1)
+        self.assertNotIn("%s#9" % self.repo, worker.waits)
+        self.assertNotEqual(self.lane_of(9), [])
+
     def test_a_ticket_with_no_area_label_in_an_area_repo_gets_no_lane_and_one_note(self):
         good = ("Difficulty: medium\n\n" + HEALTH_INTAKE
                 + "\nCause: refunds post to the wrong account when two land at once.\n")
@@ -750,7 +766,8 @@ class Split(unittest.TestCase):
     def test_windows_in_the_time_sense_is_not_a_platform(self):
         # Usage windows and time windows beside one platform stay one ticket.
         for phrase in ("the end of its usage windows", "its time windows",
-                       "the rate windows", "the reset windows"):
+                       "the rate windows", "the reset windows",
+                       "a window of 30 minutes", "the maintenance windows"):
             body = ("## Why\n\nA lane on the host stops early.\n\n"
                     "## What\n\n- The Linux host stops at %s.\n\n"
                     "## Acceptance criteria\n"
