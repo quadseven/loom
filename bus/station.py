@@ -7498,11 +7498,54 @@ class Station:
             return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            if self._ship_fallback(repo, number, note):
+                self._deployed_seen(key, False)
+                _say("shipped %s#%d (fallback): %s carries #%d" % (
+                    repo, number, what, int(pr["number"])))
+                return True
             self._deployed_seen(key, True)
             return False
         self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _ship_fallback(self, repo: str, number: int, note: str) -> bool:
+        """Retry a failed shipped move after checking the issue is still merged.
+
+        GitHub can reject the first label replacement while a deployed ticket
+        remains at loom:merged. Re-read its state before retrying the label
+        update, so a concurrent move or close is never overwritten.
+        """
+        try:
+            from . import labels as label_defs
+            wanted = label_defs.LABELS["loom:shipped"]
+            self.gh.rest("POST", "/repos/%s/labels" % repo,
+                         {"name": "loom:shipped", "color": wanted["color"],
+                          "description": wanted["description"]}, ok=(422,))
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+            if issue.get("state") != "open":
+                return False
+            names = _label_names(issue)
+            if "loom:verified" in names:
+                return False
+            if "loom:shipped" in names and "loom:merged" not in names:
+                return True
+            if "loom:merged" not in names:
+                return False
+            kept = brain._moved_labels(names, "shipped", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            notify.post(self.gh, repo, number, note, notify.SHIPPED)
+            return True
+        except RateLimited:
+            raise
+        except ShadowHeld as err:
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            return False
+        except (GitHubError, ValueError) as err:
+            _say("ship retry could not move %s#%d: %s" % (repo, number, err))
+            return False
 
     def _deployed_seen(self, key: str, seen: bool) -> None:
         """Keep when a ship rule first found the ticket deployed

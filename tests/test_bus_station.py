@@ -2203,6 +2203,26 @@ class ShipDeployedTest(Base):
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertEqual(st._invariant_unshipped(), [])
 
+    def test_a_deployed_ticket_ships_when_the_move_label_write_is_retried(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        real = self.fake
+        rejected = False
+
+        def transient_refusal(method, url, headers, body):
+            nonlocal rejected
+            if (method == "PUT" and urlsplit(url).path.endswith("/issues/12/labels")
+                    and not rejected):
+                rejected = True
+                return reply(422, {"message": "refused"})
+            return real(method, url, headers, body)
+
+        self.ship(transport=transient_refusal)
+        self.assertTrue(rejected)
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
     def test_self_repo_defaults_to_the_lanes_repo(self):
         env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
                "LOOM_STATUS_REPO": "example-owner/lanes"}
