@@ -381,6 +381,19 @@ class ClaimRejectionTests(unittest.TestCase):
         self.assertIn(self.rejection_line("no acceptance criteria"), err)
         self.assertIn("loom:queued", [x["name"] for x in gh.issues[4]["labels"]])
 
+    def test_a_two_platform_ticket_is_rejected_with_the_split_reason(self):
+        # loom#2929: the split hold at the lane's own claim check.
+        gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS and on Android."))
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn(self.rejection_line("spans more than one platform"), err)
+        self.assertEqual(lane._rejection_reason(gh.issues[4], "muse"),
+                         "spans more than one platform")
+
+    def test_a_single_platform_ticket_gets_no_split_reason(self):
+        gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS."))
+        self.assertIsNone(lane._rejection_reason(gh.issues[4], "muse"))
+
     def test_a_pull_request_item_is_named_with_its_reason(self):
         gh = FakeGitHub()
         gh.issues[4]["pull_request"] = {"url": "https://example.com/pulls/4"}

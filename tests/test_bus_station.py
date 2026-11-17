@@ -290,6 +290,9 @@ class FakeGitHub:
             self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
                                         if lab["name"] != unquote(gone.group(2))]
             return reply(200, [])
+        deps = re.match(r"issues/(\d+)/dependencies/blocked_by$", rest)
+        if method == "GET" and deps:
+            return reply(200, getattr(self, "blockers", {}).get(int(deps.group(1)), []))
         tl = re.match(r"issues/(\d+)/timeline$", rest)
         if method == "GET" and tl:
             return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
@@ -5395,6 +5398,21 @@ class ClaimTest(Base):
                 for _, text in status.parse(c["body"])]
         self.assertTrue(any("names no acceptance criteria" in text for text in said), said)
 
+    def test_a_two_platform_brief_at_claim_goes_back_to_the_queue_with_the_split_note(self):
+        # loom#2929: the split hold (loom#1651) at the station's claim check.
+        self.fake.add(12, body=("Difficulty: medium\n\n## Why\nThe tool is missing.\n\n"
+                                "## What\n\n- Build it on iOS.\n- Build it on Android.\n\n"
+                                "## Acceptance criteria\n- [ ] Both builds pass.\n"))
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("needs-brain", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        said = [text for c in self.fake.comments[12] if status.is_status(c["body"])
+                for _, text in status.parse(c["body"])]
+        self.assertTrue(any("more than one platform" in text and "one ticket per platform"
+                            in text for text in said), said)
+
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
         # The lane is up (its ladder has another model), but not for this
         # ticket's Model: until the limit lifts; a claim was parked at once and
@@ -5499,6 +5517,60 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
 
+    def blocked_by(self, number, blocker, state="open"):
+        """GitHub's own "blocked by" relationship: the dependency summary the
+        issue listing carries, and the blocker list it points to."""
+        self.fake.issues[number]["issue_dependencies_summary"] = {
+            "blocked_by": 0 if state == "closed" else 1, "total_blocked_by": 1}
+        self.fake.blockers = {number: [{"number": blocker, "state": state,
+                                        "repository_url": "https://api.github.com/repos/" + REPO}]}
+
+    def test_a_briefed_ticket_github_lists_as_blocked_is_not_claimed(self):
+        # loom#3129: the blocked-by hold ran only when the factory laned a
+        # queued ticket, so a ticket briefed straight to a lane was claimed
+        # on a base that lacked its prerequisite.
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("wait:blocked", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        notes = [c["body"] for c in self.fake.comments[12]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("blocked on #5", notes[0])
+        # The next pass still holds it, and says nothing new.
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_a_briefed_ticket_whose_blocked_on_section_names_an_open_issue_is_not_claimed(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12, body=BODY_WITH_CRITERIA + "\n## Blocked on\n- #5\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_is_claimed_on_the_first_pass_after_its_blocker_closes(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.fake.issues[5]["state"] = "closed"
+        self.blocked_by(12, 5, state="closed")
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_with_no_blocker_costs_no_blocker_request(self):
+        self.fake.add(12)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
+
     def test_a_dependency_of_another_repo_is_read_from_there(self):
         self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))
         self.fake.add(12, body="After: other-owner/other-repo#5\n" + BODY_WITH_CRITERIA)  # leak-guard-allow
@@ -5558,6 +5630,17 @@ class ClaimTest(Base):
         self.fake.add(9, created="2030-01-03T00:00:00Z", body="Priority: P0\n" + BODY_WITH_CRITERIA)
         self.run_pass()
         self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+
+    def test_a_ticket_that_blocks_two_others_is_claimed_before_an_older_leaf(self):
+        # loom#3130: the order reads the dependency summary the briefed
+        # listing already carries, so it costs no request of its own.
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
 
     def test_a_regression_is_claimed_before_a_p0_ticket(self):
         self.fake.add(7, created="2030-01-01T00:00:00Z", body="Priority: P0\n" + BODY_WITH_CRITERIA)

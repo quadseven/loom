@@ -14,6 +14,15 @@ it the runner uses the lane default (`LOOM_CODEX_MODEL` or
 pull request footer names the lane and the model. A model from the other
 lane's family is refused.
 
+A ticket's `Model:` line is either a hard pin or a default. A hard pin binds
+however long the ticket waits: the ticket was opened by a person (the
+operator wrote the line), or it carries `class:sensitive` or `tier:security`.
+Any other pin (one a brain's App wrote when it briefed, or the model ladder
+wrote when it climbed) is a default: a queued ticket whose pinned model has
+had no free lane for `LOOM_PIN_FALLBACK_MINUTES` (default 30, `0` turns it
+off) takes a free lane of its difficulty tier with that lane's own model,
+and loses the line (docs/BRAIN.md, Tickets no lane takes).
+
 When a ticket body says `Builds on #N`, briefing reads open pull request N and
 uses its head branch as `Base` only for a trusted, non-draft lane pull request
 whose head belongs to the same repository. The case-insensitive declaration
@@ -62,9 +71,14 @@ request: a pass closes the incident and moves the brief to `done/`, a fail
 updates the incident and parks the brief (docs/LANES.md). Any `Deliverable:`
 value other than `answer`, `verify`, `review` or `base-check` parks the brief.
 
-The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
-what order the station claims it (docs/BRAIN.md); they stay on the ticket and
-are not written into the brief.
+The ticket's `Not before:`, `After:`, `Priority:` and `Foundational:` lines
+decide when and in what order the station claims it (docs/BRAIN.md); they
+stay on the ticket and are not written into the brief.
+
+`Foundational: yes` marks an epic child that its siblings build on.
+`bus.brain brief --foundational` writes it in the ticket's header block; any
+other value is refused. At the same priority, a ticket that blocks more open issues
+goes first, then a `Foundational: yes` ticket, then the oldest.
 
 Right after the ticket body, a build brief carries a `## Proof checks`
 section: each acceptance criterion restated as the check that proves it

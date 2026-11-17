@@ -31,8 +31,9 @@ Rules:
   only when it ran the lane workflow on main as a workflow_dispatch the
   station's own App triggered.
 - After BASE_RED_MAX base check failures of one repo at one revision on a
-  slot, the slot takes no more of that repo: its briefs park [transient] so
-  another lane takes them, until the repo's head or the runner image changes.
+  slot (one, for a check that could not start), the slot takes no more of
+  that repo: its briefs park [transient] so another lane takes them, until
+  the repo's head or the runner image changes.
 
 Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
 docs/LANES.md, "Lanes on cluster runners".
@@ -124,6 +125,8 @@ BASE_PHASES = ("setup", "baseline", "default-baseline")
 # could not run: 127 is a command missing from the runner image). A new
 # commit on the repo cannot fix those, so only a new image lifts the stop.
 CANNOT_RUN = (125, 126, 127)
+# Such a check records one failing row per run, not two, so one run stops it.
+CANNOT_RUN_MAX = 1
 # With no report from a slot for this long, a stopped repo gets one more run.
 IMAGE_PROBE = 86400
 # Ledger entries whose brief has left the inbox are dropped after this long.
@@ -267,6 +270,13 @@ def brief_field(text: str, name: str) -> str:
 
 def input_size(inputs: Dict[str, str]) -> int:
     return sum(len(k) + len(v) for k, v in inputs.items())
+
+
+def _stop_after(red: Dict[str, Any]) -> int:
+    """Base failures that stop a repo on a slot. A check that could not start
+    (CANNOT_RUN) records one row per run and no retry adds a tool to the
+    image, so one run stops it; a red check keeps BASE_RED_MAX."""
+    return CANNOT_RUN_MAX if red.get("cannot_run") else BASE_RED_MAX
 
 
 def red_reason(repo: str, red: Dict[str, Any]) -> str:
@@ -567,9 +577,9 @@ class Runners:
         slot: only a run can show a new runner image, and a sole red repo
         lets none run. A head that cannot be read keeps it. A check the
         runner cannot run (CANNOT_RUN) is the image's fault, not the
-        revision's, so a moved head does not clear it."""
+        revision's, so one run stops it and a moved head does not clear it."""
         red = (ledger["base_red"].get(slot) or {}).get(repo)
-        if (not red or int(red.get("failures") or 0) < BASE_RED_MAX
+        if (not red or int(red.get("failures") or 0) < _stop_after(red)
                 or red.get("base", "") != base):
             return None
         seen = (ledger["images"].get(slot) or {}).get("at") or 0

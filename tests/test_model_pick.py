@@ -233,6 +233,30 @@ class ModelPickTest(unittest.TestCase):
         stop = model_pick.plan_stop(dict(usage, monthly=(allowed + 1, monthly)), NOW)
         self.assertIn("ahead of its", stop[1])
 
+    def test_a_pace_stop_waits_until_the_pace_catches_up_with_usage(self):
+        # loom#2809: a pace stop asked again after 15 minutes, so the lane
+        # read free and was given the same ticket about three times an hour
+        # for two days. It now waits until the pace allows the usage.
+        monthly = NOW + 15 * 86400
+        usage = {"rolling": (1.0, NOW + 3600), "weekly": (1.0, NOW + 3 * 86400)}
+        gone = 1 - 15 / 30.4
+        percent = model_pick.USAGE_STOP["monthly"] * gone + model_pick.PACE_SLACK + 2
+        until, why = model_pick.plan_stop(dict(usage, monthly=(percent, monthly)), NOW)
+        self.assertIn("ahead of its", why)
+        self.assertGreater(until, NOW + model_pick.RETRY_NOTHING)
+        # At that time the pace allows the usage, and a moment before it does not.
+        self.assertIsNone(model_pick.plan_stop(dict(usage, monthly=(percent, monthly)), until + 1))
+        self.assertIsNotNone(model_pick.plan_stop(dict(usage, monthly=(percent, monthly)),
+                                                  until - 60))
+
+    def test_a_pace_stop_never_asks_again_sooner_than_the_retry_floor(self):
+        monthly = NOW + 15 * 86400
+        usage = {"rolling": (1.0, NOW + 3600), "weekly": (1.0, NOW + 3 * 86400)}
+        gone = 1 - 15 / 30.4
+        percent = model_pick.USAGE_STOP["monthly"] * gone + model_pick.PACE_SLACK + 0.0001
+        until, _ = model_pick.plan_stop(dict(usage, monthly=(percent, monthly)), NOW)
+        self.assertEqual(until, NOW + model_pick.RETRY_NOTHING)
+
     def test_usage_that_cannot_be_read_fails_closed(self):
         broken = ((500, {}, b"down"), (200, {}, b"not json"), (200, {}, b'{"usage":{}}'),
                   (200, {}, json.dumps({"usage": {"rolling": {"percent": "x"}}}).encode()))
