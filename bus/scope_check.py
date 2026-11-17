@@ -233,7 +233,12 @@ def scratch_files(tree: str, base: str, head: str, brief_text: str,
         elif "/" not in path and (path.startswith("sh-thd-") or path.endswith(".patch")):
             scratch.append(path)
         elif "/" not in path and (fnmatch.fnmatchcase(path, "test_*") or
-                                  fnmatch.fnmatchcase(path, "*_debug*")):
+                                  fnmatch.fnmatchcase(path, "*_debug*") or
+                                  fnmatch.fnmatchcase(path, "test.py") or
+                                  fnmatch.fnmatchcase(path, "verify*.py") or
+                                  fnmatch.fnmatchcase(path, "check_*.py") or
+                                  fnmatch.fnmatchcase(path, "scratch*.py") or
+                                  fnmatch.fnmatchcase(path, "tmp*.py")):
             if not referenced_by_tracked_file(tree, head, path):
                 scratch.append(path)
     return scratch
