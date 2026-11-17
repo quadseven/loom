@@ -1524,6 +1524,16 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
         self.assertEqual(tickets.priority_of(made), "P1")
 
+    def test_brief_foundational_writes_the_foundational_line(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
+                    difficulty="medium", priority="P1", foundational=True)
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        self.assertTrue(made["body"].startswith(
+            "Difficulty: medium\nPriority: P1\nFoundational: yes\n\n"))
+        self.assertTrue(tickets.foundational(made))
+
     def test_brief_repair_marker_survives_ticket_rendering(self):
         fake = Fake(reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
@@ -7391,6 +7401,45 @@ class FleetHoldTests(unittest.TestCase):
         answer = self.comment("example-lane[bot]", "Fixed the clock reset.",
                               "2030-01-01T13:30:00Z", 502)
         self.assertEqual(self.merge([self.hold(), answer]), "merged")
+
+    def test_each_factory_marker_comment_by_the_author_leaves_the_hold_standing(self):
+        markers = (
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "/grug improve\n\n<!-- loom:improve-head %s -->" % self.SHA,
+            "<!-- loom:luna-request v1 sha=%s -->\nThe review check is degraded "
+            "on this head.\nDispatch 1 at 2030-01-01 13:30 UTC.\n"
+            "<!-- loom:luna-dispatch at=1893456000 -->" % self.SHA,
+            "<!-- loom:scope-hold %s -->\nHeld for the brain: a scope check "
+            "asked whether this pull request fits its ticket." % self.SHA,
+            "<!-- loom:rebuttal-refused v1 thread=PRRT_example head=%s -->\n"
+            "Merge refused: a review thread was resolved on an answer that "
+            "does not hold." % self.SHA,
+        )
+        for body in markers:
+            with self.subTest(body=body.split("\n", 1)[0]):
+                marker = self.comment("example-lane[bot]", body,
+                                      "2030-01-01T13:30:00Z", 502)
+                self.assertIn("held by a fleet comment",
+                              self.merge([self.hold(), marker]))
+
+    def test_a_factory_marker_comment_by_a_trusted_login_leaves_the_hold_standing(self):
+        marker = self.comment(
+            "example-brain",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        self.assertIn("held by a fleet comment", self.merge([self.hold(), marker]))
+
+    def test_a_plain_reply_after_a_factory_marker_comment_lifts_the_hold(self):
+        marker = self.comment(
+            "example-lane[bot]",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        answer = self.comment("example-lane[bot]", "Fixed the clock reset.",
+                              "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, answer]), "merged")
+        named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
+                             "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, named]), "merged")
 
     def test_a_later_trusted_comment_naming_the_head_sha_lifts_the_hold(self):
         named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],

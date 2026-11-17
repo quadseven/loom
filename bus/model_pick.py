@@ -322,8 +322,20 @@ def plan_stop(usage: Optional[Mapping[str, Tuple[float, float]]], now: float
             gone = min(1.0, max(0.0, 1 - (reset - now) / PACED[name]))
             allowed = stop * gone + PACE_SLACK
             if percent >= allowed:
-                return now + RETRY_NOTHING, "%s usage %.0f%% is ahead of its %.0f%% pace" % (name, percent, allowed)
+                return (pace_catches_up(percent, stop, reset, PACED[name], now),
+                        "%s usage %.0f%% is ahead of its %.0f%% pace" % (name, percent, allowed))
     return None
+
+
+def pace_catches_up(percent: float, stop: float, reset: float, window: float,
+                    now: float) -> float:
+    """When the pace of a window that renews at `reset` allows `percent`
+    again: the allowance stop * gone + PACE_SLACK reaches it, solved for the
+    time. Never sooner than RETRY_NOTHING from now. 2026-11-03: a pace stop
+    asked again after RETRY_NOTHING, so its lane read free and took the same
+    ticket about three times an hour for two days (loom#2809)."""
+    at = reset - window * (1 - (percent - PACE_SLACK) / stop)
+    return max(at, now + RETRY_NOTHING)
 
 
 def _demoted(home: Path, brief_line: str) -> Optional[List[str]]:

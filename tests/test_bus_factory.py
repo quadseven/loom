@@ -1362,6 +1362,17 @@ class PullRequests(Base):
         self.assertEqual(updates, [])
         self.assertIsNone(self.lock_holder)
 
+    def test_a_factory_marker_comment_by_the_author_does_not_lift_a_hold(self):
+        self.hold()
+        self.gh.comments[50].append(
+            {"id": 902, "user": {"login": "alice-example"},
+             "body": "<!-- loom:review-again v1 sha=sha50 -->\n/grug improve",
+             "created_at": "2030-01-01T01:00:00Z"})
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
+            updates = self.refused(GitHubError("merge -> 405", 405, self.BEHIND_405))
+        self.assertEqual(updates, [])
+        self.assertIsNone(self.lock_holder)
+
     def test_a_hold_stops_the_update_on_a_strict_base(self):
         self.hold()
         with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": "example-fleet"}):
@@ -3496,6 +3507,24 @@ class Queued(Base):
         self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
+    def test_a_queued_ticket_that_blocks_others_takes_the_free_lane_before_an_older_leaf(self):
+        # loom#3130: a leaf filed earlier took the only free lane while the
+        # ticket two others wait on stayed queued.
+        self.queued(7, age=600)
+        self.queued(8, age=60)
+        self.gh.issues[8]["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_higher_priority_queued_leaf_goes_before_a_lower_priority_blocker(self):
+        self.queued(7, body="Difficulty: medium\nPriority: P1\n\n## Why\nx\n", age=60)
+        self.queued(8, body="Difficulty: medium\nPriority: P3\n\n## Why\nx\n", age=600)
+        self.gh.issues[8]["issue_dependencies_summary"] = {"blocking": 5}
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[8]), "queued")
+
     def test_limited_and_unavailable_lanes_are_passed_over(self):
         self.queued(7)
         self.assign(limited=["codex"], available=["codex", "codex-2"])
@@ -4112,6 +4141,18 @@ class Tickets(Base):
         self.assertIn("Not a failure (lane spark is at a limit)", note)
         self.assertNotIn("loom:rung", note)
         self.assertEqual(self.moved, [])
+
+    def test_a_ticket_on_a_pace_stopped_lane_moves_to_another_free_lane_of_its_tier(self):
+        # loom#2809: a pace stop now holds the slot until the pace catches up
+        # (bus/model_pick.py pace_catches_up), so its heartbeat reads limited
+        # and the ticket it stopped on goes to another free lane of its tier.
+        self.gh.ticket(7, "briefed", lane="opencode-go-3", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["opencode-go-3"],
+                available=[x for x in factory.TIERS["medium"] if x != "opencode-go-3"])
+        self.assertNotEqual(self.lane(7), "opencode-go-3")
+        self.assertIn(self.lane(7), factory.TIERS["medium"])
 
     def test_a_ticket_briefed_on_a_down_lane_steps_aside_at_once(self):
         # A lane whose key expired never claims its briefed tickets; they
@@ -5436,6 +5477,114 @@ class NoLane(Base):
         self.assertFalse(brain._in_flight(ticket("briefed", factory.HANDOFF_LABEL)))
         self.assertTrue(brain._in_flight(ticket("pr")))
         self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
+
+
+class PinFallback(Base):
+    """A queued ticket whose pinned model has no free lane falls back to a
+    free lane of its tier after a bounded wait (loom#3151). On 2026-11-17 one
+    pass assigned 0 of 86 queued tickets, each pinned to a codex or anthropic
+    model with no lane up, while about 30 lanes of their tiers sat idle."""
+    BOT = {"login": "loom-station[bot]", "type": "Bot"}
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
+
+    def queued(self, number, body=None, user=None, labels=()):
+        self.gh.ticket(number, "queued", body=body or self.SONNET)
+        self.gh.issues[number]["user"] = user or self.BOT
+        self.gh.issues[number]["labels"] = [{"name": x} for x in
+                                            ("loom:ticket", "loom:queued") + tuple(labels)]
+        self.gh.issues[number]["created_at"] = iso(0)
+
+    def assign(self, waited, available, env=None):
+        key = "%s#7" % REPO
+        with mock.patch.dict(os.environ, env or {}):
+            worker = factory.Factory(self.gh, [REPO], NOW,
+                                     trusted=["alice-example", "loom-station[bot]"],
+                                     available=available, no_lane_since={key: NOW - waited})
+            with mock.patch("bus.factory._say") as say:
+                worker.assign_queued()
+        worker.said = [c.args[0] for c in say.call_args_list]
+        return worker
+
+    def notes(self, number):
+        return "".join(c["body"] for c in self.gh.comments.get(number, []))
+
+    def test_the_wait_comes_from_the_environment_and_works_without_it(self):
+        self.assertEqual(factory.pin_fallback_after({}), 30 * 60)
+        self.assertEqual(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": "10"}), 600)
+        self.assertIsNone(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": "0"}))
+        for bad in ("", "x", "-3", "nan", "inf"):
+            self.assertEqual(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": bad}),
+                             30 * 60, bad)
+
+    def test_a_pinned_ticket_with_no_free_lane_takes_a_free_tier_lane_after_the_wait(self):
+        self.queued(7)
+        worker = self.assign(31 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "spark", None))
+        self.assertIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+        self.assertIn("lane spark with that lane's own model", self.notes(7))
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+        self.assertIn("%s#7" % REPO, worker.settled)
+        self.assertTrue(any("pin fallback" in line and "spark" in line
+                            and "claude-sonnet-5-5" in line for line in worker.said),
+                        worker.said)
+
+    def test_a_pinned_ticket_waits_for_its_model_before_the_wait_is_out(self):
+        self.queued(7)
+        worker = self.assign(29 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model claude-sonnet-5-5")
+
+    def test_the_pinned_model_goes_first_when_its_lane_is_free(self):
+        self.queued(7)
+        self.assign(3 * 3600, ["claude", "spark"])
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        self.assertNotIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+
+    def test_the_wait_is_configurable_and_zero_turns_the_fallback_off(self):
+        self.queued(7)
+        self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "0"})
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "10"})
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
+
+    def test_a_ticket_a_person_opened_keeps_its_pin(self):
+        # The operator wrote its Model: line: a hard pin.
+        self.queued(7, user=ME)
+        worker = self.assign(3 * 3600, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_sensitive_or_security_ticket_keeps_its_pin(self):
+        for label in ("class:sensitive", "tier:security"):
+            self.queued(7, labels=(label,))
+            self.assign(3 * 3600, ["spark"])
+            self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                             ("queued", "claude-sonnet-5-5"), label)
+
+    def test_a_fallback_skips_a_lane_the_ticket_already_ran_on(self):
+        self.queued(7)
+        self.gh.comments[7] = [{"body": "Claimed for lane spark (body sha256 0123456789ab)",
+                                "user": self.BOT}]
+        self.assign(3 * 3600, ["spark", "spark-2"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark-2", None))
+
+    def test_a_ticket_falls_back_at_most_twice(self):
+        self.queued(7)
+        self.gh.comments[7] = [{"body": factory.PIN_FALLBACK_MARKER % "gpt-6-luna", "user": self.BOT}
+                               for _ in range(factory.PIN_FALLBACK_MAX)]
+        worker = self.assign(3 * 3600, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_private_repo_never_falls_back_to_a_public_only_lane(self):
+        self.gh.private = True
+        self.queued(7)
+        self.assign(3 * 3600, ["zai"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
 
 def conflict_round_comment(number, ticket):

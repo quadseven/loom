@@ -47,7 +47,7 @@ class LaneFeedOrder(unittest.TestCase):
                    mock.patch.object(st, "record_scans"),
                    mock.patch.object(st, "disk_low", return_value=False)]
         for name in ("tend_runners", "reconcile_pull_requests", "hand_back",
-                     "claim_new", "assign_queued", "sweep_reviews"):
+                     "claim_new", "assign_queued", "sweep_reviews", "settle_ended_runs"):
             patches.append(mock.patch.object(st, name, side_effect=step(name)))
         for p in patches:
             p.start()
@@ -59,6 +59,12 @@ class LaneFeedOrder(unittest.TestCase):
         calls = self.run_pass(spent_by="claim_new")
         self.assertLess(calls.index("assign_queued"), calls.index("reconcile_pull_requests"))
         self.assertLess(calls.index("assign_queued"), calls.index("claim_new"))
+
+    def test_ended_runs_are_settled_before_queued_tickets_look_for_a_lane(self):
+        # A ticket left loom:running after its run ended is lane load; on
+        # 2026-11-16 such tickets kept three live lanes from any queued work.
+        calls = self.run_pass(spent_by="claim_new")
+        self.assertLess(calls.index("settle_ended_runs"), calls.index("assign_queued"))
 
     def test_a_pass_spent_by_the_early_reads_still_runs_assign_queued(self):
         calls = self.run_pass(spent_by="reconcile_pull_requests")

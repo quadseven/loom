@@ -203,6 +203,13 @@ TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
 # A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
 # this is never removed: a runner may have just made it.
 RUN_SCRATCH_SETTLE = 600
+# How long a loom:running ticket's newest brief must have sat in its lane's
+# done or failed folder, with none in the inbox and no runner on the lane,
+# before the station calls the run ended (settle_ended_runs). The run's own
+# report moves the ticket within a pass or two; this is the backstop.
+ENDED_RUN_SETTLE = 2 * 3600
+# At most this many ended runs are settled a pass: each is a read and two writes.
+ENDED_RUN_MAX = 10
 # The folders an idle lane's run home drops each pass: package caches and
 # temp files a run rebuilds.
 RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
@@ -1163,7 +1170,7 @@ class Settings:
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None) -> None:
         self.home = home
-        # The review sweep (bus/review_sweep.py); off unless from_env built it.
+        # The review sweep (bus/review_sweep.py); off unless LOOM_REVIEW_SWEEP=on.
         self.review_sweep = review_sweep or review_sweep_mod.Config()
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
         # LOOM_PASS_DEADLINE: seconds a whole pass may run before it dumps its
@@ -2214,8 +2221,42 @@ def adoption_comment(repo: str, ticket: int) -> str:
 
 # A ready mark: a status event naming the head whose checks and review passed.
 # Plain text, because a status event is shown to readers as it is written.
-READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands the pull "
-              "request in its turn.")
+READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands it in "
+              "its turn.")
+# The Ready line in a repo shadow mode holds (bus/shadow.py): the factory only
+# records a would-merge there, so the line must not promise a landing. Most
+# lane pull requests in shadow repos were merged by other sessions while the
+# line said the factory would (loom#2432).
+READY_SHADOW_TEXT = ("Ready: checks and review passed on head %s; shadow mode holds this "
+                     "repo, so the merge is recorded for the brain, not landed.")
+# The newest merged pull requests of a repo, for the digest's count of lane
+# merges by actor (Station._digest_merge_line). REST lists carry no merged_by.
+MERGED_PULLS_QUERY = (
+    "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
+    "pullRequests(states:MERGED,first:100,after:$after,"
+    "orderBy:{field:UPDATED_AT,direction:DESC}){"
+    "nodes{headRefName mergedAt updatedAt mergedBy{login}} "
+    "pageInfo{hasNextPage endCursor}}}}")
+# Pages of MERGED_PULLS_QUERY read a repo at most: the pages come newest
+# update first and stop at the first pull request updated before the window,
+# so this bounds only a window with more merges than it covers.
+MERGED_PULLS_PAGES = 10
+
+
+def merge_actor(login: str, own: str, bots: Set[str]) -> str:
+    """Who merged a lane pull request: "factory" for the station's own login,
+    "brain" for another App login among the trusted authors, else "other"."""
+    login = _bare_login(login)
+    if login and login == own:
+        return "factory"
+    return "brain" if login in bots else "other"
+
+
+def _bare_login(login: str) -> str:
+    """A login lowercased without its "[bot]" suffix: GraphQL names an App
+    by its slug, REST and LOOM_BRIEF_AUTHORS add "[bot]"."""
+    login = str(login or "").strip().lower()
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
 READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b")
 # A ticket marked ready before the status event kept a ready-head comment of
 # its own; it is still read.
@@ -5617,6 +5658,8 @@ class Station:
         if hold is not None and self.now < hold:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
+        if self._cap_held_early(repo, issue):
+            return False
         ok, reason = self._check_trust(repo, issue)
         if self._target_reached():
             return False
@@ -5632,6 +5675,8 @@ class Station:
             self._set_wait(repo, issue, "after")
             _say("%s#%s waits for %s" % (repo, issue["number"], ", ".join(
                 "%s (%s)" % (a.short, a.why) for a in waiting)))
+            return False
+        if self._blocked(repo, issue):
             return False
         fresh = self._issue(repo, int(issue["number"]))
         labelled_lane = _lane_of(issue)
@@ -5668,6 +5713,28 @@ class Station:
                  % (repo, fresh["number"], lane))
             return False
         return self._claim(repo, lane, fresh)
+
+    def _blocked(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Whether a briefed ticket waits on an open blocker: its brief's
+        Blocked on section, or GitHub's "blocked by" relationship, through the
+        factory's reader (factory.open_blockers), so a ticket with neither
+        costs no request and a blocker read that fails holds. A held ticket
+        keeps its lane and gets wait:blocked and one status note naming its
+        blockers; the claim clears the label on the first pass after they
+        close. 2026-11-16: the blocked-by hold ran only when the factory laned
+        a queued ticket, so a ticket briefed straight to a lane was claimed on
+        a base that lacked its prerequisite (loom#3129)."""
+        blockers = factory.open_blockers(self.gh, repo, issue, self._dependency)
+        if not blockers:
+            return False
+        number = int(issue["number"])
+        reason = "blocked on %s" % ", ".join(blockers)
+        if WAIT + "blocked" not in _label_names(issue):
+            self._set_wait(repo, issue, "blocked")
+            self._routine(repo, number, "Waits: %s. A lane claims it on the first pass "
+                                        "after they close." % reason)
+        _say("%s#%s waits: %s" % (repo, number, reason))
+        return True
 
     def _status_texts(self, repo: str, number: int) -> List[str]:
         """The texts of the ticket's comments and status events written by a
@@ -5875,6 +5942,33 @@ class Station:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
         self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
+        return True
+
+    def _cap_held_early(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Hold a build ticket of a repo at its open pull request cap before
+        any read of its own but its comments, which the station keeps per
+        issue stamp (loom#3119). Only a ticket already told this exact hold
+        and with no live fix round is held here; anything else (a fix round,
+        a new count, an unread count, an unusable fix comment) takes the full
+        claim path, so the hold note and the fix exemption stay as they were.
+        On 2026-11-16, 61 of 98 briefed tickets sat in two repos over the
+        cap, and the trust, issue and merged-PR reads each one cost spent the
+        claim share before free lanes reached a ticket they could run."""
+        count = self._repo_pr_count(repo)
+        cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
+        if count is None or count < cap:
+            return False
+        number = int(issue["number"])
+        reason = "held: %s has %d open pull requests (cap %d)" % (repo, count, cap)
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        try:
+            fix, _ = self._live_fix(repo, number, self._fix_for(repo, comments))
+        except ValueError:
+            return False
+        if fix is not None or self._last_repo_pr_hold(repo, number) != reason:
+            return False
+        _say(reason)
+        self._cap_held.add("%s#%d" % (repo, number))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
@@ -8646,7 +8740,8 @@ class Station:
         # Routine, so an event in the status comment rather than a comment of
         # its own: a bare marker comment emailed a blank message (2026-10-20).
         if ready != sha:
-            self._routine(repo, number, READY_TEXT % sha)
+            text = READY_SHADOW_TEXT if shadow.active(repo) else READY_TEXT
+            self._routine(repo, number, text % sha)
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
@@ -8906,6 +9001,63 @@ class Station:
              % (name, branch, age // 60))
         self._never_left_running(repo, number, lane)
         return True
+
+    def settle_ended_runs(self) -> None:
+        """Move each loom:running ticket whose run has ended to loom:failed,
+        through _never_left_running, so it stops holding its lane. Ended
+        means the newest brief of the ticket in its lane's folders sits in
+        done or failed for ENDED_RUN_SETTLE, none waits in the inbox, and no
+        runner holds the lane. Remote lanes, factory incident holds and a
+        ticket with no brief on record are left alone. The factory counts a
+        running ticket as lane load: on 2026-11-16 six such tickets, ended
+        4 hours to 14 days before, kept three live lanes from 49 queued
+        tickets. One open-issues list a repo, a 304 when unchanged."""
+        run = os.path.join(self.s.home, "run")
+        left = ENDED_RUN_MAX
+        for repo in self.scan_repos():
+            if left <= 0 or self._deferred():
+                return
+            try:
+                found = self._paginate("/repos/%s/issues?labels=loom:running&state=open"
+                                       "&per_page=100" % repo)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not list running tickets in %s: %s" % (repo, err))
+                continue
+            for issue in found:
+                if left <= 0:
+                    return
+                lane = _lane_of(issue) if isinstance(issue, dict) else ""
+                if (not lane or lane in REMOTE_LANES or "pull_request" in issue
+                        or WAIT + "incident" in _label_names(issue)
+                        or self._lane_locked(run, lane)
+                        or not self._run_ended(repo, int(issue["number"]), lane)):
+                    continue
+                self._never_left_running(repo, int(issue["number"]), lane)
+                left -= 1
+
+    def _run_ended(self, repo: str, number: int, lane: str) -> bool:
+        """The ticket's newest build brief on the lane is in done or failed,
+        at least ENDED_RUN_SETTLE old, and no brief of it is in the inbox."""
+        stem = re.compile(r"%s(?:-r[0-9]+)?\.(?:md|claiming)$"
+                          % re.escape(tickets.ticket_name(repo, number)))
+        newest = None
+        for folder in ("", "done", "failed"):
+            path = os.path.join(self.inbox(lane), folder)
+            try:
+                entries = [e for e in os.listdir(path) if stem.fullmatch(e)]
+            except OSError:
+                continue
+            if entries and not folder:
+                return False
+            for entry in entries:
+                try:
+                    stamp = os.path.getmtime(os.path.join(path, entry))
+                except OSError:
+                    continue
+                newest = stamp if newest is None else max(newest, stamp)
+        return newest is not None and self.now - newest >= ENDED_RUN_SETTLE
 
     def _never_left_running(self, repo: str, number: int, lane: str) -> None:
         """A reported failure ends the run, so a ticket still loom:running on
@@ -11289,6 +11441,67 @@ class Station:
         passed, streak = dated[day]
         return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
 
+    def _digest_merge_line(self, since: float) -> str:
+        """How many lane pull requests (head loom/...) merged since `since`,
+        by actor: the factory (this station's own login), the brain (another
+        App login among the trusted authors) or other (a person or an outside
+        session). 2026-11-01: 30 of 36 lane merges in a day were by outside
+        sessions while the Ready line said the factory lands them, and nothing
+        measured it (loom#2432). The own login is the App's or
+        LOOM_GITHUB_LOGIN; a station on a personal token sets neither, and its
+        merges count as other. A repo whose read fails is named on the line."""
+        own = _bare_login(self.gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", ""))
+        bots = {_bare_login(a) for a in self.s.authors if a.lower().endswith("[bot]")} - {own}
+        counts = {"factory": 0, "brain": 0, "other": 0}
+        unread = []
+        for repo in (r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)):
+            try:
+                mergers = self._lane_mergers(repo, since)
+            except RateLimited:
+                raise
+            except GitHubError:
+                unread.append(repo)
+                continue
+            for login in mergers:
+                counts[merge_actor(login, own, bots)] += 1
+        line = ("Lane pull requests merged since the last digest: %d (factory %d, brain %d, "
+                "other %d)." % (sum(counts.values()), counts["factory"], counts["brain"],
+                                counts["other"]))
+        if unread:
+            line += " Not read: %s." % ", ".join(unread)
+        return line
+
+    def _lane_mergers(self, repo: str, since: float) -> List[str]:
+        """The merger login of each lane pull request (head loom/...) of the
+        repo merged since `since`, paging MERGED_PULLS_QUERY newest update
+        first until a pull request was last updated before `since` (a merge
+        updates it, so none older can have merged in the window), at most
+        MERGED_PULLS_PAGES pages. Raises GitHubError when a read fails."""
+        owner, name = repo.split("/")
+        found: List[str] = []
+        after: Optional[str] = None
+        for _ in range(MERGED_PULLS_PAGES):
+            data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name,
+                                                        "after": after})
+            pulls = (((data or {}).get("repository") or {}).get("pullRequests") or {})
+            nodes = [n for n in pulls.get("nodes") or [] if isinstance(n, dict)]
+            found += [m for m in (self._lane_merger(n, since) for n in nodes) if m is not None]
+            page = pulls.get("pageInfo") or {}
+            oldest = self._epoch(str((nodes[-1] if nodes else {}).get("updatedAt") or ""))
+            if not page.get("hasNextPage") or oldest is None or oldest < since:
+                return found
+            after = page.get("endCursor")
+        return found
+
+    def _lane_merger(self, node: Dict[str, Any], since: float) -> Optional[str]:
+        """The merger login of one merged pull request node when it is a lane
+        pull request (head loom/...) merged since `since`, else None."""
+        merged = self._epoch(str(node.get("mergedAt") or ""))
+        if not str(node.get("headRefName") or "").startswith("loom/") \
+                or merged is None or merged < since:
+            return None
+        return str((node.get("mergedBy") or {}).get("login") or "")
+
     def _digest_shadow_lines(self, since: float) -> List[str]:
         """What shadow mode held since the last digest (bus/shadow.py): at
         most two lines, the counts and the command that lists each with its
@@ -11367,6 +11580,7 @@ class Station:
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
+        lines.append(self._digest_merge_line(start))
         lines += self._digest_shadow_lines(start)
         lines += scorecard.Scorecard(self.state, self.now).demotion_lines().values()
         if not self._digest_send("\n".join(lines)):
@@ -17186,6 +17400,15 @@ class Station:
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
             self.report_outcomes()
+            # A ticket left loom:running after its run ended counts as lane
+            # load, so it is settled before queued tickets look for a lane.
+            if not self._deferred():
+                try:
+                    self._timed(self.settle_ended_runs)
+                except RateLimited:
+                    raise
+                except (GitHubError, OSError) as err:
+                    _say("settle_ended_runs failed: %s" % err)
             # Briefing a queued ticket onto a free lane comes before the heavy
             # reads: reconcile_pull_requests and claim_new spend the pass's
             # request target, and on 2026-11-07 assign_queued carried over

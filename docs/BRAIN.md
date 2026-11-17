@@ -100,7 +100,7 @@ decides who acts:
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
-| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section or GitHub's own blocked-by link names an issue still open, its brief says another issue supersedes it (the factory gives neither a lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
+| `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section or GitHub's own blocked-by link names an issue still open (the factory gives such a queued ticket no lane, and the station claims no such briefed one), its brief says another issue supersedes it (the factory gives it no lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
 | `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither, with one exception: an unclaimed queued ticket in the pool takes a lane left free after every other queued ticket had its turn, and loses the label (see Tickets no lane takes). The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; a claimed ticket stays in the pool, and taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
@@ -279,7 +279,12 @@ with no quote counts for every friction of that journal.
 `Priority:` orders the work. Every queue (station claims, the factory's
 queued tier moves and its landing order) takes `loom:urgent`,
 `loom:regression` and `loom:revert` tickets first, then P0 before P1, P2
-and P3, then the oldest. `brief --priority P1` writes the line; a ticket
+and P3, then the ticket that blocks the most open issues (the `blocking`
+count of the dependency summary the issue listing already returns, so the
+order sends no request of its own), then a `Foundational: yes` ticket
+(docs/BRIEF_FORMAT.md), then the oldest. Priority stays ahead of the
+blocking terms: a P3 ticket that blocks others never jumps a P1 leaf.
+`brief --priority P1` writes the line; a ticket
 filed from a health finding gets it from the finding's impact
 (docs/HEALTH.md). `status` opens with a Priorities section: the top 10 open
 tickets not yet merged, across repos, in that order, then the Health
@@ -1062,7 +1067,10 @@ superseded, when the issue it was rewritten from is already closed as
 completed, when a pull request in another repo of the owner that names it in
 full has merged, when a pull request a person linked in it or its comments
 merged after it was filed, or when every file its criteria ask to add already
-exists on the default branch. A stale ticket goes back to `loom:queued` with
+exists on the default branch. A mention under an Out of scope, Not in scope
+or Follow-ups heading, or on a line that says the ticket was filed for later
+("filed for", "filed as", "follow-up"), names work not built and does not
+count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
 `needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
 gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
 once: once the operator removes `needs:human`, the same evidence does not hold
@@ -1371,7 +1379,10 @@ itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
 push to its pull request, a lane's first pull request (`Lane <lane> opened a
 pull request: <url>`; the pull request's `Refs #N` already cross-references the
 ticket and `loom:pr` is set, loom#1390), a ready mark (`Ready: checks and
-review passed on head <sha>`; loom#1244), and a build run's no-change answer
+review passed on head <sha>`; loom#1244; it ends "the factory lands it in its
+turn", or in a repo shadow mode holds "shadow mode holds this repo, so the
+merge is recorded for the brain, not landed", since there the factory only
+records a would-merge, loom#2432), and a build run's no-change answer
 with where it left the ticket (Claim and outcome). A new comment emails the
 operator; an edit does not (loom#866: zippie#264 carried 77 bot comments).
 Outcomes (a failure, merged, shipped, verified, an ask, a runaway hold) and
@@ -1699,6 +1710,23 @@ skipped (loom#1831). The station keeps when each such ticket first waited
 (`no_lane_since` in `state/station/ticket-waits.json`, kept across its
 no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 
+- After `LOOM_PIN_FALLBACK_MINUTES` minutes (default 30; `0` turns it off) a
+  queued ticket pinned to a model no free lane takes is given the first free
+  lane of its difficulty tier (or of its FALLBACK tiers when none of its tier
+  is up), for its repo, with that lane's own model: the factory takes its
+  `Model:` line off, so the pull request footer names the model that ran
+  (loom#3151). Its pinned model is still tried first on every pass. It never
+  takes a lane it already ran on, and falls back at most twice
+  (`PIN_FALLBACK_MAX`): a fallback run that fails climbs the ladder as any
+  failure does. The status comment says `Not a failure` with a
+  `loom:pin-fallback <model>` marker, and the station log says `pin fallback
+  from model <model> after N minutes`. Hard pins wait instead: a ticket a
+  person opened (the operator wrote its `Model:` line), and one carrying
+  `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
+  lifted and no credit spent: the fallback routes around both. On
+  2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
+  or anthropic model with no lane up, while about 30 lanes of their tiers sat
+  idle.
 - After `LOOM_NO_LANE_REROUTE` hours (default 6, at most 24) a ticket pinned
   to a model moves to the first rung of the model ladder the climb rules allow
   (never down from a strong model) that has a free lane in its difficulty
@@ -1870,6 +1898,11 @@ A lane pull request is merge-ready if and only if all five hold:
 - every thread the review bot opened (a finding) is older than the head
   commit, so a fix-up commit came after each finding.
 
+Review is `grug`'s alone on every repo (operator decision, 2026-11-16).
+The station's review sweep, which handed unreviewed pull requests to codex
+and agy review lanes, is off unless `LOOM_REVIEW_SWEEP=on` (docs/LANES.md,
+"The review sweep").
+
 `python3 -m bus.brain status` prints this per pull request: `READY`, or
 `blocked:` and every blocker that applies, for example `blocked: checks
 failure, grug changes_requested, 3 unresolved threads`. It is computed by
@@ -1899,8 +1932,14 @@ A fleet hold blocks too (loom#2393): a plain pull request comment from a
 `LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
 commit, whose text opens with `Not merging` or `Hold` (any letter case, after
 optional whitespace or markdown marks such as `**`, `>` or `#`). A later
-comment by the pull request's author lifts it, as does a later trusted comment
-naming the head commit's sha (7 or more hex characters), or a newer push.
+plain comment by the pull request's author lifts it, as does a later plain
+trusted comment naming the head commit's sha (7 or more hex characters), or
+a newer push. A comment carrying a Loom marker never lifts a hold, whoever
+posts it and whatever sha the marker names: the factory and the brain post
+marker comments (a review-again ask, a reviewer ask, a Luna note, a scope
+hold, a rebuttal refusal) under the same App login that opens lane pull
+requests, so those machine notes leave the hold standing. Only a plain,
+marker-free reply lifts a hold by comment.
 Status prints `held by a fleet comment from LOGIN: <comment link>`, and
 `bus.brain merge` refuses with the same words. Comments that cannot be read
 block as `pull request comments unreadable`. Only the opener counts: no other

@@ -967,9 +967,23 @@ def _names_sha(body: str, sha: str) -> bool:
                              for m in _SHA_WORD.finditer(body))
 
 
+def _carries_marker(body: str) -> bool:
+    """The comment carries an automated marker: an HTML comment opening
+    with the Loom marker prefix, or a review-bot marker of the same shape.
+    The factory and the brain post such comments under the same App login
+    that opens lane pull requests, so a marker comment is a machine note,
+    never the author's or a trusted login's own answer."""
+    return "<!-- loom:" in body or "<!-- grug-" in body
+
+
 def _lifts_hold(login: str, body: str, author: str, sha: str, allowed: set) -> bool:
     """A comment after a hold that lifts it: the pull request author's, or
-    a trusted one naming the head commit's sha."""
+    a trusted one naming the head commit's sha. A comment carrying a Loom
+    marker never lifts a hold, whoever posts it and whatever sha it names:
+    that is the chosen rule for this ticket, so the factory's own marker
+    comments leave a hold standing."""
+    if _carries_marker(body):
+        return False
     return (bool(author) and login == author) or (login in allowed and _names_sha(body, sha))
 
 
@@ -977,9 +991,10 @@ def fleet_hold(comments: Sequence[Any], head: Dict[str, Any], head_sha: str,
                pr_author: str, trusted: Sequence[str]) -> Optional[Dict[str, Any]]:
     """The standing hold comment on a pull request, else None (loom#2393).
     A hold is a trusted login's comment opening with "Not merging" or "Hold",
-    made after the head commit (a newer push lifts it). A later comment by
-    the pull request's author lifts it, and so does a later trusted comment
-    naming the head commit's sha. With no head commit date every hold counts."""
+    made after the head commit (a newer push lifts it). A later plain comment
+    by the pull request's author lifts it, and so does a later plain trusted
+    comment naming the head commit's sha. A comment carrying a Loom marker
+    never lifts it. With no head commit date every hold counts."""
     allowed = {a.lower() for a in trusted if a}
     if not allowed:
         return None
@@ -3897,7 +3912,9 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
-BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+# A body edited in the GitHub web editor ends its lines in CRLF, so the
+# line may end in a carriage return before the newline (loom#3115).
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*\r?$", re.M | re.I)
 
 
 def _builds_on_base(gh: GitHub, repo: str, body: str,
@@ -3935,11 +3952,12 @@ def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
-                 repairs_incident: Optional[int] = None) -> str:
+                 repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
                (("Repairs incident", "#%d" % repairs_incident if repairs_incident is not None else None),
                 ("After", after), ("Not before", not_before),
-                ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
+                ("Difficulty", difficulty), ("Priority", priority),
+                ("Foundational", "yes" if foundational else None), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
@@ -3974,7 +3992,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
           resolves: Optional[str] = None, intake_of: Optional[int] = None,
-          repairs_incident: Optional[int] = None) -> str:
+          repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -4050,7 +4068,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
+                             repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
                                       "Model": model, "Base": base, "After": after,
                                       "Not before": not_before,
@@ -8856,6 +8875,8 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default=lanes_repo_default()); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")  # leak-guard-allow: the --after help above shows the cross-repo ref shape
     b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
+    b.add_argument("--foundational", action="store_true",
+                   help="an epic child its siblings build on: writes Foundational: yes")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -8927,7 +8948,8 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
-                resolves=args.resolves, repairs_incident=args.repairs_incident))
+                resolves=args.resolves, repairs_incident=args.repairs_incident,
+                foundational=args.foundational))
 
 
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:

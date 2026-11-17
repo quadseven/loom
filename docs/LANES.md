@@ -17,6 +17,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
+  (Before a brief is written, the factory may take a default pin off a
+  queued ticket whose model had no free lane for `LOOM_PIN_FALLBACK_MINUTES`;
+  docs/BRIEF_FORMAT.md says which pins are hard.)
   Account-wide out-of-credit limits still hold the lane. The heartbeat names
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
@@ -822,7 +825,12 @@ At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
 line and a link; a count of the goal homes where nothing moved; one line
 per backlog goal home (labelled `loom:backlog`), counted from its tickets,
-since a backlog goal posts no report on GitHub; and the
+since a backlog goal posts no report on GitHub; one line counting the lane
+pull requests (head `loom/...`) merged since the last digest by actor:
+factory (the station's own App login, or `LOOM_GITHUB_LOGIN`), brain
+(another App login in `LOOM_BRIEF_AUTHORS`) and other (a person or an
+outside session), read by GraphQL newest update first until the window ends
+(at most 10 pages a repo; a repo whose read fails is named); and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
@@ -2076,6 +2084,13 @@ again after an hour.
 
 ## The review sweep: independent reviews by the reviewer Apps
 
+The sweep is off. Review is `grug`'s alone: the `Grug - Elder` check is the
+one reviewer on every repo (operator decision, 2026-11-16).
+`Config.from_env` leaves the sweep off unless the station environment sets
+`LOOM_REVIEW_SWEEP=on`, and the installer does not set it, so no pull
+request goes to a review lane. The code and the settings below stay for a
+later decision; they describe what the sweep does once turned on.
+
 The station's `sweep_reviews` duty (`bus/review_sweep.py`) gives open pull
 requests an independent review without waiting for a brain to ask. At most
 once per `LOOM_REVIEW_SWEEP_EVERY` seconds it lists the open, non-draft
@@ -2460,7 +2475,9 @@ image (a fingerprint of the image's packages and tools, `<ticket>.image`).
 When the last failure exited 125 to 127 (the check could not run: a tool the
 image lacks, such as `ruff`), a moved head does not lift the stop, because no
 commit on the repo can add a tool to the image; only a new image or the day
-probe below does. One run records two failures, because a red check runs twice. A failed `setup:`
+probe below does. A red check runs twice, so one run of it records two
+failures. A check that cannot start records one row, so it stops the repo on
+that slot after one run, since no retry can add the tool. A failed `setup:`
 counts too. A check that passed on its second run counts for nothing, and only
 a fix round's default-branch rows count. A day with no report from the slot
 lets one run through, because only a run can show a new image.

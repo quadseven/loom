@@ -264,12 +264,46 @@ class Stale(unittest.TestCase):
         asked = comment(brief_check.ask(self.check()), login="loom-station[bot]", bot=True)
         self.assertIsNone(self.check(comments=[asked]))
 
-    def merged_in_other_repo(self, number):
+    def merged_in_other_repo(self, number, body=None):
         self.fake.routes["/repos/%s/issues/206/timeline" % REPO] = [{
             "event": "cross-referenced", "source": {"type": "issue", "issue": {
-                "number": number, "body": "Refs %s#206\n" % REPO, "title": "Ship it",
-                "repository": {"full_name": OTHER},
+                "number": number, "body": "Refs %s#206\n" % REPO if body is None else body,
+                "title": "Ship it", "repository": {"full_name": OTHER},
                 "pull_request": {"merged_at": iso(3600)}}}}]
+
+    def test_a_merged_pull_request_naming_it_only_under_out_of_scope_does_not_hold_it(self):
+        # loom#1856: a pull request names a ticket under Out of scope because
+        # it does not build it; the stale check held such tickets on a person.
+        for heading in ("## Out of scope", "### Not in scope", "**Follow-ups**"):
+            with self.subTest(heading=heading):
+                self.merged_in_other_repo(31, "## Why\nShip the caller.\n\nRefs %s#3\n\n%s\n"
+                                              "- The key, %s#206.\n" % (OTHER, heading, REPO))
+                self.assertIsNone(self.check())
+
+    def test_a_merged_pull_request_naming_it_only_in_a_filed_note_does_not_hold_it(self):
+        for note in ("(%s#206 filed for a way out of the yard)",
+                     "Filed as %s#206 for the rest.",
+                     "The rest is a follow-up: %s#206."):
+            with self.subTest(note=note):
+                self.merged_in_other_repo(31, "## Why\nShip the caller.\n\n" + note % REPO)
+                self.assertIsNone(self.check())
+
+    def test_a_refs_line_still_holds_it_beside_an_out_of_scope_section(self):
+        self.merged_in_other_repo(31, "## Why\nShip it.\n\nRefs %s#206\n\n## Out of scope\n"
+                                      "- Other work.\n" % REPO)
+        got = self.check()
+        self.assertEqual(got.key, "pr-%s#31" % OTHER)
+        self.assertIn("names this ticket", brief_check.ask(got))
+        # A Refs line counts even when it also says follow-up.
+        self.merged_in_other_repo(32, "Refs %s#206 (a follow-up to the first slice)\n" % REPO)
+        self.assertEqual(self.check().key, "pr-%s#32" % OTHER)
+
+    def test_a_link_only_under_the_tickets_out_of_scope_does_not_hold_it(self):
+        # The same rule for a pull request a person linked on the ticket.
+        said = [comment("## Out of scope\n- https://github.com/%s/pull/45 covers the rest."
+                        % OTHER)]
+        self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(3600), "title": "x"}
+        self.assertIsNone(self.check(comments=said))
 
     def test_a_scrubbed_ask_on_a_public_repo_holds_it_once(self):
         # loom#2835: the public scrub rewrote the private repo named in the
@@ -452,6 +486,22 @@ class FactoryQueue(unittest.TestCase):
         self.assertEqual(worker.waits["%s#8" % self.repo], "waits for a person (needs:human)")
         self.assertEqual((self.lane_of(7), self.lane_of(8)), ([], []))
         self.assertNotIn("%s#9" % self.repo, worker.waits)
+
+    def test_a_queued_two_platform_brief_gains_needs_brain_and_one_note(self):
+        # loom#2929: the split hold (loom#1651) at the factory queue gate.
+        self.queued(7, "Difficulty: medium\n\n" + Split.MULTI)
+        self.queued(9, "Difficulty: medium\n\n" + Split.SINGLE)
+        for _ in range(2):
+            worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+            worker.assign_queued()
+        self.assertEqual(worker.waits["%s#7" % self.repo], "spans more than one platform")
+        self.assertEqual(self.lane_of(7), [])
+        self.assertIn("needs-brain", [x["name"] for x in self.gh.issues[7]["labels"]])
+        notes = [c for c in self.gh.comments.get(7, [])
+                 if "more than one platform" in str(c.get("body"))]
+        self.assertEqual(len(notes), 1)
+        self.assertNotIn("%s#9" % self.repo, worker.waits)
+        self.assertNotEqual(self.lane_of(9), [])
 
     def test_a_ticket_with_no_area_label_in_an_area_repo_gets_no_lane_and_one_note(self):
         good = ("Difficulty: medium\n\n" + HEALTH_INTAKE
@@ -750,7 +800,8 @@ class Split(unittest.TestCase):
     def test_windows_in_the_time_sense_is_not_a_platform(self):
         # Usage windows and time windows beside one platform stay one ticket.
         for phrase in ("the end of its usage windows", "its time windows",
-                       "the rate windows", "the reset windows"):
+                       "the rate windows", "the reset windows",
+                       "a window of 30 minutes", "the maintenance windows"):
             body = ("## Why\n\nA lane on the host stops early.\n\n"
                     "## What\n\n- The Linux host stops at %s.\n\n"
                     "## Acceptance criteria\n"
