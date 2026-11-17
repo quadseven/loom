@@ -44,6 +44,8 @@ slot such as anthropic-2 runs its lane's agent):
 - `zai` - Z.ai free GLM Flash models via opencode; public repos only.
 - `workersai` - Cloudflare Workers AI models via opencode, within the
   account's free daily allowance.
+- `openai-mini` - a small OpenAI model via opencode on the monthly API
+  credit, easy tickets only, refused at its spend cap.
 - `spark` - a self-hosted vLLM coder via opencode, one stream at a time.
 - `free` - one free OpenAI-compatible provider per slot (free-kilo,
   free-groq, ...) via opencode, sharing the spark lane's endpoint handling.

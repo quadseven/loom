@@ -10107,6 +10107,32 @@ class SpendTest(Base):
         self.station().run_pass()
         self.assertNotIn("Anthropic", self.fake.posts[0])
 
+    def openai_calls(self, *costs, month="2030-05"):
+        path = os.path.join(self.home, "state", "usage", "openai.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            for cost in costs:
+                fh.write(json.dumps({"month": month, "cost_usd": cost, "source": "lane"}) + "\n")
+
+    def test_the_status_shows_the_months_openai_spend_against_the_cap(self):
+        # loom#3188: the month's OpenAI spend is in the lane status.
+        self.openai_calls(12.5, 0.25)
+        self.openai_calls(40.0, month="2030-04")
+        self.station().run_pass()
+        self.assertIn("\nOpenAI spend 2030-05: $12.75 of the $90.00 cap, 2 calls", self.fake.posts[0])
+        self.assertNotIn("At the cap", self.fake.posts[0])
+
+    def test_the_status_says_when_the_openai_cap_is_reached(self):
+        self.openai_calls(90.0)
+        self.station().run_pass()
+        self.assertIn("At the cap: openai-mini and the decision helper make no call until next month.",
+                      self.fake.posts[0])
+
+    def test_no_openai_line_without_a_call_this_month(self):
+        self.openai_calls(5.0, month="2030-04")
+        self.station().run_pass()
+        self.assertNotIn("OpenAI spend", self.fake.posts[0])
+
     def test_a_new_run_republishes_on_the_next_pass(self):
         self.runs((2, "anthropic", 1.0))
         self.station().run_pass()
@@ -10150,6 +10176,84 @@ class SpendTest(Base):
         self.assertEqual(s.anthropic.expires, calendar.timegm((2026, 10, 21, 0, 0, 0)))
         bad = station.Settings.from_env({"LOOM_ANTHROPIC_BUDGET_USD": "lots"})
         self.assertIsNone(bad.anthropic.usd)
+
+
+class OpenAIAdviceTest(Base):
+    """The OpenAI decision helper's advisory comment on loom:triage tickets
+    (loom#3188): off unless LOOM_OPENAI_HELPER=1, refused at the cap."""
+    NOW = calendar.timegm((2030, 5, 5, 12, 0, 0))
+    ENV = {"LOOM_OPENAI_HELPER": "1", "LOOM_OPENAI_HELPER_KEY_SSM": "/k/openai"}
+
+    def setUp(self):
+        super().setUp()
+        self.fake.add(41, title="Crash on empty input", state="triage")
+        self.fake.add(42, title="Crash when the input is empty", state="triage")
+        self.fake.add(43, title="Docs typo", state="queued")
+        self.answers = []
+        self.secret_reads = []
+
+    def transport(self, url, headers, body, timeout):
+        self.answers.append(json.loads(body))
+        task = json.loads(body)["messages"][0]["content"]
+        if "triage" in task:
+            content = '{"difficulty": "easy", "ready": true, "reason": "small"}'
+        elif "route" in task:
+            content = '{"lane": "spark"}'
+        else:
+            content = '{"duplicate_of": 41, "reason": "same crash"}'
+        return 200, {"choices": [{"message": {"content": content}}],
+                     "usage": {"prompt_tokens": 500, "completion_tokens": 50}}
+
+    def station(self):
+        def read_secret(name, region):
+            self.secret_reads.append(name)
+            return "sk-fake"
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.NOW,
+                             read_secret=read_secret)
+        st.openai_transport = self.transport
+        return st
+
+    def advised(self):
+        return {n: [c["body"] for c in self.fake.comments.get(n, [])
+                    if c["body"].startswith("<!-- loom:openai-advice v1 -->")]
+                for n in (41, 42, 43)}
+
+    def test_off_by_default_it_reads_no_key_and_sends_nothing(self):
+        with mock.patch.dict(os.environ, {"LOOM_OPENAI_HELPER": ""}):
+            self.station().advise_triage()
+        self.assertEqual((self.secret_reads, self.answers), ([], []))
+        self.assertEqual(self.advised(), {41: [], 42: [], 43: []})
+
+    def test_on_it_advises_each_triage_ticket_once(self):
+        with mock.patch.dict(os.environ, self.ENV):
+            self.station().advise_triage()
+        advised = self.advised()
+        self.assertEqual([len(advised[n]) for n in (41, 42, 43)], [1, 1, 0])
+        self.assertIn("Difficulty: easy", advised[42][0])
+        self.assertIn("Lane: spark", advised[42][0])
+        self.assertIn("Possible duplicate of #41", advised[42][0])
+        self.assertEqual(self.secret_reads, ["/k/openai"])
+        # The candidates for 42 exclude 42 itself.
+        dup = [a for a in self.answers if "duplicate" in a["messages"][0]["content"]]
+        self.assertNotIn("#42 ", dup[-1]["messages"][1]["content"])
+        # Every call is in the ledger; the next run within the hour sends nothing.
+        self.assertEqual(open(os.path.join(self.home, "state", "usage", "openai.jsonl")).read().count("\n"), 6)
+        sent = len(self.answers)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.station().advise_triage()
+        self.assertEqual(len(self.answers), sent)
+
+    def test_at_the_cap_nothing_is_sent_and_no_ticket_is_marked(self):
+        path = os.path.join(self.home, "state", "usage", "openai.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(json.dumps({"month": "2030-05", "cost_usd": 90.0}) + "\n")
+        with mock.patch.dict(os.environ, self.ENV):
+            self.station().advise_triage()
+        self.assertEqual(self.answers, [])
+        self.assertEqual(self.advised(), {41: [], 42: [], 43: []})
+        seen = json.load(open(os.path.join(self.home, "state", "station", "openai_advice.json")))
+        self.assertEqual(sorted(seen), ["_at"])
 
 
 class AsksTest(Base):

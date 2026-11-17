@@ -980,6 +980,8 @@ on hard work):
   opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
   (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
   are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
+  Last, openai-mini: a small OpenAI model on the monthly API credit, any repo,
+  easy tickets only (never a medium fallback), refused at its spend cap.
   Never anthropic or claude for an easy ticket.
 - Medium: a spark slot first (any repo); then on a public repo muse, then
   agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a

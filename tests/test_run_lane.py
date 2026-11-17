@@ -414,7 +414,7 @@ if [ "${1:-}" = models ]; then
 fi
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY OPENAI_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -443,6 +443,10 @@ printf 'config=%s\\n' "${OPENCODE_CONFIG_CONTENT:-none}" >> "$TMPDIR/agent.log"
 case "$args" in *AGENT_FAIL=1*) exit 3 ;; esac
 # AGENT_TIMEOUT=1 ends it as `timeout` does when the run outlasts its limit.
 case "$args" in *AGENT_TIMEOUT=1*) exit 124 ;; esac
+# EMIT_USAGE=1: one model call's step event, as opencode --format json prints it.
+case "$args" in *EMIT_USAGE=1*)
+  echo '{"type":"step_finish","part":{"tokens":{"input":200000,"output":1000,"reasoning":0,"cache":{"read":0,"write":0}}}}' ;;
+esac
 # Real CLIs fstat their stdout and stderr (Bun does on start).
 if /usr/bin/perl -e 'exit((stat(STDOUT) && stat(STDERR)) ? 0 : 1)'; then
   fds=ok; else fds=denied; fi
@@ -4367,6 +4371,65 @@ exec /usr/bin/git "$@"
         )
         self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
         self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    # The openai-mini lane (loom#3188): a small OpenAI model on API credit,
+    # every call priced into state/usage/openai.jsonl, no call at the cap.
+    OPENAI_ENV = {"LOOM_OPENAI_MINI_KEY_SSM": "/k/oa", "FAKE_SECRET__k_oa": "fake-oa-key",
+                  "LOOM_OPENAI_MINI_MODEL": "openai/gpt-6-luna"}
+
+    def openai_ledger(self):
+        path = self.loom / "state" / "usage" / "openai.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_openai_mini_lane_runs_its_model_with_the_openai_key_and_records_each_call(self):
+        inbox, result = self.api_lane("openai-mini", extra="EMIT_USAGE=1", difficulty="easy",
+                                      **self.OPENAI_ENV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agent = [c for c in self.calls() if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, self.calls())
+        self.assertIn("-m openai/gpt-6-luna", agent[0])
+        self.assertIn("keyvar=OPENAI_API_KEY key=fake-oa-key", agent[0])
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+        [line] = self.openai_ledger()
+        self.assertEqual((line["source"], line["slot"], line["model"]),
+                         ("lane", "openai-mini", "openai/gpt-6-luna"))
+        self.assertIn("T042", line["ticket"])
+        self.assertAlmostEqual(line["cost_usd"], (200000 * 0.10 + 1000 * 0.50) / 1e6)
+        self.assertNotIn("fake-oa-key", json.dumps(line))
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_openai_mini_lane_at_the_cap_takes_no_brief_and_reads_no_key(self):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        month = time.strftime("%Y-%m", time.gmtime())
+        (usage / "openai.jsonl").write_text(json.dumps({"month": month, "cost_usd": 90.0}) + "\n")
+        inbox, result = self.api_lane("openai-mini", difficulty="easy", **self.OPENAI_ENV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertFalse(any("/k/oa" in c for c in self.calls() if c.startswith("aws ")))
+        # The brief waits for the next month or another lane; it is not failed.
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        beat = json.loads((usage / "openai-mini.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("cap", beat["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_openai_mini_lane_refuses_a_pinned_model_from_elsewhere(self):
+        inbox, _ = self.api_lane("openai-mini", difficulty="easy",
+                                 brief_header="Demoted-Models: none\nModel: openrouter/vendor/model:free",
+                                 **self.OPENAI_ENV)
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_openai_mini_lane_holds_on_a_model_with_no_pinned_price(self):
+        inbox, _ = self.api_lane("openai-mini", difficulty="easy",
+                                 **{**self.OPENAI_ENV, "LOOM_OPENAI_MINI_MODEL": "openai/gpt-6-astra"})
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        beat = json.loads((self.loom / "state" / "usage" / "openai-mini.json").read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("no pinned price", beat["reason"])
 
     def operator_skills(self):
         """The operator's skill folders: links into a skills checkout, as the

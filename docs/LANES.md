@@ -2214,6 +2214,45 @@ App wrote.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
 
+## openai-mini: OpenAI API credit, capped
+
+- A small OpenAI model through opencode's `openai` provider, on the
+  operator's monthly OpenAI API credit (100 USD). Default model
+  `openai/gpt-6-luna` (`LOOM_OPENAI_MINI_MODEL`). Easy tickets only: it is
+  last in the easy tier, never a medium fallback, never on the model ladder
+  and never a review lane, whatever `LOOM_REVIEW_LANES` names.
+- Needs an API key from a dedicated OpenAI project (`LOOM_OPENAI_MINI_KEY_SSM`),
+  read from SSM at run time and handed to the agent as `OPENAI_API_KEY`.
+  This is not the ChatGPT login the codex lanes use.
+- Spend: `bus/openai_budget.py` prices every model call (each `step_finish`
+  event of the run) from its token usage and a pinned price table, read from
+  the official pricing page on the date in `PRICES_READ`, into
+  `state/usage/openai.jsonl`. A call whose usage cannot be read is charged
+  0.25 USD, never zero. Reasoning tokens are charged at the output rate and
+  cache writes at the input rate, so the ledger never undercounts the steps
+  it sees; opencode's title calls print no step event and are not counted,
+  which the headroom covers.
+- Cap: once the calendar month (UTC) reaches 90 USD, or a lower
+  `LOOM_OPENAI_CAP_USD`, the lane is unavailable and reads no key, and the
+  rest of its inbox waits; the cap is read again before each brief. The last
+  10 USD is headroom for the run in flight. The OpenAI project's own monthly
+  budget of 100 USD is the backstop. A model with no pinned price holds the
+  lane, and a brief pinned to one fails.
+- The lane status comment shows the month's spend against the cap.
+- OpenAI does not train on API data by default, so private repos are allowed.
+
+## OpenAI decision helper
+
+`bus/openai_helper.py` asks the same model three questions: which offered
+lane should build a ticket, how hard it is and whether it is ready, and
+whether it repeats an open ticket. Each call shares the lane's ledger and
+cap, and is refused before it is sent when the month's spend plus the most
+the call can cost reaches the cap. With `LOOM_OPENAI_HELPER=1` (off by
+default) the station's `advise_triage` step posts one advisory comment on
+each open `loom:triage` ticket, at most 5 a run and one run an hour, with
+the key from `LOOM_OPENAI_HELPER_KEY_SSM` (else `LOOM_OPENAI_MINI_KEY_SSM`).
+The brain still decides. The helper never reviews code.
+
 ## free provider slots on the spark-gateway
 
 Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use

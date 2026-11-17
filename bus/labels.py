@@ -15,7 +15,10 @@ from .stale_claims import OVERFLOW_CLAIM
 HANDOFF = "handoff:claude"
 
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
-         "zai", "workersai", "agy", "spark", "copilot"]
+         "zai", "workersai", "agy", "spark", "copilot",
+         # A small OpenAI model on the operator's monthly API credit, held
+         # under the cap in bus/openai_budget.py (loom#3188).
+         "openai-mini"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
 # maps a slot to its lane). anthropic has credits that expire, so it gets the
 # most; claude has none, because it spends the operator's own subscription.

@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from . import labels, spend
+from . import labels, openai_budget, spend
 
 
 def _record(provider: str, lanes: List[str], window: str, used_pct: Optional[float],
@@ -195,6 +195,22 @@ def anthropic_records(home: str, lanes: List[str], env: Dict[str, str], now: flo
     return [_record("anthropic", lanes, "credit", pct, summary.remaining, "USD",
                     _utc_epoch(budget.expires, now) if budget.expires else None,
                     "bus/spend.py", now, "floor USD %.2f" % budget.floor)]
+
+
+def openai_records(home: str, lanes: List[str], env: Dict[str, str], now: float) -> List[Dict[str, Any]]:
+    """The month's OpenAI spend from the ledger (bus/openai_budget.py), as a
+    monthly window against the cap that resets at the next UTC month."""
+    spent = openai_budget.month_spend(home, now)
+    try:
+        cap = openai_budget.cap_usd(env)
+    except ValueError as err:
+        return [_record("openai-mini", lanes, "monthly", None, None, "USD", None,
+                        "bus/openai_budget.py", now, str(err))]
+    year, month = time.gmtime(now)[:2]
+    reset = datetime(year + month // 12, month % 12 + 1, 1, tzinfo=timezone.utc).isoformat()
+    pct = min(100.0, 100.0 * spent.usd / cap) if cap > 0 else 100.0
+    return [_record("openai-mini", lanes, "monthly", round(pct, 1), round(max(0.0, cap - spent.usd), 2),
+                    "USD", reset, "bus/openai_budget.py", now, spent.line(cap))]
 
 
 # -- limit holds from the lane heartbeats ---------------------------------
@@ -447,6 +463,7 @@ def collect(home: str, env: Optional[Dict[str, str]] = None, now: Optional[float
     records = []
     registry = {
         "anthropic": lambda _home, slots, settings, stamp: anthropic_records(_home, slots, settings, stamp),
+        "openai-mini": openai_records,
         "codex": lambda _home, slots, settings, stamp: codex_records(
             slots, sessions or Path(settings.get("LOOM_CODEX_SESSIONS")
                                     or Path.home() / ".codex" / "sessions"), stamp),

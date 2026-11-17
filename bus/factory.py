@@ -447,6 +447,11 @@ SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # free-openrouter, OpenRouter's free models on a cluster runner.
 FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
              "free-openrouter")
+# A small OpenAI model on API credit: easy tier only, never a review.
+OPENAI_MINI = "openai-mini"
+# Lanes that take only their own tier's tickets, never another tier's
+# fallback (FALLBACK): the OpenAI credit is for easy work.
+OWN_TIER_ONLY = (OPENAI_MINI,)
 TIERS: Dict[str, Tuple[str, ...]] = {
     # The operator's priorities: Muse and agy first on public repos, so their
     # allowances are spent before the rest (2026-10-14); then the Sparks,
@@ -460,7 +465,10 @@ TIERS: Dict[str, Tuple[str, ...]] = {
     # Analysis has no listing for it yet. A ticket a Spark fails still climbs
     # the model ladder, so nothing waits on them.
     "easy": SPARKS + ("muse", "agy") + FREE_POOL + ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                      "openrouter", "workersai", "zen", "zai", "copilot"),
+                      "openrouter", "workersai", "zen", "zai", "copilot",
+                      # The monthly OpenAI API credit, last: easy work only,
+                      # held under its cap (bus/openai_budget.py, loom#3188).
+                      OPENAI_MINI),
     # The free lanes take medium work too, before the paid ones (operator
     # 2026-10-19: "I always want my free tier used up"). 84 medium tickets
     # waited a median 18.5 hours for codex while these sat idle; a ticket a
@@ -487,6 +495,8 @@ LANE_KINDS: Dict[str, str] = {
     **{lane: "free" for lane in FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")},
     **{lane: "subscription" for lane in ("claude", "codex", "opencode-go", "agy", "muse")},
     "anthropic": "never-paid",
+    # A monthly API credit no one tops up, spent only under its cap.
+    OPENAI_MINI: "never-paid",
 }
 
 
@@ -1832,6 +1842,12 @@ def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
                  if not (private and public_only(x)))
 
 
+def fallback_of(tier: str, private: bool) -> Tuple[str, ...]:
+    """The lanes of a tier another tier's ticket may fall back to: lanes_of
+    without OWN_TIER_ONLY, which take their own tier's tickets alone."""
+    return tuple(x for x in lanes_of(tier, private) if labels.base_lane(x) not in OWN_TIER_ONLY)
+
+
 def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
     """The lanes of the ticket's difficulty tier it may run on, best first;
     none when it has no readable Difficulty: line."""
@@ -2193,7 +2209,7 @@ class Factory:
             # rather than leave the tier (loom#1224).
             return None, ""
         for tier in FALLBACK.get(difficulty, ()):
-            fallback_lanes = [x for x in lanes_of(tier, private)
+            fallback_lanes = [x for x in fallback_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
                               and (x != "agy" or agy_ok)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
@@ -5680,7 +5696,7 @@ class Factory:
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
-            lane = next((x for x in lanes_of(tier, private)
+            lane = next((x for x in fallback_of(tier, private)
                          if x not in REMOTE_LANES and x not in skip and self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty

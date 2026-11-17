@@ -109,6 +109,8 @@ class Config(NamedTuple):
         """The sweep stays off unless LOOM_REVIEW_SWEEP=on: review is the
         Elder's alone (2026-11-16), so no setting but that one turns it on."""
         lanes = tuple(str(env.get("LOOM_REVIEW_LANES", "")).replace(",", " ").split())
+        # The OpenAI credit lane never reviews, whatever the setting names.
+        lanes = tuple(lane for lane in lanes if base_lane(lane) != factory.OPENAI_MINI)
         reviewers = tuple(str(env.get("LOOM_FLEET_REVIEWERS", "")).replace(",", " ").split())
         every = _int(env.get("LOOM_REVIEW_SWEEP_EVERY", ""), EVERY) if enabled(env) else 0
         return cls(every=every,

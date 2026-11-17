@@ -87,6 +87,7 @@ from . import ship_paths
 from . import roll_pin
 from . import revert
 from . import spend
+from . import openai_budget, openai_helper
 from . import state_store
 from . import station_lease
 from . import status
@@ -636,6 +637,8 @@ LANE_MODELS = {
     "spark": ["spark/?*"],
     "free": ["free/?*"],
     "agy": ["gemini-3.8-flash*"],
+    # Only the models bus/openai_budget.py can price.
+    "openai-mini": ["openai/" + name for name in openai_budget.PRICES],
 }
 # Operator messages in the Discord channel become notes on a goal home, and
 # the brain's replies go back to the channel (docs/LANES.md, "Talking to the
@@ -835,6 +838,13 @@ READY_LABEL = "ready-for-agent"
 READY_EVERY = 3600
 READY_PER_RUN = 20
 READY_FILE = "ready_for_agent.json"
+# The OpenAI decision helper's advisory comments on loom:triage tickets
+# (bus/openai_helper.py, loom#3188), only with LOOM_OPENAI_HELPER=1: at most
+# OPENAI_ADVICE_PER_RUN tickets a run, a run at most each OPENAI_ADVICE_EVERY
+# seconds, each ticket once (OPENAI_ADVICE_FILE).
+OPENAI_ADVICE_EVERY = 3600
+OPENAI_ADVICE_PER_RUN = 5
+OPENAI_ADVICE_FILE = "openai_advice.json"
 STATELESS_TEXT = ("Queued: this ticket carried no state label, so nothing would route it "
                   "to a lane (loom#1653).")
 # Labels that mean someone or something already holds a ticket: any Loom
@@ -6723,6 +6733,7 @@ class Station:
                      self.referee_claims,
                      self.withdraw_held_pr_waits, self.clean_labels,
                      self.queue_stateless_tickets, self.intake_ready_for_agent,
+                     self.advise_triage,
                      self.compare_send_back_counts,
                      self.restate_shipped_live,
                      self.health_intake, self.check_fabric_reviews, self.intake_friction, self.report_review_debt,
@@ -10400,8 +10411,24 @@ class Station:
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (pr_lines or [])
             + self._scorecard_lines()
-            + (["", summary.line()] if summary is not None else []))
+            + (["", summary.line()] if summary is not None else [])
+            + self._openai_spend_lines())
         return body
+
+    def _openai_spend_lines(self) -> List[str]:
+        """The month's OpenAI spend (openai-mini lane and decision helper),
+        once a call is recorded this month; a cap at its limit says so."""
+        spent = openai_budget.month_spend(self.s.home, self.now)
+        if not spent.calls:
+            return []
+        try:
+            cap = openai_budget.cap_usd(os.environ)
+        except ValueError as err:
+            return ["", "%s; %s" % (spent.line(openai_budget.CAP_USD), err)]
+        line = spent.line(cap)
+        if round(spent.usd, 6) >= cap:
+            line += ". At the cap: openai-mini and the decision helper make no call until next month."
+        return ["", line]
 
     def _scorecard_lines(self) -> List[str]:
         """The lane scorecard's table, for the lane status comment the
@@ -10491,6 +10518,8 @@ class Station:
             # for LANES_REPUBLISH.
             values["anthropic spend"] = "%d runs, $%.2f, budget %s" % (
                 summary.runs, summary.spent, self.s.anthropic.usd)
+        # A new OpenAI call republishes, as an anthropic run does.
+        values["openai spend"] = "\n".join(self._openai_spend_lines())
         # A changed scorecard (bus/scorecard.py) republishes too.
         values["scorecard"] = hashlib.sha256("\n".join(
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
@@ -12926,6 +12955,84 @@ class Station:
             done = READY_PER_RUN - left
             _say("ready-for-agent intake: %d issue%s to loom:triage"
                  % (done, "" if done == 1 else "s"))
+
+    # The OpenAI decision helper's advice; transport None is the network.
+    openai_transport: Optional[Any] = None
+
+    def advise_triage(self) -> None:
+        """With LOOM_OPENAI_HELPER=1 (off by default), one advisory comment
+        on each open loom:triage ticket from the OpenAI decision helper:
+        difficulty, a lane of that tier and a duplicate verdict
+        (bus/openai_helper.py). The brain still triages. At most
+        OPENAI_ADVICE_PER_RUN tickets a run and one run an hour; the
+        helper's spend cap ends a run early."""
+        if not openai_helper.enabled(os.environ):
+            return
+        path = os.path.join(self.state, OPENAI_ADVICE_FILE)
+        seen = _read_json(path, {}, strict=False)
+        seen = seen if isinstance(seen, dict) else {}
+        if self._num(seen.get("_at")) and 0 <= self.now - seen["_at"] < OPENAI_ADVICE_EVERY:
+            return
+        helper = self._openai_helper()
+        if helper is None:
+            return
+        left = OPENAI_ADVICE_PER_RUN
+        try:
+            for repo in self._verify_repos():
+                if left <= 0 or self._deferred():
+                    break
+                left -= self._advise_repo(repo, helper, seen, left)
+        except openai_helper.Refused as err:
+            _say("openai advice stopped: %s" % err)
+        finally:
+            seen["_at"] = self.now
+            _write_json(path, seen)
+
+    def _openai_helper(self) -> Optional[openai_helper.Helper]:
+        """The helper with its key from SSM (LOOM_OPENAI_HELPER_KEY_SSM, else
+        the lane's LOOM_OPENAI_MINI_KEY_SSM); None, said once, without one."""
+        name = (os.environ.get("LOOM_OPENAI_HELPER_KEY_SSM", "").strip()
+                or os.environ.get("LOOM_OPENAI_MINI_KEY_SSM", "").strip())
+        if not name:
+            _say("openai advice off: set LOOM_OPENAI_HELPER_KEY_SSM or LOOM_OPENAI_MINI_KEY_SSM")
+            return None
+        try:
+            key = self.read_secret(name, self.s.region)
+        except OSError as err:  # SsmReadError, AwsCliUnavailable: the reason only
+            _say("openai advice off: could not read the key: %s" % secret_read_reason(err))
+            return None
+        return openai_helper.Helper(self.s.home, key, env=os.environ, clock=lambda: self.now,
+                                    transport=self.openai_transport)
+
+    def _advise_repo(self, repo: str, helper: openai_helper.Helper,
+                     seen: Dict[str, Any], left: int) -> int:
+        """Advise up to `left` unadvised loom:triage tickets of one repo, the
+        other open tickets its duplicate candidates; how many it advised."""
+        issues = [i for i in self._paginate("/repos/%s/issues?state=open&labels=loom:ticket" % repo)
+                  if isinstance(i, dict) and "pull_request" not in i]
+        listed = [(int(i["number"]), str(i.get("title") or "")) for i in issues]
+        done = 0
+        for issue in issues:
+            number = int(issue["number"])
+            key = "%s#%d" % (repo, number)
+            if done >= left or self._deferred():
+                break
+            if key in seen or "loom:triage" not in _label_names(issue):
+                continue
+            # A refusal at the cap leaves the ticket unadvised for next month;
+            # a failed answer is not asked again.
+            try:
+                body = openai_helper.advise(helper, str(issue.get("title") or ""),
+                                            str(issue.get("body") or ""),
+                                            [o for o in listed if o[0] != number], factory.TIERS)
+            except openai_helper.HelperError as err:
+                seen[key] = self.now
+                _say("openai advice on %s failed: %s" % (key, err))
+                continue
+            notify.post(self.gh, repo, number, body, notify.NOTE)
+            seen[key] = self.now
+            done += 1
+        return done
 
     def _intake_ready_repo(self, repo: str, left: int) -> int:
         """Label up to `left` of one repo's unseen ready-for-agent issues

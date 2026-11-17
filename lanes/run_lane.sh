@@ -3,6 +3,7 @@
 #
 #   run_lane.sh <lane>   lane = codex | claude | openrouter | opencode-go | anthropic
 #                               | zen | zai | workersai | agy | spark | copilot
+#                               | openai-mini
 #                               | <lane>-<n> (an extra slot of that lane)
 #
 # A slot such as anthropic-2 is a second copy of the anthropic lane: its own
@@ -2114,7 +2115,7 @@ opencode_bin() {
 # broken probe never holds a lane for good.
 model_listed() {
   local model="$1" provider list
-  case "$LANE" in openrouter|opencode-go|zen|zai|workersai|spark|free) ;; *) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|zen|zai|workersai|spark|free|openai-mini) ;; *) return 0 ;; esac
   provider="${model%%/*}"
   [ "$provider" != "$model" ] || return 0
   list="$(timeout "$NET_TIMEOUT" "$(opencode_bin)" models "$provider" 2>/dev/null < /dev/null)" || return 0
@@ -2195,8 +2196,32 @@ for line in sys.stdin:
 opencode_json_pass() {
   local key_var="$1" view="$2" events="$3"
   shift 3
+  local status
   opencode_agent "$key_var" --format json "$@" | tee "$events" | opencode_log_view "$view"
-  return "${PIPESTATUS[0]}"
+  status="${PIPESTATUS[0]}"
+  [ "$LANE" = openai-mini ] && openai_record "$events"
+  return "$status"
+}
+
+openai_budget() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.openai_budget "$@"; }
+
+# The openai-mini lane spends the operator's monthly OpenAI API credit. Each
+# model call of a pass (one step_finish event) is priced from its token usage
+# into state/usage/openai.jsonl (bus/openai_budget.py); the decision helper
+# writes the same ledger. A ledger that cannot be written is said in the log.
+openai_record() {
+  openai_budget record-events --events "$1" --model "$MODEL" --slot "$SLOT" --ticket "$TICKET" >> "$LOG" 2>&1 ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: could not record this pass's OpenAI spend" | tee -a "$LOG" >&2
+}
+
+# The month's OpenAI spend under the cap, and the model priced; else the lane
+# is unavailable with the ledger's reason and reads no key.
+openai_cap_ok() {
+  local why model
+  model="$(lane_setting MODEL)"
+  why="$(openai_budget check --model "${model:-openai/gpt-6-luna}" 2>&1)" && return 0
+  READY_REASON="${why:-could not check the OpenAI spend cap}"
+  return 1
 }
 
 # Every opencode lane gets one continue for a run that ends on a described
@@ -3884,7 +3909,7 @@ trains_on_prompts() {
 
 # Lanes whose agent runs sandboxed in a fresh scratch home (api_agent).
 is_api_lane() {
-  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot) return 0 ;; esac
+  case "$LANE" in openrouter|opencode-go|anthropic|zen|zai|workersai|spark|free|copilot|openai-mini) return 0 ;; esac
   return 1
 }
 
@@ -4084,6 +4109,7 @@ Do not search the whole filesystem (for example, find /). Search within the chec
     zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
+    openai-mini) opencode_agent_continuing OPENAI_API_KEY text "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
     agy) agy_agent "$brief_text" ;;
     copilot) api_agent COPILOT_GITHUB_TOKEN copilot -p "$brief_text" --allow-all-tools ;;
@@ -4187,11 +4213,12 @@ lane_ready() {
   fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; copilot) cli=copilot ;;
-    openrouter|opencode-go|zen|zai|workersai|spark|free) cli="$(opencode_bin)" ;;
+    openrouter|opencode-go|zen|zai|workersai|spark|free|openai-mini) cli="$(opencode_bin)" ;;
     *) READY_REASON="unknown lane"; return 1 ;;
   esac
   command -v "$cli" > /dev/null || { READY_REASON="$cli not on PATH"; return 1; }
   [ "$LANE" = anthropic ] && ! anthropic_credit_ok && return 1
+  [ "$LANE" = openai-mini ] && ! openai_cap_ok && return 1
   case "$LANE" in codex|claude) return 0 ;; esac
   sandbox_ready || { READY_REASON="$SANDBOX_WHY"; return 1; }
   case "$LANE" in zen) return 0 ;; spark|free) spark_ready; return ;; esac
@@ -4461,6 +4488,7 @@ for BRIEF in "$INBOX"/*.md; do
   if [ -z "$MODEL" ]; then
     MODEL="$(lane_setting MODEL)"
     [ -n "$MODEL" ] || { [ "$LANE" = copilot ] && MODEL="copilot-free"; }
+    [ -n "$MODEL" ] || { [ "$LANE" = openai-mini ] && MODEL="openai/gpt-6-luna"; }
     if [ "$LANE" = opencode-go ] && [ -z "$CONFIGURED_MODELS" ]; then
       if [ -z "$MODEL" ] || model_limit_until "$MODEL" >/dev/null; then
         DIFFICULTY="$(field Difficulty "$BRIEF" || echo "medium")"
@@ -4529,7 +4557,19 @@ for BRIEF in "$INBOX"/*.md; do
       esac ;;
     agy:*) park "$BRIEF" "model $MODEL is not in the agy catalog (gemini-*, claude-*, gpt-oss-*)" transient; continue ;;
     workersai:*) park "$BRIEF" "workersai lane runs Cloudflare Workers AI models only (cloudflare-workers-ai/@cf/...), not $MODEL"; continue ;;
+    openai-mini:openai/*) ;;
+    openai-mini:*) park "$BRIEF" "openai-mini lane runs OpenAI models only (openai/...), not $MODEL"; continue ;;
   esac
+  # The OpenAI cap is read again before each brief: an earlier brief of this
+  # pass may have reached it. At the cap the rest of the inbox waits; a
+  # pinned model with no price fails its brief.
+  if [ "$LANE" = openai-mini ] && ! OPENAI_WHY="$(openai_budget check --model "$MODEL" 2>&1)"; then
+    case "$OPENAI_WHY" in
+      *"no pinned price"*) park "$BRIEF" "$OPENAI_WHY"; continue ;;
+    esac
+    heartbeat false "${OPENAI_WHY:-could not check the OpenAI spend cap}"
+    break
+  fi
   if [ -n "$CONFIGURED_MODELS" ] && [ -z "$PINNED_MODEL" ]; then
     WHY="$(ladder_reason "$CONFIGURED_MODELS")"
     if [ -n "$WHY" ]; then heartbeat true "model $MODEL in use; limited: $WHY"
