@@ -456,6 +456,36 @@ def asked(comments: Iterable[Mapping[str, Any]], trusted: Iterable[str]) -> set:
             for key in ASK_MARKER_RE.findall(str(c.get("body") or ""))}
 
 
+def _matching_ask_stamp(issue: Mapping[str, Any],
+                        comments: Sequence[Mapping[str, Any]],
+                        trusted: Sequence[str]) -> float:
+    """Return the latest ask timestamp only when its body fingerprint matches."""
+    allowed = {x.lower() for x in trusted}
+    asks = [c for c in comments if _login(c).lower() in allowed
+            and ASK_MARKER_RE.search(str(c.get("body") or ""))]
+    if not asks:
+        return 0.0
+    latest = max(asks, key=lambda c: (_ts(c.get("created_at")), int(c.get("id") or 0)))
+    stamp = max(_ts(latest.get("created_at")), _ts(latest.get("updated_at")))
+    digest = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()
+    if stamp <= 0 or digest not in BODY_MARKER_RE.findall(str(latest.get("body") or "")):
+        return 0.0
+    return stamp
+
+
+def _latest_ask_label_change(gh: Any, repo: str,
+                             issue: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read the last ask-label transition without reusing an older removal."""
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+    changes = [e for e in events if isinstance(e, dict)
+               and e.get("event") in {"labeled", "unlabeled"}
+               and (e.get("label") or {}).get("name") in PERSON_ASK_LABELS]
+    if not changes:
+        return {}
+    last = max(changes, key=lambda e: (_ts(e.get("created_at")), int(e.get("id") or 0)))
+    return last
+
+
 def settled_body(gh: Any, repo: str, issue: Mapping[str, Any],
                  comments: Sequence[Mapping[str, Any]], trusted: Sequence[str]) -> bool:
     """A verified person removed the latest ask for exactly this body.
@@ -467,23 +497,10 @@ def settled_body(gh: Any, repo: str, issue: Mapping[str, Any],
              for x in issue.get("labels", [])}
     if names & PERSON_ASK_LABELS:
         return False
-    allowed = {x.lower() for x in trusted}
-    asks = [c for c in comments if _login(c).lower() in allowed
-            and ASK_MARKER_RE.search(str(c.get("body") or ""))]
-    if not asks:
+    stamp = _matching_ask_stamp(issue, comments, trusted)
+    if stamp <= 0:
         return False
-    latest = max(asks, key=lambda c: (_ts(c.get("created_at")), int(c.get("id") or 0)))
-    stamp = max(_ts(latest.get("created_at")), _ts(latest.get("updated_at")))
-    digest = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()
-    if stamp <= 0 or digest not in BODY_MARKER_RE.findall(str(latest.get("body") or "")):
-        return False
-    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
-    changes = [e for e in events if isinstance(e, dict)
-               and e.get("event") in {"labeled", "unlabeled"}
-               and (e.get("label") or {}).get("name") in PERSON_ASK_LABELS]
-    if not changes:
-        return False
-    last = max(changes, key=lambda e: (_ts(e.get("created_at")), int(e.get("id") or 0)))
+    last = _latest_ask_label_change(gh, repo, issue)
     actor = last.get("actor") or {}
     if (last.get("event") != "unlabeled" or _ts(last.get("created_at")) <= stamp
             or decision_claim.is_bot(actor)
