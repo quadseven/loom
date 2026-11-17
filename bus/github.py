@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from . import fixrounds, proof, shadow, status, text as _text
+from . import fixrounds, notify, proof, shadow, status, text as _text
 
 DEFAULT_API = "https://api.github.com"
 TIMEOUT = 30
@@ -64,6 +64,10 @@ Transport = Callable[[str, str, Dict[str, str], Optional[bytes]],
 _ISSUE_PATH = re.compile(r"^/repos/[^/]+/[^/]+/issues/[0-9]+$")
 # The repo and issue number of an issue-comment list path.
 _COMMENTS_OF = re.compile(r"/repos/([^/]+/[^/]+)/issues/([0-9]+)/comments(?:\?|$)")
+# A POST that makes a new comment, which GitHub emails: on an issue or pull
+# request, a review thread, or a reply to one.
+_NEW_COMMENT = re.compile(r"^/repos/[^/]+/[^/]+/(?:issues|pulls)/[0-9]+/comments"
+                          r"(?:/[0-9]+/replies)?$")
 
 # Labels that let an issue close as completed with unchecked boxes, mirroring
 # the close-completeness guard's escape hatches.
@@ -729,6 +733,7 @@ class GitHub:
         body = self._without_mentions(method, body)
         body = self._keep_status_section(method, path, body)
         body = self._guard_public_write(method, path, body)
+        self._refuse_empty_comment(method, path, body)
         resp = self._rest(method, path, body, etag, ok)
         if method == "POST" and self.unsubscribe and self.app is None:
             self._leave_thread(path, resp.data)
@@ -747,6 +752,22 @@ class GitHub:
             if expanded is not resp.data:
                 resp = Response(resp.status, expanded, resp.etag, resp.headers)
         return resp
+
+    @staticmethod
+    def _refuse_empty_comment(method: str, path: str, body: Any) -> None:
+        """Raise notify.EmptyComment before a new comment with no visible text
+        is sent: GitHub renders it as nothing and still emails it (#3200).
+        bus/notify.post checks first; this holds for every other path too."""
+        if method.upper() != "POST" or not isinstance(body, dict):
+            return
+        if _NEW_COMMENT.match(path.split("?", 1)[0]):
+            notify.check_visible(body.get("body"), "a comment at %s" % path)
+            return
+        query = body.get("query")
+        variables = body.get("variables")
+        if (path == "/graphql" and isinstance(query, str) and isinstance(variables, dict)
+                and re.search(r"\b(?:addComment|addPullRequestReviewThreadReply)\b", query)):
+            notify.check_visible(variables.get("body"), "a GraphQL comment")
 
     @staticmethod
     def _body_texts(value: Any) -> List[str]:

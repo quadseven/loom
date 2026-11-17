@@ -48,6 +48,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import lane_markers
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -3364,12 +3365,11 @@ class Station:
         if not issues:
             return None
         latest = None
-        pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
         # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
         for comment in brain.trusted_comments(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
                 self.s.authors):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip())
+            match = lane_markers.heartbeat_match(comment.get("body"))
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -5213,6 +5213,10 @@ class Station:
         # (one pulls/comments post per finding), so the factory's fix rounds
         # and rebuttal reads meet them exactly like the review bot's threads.
         for finding in [f for f in blocking if "file" in f and "line" in f]:
+            if not notify.visible_text(finding.get("finding")):
+                _say("a Luna finding on %s#%d has no visible text; no review thread "
+                     "posted for it" % (repo, pr_number))
+                continue
             try:
                 self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
                     "commit_id": sha, "path": finding["file"],
