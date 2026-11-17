@@ -5616,6 +5616,17 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
 
+    def test_a_ticket_that_blocks_two_others_is_claimed_before_an_older_leaf(self):
+        # loom#3130: the order reads the dependency summary the briefed
+        # listing already carries, so it costs no request of its own.
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
+
     def test_a_regression_is_claimed_before_a_p0_ticket(self):
         self.fake.add(7, created="2030-01-01T00:00:00Z", body="Priority: P0\n" + BODY_WITH_CRITERIA)
         self.fake.add(9, created="2030-01-03T00:00:00Z", body="Priority: P3\n" + BODY_WITH_CRITERIA)

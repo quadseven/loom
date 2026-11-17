@@ -279,7 +279,12 @@ with no quote counts for every friction of that journal.
 `Priority:` orders the work. Every queue (station claims, the factory's
 queued tier moves and its landing order) takes `loom:urgent`,
 `loom:regression` and `loom:revert` tickets first, then P0 before P1, P2
-and P3, then the oldest. `brief --priority P1` writes the line; a ticket
+and P3, then the ticket that blocks the most open issues (the `blocking`
+count of the dependency summary the issue listing already returns, so the
+order sends no request of its own), then a `Foundational: yes` ticket
+(docs/BRIEF_FORMAT.md), then the oldest. Priority stays ahead of the
+blocking terms: a P3 ticket that blocks others never jumps a P1 leaf.
+`brief --priority P1` writes the line; a ticket
 filed from a health finding gets it from the finding's impact
 (docs/HEALTH.md). `status` opens with a Priorities section: the top 10 open
 tickets not yet merged, across repos, in that order, then the Health

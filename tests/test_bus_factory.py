@@ -3496,6 +3496,24 @@ class Queued(Base):
         self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
 
+    def test_a_queued_ticket_that_blocks_others_takes_the_free_lane_before_an_older_leaf(self):
+        # loom#3130: a leaf filed earlier took the only free lane while the
+        # ticket two others wait on stayed queued.
+        self.queued(7, age=600)
+        self.queued(8, age=60)
+        self.gh.issues[8]["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[8]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+    def test_a_higher_priority_queued_leaf_goes_before_a_lower_priority_blocker(self):
+        self.queued(7, body="Difficulty: medium\nPriority: P1\n\n## Why\nx\n", age=60)
+        self.queued(8, body="Difficulty: medium\nPriority: P3\n\n## Why\nx\n", age=600)
+        self.gh.issues[8]["issue_dependencies_summary"] = {"blocking": 5}
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
+        self.assertEqual(factory._state(self.gh.issues[8]), "queued")
+
     def test_limited_and_unavailable_lanes_are_passed_over(self):
         self.queued(7)
         self.assign(limited=["codex"], available=["codex", "codex-2"])

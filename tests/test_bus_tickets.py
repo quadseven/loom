@@ -381,6 +381,38 @@ class PriorityTest(unittest.TestCase):
         ordered = sorted(found, key=lambda i: work_order(REPO, i))
         self.assertEqual([i["number"] for i in ordered], [4, 3, 5, 2, 1])
 
+    def test_work_order_puts_a_ticket_that_blocks_others_ahead_of_an_older_leaf(self):
+        # loom#3130: after FIRST labels and priority, the count of open
+        # issues a ticket blocks (from the listing's dependency summary),
+        # then a Foundational: yes header, then age.
+        from bus.tickets import work_order
+        leaf = self.issue(1, "P2", "2030-01-01T00:00:00Z")
+        blocks_one = self.issue(2, "P2", "2030-01-02T00:00:00Z")
+        blocks_one["issue_dependencies_summary"] = {"blocking": 1, "total_blocking": 3}
+        blocks_two = self.issue(3, "P2", "2030-01-03T00:00:00Z")
+        blocks_two["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        foundational = {"number": 4, "body": "Priority: P2\nFoundational: yes\n\n## Why\nx\n",
+                        "created_at": "2030-01-04T00:00:00Z", "labels": []}
+        p1_leaf = self.issue(5, "P1", "2030-01-05T00:00:00Z")
+        p3_blocker = self.issue(6, "P3", "2030-01-01T00:00:00Z")
+        p3_blocker["issue_dependencies_summary"] = {"blocking": 9}
+        found = [leaf, blocks_one, blocks_two, foundational, p1_leaf, p3_blocker]
+        ordered = sorted(found, key=lambda i: work_order(REPO, i))
+        self.assertEqual([i["number"] for i in ordered], [5, 3, 2, 4, 1, 6])
+
+    def test_work_order_reads_a_missing_or_malformed_summary_as_blocking_none(self):
+        from bus.tickets import work_order
+        plain = self.issue(1, "P2")
+        for summary in (None, "x", {"blocking": "two"}, {"blocking": -3}, {"blocking": True}):
+            with self.subTest(summary=summary):
+                odd = dict(plain, issue_dependencies_summary=summary)
+                self.assertEqual(work_order(REPO, odd), work_order(REPO, plain))
+
+    def test_parse_accepts_foundational_yes_and_refuses_anything_else(self):
+        self.assertEqual(parse("Foundational: yes\n\nbody")[0], {"Foundational": "yes"})
+        with self.assertRaisesRegex(ValueError, "Foundational:"):
+            parse("Foundational: maybe\n\nbody")
+
     def test_priority_bands_follow_impact(self):
         from bus.tickets import priority_for_impact
         cases = {0: "P3", 9.9: "P3", 10: "P2", 49: "P2", 50: "P1", 199: "P1", 200: "P0", 5000: "P0"}
