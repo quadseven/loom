@@ -196,7 +196,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import no_change
+from . import human_claims, no_change
 from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
@@ -2010,6 +2010,17 @@ class Factory:
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
 
+    def _human_holder(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+        """The login of a person's session that claims the issue by
+        assignment or by its claim comment (bus/human_claims.py), else None.
+        Asked only of a ticket about to get a lane; its comments are read
+        once a pass, and only when it has any."""
+        reader = getattr(self, "_human_reader", None)
+        if reader is None:
+            reader = self._human_reader = human_claims.Reader(
+                lambda r, n: self.gh.paginate("/repos/%s/issues/%d/comments" % (r, n)))
+        return reader.holder(repo, issue)
+
     def _trusted_comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """A pull request's comments by trusted logins, in order: anyone can
         comment on a public repo, so a marker counts only from these. By
@@ -3631,7 +3642,7 @@ class Factory:
         conflict round once per head after 24 hours. Explicit claims,
         brain holds and running tickets always keep their work."""
         labels = _labels(issue)
-        if self._conflict_hygiene_held(labels):
+        if self._conflict_hygiene_held(labels) or self._human_holder(repo, issue):
             return
         handoff = HANDOFF_LABEL in labels
         if handoff and not self._handoff_is_aged(repo, issue):
@@ -4320,7 +4331,7 @@ class Factory:
         _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
              % (repo, number, sha[:12]))
 
-    def _finding_blocker(self, repo: str, number: int) -> Optional[str]:
+    def _finding_blocker(self, repo: str, number: int, head_sha: str) -> Optional[str]:
         """The refusal an unanswered blocking comment on pull request `number`
         puts on its merge, naming each finding's link, else None (loom#2988).
         Read from the pull request's own comments, never its ticket's; comments
@@ -4335,7 +4346,7 @@ class Factory:
             return ("pull request comments unreadable, so a blocking comment cannot be "
                     "ruled out (%s)" % err)
         found = comment_findings.open_findings(
-            [c for c in comments if isinstance(c, dict)], sorted(self.trusted))
+            [c for c in comments if isinstance(c, dict)], sorted(self.trusted), head_sha)
         return comment_findings.blocker(found) if found else None
 
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
@@ -4359,7 +4370,7 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             blockers.append("another pull request holds the landing lock")
-        finding = self._finding_blocker(repo, number)
+        finding = self._finding_blocker(repo, number, str((full.get("head") or {}).get("sha") or ""))
         if finding:
             _say("%s#%d waits: %s" % (repo, number, finding))
             blockers.append(finding)
@@ -5225,6 +5236,9 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        person = self._human_holder(repo, issue)
+        if person:
+            return "%s is claimed by %s" % (ref, person)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)
@@ -5458,11 +5472,12 @@ class Factory:
         if newer is not None:
             reason, label = "superseded by #%d" % newer, WAIT_SUPERSEDED
         else:
-            still = [n for n in brief_check.blocked_on(body) if n != int(issue["number"])
+            still = ["#%d" % n for n in brief_check.blocked_on(body) if n != int(issue["number"])
                      and (self._dependency(repo, n) or {}).get("state") != "closed"]
+            still += [ref for ref in self._native_blockers(repo, issue) if ref not in still]
             if not still:
                 return ""
-            reason = "blocked on %s" % ", ".join("#%d" % n for n in still)
+            reason = "blocked on %s" % ", ".join(still)
             label = WAIT_BLOCKED
         if label not in _labels(issue):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, int(issue["number"])),
@@ -5472,6 +5487,31 @@ class Factory:
             _say("held queued %s#%s: its brief says %s" % (repo, issue["number"], reason))
         self._waiting(repo, issue["number"], reason)
         return reason
+
+    def _native_blockers(self, repo: str, issue: Dict[str, Any]) -> List[str]:
+        """The open issues GitHub's own "blocked by" relationship names for
+        the ticket, as #N (this repo) or owner/name#N. Read only when the
+        issue's dependency summary counts an open blocker, so a ticket with
+        none costs no request. A read that fails holds the ticket, naming the
+        summary's count: a lane must not take work whose blocker is unknown."""
+        summary = issue.get("issue_dependencies_summary") or {}
+        if not isinstance(summary, dict) or not summary.get("blocked_by"):
+            return []
+        number = int(issue["number"])
+        try:
+            found = list(self.gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by"
+                                          % (repo, number)))
+        except RateLimited:
+            raise
+        except GitHubError:
+            return ["%d open issue(s) GitHub lists as blocking it" % int(summary["blocked_by"])]
+        refs = []
+        for blocker in found if isinstance(found, list) else []:
+            if not isinstance(blocker, dict) or blocker.get("state") == "closed":
+                continue
+            where = str(blocker.get("repository_url") or "").rsplit("/repos/", 1)[-1]
+            refs.append(("#%d" if where in ("", repo) else where + "#%d") % int(blocker["number"]))
+        return refs
 
     def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether every acceptance criterion of the queued ticket is a check

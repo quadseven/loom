@@ -53,8 +53,14 @@ the brief to `done/`, and opens no pull request (docs/LANES.md, "Verify runs").
 it) and hands a lane one pull request to review when the normal review route
 is degraded. The agent changes no code and writes `review.json`; the runner
 copies it to the lane's log folder, moves the brief to `done/`, and opens no
-pull request (docs/LANES.md, "Elder fallback reviews"). Any `Deliverable:`
-value other than `answer`, `verify` or `review` parks the brief.
+pull request (docs/LANES.md, "Elder fallback reviews").
+
+`Deliverable: base-check` is written only by the station (a ticket cannot ask
+for it) for a repo an open base-check incident holds. The runner runs setup
+and the base check on the default branch, runs no agent, and opens no pull
+request: a pass closes the incident and moves the brief to `done/`, a fail
+updates the incident and parks the brief (docs/LANES.md). Any `Deliverable:`
+value other than `answer`, `verify`, `review` or `base-check` parks the brief.
 
 The ticket's `Not before:`, `After:` and `Priority:` lines decide when and in
 what order the station claims it (docs/BRAIN.md); they stay on the ticket and
@@ -87,7 +93,7 @@ Repo: <owner/name>
 Branch: loom/T0001-<slug>
 Base: <target branch, optional>
 Model: <model id, optional>
-Deliverable: answer (optional; the station also writes verify and review; any other value parks the brief)
+Deliverable: answer (optional; the station also writes verify, review and base-check; any other value parks the brief)
 
 # T0001: <short title>
 

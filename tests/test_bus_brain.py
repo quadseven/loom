@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, hold_boxes, journal, metrics, proof, station, text, tickets
+from bus import brain, factory, hold_boxes, human_claims, journal, metrics, proof, station, text, tickets
 from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -4826,6 +4826,22 @@ class TriageTests(unittest.TestCase):
             self.assertEqual(method, "POST", path)
             self.assertTrue(path.endswith(("/labels", "/comments", "/sub_issues")), path)
 
+    def test_triage_leaves_an_issue_a_person_claimed(self):
+        # A second operator's session claims by assignment or by a comment
+        # carrying its phrase (bus/human_claims.py).
+        phrase = human_claims.DEFAULT.split(":", 1)[1]
+
+        class Commented(Routes):
+            def _read(self, path):
+                if path.startswith("/repos/%s/issues/6/comments" % REPO):
+                    return reply(200, [{"user": {"login": "ccqw"}, "body": phrase}])
+                return super()._read(path)
+        routes = Commented([item(5, assignees=[{"login": "ccqw"}]), item(6, comments=1),
+                            item(7, comments=0)])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {7: ["loom:ticket", "loom:queued"]})
+        self.assertFalse(any("/issues/7/comments" in c[1] for c in routes.calls))
+
     def test_ready_issue_becomes_a_queued_ticket_under_the_goal(self):
         routes = Routes([item(5)])
         lines = self.run_triage(routes)
@@ -5150,6 +5166,18 @@ class HumanAndRefsTests(unittest.TestCase):
         for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
             fake = Fake(reply(200, issue))
             with self.assertRaises(ValueError):
+                brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
+            self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_brief_refs_refuses_an_original_a_person_claimed(self):
+        # A second operator's session claims by assignment or by a comment
+        # carrying its phrase (bus/human_claims.py); no brief takes it.
+        phrase = human_claims.DEFAULT.split(":", 1)[1]
+        said = [{"user": {"login": "ccqw"}, "body": phrase}]
+        for issue, replies in ((item(6, assignees=[{"login": "ccqw"}]), ()),
+                               (item(6, comments=1), (reply(200, said),))):
+            fake = Fake(reply(200, issue), *replies)
+            with self.assertRaisesRegex(ValueError, "ccqw"):
                 brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
             self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 

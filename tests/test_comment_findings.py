@@ -10,6 +10,7 @@ from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 REPO = "example-owner/example-repo"
 SHA = "abc1234def5678abc1234def5678abc1234def56"
 AUTHORS = ["example-brain"]
+HEAD_SHA = "abc1234def5678abc1234def5678abc1234def56"
 
 
 def comment(login, body, at, ident):
@@ -55,7 +56,7 @@ class OpenFindingsTests(unittest.TestCase):
     def test_a_linked_later_trusted_comment_answers_the_finding(self):
         finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
                           "2030-01-01T13:00:00Z", 1)
-        answer = comment("example-brain", "Declined: evidence in the test. " + url(1),
+        answer = comment("example-brain", "Declined: test_retry_handles_empty_input covers it. " + url(1),
                          "2030-01-01T13:30:00Z", 2)
         self.assertEqual(comment_findings.open_findings([finding, answer], AUTHORS), [])
 
@@ -112,6 +113,54 @@ class OpenFindingsTests(unittest.TestCase):
                           "2030-01-01T13:00:00Z", 1)
         self.assertEqual(comment_findings.blocker([finding]),
                          "unanswered blocking comment from example-brain: " + url(1))
+
+    def test_fixed_in_fake_sha_does_not_clear_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Fixed in deadbeef1: the retry test covers it. " + url(1),
+                          "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS, head_sha=HEAD_SHA)
+        self.assertEqual([c["id"] for c in found], [1])
+
+    def test_declined_without_evidence_does_not_clear_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Declined: this is fine, no issue. " + url(1),
+                          "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS)
+        self.assertEqual([c["id"] for c in found], [1])
+
+    def test_declined_with_file_line_clears_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Declined: the retry case is handled at test_retry.py:42. " + url(1),
+                          "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS)
+        self.assertEqual(found, [])
+
+    def test_declined_with_test_name_clears_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Declined: test_retry_handles_empty_input covers it. " + url(1),
+                          "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS)
+        self.assertEqual(found, [])
+
+    def test_declined_with_link_clears_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Declined: see https://example.com/design-doc for reasoning. " + url(1),
+                          "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS)
+        self.assertEqual(found, [])
+
+    def test_fixed_in_real_sha_clears_finding(self):
+        finding = comment("example-brain", "Blocking: retry fails on %s." % SHA[:9],
+                          "2030-01-01T13:00:00Z", 1)
+        answer = comment("example-brain", "Fixed in %s: the retry test covers it. %s"
+                          % (HEAD_SHA[:10], url(1)), "2030-01-01T13:30:00Z", 2)
+        found = comment_findings.open_findings([finding, answer], AUTHORS, head_sha=HEAD_SHA)
+        self.assertEqual(found, [])
 
 
 if __name__ == "__main__":

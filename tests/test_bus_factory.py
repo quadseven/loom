@@ -11,7 +11,7 @@ from unittest import mock
 
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
-from bus import brain, claimed, comment_findings, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, comment_findings, factory, human_claims, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
@@ -119,6 +119,9 @@ class FakeGitHub:
 
     # -- the GitHub client surface the factory uses --------------------
     def paginate(self, path):
+        m = re.search(r"/issues/(\d+)/dependencies/blocked_by$", path)
+        if m:
+            return getattr(self, "blockers", {}).get(int(m.group(1)), [])
         if re.search(r"/issues\?labels=loom:ticket", path):
             return [i for i in self.issues.values() if i.get("state") == "open"]
         if path.endswith("/pulls?state=open") or re.search(r"/pulls\?.*state=open", path):
@@ -3259,6 +3262,26 @@ class Queued(Base):
     def test_a_claimed_hand_off_ticket_stays_in_the_pool(self):
         self.queued(7)
         self.gh.issues[7]["labels"] += [{"name": factory.HANDOFF_LABEL}, {"name": "claim:someone"}]
+        self.assign(available=["codex"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))
+
+    def human_claim(self, number):
+        # A second operator's session claims by a comment carrying its phrase.
+        phrase = human_claims.DEFAULT.split(":", 1)[1]
+        self.gh.comments[number].append({"user": {"login": "ccqw"}, "body": phrase})
+        self.gh.issues[number]["comments"] = len(self.gh.comments[number])
+
+    def test_a_queued_ticket_with_the_claim_comment_gets_no_lane(self):
+        self.queued(7)
+        self.human_claim(7)
+        self.assign(available=["codex"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7)), ("queued", ""))
+
+    def test_a_hand_off_ticket_with_the_claim_comment_stays_in_the_pool(self):
+        self.queued(7)
+        self.gh.issues[7]["labels"].append({"name": factory.HANDOFF_LABEL})
+        self.human_claim(7)
         self.assign(available=["codex"])
         self.assertEqual(factory._state(self.gh.issues[7]), "queued")
         self.assertIn(factory.HANDOFF_LABEL, factory._labels(self.gh.issues[7]))

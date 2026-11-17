@@ -41,6 +41,7 @@ class PausedStepsTest(unittest.TestCase):
         self.ran = []
         with mock.patch.object(station.Station, "_timed", timed), \
                 mock.patch.object(station.Station, "_note_every_pass", lambda _self: None), \
+                mock.patch.object(station.Station, "_run_due_steps", lambda _self, _paused: None), \
                 mock.patch.object(station.Station, "_deferred", lambda _self: False), \
                 mock.patch.object(station, "PASS_STEP_BUDGET", 10 ** 6), \
                 contextlib.redirect_stderr(err):

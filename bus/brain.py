@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -1048,7 +1048,8 @@ def _read_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
 
 
 def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
-                     known: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+                      known: Optional[List[Dict[str, Any]]] = None,
+                      head_sha: Optional[str] = None) -> Optional[str]:
     """The blocker an unanswered blocking comment from a trusted login puts on a
     pull request, else None (bus/comment_findings.py, loom#2988). Status and
     merge both call it, so they agree. `known` is every comment, already read;
@@ -1060,7 +1061,7 @@ def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
             known = _read_comments(gh, repo, number)
         except ValueError as err:
             return str(err).removeprefix("blocked: ")
-    found = comment_findings.open_findings(list(known), authors)
+    found = comment_findings.open_findings(list(known), authors, head_sha)
     return comment_findings.blocker(found) if found else None
 
 
@@ -1203,7 +1204,8 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                          hold, _node_comments(node))
     if hold:
         line = _add_blocker(line, hold)
-    finding = _finding_blocker(gh, repo, int(pr["number"]), authors, _node_comments(node))
+    finding = _finding_blocker(gh, repo, int(pr["number"]), authors, _node_comments(node),
+                                  str((pr.get("head") or {}).get("sha") or ""))
     if finding:
         line = _add_blocker(line, finding)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
@@ -4256,7 +4258,19 @@ def _check_rewritable(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     names = _labels(issue)
     if "loom:ticket" in names or "loom:rewritten" in names:
         raise ValueError("#%d is already a ticket or already rewritten" % number)
+    person = _human_holder(gh, repo, issue)
+    if person:
+        raise ValueError("#%d is claimed by %s, a person's session; leave it to them"
+                         % (number, person))
     return issue
+
+
+def _human_holder(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+    """The login of a person's session that claims the issue by assignment
+    or by its claim comment (bus/human_claims.py). The comments are read only
+    when the issue has some."""
+    return human_claims.Reader(
+        lambda r, n: gh.paginate("/repos/%s/issues/%d/comments" % (r, n))).holder(repo, issue)
 
 
 def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
@@ -4497,7 +4511,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             break
         number = int(issue["number"])
         skip = _triage_skip(issue, authors, briefers, journals)
-        if skip:
+        if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
         if not missing:
@@ -5295,7 +5309,7 @@ def merge(gh: GitHub, repo: str, number: int,
                          str((pr.get("user") or {}).get("login") or ""), logins, comments)
     if hold:
         raise ValueError("blocked: " + hold)
-    finding = _finding_blocker(gh, repo, number, trusted_authors(env), comments)
+    finding = _finding_blocker(gh, repo, number, trusted_authors(env), comments, sha)
     if finding:
         raise ValueError("blocked: " + finding)
     shadow_env = _shadow_env(env)
