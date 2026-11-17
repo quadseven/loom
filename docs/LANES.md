@@ -1366,8 +1366,12 @@ The loom home is kept bounded by the station and the runner (loom#643).
   `archive/trees/` in the home and removed only once the archive reads back
   whole (local tree archives go after 14 days); then idle lanes' tool caches
   (`.cache`, `.cargo`, `.npm`, `tmp`, `Library/Caches` and the like). It never
-  touches a brief that is waiting or running, a busy lane's folders, a link,
-  or any path outside `logs/`, `run/`, `archive/` and the lane tree folders.
+  touches a brief that is waiting or running, a busy lane's folders (the
+  lane lock is read again before each removal, and a lane home changed in
+  the last 10 minutes keeps its caches), a link, or any path outside
+  `logs/`, `run/`, `archive/` and `worktrees/` in the home; a home reached
+  through a link is refused, and the agy lane's tree folder is left to the
+  tree sweep. Archive folders it makes are 0700 and archives 0600.
   Each step says `disk watchdog: ...` with what it freed. When the disk is
   still under the floor it logs the largest folders beside the home once an
   hour, and the lane status shows a `Disk watchdog:` line until the disk is

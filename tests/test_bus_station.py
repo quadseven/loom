@@ -8549,6 +8549,8 @@ class DiskWatchdogTest(Base):
         super().setUp()
         self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
         self.settings.disk_watch = station.disk_watchdog.Config()
+        # A root reached through a link (macOS's /var) is refused.
+        self.settings.home = os.path.realpath(self.home)
         self.log = os.path.join(self.home, "logs", "codex", "old.log")
         self.write(self.log, "x" * 4096)
         old = time.time() - 30 * 86400
@@ -8579,6 +8581,27 @@ class DiskWatchdogTest(Base):
         self.assertTrue(any(s.startswith("disk watchdog: logs older than 7 days") for s in said),
                         said)
         self.assertNotIn("Disk watchdog:", runner._lanes_body([]))
+
+    def test_the_agy_tree_folder_is_left_alone(self):
+        agy = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, agy, True)
+        tree = os.path.join(agy, "quadseven.loom-1")
+        os.makedirs(tree)
+        old = time.time() - 30 * 86400
+        os.utime(tree, (old, old))
+        self.settings.agy_workdir = agy
+        self.tend(5 * 1024 ** 3)
+        self.assertTrue(os.path.isdir(tree))
+
+    def test_a_busy_lane_keeps_its_run_scratch(self):
+        check = os.path.join(self.settings.home, "run", "codex-check")
+        os.makedirs(check)
+        old = time.time() - 30 * 86400
+        os.utime(check, (old, old))
+        with mock.patch.object(station.Station, "_lane_idle", return_value=True), \
+                mock.patch.object(station.Station, "_lane_locked", return_value=True):
+            self.tend(20 * 1024 ** 3)
+        self.assertTrue(os.path.isdir(check))
 
     def test_the_lane_status_says_when_the_floor_is_out_of_reach(self):
         runner, _ = self.tend(5 * 1024 ** 3)

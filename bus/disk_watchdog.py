@@ -19,8 +19,13 @@ soon as the disk is back above the trigger:
 4. Regenerable tool caches in idle lanes' homes (HOME_CACHES).
 
 Nothing a waiting or running brief names is touched, nor a busy lane's run
-folder. Every path it acts on must sit, with no link anywhere along it,
-inside one of the Loom-owned roots (Roots.owned); a link is never followed.
+folder: the lane lock is read again right before each run folder or cache
+goes, and a lane home changed in the last RUN_SCRATCH_SETTLE seconds keeps
+its caches. Every path it acts on must sit, with no link anywhere along it,
+inside one of the Loom-owned roots (Roots.owned), each of which must resolve
+to itself; a link is never followed, and a file is archived only through an
+O_NOFOLLOW fd that is the file lstat saw. Archive folders it makes are 0700
+and archives 0600, since logs sit beside tokens.
 When even that leaves the disk under the floor, it logs the largest folders
 beside the loom home once an hour and keeps one line for the lane status
 (the station's operator notice) until the disk is above the floor again.
@@ -54,6 +59,8 @@ LOCAL_ARCHIVE_DAYS = 14
 WATCH_EVERY = 300
 REPORT_EVERY = 3600
 SCAN_SECONDS = 120
+# A lane home unchanged this long is settled (station RUN_SCRATCH_SETTLE).
+RUN_SCRATCH_SETTLE = 600
 RUN_SCRATCH = ("-check", "-check-default", "-tmp")
 RUN_SCRATCH_PREFIXES = ("-intent.", "-gh.")
 HOME_CACHES = (".cache", ".cargo", ".npm", "tmp", "Library/Caches", ".bun/install/cache",
@@ -98,6 +105,9 @@ class Roots(NamedTuple):
     lanes: Tuple[str, ...]
     live: FrozenSet[str]
     idle: FrozenSet[str]
+    # Asked again right before a slot's run folder or cache goes: a runner
+    # may have taken the slot since idle was read (Station._lane_locked).
+    locked: Callable[[str], bool] = lambda slot: False
 
     def owned(self) -> Tuple[str, ...]:
         home = self.home.rstrip(os.sep)
@@ -116,6 +126,7 @@ class Item(NamedTuple):
     step: str
     path: str
     dest: Optional[str]  # None: remove; else archive to dest, verified
+    slot: Optional[str] = None  # the lane whose lock is checked first
 
 
 def _gb(n: float) -> str:
@@ -137,14 +148,13 @@ class Watchdog:
 
     # -- the guard ------------------------------------------------------------
     def owned(self, path: str) -> bool:
-        """path is strictly inside a Loom-owned root, neither the root nor
-        anything below it on the way is a link, and the path resolves inside
-        where the root resolves (a link above the root, such as the temp
-        folder's on macOS, moves both alike)."""
+        """path is strictly inside a Loom-owned root, the root resolves to
+        itself (no link anywhere on its path), nothing below the root on
+        the way is a link, and the path resolves inside the root."""
         for root in self.roots.owned():
             if not path.startswith(root + os.sep):
                 continue
-            if self.disk.islink(root):
+            if self.disk.realpath(root) != os.path.abspath(root):
                 return False
             rest = path[len(root) + 1:].split(os.sep)
             here = root
@@ -201,8 +211,8 @@ class Watchdog:
         for name, info in self._entries(run):
             slot = self._scratch_slot(name)
             if slot in self.roots.idle and info.newest < cutoff:
-                found.append((info.newest, os.path.join(run, name)))
-        return [Item("run", p, None) for _, p in sorted(found)]
+                found.append((info.newest, os.path.join(run, name), slot))
+        return [Item("run", p, None, slot) for _, p, slot in sorted(found)]
 
     def _scratch_slot(self, name: str) -> Optional[str]:
         for slot in self.roots.lanes:
@@ -231,11 +241,14 @@ class Watchdog:
         run = os.path.join(self.roots.home, "run")
         items = []
         for slot in sorted(self.roots.idle):
+            home = self.disk.info(os.path.join(run, slot + "-home"))
+            if home is None or home.is_link or self.now - home.newest < RUN_SCRATCH_SETTLE:
+                continue
             for cache in HOME_CACHES:
                 path = os.path.join(run, slot + "-home", *cache.split("/"))
                 info = self.disk.info(path)
                 if info is not None and not info.is_link and info.size > 0:
-                    items.append(Item("caches", path, None))
+                    items.append(Item("caches", path, None, slot))
         return items
 
     # -- the run ------------------------------------------------------------
@@ -265,6 +278,9 @@ class Watchdog:
     def _act(self, item: Item) -> bool:
         if not self.owned(item.path):
             self.say("disk watchdog: refused %s: not inside a loom-owned folder" % item.path)
+            return False
+        if item.slot is not None and self.roots.locked(item.slot):
+            self.say("disk watchdog: kept %s: lane %s took work" % (item.path, item.slot))
             return False
         try:
             if item.dest is None:
@@ -379,6 +395,84 @@ def _measure(path: str, deadline: float) -> int:
     return size
 
 
+def _private_dirs(folder: str) -> None:
+    """Make each missing folder on the way to folder, 0700."""
+    missing = []
+    here = folder
+    while here and not os.path.lexists(here):
+        missing.append(here)
+        here = os.path.dirname(here)
+    for path in reversed(missing):
+        os.mkdir(path, 0o700)
+        os.chmod(path, 0o700)
+
+
+def _private_part(part: str):
+    """A new 0600 file to write an archive into, never through a link."""
+    if os.path.lexists(part):
+        os.unlink(part)
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "wb")
+
+
+def _open_regular(path: str, seen: os.stat_result) -> int:
+    """An fd on path, opened without following a link, that is the regular
+    file lstat saw (same device and inode); OSError otherwise."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (seen.st_dev, seen.st_ino):
+        os.close(fd)
+        raise OSError("%s changed or is not a regular file" % path)
+    return fd
+
+
+def _copy_hashing(src, out) -> str:
+    """Copy src to out (None: only read) and return the sha256 of the bytes."""
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: src.read(1 << 20), b""):
+        digest.update(chunk)
+        if out is not None:
+            out.write(chunk)
+    return digest.hexdigest()
+
+
+class _Hashing:
+    """A reader that hashes what tarfile reads from it."""
+
+    def __init__(self, fh):
+        self.fh, self.digest = fh, hashlib.sha256()
+
+    def read(self, n: int = -1) -> bytes:
+        chunk = self.fh.read(n)
+        self.digest.update(chunk)
+        return chunk
+
+
+def _tarinfo(name: str, st: os.stat_result, kind: bytes) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type, info.mode, info.mtime = kind, stat.S_IMODE(st.st_mode), int(st.st_mtime)
+    return info
+
+
+def _tar_entry(tf: tarfile.TarFile, path: str, name: str, want: Dict[str, str]) -> None:
+    """Add one folder entry: a link as a link, a regular file read through
+    _open_regular; a folder is added when os.walk reaches it; anything else
+    (a socket, a fifo) is left out."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        info = _tarinfo(name, st, tarfile.SYMTYPE)
+        info.linkname = os.readlink(path)
+        tf.addfile(info)
+    elif stat.S_ISREG(st.st_mode):
+        with os.fdopen(_open_regular(path, st), "rb") as fh:
+            info = _tarinfo(name, os.fstat(fh.fileno()), tarfile.REGTYPE)
+            info.size = os.fstat(fh.fileno()).st_size
+            reader = _Hashing(fh)
+            tf.addfile(info, reader)
+            want[name] = reader.digest.hexdigest()
+
+
 class RealDisk:
     def free(self, path: str) -> int:
         return shutil.disk_usage(path).free
@@ -419,21 +513,24 @@ class RealDisk:
             os.unlink(path)
 
     def archive(self, src: str, dest: str) -> None:
-        """Write src to dest (gzip for a file, tar.gz for a folder), read it
-        back, and remove src only when the copy is whole. Links are stored
-        as links."""
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        """Write src to dest (gzip for a file, a copy for a compressed file,
+        tar.gz for a folder), read it back, and remove src only when the copy
+        is whole. No link is followed: a file is read through an fd opened
+        with O_NOFOLLOW that must be the regular file lstat saw, and a link
+        in a folder is stored as a link. Archives may hold logs, so new
+        folders are 0700 and the archive file 0600."""
+        _private_dirs(os.path.dirname(dest))
         part = dest + ".part"
         st = os.lstat(src)
         try:
             if stat.S_ISDIR(st.st_mode):
                 self._tar(src, part)
-            elif src.endswith(COMPRESSED):
-                self._copy(src, part)
+            elif stat.S_ISREG(st.st_mode):
+                self._file(src, st, part, not src.endswith(COMPRESSED))
             else:
-                self._gzip(src, part)
+                raise OSError("%s is not a regular file or folder" % src)
             # The source's time, so log retention still counts from the run.
-            os.utime(part, (st.st_atime, st.st_mtime))
+            os.utime(part, (st.st_atime, st.st_mtime), follow_symlinks=False)
             os.replace(part, dest)
         finally:
             if os.path.lexists(part):
@@ -441,38 +538,36 @@ class RealDisk:
         self.remove(src)
 
     @staticmethod
-    def _gzip(src: str, part: str) -> None:
-        with open(src, "rb") as fh, gzip.open(part, "wb", compresslevel=6) as out:
-            shutil.copyfileobj(fh, out, 1 << 20)
-        if _sha(part, gzip.open) != _sha(src):
+    def _file(src: str, st: os.stat_result, part: str, compress: bool) -> None:
+        fd = _open_regular(src, st)
+        with os.fdopen(fd, "rb") as fh, _private_part(part) as raw:
+            out = gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=6) if compress else raw
+            want = _copy_hashing(fh, out)
+            if compress:
+                out.close()
+        if _sha(part, gzip.open if compress else open) != want:
             raise OSError("archive of %s did not verify" % src)
 
     @staticmethod
-    def _copy(src: str, part: str) -> None:
-        shutil.copyfile(src, part)
-        if _sha(part) != _sha(src):
-            raise OSError("copy of %s did not verify" % src)
-
-    @staticmethod
     def _tar(src: str, part: str) -> None:
-        _, _, files = _walk(src)
-        want = sum(os.lstat(os.path.join(t, n)).st_size
-                   for t, _, ns in os.walk(src, followlinks=False) for n in ns
-                   if stat.S_ISREG(os.lstat(os.path.join(t, n)).st_mode))
-        with tarfile.open(part, "w:gz", compresslevel=6) as tf:
-            tf.add(src, arcname=os.path.basename(src), recursive=True)
-        got_files = got_bytes = 0
+        want: Dict[str, str] = {}
+        base = os.path.basename(src)
+        with _private_part(part) as raw, \
+                tarfile.open(fileobj=raw, mode="w:gz", compresslevel=6) as tf:
+            for top, dirs, names in os.walk(src, followlinks=False):
+                rel = os.path.normpath(os.path.join(base, os.path.relpath(top, src)))
+                tf.addfile(_tarinfo(rel, os.lstat(top), tarfile.DIRTYPE))
+                for name in dirs + names:
+                    _tar_entry(tf, os.path.join(top, name), os.path.join(rel, name), want)
+        got: Dict[str, str] = {}
         with tarfile.open(part, "r:gz") as tf:
             for member in tf:
                 if member.isreg():
-                    got_files += 1
-                    got_bytes += member.size
                     reader = tf.extractfile(member)
-                    while reader is not None and reader.read(1 << 20):
-                        pass
-        if (got_files, got_bytes) != (files, want):
-            raise OSError("archive of %s did not verify: %d files, %d bytes; wanted %d, %d"
-                          % (src, got_files, got_bytes, files, want))
+                    got[member.name] = _copy_hashing(reader, None) if reader else ""
+        if got != want:
+            raise OSError("archive of %s did not verify: %d files read back, %d written"
+                          % (src, len(got), len(want)))
 
     def largest(self, root: str, skip, deadline: float) -> List[Tuple[str, int]]:
         """The folders in root (and in its largest few) by size, measured

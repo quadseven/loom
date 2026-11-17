@@ -16922,11 +16922,13 @@ class Station:
                 _say("cannot list lane %s's inbox, so the disk watchdog waits: %s" % (lane, err))
                 return
         run = os.path.join(self.s.home, "run")
-        trees = (os.path.join(self.s.home, "worktrees"),) + (
-            (self.s.agy_workdir,) if self.s.agy_workdir else ())
-        roots = disk_watchdog.Roots(home=self.s.home, trees=trees, lanes=tuple(LANES),
-                                    live=frozenset(live),
-                                    idle=frozenset(s for s in LANES if self._lane_idle(run, s)))
+        # Only the home's own tree folder: the agy folder sits in another
+        # user's home and is left to prune_trees.
+        roots = disk_watchdog.Roots(home=self.s.home,
+                                    trees=(os.path.join(self.s.home, "worktrees"),),
+                                    lanes=tuple(LANES), live=frozenset(live),
+                                    idle=frozenset(s for s in LANES if self._lane_idle(run, s)),
+                                    locked=lambda slot: self._lane_locked(run, slot))
         path = os.path.join(self.state, DISK_WATCH_FILE)
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}

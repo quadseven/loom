@@ -186,15 +186,41 @@ class TendTest(unittest.TestCase):
         tend(disk, rts=roots(live={"quadseven.loom-7-r2"}, idle={"codex"}))
         self.assertEqual(disk.calls, [])
 
-    def test_caches_of_idle_lanes_go_last(self):
+    def caches(self, home_age_days=1.0):
         disk = FakeDisk(40 * GB, used_elsewhere=20 * GB)
-        disk.add(HOME + "/run/codex-home/.npm", 3 * GB, is_dir=True)
-        disk.add(HOME + "/run/codex-home/Library/Caches", 3 * GB, is_dir=True)
-        disk.add(HOME + "/run/codex-home/.config", 3 * GB, is_dir=True)
+        disk.add(HOME + "/run/codex-home", is_dir=True, age_days=home_age_days)
+        disk.add(HOME + "/run/codex-home/.npm", 3 * GB, is_dir=True, age_days=1)
+        disk.add(HOME + "/run/codex-home/Library/Caches", 3 * GB, is_dir=True, age_days=1)
+        disk.add(HOME + "/run/codex-home/.config", 3 * GB, is_dir=True, age_days=1)
+        return disk
+
+    def test_caches_of_idle_lanes_go_last(self):
+        disk = self.caches()
         tend(disk)
         removed = [c[1] for c in disk.calls if c[0] == "remove"]
         self.assertIn(HOME + "/run/codex-home/.npm", removed)
         self.assertNotIn(HOME + "/run/codex-home/.config", removed)
+
+    def test_a_lane_home_changed_in_the_settle_time_keeps_its_caches(self):
+        disk = self.caches(home_age_days=60 / DAY)
+        tend(disk)
+        self.assertEqual(disk.calls, [])
+
+    def test_a_lane_that_takes_work_meanwhile_keeps_its_folders(self):
+        disk = self.caches()
+        disk.add(HOME + "/run/codex-check", GB, age_days=3, is_dir=True)
+        rts = roots()._replace(locked=lambda slot: slot == "codex")
+        _, said = tend(disk, rts=rts)
+        self.assertEqual(disk.calls, [])
+        self.assertTrue(any("lane codex took work" in s for s in said), said)
+
+    def test_a_home_reached_through_a_link_is_refused(self):
+        disk = FakeDisk(40 * GB, used_elsewhere=30 * GB)
+        disk.add(HOME + "/logs/codex/a.log", GB, age_days=9)
+        disk.entries["/srv"] = (False, NOW, 0, "/mnt")
+        _, said = tend(disk)
+        self.assertEqual(disk.calls, [])
+        self.assertTrue(any("refused" in s for s in said), said)
 
     def test_a_tree_that_does_not_verify_is_kept(self):
         disk = FakeDisk(40 * GB, used_elsewhere=30 * GB)
@@ -248,9 +274,9 @@ class RealDiskTest(unittest.TestCase):
     removal reaches through a link to a folder outside the roots."""
 
     def setUp(self):
-        # macOS keeps temp folders behind the /var link: a link above the
-        # roots is allowed, one inside them is not.
-        self.tmp = tempfile.mkdtemp()
+        # The real path: macOS keeps temp folders behind the /var link, and
+        # a root reached through any link is refused.
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, "loom")
         self.outside = os.path.join(self.tmp, "personal")
@@ -295,6 +321,41 @@ class RealDiskTest(unittest.TestCase):
             self.assertEqual(fh.read(), b"\x1f\x8b already compressed")
         self.assertAlmostEqual(os.lstat(dest).st_mtime, NOW - 30 * DAY, delta=1)
         self.assertFalse(os.path.exists(log))
+
+    def test_archives_are_private(self):
+        log = os.path.join(self.home, "logs", "codex", "a.log")
+        with open(log, "w") as fh:
+            fh.write("token-adjacent\n")
+        os.chmod(log, 0o644)
+        dest = os.path.join(self.tmp, "arch", "loom", "logs", "a.log.gz")
+        wd.RealDisk().archive(log, dest)
+        self.assertEqual(os.stat(dest).st_mode & 0o777, 0o600)
+        for folder in ("arch", "arch/loom", "arch/loom/logs"):
+            self.assertEqual(os.stat(os.path.join(self.tmp, folder)).st_mode & 0o777, 0o700,
+                             folder)
+
+    def test_a_link_given_as_a_file_is_not_archived(self):
+        secret = os.path.join(self.outside, "keep.txt")
+        link = os.path.join(self.home, "logs", "codex", "a.log")
+        os.symlink(secret, link)
+        with self.assertRaises(OSError):
+            wd.RealDisk().archive(link, link + ".gz")
+        self.assertFalse(os.path.exists(link + ".gz"))
+        self.assertTrue(os.path.islink(link))
+        self.assertEqual(os.listdir(self.outside), ["keep.txt"])
+
+    def test_a_file_swapped_after_lstat_is_refused(self):
+        log = os.path.join(self.home, "logs", "codex", "a.log")
+        other = os.path.join(self.home, "logs", "codex", "b.log")
+        for path in (log, other):
+            with open(path, "w") as fh:
+                fh.write(path)
+        with self.assertRaises(OSError):
+            wd._open_regular(log, os.lstat(other))
+        os.unlink(log)
+        os.symlink(other, log)
+        with self.assertRaises(OSError):
+            wd._open_regular(log, os.lstat(other))
 
     def test_links_to_outside_are_never_followed(self):
         links = [os.path.join(self.home, "logs", "codex", "escape"),
