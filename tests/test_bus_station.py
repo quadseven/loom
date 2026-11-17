@@ -3247,7 +3247,7 @@ class TriageTest(Base):
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
-        self.fake.add_open_issue(100, body=READY_BODY)
+        self.fake.add_open_issue(100, body=READY_BODY, author=brain.trusted_authors()[0])
         self.fake.add_open_issue(101, body="It is slow.")
         err = self.run_at()
         self.assertEqual(len(self.triage_reads()), 1)
@@ -3316,7 +3316,7 @@ class TriageTest(Base):
 
     def test_a_goal_without_backlog_home_is_triaged_and_rewritten(self):
         self.fake.add_goal(31, title="Ship the thing")
-        self.fake.add_open_issue(102, body=READY_BODY)
+        self.fake.add_open_issue(102, body=READY_BODY, author=brain.trusted_authors()[0])
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=self.start)
         with mock.patch.object(brain, "triage", wraps=brain.triage) as triage:
@@ -15328,7 +15328,7 @@ class TwoLoomsTest(Base):
     def test_a_goal_home_naming_our_operator_is_worked(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
         self.fake.goals[0]["body"] = "Operator: Alice-Example\n\n## Destination\nAll of it."
-        self.fake.add_open_issue(100, body=READY_BODY)
+        self.fake.add_open_issue(100, body=READY_BODY, author=brain.trusted_authors()[0])
         self.run_quiet()
         self.assertIn("loom:queued", self.fake.names(100))
 
