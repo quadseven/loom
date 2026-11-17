@@ -5624,6 +5624,8 @@ class Station:
         if hold is not None and self.now < hold:
             _say("%s#%s is held until %s" % (repo, issue["number"], headers["Not before"]))
             return False
+        if self._cap_held_early(repo, issue):
+            return False
         ok, reason = self._check_trust(repo, issue)
         if self._target_reached():
             return False
@@ -5882,6 +5884,33 @@ class Station:
             self._routine(repo, int(issue["number"]), reason)
         _say(reason)
         self._cap_held.add("%s#%d" % (repo, int(issue["number"])))
+        return True
+
+    def _cap_held_early(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Hold a build ticket of a repo at its open pull request cap before
+        any read of its own but its comments, which the station keeps per
+        issue stamp (loom#3119). Only a ticket already told this exact hold
+        and with no live fix round is held here; anything else (a fix round,
+        a new count, an unread count, an unusable fix comment) takes the full
+        claim path, so the hold note and the fix exemption stay as they were.
+        On 2026-11-16, 61 of 98 briefed tickets sat in two repos over the
+        cap, and the trust, issue and merged-PR reads each one cost spent the
+        claim share before free lanes reached a ticket they could run."""
+        count = self._repo_pr_count(repo)
+        cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
+        if count is None or count < cap:
+            return False
+        number = int(issue["number"])
+        reason = "held: %s has %d open pull requests (cap %d)" % (repo, count, cap)
+        comments = self._paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        try:
+            fix, _ = self._live_fix(repo, number, self._fix_for(repo, comments))
+        except ValueError:
+            return False
+        if fix is not None or self._last_repo_pr_hold(repo, number) != reason:
+            return False
+        _say(reason)
+        self._cap_held.add("%s#%d" % (repo, number))
         return True
 
     def _last_repo_pr_hold(self, repo: str, number: int) -> Optional[str]:
