@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import answer, proof, status
+from . import answer, human_claims, proof, status
 from .stale_claims import outside_hold
 
 # The runner's own patterns (lanes/run_lane.sh).
@@ -1275,8 +1275,11 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
 
     Outside work beats anything of ours (loom#2333): an issue under
     outside_hold, or assigned to a person who is not one of ours, is theirs
-    even beside our claim or operator. An App assignee owns nothing."""
-    held = outside_hold(issue)
+    even beside our claim or operator. An App assignee owns nothing.
+
+    A person's session that claims by assignment (bus/human_claims.py) owns
+    the issue outright, even a loom:ticket it filed as a trusted briefer."""
+    held = outside_hold(issue) or human_claims.assigned(issue)
     if held:
         return held
     logins = assignees(issue) + claimed_by(issue)

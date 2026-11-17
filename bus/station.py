@@ -40,6 +40,7 @@ from . import converge
 from . import brain_memory
 from . import brain_hold
 from . import claimed
+from . import human_claims
 from . import claim_referee
 from . import close_audit
 from . import closing
@@ -2726,6 +2727,20 @@ class Station:
         self._note_owned("%s#%s" % (repo, issue.get("number")),
                          ("assigned to %s, not a LOOM_BRIEF_AUTHORS login" % owner)
                          if ":" not in owner else "held by %s for outside work" % owner)
+        return True
+
+    def _human_held(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """True when a person's session claims the issue (bus/human_claims.py)
+        by assignment or by its claim comment. Asked only of an issue about to
+        be taken; the comments are read once per issue state."""
+        reader = getattr(self, "_human_reader", None)
+        if reader is None:
+            reader = self._human_reader = human_claims.Reader(
+                lambda r, n: self._paginate("/repos/%s/issues/%d/comments" % (r, n)))
+        login = reader.holder(repo, issue)
+        if login is None:
+            return False
+        self._note_owned("%s#%s" % (repo, issue.get("number")), "claimed by %s" % login)
         return True
 
     def _goal_elsewhere(self, repo: str, issue: Dict[str, Any]) -> bool:
@@ -5623,7 +5638,7 @@ class Station:
         if not self._still_ours(fresh, labelled_lane or lane):
             _say("%s#%s changed before the claim; leaving it" % (repo, issue["number"]))
             return False
-        if self._owned_elsewhere(repo, fresh):
+        if self._owned_elsewhere(repo, fresh) or self._human_held(repo, fresh):
             return False
         if (fresh.get("body") or "") != (issue.get("body") or "") \
                 or fresh.get("updated_at") != issue.get("updated_at"):
@@ -12653,7 +12668,8 @@ class Station:
                 break
             if (not isinstance(issue, dict) or issue.get("assignees") or issue.get("assignee")
                     or any(name.startswith("claim:") for name in _label_names(issue))
-                    or brain._triage_skip(issue, self.s.authors, self.s.briefers)):
+                    or brain._triage_skip(issue, self.s.authors, self.s.briefers)
+                    or self._human_held(repo, issue)):
                 continue
             number = int(issue["number"])
             try:
