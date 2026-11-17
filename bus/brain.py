@@ -967,9 +967,23 @@ def _names_sha(body: str, sha: str) -> bool:
                              for m in _SHA_WORD.finditer(body))
 
 
+def _carries_marker(body: str) -> bool:
+    """The comment carries an automated marker: an HTML comment opening
+    with the Loom marker prefix, or a review-bot marker of the same shape.
+    The factory and the brain post such comments under the same App login
+    that opens lane pull requests, so a marker comment is a machine note,
+    never the author's or a trusted login's own answer."""
+    return "<!-- loom:" in body or "<!-- grug-" in body
+
+
 def _lifts_hold(login: str, body: str, author: str, sha: str, allowed: set) -> bool:
     """A comment after a hold that lifts it: the pull request author's, or
-    a trusted one naming the head commit's sha."""
+    a trusted one naming the head commit's sha. A comment carrying a Loom
+    marker never lifts a hold, whoever posts it and whatever sha it names:
+    that is the chosen rule for this ticket, so the factory's own marker
+    comments leave a hold standing."""
+    if _carries_marker(body):
+        return False
     return (bool(author) and login == author) or (login in allowed and _names_sha(body, sha))
 
 
@@ -977,9 +991,10 @@ def fleet_hold(comments: Sequence[Any], head: Dict[str, Any], head_sha: str,
                pr_author: str, trusted: Sequence[str]) -> Optional[Dict[str, Any]]:
     """The standing hold comment on a pull request, else None (loom#2393).
     A hold is a trusted login's comment opening with "Not merging" or "Hold",
-    made after the head commit (a newer push lifts it). A later comment by
-    the pull request's author lifts it, and so does a later trusted comment
-    naming the head commit's sha. With no head commit date every hold counts."""
+    made after the head commit (a newer push lifts it). A later plain comment
+    by the pull request's author lifts it, and so does a later plain trusted
+    comment naming the head commit's sha. A comment carrying a Loom marker
+    never lifts it. With no head commit date every hold counts."""
     allowed = {a.lower() for a in trusted if a}
     if not allowed:
         return None

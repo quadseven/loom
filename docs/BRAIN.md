@@ -1067,7 +1067,10 @@ superseded, when the issue it was rewritten from is already closed as
 completed, when a pull request in another repo of the owner that names it in
 full has merged, when a pull request a person linked in it or its comments
 merged after it was filed, or when every file its criteria ask to add already
-exists on the default branch. A stale ticket goes back to `loom:queued` with
+exists on the default branch. A mention under an Out of scope, Not in scope
+or Follow-ups heading, or on a line that says the ticket was filed for later
+("filed for", "filed as", "follow-up"), names work not built and does not
+count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
 `needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
 gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
 once: once the operator removes `needs:human`, the same evidence does not hold
@@ -1376,7 +1379,10 @@ itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
 push to its pull request, a lane's first pull request (`Lane <lane> opened a
 pull request: <url>`; the pull request's `Refs #N` already cross-references the
 ticket and `loom:pr` is set, loom#1390), a ready mark (`Ready: checks and
-review passed on head <sha>`; loom#1244), and a build run's no-change answer
+review passed on head <sha>`; loom#1244; it ends "the factory lands it in its
+turn", or in a repo shadow mode holds "shadow mode holds this repo, so the
+merge is recorded for the brain, not landed", since there the factory only
+records a would-merge, loom#2432), and a build run's no-change answer
 with where it left the ticket (Claim and outcome). A new comment emails the
 operator; an edit does not (loom#866: zippie#264 carried 77 bot comments).
 Outcomes (a failure, merged, shipped, verified, an ask, a runaway hold) and
@@ -1926,8 +1932,14 @@ A fleet hold blocks too (loom#2393): a plain pull request comment from a
 `LOOM_BRIEF_AUTHORS` or `LOOM_TRUSTED_BRIEFERS` login, made after the head
 commit, whose text opens with `Not merging` or `Hold` (any letter case, after
 optional whitespace or markdown marks such as `**`, `>` or `#`). A later
-comment by the pull request's author lifts it, as does a later trusted comment
-naming the head commit's sha (7 or more hex characters), or a newer push.
+plain comment by the pull request's author lifts it, as does a later plain
+trusted comment naming the head commit's sha (7 or more hex characters), or
+a newer push. A comment carrying a Loom marker never lifts a hold, whoever
+posts it and whatever sha the marker names: the factory and the brain post
+marker comments (a review-again ask, a reviewer ask, a Luna note, a scope
+hold, a rebuttal refusal) under the same App login that opens lane pull
+requests, so those machine notes leave the hold standing. Only a plain,
+marker-free reply lifts a hold by comment.
 Status prints `held by a fleet comment from LOGIN: <comment link>`, and
 `bus.brain merge` refuses with the same words. Comments that cannot be read
 block as `pull request comments unreadable`. Only the opener counts: no other

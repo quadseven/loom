@@ -1311,7 +1311,7 @@ class InvariantsCloseTest(ShadowCase):
     NUMBER = 77
 
     def wire(self, state="open", labels=("loom:triage", "loom:invariant"),
-             key="goal-epics-over-cap/ad09a1c365b8", age=86400):
+             key="queued-ticket-no-headers/ad09a1c365b8", age=86400):
         breach = {"number": self.NUMBER, "state": state, "title": "Lane pull request #5 open",
                   "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.NOW - age)),
                   "closed_at": None if state == "open" else time.strftime(

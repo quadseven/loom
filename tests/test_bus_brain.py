@@ -7402,6 +7402,45 @@ class FleetHoldTests(unittest.TestCase):
                               "2030-01-01T13:30:00Z", 502)
         self.assertEqual(self.merge([self.hold(), answer]), "merged")
 
+    def test_each_factory_marker_comment_by_the_author_leaves_the_hold_standing(self):
+        markers = (
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "/grug improve\n\n<!-- loom:improve-head %s -->" % self.SHA,
+            "<!-- loom:luna-request v1 sha=%s -->\nThe review check is degraded "
+            "on this head.\nDispatch 1 at 2030-01-01 13:30 UTC.\n"
+            "<!-- loom:luna-dispatch at=1893456000 -->" % self.SHA,
+            "<!-- loom:scope-hold %s -->\nHeld for the brain: a scope check "
+            "asked whether this pull request fits its ticket." % self.SHA,
+            "<!-- loom:rebuttal-refused v1 thread=PRRT_example head=%s -->\n"
+            "Merge refused: a review thread was resolved on an answer that "
+            "does not hold." % self.SHA,
+        )
+        for body in markers:
+            with self.subTest(body=body.split("\n", 1)[0]):
+                marker = self.comment("example-lane[bot]", body,
+                                      "2030-01-01T13:30:00Z", 502)
+                self.assertIn("held by a fleet comment",
+                              self.merge([self.hold(), marker]))
+
+    def test_a_factory_marker_comment_by_a_trusted_login_leaves_the_hold_standing(self):
+        marker = self.comment(
+            "example-brain",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        self.assertIn("held by a fleet comment", self.merge([self.hold(), marker]))
+
+    def test_a_plain_reply_after_a_factory_marker_comment_lifts_the_hold(self):
+        marker = self.comment(
+            "example-lane[bot]",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        answer = self.comment("example-lane[bot]", "Fixed the clock reset.",
+                              "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, answer]), "merged")
+        named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
+                             "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, named]), "merged")
+
     def test_a_later_trusted_comment_naming_the_head_sha_lifts_the_hold(self):
         named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
                              "2030-01-01T13:30:00Z", 502)

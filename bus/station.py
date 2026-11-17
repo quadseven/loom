@@ -200,6 +200,13 @@ SESSION_UNSENT_KEEP = 24 * 3600
 # check copy and idle run scratch go at once, not after TREE_KEEP.
 TREE_DONE_STATES = frozenset(("loom:merged", "loom:shipped", "loom:verified",
                               "loom:closed-unmerged"))
+# The ticket states a merged pull request that names the ticket may deliver
+# straight to loom:merged (Station._deliver_unlinked). Running, answered and
+# failed only from a branch outside loom/: a lane run reports its own pull
+# request. 2026-11-10: a fix merged from a muse/ branch left its ticket at
+# loom:queued on a lane for 3 days (loom#2938).
+UNLINKED_STATES = ("loom:queued", "loom:briefed", "loom:running", "loom:answered",
+                   "loom:failed")
 # A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
 # this is never removed: a runner may have just made it.
 RUN_SCRATCH_SETTLE = 600
@@ -2221,8 +2228,42 @@ def adoption_comment(repo: str, ticket: int) -> str:
 
 # A ready mark: a status event naming the head whose checks and review passed.
 # Plain text, because a status event is shown to readers as it is written.
-READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands the pull "
-              "request in its turn.")
+READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands it in "
+              "its turn.")
+# The Ready line in a repo shadow mode holds (bus/shadow.py): the factory only
+# records a would-merge there, so the line must not promise a landing. Most
+# lane pull requests in shadow repos were merged by other sessions while the
+# line said the factory would (loom#2432).
+READY_SHADOW_TEXT = ("Ready: checks and review passed on head %s; shadow mode holds this "
+                     "repo, so the merge is recorded for the brain, not landed.")
+# The newest merged pull requests of a repo, for the digest's count of lane
+# merges by actor (Station._digest_merge_line). REST lists carry no merged_by.
+MERGED_PULLS_QUERY = (
+    "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
+    "pullRequests(states:MERGED,first:100,after:$after,"
+    "orderBy:{field:UPDATED_AT,direction:DESC}){"
+    "nodes{headRefName mergedAt updatedAt mergedBy{login}} "
+    "pageInfo{hasNextPage endCursor}}}}")
+# Pages of MERGED_PULLS_QUERY read a repo at most: the pages come newest
+# update first and stop at the first pull request updated before the window,
+# so this bounds only a window with more merges than it covers.
+MERGED_PULLS_PAGES = 10
+
+
+def merge_actor(login: str, own: str, bots: Set[str]) -> str:
+    """Who merged a lane pull request: "factory" for the station's own login,
+    "brain" for another App login among the trusted authors, else "other"."""
+    login = _bare_login(login)
+    if login and login == own:
+        return "factory"
+    return "brain" if login in bots else "other"
+
+
+def _bare_login(login: str) -> str:
+    """A login lowercased without its "[bot]" suffix: GraphQL names an App
+    by its slug, REST and LOOM_BRIEF_AUTHORS add "[bot]"."""
+    login = str(login or "").strip().lower()
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
 READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b")
 # A ticket marked ready before the status event kept a ready-head comment of
 # its own; it is still read.
@@ -6516,16 +6557,17 @@ class Station:
 
     def _unlinked_tickets(self, repo: str, linked: Dict[int, Dict[str, Any]],
                           found: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
-        """The repo's open tickets at loom:queued or loom:briefed that a
-        briefing login filed, by number. The open-tickets list is the verify
-        runs' own read, so a pass that reads both pays for it once; with no
-        such ticket and no loom:pr ticket, no closed pull request is read."""
+        """The repo's open tickets at a state a merged pull request may
+        deliver (UNLINKED_STATES) that a briefing login filed, by number. The
+        open-tickets list is the verify runs' own read, so a pass that reads
+        both pays for it once; with no such ticket and no loom:pr ticket, no
+        closed pull request is read."""
         out: Dict[int, Dict[str, Any]] = {}
         for issue in found:
             if (isinstance(issue, dict) and "pull_request" not in issue
                     and int(issue.get("number") or 0) not in linked
                     and "loom:ticket" in _label_names(issue)
-                    and set(_label_names(issue)).intersection(("loom:queued", "loom:briefed"))
+                    and set(_label_names(issue)).intersection(UNLINKED_STATES)
                     and tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)):
                 # The trust check reads the repo owner from repository_url.
                 issue.setdefault("repository_url", "%s/repos/%s" % (self.gh.api, repo))
@@ -6547,30 +6589,68 @@ class Station:
 
     def _deliver_unlinked(self, repo: str, pr: Dict[str, Any],
                           unlinked: Dict[int, Dict[str, Any]]) -> None:
-        """Move a queued or briefed ticket to loom:merged when this merged
-        pull request delivers it: a same-repo branch, linked to the ticket,
-        by a trusted author of a trusted ticket or by the contributor who
-        owns it, and merged after the ticket last went to queued or briefed."""
+        """Move a waiting ticket (UNLINKED_STATES) to loom:merged when this
+        merged pull request delivers it: a same-repo branch, linked to the
+        ticket, by a trusted author of a trusted ticket or by the contributor
+        who owns it, and merged after the ticket last went to queued or
+        briefed. A running, answered or failed ticket only from a branch
+        outside loom/. A branch outside loom/ also takes the lane label off,
+        and its note names the merge commit (loom#2938)."""
         number = self._pr_ticket_number(repo, pr)
         ticket = unlinked.get(number) if number is not None else None
-        if ticket is None or not _linked_pr(ticket, repo, pr):
+        was = self._deliverable(repo, pr, ticket) if ticket is not None else None
+        if was is None:
             return
-        head_repo = str(((pr.get("head") or {}).get("repo") or {}).get("full_name") or "")
-        if head_repo != repo:
+        self._reconcile_pr_ticket(repo, pr, {number: ticket})
+        if "loom:merged" not in _label_names(ticket):
             return
+        del unlinked[number]
+        note = ("Pull request #%d merged while this ticket was at %s, so it moved to "
+                "loom:merged." % (int(pr["number"]), was))
+        branch = str((pr.get("head") or {}).get("ref") or "")
+        if not branch.startswith("loom/"):
+            self._drop_lane_label(repo, ticket)
+            note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
+                     "ticket no longer holds a lane." % (
+                         branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
+            _say("%s#%d merged from a non-lane branch: pull request #%d"
+                 % (repo, number, int(pr["number"])))
+        self._comment(repo, number, note, notify.MERGED)
+
+    def _deliverable(self, repo: str, pr: Dict[str, Any],
+                     ticket: Dict[str, Any]) -> Optional[str]:
+        """The state (UNLINKED_STATES) the ticket leaves when this merged pull
+        request delivers it, or None when it may not: another repo's branch,
+        no link, a lane branch for a ticket past briefed (its run reports its
+        own pull request), an author who may not deliver it, or a merge before
+        the ticket last went back to queued or briefed."""
+        number = int(ticket["number"])
+        head = pr.get("head") or {}
+        if (str((head.get("repo") or {}).get("full_name") or "") != repo
+                or not _linked_pr(ticket, repo, pr)):
+            return None
+        labels = _label_names(ticket)
+        was = next((s for s in UNLINKED_STATES if s in labels), "loom:queued")
+        if str(head.get("ref") or "").startswith("loom/") and was not in (
+                "loom:queued", "loom:briefed"):
+            return None
         if not self._deliver_trusted_author(repo, ticket, pr):
-            return
+            return None
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
         if tickets.merged_before_requeue(pr.get("merged_at"), events):
+            return None
+        return was
+
+    def _drop_lane_label(self, repo: str, ticket: Dict[str, Any]) -> None:
+        """Take the lane: labels off a ticket a pull request outside loom/
+        delivered: no lane run holds it, and the label read as lane load."""
+        names = _label_names(ticket)
+        kept = [n for n in names if not n.startswith("lane:")]
+        if kept == names:
             return
-        labels = _label_names(ticket)
-        was = "loom:briefed" if "loom:briefed" in labels else "loom:queued"
-        self._reconcile_pr_ticket(repo, pr, {number: ticket})
-        if "loom:merged" in _label_names(ticket):
-            del unlinked[number]
-            self._comment(repo, number, "Pull request #%d merged while this ticket was at %s, "
-                          "so it moved to loom:merged." % (int(pr["number"]), was),
-                          notify.MERGED)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, int(ticket["number"])),
+                     {"labels": kept})
+        ticket["labels"] = [{"name": n} for n in kept]
 
     def _contributor_ticket(self, repo: str, pr: Dict[str, Any],
                             author: str) -> Optional[Dict[str, Any]]:
@@ -8706,7 +8786,8 @@ class Station:
         # Routine, so an event in the status comment rather than a comment of
         # its own: a bare marker comment emailed a blank message (2026-10-20).
         if ready != sha:
-            self._routine(repo, number, READY_TEXT % sha)
+            text = READY_SHADOW_TEXT if shadow.active(repo) else READY_TEXT
+            self._routine(repo, number, text % sha)
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
@@ -11406,6 +11487,67 @@ class Station:
         passed, streak = dated[day]
         return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
 
+    def _digest_merge_line(self, since: float) -> str:
+        """How many lane pull requests (head loom/...) merged since `since`,
+        by actor: the factory (this station's own login), the brain (another
+        App login among the trusted authors) or other (a person or an outside
+        session). 2026-11-01: 30 of 36 lane merges in a day were by outside
+        sessions while the Ready line said the factory lands them, and nothing
+        measured it (loom#2432). The own login is the App's or
+        LOOM_GITHUB_LOGIN; a station on a personal token sets neither, and its
+        merges count as other. A repo whose read fails is named on the line."""
+        own = _bare_login(self.gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", ""))
+        bots = {_bare_login(a) for a in self.s.authors if a.lower().endswith("[bot]")} - {own}
+        counts = {"factory": 0, "brain": 0, "other": 0}
+        unread = []
+        for repo in (r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)):
+            try:
+                mergers = self._lane_mergers(repo, since)
+            except RateLimited:
+                raise
+            except GitHubError:
+                unread.append(repo)
+                continue
+            for login in mergers:
+                counts[merge_actor(login, own, bots)] += 1
+        line = ("Lane pull requests merged since the last digest: %d (factory %d, brain %d, "
+                "other %d)." % (sum(counts.values()), counts["factory"], counts["brain"],
+                                counts["other"]))
+        if unread:
+            line += " Not read: %s." % ", ".join(unread)
+        return line
+
+    def _lane_mergers(self, repo: str, since: float) -> List[str]:
+        """The merger login of each lane pull request (head loom/...) of the
+        repo merged since `since`, paging MERGED_PULLS_QUERY newest update
+        first until a pull request was last updated before `since` (a merge
+        updates it, so none older can have merged in the window), at most
+        MERGED_PULLS_PAGES pages. Raises GitHubError when a read fails."""
+        owner, name = repo.split("/")
+        found: List[str] = []
+        after: Optional[str] = None
+        for _ in range(MERGED_PULLS_PAGES):
+            data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name,
+                                                        "after": after})
+            pulls = (((data or {}).get("repository") or {}).get("pullRequests") or {})
+            nodes = [n for n in pulls.get("nodes") or [] if isinstance(n, dict)]
+            found += [m for m in (self._lane_merger(n, since) for n in nodes) if m is not None]
+            page = pulls.get("pageInfo") or {}
+            oldest = self._epoch(str((nodes[-1] if nodes else {}).get("updatedAt") or ""))
+            if not page.get("hasNextPage") or oldest is None or oldest < since:
+                return found
+            after = page.get("endCursor")
+        return found
+
+    def _lane_merger(self, node: Dict[str, Any], since: float) -> Optional[str]:
+        """The merger login of one merged pull request node when it is a lane
+        pull request (head loom/...) merged since `since`, else None."""
+        merged = self._epoch(str(node.get("mergedAt") or ""))
+        if not str(node.get("headRefName") or "").startswith("loom/") \
+                or merged is None or merged < since:
+            return None
+        return str((node.get("mergedBy") or {}).get("login") or "")
+
     def _digest_shadow_lines(self, since: float) -> List[str]:
         """What shadow mode held since the last digest (bus/shadow.py): at
         most two lines, the counts and the command that lists each with its
@@ -11484,6 +11626,7 @@ class Station:
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
+        lines.append(self._digest_merge_line(start))
         lines += self._digest_shadow_lines(start)
         lines += scorecard.Scorecard(self.state, self.now).demotion_lines().values()
         if not self._digest_send("\n".join(lines)):

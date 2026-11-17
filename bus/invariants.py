@@ -18,7 +18,7 @@ lane-no-success stays one issue per lane: the station reads its per-lane keys
 to release runaways a dead lane held.
 
 The kinds in ROLLED (lane-pr-stalled, plan-check-failed, epic-over-cap,
-epic-title-shared) restate state the pull request, the epic or the dashboard
+epic-title-shared, closed-epic-open-tickets, goal-epics-over-cap) restate state the pull request, the epic or the dashboard
 already shows, so they file no issue per violation
 (loom#2099: 185 such tickets in 7 days). The filer folds each kind's breaches
 into one tracking issue per (kind, subject repo), titled "Invariant: <kind> in
@@ -211,7 +211,8 @@ SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
 # already shows: one tracking issue per (kind, subject repo), its list edited
 # in place, instead of one issue per violation (loom#2099). The settle path
 # above now only closes per-violation issues filed before this.
-ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared")
+ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared",
+          "closed-epic-open-tickets", "goal-epics-over-cap")
 ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
 ROLL_TITLE = "Invariant: %s in %s"
 ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
@@ -269,6 +270,12 @@ ROLL_HINTS = {
     EPIC_OVER_CAP: "Each epic here holds more than its cap; new work goes into a next epic.",
     "epic-title-shared": "The epics on each line share one title; give each a distinct title, "
                          "and move the tickets of the older ones under one.",
+    "closed-epic-open-tickets": "Each closed epic here still holds open tickets; the station's "
+                                "outside-epic pass moves them under an open intake epic of "
+                                "their goal, or reopen the epic.",
+    "goal-epics-over-cap": "Each goal home here has more open epics than its cap; finish an "
+                           "epic before opening another, or record a one-time exception on "
+                           "the goal home.",
 }
 
 Say = Callable[[str], None]
@@ -816,7 +823,10 @@ def goal_epics_over_cap(f: Facts) -> List[Breach]:
                               ("Open epics: %s" % _refs(opened),
                                "Finish an epic before opening another, or record a one-time "
                                "exception on the goal home"),
-                              f.now))
+                              f.now,
+                              line="Goal home %s: %d open epics (cap %d), %s" % (
+                                  shape.goal.label, len(opened), shape.cap, _refs(opened)),
+                              where=_where(shape.goal)))
     return out
 
 
@@ -829,7 +839,11 @@ def closed_epic_open_tickets(f: Facts) -> List[Breach]:
                                                             len(epic.open_tickets)),
                    ("Open tickets under it: %s" % _refs(epic.open_tickets),
                     "Reopen the epic, or move the tickets under an open one"),
-                   f.now)
+                   f.now,
+                   line="Closed epic %s of goal home %s: %d open tickets, %s" % (
+                       epic.epic.label, shape.goal.label, len(epic.open_tickets),
+                       _refs(epic.open_tickets)),
+                   where=_where(epic.epic))
             for shape in f.shapes for epic in shape.epics
             if not epic.open and epic.open_tickets]
 
@@ -1321,7 +1335,8 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
 # The Facts field each ROLLED kind reads: a pass that could not read it says
 # nothing about that kind, so its tracking issue is left as it is.
 ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
-                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes"}
+                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes",
+                "closed-epic-open-tickets": "shapes", "goal-epics-over-cap": "shapes"}
 
 
 def read_kinds(facts: Facts) -> Tuple[str, ...]:
