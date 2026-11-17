@@ -11484,18 +11484,23 @@ class Station:
             data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name,
                                                         "after": after})
             pulls = (((data or {}).get("repository") or {}).get("pullRequests") or {})
-            nodes = pulls.get("nodes") if isinstance(pulls.get("nodes"), list) else []
-            for node in (n for n in nodes if isinstance(n, dict)):
-                merged = self._epoch(str(node.get("mergedAt") or ""))
-                if (str(node.get("headRefName") or "").startswith("loom/")
-                        and merged is not None and merged >= since):
-                    found.append(str((node.get("mergedBy") or {}).get("login") or ""))
+            nodes = [n for n in pulls.get("nodes") or [] if isinstance(n, dict)]
+            found += [m for m in (self._lane_merger(n, since) for n in nodes) if m is not None]
             page = pulls.get("pageInfo") or {}
             oldest = self._epoch(str((nodes[-1] if nodes else {}).get("updatedAt") or ""))
             if not page.get("hasNextPage") or oldest is None or oldest < since:
                 return found
             after = page.get("endCursor")
         return found
+
+    def _lane_merger(self, node: Dict[str, Any], since: float) -> Optional[str]:
+        """The merger login of one merged pull request node when it is a lane
+        pull request (head loom/...) merged since `since`, else None."""
+        merged = self._epoch(str(node.get("mergedAt") or ""))
+        if not str(node.get("headRefName") or "").startswith("loom/") \
+                or merged is None or merged < since:
+            return None
+        return str((node.get("mergedBy") or {}).get("login") or "")
 
     def _digest_shadow_lines(self, since: float) -> List[str]:
         """What shadow mode held since the last digest (bus/shadow.py): at
