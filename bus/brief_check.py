@@ -482,8 +482,40 @@ def source_shipped(gh: Any, repo: str, body: str) -> Optional[Verdict]:
     return None
 
 
+# Where a pull request or a ticket names work it does not build: a section
+# headed Out of scope, Not in scope or Follow-ups (any heading level or a bold
+# line), and a line that says a ticket was filed for the rest. 2026-10-26: a
+# merged pull request named a ticket only in its Out of scope list, and the
+# stale check held that ticket on a person (loom#1856).
+UNBUILT_HEAD_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+|\*\*)[ \t]*(?:out of scope|not in scope|follow[- ]?ups?)\b", re.I)
+FILED_NOTE_RE = re.compile(r"\bfiled (?:for|as)\b|\bfollow[- ]up\b", re.I)
+REFS_LINE_RE = re.compile(r"^[ \t]*(?:refs|part of)\b", re.I)
+
+
+def without_unbuilt_mentions(text: str) -> str:
+    """The text without its Out of scope, Not in scope and Follow-ups
+    sections and without lines that say a ticket was filed for later: a
+    reference there names work the text does not build. Reads nothing."""
+    kept: List[str] = []
+    inside = False
+    for line in (text or "").replace("\r", "").split("\n"):
+        if UNBUILT_HEAD_RE.match(line):
+            inside = True
+            continue
+        if inside and NEXT_HEAD_RE.match(line):
+            inside = False
+        if inside:
+            continue
+        # A Refs or Part of line names the work the text does, whatever
+        # else it says.
+        if REFS_LINE_RE.match(line) or not FILED_NOTE_RE.search(line):
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def _names_ticket(text: str, repo: str, number: int) -> bool:
-    lowered = (text or "").lower()
+    lowered = without_unbuilt_mentions(text or "").lower()
     return ("%s#%d" % (repo.lower(), number) in re.sub(r"\s+", "", lowered)
             or "github.com/%s/issues/%d" % (repo.lower(), number) in lowered)
 
@@ -563,7 +595,8 @@ def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
     the ticket was filed. A link to work merged before it is context."""
     owner = repo.partition("/")[0].lower()
     filed = _ts(issue.get("created_at"))
-    links = [(r, n) for r, n in _links(_person_texts(issue, comments, trusted))
+    texts = [without_unbuilt_mentions(t) for t in _person_texts(issue, comments, trusted)]
+    links = [(r, n) for r, n in _links(texts)
              if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
     for where, num in links[:LINKS_READ]:
         merged = _merged_at(gh, where, num)
