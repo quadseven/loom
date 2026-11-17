@@ -20,7 +20,9 @@ from bus.github import GitHub  # noqa: E402
 from tests.test_release_stale_claims import Fake, at, issue, labeled, REPO  # noqa: E402
 
 LOGIN = "ccqw"
-PHRASE = human_claims.DEFAULT.split(":", 1)[1]
+# The claim comment as the second operator's session writes it.
+PHRASE = "Claimed by ccqw's Claude Code"
+MARKER = "<!-- ccqw:claim v1 -->"
 DAY = 24 * 3600
 
 
@@ -32,15 +34,42 @@ def claim_comment(by=LOGIN, body=None, ago=3 * DAY, timeline=True):
     return found
 
 
+def held(body, claims=None, by=LOGIN):
+    return human_claims.commented([claim_comment(by=by, body=body)], claims)
+
+
 class Config(unittest.TestCase):
     def test_the_default_needs_no_setting(self):
-        self.assertEqual({LOGIN: PHRASE.lower()}, human_claims.configured({}))
-        self.assertEqual({LOGIN: PHRASE.lower()}, human_claims.configured({human_claims.ENV: " "}))
+        for env in ({}, {human_claims.ENV: " "}):
+            self.assertEqual([LOGIN], list(human_claims.configured(env)))
+            self.assertEqual(LOGIN, held(PHRASE, human_claims.configured(env)))
 
     def test_the_setting_names_several_claims_or_turns_them_off(self):
-        self.assertEqual({"a-op": "mine now", "b-op": "taken"},
-                         human_claims.parse("A-Op: Mine  now ;b-op:taken\nbroken"))
+        claims = human_claims.parse("A-Op: Mine  now | taken by *! ;b-op:taken\nbroken")
+        self.assertEqual(["a-op", "b-op"], sorted(claims))
+        self.assertEqual("a-op", held("MINE now", claims, by="a-op"))
+        self.assertEqual("a-op", held("Taken by anyone!", claims, by="a-op"))
+        self.assertIsNone(held("taken", claims, by="a-op"))
         self.assertEqual({}, human_claims.parse("off"))
+
+
+class DefaultForms(unittest.TestCase):
+    """The default matches each form the live claim comments take."""
+
+    def test_the_hidden_marker_alone_holds_the_issue(self):
+        self.assertEqual(LOGIN, held(MARKER + "\nClaiming for triage (rewrite, labels)."))
+
+    def test_claimed_by_anyones_claude_code_holds_the_issue(self):
+        for body in (PHRASE, MARKER + "\n" + PHRASE + ".", "claimed BY Someone Else's claude code",
+                     "Claimed by ccqw\u2019s Claude Code"):
+            with self.subTest(body=body):
+                self.assertEqual(LOGIN, held(body))
+
+    def test_other_words_hold_nothing(self):
+        for body in ("Claimed by ccqw", "Claude Code is great", "<!-- other:claim v1 -->",
+                     "Claimed by a person, not Claude Code"):
+            with self.subTest(body=body):
+                self.assertIsNone(held(body))
 
 
 class Holder(unittest.TestCase):
@@ -51,7 +80,7 @@ class Holder(unittest.TestCase):
     def test_the_claim_comment_holds_the_issue_whatever_its_case(self):
         said = claim_comment(body="Working it.\n" + PHRASE.upper().replace(" ", "\n"))
         self.assertEqual(LOGIN, human_claims.holder(issue(1, labels=()), [said]))
-        said = claim_comment(body="Claimed by Cait's  claude code: on it", timeline=False)
+        said = claim_comment(body="Claimed by ccqw's  claude code: on it", timeline=False)
         self.assertEqual(LOGIN, human_claims.holder(issue(1, labels=()), [said]))
 
     def test_the_phrase_from_anyone_else_holds_nothing(self):

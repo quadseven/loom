@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import human_claims, incident_probe, lock, rebuttal, urgency  # noqa: E402
+from bus import incident_probe, lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -15805,7 +15805,7 @@ class HumanClaimTest(Base):
     intake and a lane claim both leave such an issue alone."""
 
     LOGIN = "ccqw"
-    PHRASE = human_claims.DEFAULT.split(":", 1)[1]
+    PHRASE = "Claimed by ccqw's Claude Code"
 
     def setUp(self):
         super().setUp()
