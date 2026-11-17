@@ -290,6 +290,9 @@ class FakeGitHub:
             self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
                                         if lab["name"] != unquote(gone.group(2))]
             return reply(200, [])
+        deps = re.match(r"issues/(\d+)/dependencies/blocked_by$", rest)
+        if method == "GET" and deps:
+            return reply(200, getattr(self, "blockers", {}).get(int(deps.group(1)), []))
         tl = re.match(r"issues/(\d+)/timeline$", rest)
         if method == "GET" and tl:
             return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
@@ -5498,6 +5501,60 @@ class ClaimTest(Base):
         self.assertEqual(self.fake.comments[12], [])
         self.run_pass()
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
+
+    def blocked_by(self, number, blocker, state="open"):
+        """GitHub's own "blocked by" relationship: the dependency summary the
+        issue listing carries, and the blocker list it points to."""
+        self.fake.issues[number]["issue_dependencies_summary"] = {
+            "blocked_by": 0 if state == "closed" else 1, "total_blocked_by": 1}
+        self.fake.blockers = {number: [{"number": blocker, "state": state,
+                                        "repository_url": "https://api.github.com/repos/" + REPO}]}
+
+    def test_a_briefed_ticket_github_lists_as_blocked_is_not_claimed(self):
+        # loom#3129: the blocked-by hold ran only when the factory laned a
+        # queued ticket, so a ticket briefed straight to a lane was claimed
+        # on a base that lacked its prerequisite.
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("wait:blocked", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        notes = [c["body"] for c in self.fake.comments[12]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("blocked on #5", notes[0])
+        # The next pass still holds it, and says nothing new.
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_a_briefed_ticket_whose_blocked_on_section_names_an_open_issue_is_not_claimed(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12, body=BODY_WITH_CRITERIA + "\n## Blocked on\n- #5\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_is_claimed_on_the_first_pass_after_its_blocker_closes(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.fake.issues[5]["state"] = "closed"
+        self.blocked_by(12, 5, state="closed")
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_with_no_blocker_costs_no_blocker_request(self):
+        self.fake.add(12)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
 
     def test_a_dependency_of_another_repo_is_read_from_there(self):
         self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))

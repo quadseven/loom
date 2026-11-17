@@ -1817,6 +1817,47 @@ def _author(full: Dict[str, Any]) -> str:
     return str((full.get("user") or {}).get("login") or "")
 
 
+
+def open_blockers(gh: Any, repo: str, issue: Dict[str, Any],
+                  dependency: Callable[[str, int], Optional[Dict[str, Any]]]) -> List[str]:
+    """The issues still open that hold the ticket: those its brief's Blocked
+    on section names (bus/brief_check.py blocked_on), read through
+    `dependency`, which answers None for an issue it cannot read (that holds),
+    then those GitHub's own "blocked by" relationship names (native_blockers).
+    Each is #N (this repo) or owner/name#N. A ticket with neither costs no
+    request. The factory's queued hold and the station's claim both ask this,
+    so the two cannot disagree on what blocks a ticket (loom#3129)."""
+    number = int(issue["number"])
+    still = ["#%d" % n for n in brief_check.blocked_on(issue.get("body")) if n != number
+             and (dependency(repo, n) or {}).get("state") != "closed"]
+    return still + [ref for ref in native_blockers(gh, repo, issue) if ref not in still]
+
+
+def native_blockers(gh: Any, repo: str, issue: Dict[str, Any]) -> List[str]:
+    """The open issues GitHub's own "blocked by" relationship names for
+    the ticket, as #N (this repo) or owner/name#N. Read only when the
+    issue's dependency summary counts an open blocker, so a ticket with
+    none costs no request. A read that fails holds the ticket, naming the
+    summary's count: a lane must not take work whose blocker is unknown."""
+    summary = issue.get("issue_dependencies_summary") or {}
+    if not isinstance(summary, dict) or not summary.get("blocked_by"):
+        return []
+    number = int(issue["number"])
+    try:
+        found = list(gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by" % (repo, number)))
+    except RateLimited:
+        raise
+    except GitHubError:
+        return ["%d open issue(s) GitHub lists as blocking it" % int(summary["blocked_by"])]
+    refs = []
+    for blocker in found if isinstance(found, list) else []:
+        if not isinstance(blocker, dict) or blocker.get("state") == "closed":
+            continue
+        where = str(blocker.get("repository_url") or "").rsplit("/repos/", 1)[-1]
+        refs.append(("#%d" if where in ("", repo) else where + "#%d") % int(blocker["number"]))
+    return refs
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -5450,9 +5491,7 @@ class Factory:
         if newer is not None:
             reason, label = "superseded by #%d" % newer, WAIT_SUPERSEDED
         else:
-            still = ["#%d" % n for n in brief_check.blocked_on(body) if n != int(issue["number"])
-                     and (self._dependency(repo, n) or {}).get("state") != "closed"]
-            still += [ref for ref in self._native_blockers(repo, issue) if ref not in still]
+            still = open_blockers(self.gh, repo, issue, self._dependency)
             if not still:
                 return ""
             reason = "blocked on %s" % ", ".join(still)
@@ -5465,31 +5504,6 @@ class Factory:
             _say("held queued %s#%s: its brief says %s" % (repo, issue["number"], reason))
         self._waiting(repo, issue["number"], reason)
         return reason
-
-    def _native_blockers(self, repo: str, issue: Dict[str, Any]) -> List[str]:
-        """The open issues GitHub's own "blocked by" relationship names for
-        the ticket, as #N (this repo) or owner/name#N. Read only when the
-        issue's dependency summary counts an open blocker, so a ticket with
-        none costs no request. A read that fails holds the ticket, naming the
-        summary's count: a lane must not take work whose blocker is unknown."""
-        summary = issue.get("issue_dependencies_summary") or {}
-        if not isinstance(summary, dict) or not summary.get("blocked_by"):
-            return []
-        number = int(issue["number"])
-        try:
-            found = list(self.gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by"
-                                          % (repo, number)))
-        except RateLimited:
-            raise
-        except GitHubError:
-            return ["%d open issue(s) GitHub lists as blocking it" % int(summary["blocked_by"])]
-        refs = []
-        for blocker in found if isinstance(found, list) else []:
-            if not isinstance(blocker, dict) or blocker.get("state") == "closed":
-                continue
-            where = str(blocker.get("repository_url") or "").rsplit("/repos/", 1)[-1]
-            refs.append(("#%d" if where in ("", repo) else where + "#%d") % int(blocker["number"]))
-        return refs
 
     def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether every acceptance criterion of the queued ticket is a check
