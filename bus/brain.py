@@ -8568,7 +8568,10 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
         globals()["scorecard"] = scorecard
     # A lane the scorecard has demoted takes no build ticket, the same set
     # the factory reads (bus/scorecard.py): leave it out even where lane
-    # status still prints it as available.
+    # status still prints it as available. The scorecard keys a demotion
+    # by base lane, so expand it to every slot of that lane the way the
+    # factory does (scorecard.demoted_slots): a demoted base lane leaves
+    # out its numbered slots too.
     demoted = {row["lane"] for row in scorecard.parse_rows(body)
                if row.get("demoted")}
     # The station also keeps the demoted set in its scorecard file; read it
@@ -8585,7 +8588,8 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
                     demoted |= set(card.demoted())
             except (OSError, ValueError):
                 pass
-    return [lane for lane in rows if lane not in demoted]
+    blocked = scorecard.demoted_slots({lane: "" for lane in demoted}, rows)
+    return [lane for lane in rows if lane not in blocked]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,
