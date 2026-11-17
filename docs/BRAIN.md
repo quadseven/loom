@@ -654,9 +654,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
-station leaves it alone from then on; the brain decides whether it becomes a
-ticket or `needs:human`. Free rewrite models labelled factory work as
+work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
+leaves it alone from then on; the brain decides whether it becomes a ticket
+or `needs:human`. The proposed ask is no comment to a person: it is one
+routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
+which the factory's hold notes quote as the reason for the hold and the
+prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
 person-only, and every `needs:human` reaches the operator's digest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
