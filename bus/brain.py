@@ -4503,7 +4503,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing:
+        trusted_author = tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True)
+        if not missing and trusted_author:
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -4532,7 +4533,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         else:
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
-            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
+            reason = "untrusted author" if not trusted_author else "missing %s" % ", ".join(missing)
+            lines.append("#%d loom:triage, %s" % (number, reason))
         done += 1
     return lines
 

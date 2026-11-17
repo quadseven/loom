@@ -4826,7 +4826,8 @@ class TriageTests(unittest.TestCase):
     def run_triage(self, routes, limit=25):
         # The goal's intake epic is #3 (intake_epic has its own tests).
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
-                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
+                unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]), \
+                unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True):
             return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
 
     def assert_never_edited(self, routes):
