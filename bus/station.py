@@ -2221,8 +2221,27 @@ def adoption_comment(repo: str, ticket: int) -> str:
 
 # A ready mark: a status event naming the head whose checks and review passed.
 # Plain text, because a status event is shown to readers as it is written.
-READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands the pull "
-              "request in its turn.")
+READY_TEXT = ("Ready: checks and review passed on head %s; the factory lands it in "
+              "its turn.")
+# The Ready line in a repo shadow mode holds (bus/shadow.py): the factory only
+# records a would-merge there, so the line must not promise a landing. Most
+# lane pull requests in shadow repos were merged by other sessions while the
+# line said the factory would (loom#2432).
+READY_SHADOW_TEXT = ("Ready: checks and review passed on head %s; shadow mode holds this "
+                     "repo, so the merge is recorded for the brain, not landed.")
+# The newest merged pull requests of a repo, for the digest's count of lane
+# merges by actor (Station._digest_merge_line). REST lists carry no merged_by.
+MERGED_PULLS_QUERY = (
+    "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){"
+    "pullRequests(states:MERGED,first:100,orderBy:{field:UPDATED_AT,direction:DESC}){"
+    "nodes{headRefName mergedAt mergedBy{login}}}}}")
+
+
+def _bare_login(login: str) -> str:
+    """A login lowercased without its "[bot]" suffix: GraphQL names an App
+    by its slug, REST and LOOM_BRIEF_AUTHORS add "[bot]"."""
+    login = str(login or "").strip().lower()
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
 READY_RE = re.compile(r"Ready: checks and review passed on head ([0-9a-f]{40})\b")
 # A ticket marked ready before the status event kept a ready-head comment of
 # its own; it is still read.
@@ -8706,7 +8725,8 @@ class Station:
         # Routine, so an event in the status comment rather than a comment of
         # its own: a bare marker comment emailed a blank message (2026-10-20).
         if ready != sha:
-            self._routine(repo, number, READY_TEXT % sha)
+            text = READY_SHADOW_TEXT if shadow.active(repo) else READY_TEXT
+            self._routine(repo, number, text % sha)
 
     @staticmethod
     def _fix_round_count(comments: List[Any], authors: set) -> int:
@@ -11406,6 +11426,48 @@ class Station:
         passed, streak = dated[day]
         return "Factory %s: %d/9 numbers pass; streak %d of 7." % (day, passed, streak)
 
+    def _digest_merge_line(self, since: float) -> str:
+        """How many lane pull requests (head loom/...) merged since `since`,
+        by actor: the factory (this station's own login), the brain (another
+        App login among the trusted authors) or other (a person or an outside
+        session). One GraphQL read a repo. 2026-11-01: 30 of 36 lane merges
+        in a day were by outside sessions while the Ready line said the
+        factory lands them, and nothing measured it (loom#2432). The own
+        login is the App's or LOOM_GITHUB_LOGIN; a station on a personal token
+        sets neither, and its merges count as other."""
+        own = _bare_login(self.gh.app_login() or os.environ.get("LOOM_GITHUB_LOGIN", ""))
+        bots = {_bare_login(a) for a in self.s.authors if a.lower().endswith("[bot]")} - {own}
+        counts = {"factory": 0, "brain": 0, "other": 0}
+        unread = []
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            owner, name = repo.split("/")
+            try:
+                data = self.gh.graphql(MERGED_PULLS_QUERY, {"owner": owner, "name": name})
+            except RateLimited:
+                raise
+            except GitHubError:
+                unread.append(repo)
+                continue
+            nodes = ((((data or {}).get("repository") or {}).get("pullRequests") or {})
+                     .get("nodes") or [])
+            for node in nodes if isinstance(nodes, list) else []:
+                if not isinstance(node, dict) or not str(node.get("headRefName") or "").startswith("loom/"):
+                    continue
+                merged = self._epoch(str(node.get("mergedAt") or ""))
+                if merged is None or merged < since:
+                    continue
+                login = _bare_login(str((node.get("mergedBy") or {}).get("login") or ""))
+                counts["factory" if login and login == own
+                       else "brain" if login in bots else "other"] += 1
+        line = ("Lane pull requests merged since the last digest: %d (factory %d, brain %d, "
+                "other %d)." % (sum(counts.values()), counts["factory"], counts["brain"],
+                                counts["other"]))
+        if unread:
+            line += " Not read: %s." % ", ".join(unread)
+        return line
+
     def _digest_shadow_lines(self, since: float) -> List[str]:
         """What shadow mode held since the last digest (bus/shadow.py): at
         most two lines, the counts and the command that lists each with its
@@ -11484,6 +11546,7 @@ class Station:
         factory_line = self._digest_factory_line()
         if factory_line:
             lines.append(factory_line)
+        lines.append(self._digest_merge_line(start))
         lines += self._digest_shadow_lines(start)
         lines += scorecard.Scorecard(self.state, self.now).demotion_lines().values()
         if not self._digest_send("\n".join(lines)):
