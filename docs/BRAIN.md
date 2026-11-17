@@ -1704,6 +1704,23 @@ skipped (loom#1831). The station keeps when each such ticket first waited
 (`no_lane_since` in `state/station/ticket-waits.json`, kept across its
 no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 
+- After `LOOM_PIN_FALLBACK_MINUTES` minutes (default 30; `0` turns it off) a
+  queued ticket pinned to a model no free lane takes is given the first free
+  lane of its difficulty tier (or of its FALLBACK tiers when none of its tier
+  is up), for its repo, with that lane's own model: the factory takes its
+  `Model:` line off, so the pull request footer names the model that ran
+  (loom#3151). Its pinned model is still tried first on every pass. It never
+  takes a lane it already ran on, and falls back at most twice
+  (`PIN_FALLBACK_MAX`): a fallback run that fails climbs the ladder as any
+  failure does. The status comment says `Not a failure` with a
+  `loom:pin-fallback <model>` marker, and the station log says `pin fallback
+  from model <model> after N minutes`. Hard pins wait instead: a ticket a
+  person opened (the operator wrote its `Model:` line), and one carrying
+  `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
+  lifted and no credit spent: the fallback routes around both. On
+  2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
+  or anthropic model with no lane up, while about 30 lanes of their tiers sat
+  idle.
 - After `LOOM_NO_LANE_REROUTE` hours (default 6, at most 24) a ticket pinned
   to a model moves to the first rung of the model ladder the climb rules allow
   (never down from a strong model) that has a free lane in its difficulty

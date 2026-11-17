@@ -17,6 +17,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
+  (Before a brief is written, the factory may take a default pin off a
+  queued ticket whose model had no free lane for `LOOM_PIN_FALLBACK_MINUTES`;
+  docs/BRIEF_FORMAT.md says which pins are hard.)
   Account-wide out-of-credit limits still hold the lane. The heartbeat names
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory

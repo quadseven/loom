@@ -142,6 +142,12 @@ Neither needs a model:
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
   its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A queued ticket pinned to a model no free lane takes, waiting for it
+  past LOOM_PIN_FALLBACK_MINUTES (default 30), takes a free lane of its tier
+  with that lane's own model and loses its Model: line (_pin_fallback,
+  loom#3151), unless the pin is hard (hard_pin: a person opened the ticket,
+  or it carries class:sensitive or tier:security). It never takes a lane it
+  ran on, and falls back at most PIN_FALLBACK_MAX times.
 - A ticket waiting with no lane that takes it (NO_LANE_RE) for
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
   climb rules allow with a free lane in its tier; with none, by
@@ -244,6 +250,55 @@ def no_lane_reroute(env: Optional[Dict[str, str]] = None) -> float:
     if not 0 < hours < float("inf"):
         return float(NO_LANE_REROUTE)
     return min(hours * 3600, float(NO_LANE_HANDOFF))
+
+
+# A queued ticket pinned to a model with no free lane takes a free lane of its
+# tier, with that lane's own model, after this long (loom#3151). On 2026-11-17
+# one pass assigned 0 of 86 queued tickets, every one pinned to a codex or
+# anthropic model with no lane up (codex demoted, anthropic out of credit),
+# while about 30 lanes of their tiers sat idle. LOOM_PIN_FALLBACK_MINUTES sets
+# the minutes (pin_fallback_after); 0 turns the fallback off.
+PIN_FALLBACK_WAIT = 30 * 60
+# A ticket falls back at most this many times: a fallback run that fails
+# climbs the ladder and pins the ticket again, and without a bound it would
+# cycle across every free lane.
+PIN_FALLBACK_MAX = 2
+PIN_FALLBACK_MARKER = "<!-- loom:pin-fallback %s -->"
+PIN_FALLBACK_RE = re.compile(r"<!-- loom:pin-fallback \S+ -->")
+# Labels whose ticket keeps its Model: line however long it waits: its change
+# needs the reviewer-grade model it was pinned to (bus/merge_tier.py).
+HARD_PIN_LABELS = ("class:sensitive", "tier:security")
+
+
+def pin_fallback_after(env: Optional[Dict[str, str]] = None) -> Optional[float]:
+    """Seconds a queued pinned ticket waits for its model before it takes a
+    free lane of its tier: the minutes in LOOM_PIN_FALLBACK_MINUTES, None
+    when that is 0 (off), else PIN_FALLBACK_WAIT."""
+    raw = str((os.environ if env is None else env).get("LOOM_PIN_FALLBACK_MINUTES", "")).strip()
+    try:
+        minutes = float(raw)
+    except ValueError:
+        return float(PIN_FALLBACK_WAIT)
+    if minutes == 0:
+        return None
+    if not 0 < minutes < float("inf"):
+        return float(PIN_FALLBACK_WAIT)
+    return minutes * 60
+
+
+def hard_pin(issue: Dict[str, Any]) -> str:
+    """Why a ticket's Model: line binds however long it waits, or "": a
+    person opened the ticket (the operator wrote the pin), or it carries a
+    HARD_PIN_LABELS label. A pin a brain's App or the ladder wrote is a
+    default the factory may route around."""
+    found = [x for x in HARD_PIN_LABELS if x in _labels(issue)]
+    if found:
+        return "it carries %s" % found[0]
+    user = issue.get("user") or {}
+    login = str(user.get("login") or "")
+    if login and user.get("type") != "Bot" and not login.endswith("[bot]"):
+        return "a person opened it"
+    return ""
 
 
 def no_lane(reason: str) -> bool:
@@ -1948,6 +2003,9 @@ class Factory:
         # reroute_after it is rerouted, past NO_LANE_HANDOFF handed off.
         self.no_lane_since = dict(no_lane_since or {})
         self.reroute_after = no_lane_reroute() if reroute_after is None else reroute_after
+        # How long a queued pinned ticket waits for its model before a free
+        # lane of its tier takes it (pin_fallback_after); None never.
+        self.pin_fallback = pin_fallback_after()
         # The tickets whose no-lane wait ended this pass: a lane took them,
         # they were rerouted, or they went to the hand-off pool. The station
         # clears their no_lane_since.
@@ -5546,6 +5604,9 @@ class Factory:
             # tickets before the lane's other work.
             lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
+            fell = self._pin_fallback(repo, issue, model)
+            if fell is not None:
+                return fell
             why = "%s waits: no free lane takes model %s" % (ref, model)
             reason = "no free lane takes model %s" % (
                 model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
@@ -5556,6 +5617,62 @@ class Factory:
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
             _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))
             return "%s: giving it lane %s failed" % (ref, lane)
+        return ""
+
+    def _fallback_lane(self, repo: str, issue: Dict[str, Any],
+                       skip: Sequence[str] = ()) -> Tuple[Optional[str], str]:
+        """(lane, fallback) for a pin fallback: the first free local lane of
+        the ticket's tier not in `skip`; when no lane of the tier is up, the
+        first free one of its FALLBACK tiers, with fallback saying so."""
+        private = self._is_private(repo)
+        difficulty = difficulty_of(issue)
+        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip]
+        lane = next((x for x in own if self._free(x)), None)
+        if lane is not None or any(self._takes_work(x) for x in own):
+            return lane, ""
+        for tier in FALLBACK.get(difficulty, ()):
+            lane = next((x for x in lanes_of(tier, private)
+                         if x not in REMOTE_LANES and x not in skip and self._free(x)), None)
+            if lane is not None:
+                return lane, "fallback: no %s lane is up" % difficulty
+        return None, ""
+
+    def _pin_fallback(self, repo: str, issue: Dict[str, Any], model: str) -> Optional[str]:
+        """Brief a queued ticket whose pinned `model` has had no free lane for
+        pin_fallback seconds (the station's no_lane_since clock) on a free
+        lane of its tier, with that lane's own model: its Model: line is
+        removed, so the runner's footer names the model that ran. None when
+        it keeps waiting for its model: inside the wait, a hard pin
+        (hard_pin), PIN_FALLBACK_MAX fallbacks already, or no free lane it has
+        not run on. Else "" when it got the lane, or why giving it failed."""
+        key = "%s#%s" % (repo, issue["number"])
+        waited = self.now - self.no_lane_since.get(key, self.now)
+        if self.pin_fallback is None or waited < self.pin_fallback or hard_pin(issue):
+            return None
+        if self._fallback_lane(repo, issue)[0] is None:
+            return None  # nothing to move to: no comment read, every pass
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        if sum(bool(PIN_FALLBACK_RE.search(str(c.get("body") or "")))
+               for c in comments) >= PIN_FALLBACK_MAX:
+            return None
+        ran = {m.group(1) for c in comments for m in [CLAIMED_RE.match(str(c.get("body") or ""))] if m}
+        lane, fallback = self._fallback_lane(repo, issue, sorted(ran))
+        if lane is None:
+            return None
+        minutes = waited / 60
+        tier = "%s, pin fallback from model %s after %.0f minutes%s" % (
+            difficulty_of(issue), model, minutes, ", " + fallback if fallback else "")
+        body = without_model(str(issue.get("body") or ""))
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        issue["body"] = body
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            return "%s: giving it lane %s failed" % (key, lane)
+        self._status_note(repo, number,
+                          "%s\nNot a failure (no free lane took model %s for %.0f minutes): the "
+                          "factory gave this ticket lane %s with that lane's own model, and took "
+                          "its Model: line off, so the pull request footer names the model that "
+                          "ran." % (PIN_FALLBACK_MARKER % model, model, minutes, lane))
         return ""
 
     def _assign_equivalent(self, repo: str, issue: Dict[str, Any], pinned: str,
