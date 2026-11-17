@@ -8541,6 +8541,50 @@ class DiskGuardTest(Base):
                                                     "LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 20)
 
 
+class DiskWatchdogTest(Base):
+    """Below LOOM_DISK_WATCHDOG_GB the pass clears Loom's own data before the
+    claim floor (loom#3187), and the lane status says when it cannot."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
+        self.settings.disk_watch = station.disk_watchdog.Config()
+        self.log = os.path.join(self.home, "logs", "codex", "old.log")
+        self.write(self.log, "x" * 4096)
+        old = time.time() - 30 * 86400
+        os.utime(self.log, (old, old))
+
+    def tend(self, free):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        usage = mock.Mock(free=free, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch.object(station.disk_watchdog.RealDisk, "largest", return_value=[]), \
+                mock.patch("bus.station._say") as say:
+            runner.tend_watchdog()
+        return runner, [c.args[0] for c in say.call_args_list]
+
+    def test_from_env_turns_it_on_with_no_setting(self):
+        self.assertEqual(station.Settings.from_env({}).disk_watch.trigger_gb, 25.0)
+        self.assertEqual(station.Settings.from_env(
+            {"LOOM_DISK_WATCHDOG_GB": "0"}).disk_watch.trigger_gb, 0)
+
+    def test_above_the_trigger_old_logs_stay(self):
+        self.tend(40 * 1024 ** 3)
+        self.assertTrue(os.path.exists(self.log))
+
+    def test_below_the_trigger_old_logs_are_compressed(self):
+        runner, said = self.tend(20 * 1024 ** 3)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertTrue(os.path.exists(self.log + ".gz"))
+        self.assertTrue(any(s.startswith("disk watchdog: logs older than 7 days") for s in said),
+                        said)
+        self.assertNotIn("Disk watchdog:", runner._lanes_body([]))
+
+    def test_the_lane_status_says_when_the_floor_is_out_of_reach(self):
+        runner, _ = self.tend(5 * 1024 ** 3)
+        self.assertIn("Disk watchdog: Loom's own data is cleared", runner._lanes_body([]))
+
+
 class RewriteScratchTest(Base):
     """A rewrite killed past its EXIT trap leaves run/rewrite.* behind; the
     disk sweep removes it once stale and unowned (loom#2966)."""

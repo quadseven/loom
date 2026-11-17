@@ -37,6 +37,7 @@ from . import audit
 from . import bench
 from . import ci_gap
 from . import converge
+from . import disk_watchdog
 from . import brain_memory
 from . import brain_hold
 from . import claimed
@@ -188,6 +189,7 @@ LOG_ROTATE_KEEP = 5
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
 DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
+DISK_WATCH_FILE = "disk-watchdog.json"
 FIX_OVERLAP_FILE = "fix-overlap-holds.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
@@ -1175,8 +1177,13 @@ class Settings:
                  decision_window_days: int = 3,
                  repo_pr_caps: Optional[Dict[str, int]] = None,
                  fabric_review_notes: str = "",
-                 review_sweep: Optional[review_sweep_mod.Config] = None) -> None:
+                 review_sweep: Optional[review_sweep_mod.Config] = None,
+                 disk_watch: Optional[disk_watchdog.Config] = None) -> None:
         self.home = home
+        # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
+        # loom#3187): off for a Settings built in code; from_env turns it on
+        # at 25 GB.
+        self.disk_watch = disk_watch or disk_watchdog.Config(trigger_gb=0)
         # The review sweep (bus/review_sweep.py); off unless LOOM_REVIEW_SWEEP=on.
         self.review_sweep = review_sweep or review_sweep_mod.Config()
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
@@ -1373,6 +1380,7 @@ class Settings:
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
                    review_sweep=review_sweep_mod.Config.from_env(env),
+                   disk_watch=disk_watchdog.Config.from_env(env),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -10389,11 +10397,11 @@ class Station:
     def _lanes_body(self, rows: List[Tuple[str, str, str]],
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
-        disk = self._disk_status_line()
+        disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
-            + ([disk, ""] if disk else [])
+            + (disk + [""] if disk else [])
             + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
@@ -10496,6 +10504,7 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
+        values["disk watchdog"] = self._watchdog_notice() or ""
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -16895,6 +16904,47 @@ class Station:
             return "Claims paused: the loom home's disk is low on free space"
         return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
 
+    def tend_watchdog(self) -> None:
+        """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
+        the claim floor is reached (bus/disk_watchdog.py, loom#3187): old
+        lane logs, finished run scratch, old lane trees (archived), then idle
+        lanes' tool caches. Nothing a waiting or running brief names, and no
+        busy lane's folder, is touched; an inbox that cannot be read stops it."""
+        if self.s.disk_watch.trigger_gb <= 0:
+            return
+        live: Set[str] = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's inbox, so the disk watchdog waits: %s" % (lane, err))
+                return
+        run = os.path.join(self.s.home, "run")
+        trees = (os.path.join(self.s.home, "worktrees"),) + (
+            (self.s.agy_workdir,) if self.s.agy_workdir else ())
+        roots = disk_watchdog.Roots(home=self.s.home, trees=trees, lanes=tuple(LANES),
+                                    live=frozenset(live),
+                                    idle=frozenset(s for s in LANES if self._lane_idle(run, s)))
+        path = os.path.join(self.state, DISK_WATCH_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        out = disk_watchdog.tend(self.s.disk_watch, roots, disk_watchdog.RealDisk(),
+                                 self.s.disk_free_min_gb * GB, self.now, _say, saved)
+        if out != saved:
+            _write_json(path, out)
+        if out.get("at") == self.now:
+            # Read the free space again for the claim floor and the size line.
+            self._free_read = False
+
+    def _watchdog_notice(self) -> Optional[str]:
+        """The disk watchdog's lane status line while Loom's own data is
+        cleared and the disk is still under the floor, else None."""
+        saved = _read_json(os.path.join(self.state, DISK_WATCH_FILE), {}, strict=False)
+        notice = saved.get("notice") if isinstance(saved, dict) else None
+        return notice if isinstance(notice, str) and notice else None
+
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
         DISK_EVERY seconds the service logs rotate, the lane logs past
@@ -17647,7 +17697,7 @@ class Station:
         """Local housekeeping that needs no GitHub request: finished lane
         trees, old lane logs, the disk, the usage snapshot and the command
         chain snapshot."""
-        for local in (self.prune_trees, self.tend_disk):
+        for local in (self.prune_trees, self.tend_watchdog, self.tend_disk):
             try:
                 local()
             except OSError as err:

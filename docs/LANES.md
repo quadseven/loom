@@ -1354,6 +1354,25 @@ The loom home is kept bounded by the station and the runner (loom#643).
   when the state changes, `claims resumed: ...` once when the disk has that
   much free again, and the lane status shows a `Claims paused` line
   meanwhile. The state is kept in `state/station/disk-guard.json`.
+- Before that floor, the disk watchdog (`bus/disk_watchdog.py`, loom#3187)
+  acts. Once the disk has less than `LOOM_DISK_WATCHDOG_GB` free (default 25;
+  0 turns it off), at most every 5 minutes, it clears Loom's own data in this
+  order and stops as soon as the disk is back above that: lane logs and
+  rotated service logs unchanged for 7 days (moved to
+  `LOOM_DISK_ARCHIVE_DIR` when that folder is mounted, else compressed in
+  place); idle lanes' run scratch (`-check`, `-check-default`, `-tmp`,
+  `-intent.*`, `-gh.*`) unchanged for `LOOM_DISK_RUN_DAYS` (default 2);
+  lane trees unchanged for 2 days, archived to the archive folder or to
+  `archive/trees/` in the home and removed only once the archive reads back
+  whole (local tree archives go after 14 days); then idle lanes' tool caches
+  (`.cache`, `.cargo`, `.npm`, `tmp`, `Library/Caches` and the like). It never
+  touches a brief that is waiting or running, a busy lane's folders, a link,
+  or any path outside `logs/`, `run/`, `archive/` and the lane tree folders.
+  Each step says `disk watchdog: ...` with what it freed. When the disk is
+  still under the floor it logs the largest folders beside the home once an
+  hour, and the lane status shows a `Disk watchdog:` line until the disk is
+  above the floor. The state is kept in `state/station/disk-watchdog.json`.
+  The station runs it, so it runs where the station runs (the Mac lane host).
 - When a run ends the runner drops the build output git ignores from its
   tree and its default-branch check copy: `.venv`, `node_modules`,
   `__pycache__` and `.pytest_cache` folders that `git check-ignore`
