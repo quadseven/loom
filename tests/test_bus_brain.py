@@ -7055,6 +7055,28 @@ class MoveOutsideEpicTests(unittest.TestCase):
         self.assertEqual(fake.subs[next_epic], [115])
         self.assertEqual(fake.issues[115]["body"], "## Why\nwhy\n\nPart of #%d\n" % next_epic)
 
+    def test_closed_tickets_do_not_put_an_open_epic_over_capacity(self):
+        # loom#1925: two intake epics held 35 and 39 tickets but only 5 and
+        # 8 open ones. Counted with their closed tickets both read as over
+        # the cap, while room counts open tickets only, so each pass moved
+        # the "excess" open tickets of one into the other and back again.
+        fake = self.repo()
+        for number in (1462, 1875):
+            url = "https://api.github.com/repos/%s/issues/%d" % (REPO, number)
+            held = [item(number * 10 + i, body="## Why\nwhy\n\nPart of #%d\n" % number,
+                         labels=("loom:ticket",), parent_issue_url=url,
+                         state="closed" if i < 12 else "open",
+                         created_at="2030-01-%02dT00:00:00Z" % (i + 1))
+                    for i in range(brain.EPIC_TICKET_CAP + 5)]
+            fake.issues[number] = dict(item(number, body="Part of #1\n", labels=("epic",)),
+                                       title=brain.INTAKE_TITLE)
+            fake.subs[1].append(number)
+            fake.subs[number] = [t["number"] for t in held]
+            for t in held:
+                fake.issues[t["number"]] = t
+        self.assertEqual(self.move(fake), (0, 0))
+        self.assertEqual(fake.writes(), [])
+
     def test_an_open_epic_over_capacity_moves_excess_tickets_into_existing_intake_epic(self):
         url = "https://api.github.com/repos/%s/issues/1883" % REPO
         tickets_1883 = [
