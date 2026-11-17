@@ -825,7 +825,12 @@ At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
 line and a link; a count of the goal homes where nothing moved; one line
 per backlog goal home (labelled `loom:backlog`), counted from its tickets,
-since a backlog goal posts no report on GitHub; and the
+since a backlog goal posts no report on GitHub; one line counting the lane
+pull requests (head `loom/...`) merged since the last digest by actor:
+factory (the station's own App login, or `LOOM_GITHUB_LOGIN`), brain
+(another App login in `LOOM_BRIEF_AUTHORS`) and other (a person or an
+outside session), read by GraphQL newest update first until the window ends
+(at most 10 pages a repo; a repo whose read fails is named); and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting

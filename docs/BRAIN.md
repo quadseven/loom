@@ -1379,7 +1379,10 @@ itself, a lane stop (a limit, an expired key, a moved branch), a fix round's
 push to its pull request, a lane's first pull request (`Lane <lane> opened a
 pull request: <url>`; the pull request's `Refs #N` already cross-references the
 ticket and `loom:pr` is set, loom#1390), a ready mark (`Ready: checks and
-review passed on head <sha>`; loom#1244), and a build run's no-change answer
+review passed on head <sha>`; loom#1244; it ends "the factory lands it in its
+turn", or in a repo shadow mode holds "shadow mode holds this repo, so the
+merge is recorded for the brain, not landed", since there the factory only
+records a would-merge, loom#2432), and a build run's no-change answer
 with where it left the ticket (Claim and outcome). A new comment emails the
 operator; an edit does not (loom#866: zippie#264 carried 77 bot comments).
 Outcomes (a failure, merged, shipped, verified, an ask, a runaway hold) and

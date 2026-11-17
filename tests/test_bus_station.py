@@ -509,6 +509,14 @@ class FakeGitHub:
             return reply(200, {"data": {"node": {"replies": page}}})
         if "PullRequestReviewThread" in query:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
+        if "mergedBy" in query:
+            # The digest's lane merge count (loom#2432).
+            pages = getattr(self, "merged_pages", None) or [getattr(self, "merged_pulls", [])]
+            index = int(variables.get("after") or 0)
+            return reply(200, {"data": {"repository": {"pullRequests": {
+                "nodes": pages[index],
+                "pageInfo": {"hasNextPage": index + 1 < len(pages),
+                             "endCursor": str(index + 1)}}}}})
         editor = self.editors[data["variables"]["number"]]
         # GitHub's GraphQL names an App by its slug, typed Bot, without "[bot]".
         actor = ({"__typename": "Bot", "login": editor[:-len("[bot]")]}
@@ -3904,6 +3912,21 @@ class HandBackTest(unittest.TestCase):
         # event in the status comment, which says what it means (2026-10-20).
         self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_the_ready_line_says_the_factory_lands_it(self):
+        # loom#2432: the Ready line names the path that lands the pull request.
+        self.run_hand_back()
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
+        self.assertIn("the factory lands it", self.ready_events()[0])
+
+    def test_in_a_shadow_repo_the_ready_line_says_it_is_recorded_not_landed(self):
+        # loom#2432: in shadow the factory only records a would-merge, so the
+        # line must not promise a landing.
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": REPO}):
+            self.run_hand_back()
+        self.assertEqual(self.ready_events(), [station.READY_SHADOW_TEXT % ("a" * 40)])
+        self.assertIn("recorded for the brain, not landed", self.ready_events()[0])
+        self.assertTrue(station.READY_RE.match(self.ready_events()[0]))
 
     def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
         self.gh.issue["labels"].append({"name": "loom:running"})
@@ -10781,6 +10804,52 @@ class ReportDigestTest(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
+
+    def test_the_digest_counts_lane_merges_by_actor(self):
+        # loom#2432: most lane merges were by outside sessions while the
+        # Ready line said the factory lands them; the digest now counts them.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base + 9.5 * 3600))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 3 * 86400))
+        self.fake.merged_pulls = [
+            {"headRefName": "loom/1-a", "mergedAt": stamp, "mergedBy": {"login": "loom-station"}},
+            {"headRefName": "loom/2-b", "mergedAt": stamp, "mergedBy": {"login": "loom-station"}},
+            {"headRefName": "loom/3-c", "mergedAt": stamp, "mergedBy": {"login": "loom-brain"}},
+            {"headRefName": "loom/4-d", "mergedAt": stamp, "mergedBy": {"login": "someone-else"}},
+            # Not a lane branch, and a merge before the window: neither counts.
+            {"headRefName": "feature/x", "mergedAt": stamp, "mergedBy": {"login": "loom-brain"}},
+            {"headRefName": "loom/5-e", "mergedAt": old, "mergedBy": {"login": "loom-brain"}}]
+        self.settings.authors = list(AUTHORS) + ["loom-brain[bot]", "loom-station[bot]"]
+        with mock.patch.dict(os.environ, {"LOOM_GITHUB_LOGIN": "loom-station[bot]"}):
+            self.at(10, 1)
+        self.assertIn("Lane pull requests merged since the last digest: 4 "
+                      "(factory 2, brain 1, other 1).", self.sent[0]["content"])
+
+    def test_the_merge_count_pages_until_the_window_ends(self):
+        # Elder review of the PR for loom#2432: a repo with over 100 merged
+        # pull requests hid lane merges past the first page.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base + 9.5 * 3600))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 3 * 86400))
+        fresh = {"headRefName": "loom/1-a", "mergedAt": stamp, "updatedAt": stamp,
+                 "mergedBy": {"login": "someone-else"}}
+        stale = {"headRefName": "loom/9-z", "mergedAt": old, "updatedAt": old,
+                 "mergedBy": {"login": "someone-else"}}
+        # Three pages: two in the window, then one past it; a fourth page
+        # would never be read.
+        self.fake.merged_pages = [[fresh, fresh], [fresh, stale], [fresh], [fresh]]
+        self.at(10, 1)
+        self.assertIn("Lane pull requests merged since the last digest: 3 "
+                      "(factory 0, brain 0, other 3).", self.sent[0]["content"])
+
+    def test_a_merger_is_factory_brain_or_other(self):
+        bots = {"loom-brain"}
+        self.assertEqual(station.merge_actor("loom-station[bot]", "loom-station", bots), "factory")
+        self.assertEqual(station.merge_actor("Loom-Brain", "loom-station", bots), "brain")
+        self.assertEqual(station.merge_actor("a-person", "loom-station", bots), "other")
+        self.assertEqual(station.merge_actor("", "", bots), "other")
 
     def test_a_backlog_goal_is_one_digest_line_from_its_tickets(self):
         # 2026-10-25: a per-repo backlog goal posts no report on GitHub; its
