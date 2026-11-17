@@ -6066,7 +6066,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found)
+        return self._apply_brief_hold(repo, number, found, body)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6089,7 +6089,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
+                          body: str = "") -> bool:
         """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
@@ -6127,7 +6128,7 @@ class Station:
                     "slices so each slice queues only when the one before it "
                     "has merged."))
             else:
-                brain.human(self.gh, repo, number, brief_check.ask(found))
+                brain.human(self.gh, repo, number, brief_check.ask(found, body))
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
