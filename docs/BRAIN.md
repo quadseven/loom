@@ -1516,6 +1516,14 @@ decision, not an accident. A routine event is not a kind: it is an event in the
 ticket's status comment (`status.add`; the station's `_routine`, the factory's
 `_status_note`).
 
+A body must show a reader something. `notify.post` raises `notify.EmptyComment`
+and sends nothing when only HTML comments, empty `<details>`/`<summary>` tags
+or whitespace remain (#3200: a marker-only remote-claim comment rendered
+empty and still emailed the operator). The REST client (`GitHub.rest`) checks
+the same for every new issue, review-thread and reply comment, and the lane
+runner's answer check refuses such an answer. A record Loom reads back puts its
+marker on the first line and a plain sentence after it.
+
 To post a new comment: call `notify.post(gh, repo, number, body, notify.KIND)`.
 To add a kind: first ask whether it is a routine event (then it is a status
 event, not a kind); if it is an outcome a person reads or a record Loom reads

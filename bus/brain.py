@@ -25,7 +25,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
                      strip_body as strip_status_body)
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
-from . import tick_clock
+from . import lane_markers, tick_clock
 from . import home_repo
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -853,8 +853,7 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
-        remote_claim = re.fullmatch(r"<!-- loom:remote-claim v1 [^ ]+ ([0-9]+) [0-9.]+(?: [0-9.]+)? -->",
-                                    body.strip())
+        remote_claim = lane_markers.claim_match(body)
         login = tickets._login(comment.get("user")).lower()
         if login in claim_authors and (_CLAIM.fullmatch(body.strip()) or remote_claim):
             last_claim = i
@@ -6270,6 +6269,7 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
 
 def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
                     body: str, resolve: bool = False) -> None:
+    notify.check_visible(body, "a review reply on %s#%d" % (repo, number))
     _check_written_text(body)
     _check_decision_claim(gh, repo, number, body)
     gh.rest("POST", "/repos/%s/pulls/%d/comments/%d/replies" % (repo, number, comment_id), {"body": body})

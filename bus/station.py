@@ -48,6 +48,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import lane_markers
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -3364,12 +3365,11 @@ class Station:
         if not issues:
             return None
         latest = None
-        pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
         # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
         for comment in brain.trusted_comments(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
                 self.s.authors):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip())
+            match = lane_markers.heartbeat_match(comment.get("body"))
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -5213,6 +5213,10 @@ class Station:
         # (one pulls/comments post per finding), so the factory's fix rounds
         # and rebuttal reads meet them exactly like the review bot's threads.
         for finding in [f for f in blocking if "file" in f and "line" in f]:
+            if not notify.visible_text(finding.get("finding")):
+                _say("a Luna finding on %s#%d has no visible text; no review thread "
+                     "posted for it" % (repo, pr_number))
+                continue
             try:
                 self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
                     "commit_id": sha, "path": finding["file"],
@@ -6066,7 +6070,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found)
+        return self._apply_brief_hold(repo, number, found, body)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6089,7 +6093,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
+                          body: str = "") -> bool:
         """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
@@ -6127,7 +6132,7 @@ class Station:
                     "slices so each slice queues only when the one before it "
                     "has merged."))
             else:
-                brain.human(self.gh, repo, number, brief_check.ask(found))
+                brain.human(self.gh, repo, number, brief_check.ask(found, body))
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
@@ -7498,11 +7503,54 @@ class Station:
             return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            if self._ship_fallback(repo, number, note):
+                self._deployed_seen(key, False)
+                _say("shipped %s#%d (fallback): %s carries #%d" % (
+                    repo, number, what, int(pr["number"])))
+                return True
             self._deployed_seen(key, True)
             return False
         self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _ship_fallback(self, repo: str, number: int, note: str) -> bool:
+        """Retry a failed shipped move after checking the issue is still merged.
+
+        GitHub can reject the first label replacement while a deployed ticket
+        remains at loom:merged. Re-read its state before retrying the label
+        update, so a concurrent move or close is never overwritten.
+        """
+        try:
+            from . import labels as label_defs
+            wanted = label_defs.LABELS["loom:shipped"]
+            self.gh.rest("POST", "/repos/%s/labels" % repo,
+                         {"name": "loom:shipped", "color": wanted["color"],
+                          "description": wanted["description"]}, ok=(422,))
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+            if issue.get("state") != "open":
+                return False
+            names = _label_names(issue)
+            if "loom:verified" in names:
+                return False
+            if "loom:shipped" in names and "loom:merged" not in names:
+                return True
+            if "loom:merged" not in names:
+                return False
+            kept = brain._moved_labels(names, "shipped", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            notify.post(self.gh, repo, number, note, notify.SHIPPED)
+            return True
+        except RateLimited:
+            raise
+        except ShadowHeld as err:
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            return False
+        except (GitHubError, ValueError) as err:
+            _say("ship retry could not move %s#%d: %s" % (repo, number, err))
+            return False
 
     def _deployed_seen(self, key: str, seen: bool) -> None:
         """Keep when a ship rule first found the ticket deployed

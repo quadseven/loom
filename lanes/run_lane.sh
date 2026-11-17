@@ -1026,13 +1026,14 @@ checked_text() {
   PYTHONPATH="$REPO_ROOT" python3 - "$1" <<'PY'
 import sys
 from pathlib import Path
-from bus import text
+from bus import notify, text
 path = Path(sys.argv[1])
 try:
     data = path.read_bytes()
     if len(data) > 32768: raise ValueError("answer is too large")
     value = data.decode("utf-8")
     if not value.strip(): raise ValueError("answer is empty")
+    if not notify.visible_text(value): raise ValueError("answer has no visible text")
     if not value.isascii(): raise ValueError("answer is not ASCII")
     text.check(value)
 except Exception as exc:

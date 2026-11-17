@@ -1746,6 +1746,21 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertIn("no answer written", log)
 
+    def test_answer_deliverable_refuses_an_answer_with_no_visible_text(self):
+        # A marker-only comment renders empty and still emails the operator.
+        for answer in ("<!-- loom:answer-marker -->", "<details><summary></summary></details>"):
+            with self.subTest(answer=answer):
+                self.drop_brief(text=BRIEF.replace("Difficulty: medium",
+                                                   "Difficulty: medium\nDeliverable: answer"))
+                result = self.run_lane(FAKE_AGENT="answer-file", FAKE_ANSWER_TEXT=answer)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
+                self.assertIn("answer refused: answer has no visible text", log)
+                self.assertFalse(any(c.startswith("gh issue comment") for c in self.calls()))
+                failed = list((self.inbox / "failed").glob("*.md"))
+                self.assertTrue(failed)
+                failed[0].rename(self.inbox / failed[0].name)
+
     def test_no_deliverable_header_and_no_commit_still_fails(self):
         self.drop_brief()
         result = self.run_lane(FAKE_AGENT="noop")
