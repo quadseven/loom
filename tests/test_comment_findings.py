@@ -47,6 +47,13 @@ class OpenFindingsTests(unittest.TestCase):
                      "2030-01-01T13:00:00Z", 1)], AUTHORS)
         self.assertEqual([c["id"] for c in found], [1])
 
+    def test_a_marker_quoted_later_in_a_comment_is_not_a_finding(self):
+        # The marker form opens the comment. A trusted builder quoting the
+        # marker, say to explain the convention, raises no finding.
+        quoted = comment("example-brain", "To block, open a comment with "
+                         "`<!-- loom:finding v1 -->`.", "2030-01-01T13:00:00Z", 1)
+        self.assertEqual(comment_findings.open_findings([quoted], AUTHORS), [])
+
     def test_luna_verdicts_and_other_machine_markers_are_not_legacy_findings(self):
         verdict = comment("example-brain", "<!-- loom:luna-review v1 sha=%s -->\n"
                           "Blocking findings:\n- x" % SHA, "2030-01-01T13:00:00Z", 1)

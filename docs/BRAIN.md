@@ -1947,8 +1947,8 @@ block as `pull request comments unreadable`. Only the opener counts: no other
 comment text is read as a hold.
 A blocking comment blocks too (loom#2988, bus/comment_findings.py): a trusted
 login's plain pull request comment, by the API author and never by a name in
-its text (LOOM_BRIEF_AUTHORS), that is either a finding in the marker form
-`<!-- loom:finding v1 -->`, or the legacy form: a line opening with `Blocking`
+its text (LOOM_BRIEF_AUTHORS), that is either a finding that opens with the marker
+`<!-- loom:finding v1 -->` (a marker quoted later blocks nothing), or the legacy form: a line opening with `Blocking`
 (not `Blocking: none`) that names a commit by 7 or more hex characters. A
 comment carrying any other `<!-- loom:` marker is never a legacy finding, so a
 Luna verdict for an older head does not block a newer one. A finding stays open
