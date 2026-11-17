@@ -121,6 +121,9 @@ class BrainTickTest(unittest.TestCase):
         for shared in ("agent_cli.sh", "agent_sandbox.sh"):
             if (LANES / shared).exists():
                 shutil.copy(LANES / shared, self.root / "lanes" / shared)
+        for shared in ("github_process.sh", "gh", "git-app", "git-credential-app"):
+            shutil.copy(LANES / shared, self.root / "lanes" / shared)
+            (self.root / "lanes" / shared).chmod(0o755)
         (self.root / "docs").mkdir()
         (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\n")
         git("init", "-q", "-b", "main", cwd=self.root)
@@ -133,6 +136,9 @@ class BrainTickTest(unittest.TestCase):
         bin_dir.mkdir()
         self.log = self.tmp / "calls.log"
         self.profile = self.tmp / "profile.sb"
+        self.token_cmd = bin_dir / "app-token"
+        self.token_cmd.write_text("#!/usr/bin/env bash\n[ -n \"${FAKE_APP_TOKEN:-}\" ] || exit 2\nprintf '%s\\n' \"$FAKE_APP_TOKEN\"\n")
+        self.token_cmd.chmod(0o755)
         fakes = [("python3", FAKE_PYTHON), ("gh", FAKE_GH),
                  ("sandbox-exec", FAKE_SANDBOX.replace("@PROFILE@", shlex.quote(str(self.profile)))),
                  ("opencode", FAKE_OPENCODE.replace("@LOG@", shlex.quote(str(self.log))))]
@@ -147,6 +153,12 @@ class BrainTickTest(unittest.TestCase):
             "LOOM_HOME": str(self.home),
             "LOOM_REPOS": "example/project",
             "LOOM_STATUS_REPO": "example/loom",
+            "LOOM_GITHUB_APP_ID": "123",
+            "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+            "LOOM_GITHUB_APP_KEY_SSM": "/example/app-key",
+            "LOOM_APP_TOKEN_CMD": str(self.token_cmd),
+            "FAKE_APP_TOKEN": "ghs_brain.tok-en",
+            "FAKE_APP_LOGIN": "loom-brain[bot]",
             "FAKE_LOG": str(self.log),
             # No other brain's slot bounds these ticks; the slot tests below
             # set their own (loom#2469).
@@ -389,7 +401,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertEqual(0, run.returncode)
         self.assertIn("-m bus lock", calls[0])
         self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
-                         "--lock-repo example/loom --tick-minutes 40", calls[1])
+                         "--lock-repo example/loom --tick-minutes 40", calls[2])
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
@@ -653,8 +665,8 @@ class BrainTickTest(unittest.TestCase):
         self.assertTrue(opencode[0].startswith("opencode run -m spark/coder "), opencode)
         self.assertIn("%s/brain/loom/docs/MUSE.md" % self.home, opencode[0])
         # The token reaches the agent's environment, never its argv.
-        self.assertNotIn("gho_faketoken123", opencode[0])
-        self.assertIn("opencode env GH_TOKEN=gho_faketoken123 GITHUB_TOKEN=gho_faketoken123 "
+        self.assertNotIn("ghs_brain.tok-en", opencode[0])
+        self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
@@ -666,7 +678,7 @@ class BrainTickTest(unittest.TestCase):
         run, calls = self.tick(LOOM_SPARK_MODEL="spark/coder",
                                LOOM_SPARK_URL="http://spark.invalid:8000/v1",
                                LOOM_GITHUB_APP_ID="123", FAKE_APP_TOKEN="ghs_brain.tok-en",
-                               GITHUB_TOKEN="ghp_personal")
+                               GITHUB_TOKEN="")
         self.assertEqual(0, run.returncode)
         self.assertIn("opencode env GH_TOKEN=ghs_brain.tok-en GITHUB_TOKEN=ghs_brain.tok-en "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
@@ -686,12 +698,21 @@ class BrainTickTest(unittest.TestCase):
     def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
         self.usage("codex", True)
         run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
-                               GITHUB_TOKEN="ghp_personal")
+                               FAKE_APP_TOKEN="", GITHUB_TOKEN="")
         self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
-        self.assertTrue(any(" unlock " in c for c in calls), calls)
+        self.assertFalse(any(" -m bus lock " in c for c in calls), calls)
         last, ok = self.beat()
         self.assertEqual("failed", last["outcome"])
         self.assertFalse(ok)
+
+    def test_a_tick_rejects_an_ambient_github_token_before_any_github_call(self):
+        run, calls = self.tick(GH_TOKEN="ghp_personal")
+        self.assertNotEqual(0, run.returncode)
+        self.assertFalse(any(" -m bus lock " in call for call in calls), calls)
+        self.assertFalse(any(call.startswith(("claude ", "codex ", "opencode "))
+                             for call in calls), calls)
+        self.assertIn("ambient GH_TOKEN",
+                      (self.home / "logs" / "brain.log").read_text())
 
     def test_a_tick_longer_than_its_app_token_lasts_runs_no_rung(self):
         # An installation token lasts an hour; a 58-minute tick would outlive it.
@@ -718,7 +739,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
-        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
+        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=ghs_brain.tok-en", settings)
         # TLS inside the sandbox, which denies the keychain server.
         self.assertIn("opencode setting SSL_CERT_FILE=/etc/ssl/cert.pem", settings)
         self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
@@ -800,7 +821,11 @@ class BrainTickTest(unittest.TestCase):
         (real / "python3").symlink_to(sys.executable)
         ledger = self.tmp / "ledger.jsonl"
         env = {k: v for k, v in self.env.items() if not k.startswith("LOOM_SHADOW")}
-        env.update(PATH="%s:%s" % (real, self.env["PATH"]), LOOM_SHADOW_LEDGER=str(ledger))
+        config = self.tmp / "empty-gh-config"
+        config.mkdir()
+        env.update(PATH="%s:%s" % (real, self.env["PATH"]), LOOM_SHADOW_LEDGER=str(ledger),
+                   GH_TOKEN="ghs_brain.tok-en", GH_CONFIG_DIR=str(config),
+                   LOOM_REAL_GH=str(self.tmp / "bin" / "gh"))
 
         def gh(*args, **extra):
             run = subprocess.run([guard, *args], env={**env, **extra}, capture_output=True,

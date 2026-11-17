@@ -123,7 +123,14 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
         return 2
     gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
                 transport=transport or urllib_transport)
-    out.write(gh.app_token() + "\n")
+    gh.app_login()
+    token = gh.app_token()
+    if not token.startswith("ghs_") or any(
+            char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+            for char in token):
+        print("error: the GitHub App installation token is empty or malformed", file=sys.stderr)
+        return 2
+    out.write(token + "\n")
     return 0
 
 

@@ -102,7 +102,6 @@ LOCK_REPO="${LOOM_STATUS_REPO:-$(printf '%s' "$ORIGIN" | sed -E 's#^.*[:/]([^/]+
 mkdir -p "$WORK" "$(dirname "$LOG")"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
-
 say() { echo "[$(date -u +%FT%TZ)] brain: $*" >> "$LOG"; }
 
 # The station reads these to tell the operator when the brain stops ticking:
@@ -134,6 +133,14 @@ beat() {
     mv "$STATE/brain.json.tmp" "$STATE/brain.json"
   case "$1:${3:-}" in ok:*|skipped:) touch "$STATE/brain-ok" ;; esac
 }
+
+. "$REPO_ROOT/lanes/github_process.sh"
+if ! loom_github_start "$REPO_ROOT" "$LOOM_HOME/run" 2>> "$LOG"; then
+  say "tick refused: unsafe GitHub environment"
+  beat failed 1
+  exit 1
+fi
+trap 'loom_github_cleanup' EXIT
 
 # shellcheck source=lanes/agent_cli.sh
 . "$REPO_ROOT/lanes/agent_cli.sh"
@@ -238,10 +245,10 @@ shadow_guard() {
 spark_brain() {
   local token kv
   token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-  [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
-  [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
-  # An App installation token is ghs_ and a JWT-like body with dots and dashes.
-  case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  [[ "$token" =~ ^ghs_[A-Za-z0-9_.-]+$ ]] || {
+    echo "no valid GitHub App token for the spark brain" >&2
+    return 3
+  }
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   shadow_guard "$AGENT_HOME/bin" || { echo "could not put the shadow gh guard in place" >&2; return 3; }
@@ -249,7 +256,9 @@ spark_brain() {
   NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
   # The sandbox denies the keychain server, which TLS verification asks for
   # the system roots; a CA file lets HTTPS clients verify without it.
-  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"$'\n'"LOOM_GITHUB_TOKEN=$token"$'\n'"SSL_CERT_FILE=/etc/ssl/cert.pem"
+  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"$'\n'\
+"LOOM_GITHUB_TOKEN=$token"$'\n'"GH_CONFIG_DIR=$GH_CONFIG_DIR"$'\n'\
+"LOOM_REAL_GH=$LOOM_REAL_GH"$'\n'"SSL_CERT_FILE=/etc/ssl/cert.pem"
   for kv in "${BRAIN_SETTINGS[@]}"; do
     [ -n "${!kv:-}" ] || continue
     case "${!kv}" in *$'\n'*) continue ;; esac
@@ -282,8 +291,16 @@ if ! ladder_open; then
   exit 0
 fi
 
+# The App token is required before the lock or any other GitHub request. An
+# absent or failed mint ends the tick without calling GitHub as a person.
+[ "$MINUTES" -le 50 ] ||
+  { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
-
+if ! loom_github_mint "$REPO_ROOT" "${LOOM_NET_TIMEOUT:-120}"; then
+  say "tick failed: could not mint the brain's GitHub App token; nothing was posted"
+  beat failed 1
+  exit 1
+fi
 # The lock outlives the agent by 5 minutes (2 when bounded by another
 # brain's slot), so a tick cut off by the timeout still releases it below
 # before anyone else could take it.
@@ -315,37 +332,17 @@ done
 LOCKED_AT="$(date +%s)"
 [ "$TICK_MINUTES" -eq "$MINUTES" ] ||
   say "tick bounded to $TICK_MINUTES minutes: another brain's tick starts in $LOCK_MINUTES (LOOM_BRAIN_YIELD_AT $YIELD_AT)"
-trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
+trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1; loom_github_cleanup' EXIT
 # launchd stops a job with SIGTERM; exiting on it runs the EXIT trap.
 trap 'exit 143' TERM INT
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
-brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" --tick-minutes "$TICK_MINUTES" >> "$LOG" 2>&1 || say "could not record lock step"
-
-# With GitHub App settings (the Loom Brain App) the tick writes as that App,
-# never as the operator (loom#1142): every rung's gh and GitHub API calls get
-# the App's installation token, which lasts an hour, longer than a tick. A
-# personal token in the environment is dropped first, so a failed mint runs
-# no rung at all.
-if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
-  [ "$MINUTES" -le 50 ] ||
-    { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
-  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
-  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
-    beat failed 1
-    exit 1
-  fi
-  export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
-  unset app_token
-  # GET /user refuses an installation token, so the agent's journal is told
-  # the App's login; without it the journal fails, not the tick.
-  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
-    export LOOM_GITHUB_LOGIN="$app_login"
-  else
-    say "could not read the brain's GitHub App login; its journal may not post"
-  fi
+if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+  export LOOM_GITHUB_LOGIN="$app_login"
+else
+  say "could not read the brain's GitHub App login; its journal may not post"
 fi
+brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" --tick-minutes "$TICK_MINUTES" >> "$LOG" 2>&1 || say "could not record lock step"
 
 # A rung may have changed the checkout (a hook, a config, an edited
 # docs/MUSE.md the next tick would follow). Each tick starts from origin's
@@ -354,8 +351,9 @@ fi
 # those). A checkout that still is not clean is deleted and cloned again, so
 # nothing a run left there runs or steers the next tick.
 wgit() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WORK/loom" "$@"; }
+wgit_auth() { "$LOOM_GIT_AUTH" -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WORK/loom" "$@"; }
 if [ -d "$WORK/loom/.git" ]; then
-  if ! { wgit fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qffdx; } >> "$LOG" 2>&1 ||
+  if ! { wgit_auth fetch -q && wgit reset -q --hard '@{u}' && wgit clean -qffdx; } >> "$LOG" 2>&1 ||
      ! left="$(wgit status --porcelain --ignored 2>> "$LOG")" || [ -n "$left" ]; then
     say "$WORK/loom did not come clean; cloning it again"
     rm -rf "$WORK/loom"
@@ -363,7 +361,7 @@ if [ -d "$WORK/loom/.git" ]; then
 fi
 if [ ! -d "$WORK/loom/.git" ]; then
   rm -rf "$WORK/loom"
-  git clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
+  "$LOOM_GIT_AUTH" clone -q "$ORIGIN" "$WORK/loom" >> "$LOG" 2>&1 || { say "could not clone $ORIGIN"; beat failed 1; exit 1; }
 fi
 
 # The handoff packet (docs/decisions/0002, item 3): the last ticks, the open

@@ -25,7 +25,16 @@ DEPLOY_LOOKBACK=8
 STATE_DIR="${LOOM_HOME:-$HOME/loom}/state/station"
 say() { printf 'station: %s\n' "$*"; }
 g() { git -C "$REPO_ROOT" -c core.hooksPath=/dev/null "$@"; }
-
+. "$REPO_ROOT/lanes/github_process.sh"
+if ! loom_github_start "$REPO_ROOT" "${LOOM_HOME:-$HOME/loom}/run"; then
+  say "refusing station pass: unsafe GitHub environment" >&2
+  exit 1
+fi
+trap 'loom_github_cleanup' EXIT
+if ! loom_github_mint "$REPO_ROOT" "${LOOM_NET_TIMEOUT:-120}"; then
+  say "refusing station pass: could not mint a GitHub App token" >&2
+  exit 1
+fi
 api() {
   local path="$1"
   if [ -n "${LOOM_GITHUB_APP_ID:-}" ] &&
@@ -68,7 +77,7 @@ deploy() {
   if [ -n "$(g status --porcelain --untracked-files=no)" ]; then
     say "not deploying: the checkout has local changes"; return 0
   fi
-  timeout 60 git -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch -q origin "$BRANCH" 2>/dev/null ||
+  timeout 60 "$LOOM_GIT_AUTH" -C "$REPO_ROOT" -c core.hooksPath=/dev/null fetch -q origin "$BRANCH" 2>/dev/null ||
     { say "not deploying: fetch of $BRANCH failed"; return 0; }
   local head target slug verdict check_error check_state newest sha
   head="$(g rev-parse HEAD)"; target="$(g rev-parse FETCH_HEAD)"
@@ -118,4 +127,4 @@ if [ -n "${LOOM_PIN_TARGETS:-}" ] && [ "${LOOM_DEPLOY:-1}" != 0 ] &&
   LOOM_SELF_REPO="${LOOM_SELF_REPO:-$(g remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')}" \
     python3 -m bus.pin || say "pin pass failed; will retry on the next station pass"
 fi
-cd "$REPO_ROOT" && exec python3 -m bus station
+cd "$REPO_ROOT" && python3 -m bus station

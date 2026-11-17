@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -u
+
+if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_.-]+$ ]]; then
+  echo "git refused: no valid process GitHub App token" >&2
+  exit 2
+fi
+unset GIT_ASKPASS SSH_ASKPASS
+export GIT_TERMINAL_PROMPT=0
+exec git -c credential.helper= \
+  -c "credential.helper=!${LOOM_GIT_CREDENTIAL_HELPER_ESCAPED:?}" \
+  -c url.https://github.com/.insteadOf=git@github.com: \
+  -c url.https://github.com/.insteadOf=ssh://git@github.com/ "$@"

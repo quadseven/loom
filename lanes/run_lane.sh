@@ -310,30 +310,16 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; type loom_github_cleanup >/dev/null 2>&1 && loom_github_cleanup; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
-# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
-# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
-# requests as the operator in a day. It clones over https, and each run mints
-# an installation token for gh and git (lane_app_token). The agent never gets
-# the token in its environment, nor the App's settings or git's helper: its gh
-# reads the token from a per-run gh config directory (agent_gh_config, loom#665).
-# LOOM_APP_TOKEN_CMD, when set, prints the token in place of
-# `python3 -m bus app token`.
-if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
-  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
-  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
-  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_1="!gh auth git-credential"
-else
-  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
-fi
+# Every lane operation that reaches GitHub uses its App token. The shared git
+# credential helper supplies it; the gh wrapper refuses calls without it.
+CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -350,6 +336,10 @@ if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RU
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+. "$LOOM_ROOT/lanes/github_process.sh"
+if ! loom_github_start "$LOOM_ROOT" "$LOOM_HOME/run"; then
+  exit 1
+fi
 
 # A check that hashes a file needs a sha256sum this machine can execute. The
 # lane plist puts the Intel Homebrew bin directory ahead of everything but the
@@ -1207,45 +1197,24 @@ signin_rest_until() {
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 
-# Mint this run's App token into GH_TOKEN. A personal token in the
-# environment is dropped first, so a failed mint leaves gh with nothing to
-# post as. Installation tokens last an hour: a run mints again after its agent.
+# Mint this run's App token into GH_TOKEN. Startup already rejected inherited
+# tokens, so a failed mint leaves gh with nothing to post as. Installation
+# tokens last an hour: a run mints again after its agent.
 lane_app_token() {
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  local token
-  unset GH_TOKEN GITHUB_TOKEN
-  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
-    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
-  else
-    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
-  fi
-  # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
-  [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-  export GH_TOKEN="$token"
+  loom_github_mint "$LOOM_ROOT" "$NET_TIMEOUT" || return 1
+  APP_TOKEN="$GH_TOKEN"
 }
 
-# The agent's own gh config directory (loom#665): a fresh one per run, holding
-# this run's App token in the hosts.yml gh reads, so the agent's gh calls bill
-# the App and not the operator. The token never enters the agent's
-# environment and never passes through a gh command whose error text could
-# echo it into the log; printf is a builtin, so it is in no process's argv.
-# Sets AGENT_GH_CONFIG, empty on a lane without App settings.
+# Give the agent the same empty per-process config directory and App token.
+# The wrapper, rather than gh's credential store, supplies authentication.
 agent_gh_config() {
   AGENT_GH_CONFIG=""
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  [[ "${GH_TOKEN:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-  # One runner per lane holds its lock, so this lane's stores are its own:
-  # drop one a killed run left behind before making the next.
   rm -rf "$LOOM_HOME/run/$SLOT-gh."* || return 1
-  local dir
-  dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-gh.XXXXXX")" || return 1
-  if ! (umask 077 && printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n' "$GH_TOKEN" > "$dir/hosts.yml"); then
-    rm -rf "$dir"
-    return 1
-  fi
-  AGENT_GH_CONFIG="$dir"
+  [[ "$GH_TOKEN" =~ ^[A-Za-z0-9_.-]+$ && -d "$GH_CONFIG_DIR" ]] || return 1
+  [ -z "$(ls -A "$GH_CONFIG_DIR" 2>/dev/null)" ] || return 1
+  AGENT_GH_CONFIG="$GH_CONFIG_DIR"
 }
-AGENT_GH_WHY="could not write the agent's gh credential store; the agent did not run"
+AGENT_GH_WHY="could not prepare the agent's empty gh config directory; the agent did not run"
 
 # How many gh commands the agent's output shows (loom#665), counted in the
 # bytes this run added to the log; "unknown" when that slice cannot be read.
@@ -2301,7 +2270,7 @@ parse_contract() {
 fetch_base_for_contract() {
   local try
   for try in 1 2; do
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
       fetch -q --depth 1 origin "${BASE_BRANCH:-HEAD}" >> "$LOG" 2>&1 && return 0
     [ "$try" -eq 2 ] || sleep 3
   done
@@ -3036,7 +3005,7 @@ check_default_branch() {
   if ! mkdir -p "$CHECK_HOME/tmp"; then
     SETUP_REASON="could not prepare the default branch check home"; rc=1
   fi
-  if [ "$rc" -eq 0 ] && [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+  if [ "$rc" -eq 0 ] && [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null \
          -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
     SETUP_REASON="default branch submodule checkout failed"; rc=1
   fi
@@ -3131,7 +3100,7 @@ prepare_validation() {
   elif [ -n "$C_INTERP" ] && ! interp="$(command -v "$C_INTERP")"; then
     SETUP_REASON="interpreter $C_INTERP is not on PATH"
     note_factory_incident environment "interpreter: $C_INTERP" SETUP_REASON
-  elif [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null \
+  elif [ "$C_SUBMODULES" = yes ] && ! timeout "$CHECK_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null \
          -c core.fsmonitor=false submodule update --init --recursive >> "$LOG" 2>&1; then
     SETUP_REASON="submodule checkout failed"
     note_factory_incident environment "submodule checkout failed" SETUP_REASON
@@ -3650,7 +3619,7 @@ push_side() {
     printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
     return 1
   fi
-  if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+  if timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        push -q origin "$from:refs/heads/$side" >> "$LOG" 2>&1; then
     printf 'the edits are on branch %s' "$side"
   else
@@ -3899,20 +3868,20 @@ is_api_lane() {
 update_fix_branch() {
   local default
   UPDATE_REASON=""; CONFLICTS=""
-  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
+  default="${BASE_BRANCH:-$(timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" ls-remote --symref origin HEAD 2>> "$LOG" |
     sed -n 's#^ref: refs/heads/\(.*\)[[:space:]]HEAD$#\1#p')}"
   if ! [[ "$default" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]]; then
     UPDATE_REASON="could not read the default branch"; return 1
   fi
   FIX_DEFAULT="$default"
-  if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+  if ! timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q --depth 200 origin "+refs/heads/$default:refs/remotes/origin/$default" >> "$LOG" 2>&1; then
     UPDATE_REASON="could not fetch $default"; return 1
   fi
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge-base HEAD "origin/$default" > /dev/null 2>&1; then
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+     timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+       fetch -q --unshallow origin >> "$LOG" 2>&1 || true
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
@@ -4069,7 +4038,8 @@ run_agent() {
 ## Spark repository search
 Do not search the whole filesystem (for example, find /). Search within the checkout and read the repository's build files to learn how it builds and tests."
   fi
-  AGENT_EXTRA_ENV=""
+  AGENT_EXTRA_ENV="GH_TOKEN=$APP_TOKEN"$'\n'"GITHUB_TOKEN=$APP_TOKEN"$'\n'\
+"GH_CONFIG_DIR=$GH_CONFIG_DIR"$'\n'"LOOM_REAL_GH=$LOOM_REAL_GH"
   AGENT_LAST_MESSAGE=""
   [ "$LANE" = codex ] && AGENT_LAST_MESSAGE="$WORKDIR/$TICKET.last-message"
   agent_uv_cache
@@ -4614,7 +4584,7 @@ for BRIEF in "$INBOX"/*.md; do
   rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events" "$WORKDIR/$TICKET.last-message"
   rm -f "$LOGDIR/$TICKET.answered" "$LOGDIR/$TICKET.answered.tmp" "$LOGDIR/$TICKET.pushed"
   echo "[$(date -u +%FT%TZ)] $TICKET start, lane $SLOT" >> "$LOG"
-  if ! { timeout "$NET_TIMEOUT" git clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
+  if ! { timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" clone -q --depth 50 ${CLONE_ARGS[@]+"${CLONE_ARGS[@]}"} "${CLONE_BASE}${REPO}.git" "$TREE" &&
          { [ -n "$FIX_PR" ] || [ -n "$REVIEW_PR" ] || git -C "$TREE" checkout -q -b "$BRANCH"; }; } >> "$LOG" 2>&1; then
     park "$BRIEF" "clone or branch failed" transient; continue
   fi
@@ -4677,7 +4647,8 @@ for BRIEF in "$INBOX"/*.md; do
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
     (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
+      export GH_TOKEN="$APP_TOKEN" GITHUB_TOKEN="$APP_TOKEN" GH_CONFIG_DIR="$AGENT_GH_CONFIG" \
+        LOOM_REAL_GH="$LOOM_REAL_GH" &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
     echo $agent_pid > "$LOCK/pgid"
@@ -4692,10 +4663,7 @@ for BRIEF in "$INBOX"/*.md; do
   wait $!
   STATUS=$?
   AGENT_GH_CALLS="$(agent_gh_calls)"
-  # The token in the store outlives the agent by up to an hour: remove it now.
-  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
-    park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
-  fi
+  AGENT_GH_CONFIG=""
   is_api_lane && archive_transcripts
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
     # An unknown spend fails closed: the marker stops paid picks for an hour.
@@ -5197,10 +5165,10 @@ for BRIEF in "$INBOX"/*.md; do
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
-    if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
+    if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
       if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then
-        NOW_HEAD="$(timeout "$NET_TIMEOUT" git -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
+        NOW_HEAD="$(timeout "$NET_TIMEOUT" "$LOOM_GIT_AUTH" -C "$TREE" ls-remote origin "refs/heads/$BRANCH" 2>> "$LOG" | cut -f1)"
         if [ -n "$NOW_HEAD" ] && [ "$NOW_HEAD" != "$BASE" ]; then
           park "$BRIEF" "branch moved: $BRANCH is at ${NOW_HEAD:0:12} on the remote, not ${BASE:0:12} as when the run started"; continue
         fi

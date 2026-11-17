@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -u
+
+if ! [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_.-]+$ ]]; then
+  echo "gh refused: no valid process GitHub App token" >&2
+  exit 2
+fi
+if [ -n "${GH_ENTERPRISE_TOKEN:-}${GITHUB_ENTERPRISE_TOKEN:-}" ]; then
+  echo "gh refused: an ambient enterprise token is set" >&2
+  exit 2
+fi
+if [ -n "${GH_HOST:-}" ] && [ "$GH_HOST" != github.com ]; then
+  echo "gh refused: the process App token is for github.com" >&2
+  exit 2
+fi
+if [ -z "${GH_CONFIG_DIR:-}" ] || [ ! -d "$GH_CONFIG_DIR" ]; then
+  echo "gh refused: no fresh GH_CONFIG_DIR" >&2
+  exit 2
+fi
+if [ -n "$(ls -A "$GH_CONFIG_DIR" 2>/dev/null)" ]; then
+  echo "gh refused: GH_CONFIG_DIR is not empty" >&2
+  exit 2
+fi
+if [ "${1:-}" = auth ]; then
+  case "${2:-}" in
+    login|logout|refresh|setup-git|switch|token)
+      echo "gh refused: authentication changes are disabled" >&2
+      exit 2 ;;
+  esac
+fi
+if [ -z "${LOOM_REAL_GH:-}" ] || [ ! -x "$LOOM_REAL_GH" ]; then
+  echo "gh refused: real gh executable is unavailable" >&2
+  exit 2
+fi
+exec "$LOOM_REAL_GH" "$@"

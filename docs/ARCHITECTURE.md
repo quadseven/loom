@@ -48,8 +48,9 @@ slot such as anthropic-2 runs its lane's agent):
 - `free` - one free OpenAI-compatible provider per slot (free-kilo,
   free-groq, ...) via opencode, sharing the spark lane's endpoint handling.
 
-API-lane agents run sandboxed without credentials; the runner pushes the
-branch and opens the PR. The directories under `lanes/` are support, not
+API-lane agents run sandboxed; their GitHub CLI calls pass through the
+App-token wrapper. The runner pushes the branch and opens the PR. The
+directories under `lanes/` are support, not
 lanes: `agy/` holds the agy lane's settings, `opencode/` the opencode
 config, `sparks/` the workshop's test-farm scripts (compute, not a model
 lane), `mac/` the launchd ticks, and `evidence/` and `viewer/` the evidence

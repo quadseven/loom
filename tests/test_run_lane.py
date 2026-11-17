@@ -674,6 +674,10 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "copilot", FAKE_COPILOT)
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
+        self.app_token = self.bin / "app-token"
+        self.write_tool(self.app_token, "#!/bin/sh\nprintf '%s\\n' ghs_lane.test-token\n")
+        self.no_app_token = self.bin / "no-app-token"
+        self.write_tool(self.no_app_token, "#!/bin/sh\nexit 2\n")
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
 import os, re, subprocess, sys
@@ -777,6 +781,10 @@ print('leak guard: clean (shape patterns only)')
             "FAKE_LOG": str(self.log),
             "FAKE_BODY": str(self.body),
             "LOOM_REPO_OWNERS": "example",
+            "LOOM_GITHUB_APP_ID": "123",
+            "LOOM_GITHUB_APP_INSTALLATION_ID": "456",
+            "LOOM_GITHUB_APP_KEY_SSM": "/example/app-key",
+            "LOOM_APP_TOKEN_CMD": str(self.app_token),
             "LOOM_LEAK_SCANNER": str(self.scanner),
             "LOOM_CODEX_MODEL": "gpt-test-default",
             "LOOM_CLAUDE_MODEL": "claude-test-default",
@@ -1417,12 +1425,11 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def test_a_lane_that_cannot_mint_its_token_again_posts_no_log_tail(self):
         # The token is minted again after the agent. When that fails the lane
-        # has no token, and gh would answer as the operator's own login, so
-        # nothing is posted.
+        # has no token, so the wrapper refuses the attempted log-tail post.
         count = Path(self._tmp.name) / "mints"
         self.drop_brief()
         result = self.run_lane(
-            LOOM_GITHUB_APP_ID="124", GH_TOKEN="ghp_personal",
+            LOOM_GITHUB_APP_ID="124",
             LOOM_APP_TOKEN_CMD=self.app_token_cmd(
                 'n=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
                 '[ "$n" = 0 ] && echo ghs_first.tok-en || { echo "key not found" >&2; exit 2; }'
@@ -3965,7 +3972,7 @@ exec /usr/bin/git "$@"
         (inbox / "T042-fix-the-thing.md").write_text(
             BRIEF.replace("Lane: codex", f"Lane: {lane}").replace("Difficulty: medium", f"Difficulty: {difficulty}\n{brief_header}")
             + f"\nPROBE_PORT={port}\n{extra}")
-        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
+        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", **env)
         return inbox, result
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -4943,7 +4950,7 @@ echo fixed > fix.txt
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
         self.assertFalse((inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.beat("opencode-go")["available"])
-        second = self.run_lane("opencode-go", GH_TOKEN="fake-token-not-real", **env)
+        second = self.run_lane("opencode-go", **env)
         self.assertEqual(second.returncode, 0, second.stderr)
         log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
         self.assertIn("opencode-go/beam-free paused for 86400 s", log)
@@ -6376,7 +6383,7 @@ exit %d
         self.write_tool(cmd, "#!/usr/bin/env bash\n" + script)
         return str(cmd)
 
-    def test_a_lane_with_its_app_settings_writes_as_the_app_and_the_agent_never_sees_the_token(self):
+    def test_a_lane_with_its_app_settings_uses_an_empty_config_and_app_token_wrapper(self):
         # loom#1142: lanes opened every pull request as the operator.
         seen_gh = Path(self._tmp.name) / "gh-tokens"
         seen_agent = Path(self._tmp.name) / "agent-tokens"
@@ -6388,32 +6395,46 @@ exit %d
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
-                      GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
+                      FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
-        # No token in its environment, nor the App's settings to mint one, nor
-        # git's helper to borrow one.
+        # The token is available only to the wrapped gh process; the App
+        # settings and inherited git config are absent from the agent.
         agent_env = seen_agent.read_text().splitlines()
-        self.assertEqual(agent_env[:3], ["none", "none", "none"])
-        # loom#665: its gh reads the minted App token, never the operator's,
-        # from a per-run config directory the runner removes after the agent.
+        self.assertEqual(agent_env[:3], ["ghs_lanes.tok-en", "none", "none"])
         store = Path(agent_env[3])
         self.assertEqual(store.parent, self.loom / "run")
-        self.assertTrue(store.name.startswith("codex-gh."), store)
-        self.assertIn("oauth_token: ghs_lanes.tok-en ", agent_env[4])
-        self.assertNotIn("ghp_personal", agent_env[4])
+        self.assertTrue(store.name.startswith("gh-config."), store)
+        self.assertEqual(agent_env[4], "")
         self.assertFalse(store.exists())
         self.assertFalse(stale.exists())
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertNotIn("ghs_lanes.tok-en", log)
 
-    def test_a_lane_without_app_settings_leaves_the_agent_gh_config_alone(self):
+    def test_a_lane_without_app_settings_fails_before_running_the_agent(self):
         seen_agent = Path(self._tmp.name) / "agent-tokens"
         self.drop_brief()
-        self.run_lane(FAKE_AGENT_ENV=str(seen_agent))
-        self.assertEqual(seen_agent.read_text().splitlines()[3], "none")
+        self.run_lane(FAKE_AGENT_ENV=str(seen_agent), LOOM_GITHUB_APP_ID="",
+                      LOOM_GITHUB_APP_INSTALLATION_ID="", LOOM_GITHUB_APP_KEY_SSM="",
+                      LOOM_APP_TOKEN_CMD=str(self.no_app_token))
+        self.assertFalse(seen_agent.exists())
+        self.assertTrue(self.failure_line().startswith("[transient] "))
         self.assertEqual(list((self.loom / "run").glob("codex-gh.*")), [])
+
+    def test_a_lane_without_an_app_token_fails_before_any_github_call(self):
+        self.drop_brief()
+        self.run_lane(LOOM_APP_TOKEN_CMD=str(self.no_app_token))
+        self.assertEqual([], [call for call in self.calls()
+                              if call.startswith(("gh ", "codex "))])
+        self.assertTrue(self.failure_line().startswith("[transient] "))
+        self.assertIn("GitHub App", self.failure_line())
+
+    def test_a_lane_rejects_an_ambient_github_token_before_any_call(self):
+        self.drop_brief()
+        result = self.run_lane(GH_TOKEN="ghp_personal")
+        self.assertEqual([], self.calls())
+        self.assertIn("ambient GH_TOKEN", result.stderr)
 
     def test_the_brief_says_not_to_poll_and_the_run_reports_its_gh_calls(self):
         # loom#665: agents polled their own pull requests hundreds of times.
@@ -6430,21 +6451,18 @@ exit %d
         self.assertIn("agent gh calls: 1", log)
 
     def test_agent_launch_chain_stops_when_the_tree_cannot_be_entered(self):
-        # The agent must never start outside its tree with the runner's token.
+        # The agent must never start outside its tree with wrapper credentials.
         source = RUNNER.read_text()
-        self.assertRegex(
-            source,
-            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
-            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
-            r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
-            r'run_agent "\$RUN_BRIEF"',
-        )
+        self.assertIn('cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN', source)
+        self.assertIn('export GH_TOKEN="$APP_TOKEN" GITHUB_TOKEN="$APP_TOKEN"', source)
+        self.assertIn('GH_CONFIG_DIR="$AGENT_GH_CONFIG"', source)
+        self.assertIn('LOOM_REAL_GH="$LOOM_REAL_GH" &&', source)
+        self.assertIn('run_agent "$RUN_BRIEF"', source)
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
-                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"),
-                      GH_TOKEN="ghp_personal")
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"))
         self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
         line = self.failure_line()
         self.assertTrue(line.startswith("[transient] "), line)

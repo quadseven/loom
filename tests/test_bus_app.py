@@ -229,6 +229,8 @@ class Token(unittest.TestCase):
 
     def fake(self, method, url, headers, body):
         self.minted.append((method, url))
+        if method == "GET" and url.endswith("/app"):
+            return 200, {}, json.dumps({"slug": "loom-lanes"}).encode()
         answer = {"token": "ghs_lanes_token", "expires_at": "2099-01-01T00:00:00Z"}
         return 201, {}, json.dumps(answer).encode()
 
@@ -243,6 +245,7 @@ class Token(unittest.TestCase):
                                      "LOOM_GITHUB_APP_KEY_FILE": self.key})
         self.assertEqual((code, out), (0, "ghs_lanes_token\n"))
         self.assertEqual(self.minted, [
+            ("GET", "https://api.github.com/app"),
             ("POST", "https://api.github.com/app/installations/77/access_tokens")])
         self.assertNotIn(KEY_MARK, out + err)
 
@@ -259,11 +262,61 @@ class Token(unittest.TestCase):
         self.assertEqual(self.minted, [("GET", "https://api.github.com/app")])
 
     def test_without_the_app_settings_it_prints_nothing_and_fails(self):
+        partial = (
+            {"LOOM_GITHUB_APP_INSTALLATION_ID": "77", "LOOM_GITHUB_APP_KEY_FILE": self.key},
+            {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_KEY_FILE": self.key},
+            {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77"},
+        )
         with mock.patch("bus.github.token_from_env", side_effect=AssertionError("personal token read")):
-            code, out, err = self.token({"GITHUB_TOKEN": "ghp_personal"})
-        self.assertEqual((code, out), (2, ""))
-        self.assertIn("LOOM_GITHUB_APP_ID", err)
+            for settings in partial:
+                code, out, err = self.token(dict(settings, GITHUB_TOKEN="ghp_personal"))
+                self.assertEqual((code, out), (2, ""))
+                self.assertIn("LOOM_GITHUB_APP", err)
         self.assertEqual(self.minted, [])
+
+    def test_a_mint_reply_without_a_token_prints_nothing_and_fails(self):
+        def missing_token(method, url, headers, body):
+            self.minted.append((method, url))
+            if method == "GET" and url.endswith("/app"):
+                return 200, {}, json.dumps({"slug": "loom-lanes"}).encode()
+            return 201, {}, json.dumps({"expires_at": "2099-01-01T00:00:00Z"}).encode()
+
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, err = run(["app", "token"], app_transport=missing_token,
+                                 app_sign=lambda data, key: b"sig")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("no token", err)
+
+    def test_a_missing_app_slug_prints_nothing_and_fails(self):
+        def no_slug(method, url, headers, body):
+            self.minted.append((method, url))
+            return 200, {}, json.dumps({}).encode()
+
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, err = run(["app", "token"], app_transport=no_slug,
+                                 app_sign=lambda data, key: b"sig")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("slug", err)
+        self.assertEqual(len(self.minted), 1)
+
+    def test_a_refused_installation_mint_prints_nothing_and_fails(self):
+        def refuse_mint(method, url, headers, body):
+            self.minted.append((method, url))
+            if method == "GET" and url.endswith("/app"):
+                return 200, {}, json.dumps({"slug": "loom-lanes"}).encode()
+            return 401, {}, json.dumps({"message": "Bad credentials"}).encode()
+
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        with mock.patch.dict(os.environ, env, clear=True):
+            code, out, err = run(["app", "token"], app_transport=refuse_mint,
+                                 app_sign=lambda data, key: b"sig")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("Bad credentials", err)
 
 
 if __name__ == "__main__":

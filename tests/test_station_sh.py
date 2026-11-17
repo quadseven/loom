@@ -35,6 +35,8 @@ esac
 # Fake python3: records that the station pass ran, from which directory.
 FAKE_PY = """#!/usr/bin/env bash
 printf 'python3 %s in %s\\n' "$*" "$PWD" >> "$FAKE_LOG"
+if [ "$1" = -c ]; then exec "$LOOM_REAL_GH" api "$3"; fi
+exit 0
 """
 
 
@@ -61,6 +63,10 @@ class StationScriptTest(unittest.TestCase):
         git("clone", "-q", str(self.remote), str(self.checkout))
         (self.checkout / "lanes" / "mac").mkdir(parents=True)
         shutil.copy(SCRIPT, self.checkout / "lanes" / "mac" / "station.sh")
+        (self.checkout / "lanes").mkdir(exist_ok=True)
+        for name in ("github_process.sh", "gh", "git-app", "git-credential-app"):
+            shutil.copy(SCRIPT.parents[1] / name, self.checkout / "lanes" / name)
+            (self.checkout / "lanes" / name).chmod(0o755)
         (self.checkout / ".git" / "info" / "exclude").write_text("lanes/\n")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
@@ -68,6 +74,9 @@ class StationScriptTest(unittest.TestCase):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
         self.log = self.tmp / "calls.log"
+        self.token_cmd = self.bin / "app-token"
+        self.token_cmd.write_text("#!/bin/sh\nprintf '%s\\n' ghs_station.test-token\n")
+        self.token_cmd.chmod(0o755)
 
     def push_change(self, text="two\n"):
         (self.seed / "a.txt").write_text(text)
@@ -81,8 +90,13 @@ class StationScriptTest(unittest.TestCase):
                               capture_output=True, text=True, check=True).stdout.strip()
 
     def run_script(self, **env):
-        full = dict(os.environ, PATH="%s:%s" % (self.bin, os.environ["PATH"]),
-                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"), **env)
+        full = dict(os.environ)
+        full.update(PATH="%s:%s" % (self.bin, os.environ["PATH"]),
+                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"),
+                    LOOM_GITHUB_APP_ID="123", LOOM_GITHUB_APP_INSTALLATION_ID="456",
+                    LOOM_GITHUB_APP_KEY_SSM="/example/app-key",
+                    LOOM_APP_TOKEN_CMD=str(self.token_cmd))
+        full.update(env)
         return subprocess.run(["bash", str(self.checkout / "lanes" / "mac" / "station.sh")],
                               env=full, capture_output=True, text=True, timeout=60)
 
@@ -104,6 +118,21 @@ class StationScriptTest(unittest.TestCase):
         record = self.deployed()
         self.assertEqual(record["revision"], target)
         self.assertLessEqual(abs(record["at"] - time.time()), 60)
+
+    def test_a_station_with_no_app_token_stops_before_github_or_station_calls(self):
+        no_token = self.bin / "no-app-token"
+        no_token.write_text("#!/bin/sh\nexit 2\n")
+        no_token.chmod(0o755)
+        result = self.run_script(LOOM_APP_TOKEN_CMD=str(no_token))
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self.calls())
+        self.assertIn("GitHub App", result.stderr)
+
+    def test_a_station_rejects_an_ambient_github_token_before_any_call(self):
+        result = self.run_script(GH_TOKEN="ghp_personal")
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual([], self.calls())
+        self.assertIn("ambient GH_TOKEN", result.stderr)
 
     def test_configured_pin_pass_runs_after_deploy_and_retries_next_pass(self):
         self.push_change()
