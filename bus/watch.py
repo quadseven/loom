@@ -549,7 +549,8 @@ def keep(line: str) -> bool:
     station's hold line is status, whatever state word it names, so is the
     brain's own status output (brain_status), the station's note of a failed
     verify run (VERIFY_RUN_RE) and a designed station outcome (EXPECTED_RES).
-    A relayed CI log line is the run's output (CI_LOG_RE)."""
+    A relayed CI log line is the run's output (CI_LOG_RE). A line that is
+    exactly a line from a docs file is not an error."""
     bare = _LEAD_RE.sub("", line).rstrip("\r\n")
     if HOLD_RE.fullmatch(bare) or any(r.fullmatch(bare) for r in EXPECTED_RES):
         return False
@@ -561,7 +562,12 @@ def keep(line: str) -> bool:
         return False
     if CI_LOG_RE.match(_LEAD_RE.sub("", line)):
         return False
+    if bare in WATCHER_DOC_LINES:
+        return False
     return bool(KEEP_RE.search(line) or HTTP_RE.search(line))
+
+
+WATCHER_DOC_LINES: set = set()
 
 
 def _echoed_json(line: str) -> bool:
@@ -643,6 +649,10 @@ class Watcher:
         self.private = tuple(n for n in private if n)
         # Refusals of the runs that ended this pass, applied after _remember.
         self.settled: List[Dict[str, Any]] = []
+        # Doc lines that are exact matches to tracked documentation files.
+        self.doc_lines: set = self._load_doc_lines()
+        # Share the doc lines with other watchers through the module-level set.
+        WATCHER_DOC_LINES.update(self.doc_lines)
 
     # -- state -----------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
@@ -665,6 +675,32 @@ class Watcher:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh)
         os.replace(tmp, self.path)
+
+    def _load_doc_lines(self) -> set:
+        """Load all lines from documentation files into a set for exact matching.
+
+        The watcher filters out lines that are exact matches to lines in the
+        docs/ directory, because those are documentation text, not errors.
+        """
+        doc_lines = set()
+        docs_dir = os.path.join(os.path.dirname(self.path), "docs")
+        if not os.path.exists(docs_dir):
+            return doc_lines
+
+        for root, _, files in os.walk(docs_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                if not file_path.lower().endswith((".md", ".txt")):
+                    continue
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            stripped = line.rstrip("\r\n")
+                            if stripped:
+                                doc_lines.add(stripped)
+                except (OSError, IOError):
+                    self.say("watch: could not read docs file %s, skipping" % file_path)
+        return doc_lines
 
     # -- reading ---------------------------------------------------------
     def _read(self, rec: Dict[str, Any], path: str) -> Optional[List[str]]:
