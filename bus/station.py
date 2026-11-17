@@ -16954,8 +16954,8 @@ class Station:
 
     def tend_watchdog(self) -> None:
         """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
-        the claim floor is reached (bus/disk_watchdog.py, loom#3187): old
-        lane logs, finished run scratch, old lane trees (archived), then idle
+        the claim floor is reached (bus/disk_watchdog.py, loom#3187): Time
+        Machine local snapshots on macOS, old lane logs, finished run scratch, old lane trees (archived), then idle
         lanes' tool caches. Nothing a waiting or running brief names, and no
         busy lane's folder, is touched; an inbox that cannot be read stops it."""
         if self.s.disk_watch.trigger_gb <= 0:
@@ -16980,8 +16980,10 @@ class Station:
         path = os.path.join(self.state, DISK_WATCH_FILE)
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
+        # LOOM_THIN_SNAPSHOTS=0 also keeps Time Machine local snapshots.
+        tm = disk_watchdog.TimeMachine.for_host() if self.s.thin_snapshots else None
         out = disk_watchdog.tend(self.s.disk_watch, roots, disk_watchdog.RealDisk(),
-                                 self.s.disk_free_min_gb * GB, self.now, _say, saved)
+                                 self.s.disk_free_min_gb * GB, self.now, _say, saved, tm=tm)
         if out != saved:
             _write_json(path, out)
         if out.get("at") == self.now:

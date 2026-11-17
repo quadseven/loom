@@ -97,11 +97,54 @@ def roots(trees=(HOME + "/worktrees",), lanes=("codex", "spark"), live=(), idle=
                     live=frozenset(live), idle=frozenset(idle))
 
 
-def tend(disk, cfg=None, saved=None, floor=15 * GB, rts=None, now=NOW):
+def tend(disk, cfg=None, saved=None, floor=15 * GB, rts=None, now=NOW, tm=None):
     said = []
     out = wd.tend(cfg or wd.Config(), rts or roots(), disk, floor, now, said.append,
-                  dict(saved or {}))
+                  dict(saved or {}), tm=tm)
     return out, said
+
+
+OS_UPDATE = "com.apple.os.update-0123456789ABCDEF"
+
+
+def tm_name(date):
+    return "com.apple.TimeMachine.%s.local" % date
+
+
+class FakeTmutil:
+    """tmutil over a FakeDisk: each snapshot holds bytes counted as used
+    elsewhere until it is deleted. fail names the verb that exits 1;
+    raise_on names the verb whose run raises OSError."""
+
+    def __init__(self, disk, snapshots, fail=None, raise_on=None):
+        self.disk, self.snapshots = disk, dict(snapshots)
+        self.fail, self.raise_on = fail, raise_on
+        self.extra_dates = []
+        self.calls = []
+        disk.elsewhere += sum(self.snapshots.values())
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        verb = args[0]
+        if verb == self.raise_on:
+            raise OSError("tmutil went away")
+        if verb == self.fail:
+            return 1, "", "tmutil: %s failed" % verb
+        if verb == "listlocalsnapshots":
+            return 0, "Snapshots for disk /:\n" + "".join(n + "\n" for n in self.snapshots), ""
+        if verb == "listlocalsnapshotdates":
+            dates = [n[len("com.apple.TimeMachine."):-len(".local")] for n in self.snapshots
+                     if n.startswith("com.apple.TimeMachine.")] + self.extra_dates
+            return 0, "Snapshot dates for disk /:\n" + "".join(d + "\n" for d in dates), ""
+        if verb == "deletelocalsnapshots":
+            name = tm_name(args[1])
+            if name in self.snapshots:
+                self.disk.elsewhere -= self.snapshots.pop(name)
+            return 0, "Deleted local snapshot '%s'\n" % args[1], ""
+        return 1, "", "unknown verb"
+
+    def deleted(self):
+        return [c[1] for c in self.calls if c[0] == "deletelocalsnapshots"]
 
 
 class ConfigTest(unittest.TestCase):
@@ -267,6 +310,79 @@ class TendTest(unittest.TestCase):
         disk.add(HOME + "/logs/codex/a.log", GB, age_days=9)
         tend(disk, cfg=wd.Config(trigger_gb=0))
         self.assertEqual(disk.calls, [])
+
+
+class TimeMachineTest(unittest.TestCase):
+    """Time Machine local snapshots go first (loom#3187): deleting files
+    frees nothing while an hourly snapshot still holds them."""
+
+    def setUp(self):
+        # 40 GB, 10 GB of other data: 30 GB free before the snapshots.
+        self.disk = FakeDisk(40 * GB, used_elsewhere=10 * GB)
+
+    def test_only_time_machine_snapshots_go_oldest_first(self):
+        tmutil = FakeTmutil(self.disk, {OS_UPDATE: 6 * GB,
+                                        tm_name("2026-11-17-210012"): 4 * GB,
+                                        tm_name("2026-11-17-200011"): 4 * GB,
+                                        "com.apple.other.snapshot": 2 * GB})
+        # 30 - 16 = 14 GB free: both Time Machine snapshots go and 22 is free.
+        _, said = tend(self.disk, tm=wd.TimeMachine(tmutil))
+        self.assertEqual(tmutil.deleted(), ["2026-11-17-200011", "2026-11-17-210012"])
+        self.assertIn(OS_UPDATE, tmutil.snapshots)
+        self.assertIn("com.apple.other.snapshot", tmutil.snapshots)
+        for call in tmutil.calls:
+            self.assertNotIn(OS_UPDATE, " ".join(call))
+        lines = [s for s in said if "Time Machine local snapshot" in s]
+        self.assertEqual(len(lines), 2, said)
+        self.assertIn(tm_name("2026-11-17-200011"), lines[0])
+        self.assertIn("14.0 GB free before, 18.0 GB after", lines[0])
+
+    def test_stops_once_above_the_trigger(self):
+        tmutil = FakeTmutil(self.disk, {tm_name("2026-11-17-180000"): 12 * GB,
+                                        tm_name("2026-11-17-190000"): 4 * GB})
+        # 14 GB free; the oldest alone brings it to 26, over 25.
+        tend(self.disk, tm=wd.TimeMachine(tmutil))
+        self.assertEqual(tmutil.deleted(), ["2026-11-17-180000"])
+        self.assertIn(tm_name("2026-11-17-190000"), tmutil.snapshots)
+
+    def test_snapshots_go_before_loom_data(self):
+        tmutil = FakeTmutil(self.disk, {tm_name("2026-11-17-180000"): 12 * GB})
+        self.disk.add(HOME + "/logs/codex/a.log", 2 * GB, age_days=9)
+        # 30 - 12 - 2 = 16 GB free; the snapshot alone brings it to 28.
+        tend(self.disk, tm=wd.TimeMachine(tmutil))
+        self.assertEqual(tmutil.deleted(), ["2026-11-17-180000"])
+        self.assertEqual(self.disk.calls, [])
+
+    def test_above_the_trigger_tmutil_is_not_run(self):
+        tmutil = FakeTmutil(self.disk, {tm_name("2026-11-17-180000"): GB})
+        tend(self.disk, tm=wd.TimeMachine(tmutil))
+        self.assertEqual(tmutil.calls, [])
+
+    def test_a_tmutil_error_does_not_stop_the_pass(self):
+        for fail, raise_on in (("listlocalsnapshots", None), ("listlocalsnapshotdates", None),
+                               ("deletelocalsnapshots", None), (None, "listlocalsnapshots"),
+                               (None, "deletelocalsnapshots")):
+            with self.subTest(fail=fail, raise_on=raise_on):
+                disk = FakeDisk(40 * GB, used_elsewhere=10 * GB)
+                tmutil = FakeTmutil(disk, {tm_name("2026-11-17-180000"): 12 * GB},
+                                    fail=fail, raise_on=raise_on)
+                disk.add(HOME + "/logs/codex/a.log", 2 * GB, age_days=9)
+                _, said = tend(disk, tm=wd.TimeMachine(tmutil))
+                self.assertIn(tm_name("2026-11-17-180000"), tmutil.snapshots)
+                self.assertEqual([c[0] for c in disk.calls], ["archive"])
+                self.assertTrue(any("Time Machine" in s for s in said), said)
+
+    def test_a_date_with_no_time_machine_name_is_kept(self):
+        # A date that no com.apple.TimeMachine. name backs is never deleted.
+        tmutil = FakeTmutil(self.disk, {tm_name("2026-11-17-180000"): 12 * GB})
+        tmutil.extra_dates = ["2026-11-16-000000"]
+        tend(self.disk, tm=wd.TimeMachine(tmutil))
+        self.assertEqual(tmutil.deleted(), ["2026-11-17-180000"])
+
+    def test_off_this_host_when_not_macos_or_no_tmutil(self):
+        self.assertIsNone(wd.TimeMachine.for_host("linux", lambda name: "/usr/bin/tmutil"))
+        self.assertIsNone(wd.TimeMachine.for_host("darwin", lambda name: None))
+        self.assertIsNotNone(wd.TimeMachine.for_host("darwin", lambda name: "/usr/bin/tmutil"))
 
 
 class RealDiskTest(unittest.TestCase):
