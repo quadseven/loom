@@ -591,13 +591,19 @@ inbox never means a briefed ticket is stale. Not load:
 - a ticket the unproven-work gate refused this pass;
 - a briefed build ticket of a repo whose counted open pull requests reach its
   cap (`LOOM_REPO_OPEN_PR_CAP`, default 8), read from the station's per-pass
-  count, not from how far the claim pass got. A briefed fix round is claimed
-  over the cap, so it stays load. A queued ticket of such a repo
+  count, not from how far the claim pass got. Its brief cannot be written, so
+  the factory puts it back to `loom:queued` with no lane label. A briefed fix
+  round is claimed over the cap, so it stays load. A queued ticket of such a repo
   waits (`its repo is at its open pull request cap`) instead of being briefed
   onto a lane. An unread count is no cap here.
 
 A running ticket is always load; one whose run ended is settled to
-`loom:failed` (`settle_ended_runs`).
+`loom:failed` (`settle_ended_runs`). A briefed ticket no lane claims for
+`BRIEFED_STALL` (2 hours) moves to a free or shorter lane of its tier or
+rung. With no such lane it goes back to `loom:queued` with no lane label
+(a status note says why; it is not a failure and takes no rung marker), so
+it stops holding its lane and any free lane can take it from the queue. A
+ticket whose brief sits in a lane inbox is never settled this way.
 
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no

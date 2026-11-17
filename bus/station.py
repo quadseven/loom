@@ -2555,7 +2555,12 @@ class Station:
     # -- which repos a pass scans -----------------------------------------
     def _inbox_repos(self) -> set:
         """Repos named by a brief waiting or running in a lane inbox."""
-        found = set()
+        return {key.split("#", 1)[0] for key in self._inbox_tickets()}
+
+    def _inbox_tickets(self) -> Set[str]:
+        """The ticket, as owner/repo#n, of each brief waiting or running in a
+        lane inbox."""
+        found: Set[str] = set()
         for lane in LANES:
             try:
                 entries = os.listdir(self.inbox(lane))
@@ -2570,7 +2575,7 @@ class Station:
                 except (OSError, ValueError):
                     continue
                 if m:
-                    found.add(m.group(1))
+                    found.add("%s#%s" % (m.group(1), m.group(2)))
         return found
 
     def _scan_due(self, rec: Any) -> bool:
@@ -16249,16 +16254,20 @@ class Station:
         assign_queued), told which repos are at their open pull request cap.
         Only these read the counts, so a factory built for one ticket's check
         costs no pull request list. Each briefed build ticket of a capped repo
-        is held, so the factory neither counts it as lane load nor moves it as
-        stalled; a briefed fix round is claimed over the cap and stays load."""
+        is in cap_held: its brief cannot be written, so the factory counts it
+        as no lane's load and puts it back to the queue with no lane. A
+        briefed fix round is claimed over the cap and stays load. in_inbox
+        names the tickets whose brief sits in a lane inbox, which are never
+        settled as stalled (loom#3158)."""
         runner = self._factory()
+        runner.in_inbox = self._inbox_tickets()
         runner.capped = set(self._capped_repos(
             [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]))
         for repo in sorted(runner.capped):
             try:
                 for issue in self._poll(repo):
                     if self._build_only(repo, int(issue["number"])):
-                        runner.held.add("%s#%d" % (repo, int(issue["number"])))
+                        runner.cap_held.add("%s#%d" % (repo, int(issue["number"])))
             except RateLimited:
                 raise
             except TargetReached:

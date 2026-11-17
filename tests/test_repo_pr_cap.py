@@ -1,4 +1,5 @@
 """Repository backpressure leaves existing PR work runnable."""
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -346,13 +347,33 @@ class CapLoadBeforeClaimTest(Base):
         self.assertIn("loom:queued", self.fake.names(12))
         self.assertEqual(self.fake.paths("PUT") + self.fake.paths("POST"), [])
 
-    def test_briefed_ticket_over_cap_is_not_moved_as_stalled(self):
+    def test_briefed_ticket_over_cap_goes_back_to_the_queue_with_no_lane(self):
+        # Its brief cannot be written while the repo is at the cap, so it
+        # waits queued (CAP_WAIT), off every lane, not briefed on one.
         self.pulls(9)
         self.fake.add(12)
         _, counter = self.factory()
         with mock.patch.object(counter, "_spread", side_effect=AssertionError("moved")), \
                 mock.patch.object(counter, "_step_aside", side_effect=AssertionError("moved")):
             counter.briefed(REPO, self.fake.issues[12])
+        names = self.fake.names(12)
+        self.assertIn("loom:queued", names)
+        self.assertNotIn("loom:briefed", names)
+        self.assertFalse([n for n in names if n.startswith("lane:")], names)
+
+    def test_the_factory_is_told_which_tickets_have_a_brief_in_an_inbox(self):
+        os.makedirs(self.inbox("codex"), exist_ok=True)
+        Path(self.inbox("codex", "brief.md")).write_text("Issue: %s#12\n\nbody\n" % REPO)
+        Path(self.inbox("codex", "note.txt")).write_text("Issue: %s#13\n" % REPO)
+        _, counter = self.factory()
+        self.assertEqual(counter.in_inbox, {"%s#12" % REPO})
+
+    def test_briefed_fix_round_over_cap_stays_briefed(self):
+        self.pulls(9)
+        self.fake.add(12)
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, counter = self.factory()
+        self.assertNotIn("%s#12" % REPO, counter.cap_held)
 
 
 if __name__ == "__main__":
