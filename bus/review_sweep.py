@@ -10,6 +10,10 @@ review.json; the station posts it as one formal review on the head commit,
 as the lane's own reviewer App (LOOM_REVIEW_APPS), with the fleet:review
 marker the fleet merge gate reads.
 
+The sweep is off (2026-11-16): review is the Elder check's alone, and
+Config.from_env dispatches nothing unless LOOM_REVIEW_SWEEP=on. The code
+stays for a later decision.
+
 This module holds the parts with no station state: the settings, the
 verdict and qualification reads, the review the station posts, and the
 reviewer App's client. The App's id and key are read from SSM, used to
@@ -65,6 +69,11 @@ def _float(raw: str, default: float) -> float:
         return default
 
 
+def enabled(env: Mapping[str, str]) -> bool:
+    """Whether LOOM_REVIEW_SWEEP turns the sweep on; off by default."""
+    return str(env.get("LOOM_REVIEW_SWEEP", "")).strip().lower() in ("on", "1", "true", "yes")
+
+
 def _apps(raw: str) -> Dict[str, str]:
     """LOOM_REVIEW_APPS: lane=slug pairs over the defaults."""
     apps = dict(DEFAULT_APPS)
@@ -76,8 +85,8 @@ def _apps(raw: str) -> Dict[str, str]:
 
 
 class Config(NamedTuple):
-    """The sweep's settings. Built in code it is off (every=0); the
-    station's Settings.from_env turns it on with the defaults."""
+    """The sweep's settings. Built in code it is off (every=0), and
+    from_env leaves it off unless LOOM_REVIEW_SWEEP=on."""
     every: int = 0
     hours: float = HOURS
     per_run: int = PER_RUN
@@ -97,9 +106,12 @@ class Config(NamedTuple):
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Config":
+        """The sweep stays off unless LOOM_REVIEW_SWEEP=on: review is the
+        Elder's alone (2026-11-16), so no setting but that one turns it on."""
         lanes = tuple(str(env.get("LOOM_REVIEW_LANES", "")).replace(",", " ").split())
         reviewers = tuple(str(env.get("LOOM_FLEET_REVIEWERS", "")).replace(",", " ").split())
-        return cls(every=_int(env.get("LOOM_REVIEW_SWEEP_EVERY", ""), EVERY),
+        every = _int(env.get("LOOM_REVIEW_SWEEP_EVERY", ""), EVERY) if enabled(env) else 0
+        return cls(every=every,
                    hours=_float(env.get("LOOM_REVIEW_SWEEP_HOURS", ""), HOURS),
                    per_run=_int(env.get("LOOM_REVIEW_SWEEP_PER_RUN", ""), PER_RUN),
                    retry=_int(env.get("LOOM_REVIEW_SWEEP_RETRY", ""), RETRY),
