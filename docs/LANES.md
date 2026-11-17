@@ -579,6 +579,26 @@ the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
 requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
+
+Lane load, the single source of truth for whether a lane holds work: the
+open tickets carrying the lane's `lane:<name>` label at `loom:running`, plus
+those at `loom:briefed` that the station can claim. A lane is free only with
+no load. A briefed ticket has no brief file until the station claims it (the
+claim writes the brief and moves the ticket to `loom:running`), so an empty
+inbox never means a briefed ticket is stale. Not load:
+
+- a ticket the station holds for a factory incident (`factory_held.json`);
+- a ticket the unproven-work gate refused this pass;
+- a briefed build ticket of a repo whose counted open pull requests reach its
+  cap (`LOOM_REPO_OPEN_PR_CAP`, default 8), read from the station's per-pass
+  count, not from how far the claim pass got. A briefed fix round is claimed
+  over the cap, so it stays load. A queued ticket of such a repo
+  waits (`its repo is at its open pull request cap`) instead of being briefed
+  onto a lane. An unread count is no cap here.
+
+A running ticket is always load; one whose run ended is settled to
+`loom:failed` (`settle_ended_runs`).
+
 It skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
