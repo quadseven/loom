@@ -5468,6 +5468,114 @@ class NoLane(Base):
         self.assertTrue(brain._in_flight(ticket("pr", factory.HANDOFF_LABEL)))
 
 
+class PinFallback(Base):
+    """A queued ticket whose pinned model has no free lane falls back to a
+    free lane of its tier after a bounded wait (loom#3151). On 2026-11-17 one
+    pass assigned 0 of 86 queued tickets, each pinned to a codex or anthropic
+    model with no lane up, while about 30 lanes of their tiers sat idle."""
+    BOT = {"login": "loom-station[bot]", "type": "Bot"}
+    SONNET = "Model: claude-sonnet-5-5\nDifficulty: medium\n\n## Why\nx\n" + ACCEPTANCE
+
+    def queued(self, number, body=None, user=None, labels=()):
+        self.gh.ticket(number, "queued", body=body or self.SONNET)
+        self.gh.issues[number]["user"] = user or self.BOT
+        self.gh.issues[number]["labels"] = [{"name": x} for x in
+                                            ("loom:ticket", "loom:queued") + tuple(labels)]
+        self.gh.issues[number]["created_at"] = iso(0)
+
+    def assign(self, waited, available, env=None):
+        key = "%s#7" % REPO
+        with mock.patch.dict(os.environ, env or {}):
+            worker = factory.Factory(self.gh, [REPO], NOW,
+                                     trusted=["alice-example", "loom-station[bot]"],
+                                     available=available, no_lane_since={key: NOW - waited})
+            with mock.patch("bus.factory._say") as say:
+                worker.assign_queued()
+        worker.said = [c.args[0] for c in say.call_args_list]
+        return worker
+
+    def notes(self, number):
+        return "".join(c["body"] for c in self.gh.comments.get(number, []))
+
+    def test_the_wait_comes_from_the_environment_and_works_without_it(self):
+        self.assertEqual(factory.pin_fallback_after({}), 30 * 60)
+        self.assertEqual(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": "10"}), 600)
+        self.assertIsNone(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": "0"}))
+        for bad in ("", "x", "-3", "nan", "inf"):
+            self.assertEqual(factory.pin_fallback_after({"LOOM_PIN_FALLBACK_MINUTES": bad}),
+                             30 * 60, bad)
+
+    def test_a_pinned_ticket_with_no_free_lane_takes_a_free_tier_lane_after_the_wait(self):
+        self.queued(7)
+        worker = self.assign(31 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.lane(7), self.model(7)),
+                         ("briefed", "spark", None))
+        self.assertIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+        self.assertIn("lane spark with that lane's own model", self.notes(7))
+        self.assertNotIn("%s#7" % REPO, worker.waits)
+        self.assertIn("%s#7" % REPO, worker.settled)
+        self.assertTrue(any("pin fallback" in line and "spark" in line
+                            and "claude-sonnet-5-5" in line for line in worker.said),
+                        worker.said)
+
+    def test_a_pinned_ticket_waits_for_its_model_before_the_wait_is_out(self):
+        self.queued(7)
+        worker = self.assign(29 * 60, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertEqual(worker.waits["%s#7" % REPO], "no free lane takes model claude-sonnet-5-5")
+
+    def test_the_pinned_model_goes_first_when_its_lane_is_free(self):
+        self.queued(7)
+        self.assign(3 * 3600, ["claude", "spark"])
+        self.assertEqual((self.lane(7), self.model(7)), ("claude", "claude-sonnet-5-5"))
+        self.assertNotIn(factory.PIN_FALLBACK_MARKER % "claude-sonnet-5-5", self.notes(7))
+
+    def test_the_wait_is_configurable_and_zero_turns_the_fallback_off(self):
+        self.queued(7)
+        self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "0"})
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+        self.assign(11 * 60, ["spark"], env={"LOOM_PIN_FALLBACK_MINUTES": "10"})
+        self.assertEqual((self.lane(7), self.model(7)), ("spark", None))
+
+    def test_a_ticket_a_person_opened_keeps_its_pin(self):
+        # The operator wrote its Model: line: a hard pin.
+        self.queued(7, user=ME)
+        worker = self.assign(3 * 3600, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_sensitive_or_security_ticket_keeps_its_pin(self):
+        for label in ("class:sensitive", "tier:security"):
+            self.queued(7, labels=(label,))
+            self.assign(3 * 3600, ["spark"])
+            self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                             ("queued", "claude-sonnet-5-5"), label)
+
+    def test_a_fallback_skips_a_lane_the_ticket_already_ran_on(self):
+        self.queued(7)
+        self.gh.comments[7] = [{"body": "Claimed for lane spark (body sha256 0123456789ab)",
+                                "user": self.BOT}]
+        self.assign(3 * 3600, ["spark", "spark-2"])
+        self.assertEqual((self.lane(7), self.model(7)), ("spark-2", None))
+
+    def test_a_ticket_falls_back_at_most_twice(self):
+        self.queued(7)
+        self.gh.comments[7] = [{"body": factory.PIN_FALLBACK_MARKER % "gpt-6-luna", "user": self.BOT}
+                               for _ in range(factory.PIN_FALLBACK_MAX)]
+        worker = self.assign(3 * 3600, ["spark"])
+        self.assertEqual((factory._state(self.gh.issues[7]), self.model(7)),
+                         ("queued", "claude-sonnet-5-5"))
+        self.assertIn("%s#7" % REPO, worker.waits)
+
+    def test_a_private_repo_never_falls_back_to_a_public_only_lane(self):
+        self.gh.private = True
+        self.queued(7)
+        self.assign(3 * 3600, ["zai"])
+        self.assertEqual(factory._state(self.gh.issues[7]), "queued")
+
+
 def conflict_round_comment(number, ticket):
     """A loom:fix comment sending a pull request back for its conflict, in
     the shape brain.fix writes (the header names the pull request, and the
