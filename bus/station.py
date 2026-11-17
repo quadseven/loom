@@ -8848,6 +8848,12 @@ class Station:
         persisted = converge.persistent(
             converge.last_fix_body(comments, authors, (repo, pr_number)),
             failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
+        timedout_branch = self._unpersisted_timedout_branch(
+            comments, authors, repo, pr_number, sha)
+        if persisted and timedout_branch:
+            _say("%s#%d: timed-out fix round on branch %s not counted as persisted"
+                 % (repo, number, timedout_branch))
+            persisted = []
         if persisted:
             lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
             if lane is None:
@@ -8861,6 +8867,40 @@ class Station:
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
+
+    @staticmethod
+    def _unpersisted_timedout_branch(comments: List[Any], authors: set, repo: str,
+                                     pr_number: int, sha: str) -> Optional[str]:
+        """A kept timeout branch is unpushed work only when its fix brief
+        still names the current PR head and a trusted transient timeout ended
+        after that brief."""
+        allowed = {author.lower() for author in authors}
+        fix = None
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            if tickets._login(comment.get("user")).lower() not in allowed:
+                continue
+            body = str(comment.get("body") or "")
+            if (not body.startswith(tickets.FIX_MARKER)
+                    or ("Pull request: %s#%d," % (repo, pr_number)) not in body):
+                continue
+            fix = comment
+        if fix is None or Station._fix_head(str(fix.get("body") or "")) != sha:
+            return None
+        fix_time = str(fix.get("created_at") or "")
+        events = status.expand(comments, authors)
+        endings = [comment for comment in events if isinstance(comment, dict)
+                   and tickets._login(comment.get("user")).lower() in allowed
+                   and str(comment.get("created_at") or "") > fix_time
+                   and re.match(r"^Lane .+ (?:failed|stopped):", str(comment.get("body") or ""))]
+        if not endings:
+            return None
+        ending = max(endings, key=lambda comment: str(comment.get("created_at") or ""))
+        body = str(ending.get("body") or "")
+        if not re.match(r"^Lane .+ (?:failed|stopped): \[transient\] agent exited 124(?:\D|$)", body):
+            return None
+        return tickets.timedout_branch([body])
 
     @staticmethod
     def _rung_round_count(comments: List[Any], authors: set) -> int:
