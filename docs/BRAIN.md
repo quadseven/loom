@@ -654,9 +654,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
-station leaves it alone from then on; the brain decides whether it becomes a
-ticket or `needs:human`. Free rewrite models labelled factory work as
+work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
+leaves it alone from then on; the brain decides whether it becomes a ticket
+or `needs:human`. The proposed ask is no comment to a person: it is one
+routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
+which the factory's hold notes quote as the reason for the hold and the
+prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
 person-only, and every `needs:human` reaches the operator's digest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
@@ -1512,6 +1515,14 @@ to 2026-10-21, and each one emails the operator, so a new kind of comment is a
 decision, not an accident. A routine event is not a kind: it is an event in the
 ticket's status comment (`status.add`; the station's `_routine`, the factory's
 `_status_note`).
+
+A body must show a reader something. `notify.post` raises `notify.EmptyComment`
+and sends nothing when only HTML comments, empty `<details>`/`<summary>` tags
+or whitespace remain (#3200: a marker-only remote-claim comment rendered
+empty and still emailed the operator). The REST client (`GitHub.rest`) checks
+the same for every new issue, review-thread and reply comment, and the lane
+runner's answer check refuses such an answer. A record Loom reads back puts its
+marker on the first line and a plain sentence after it.
 
 To post a new comment: call `notify.post(gh, repo, number, body, notify.KIND)`.
 To add a kind: first ask whether it is a routine event (then it is a status
