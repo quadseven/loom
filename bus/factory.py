@@ -199,7 +199,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import human_claims, no_change
@@ -1994,6 +1994,13 @@ class Factory:
         # pass: it claims none of their build tickets, so a queued one is not
         # briefed (loom#3158). Their briefed build tickets come in `held`.
         self.capped = set(capped)
+        # The briefed build tickets of those repos, "owner/repo#n" (a fix
+        # round is claimed over the cap, so it is not here): their brief
+        # cannot be written, so they go back to the queue with no lane.
+        self.cap_held: Set[str] = set()
+        # "owner/repo#n" of each brief in a lane inbox: the station wrote it
+        # and the run is starting, so the ticket is not stalled.
+        self.in_inbox: Set[str] = set()
         # Lane -> seconds since its last heartbeat, for each local lane
         # without a live one; silent_running is the lanes found holding a
         # running ticket past SILENT_MAX, with those tickets.
@@ -4864,6 +4871,10 @@ class Factory:
             # rotated loom#633 through every rung with a comment each time
             # while the gate held it (2026-10-18).
             return
+        if "%s#%s" % (repo, issue["number"]) in self.cap_held:
+            self._requeue(repo, issue, "its brief cannot be written while %s is at its open "
+                          "pull request cap" % repo, counted=False)
+            return
         waiting = self.held_by(repo, issue)
         if waiting:
             # Waiting for another ticket is not this one's fault: it is not
@@ -5008,28 +5019,47 @@ class Factory:
             return
         if self._move_capped(repo, issue, comments):
             return
+        if "%s#%d" % (repo, number) in self.in_inbox:
+            return  # its brief is written and the run is starting
         old = _lane(issue)
         rung = current_rung(issue)
         lanes = self._stall_lanes(repo, issue, rung)
+        hours = (self.now - since) / 3600
         if not lanes:
-            kind = "rung" if rung else "tier"
-            self._wait_said(repo, number, "stalled on lane %s: no other lane of its %s is available"
-                            % (old, kind),
-                            "%s#%d stalled on lane %s: no other lane of its %s is available"
-                            % (repo, number, old, kind))
+            # Left briefed, it held its lane as load for days while 33 lanes
+            # idled with 79 tickets queued (2026-11-17, loom#3158): it waits
+            # in the queue instead, where any free lane can take it.
+            self._requeue(repo, issue, "briefed %.0f hours on lane %s with no claim, and no "
+                          "other lane of its %s is available" % (hours, old,
+                                                                 "rung" if rung else "tier"))
             return
         lane = pick_lane(lanes, self.load)
         waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
         if self._takes_work(old) and there and there >= waiting - 1:
             # A move to a lane with as long a wait only restarts the stall
             # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
-            # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
-            self._wait_said(repo, number, "stalled on lane %s: another lane of its %s waits as long"
-                            % (old, "rung" if rung else "tier"),
-                            "%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
-                            % (repo, number, old, lane, there, waiting))
+            # hours unclaimed (2026-10-21). It goes back to the queue.
+            self._requeue(repo, issue, "briefed %.0f hours on lane %s with no claim, and lane "
+                          "%s waits as long" % (hours, old, lane))
             return
-        self._move_stalled(repo, issue, lane, (self.now - since) / 3600, rung)
+        self._move_stalled(repo, issue, lane, hours, rung)
+
+    def _requeue(self, repo: str, issue: Dict[str, Any], why: str, counted: bool = True) -> None:
+        """Return a briefed ticket no lane will run to loom:queued with no lane
+        label, so it stops counting as its lane's load; assign_queued gives it
+        a free lane later. Not a failure: no rung marker. `counted` says the
+        ticket was counted as load this pass."""
+        number, old = int(issue["number"]), _lane(issue)
+        kept = stale_claims.without_own_claim(
+            [x for x in _labels(issue) if x != "loom:briefed" and not x.startswith("lane:")],
+            brain.trusted_authors())
+        self._relabel(repo, issue, kept + ["loom:queued"])
+        self._status_note(repo, number, "Not a failure (%s): the factory put this ticket "
+                                        "back to the queue, with no lane." % why)
+        if counted:
+            self.load[old] = self.load.get(old, 0) - 1
+        self.actions += 1
+        _say("requeued briefed %s#%d off lane %s: %s" % (repo, number, old, why))
 
     def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
                       hours: float, rung: int) -> None:
@@ -5243,7 +5273,8 @@ class Factory:
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for repo, issue in ((r, i) for r, found in tickets.items() for i in found.values()):
-            if "%s#%s" % (repo, issue["number"]) in self.held:
+            key = "%s#%s" % (repo, issue["number"])
+            if key in self.held or key in self.cap_held:
                 continue
             if (_state(issue) in ("briefed", "running")
                     or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
