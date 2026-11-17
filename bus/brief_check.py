@@ -23,7 +23,10 @@ Before the station hands a ticket to a lane (`check`), it reads:
   the ticket to a verify run. A stale ticket goes back to the queue with
   `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
-  hold it again. A recorded decision by a configured person beside blocked
+  hold it again. New asks fingerprint the body: a later verified person
+  removal of the ask label settles all stale evidence for that same body,
+  until its text changes. Legacy asks keep their evidence-only behavior.
+  A recorded decision by a configured person beside blocked
   or awaiting-live-check, or a non-person Blocked on section beside those
   labels, keeps waiting work held before stale-evidence reads. A stale event
   wait without the label gets blocked once. This neither approves a build
@@ -80,6 +83,9 @@ AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
+BODY_MARKER = "<!-- loom:stale-body %s -->"
+BODY_MARKER_RE = re.compile(r"<!-- loom:stale-body ([0-9a-f]{64}) -->")
+PERSON_ASK_LABELS = {"loom:human", "needs:human", "needs-operator"}
 # An evidence key the marker carries as it is: a word and a number or hex
 # stamp, which holds no repository reference. Any other key (a pull
 # request key names its repo) is written as a hash of itself, because the
@@ -450,6 +456,59 @@ def asked(comments: Iterable[Mapping[str, Any]], trusted: Iterable[str]) -> set:
             for key in ASK_MARKER_RE.findall(str(c.get("body") or ""))}
 
 
+def _matching_ask_stamp(issue: Mapping[str, Any],
+                        comments: Sequence[Mapping[str, Any]],
+                        trusted: Sequence[str]) -> float:
+    """Return the latest ask timestamp only when its body fingerprint matches."""
+    allowed = {x.lower() for x in trusted}
+    asks = [c for c in comments if _login(c).lower() in allowed
+            and ASK_MARKER_RE.search(str(c.get("body") or ""))]
+    if not asks:
+        return 0.0
+    latest = max(asks, key=lambda c: (_ts(c.get("created_at")), int(c.get("id") or 0)))
+    stamp = max(_ts(latest.get("created_at")), _ts(latest.get("updated_at")))
+    digest = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()
+    if stamp <= 0 or digest not in BODY_MARKER_RE.findall(str(latest.get("body") or "")):
+        return 0.0
+    return stamp
+
+
+def _latest_ask_label_change(gh: Any, repo: str,
+                             issue: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read the last ask-label transition without reusing an older removal."""
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+    changes = [e for e in events if isinstance(e, dict)
+               and e.get("event") in {"labeled", "unlabeled"}
+               and (e.get("label") or {}).get("name") in PERSON_ASK_LABELS]
+    if not changes:
+        return {}
+    last = max(changes, key=lambda e: (_ts(e.get("created_at")), int(e.get("id") or 0)))
+    return last
+
+
+def settled_body(gh: Any, repo: str, issue: Mapping[str, Any],
+                 comments: Sequence[Mapping[str, Any]], trusted: Sequence[str]) -> bool:
+    """A verified person removed the latest ask for exactly this body.
+
+    Legacy asks have no fingerprint and cannot establish a body-wide waiver.
+    This suppresses stale evidence only, never another kind of build hold.
+    """
+    names = {x.get("name") if isinstance(x, dict) else x
+             for x in issue.get("labels", [])}
+    if names & PERSON_ASK_LABELS:
+        return False
+    stamp = _matching_ask_stamp(issue, comments, trusted)
+    if stamp <= 0:
+        return False
+    last = _latest_ask_label_change(gh, repo, issue)
+    actor = last.get("actor") or {}
+    if (last.get("event") != "unlabeled" or _ts(last.get("created_at")) <= stamp
+            or decision_claim.is_bot(actor)
+            or str(actor.get("login") or "").lower() not in decision_claim.person_logins(trusted)):
+        return False
+    return str(actor.get("login") or "").lower() != decision_claim.client_login(gh).lower()
+
+
 def operator_done(comments: Sequence[Mapping[str, Any]], operator: str) -> Optional[Verdict]:
     """The operator's newest comment, when it says the work is done or
     superseded."""
@@ -739,6 +798,8 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
              lambda: merged_linked(gh, repo, issue, comments, trusted),
              lambda: already_built(gh, repo, body, branch))
     try:
+        if settled_body(gh, repo, issue, comments, trusted):
+            return split if split is not None else criteria
         for read in reads:
             found = read()
             if found is not None and not was_asked(found.key, done):
@@ -748,10 +809,13 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     return split if split is not None else criteria
 
 
-def ask(verdict: Verdict) -> str:
+def ask(verdict: Verdict, body: Optional[str] = None) -> str:
     """The one ask for a stale ticket."""
+    marker = ASK_MARKER % marker_key(verdict.key)
+    if body is not None:
+        marker += "\n" + BODY_MARKER % hashlib.sha256(body.encode("utf-8")).hexdigest()
     return ("Kind: decision\n%s\nThis ticket did not go to a build lane: %s. A lane that "
             "builds a stale ticket rewrites working code to match it. Close the ticket if "
             "its work is done, or rewrite it to what is still missing and remove "
             "`needs:human`; this evidence will not hold it again."
-            % (ASK_MARKER % marker_key(verdict.key), verdict.reason))
+            % (marker, verdict.reason))
