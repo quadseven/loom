@@ -1356,8 +1356,12 @@ The loom home is kept bounded by the station and the runner (loom#643).
   meanwhile. The state is kept in `state/station/disk-guard.json`.
 - Before that floor, the disk watchdog (`bus/disk_watchdog.py`, loom#3187)
   acts. Once the disk has less than `LOOM_DISK_WATCHDOG_GB` free (default 25;
-  0 turns it off), at most every 5 minutes, it clears Loom's own data in this
-  order and stops as soon as the disk is back above that: lane logs and
+  0 turns it off), at most every 5 minutes, it frees space in this order and
+  stops as soon as the disk is back above that: on macOS, Time Machine local
+  snapshots (`com.apple.TimeMachine.<date>.local`, oldest first, through
+  `tmutil deletelocalsnapshots`; deleted files free nothing while a snapshot
+  holds them, and no other snapshot such as `com.apple.os.update-*` is
+  touched; `LOOM_THIN_SNAPSHOTS=0` keeps them); then Loom's own data: lane logs and
   rotated service logs unchanged for 7 days (moved to
   `LOOM_DISK_ARCHIVE_DIR` when that folder is mounted, else compressed in
   place); idle lanes' run scratch (`-check`, `-check-default`, `-tmp`,

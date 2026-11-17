@@ -8623,6 +8623,22 @@ class DiskWatchdogTest(Base):
             self.tend(20 * 1024 ** 3)
         self.assertTrue(os.path.isdir(check))
 
+    def test_time_machine_snapshots_follow_the_thin_setting(self):
+        calls = []
+
+        def tmutil(args):
+            calls.append(list(args))
+            return 1, "", "no"
+        fake = station.disk_watchdog.TimeMachine(tmutil)
+        with mock.patch.object(station.disk_watchdog.TimeMachine, "for_host", return_value=fake):
+            runner, _ = self.tend(20 * 1024 ** 3)
+            self.assertEqual(calls, [])
+            self.settings.thin_snapshots = True
+            os.remove(os.path.join(runner.state, station.DISK_WATCH_FILE))
+            _, said = self.tend(20 * 1024 ** 3)
+        self.assertEqual(calls, [["listlocalsnapshots", "/"]])
+        self.assertTrue(any("Time Machine" in s for s in said), said)
+
     def test_the_lane_status_says_when_the_floor_is_out_of_reach(self):
         runner, _ = self.tend(5 * 1024 ** 3)
         self.assertIn("Disk watchdog: Loom's own data is cleared", runner._lanes_body([]))
