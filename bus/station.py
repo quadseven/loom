@@ -15875,10 +15875,16 @@ class Station:
         if not self.s.factory_on or not factory.due(self.state, self.now):
             return
         runner = self._factory()
-        runner.run()
+        try:
+            runner.run()
+        finally:
+            # A silent-lane move is already made on GitHub when the step
+            # carries over at the request target, so its record and its
+            # brief's return run either way; on 2026-11-07 every one of
+            # twelve moves was lost to a carry-over (loom#2094).
+            self._record_silent(runner.silent_running, runner.silent)
+            self._return_silent_briefs(runner.silent_running)
         self._record_waits(runner.waits, runner.settled)
-        self._record_silent(runner.silent_running, runner.silent)
-        self._return_silent_briefs(runner.silent_running)
 
     def lift_brain_holds(self) -> None:
         """Resolve the needs-brain holds older than a day that Loom set
