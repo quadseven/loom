@@ -878,9 +878,11 @@ only what is its own, and adding an operator is configuration:
   Loom's like any unowned one. A label removal sends no email.
 - A person's session may claim by assignment and a comment instead of a
   label (`bus/human_claims.py`). `LOOM_HUMAN_CLAIMS` names each such claim as
-  `<login>:<phrase>`, entries split by `;`; unset is the built-in default and
-  `off` turns it off. An issue assigned to that login, or with a comment by
-  that login carrying the phrase (any case), is never taken: the
+  `<login>:<phrase>|<phrase>`, entries split by `;`, where `*` in a phrase is
+  any short text on one line. Unset is the built-in default, which takes the
+  session's hidden claim marker or "Claimed by <anyone>'s Claude Code"; `off`
+  turns it off. An issue assigned to that login, or with a comment by that
+  login carrying one of its phrases (any case), is never taken: the
   ready-for-agent intake, brain triage, a brief that rewrites it, a lane claim,
   the factory's lane assignment, the hand-off pool return and conflict
   recovery all skip it. The comments are read only for an issue about to be

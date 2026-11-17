@@ -11,7 +11,7 @@ from unittest import mock
 
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
-from bus import brain, claimed, factory, human_claims, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
@@ -3268,7 +3268,7 @@ class Queued(Base):
 
     def human_claim(self, number):
         # A second operator's session claims by a comment carrying its phrase.
-        phrase = human_claims.DEFAULT.split(":", 1)[1]
+        phrase = "Claimed by ccqw's Claude Code"
         self.gh.comments[number].append({"user": {"login": "ccqw"}, "body": phrase})
         self.gh.issues[number]["comments"] = len(self.gh.comments[number])
 
