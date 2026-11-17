@@ -1268,7 +1268,8 @@ def _repo_cap_refusal(gh: GitHub, repo: str, caps: Optional[Dict[str, str]],
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                     ticket: Optional[Tuple[str, int]],
                     caps: Optional[Dict[str, str]] = None,
-                    now: Optional[datetime] = None) -> List[str]:
+                    now: Optional[datetime] = None,
+                    env: Optional[Dict[str, str]] = None) -> List[str]:
     """What bus.brain merge would refuse a READY pull request for, read with
     the functions merge uses (loom#1643): its ticket's state, a conflict,
     a risk tier held for the operator, and the hourly merge cap."""
@@ -1300,8 +1301,18 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     except ValueError as err:
         found.append(str(err))
         return list(merge_verdict.decide(pr, issue, found, ("operator",)).blockers)
-    if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
+    auto_tiers = merge_tier.auto_tiers(env)
+    if tier != merge_tier.REVERT and tier not in auto_tiers:
         found.append("held for the operator: %s" % tier)
+    elif tier in auto_tiers:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        check = review_check_name(env)
+        passed = bool(sha and _review_check_passed(gh, repo, sha, check))
+        details = {} if passed else _pr_graphql(gh, repo, number)
+        luna = bool(not passed and _luna_stands_in(
+            gh, repo, number, details, env, _pr_author(pr)))
+        if not passed and not luna:
+            found.append("review check %s not success on head" % check)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
