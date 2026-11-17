@@ -18,7 +18,7 @@ lane-no-success stays one issue per lane: the station reads its per-lane keys
 to release runaways a dead lane held.
 
 The kinds in ROLLED (lane-pr-stalled, plan-check-failed, epic-over-cap,
-epic-title-shared) restate state the pull request, the epic or the dashboard
+epic-title-shared, closed-epic-open-tickets, goal-epics-over-cap) restate state the pull request, the epic or the dashboard
 already shows, so they file no issue per violation
 (loom#2099: 185 such tickets in 7 days). The filer folds each kind's breaches
 into one tracking issue per (kind, subject repo), titled "Invariant: <kind> in
@@ -89,6 +89,10 @@ RUNS_MIN = 5
 # expired key, is failing now even with a success earlier in the day.
 FAILING_STREAK = 5
 HELD_MAX = 2 * 3600
+# A base-check incident open this long with no base-check run since its last
+# repeat, past two probe intervals, is one nothing re-checks (loom#3084).
+INCIDENT_OPEN_MAX = DAY
+INCIDENT_PROBE_GRACE = 2 * 3600
 # A gate that has refused a goal's briefed tickets for this long gets its own
 # invariant naming it (loom#564).
 GATE_HOLD_MAX = 3600
@@ -207,7 +211,8 @@ SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
 # already shows: one tracking issue per (kind, subject repo), its list edited
 # in place, instead of one issue per violation (loom#2099). The settle path
 # above now only closes per-violation issues filed before this.
-ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared")
+ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared",
+          "closed-epic-open-tickets", "goal-epics-over-cap")
 ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
 ROLL_TITLE = "Invariant: %s in %s"
 ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
@@ -265,6 +270,12 @@ ROLL_HINTS = {
     EPIC_OVER_CAP: "Each epic here holds more than its cap; new work goes into a next epic.",
     "epic-title-shared": "The epics on each line share one title; give each a distinct title, "
                          "and move the tickets of the older ones under one.",
+    "closed-epic-open-tickets": "Each closed epic here still holds open tickets; the station's "
+                                "outside-epic pass moves them under an open intake epic of "
+                                "their goal, or reopen the epic.",
+    "goal-epics-over-cap": "Each goal home here has more open epics than its cap; finish an "
+                           "epic before opening another, or record a one-time exception on "
+                           "the goal home.",
 }
 
 Say = Callable[[str], None]
@@ -388,6 +399,17 @@ class SilentRun(NamedTuple):
     at: float
 
 
+class Incident(NamedTuple):
+    """An open base-check factory incident the station probes (loom#3084):
+    when it was filed, when a base check last failed on it (its repeat
+    comment's last edit, else its filing), and when a station probe last
+    finished, None for never."""
+    incident: Ref
+    opened: float
+    repeat: float
+    ran: Optional[float]
+
+
 class Event(NamedTuple):
     at: float
     kind: str
@@ -450,6 +472,8 @@ class Facts:
     # Open tickets carrying loom:queued and a lane: label whose body parses
     # to no brief headers: no lane can ever claim them.
     headerless: Optional[List[Ref]] = None
+    # Each open base-check incident the station probes (loom#3084).
+    incidents: Optional[List[Incident]] = None
 
 
 @dataclass(frozen=True)
@@ -799,7 +823,10 @@ def goal_epics_over_cap(f: Facts) -> List[Breach]:
                               ("Open epics: %s" % _refs(opened),
                                "Finish an epic before opening another, or record a one-time "
                                "exception on the goal home"),
-                              f.now))
+                              f.now,
+                              line="Goal home %s: %d open epics (cap %d), %s" % (
+                                  shape.goal.label, len(opened), shape.cap, _refs(opened)),
+                              where=_where(shape.goal)))
     return out
 
 
@@ -812,7 +839,11 @@ def closed_epic_open_tickets(f: Facts) -> List[Breach]:
                                                             len(epic.open_tickets)),
                    ("Open tickets under it: %s" % _refs(epic.open_tickets),
                     "Reopen the epic, or move the tickets under an open one"),
-                   f.now)
+                   f.now,
+                   line="Closed epic %s of goal home %s: %d open tickets, %s" % (
+                       epic.epic.label, shape.goal.label, len(epic.open_tickets),
+                       _refs(epic.open_tickets)),
+                   where=_where(epic.epic))
             for shape in f.shapes for epic in shape.epics
             if not epic.open and epic.open_tickets]
 
@@ -1113,6 +1144,29 @@ def queued_ticket_no_headers(f: Facts) -> List[Breach]:
             for ref in f.headerless]
 
 
+def incident_unprobed(f: Facts) -> List[Breach]:
+    """A base-check incident open over INCIDENT_OPEN_MAX with no base-check
+    run since its last repeat, once the probe has had INCIDENT_PROBE_GRACE
+    to run one: it holds its repo's tickets and closes only on a pass, so
+    nothing will close it (loom#3084: three repos sat frozen for days)."""
+    if f.incidents is None:
+        return []
+    return [Breach("incident-unprobed", i.incident.key,
+                   "Factory incident %s has had no base-check run for %s"
+                   % (i.incident.label, _hours(f.now - i.repeat)),
+                   ("Factory incident %s is open %s and has had no base-check run since its "
+                    "last repeat at %s" % (i.incident.label, _hours(f.now - i.opened),
+                                           utc(i.repeat)),
+                    "It holds its repo's tickets and closes only when a base check passes",
+                    "Check that a free local lane takes the station's base-check brief, or "
+                    "close the incident once the default branch's check passes"),
+                   i.repeat)
+            for i in f.incidents
+            if f.now - i.opened > INCIDENT_OPEN_MAX
+            and (i.ran is None or i.ran < i.repeat)
+            and f.now - i.repeat > INCIDENT_PROBE_GRACE]
+
+
 def merged_not_shipped(f: Facts) -> List[Breach]:
     """Tickets still at loom:merged MERGED_UNSHIPPED_AFTER after a ship rule
     found their merge commit deployed: the move to loom:shipped failed, and
@@ -1203,7 +1257,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
     untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
-    guard_unreadable, queued_ticket_no_headers)
+    guard_unreadable, queued_ticket_no_headers, incident_unprobed)
 
 
 def check(facts: Facts, say: Say,
@@ -1281,7 +1335,8 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
 # The Facts field each ROLLED kind reads: a pass that could not read it says
 # nothing about that kind, so its tracking issue is left as it is.
 ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
-                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes"}
+                EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes",
+                "closed-epic-open-tickets": "shapes", "goal-epics-over-cap": "shapes"}
 
 
 def read_kinds(facts: Facts) -> Tuple[str, ...]:

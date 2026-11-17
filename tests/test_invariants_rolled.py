@@ -281,6 +281,34 @@ class RolledKindTest(unittest.TestCase):
         self.assertIn("- Open epics with one title: #40, #41 (since %s)" % stamp(T0),
                       issue["body"])
 
+    def test_closed_epics_holding_open_tickets_are_one_tracking_issue_with_a_line_each(self):
+        # loom#2099: closed-epic-open-tickets filed one issue per closed epic.
+        t = lambda n: Ref("%s#%d" % (REPO, n), "#%d" % n)  # noqa: E731
+        shape = invariants.GoalShape(Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL), 6, (
+            invariants.EpicShape(Ref("%s#40" % REPO, "#40"), False, 3, (t(70), t(71))),
+            invariants.EpicShape(Ref("%s#41" % REPO, "#41"), False, 2, (t(72),)),
+            invariants.EpicShape(Ref("%s#42" % REPO, "#42"), True, 2, (t(73),))), ())
+        self.file(invariants.closed_epic_open_tickets(Facts(T0, shapes=[shape])))
+        (issue,) = self.gh.issues.values()
+        self.assertEqual(issue["title"], "Invariant: closed-epic-open-tickets in %s" % REPO)
+        self.assertIn("- Closed epic #40 of goal home #%d: 2 open tickets, #70, #71 (since %s)"
+                      % (GOAL, stamp(T0)), issue["body"])
+        self.assertIn("- Closed epic #41 of goal home #%d: 1 open tickets, #72" % GOAL,
+                      issue["body"])
+        self.assertNotIn("#42", issue["body"])
+
+    def test_goals_over_their_epic_cap_are_one_tracking_issue_with_a_line_each(self):
+        def goal(number, epics):
+            return invariants.GoalShape(Ref("%s#%d" % (REPO, number), "#%d" % number), 1, tuple(
+                invariants.EpicShape(Ref("%s#%d" % (REPO, e), "#%d" % e), True, 1, ())
+                for e in epics), ())
+        shapes = [goal(GOAL, (40, 41)), goal(GOAL + 1, (50, 51, 52))]
+        self.file(invariants.goal_epics_over_cap(Facts(T0, shapes=shapes)))
+        (issue,) = self.gh.issues.values()
+        self.assertEqual(issue["title"], "Invariant: goal-epics-over-cap in %s" % REPO)
+        self.assertIn("- Goal home #%d: 2 open epics (cap 1), #40, #41" % GOAL, issue["body"])
+        self.assertIn("- Goal home #%d: 3 open epics (cap 1)" % (GOAL + 1), issue["body"])
+
     def test_a_pull_request_stalls_past_a_day_not_past_six_hours(self):
         self.assertEqual(invariants.PR_STALLED, 24 * 3600)
         self.assertEqual(self.stalled([self.pull(201, opened=T0 - 23 * 3600)]), [])

@@ -56,6 +56,68 @@ class RepoPrCapTest(Base):
             runner.claim_new()
         self.assertEqual(runner._gate_held(), [])
 
+    def try_ticket(self):
+        """One claim pass's look at ticket 12 for lane codex, with fresh
+        station memory, and the requests it sent."""
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.fake.calls.clear()
+        # As the briefed poll hands it over (Station._poll).
+        issue = dict(self.fake.issues[12], repository_url="https://api.github.com/repos/" + REPO)
+        took = runner._try_ticket(REPO, "codex", issue, ["codex"])
+        return runner, took, list(self.fake.calls)
+
+    def per_ticket_reads(self, calls):
+        """The reads a claim spends on ticket 12 itself before it can be held:
+        its trust events, its editor, its fresh issue and the closed pull
+        requests a verify-before-build check lists (loom#3119)."""
+        return [(m, p) for m, p in calls
+                if p in ("/repos/%s/issues/12" % REPO, "/graphql")
+                or p.startswith("/repos/%s/issues/12/events" % REPO)
+                or (p.startswith("/repos/%s/pulls?" % REPO) and "state=closed" in p)]
+
+    def test_cap_held_ticket_already_told_costs_no_per_ticket_read(self):
+        # loom#3119: 61 of 98 briefed tickets sat in two repos over the cap,
+        # and every pass spent the trust, issue and merged-PR reads on each
+        # one before the cap held it, so the claim share ran out first.
+        self.pulls(9)
+        self.fake.add(12)
+        _, took, _ = self.try_ticket()
+        self.assertFalse(took)
+        self.assertIn("9 open pull requests (cap 8)", str(self.fake.comments[12]))
+        runner, took, calls = self.try_ticket()
+        self.assertFalse(took)
+        self.assertEqual(self.per_ticket_reads(calls), [])
+        self.assertEqual(self.fake.paths("POST") + self.fake.paths("PATCH")
+                         + self.fake.paths("PUT"), [])
+        self.assertEqual(runner._gate_held(), ["%s#12" % REPO])
+        self.assertEqual(self.listing(), [])
+
+    def test_changed_cap_count_takes_the_full_path_and_restates_the_hold(self):
+        self.pulls(9)
+        self.fake.add(12)
+        self.try_ticket()
+        self.pulls(10)
+        _, took, _ = self.try_ticket()
+        self.assertFalse(took)
+        self.assertIn("10 open pull requests (cap 8)", str(self.fake.comments[12]))
+
+    def test_fix_round_over_cap_is_not_held_early(self):
+        self.pulls(9)
+        self.fake.add(12)
+        self.try_ticket()
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, took, _ = self.try_ticket()
+        self.assertTrue(took)
+        text = Path(self.inbox("codex", self.listing()[0])).read_text()
+        self.assertIn("Fix-PR: 99", text)
+
+    def test_under_cap_ticket_still_reads_its_trust(self):
+        self.pulls(7)
+        self.fake.add(12)
+        _, took, calls = self.try_ticket()
+        self.assertTrue(took)
+        self.assertTrue(self.per_ticket_reads(calls))
+
     def test_ticket_under_cap_still_counts_as_load(self):
         self.pulls(7)
         runner, claimed = self.claim()

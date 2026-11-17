@@ -17,6 +17,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
+  (Before a brief is written, the factory may take a default pin off a
+  queued ticket whose model had no free lane for `LOOM_PIN_FALLBACK_MINUTES`;
+  docs/BRIEF_FORMAT.md says which pins are hard.)
   Account-wide out-of-credit limits still hold the lane. The heartbeat names
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
@@ -169,6 +172,32 @@ unset variables.
   Environment incidents describe the machine that filed them and still close
   only from that machine's own file. A private repo's incident title carries
   a per-host alias, so it still closes only from the host that filed it.
+- An open base-check incident holds every ticket of its repo, so no ticket
+  run would ever check that repo again (loom#3084). While an incident holds
+  tickets, the station gives one free local lane (never a cluster runner
+  slot) a `Deliverable: base-check` brief for the repo at most once an hour:
+  `Repo:`, a `loom/base-check-<time>` branch, no `Issue:` and no `Base:`,
+  and `Incident:` naming the incident. The runner clones the default
+  branch, runs setup and the base check only, and runs no agent: a pass
+  closes the incident through the close path above and the station
+  re-queues the held tickets, and a fail updates the incident's repeat
+  count and parks the brief. The runner stamps the brief
+  `Base-check-exit: <code>` only when the check ran, and the station counts
+  a probe as run on that stamp alone; a repo with no validation contract
+  parks the brief with no stamp, since nothing was checked. Nothing is posted on any ticket. The station
+  reads each held incident and its comments at most once an hour and keeps
+  `state/station/incident_probe.json` (`bus/incident_probe.py`).
+- The incident's fix is not held by it. When that hourly read finds a held
+  ticket whose body (its status section aside) names the incident, as
+  `owner/name#N`, `name#N`, its URL or a `Repairs incident: #N` header, or
+  a comment on the incident other than the runner's repeat count has a line
+  `Fix: <ref>` naming the ticket (a mention in passing names no fix), the
+  station adds `Repairs incident: #N` to the ticket's header
+  block and moves it back to `loom:queued` on its lane. Its run then passes
+  the red base only if its final check passes (docs/BRIEF_FORMAT.md). The
+  repo's other tickets stay held. The factory repo is public, so only
+  comments by a `LOOM_BRIEF_AUTHORS` login count, for the fix and for the
+  last repeat alike: a stranger's comment lifts no hold.
 - A base check red only on the lane host is not a broken default branch.
   The runner treats a fresh red base run (exit 1 to 123, after its second
   run) as host-only red when all of these hold: GitHub's own check runs on
@@ -796,7 +825,12 @@ At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
 line and a link; a count of the goal homes where nothing moved; one line
 per backlog goal home (labelled `loom:backlog`), counted from its tickets,
-since a backlog goal posts no report on GitHub; and the
+since a backlog goal posts no report on GitHub; one line counting the lane
+pull requests (head `loom/...`) merged since the last digest by actor:
+factory (the station's own App login, or `LOOM_GITHUB_LOGIN`), brain
+(another App login in `LOOM_BRIEF_AUTHORS`) and other (a person or an
+outside session), read by GraphQL newest update first until the window ends
+(at most 10 pages a repo; a repo whose read fails is named); and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
@@ -850,6 +884,19 @@ only what is its own, and adding an operator is configuration:
   theirs names it, the station removes the claim label and unassigns them,
   at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
   Loom's like any unowned one. A label removal sends no email.
+- A person's session may claim by assignment and a comment instead of a
+  label (`bus/human_claims.py`). `LOOM_HUMAN_CLAIMS` names each such claim as
+  `<login>:<phrase>|<phrase>`, entries split by `;`, where `*` in a phrase is
+  any short text on one line. Unset is the built-in default, which takes the
+  session's hidden claim marker or "Claimed by <anyone>'s Claude Code"; `off`
+  turns it off. An issue assigned to that login, or with a comment by that
+  login carrying one of its phrases (any case), is never taken: the
+  ready-for-agent intake, brain triage, a brief that rewrites it, a lane claim,
+  the factory's lane assignment, the hand-off pool return and conflict
+  recovery all skip it. The comments are read only for an issue about to be
+  taken that has any, once per issue state. No reaper releases such a claim:
+  the stale-claim release never unassigns that login, and the claim referee
+  leaves every claim on such an issue.
 - A Loom's own claim lapses too. The same hourly step reads each open ticket
   carrying this Loom's `claim:<login>` label and a Loom label (`loom:*`,
   `wait:*` or `needs-brain`). When it is not `loom:running`, nothing on its
@@ -921,6 +968,17 @@ body, and none is named by a "Rewritten as ticket #N" or "Briefed as #N"
 comment on the issue. `loom:triage` and `loom:rewritten` alone do not hold
 an issue. An issue whose covering ticket is closed or merged is listed apart,
 to verify and close; so is a `loom:rewritten` issue whose ticket is not found.
+
+Other brains and people mark an issue ready for an agent with the
+`ready-for-agent` label. Once an hour the station reads the open issues
+carrying it in each `LOOM_REPOS` repo, oldest first, and gives `loom:triage`
+to each that carries no `loom:` label, has no assignee and no `claim:` label,
+and is not an epic, goal home or other issue triage skips
+(`intake_ready_for_agent`, loom#3092). The brain then triages it like any
+other issue: the label never skips triage. At most 20 issues a run
+(`READY_PER_RUN`), and the run stops when the pass's request budget is spent.
+It writes no comment and logs one line a run with the count. A run in which
+a repo read failed does not count toward the hour, so the next pass retries.
 
 Each Loom sets these for itself when it installs; a second operator running
 from a clone of another operator's checkout must not inherit them:
@@ -1388,6 +1446,29 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Standing by for another station
+
+The lease cannot stop a station that does not use it: one started by launchd
+on a host that was asleep, on the file backend. So every station also reads
+and writes a signal on the lane status issue (`bus/station_beat.py`), with the
+GitHub credentials it already has.
+
+- At the start of each pass a station edits one beat comment (created on the
+  first pass). A station that finds another station's beat younger than five
+  minutes logs "another station is running; standing by", runs no pass and
+  writes no beat. Freshness is the comment's own `updated_at`, so no two
+  clocks are compared.
+- The lane table carries a `Station:` stamp. A station on the lease also
+  stands by when the table was written in the last 20 minutes by a station
+  that did not stamp it with its own tag. Code from before this guard writes
+  an unstamped table and no beat, so this is how the cluster station yields to
+  a woken old station. A running station republishes the table at least every
+  15 minutes, so after the old station stops the cluster station resumes within
+  20 minutes.
+- A station is named on GitHub only by a short hash of its `LOOM_STATION_ID`.
+  A read that fails lets the pass run. `LOOM_STATION_GUARD=0` turns the guard
+  off.
+
 ## Paused steps
 
 `LOOM_PAUSED_STEPS` holds named pass steps (loom#1630): a space-separated list
@@ -1551,6 +1632,9 @@ Each invariant is one function returning breaches with evidence:
   commit deployed, because the move to `loom:shipped` failed
   (`merged-not-shipped`, one rolling issue, a line per ticket; docs/BRAIN.md,
   Shipping through a downstream roll).
+- A base-check incident open over 24 hours with no base-check run since its
+  last repeat, two hours after that repeat (`incident-unprobed`, one issue
+  per incident): the probe above is not reaching it.
 - The newest Loom review journal is over 7 days old (`review-overdue`), a
   guard ticket closed with no merged pull request that changes a test
   (`guard-no-check`), or a guard ticket unreadable after 5 tries
@@ -1998,6 +2082,82 @@ the pull request land, a blocking one sends it back through the ordinary
 fix rounds. A dispatched review that produces no verdict is dispatched
 again after an hour.
 
+## The review sweep: independent reviews by the reviewer Apps
+
+The sweep is off. Review is `grug`'s alone: the `Grug - Elder` check is the
+one reviewer on every repo (operator decision, 2026-11-16).
+`Config.from_env` leaves the sweep off unless the station environment sets
+`LOOM_REVIEW_SWEEP=on`, and the installer does not set it, so no pull
+request goes to a review lane. The code and the settings below stay for a
+later decision; they describe what the sweep does once turned on.
+
+The station's `sweep_reviews` duty (`bus/review_sweep.py`) gives open pull
+requests an independent review without waiting for a brain to ask. At most
+once per `LOOM_REVIEW_SWEEP_EVERY` seconds it lists the open, non-draft
+pull requests of each `LOOM_REPOS` repo and dispatches at most
+`LOOM_REVIEW_SWEEP_PER_RUN` review briefs. It waits while the GitHub
+budget is low or the pass request target is reached, like the other
+deferrable duties. A pull request from a fork is skipped: a lane cannot
+check its branch out.
+
+A pull request qualifies when all of these hold:
+
+- Its head commit is older than `LOOM_REVIEW_SWEEP_HOURS`.
+- No required check of its base branch (the branch rules) has a run on the
+  head that is still queued or in progress.
+- No fleet reviewer App (`LOOM_FLEET_REVIEWERS`) has a verdict on the head:
+  an `APPROVED` or `CHANGES_REQUESTED` review on that commit, or a
+  `<!-- fleet:review v1 verdict=APPROVE|REQUEST_CHANGES head=<sha> -->`
+  marker for that sha in a review or a comment.
+- No sweep review of that head was dispatched within
+  `LOOM_REVIEW_SWEEP_RETRY` seconds.
+
+A stale block also qualifies, before the age bound: a fleet reviewer App's
+`CHANGES_REQUESTED` on an older commit keeps the pull request blocked on
+GitHub after its fix is pushed, so the new head is reviewed.
+
+Each qualifying pull request goes to the first lane in `LOOM_REVIEW_LANES`
+that is not held after transient failures, has a fresh heartbeat, and
+whose reviewer App did not write the pull request. A scorecard demotion
+does not stop a review: it judges the lane's builds, and a review is not
+one; a stale block goes first to the lane of the App that blocked,
+since only that App's new review replaces its block. The brief is the Luna
+review brief with `Review-Mode: sweep`; a codex slot is pinned to
+`gpt-6-luna`, and agy runs its own model. The station records each
+dispatch (brief name, lane, pull request, head) in its state, and that
+record, not the brief's text, makes a finished run a sweep run: a pull
+request body copied into the brief cannot choose the posting mode, and
+the pull request and head are read from the brief's header block only and
+must match the record. A sweep verdict counts only from the lane the
+record names, running that lane's model: `gpt-6-luna` on a codex slot,
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
+a degraded-Elder Luna run and counts only from the `codex-2` slot on
+`gpt-6-luna`.
+
+The verdict is posted as one formal review on the head commit by the
+lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
+with no blocking finding, else `REQUEST_CHANGES` with each blocking finding
+that names a file and a line as a review comment. The body carries the
+summary, every finding and the `fleet:review` marker line. The station
+mints the App's installation token from SSM
+(`/fleet/github-apps/<slug>/app_id` and `/fleet/github-apps/<slug>/private_key`,
+for the App's first installation) and never logs it. When the token cannot
+be minted, nothing is posted and the station logs one line; the next sweep
+dispatches the head again after the retry window. Shadow mode holds an
+approving review, so a held `APPROVE` lands as a comment by the same App
+with the same marker. A reviewer App never reviews a pull request its own
+App wrote.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LOOM_REVIEW_SWEEP_EVERY` | 900 | Seconds between sweeps; 0 turns the sweep off. |
+| `LOOM_REVIEW_SWEEP_HOURS` | 2 | Hours a head must age before it is reviewed. |
+| `LOOM_REVIEW_SWEEP_PER_RUN` | 6 | Review briefs a sweep dispatches at most. |
+| `LOOM_REVIEW_SWEEP_RETRY` | 14400 | Seconds before a head with no verdict is dispatched again. |
+| `LOOM_REVIEW_LANES` | `codex-2 agy` | Review lanes, in order of preference. |
+| `LOOM_REVIEW_APPS` | `codex-2=agent-openai-codex-luna agy=agent-google-gemini` | The reviewer App that posts each lane's verdict. |
+| `LOOM_FLEET_REVIEWERS` | `agent-meta-muse agent-openai-codex-luna agent-google-gemini agent-openai-dot agent-xai-grok` | The Apps whose verdict counts as independent. |
+
 ## opencode/ - volume
 
 - Tool: headless opencode runs. Providers configured in `config.json`:
@@ -2315,7 +2475,9 @@ image (a fingerprint of the image's packages and tools, `<ticket>.image`).
 When the last failure exited 125 to 127 (the check could not run: a tool the
 image lacks, such as `ruff`), a moved head does not lift the stop, because no
 commit on the repo can add a tool to the image; only a new image or the day
-probe below does. One run records two failures, because a red check runs twice. A failed `setup:`
+probe below does. A red check runs twice, so one run of it records two
+failures. A check that cannot start records one row, so it stops the repo on
+that slot after one run, since no retry can add the tool. A failed `setup:`
 counts too. A check that passed on its second run counts for nothing, and only
 a fix round's default-branch rows count. A day with no report from the slot
 lets one run through, because only a run can show a new image.

@@ -18,7 +18,7 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
@@ -967,9 +967,23 @@ def _names_sha(body: str, sha: str) -> bool:
                              for m in _SHA_WORD.finditer(body))
 
 
+def _carries_marker(body: str) -> bool:
+    """The comment carries an automated marker: an HTML comment opening
+    with the Loom marker prefix, or a review-bot marker of the same shape.
+    The factory and the brain post such comments under the same App login
+    that opens lane pull requests, so a marker comment is a machine note,
+    never the author's or a trusted login's own answer."""
+    return "<!-- loom:" in body or "<!-- grug-" in body
+
+
 def _lifts_hold(login: str, body: str, author: str, sha: str, allowed: set) -> bool:
     """A comment after a hold that lifts it: the pull request author's, or
-    a trusted one naming the head commit's sha."""
+    a trusted one naming the head commit's sha. A comment carrying a Loom
+    marker never lifts a hold, whoever posts it and whatever sha it names:
+    that is the chosen rule for this ticket, so the factory's own marker
+    comments leave a hold standing."""
+    if _carries_marker(body):
+        return False
     return (bool(author) and login == author) or (login in allowed and _names_sha(body, sha))
 
 
@@ -977,9 +991,10 @@ def fleet_hold(comments: Sequence[Any], head: Dict[str, Any], head_sha: str,
                pr_author: str, trusted: Sequence[str]) -> Optional[Dict[str, Any]]:
     """The standing hold comment on a pull request, else None (loom#2393).
     A hold is a trusted login's comment opening with "Not merging" or "Hold",
-    made after the head commit (a newer push lifts it). A later comment by
-    the pull request's author lifts it, and so does a later trusted comment
-    naming the head commit's sha. With no head commit date every hold counts."""
+    made after the head commit (a newer push lifts it). A later plain comment
+    by the pull request's author lifts it, and so does a later plain trusted
+    comment naming the head commit's sha. A comment carrying a Loom marker
+    never lifts it. With no head commit date every hold counts."""
     allowed = {a.lower() for a in trusted if a}
     if not allowed:
         return None
@@ -1052,7 +1067,9 @@ def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
     """The blocker an unanswered blocking comment from a trusted login puts on a
     pull request, else None (bus/comment_findings.py, loom#2988). Status and
     merge both call it, so they agree. `known` is every comment, already read;
-    else they are read from REST, and unreadable comments block."""
+    else they are read from REST, and unreadable comments block. The pull
+    request's commits are read only for an answer that names a commit, and
+    unreadable commits block too."""
     if not [a for a in authors if a]:
         return None
     if known is None:
@@ -1060,8 +1077,26 @@ def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
             known = _read_comments(gh, repo, number)
         except ValueError as err:
             return str(err).removeprefix("blocked: ")
-    found = comment_findings.open_findings(list(known), authors)
+    try:
+        found = comment_findings.open_findings(list(known), authors,
+                                               pr_commit_reader(gh, repo, number))
+    except GitHubError as err:
+        return COMMITS_UNREADABLE % err
     return comment_findings.blocker(found) if found else None
+
+
+COMMITS_UNREADABLE = ("pull request commits unreadable, so a fix named in an answer "
+                      "cannot be checked (%s)")
+
+
+def pr_commit_reader(gh: GitHub, repo: str, number: int) -> comment_findings.CommitReader:
+    """Reads pull request `number`'s commit SHAs, for an answer that names its
+    fix (bus/comment_findings.py). It reads only when called."""
+    def read() -> List[str]:
+        return [str(c.get("sha") or "") for c in
+                gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+                if isinstance(c, dict)]
+    return read
 
 
 def _one_line(value: Any, limit: int = 200) -> str:
@@ -3929,7 +3964,9 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
-BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+# A body edited in the GitHub web editor ends its lines in CRLF, so the
+# line may end in a carriage return before the newline (loom#3115).
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*\r?$", re.M | re.I)
 
 
 def _builds_on_base(gh: GitHub, repo: str, body: str,
@@ -3967,11 +4004,12 @@ def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
-                 repairs_incident: Optional[int] = None) -> str:
+                 repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
                (("Repairs incident", "#%d" % repairs_incident if repairs_incident is not None else None),
                 ("After", after), ("Not before", not_before),
-                ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
+                ("Difficulty", difficulty), ("Priority", priority),
+                ("Foundational", "yes" if foundational else None), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
@@ -4006,7 +4044,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
           resolves: Optional[str] = None, intake_of: Optional[int] = None,
-          repairs_incident: Optional[int] = None) -> str:
+          repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -4082,7 +4120,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
+                             repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
                                       "Model": model, "Base": base, "After": after,
                                       "Not before": not_before,
@@ -4256,7 +4295,19 @@ def _check_rewritable(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     names = _labels(issue)
     if "loom:ticket" in names or "loom:rewritten" in names:
         raise ValueError("#%d is already a ticket or already rewritten" % number)
+    person = _human_holder(gh, repo, issue)
+    if person:
+        raise ValueError("#%d is claimed by %s, a person's session; leave it to them"
+                         % (number, person))
     return issue
+
+
+def _human_holder(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+    """The login of a person's session that claims the issue by assignment
+    or by its claim comment (bus/human_claims.py). The comments are read only
+    when the issue has some."""
+    return human_claims.Reader(
+        lambda r, n: gh.paginate("/repos/%s/issues/%d/comments" % (r, n))).holder(repo, issue)
 
 
 def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
@@ -4497,7 +4548,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             break
         number = int(issue["number"])
         skip = _triage_skip(issue, authors, briefers, journals)
-        if skip:
+        if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
         if not missing:
@@ -8883,6 +8934,8 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default=lanes_repo_default()); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")  # leak-guard-allow: the --after help above shows the cross-repo ref shape
     b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
+    b.add_argument("--foundational", action="store_true",
+                   help="an epic child its siblings build on: writes Foundational: yes")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -8954,7 +9007,8 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
-                resolves=args.resolves, repairs_incident=args.repairs_incident))
+                resolves=args.resolves, repairs_incident=args.repairs_incident,
+                foundational=args.foundational))
 
 
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:

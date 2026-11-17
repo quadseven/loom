@@ -1524,6 +1524,16 @@ class SensitiveResumeTests(unittest.TestCase):
         self.assertTrue(made["body"].startswith("Difficulty: medium\nPriority: P1\n\n"))
         self.assertEqual(tickets.priority_of(made), "P1")
 
+    def test_brief_foundational_writes_the_foundational_line(self):
+        fake = Fake(reply(200, goal()), reply(200, []),
+                    reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
+        brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex",
+                    difficulty="medium", priority="P1", foundational=True)
+        made = next(c[2] for c in fake.calls if c[0] == "POST" and c[1].endswith("/issues"))
+        self.assertTrue(made["body"].startswith(
+            "Difficulty: medium\nPriority: P1\nFoundational: yes\n\n"))
+        self.assertTrue(tickets.foundational(made))
+
     def test_brief_repair_marker_survives_ticket_rendering(self):
         fake = Fake(reply(200, goal()), reply(200, []),
                     reply(201, {"id": 202, "html_url": "https://example.com/ticket"}), reply(201, {}))
@@ -4826,6 +4836,22 @@ class TriageTests(unittest.TestCase):
             self.assertEqual(method, "POST", path)
             self.assertTrue(path.endswith(("/labels", "/comments", "/sub_issues")), path)
 
+    def test_triage_leaves_an_issue_a_person_claimed(self):
+        # A second operator's session claims by assignment or by a comment
+        # carrying its phrase (bus/human_claims.py).
+        phrase = "Claimed by ccqw's Claude Code"
+
+        class Commented(Routes):
+            def _read(self, path):
+                if path.startswith("/repos/%s/issues/6/comments" % REPO):
+                    return reply(200, [{"user": {"login": "ccqw"}, "body": phrase}])
+                return super()._read(path)
+        routes = Commented([item(5, assignees=[{"login": "ccqw"}]), item(6, comments=1),
+                            item(7, comments=0)])
+        self.run_triage(routes)
+        self.assertEqual(routes.labelled(), {7: ["loom:ticket", "loom:queued"]})
+        self.assertFalse(any("/issues/7/comments" in c[1] for c in routes.calls))
+
     def test_ready_issue_becomes_a_queued_ticket_under_the_goal(self):
         routes = Routes([item(5)])
         lines = self.run_triage(routes)
@@ -5150,6 +5176,18 @@ class HumanAndRefsTests(unittest.TestCase):
         for issue in (item(6, labels=["loom:ticket"]), item(6, state="closed")):
             fake = Fake(reply(200, issue))
             with self.assertRaises(ValueError):
+                brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
+            self.assertTrue(all(c[0] == "GET" for c in fake.calls))
+
+    def test_brief_refs_refuses_an_original_a_person_claimed(self):
+        # A second operator's session claims by assignment or by a comment
+        # carrying its phrase (bus/human_claims.py); no brief takes it.
+        phrase = "Claimed by ccqw's Claude Code"
+        said = [{"user": {"login": "ccqw"}, "body": phrase}]
+        for issue, replies in ((item(6, assignees=[{"login": "ccqw"}]), ()),
+                               (item(6, comments=1), (reply(200, said),))):
+            fake = Fake(reply(200, issue), *replies)
+            with self.assertRaisesRegex(ValueError, "ccqw"):
                 brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, refs=6)
             self.assertTrue(all(c[0] == "GET" for c in fake.calls))
 
@@ -7364,6 +7402,45 @@ class FleetHoldTests(unittest.TestCase):
                               "2030-01-01T13:30:00Z", 502)
         self.assertEqual(self.merge([self.hold(), answer]), "merged")
 
+    def test_each_factory_marker_comment_by_the_author_leaves_the_hold_standing(self):
+        markers = (
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "/grug improve\n\n<!-- loom:improve-head %s -->" % self.SHA,
+            "<!-- loom:luna-request v1 sha=%s -->\nThe review check is degraded "
+            "on this head.\nDispatch 1 at 2030-01-01 13:30 UTC.\n"
+            "<!-- loom:luna-dispatch at=1893456000 -->" % self.SHA,
+            "<!-- loom:scope-hold %s -->\nHeld for the brain: a scope check "
+            "asked whether this pull request fits its ticket." % self.SHA,
+            "<!-- loom:rebuttal-refused v1 thread=PRRT_example head=%s -->\n"
+            "Merge refused: a review thread was resolved on an answer that "
+            "does not hold." % self.SHA,
+        )
+        for body in markers:
+            with self.subTest(body=body.split("\n", 1)[0]):
+                marker = self.comment("example-lane[bot]", body,
+                                      "2030-01-01T13:30:00Z", 502)
+                self.assertIn("held by a fleet comment",
+                              self.merge([self.hold(), marker]))
+
+    def test_a_factory_marker_comment_by_a_trusted_login_leaves_the_hold_standing(self):
+        marker = self.comment(
+            "example-brain",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        self.assertIn("held by a fleet comment", self.merge([self.hold(), marker]))
+
+    def test_a_plain_reply_after_a_factory_marker_comment_lifts_the_hold(self):
+        marker = self.comment(
+            "example-lane[bot]",
+            "<!-- loom:review-again v1 sha=%s -->\n/grug improve" % self.SHA,
+            "2030-01-01T13:30:00Z", 502)
+        answer = self.comment("example-lane[bot]", "Fixed the clock reset.",
+                              "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, answer]), "merged")
+        named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
+                             "2030-01-01T13:40:00Z", 503)
+        self.assertEqual(self.merge([self.hold(), marker, named]), "merged")
+
     def test_a_later_trusted_comment_naming_the_head_sha_lifts_the_hold(self):
         named = self.comment("example-brain", "The fix is in %s." % self.SHA[:9],
                              "2030-01-01T13:30:00Z", 502)
@@ -7493,7 +7570,8 @@ class FindingGateTests(unittest.TestCase):
     def finding(self, body=FINDING, at="2030-01-01T13:00:00Z", login=BRAIN):
         return self.comment(login, body, at)
 
-    def routes(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z"):
+    def routes(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z",
+               commits=(200, [{"sha": SHA}])):
         pr = {"state": "open", "draft": False, "body": "Refs %s#9" % REPO,
               "user": {"login": "example-lane[bot]"},
               "head": {"ref": "loom/9-work", "sha": head, "repo": {"full_name": REPO}},
@@ -7512,6 +7590,7 @@ class FindingGateTests(unittest.TestCase):
             ("GET", "/issues/9"): reply(200, issue),
             ("GET", "/issues/9/comments"): reply(200, []),
             ("GET", "/issues/8/comments"): reply(status, comments),
+            ("GET", "/pulls/8/commits"): reply(*commits),
             ("GET", "/pulls/8/files"): reply(200, [{"filename": "bus/a.py", "patch": "+x"},
                                                    {"filename": "tests/test_a.py", "patch": "+x"}]),
             ("GET", "/search/issues"): reply(200, {"total_count": 0}),
@@ -7520,8 +7599,9 @@ class FindingGateTests(unittest.TestCase):
             ("PUT", "/pulls/8/merge"): reply(200, {"merged": True}),
         })
 
-    def merge(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z"):
-        transport = self.routes(comments, status, head, committed)
+    def merge(self, comments, status=200, head=SHA, committed="2030-01-01T12:00:00Z",
+              commits=(200, [{"sha": SHA}])):
+        transport = self.routes(comments, status, head, committed, commits)
         with unittest.mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}):
             try:
                 brain.merge(GitHub("t", transport=transport), REPO, 8, (REPO, 9), env=self.ENV)
@@ -7531,7 +7611,7 @@ class FindingGateTests(unittest.TestCase):
         self.assertTrue(transport.sent("PUT", "/pulls/8/merge"))
         return "merged"
 
-    def status_line(self, comments, node=None, status=200):
+    def status_line(self, comments, node=None, status=200, commits=(200, [{"sha": SHA}])):
         pr = {"number": 9, "title": "Work", "head": {"ref": "loom/7-work", "sha": self.SHA},
               "user": {"login": "example-lane[bot]"}, "labels": [{"name": "class:logic"}]}
         issue = {"number": 7, "state": "open", "body": "",
@@ -7544,6 +7624,7 @@ class FindingGateTests(unittest.TestCase):
                                                    {"filename": "tests/test_a.py", "patch": "+x"}]),
             ("GET", "/search/issues"): reply(200, {"total_count": 0}),
             ("GET", "/issues/9/comments"): reply(status, comments),
+            ("GET", "/pulls/9/commits"): reply(*commits),
         }
         gh = GitHub("t", transport=Routed(routes))
         env = {"LOOM_BRIEF_AUTHORS": self.BRAIN}
@@ -7569,10 +7650,36 @@ class FindingGateTests(unittest.TestCase):
 
     def test_a_linked_answer_after_the_finding_clears_it(self):
         answer = self.comment(self.BRAIN, "Declined with evidence: the retry case is handled "
-                              "by the existing validation. " + self.URL,
+                              "by the validation at bus/a.py:12. " + self.URL,
                               "2030-01-01T13:30:00Z", 602)
         self.assertEqual(self.merge([self.finding(), answer]), "merged")
         self.assertEqual(self.status_line([self.finding(), answer]), "- #9 Work - READY")
+
+    def test_a_fix_clears_it_only_when_its_commit_is_on_the_pull_request(self):
+        # Before: any hex token after "Fixed in" cleared the finding. After:
+        # the named commit must be one of the pull request's own commits.
+        fix = self.comment(self.BRAIN, "Fixed in %s: the retry case is handled. %s"
+                           % (self.NEW[:10], self.URL), "2030-01-01T13:30:00Z", 602)
+        self.assertIn(self.URL, self.merge([self.finding(), fix]))
+        self.assertIn(self.URL, self.status_line([self.finding(), fix]))
+        carried = (200, [{"sha": self.SHA}, {"sha": self.NEW}])
+        self.assertEqual(self.merge([self.finding(), fix], commits=carried), "merged")
+        self.assertEqual(self.status_line([self.finding(), fix], commits=carried),
+                         "- #9 Work - READY")
+
+    def test_a_decline_without_evidence_does_not_clear_it(self):
+        answer = self.comment(self.BRAIN, "Declined: this is fine as it is. " + self.URL,
+                              "2030-01-01T13:30:00Z", 602)
+        self.assertIn(self.URL, self.merge([self.finding(), answer]))
+
+    def test_unreadable_commits_for_a_named_fix_refuse_the_merge_and_the_status_line(self):
+        fix = self.comment(self.BRAIN, "Fixed in %s: done. %s" % (self.SHA[:10], self.URL),
+                           "2030-01-01T13:30:00Z", 602)
+        broken = (500, {"message": "boom"})
+        self.assertIn("pull request commits unreadable",
+                      self.merge([self.finding(), fix], commits=broken))
+        self.assertIn("pull request commits unreadable",
+                      self.status_line([self.finding(), fix], commits=broken))
 
     def test_an_answer_that_does_not_link_the_finding_does_not_clear_it(self):
         answer = self.comment(self.BRAIN, "Fixed: the retry case is handled now.",
@@ -7588,12 +7695,12 @@ class FindingGateTests(unittest.TestCase):
         self.assertIn(self.URL, self.status_line([self.finding(), answer]))
 
     def test_an_answer_older_than_the_finding_does_not_clear_it(self):
-        answer = self.comment(self.BRAIN, "Declined: the retry test covers it. " + self.URL,
+        answer = self.comment(self.BRAIN, "Declined: covered at bus/a.py:12. " + self.URL,
                               "2030-01-01T12:30:00Z", 602)
         self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
 
     def test_an_untrusted_answer_does_not_clear_it(self):
-        answer = self.comment("example-stranger", "Declined: the retry test covers it. " + self.URL,
+        answer = self.comment("example-stranger", "Declined: covered at bus/a.py:12. " + self.URL,
                               "2030-01-01T13:30:00Z", 602)
         self.assertIn("unanswered blocking comment", self.merge([self.finding(), answer]))
 

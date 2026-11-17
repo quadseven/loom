@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import answer, proof, status
+from . import answer, human_claims, proof, status
 from .stale_claims import outside_hold
 
 # The runner's own patterns (lanes/run_lane.sh).
@@ -167,7 +167,7 @@ def rewritten_source(body: Any) -> Optional[int]:
     return int(found.group(1)) if found else None
 
 
-HEADER_RE = re.compile(r"(Difficulty|Priority|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
+HEADER_RE = re.compile(r"(Difficulty|Priority|Foundational|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -264,6 +264,8 @@ _HEADER_RULES = {
     "After": (lambda v: bool(AFTER_RE.fullmatch(v)),
               lambda v: "After: %r is not a list of tickets like '#5' or "
                         "'owner/name#7, #8'" % v),
+    "Foundational": (lambda v: v == "yes",
+                     lambda v: "Foundational: must be yes"),
     "Deliverable": (lambda v: v == "answer",
                     lambda v: "Deliverable: must be answer"),
 }
@@ -376,10 +378,33 @@ def _names(issue: Dict[str, Any]) -> set:
             for x in issue.get("labels") or []}
 
 
+def blocking_count(issue: Dict[str, Any]) -> int:
+    """How many open issues wait on this one, from the dependency summary the
+    issue listing already carries (no request of its own); 0 when it has none
+    or the value is not a count."""
+    summary = issue.get("issue_dependencies_summary")
+    count = summary.get("blocking") if isinstance(summary, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
+
+
+def foundational(issue: Dict[str, Any]) -> bool:
+    """Whether the ticket's brief carries `Foundational: yes`: the brain
+    marks an epic child its siblings build on (docs/BRIEF_FORMAT.md)."""
+    try:
+        return parse(issue.get("body"))[0].get("Foundational") == "yes"
+    except ValueError:
+        return False
+
+
 def work_order(repo: str, issue: Dict[str, Any]) -> Tuple[Any, ...]:
     """The sort key every queue uses: a FIRST_LABELS ticket first, then by
-    priority (P0 first), then the oldest."""
+    priority (P0 first), then the ticket that blocks the most open issues,
+    then a Foundational: yes ticket, then the oldest. Priority stays ahead
+    of the blocking terms: a P3 blocker never jumps a P1 leaf. 2026-11-16:
+    a leaf filed earlier took the only free lane while the ticket others
+    waited on stayed queued (loom#3130)."""
     return (not (_names(issue) & set(FIRST_LABELS)), PRIORITIES.index(priority_of(issue)),
+            -blocking_count(issue), not foundational(issue),
             str(issue.get("created_at") or ""), repo, int(issue.get("number") or 0))
 
 
@@ -831,7 +856,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     if demoted_models:
         out.append("Demoted-Models: %s" % demoted_models)
     out += ["%s: %s" % (k, v) for k, v in headers.items()
-            if k not in ("Not before", "After", "Priority")]
+            if k not in ("Not before", "After", "Priority", "Foundational")]
     if "Model" not in headers and headers.get("Difficulty") == "hard":
         # A hard ticket runs the lane's strongest model, not its default.
         from .factory import HARD_MODELS  # factory imports this module
@@ -1059,12 +1084,14 @@ def review_name(repo: str, number: int, stamp: int) -> str:
 
 def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
                         pr_number: int, head_branch: str, base_branch: str,
-                        head_sha: str) -> str:
-    """The brief that hands a codex lane slot one pull request to review
-    while the Elder's model route is degraded (loom#2142): the tree is the
-    pull request's own branch, no branch is pushed, and the result is
-    review.json, not a pull request. The Model: line pins the slot to
-    gpt-6-luna, the only model the codex lanes run."""
+                        head_sha: str, model: str = "gpt-6-luna", mode: str = "") -> str:
+    """The brief that hands a lane slot one pull request to review: a codex
+    slot while the Elder's model route is degraded (loom#2142), or a review
+    lane the station's review sweep picked (mode "sweep", bus/review_sweep.py).
+    The tree is the pull request's own branch, no branch is pushed, and the
+    result is review.json, not a pull request. The Model: line pins a codex
+    slot to gpt-6-luna, the only model the codex lanes run; an empty model
+    leaves the lane its own."""
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     head = ["# Brief: %s" % review_name(repo, number, stamp), "",
@@ -1074,10 +1101,11 @@ def render_review_brief(repo: str, issue: Dict[str, Any], lane: str, stamp: int,
             "Issue: %s#%d" % (repo, number),
             "Review-PR: %d" % pr_number,
             "Head-Sha: %s" % head_sha,
-            "Base: %s" % base_branch,
-            "Model: gpt-6-luna",
-            "Deliverable: review", "",
-            "# T%d: Review pull request #%d: %s" % (number, pr_number, title), ""]
+            "Base: %s" % base_branch] + \
+        (["Model: %s" % model] if model else []) + \
+        (["Review-Mode: %s" % mode] if mode else []) + \
+        ["Deliverable: review", "",
+         "# T%d: Review pull request #%d: %s" % (number, pr_number, title), ""]
     text = "\n".join(head) + "\n" + REVIEW_BRIEF % (pr_number, base_branch, base_branch)
     body = str(issue.get("body") or "").rstrip("\n")
     if body:
@@ -1272,8 +1300,11 @@ def owned_elsewhere(issue: Dict[str, Any], authors: Iterable[str],
 
     Outside work beats anything of ours (loom#2333): an issue under
     outside_hold, or assigned to a person who is not one of ours, is theirs
-    even beside our claim or operator. An App assignee owns nothing."""
-    held = outside_hold(issue)
+    even beside our claim or operator. An App assignee owns nothing.
+
+    A person's session that claims by assignment (bus/human_claims.py) owns
+    the issue outright, even a loom:ticket it filed as a trusted briefer."""
+    held = outside_hold(issue) or human_claims.assigned(issue)
     if held:
         return held
     logins = assignees(issue) + claimed_by(issue)

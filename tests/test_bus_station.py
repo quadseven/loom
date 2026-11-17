@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import __main__ as cli  # noqa: E402
 from bus import answer, audit, brain, factory, fixrounds, invariants, proof, spend, station, status, tickets  # noqa: E402
-from bus import lock, rebuttal, urgency  # noqa: E402
+from bus import incident_probe, lock, rebuttal, urgency  # noqa: E402
 from bus import quiet as quiet_rule  # noqa: E402
 from bus import github as github_module  # noqa: E402
 from bus import watch as watch_module  # noqa: E402
@@ -290,6 +290,9 @@ class FakeGitHub:
             self.issues[n]["labels"] = [lab for lab in self.issues[n]["labels"]
                                         if lab["name"] != unquote(gone.group(2))]
             return reply(200, [])
+        deps = re.match(r"issues/(\d+)/dependencies/blocked_by$", rest)
+        if method == "GET" and deps:
+            return reply(200, getattr(self, "blockers", {}).get(int(deps.group(1)), []))
         tl = re.match(r"issues/(\d+)/timeline$", rest)
         if method == "GET" and tl:
             return reply(200, getattr(self, "timelines", {}).get(int(tl.group(1)), []))
@@ -427,6 +430,12 @@ class FakeGitHub:
             if "labels=%s&" % label in query:
                 return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                    and label in self.names(i["number"])])
+        if "labels=ready-for-agent&" in query:
+            ready = sorted((i for i in self.issues.values() if i["state"] == "open"
+                            and "ready-for-agent" in self.names(i["number"])),
+                           key=lambda i: i.get("created_at") or "")
+            page = int((re.search(r"[?&]page=(\d+)", query) or [0, "1"])[1])
+            return reply(200, ready[(page - 1) * 100:page * 100])
         if "labels=loom:audit-failed&" in query:
             return reply(200, [i for i in self.issues.values()
                                if "loom:audit-failed" in self.names(i["number"])])
@@ -436,6 +445,9 @@ class FakeGitHub:
         if "labels=loom%3Amerged" in query or "labels=loom:merged&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:merged" in self.names(i["number"])])
+        if "labels=loom:running&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:running" in self.names(i["number"])])
         if "labels=loom:runaway" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:runaway" in self.names(i["number"])])
@@ -497,6 +509,14 @@ class FakeGitHub:
             return reply(200, {"data": {"node": {"replies": page}}})
         if "PullRequestReviewThread" in query:
             return reply(200, {"data": {"node": self.threads.get(variables["id"])}})
+        if "mergedBy" in query:
+            # The digest's lane merge count (loom#2432).
+            pages = getattr(self, "merged_pages", None) or [getattr(self, "merged_pulls", [])]
+            index = int(variables.get("after") or 0)
+            return reply(200, {"data": {"repository": {"pullRequests": {
+                "nodes": pages[index],
+                "pageInfo": {"hasNextPage": index + 1 < len(pages),
+                             "endCursor": str(index + 1)}}}}})
         editor = self.editors[data["variables"]["number"]]
         # GitHub's GraphQL names an App by its slug, typed Bot, without "[bot]".
         actor = ({"__typename": "Bot", "login": editor[:-len("[bot]")]}
@@ -3057,13 +3077,15 @@ class BudgetTest(Base):
         _, err = self.passes(gh=gh)
         self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
         self.assertEqual(self.gets("loom:pr"), [])
-        self.assertEqual(self.gets("loom:lanes"), [])
+        # Only the station guard's lookup of the status issue, which runs
+        # whatever the budget: it keeps two stations from claiming at once.
+        self.assertEqual(len(self.gets("loom:lanes")), 1)
         self.assertEqual(err.count("budget low"), 1)
         self.assertIn("500 of 5000 left", err)
         # The next pass knows from the station's state, and does not say it again.
         _, err = self.passes(transport)
         self.assertEqual(self.gets("loom:pr"), [])
-        self.assertEqual(self.gets("loom:lanes"), [])
+        self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
 
     def test_below_the_floor_the_daily_metrics_line_still_goes_out(self):
@@ -3082,9 +3104,10 @@ class BudgetTest(Base):
         transport, _ = self.low(remaining=4000)
         _, err = self.passes(transport)
         self.assertEqual(len(self.gets("loom:pr")), 2)
-        # One lookup finds the status issue; the other reads the remote
-        # lane heartbeat from that issue's comments.
-        self.assertEqual(len(self.gets("loom:lanes")), 2)
+        # One lookup finds the status issue for the station guard, one finds
+        # it for the lane table, and one reads the remote lane heartbeat
+        # from that issue's comments.
+        self.assertEqual(len(self.gets("loom:lanes")), 3)
         self.assertNotIn("budget low", err)
         self.assertIn("budget 4000 of 5000 left", err)
 
@@ -3217,8 +3240,10 @@ class TriageTest(Base):
         return err.getvalue()
 
     def triage_reads(self):
+        # The ready-for-agent intake (loom#3092) reads its label oldest
+        # first too; it is not brain triage.
         return [p for p in self.fake.paths("GET")
-                if "sort=created&direction=asc" in p]
+                if "sort=created&direction=asc" in p and "labels=ready-for-agent" not in p]
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
@@ -3887,6 +3912,21 @@ class HandBackTest(unittest.TestCase):
         # event in the status comment, which says what it means (2026-10-20).
         self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
         self.assertIn("loom:ready", [x["name"] for x in self.gh.issue["labels"]])
+
+    def test_the_ready_line_says_the_factory_lands_it(self):
+        # loom#2432: the Ready line names the path that lands the pull request.
+        self.run_hand_back()
+        self.assertEqual(self.ready_events(), [READY % ("a" * 40)])
+        self.assertIn("the factory lands it", self.ready_events()[0])
+
+    def test_in_a_shadow_repo_the_ready_line_says_it_is_recorded_not_landed(self):
+        # loom#2432: in shadow the factory only records a would-merge, so the
+        # line must not promise a landing.
+        with mock.patch.dict(os.environ, {"LOOM_SHADOW": "1", "LOOM_SHADOW_REPOS": REPO}):
+            self.run_hand_back()
+        self.assertEqual(self.ready_events(), [station.READY_SHADOW_TEXT % ("a" * 40)])
+        self.assertIn("recorded for the brain, not landed", self.ready_events()[0])
+        self.assertTrue(station.READY_RE.match(self.ready_events()[0]))
 
     def test_fix_pending_for_current_head_is_not_handed_back_twice(self):
         self.gh.issue["labels"].append({"name": "loom:running"})
@@ -5046,9 +5086,11 @@ class CorruptStateTest(Base):
         # and the verify-note pass's own pool listing (loom#2092), and the
         # held pull request wait withdrawal's read of the open tickets
         # (loom#1857), and the invariant pass's read of the queued tickets
-        # for ones with no brief headers (loom#2571).
-        # The last-pass shipped wait stamp adds one canonical all-repo read.
-        self.assertEqual(self.run_pass().requests, 20)
+        # for ones with no brief headers (loom#2571), and the hourly read of
+        # ready-for-agent issues (loom#3092).
+        # The last-pass shipped wait stamp adds one canonical all-repo read,
+        # and the ended-run sweep one read of the running tickets (loom#3134).
+        self.assertEqual(self.run_pass().requests, 22)
 
 
 class TicketsTest(unittest.TestCase):
@@ -5379,6 +5421,21 @@ class ClaimTest(Base):
                 for _, text in status.parse(c["body"])]
         self.assertTrue(any("names no acceptance criteria" in text for text in said), said)
 
+    def test_a_two_platform_brief_at_claim_goes_back_to_the_queue_with_the_split_note(self):
+        # loom#2929: the split hold (loom#1651) at the station's claim check.
+        self.fake.add(12, body=("Difficulty: medium\n\n## Why\nThe tool is missing.\n\n"
+                                "## What\n\n- Build it on iOS.\n- Build it on Android.\n\n"
+                                "## Acceptance criteria\n- [ ] Both builds pass.\n"))
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("needs-brain", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        said = [text for c in self.fake.comments[12] if status.is_status(c["body"])
+                for _, text in status.parse(c["body"])]
+        self.assertTrue(any("more than one platform" in text and "one ticket per platform"
+                            in text for text in said), said)
+
     def test_a_ticket_pinned_to_a_model_limited_on_its_lane_is_not_claimed(self):
         # The lane is up (its ladder has another model), but not for this
         # ticket's Model: until the limit lifts; a claim was parked at once and
@@ -5483,6 +5540,60 @@ class ClaimTest(Base):
         self.run_pass()
         self.assertEqual(self.fake.paths("PUT"), ["/repos/%s/issues/12/labels" % REPO])
 
+    def blocked_by(self, number, blocker, state="open"):
+        """GitHub's own "blocked by" relationship: the dependency summary the
+        issue listing carries, and the blocker list it points to."""
+        self.fake.issues[number]["issue_dependencies_summary"] = {
+            "blocked_by": 0 if state == "closed" else 1, "total_blocked_by": 1}
+        self.fake.blockers = {number: [{"number": blocker, "state": state,
+                                        "repository_url": "https://api.github.com/repos/" + REPO}]}
+
+    def test_a_briefed_ticket_github_lists_as_blocked_is_not_claimed(self):
+        # loom#3129: the blocked-by hold ran only when the factory laned a
+        # queued ticket, so a ticket briefed straight to a lane was claimed
+        # on a base that lacked its prerequisite.
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertIn("wait:blocked", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        notes = [c["body"] for c in self.fake.comments[12]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("blocked on #5", notes[0])
+        # The next pass still holds it, and says nothing new.
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
+    def test_a_briefed_ticket_whose_blocked_on_section_names_an_open_issue_is_not_claimed(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12, body=BODY_WITH_CRITERIA + "\n## Blocked on\n- #5\n")
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_is_claimed_on_the_first_pass_after_its_blocker_closes(self):
+        self.fake.add(5, title="Land the package", state="queued")
+        self.fake.add(12)
+        self.blocked_by(12, 5)
+        self.run_pass()
+        self.assertEqual(self.listing(), [])
+        self.fake.issues[5]["state"] = "closed"
+        self.blocked_by(12, 5, state="closed")
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertNotIn("wait:blocked", self.fake.names(12))
+
+    def test_a_briefed_ticket_with_no_blocker_costs_no_blocker_request(self):
+        self.fake.add(12)
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
+
     def test_a_dependency_of_another_repo_is_read_from_there(self):
         self.fake.add_foreign("other-owner/other-repo", 5, labels=("loom:merged",))
         self.fake.add(12, body="After: other-owner/other-repo#5\n" + BODY_WITH_CRITERIA)  # leak-guard-allow
@@ -5542,6 +5653,17 @@ class ClaimTest(Base):
         self.fake.add(9, created="2030-01-03T00:00:00Z", body="Priority: P0\n" + BODY_WITH_CRITERIA)
         self.run_pass()
         self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+
+    def test_a_ticket_that_blocks_two_others_is_claimed_before_an_older_leaf(self):
+        # loom#3130: the order reads the dependency summary the briefed
+        # listing already carries, so it costs no request of its own.
+        self.fake.add(7, created="2030-01-01T00:00:00Z")
+        self.fake.add(9, created="2030-01-03T00:00:00Z")
+        self.fake.issues[9]["issue_dependencies_summary"] = {"blocking": 2, "total_blocking": 2}
+        self.run_pass()
+        self.assertEqual(self.listing(), ["example-owner.example-repo-9.md"])
+        self.assertIn("loom:briefed", self.fake.names(7))
+        self.assertEqual([p for p in self.fake.paths() if "dependencies" in p], [])
 
     def test_a_regression_is_claimed_before_a_p0_ticket(self):
         self.fake.add(7, created="2030-01-01T00:00:00Z", body="Priority: P0\n" + BODY_WITH_CRITERIA)
@@ -5654,9 +5776,10 @@ class ClaimTest(Base):
         # The held pull request wait withdrawal reads the open tickets too,
         # to find a person wait whose pull request is over (loom#1857); its
         # read is conditional like the verify runs', so the second pass
-        # answers it 304 as well.
-        self.assertEqual(len(self.fake.calls), first + 7)
-        self.assertEqual(gh.requests, 10)
+        # answers it 304 as well. The ended-run sweep lists the running
+        # tickets each pass (loom#3134).
+        self.assertEqual(len(self.fake.calls), first + 8)
+        self.assertEqual(gh.requests, 11)
         self.assertEqual(gh.not_modified, 2)
         self.assertEqual(self.fake.calls[-1][1].split("?")[0], "/repos/%s/issues" % REPO)
 
@@ -7783,6 +7906,209 @@ class FactoryIncidentTest(Base):
         with mock.patch.object(station, "FACTORY_REPO", REPO):
             self.run_pass()
         self.assertIn("loom:queued", self.fake.names(12))
+
+
+class IncidentProbeTest(Base):
+    """loom#3084: a base-check incident holds its repo's tickets and closes
+    only on a base-check pass, so the station gives one free lane a
+    base-check-only run at most once an hour, and lets the incident's fix
+    ticket run while the incident is open."""
+
+    def open_incident(self, created="2030-01-01T00:00:00Z", kind="base-check", comments=()):
+        self.fake.issues[99] = {
+            "number": 99, "title": "Factory incident: %s validation %s" % (REPO, kind),
+            "state": "open", "created_at": created, "closed_at": None,
+            "body": ("<!-- loom:factory-incident v1 -->\n\nRepo: %s\nKind: %s\n"
+                     "Ticket: a ticket\n\ncheck: make check (exit 1)\n" % (REPO, kind)),
+            "labels": [{"name": "loom:factory"}]}
+        self.fake.comments[99] = list(comments)
+
+    def hold(self, *numbers, bodies=None):
+        held = {}
+        for number in numbers:
+            self.fake.add(number, lane="muse", body=(bodies or {}).get(number, PLAIN),
+                          state="running")
+            issue = self.fake.issues[number]
+            issue["labels"] = [{"name": "loom:ticket"}, {"name": "lane:muse"},
+                               {"name": "loom:running"}, {"name": "wait:incident"}]
+            issue["body"] = status.with_body_events(issue["body"], [(
+                "2030-01-01T00:00:00Z", "Lane muse held: factory incident %s#99" % REPO)])
+            held["%s#%d" % (REPO, number)] = {"incident": "%s#99" % REPO, "at": time.time()}
+        path = os.path.join(self.home, "state", "station", "factory_held.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(held, fh)
+
+    def station(self):
+        return station.Station(GitHub("token", transport=self.fake), self.settings)
+
+    def probe(self, lanes=("codex",), runner=None):
+        with mock.patch.object(station, "FACTORY_REPO", REPO):
+            return (runner or self.station())._probe_incidents(list(lanes))
+
+    def briefs(self, lane="codex"):
+        return [n for n in self.listing(lane) if n.endswith(".md")]
+
+    def test_a_held_repo_gets_a_base_check_run_and_a_pass_requeues_its_tickets(self):
+        self.open_incident()
+        self.hold(12, 13)
+        self.assertEqual(self.probe(), [])
+        (name,) = self.briefs()
+        with open(self.inbox("codex", name), encoding="utf-8") as fh:
+            text = fh.read()
+        self.assertIn("Deliverable: base-check\n", text)
+        self.assertIn("Repo: %s\n" % REPO, text)
+        self.assertIn("Incident: %s#99\n" % REPO, text)
+        self.assertNotIn("Issue:", text)
+        self.assertNotIn("Base:", text)
+        for number in (12, 13):
+            self.assertIn("wait:incident", self.fake.names(number))
+        # The lane's base check passes: lanes/run_lane.sh closes the
+        # incident and moves the brief to done/.
+        os.makedirs(self.inbox("codex", "done"), exist_ok=True)
+        os.replace(self.inbox("codex", name), self.inbox("codex", "done", name))
+        self.fake.issues[99].update(state="closed", closed_at="2030-01-01T00:10:00Z")
+        runner = self.station()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), \
+                mock.patch("bus.station._say") as say:
+            runner.report_outcomes()
+            runner.release_factory_held()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertTrue(any("base check of %s" % REPO in s and "passed" in s for s in said), said)
+        for number in (12, 13):
+            self.assertIn("loom:queued", self.fake.names(number))
+            self.assertIn("lane:muse", self.fake.names(number))
+
+    def test_the_probe_runs_at_most_once_an_hour(self):
+        self.open_incident()
+        self.hold(12)
+        self.assertEqual(self.probe(), [])
+        for name in self.briefs():
+            os.remove(self.inbox("codex", name))
+        self.fake.calls.clear()
+        self.assertEqual(self.probe(), ["codex"])
+        self.assertEqual(self.briefs(), [])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_no_free_lane_writes_no_brief_and_the_next_pass_probes(self):
+        self.open_incident()
+        self.hold(12)
+        self.assertEqual(self.probe(lanes=()), [])
+        self.assertEqual(self.probe(), [])
+        self.assertEqual(len(self.briefs()), 1)
+
+    def test_an_environment_incident_gets_no_base_check_run(self):
+        self.open_incident(kind="environment")
+        self.hold(12)
+        self.assertEqual(self.probe(), ["codex"])
+        self.assertEqual(self.briefs(), [])
+
+    def test_a_ticket_naming_the_incident_runs_while_the_others_stay_held(self):
+        self.open_incident()
+        fix = PLAIN + "\nRepairs the base check of factory incident %s#99.\n" % REPO
+        self.hold(12, 13, bodies={12: fix})
+        self.probe(lanes=())
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertIn("lane:muse", self.fake.names(12))
+        self.assertNotIn("wait:incident", self.fake.names(12))
+        self.assertEqual(tickets.parse(self.fake.issues[12]["body"])[0].get("Repairs incident"),
+                         "#99")
+        self.assertIn("Repairs incident: #99\n", tickets.render_brief(
+            REPO, self.fake.issues[12], "muse"))
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertIn("wait:incident", self.fake.names(13))
+
+    def test_a_ticket_the_incident_comment_names_as_its_fix_runs(self):
+        cause = {"body": "Cause: the lane host lacks a tool.\nFix: %s#13\n" % REPO,
+                 "created_at": "2030-01-01T00:05:00Z", "user": {"login": "alice-example"}}
+        self.open_incident(comments=[cause])
+        self.hold(12, 13)
+        self.probe(lanes=())
+        self.assertIn("loom:queued", self.fake.names(13))
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_a_strangers_comment_naming_a_ticket_does_not_lift_its_hold(self):
+        # The factory repo is public: any account may comment on an incident.
+        stranger = {"body": "Fix: %s#13" % REPO,
+                    "created_at": "2030-01-01T00:05:00Z", "user": {"login": "stranger-example"}}
+        trusted = dict(stranger, body="Fix: %s#12" % REPO,
+                       user={"login": AUTHORS[1]})
+        self.open_incident(comments=[stranger, trusted])
+        self.hold(12, 13)
+        self.probe(lanes=())
+        self.assertIn("loom:running", self.fake.names(13))
+        self.assertIn("wait:incident", self.fake.names(13))
+        self.assertIn("loom:queued", self.fake.names(12))
+
+    def test_a_trusted_comment_that_only_mentions_a_ticket_does_not_lift_its_hold(self):
+        # Only a "Fix:" line designates the fix; a mention in passing is not one.
+        mention = {"body": "Cause unknown. %s#13 hit the same red base." % REPO,
+                   "created_at": "2030-01-01T00:05:00Z", "user": {"login": AUTHORS[1]}}
+        self.open_incident(comments=[mention])
+        self.hold(13)
+        self.probe(lanes=())
+        self.assertIn("wait:incident", self.fake.names(13))
+        self.assertIsNone(tickets.parse(self.fake.issues[13]["body"])[0].get("Repairs incident"))
+
+    def finish_probe(self, outcome, stamp):
+        """A probe brief the runner finished in `outcome` (done or failed),
+        with its Base-check-exit stamp or none; the ledger's ran after."""
+        self.open_incident(created="2020-01-01T00:00:00Z")
+        self.hold(12)
+        self.assertEqual(self.probe(), [])
+        (name,) = self.briefs()
+        with open(self.inbox("codex", name), "a", encoding="utf-8") as fh:
+            fh.write(stamp)
+        os.makedirs(self.inbox("codex", outcome), exist_ok=True)
+        os.replace(self.inbox("codex", name), self.inbox("codex", outcome, name))
+        runner = self.station()
+        with mock.patch.object(station, "FACTORY_REPO", REPO), mock.patch("bus.station._say"):
+            runner.report_outcomes()
+        path = os.path.join(self.home, "state", "station", incident_probe.LEDGER)
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)["%s#99" % REPO].get("ran")
+
+    def test_a_probe_whose_check_ran_records_the_run(self):
+        self.assertIsNotNone(self.finish_probe("done", "Base-check-exit: 0\n"))
+
+    def test_a_red_probe_whose_check_ran_records_the_run(self):
+        self.assertIsNotNone(self.finish_probe("failed", "Base-check-exit: 1\n"))
+
+    def test_a_probe_that_failed_before_its_check_ran_records_no_run(self):
+        # Setup failed (or the repo has no contract): no base check ran, so
+        # the incident-unprobed invariant must still see the incident.
+        self.assertIsNone(self.finish_probe("failed", ""))
+
+    def test_a_done_probe_with_no_check_stamp_records_no_run(self):
+        self.assertIsNone(self.finish_probe("done", ""))
+
+    def test_a_strangers_repeat_marked_comment_is_not_the_last_repeat(self):
+        fake_repeat = {"body": incident_probe.REPEAT_MARKER + "\nStill failing",
+                       "created_at": "2030-01-01T00:05:00Z",
+                       "updated_at": "2030-01-01T00:05:00Z", "user": {"login": "stranger-example"}}
+        self.open_incident(created="2020-01-01T00:00:00Z", comments=[fake_repeat])
+        self.hold(12)
+        runner = self.station()
+        self.probe(lanes=(), runner=runner)
+        (found,) = runner._invariant_incidents()
+        self.assertEqual(found.repeat, incident_probe.epoch("2020-01-01T00:00:00Z"))
+
+    def test_the_held_note_on_a_ticket_does_not_make_it_the_fix(self):
+        # Every held ticket's status section names the incident.
+        self.open_incident()
+        self.hold(12)
+        self.probe(lanes=())
+        self.assertIn("wait:incident", self.fake.names(12))
+
+    def test_an_old_incident_no_lane_re_checked_is_an_invariant(self):
+        self.open_incident(created="2020-01-01T00:00:00Z")
+        self.hold(12)
+        runner = self.station()
+        self.probe(lanes=(), runner=runner)
+        found = runner._invariant_incidents()
+        self.assertEqual([i.incident.key for i in found], ["%s#99" % REPO])
+        (b,) = invariants.incident_unprobed(invariants.Facts(time.time(), incidents=found))
+        self.assertEqual(b.invariant, "incident-unprobed")
 
 
 class FactoryNoIncidentHoldTest(Base):
@@ -10478,6 +10804,52 @@ class ReportDigestTest(Base):
         self.assertEqual(len(self.sent), 2)
         self.assertIn("Loom evening digest", self.sent[1]["content"])
         self.assertIn("No goal moved since the last digest.", self.sent[1]["content"])
+
+    def test_the_digest_counts_lane_merges_by_actor(self):
+        # loom#2432: most lane merges were by outside sessions while the
+        # Ready line said the factory lands them; the digest now counts them.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base + 9.5 * 3600))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 3 * 86400))
+        self.fake.merged_pulls = [
+            {"headRefName": "loom/1-a", "mergedAt": stamp, "mergedBy": {"login": "loom-station"}},
+            {"headRefName": "loom/2-b", "mergedAt": stamp, "mergedBy": {"login": "loom-station"}},
+            {"headRefName": "loom/3-c", "mergedAt": stamp, "mergedBy": {"login": "loom-brain"}},
+            {"headRefName": "loom/4-d", "mergedAt": stamp, "mergedBy": {"login": "someone-else"}},
+            # Not a lane branch, and a merge before the window: neither counts.
+            {"headRefName": "feature/x", "mergedAt": stamp, "mergedBy": {"login": "loom-brain"}},
+            {"headRefName": "loom/5-e", "mergedAt": old, "mergedBy": {"login": "loom-brain"}}]
+        self.settings.authors = list(AUTHORS) + ["loom-brain[bot]", "loom-station[bot]"]
+        with mock.patch.dict(os.environ, {"LOOM_GITHUB_LOGIN": "loom-station[bot]"}):
+            self.at(10, 1)
+        self.assertIn("Lane pull requests merged since the last digest: 4 "
+                      "(factory 2, brain 1, other 1).", self.sent[0]["content"])
+
+    def test_the_merge_count_pages_until_the_window_ends(self):
+        # Elder review of the PR for loom#2432: a repo with over 100 merged
+        # pull requests hid lane merges past the first page.
+        self.goal(40, "Goal forty")
+        self.at(9, 0)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base + 9.5 * 3600))
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 3 * 86400))
+        fresh = {"headRefName": "loom/1-a", "mergedAt": stamp, "updatedAt": stamp,
+                 "mergedBy": {"login": "someone-else"}}
+        stale = {"headRefName": "loom/9-z", "mergedAt": old, "updatedAt": old,
+                 "mergedBy": {"login": "someone-else"}}
+        # Three pages: two in the window, then one past it; a fourth page
+        # would never be read.
+        self.fake.merged_pages = [[fresh, fresh], [fresh, stale], [fresh], [fresh]]
+        self.at(10, 1)
+        self.assertIn("Lane pull requests merged since the last digest: 3 "
+                      "(factory 0, brain 0, other 3).", self.sent[0]["content"])
+
+    def test_a_merger_is_factory_brain_or_other(self):
+        bots = {"loom-brain"}
+        self.assertEqual(station.merge_actor("loom-station[bot]", "loom-station", bots), "factory")
+        self.assertEqual(station.merge_actor("Loom-Brain", "loom-station", bots), "brain")
+        self.assertEqual(station.merge_actor("a-person", "loom-station", bots), "other")
+        self.assertEqual(station.merge_actor("", "", bots), "other")
 
     def test_a_backlog_goal_is_one_digest_line_from_its_tickets(self):
         # 2026-10-25: a per-repo backlog goal posts no report on GitHub; its
@@ -15462,3 +15834,178 @@ class LunaReviewResultTest(Base):
         self.assertTrue(self.report())
         self.assertEqual(self.verdicts(), [])
         self.assertEqual(self.fake.reviews_posted, [])
+
+
+class ReadyForAgentIntakeTest(Base):
+    """loom#3092: Loom never read the ready-for-agent label, so an issue
+    marked ready for an agent with no Loom label never entered the queue.
+    The station gives each such issue loom:triage, so the brain triages it."""
+
+    def ready(self, number, labels=(), created="2030-01-01T00:00:00Z", **fields):
+        self.fake.add_open_issue(number, created=created)
+        self.fake.issues[number]["labels"] = [{"name": "ready-for-agent"}] + [
+            {"name": name} for name in labels]
+        self.fake.issues[number].update(fields)
+
+    def intake(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_a_ready_for_agent_issue_with_no_loom_label_goes_to_triage(self):
+        self.ready(21)
+        said = self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:triage"})
+        self.assertEqual(self.fake.comments[21], [])
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+    def test_a_claimed_or_assigned_ready_issue_is_left_alone(self):
+        self.ready(21, labels=("claim:someone",))
+        self.ready(22, assignees=[{"login": "someone"}])
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_epic_is_left_alone(self):
+        self.ready(21, labels=("epic",))
+        self.ready(22, sub_issues_summary={"total": 3})
+        self.intake()
+        for number in (21, 22):
+            self.assertNotIn("loom:triage", self.fake.names(number), number)
+
+    def test_a_ready_issue_loom_already_labeled_is_left_alone(self):
+        self.ready(21, labels=("loom:queued", "loom:ticket"))
+        self.ready(22, labels=("loom:triage",))
+        self.intake()
+        self.assertEqual(set(self.fake.names(21)), {"ready-for-agent", "loom:queued", "loom:ticket"})
+        self.assertEqual(set(self.fake.names(22)), {"ready-for-agent", "loom:triage"})
+        self.assertFalse([p for m, p in self.fake.calls if m != "GET"], self.fake.calls)
+
+    def test_one_run_labels_at_most_the_cap_oldest_first(self):
+        cap = station.READY_PER_RUN
+        for n in range(cap + 3):
+            self.ready(100 + n, created="2030-01-%02dT00:00:00Z" % (cap + 3 - n))
+        said = self.intake()
+        labeled = [100 + n for n in range(cap + 3) if "loom:triage" in self.fake.names(100 + n)]
+        self.assertEqual(labeled, [100 + n for n in range(3, cap + 3)])
+        self.assertEqual(said, ["ready-for-agent intake: %d issues to loom:triage" % cap])
+
+    def test_the_intake_runs_at_most_once_an_hour(self):
+        self.ready(21)
+        self.intake()
+        self.ready(22)
+        self.fake.calls.clear()
+        self.assertEqual(self.intake(), [])
+        self.assertNotIn("loom:triage", self.fake.names(22))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_budget_spent_partway_through_a_repo_stops_the_labeling(self):
+        self.ready(21, created="2030-01-01T00:00:00Z")
+        self.ready(22, created="2030-01-02T00:00:00Z")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        # Not deferred at the repo, nor before the first issue; spent after it.
+        with mock.patch.object(runner, "_deferred", side_effect=[False, False] + [True] * 9), \
+                mock.patch("bus.station._say"):
+            runner.intake_ready_for_agent()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertNotIn("loom:triage", self.fake.names(22))
+
+    def test_a_failed_label_write_still_counts_what_was_labeled_against_the_cap(self):
+        for n in range(4):
+            self.ready(21 + n, created="2030-01-0%dT00:00:00Z" % (n + 1))
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        real, posts = runner.gh.rest, []
+
+        def rest(method, path, *args, **kw):
+            if method == "POST":
+                posts.append(path)
+                if len(posts) == 2:
+                    raise station.GitHubError("server error", 500)
+            return real(method, path, *args, **kw)
+        with mock.patch.object(runner.gh, "rest", side_effect=rest), \
+                mock.patch.object(station, "READY_PER_RUN", 2), \
+                mock.patch.object(runner, "_verify_repos", return_value=[REPO, REPO]), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        labeled = [n for n in range(21, 25) if "loom:triage" in self.fake.names(n)]
+        self.assertEqual(len(labeled), 2, labeled)
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertEqual(said[-1], "ready-for-agent intake: 2 issues to loom:triage")
+
+    def test_a_failed_repo_read_lets_the_next_pass_retry_within_the_hour(self):
+        self.ready(21)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner.gh, "rest",
+                               side_effect=station.GitHubError("server error", 502)), \
+                mock.patch("bus.station._say") as say:
+            runner.intake_ready_for_agent()
+        said = [c.args[0] for c in say.call_args_list]
+        self.assertTrue(any("could not read" in line for line in said), said)
+        self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+
+    def test_eligible_issues_past_the_first_page_are_reached(self):
+        # The oldest 100 ready issues are all claimed; the intake reads on.
+        for n in range(100):
+            self.ready(200 + n, labels=("claim:someone",),
+                       created="2030-01-01T00:%02d:%02dZ" % (n // 60, n % 60))
+        self.ready(21, created="2030-02-01T00:00:00Z")
+        said = self.intake()
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertEqual(said, ["ready-for-agent intake: 1 issue to loom:triage"])
+
+
+class HumanClaimTest(Base):
+    """A second operator's session claims an issue by assigning its login and
+    commenting a fixed phrase (bus/human_claims.py). The ready-for-agent
+    intake and a lane claim both leave such an issue alone."""
+
+    LOGIN = "ccqw"
+    PHRASE = "Claimed by ccqw's Claude Code"
+
+    def setUp(self):
+        super().setUp()
+        self.fake.default_body = BODY_WITH_CRITERIA
+
+    def claim(self, number, by=None):
+        self.fake.comments[number].append({"user": {"login": by or self.LOGIN},
+                                           "body": self.PHRASE + ", working it now."})
+        self.fake.issues[number]["comments"] = len(self.fake.comments[number])
+
+    def quiet(self, step):
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch("bus.station._say"):
+            step()
+
+    def test_the_intake_skips_a_ready_issue_with_the_claim_comment(self):
+        for number in (21, 22):
+            self.fake.add_open_issue(number)
+            self.fake.issues[number]["labels"] = [{"name": "ready-for-agent"}]
+        self.claim(21)
+        self.claim(22, by="stranger")
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.quiet(runner.intake_ready_for_agent)
+        self.assertNotIn("loom:triage", self.fake.names(21))
+        self.assertIn("loom:triage", self.fake.names(22))
+
+    def test_the_intake_reads_no_comments_of_an_issue_with_none(self):
+        self.fake.add_open_issue(21)
+        self.fake.issues[21].update(labels=[{"name": "ready-for-agent"}], comments=0)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.quiet(runner.intake_ready_for_agent)
+        self.assertIn("loom:triage", self.fake.names(21))
+        self.assertFalse([p for p in self.fake.paths("GET") if "/issues/21/comments" in p])
+
+    def test_a_lane_never_claims_a_ticket_with_the_claim_comment(self):
+        self.fake.add(12)
+        self.claim(12)
+        self.quiet(self.run_pass)
+        self.assertEqual(self.listing(), [])
+        self.assertNotIn("loom:running", self.fake.names(12))
+
+    def test_a_lane_never_claims_a_ticket_assigned_to_the_claim_login(self):
+        self.settings.briefers = [self.LOGIN]
+        self.fake.add(12, author=self.LOGIN)
+        self.fake.issues[12]["assignees"] = [{"login": self.LOGIN}]
+        self.quiet(self.run_pass)
+        self.assertEqual(self.listing(), [])

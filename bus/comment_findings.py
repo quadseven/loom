@@ -16,12 +16,16 @@ The convention:
   comment with any other loom machine marker is never a legacy finding, so a
   Luna verdict for an older head does not block a newer one.
 - A finding is answered by a later trusted comment that links it as
-  #issuecomment-<id> (its own URL works too) and states a resolution: a line
-  opening with "Fixed in <commit>", or one opening with "Declined" and giving
-  its reason in three or more words. It is the only thing that clears a
-  finding. A link alone answers nothing, so an acknowledgement or a "still
-  broken, investigating" reply leaves it open, as do a comment without the
-  link, an older one, and one from an untrusted login.
+  #issuecomment-<id> (its own URL works too) and states a resolution backed by
+  evidence: a line opening with "Fixed in <commit>" whose commit is one of the
+  pull request's own commits, or one opening with "Declined" whose reason has
+  three or more words and cites evidence: a file line (path:line), one of the
+  pull request's commits, or a link other than the finding's own. It is the
+  only thing that clears a finding. A link alone answers nothing, so an
+  acknowledgement, a "still broken, investigating" reply, a fix naming a
+  commit the pull request does not carry, or a decline with no evidence leaves
+  it open, as do a comment without the link, an older one, and one from an
+  untrusted login.
 - A finding stays open across pushes. No commit clears it, empty or unrelated,
   and a newer head does not supersede it. A later trusted finding that links an
   older one is a repeated objection: both stay open.
@@ -29,7 +33,7 @@ The convention:
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from . import history
 
@@ -45,10 +49,16 @@ _COMMIT = re.compile(r"\b(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b", 
 # The two resolutions, each a line of its own after markdown marks: a fix
 # that names its commit, or a decline with its reason.
 _FIXED = re.compile(r"^[ \t>*_#-]*fixed[ \t]+(?:in|at|by)[ \t]+(?:commit[ \t]+)?[`]?"
-                    r"(?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b", re.I | re.M)
+                    r"((?=[0-9a-f]*[0-9])(?=[0-9a-f]*[a-f])[0-9a-f]{7,40})\b", re.I | re.M)
 _DECLINED = re.compile(r"^[ \t>*_#-]*declined\b(.*)$", re.I | re.M)
 _URL = re.compile(r"https?://\S+")
+# A file line a decline cites as its evidence, such as bus/brain.py:120.
+_FILE_LINE = re.compile(r"\b[\w./-]+\.\w+:\d+\b")
 DECLINE_WORDS_MIN = 3
+# Reads the pull request's commit SHAs. It is called only when an answer
+# names a commit, at most once, and its error reaches the caller, which
+# refuses the merge: a fix it cannot check is no fix.
+CommitReader = Callable[[], Sequence[str]]
 
 
 def opens_finding(body: str) -> bool:
@@ -66,20 +76,41 @@ def _links(body: str, ident: str) -> bool:
                                      body) is not None
 
 
-def resolves(body: str) -> bool:
-    """Whether a body states a resolution: a line opening with "Fixed in" (or
-    at, by) that names the fixing commit, or one opening with "Declined" that
-    gives a reason of DECLINE_WORDS_MIN or more words besides links. A
-    finding never resolves another, so a repeated objection stays open."""
+def _on_pull_request(sha: str, commits: Callable[[], List[str]]) -> bool:
+    """Whether the commit named by `sha` (7 to 40 hex characters) is one of
+    the pull request's commits."""
+    sha = sha.lower()
+    return any(c.startswith(sha) for c in commits())
+
+
+def _evidence(reason: str, ident: str, commits: Callable[[], List[str]]) -> bool:
+    """Whether a decline's reason cites evidence: a file line, a link other
+    than the finding's own, or one of the pull request's commits."""
+    if _FILE_LINE.search(_URL.sub(" ", reason)):
+        return True
+    if any(not _links(link, ident) for link in _URL.findall(reason)):
+        return True
+    return any(_on_pull_request(sha, commits) for sha in _COMMIT.findall(reason))
+
+
+def resolves(body: str, ident: str, commits: Callable[[], List[str]]) -> bool:
+    """Whether a body states a resolution of finding `ident` backed by
+    evidence: a line opening with "Fixed in" (or at, by) that names one of the
+    pull request's commits, or one opening with "Declined" that gives a reason
+    of DECLINE_WORDS_MIN or more words besides links and cites evidence
+    (_evidence). A finding never resolves another, so a repeated objection
+    stays open."""
     if opens_finding(body):
         return False
-    if _FIXED.search(body):
+    if any(_on_pull_request(sha, commits) for sha in _FIXED.findall(body)):
         return True
     return any(len(re.findall(r"[A-Za-z0-9]+", _URL.sub(" ", reason))) >= DECLINE_WORDS_MIN
+               and _evidence(reason, ident, commits)
                for reason in _DECLINED.findall(body))
 
 
-def _answered(finding: Mapping[str, Any], trusted: Sequence[Mapping[str, Any]]) -> bool:
+def _answered(finding: Mapping[str, Any], trusted: Sequence[Mapping[str, Any]],
+              commits: Callable[[], List[str]]) -> bool:
     """A trusted comment made after the finding that links it and resolves
     it. A link alone, an acknowledgement or a repeated objection is no
     answer. A finding with no id or no time cannot be answered, so it stays
@@ -91,18 +122,33 @@ def _answered(finding: Mapping[str, Any], trusted: Sequence[Mapping[str, Any]]) 
     for c in trusted:
         body = str(c.get("body") or "")
         if (str(c.get("created_at") or "") > created and _links(body, ident)
-                and resolves(body)):
+                and resolves(body, ident, commits)):
             return True
     return False
 
 
-def open_findings(comments: Sequence[Any], authors: Sequence[str]) -> List[Dict[str, Any]]:
+def _once(read: Optional[CommitReader]) -> Callable[[], List[str]]:
+    """`read`, called at most once and lowercased. With no reader, no commit
+    is the pull request's, so no answer that names one resolves anything."""
+    cache: List[List[str]] = []
+
+    def commits() -> List[str]:
+        if not cache:
+            cache.append([str(s).lower() for s in (read() if read else ()) if s])
+        return cache[0]
+    return commits
+
+
+def open_findings(comments: Sequence[Any], authors: Sequence[str],
+                  commits: Optional[CommitReader] = None) -> List[Dict[str, Any]]:
     """The trusted blocking comments on a pull request that no trusted
     comment answers, oldest first. `authors` are the trusted logins
-    (LOOM_BRIEF_AUTHORS); an empty list trusts nobody."""
+    (LOOM_BRIEF_AUTHORS); an empty list trusts nobody. `commits` reads the
+    pull request's commit SHAs (CommitReader); its error propagates."""
     trusted = history.trusted_comments(list(comments or ()), list(authors))
     found = [c for c in trusted if opens_finding(str(c.get("body") or ""))]
-    open_now = [c for c in found if not _answered(c, trusted)]
+    read = _once(commits)
+    open_now = [c for c in found if not _answered(c, trusted, read)]
     return sorted(open_now, key=lambda c: str(c.get("created_at") or ""))
 
 
