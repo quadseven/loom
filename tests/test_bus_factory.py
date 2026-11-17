@@ -4131,6 +4131,18 @@ class Tickets(Base):
         self.assertNotIn("loom:rung", note)
         self.assertEqual(self.moved, [])
 
+    def test_a_ticket_on_a_pace_stopped_lane_moves_to_another_free_lane_of_its_tier(self):
+        # loom#2809: a pace stop now holds the slot until the pace catches up
+        # (bus/model_pick.py pace_catches_up), so its heartbeat reads limited
+        # and the ticket it stopped on goes to another free lane of its tier.
+        self.gh.ticket(7, "briefed", lane="opencode-go-3", body="Difficulty: medium\n\n## Why\nx\n")
+        self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
+                              "created_at": iso(60)}]
+        self.go(limited=["opencode-go-3"],
+                available=[x for x in factory.TIERS["medium"] if x != "opencode-go-3"])
+        self.assertNotEqual(self.lane(7), "opencode-go-3")
+        self.assertIn(self.lane(7), factory.TIERS["medium"])
+
     def test_a_ticket_briefed_on_a_down_lane_steps_aside_at_once(self):
         # A lane whose key expired never claims its briefed tickets; they
         # waited the two-hour stall before (2026-10-19).
