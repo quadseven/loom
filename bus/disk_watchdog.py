@@ -8,6 +8,13 @@ LOOM_DISK_WATCHDOG_GB free (default 25; 0 turns it off), at most every
 WATCH_EVERY seconds, it clears Loom-owned data in this order and stops as
 soon as the disk is back above the trigger:
 
+0. Time Machine local snapshots (com.apple.TimeMachine.<date>.local), on
+   macOS only, oldest first, with tmutil. Deleting files frees nothing while
+   an hourly snapshot still holds them, and macOS thins snapshots only under
+   pressure, so the claim floor held while the disk looked full of data
+   already gone (loom#3187). The backups themselves live on the backup
+   target. No other snapshot (com.apple.os.update-* and the like) is
+   touched; LOOM_THIN_SNAPSHOTS=0 turns this step off.
 1. Lane logs (logs/<slot>/) unchanged for LOG_DAYS days, and rotated service
    logs: archived to LOOM_DISK_ARCHIVE_DIR when that folder is mounted,
    else compressed in place.
@@ -44,6 +51,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import time
@@ -70,7 +78,13 @@ TICKET_RE = re.compile(r"^([A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+?-[0-9]+)(?=$|[-.])")
 _ROTATED_RE = re.compile(r"^.+\.log\.[0-9]{8}T[0-9]{6}Z\.gz$")
 COMPRESSED = (".gz", ".tgz", ".zst", ".xz", ".bz2")
 
+TM_SNAPSHOT_RE = re.compile(r"^com\.apple\.TimeMachine\.([0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6})\.local$")
+TM_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{6}$")
+TMUTIL_SECONDS = 300
+
 Say = Callable[[str], None]
+# tmutil arguments -> (exit code, stdout, stderr); OSError when it cannot run.
+Tmutil = Callable[[List[str]], Tuple[int, str, str]]
 
 
 class Config(NamedTuple):
@@ -133,14 +147,59 @@ def _gb(n: float) -> str:
     return "%.1f GB" % (n / GB)
 
 
+def _run_tmutil(args: List[str]) -> Tuple[int, str, str]:
+    try:
+        done = subprocess.run(["tmutil"] + list(args), capture_output=True, text=True,
+                              timeout=TMUTIL_SECONDS)
+    except subprocess.SubprocessError as err:
+        raise OSError(str(err)) from err
+    return done.returncode, done.stdout, done.stderr
+
+
+class TimeMachine:
+    """Time Machine local snapshots of the boot volume, through tmutil."""
+
+    def __init__(self, run: Tmutil = _run_tmutil):
+        self.run = run
+
+    @classmethod
+    def for_host(cls, platform: str = sys.platform,
+                 which: Callable[[str], Optional[str]] = shutil.which) -> Optional["TimeMachine"]:
+        """A TimeMachine on macOS with tmutil on PATH, else None."""
+        if platform != "darwin" or not which("tmutil"):
+            return None
+        return cls()
+
+    def _lines(self, *args: str) -> List[str]:
+        code, out, err = self.run(list(args))
+        if code != 0:
+            raise OSError("tmutil %s exited %d: %s" % (args[0], code, (err or out).strip()[:200]))
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def dates(self) -> List[str]:
+        """Dates of the Time Machine local snapshots, oldest first: a date
+        listlocalsnapshotdates gives that a com.apple.TimeMachine. name in
+        listlocalsnapshots also backs, so no other snapshot is ever named."""
+        named = {m.group(1) for m in map(TM_SNAPSHOT_RE.match, self._lines("listlocalsnapshots", "/"))
+                 if m}
+        listed = {d for d in self._lines("listlocalsnapshotdates", "/") if TM_DATE_RE.match(d)}
+        return sorted(named & listed)
+
+    def delete(self, date: str) -> None:
+        if not TM_DATE_RE.match(date):
+            raise OSError("not a snapshot date: %r" % date)
+        self._lines("deletelocalsnapshots", date)
+
+
 def _ticket(name: str) -> Optional[str]:
     match = TICKET_RE.match(name)
     return match.group(1) if match else None
 
 
 class Watchdog:
-    def __init__(self, cfg: Config, roots: Roots, disk, floor: float, now: float, say: Say):
-        self.cfg, self.roots, self.disk = cfg, roots, disk
+    def __init__(self, cfg: Config, roots: Roots, disk, floor: float, now: float, say: Say,
+                 tm: Optional[TimeMachine] = None):
+        self.cfg, self.roots, self.disk, self.tm = cfg, roots, disk, tm
         self.floor, self.now, self.say = floor, now, say
         self.trigger = cfg.trigger_gb * GB
         self.live = {t for t in (_ticket(n) for n in roots.live) if t} | set(roots.live)
@@ -255,7 +314,8 @@ class Watchdog:
     def clear(self) -> Tuple[int, bool]:
         """Work through the steps until the disk is above the trigger. Returns
         (bytes freed, whether the trigger was reached)."""
-        start = free = self.disk.free(self.roots.home)
+        start = self.disk.free(self.roots.home)
+        free = self.snapshots(start)
         steps = (("logs older than %d days" % self.cfg.log_days, self.logs),
                  ("finished run folders older than %d days" % self.cfg.run_days, self.run),
                  ("lane trees older than %d days" % self.cfg.tree_days, self.trees),
@@ -274,6 +334,32 @@ class Watchdog:
                 self.say("disk watchdog: %s: %d cleared, %s freed, %s free"
                          % (label, count, _gb(max(0, free - before)), _gb(free)))
         return max(0, free - start), free >= self.trigger
+
+    def snapshots(self, free: int) -> int:
+        """Delete Time Machine local snapshots, oldest first, until the disk
+        is above the trigger; a tmutil error ends the step and is logged.
+        Returns the free space after."""
+        if self.tm is None or free >= self.trigger:
+            return free
+        try:
+            dates = self.tm.dates()
+        except OSError as err:
+            self.say("disk watchdog: cannot list Time Machine local snapshots: %s" % err)
+            return free
+        for date in dates:
+            if free >= self.trigger:
+                break
+            name = "com.apple.TimeMachine.%s.local" % date
+            try:
+                self.tm.delete(date)
+            except OSError as err:
+                self.say("disk watchdog: kept Time Machine local snapshot %s: %s" % (name, err))
+                break
+            after = self.disk.free(self.roots.home)
+            self.say("disk watchdog: deleted Time Machine local snapshot %s: %s free before, "
+                     "%s after" % (name, _gb(free), _gb(after)))
+            free = after
+        return free
 
     def _act(self, item: Item) -> bool:
         if not self.owned(item.path):
@@ -309,9 +395,10 @@ class Watchdog:
 
 
 def tend(cfg: Config, roots: Roots, disk, floor: float, now: float, say: Say,
-         saved: Dict) -> Dict:
+         saved: Dict, tm: Optional[TimeMachine] = None) -> Dict:
     """One watchdog turn. saved is the last turn's record; the new one is
-    returned: at (last run), reported (last floor report), notice."""
+    returned: at (last run), reported (last floor report), notice. tm, when
+    given, deletes Time Machine local snapshots before Loom's own data."""
     if cfg.trigger_gb <= 0:
         return {}
     free = disk.free(roots.home)
@@ -321,7 +408,7 @@ def tend(cfg: Config, roots: Roots, disk, floor: float, now: float, say: Say,
         if free >= floor and saved.get("notice"):
             return dict(saved, notice=None)
         return saved
-    dog = Watchdog(cfg, roots, disk, floor, now, say)
+    dog = Watchdog(cfg, roots, disk, floor, now, say, tm)
     freed, _ = dog.clear()
     out = dict(saved, at=now, freed=freed)
     if disk.free(roots.home) >= floor:
