@@ -161,6 +161,8 @@ unset variables.
 - On a host, a base check verdict is reused by repo, base revision, check
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
+  Before running a Codex agent, the lane reruns green checks that populated
+  uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
@@ -347,6 +349,11 @@ pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
 that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
 does not stop the run: the log and the pull request body (or the round's
 comment) carry `live-cluster check could not run: <reason>`.
+
+Before opening a pull request, the runner also checks each ticked live
+acceptance criterion. The criterion names its expected output lines in
+backticks or double quotes. Each line must appear in the current run's log.
+Leave the box unticked if the expected output is unspecified or missing.
 
 ## The brain tick
 

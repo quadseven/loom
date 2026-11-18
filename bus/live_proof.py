@@ -41,9 +41,9 @@ from __future__ import annotations
 import re
 import shlex
 import time
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
-from . import criteria_gate, evidence
+from . import criteria_gate, evidence, proof
 
 LOG = "log"
 QUERY = "query"
@@ -253,6 +253,24 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
     if found:
         return Step(LOG, found[0], tuple(found[1:]), hours), ""
     return None, "no proof Loom can run"
+
+
+def lane_output_gap(body: str, log: Iterable[str]) -> str:
+    """The first checked live box missing its stated output in this lane run."""
+    checked_live = [(index, text) for index, (checked, text) in enumerate(proof.criteria(body), 1)
+                    if checked and criteria_gate.kind(text) == criteria_gate.LIVE]
+    if not checked_live:
+        return ""
+    lines = {line.strip() for line in log}
+    for index, text in checked_live:
+        expected = [line for line in evidence.needles(text)
+                    if not _command_like(line) and not criteria_gate.URL_RE.fullmatch(line)]
+        if (expected and not evidence.absent_needles(text) and not evidence.required_span(text)
+                and all(line in lines for line in expected)):
+            continue
+        return ("live acceptance criterion %d needs its expected output in this run log; "
+                "leave it unticked until verified" % index)
+    return ""
 
 
 def _step_refusal(step: Step) -> str:
