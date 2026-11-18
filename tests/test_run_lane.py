@@ -2382,6 +2382,18 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual([c.split()[3] for c in writes], ["POST", "PATCH"])
         self.assertFalse([c for c in self.calls() if c.startswith("gh pr comment")])
 
+    def test_an_operator_review_fix_reports_progress_locally_and_still_answers_findings(self):
+        name, _ = self.fix_brief()
+        brief = self.inbox / (name + ".md")
+        brief.write_text(brief.read_text().replace("Fix-PR: 7\n", "Fix-PR: 7\nOperator-Review: yes\n"))
+        replies = '[{"thread":"PRRT_1","reply":"Renamed in a.py.","resolve":true}]'
+        result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_REPLIES=replies)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.sticky_bodies(), [])
+        self.assertTrue(any("addPullRequestReviewThreadReply" in call for call in self.calls()))
+        log = (self.loom / "logs" / "codex" / (name + ".log")).read_text()
+        self.assertIn("pushed 1 commit for: Check: lint", log)
+
     def test_a_failed_read_of_the_round_comment_posts_no_second_one(self):
         name, _ = self.fix_brief()
         result = self.run_lane(FAKE_GH_EXISTING="7", FAKE_GH_COMMENTS_FAIL="1")

@@ -3509,7 +3509,11 @@ validation_round_note() {
   elif [ -n "$VALIDATED" ]; then
     printf 'Contract command result: %s. ' "$VALIDATED"
   fi
-  printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
+  if [ "${1:-}" = yes ]; then
+    printf 'CI and review run again on the new head before operator review.'
+  else
+    printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
+  fi
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
@@ -4579,6 +4583,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
+  OPERATOR_REVIEW="$(field Operator-Review "$BRIEF" || true)"
   REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
   # A review brief (Deliverable: review) takes its pull request's branch the
   # same way a fix brief does: the tree under review is the PR's own head.
@@ -5273,7 +5278,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
       # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
       # reader nothing; the comment says what went up and what happens next.
       PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
-      CHECKED="$(validation_round_note)"
+      CHECKED="$(validation_round_note "$OPERATOR_REVIEW")"
       COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
 
 $(pushed_commits)
@@ -5300,9 +5305,11 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
 
 Review threads this round left without a reply: $UNANSWERED"
     fi
-    # One comment per pull request, edited each round; the push and the body
-    # edit are already on the pull request's timeline.
-    if ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
+    # Operator review needs the decisions and finding replies on the pull
+    # request. Progress travels with the local run log.
+    if [ "$OPERATOR_REVIEW" = yes ]; then
+      printf '%s\n' "$COMMENT" >> "$LOG"
+    elif ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
     if [ "$COMMITTED" -eq 1 ]; then

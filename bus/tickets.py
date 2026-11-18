@@ -834,7 +834,7 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
                   has_contract: bool = True, resume: Optional[str] = None,
                   notes: Sequence[Tuple[str, str, str]] = (),
                   linked: Sequence[str] = (), demoted_models: str = "",
-                  claim: str = "", defaults: Sequence[str] = ()) -> str:
+                  claim: str = "", defaults: Sequence[str] = (), operator_review: bool = False) -> str:
     number = int(issue["number"])
     title = " ".join(str(issue.get("title") or "").split())
     headers, body = parse(issue.get("body"))
@@ -848,6 +848,8 @@ def render_brief(repo: str, issue: Dict[str, Any], lane: str, attempt: int = 1,
     ]
     if fix:
         out.append("Fix-PR: %d" % fix.pr)
+        if operator_review:
+            out.append("Operator-Review: yes")
         for f in fix.findings_list:
             # Flatten review text so it cannot introduce a brief header or section.
             # The Finding-<id> prefix also prevents a field() match in the runner.
