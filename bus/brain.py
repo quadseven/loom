@@ -2106,14 +2106,14 @@ def _check_model(model: Optional[str]) -> None:
 
 
 def _check_laneable(body: str) -> None:
-    """Refuse a brief no lane can meet: every acceptance criterion is a check
-    on a live host or network (operator_hold.host_only). 2026-10-22: such a
-    ticket was laned; the lane replaced a README to have a diff, and it
-    merged."""
+    """Refuse host-only briefs and briefs that need to be split before filing."""
     if operator_hold.host_only(body):
         raise ValueError("every acceptance criterion is a check on a live host or network: "
                          "no lane can meet it; file it as a needs-operator ask, or add a "
                          "criterion a pull request can meet")
+    split = brief_check.split_verdict(body)
+    if split is not None:
+        raise ValueError("this brief " + split.reason)
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],
@@ -4127,7 +4127,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     Only a source the station could not claim as a ticket (_in_place_refusal)
     gets a new ticket whose body ends with "Rewritten from issue M." in
     words, and a comment naming the ticket and loom:rewritten in place of
-    loom:triage; it closes as completed when the ticket is verified
+    its ticket and state labels; it closes as completed when the ticket is verified
     (settle_source). The line is words, not "Refs #M": lanes copy the
     brief's sections into their pull request, and the review bot's plan
     check then demands that the original, which is in no epic, belong to one
@@ -4299,28 +4299,30 @@ def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
     (_rewrite_in_place), else a new issue (_filed_rewrite)."""
     if source is not None and elsewhere is None:
         return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
-    refs = int(source["number"]) if source is not None else None
-    extra = ["loom:factory"] if source is not None and "loom:factory" in _labels(source) else []
-    return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere, extra)
+    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
-                   lane: Optional[str], refs: Optional[int],
-                   elsewhere: Optional[str], extra: Sequence[str]) -> Dict[str, Any]:
-    """File the brief as a new ticket. With refs (a source in-place rewriting
-    refuses, see _in_place_refusal), the source gets the rewrite comment and
-    loom:rewritten in place of loom:triage, and closes with the ticket."""
+                   lane: Optional[str], source: Optional[Dict[str, Any]],
+                   elsewhere: Optional[str]) -> Dict[str, Any]:
+    """File the brief as a new ticket. Its source, if any, gets the rewrite
+    comment and loom:rewritten in place of its ticket and state labels."""
+    source_labels = _labels(source) if source is not None else []
+    extra = ["loom:factory"] if "loom:factory" in source_labels else []
     issue = _file_ticket(gh, repo, epic, title, body, lane, extra)
-    if refs is not None:
+    if source is not None:
+        refs = int(source["number"])
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),
               file=sys.stderr)
         notify.post(gh, repo, refs,
                     "%s\nRewritten as ticket #%d, which refs this issue. This issue "
                     "closes as completed when that ticket is verified." % (
                         TRIAGE_MARKER, issue["number"]), notify.SOURCE)
-        _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
+        for label in source_labels:
+            if label in ticket_move.STATE_LABELS or label in ("loom:ticket", "loom:triage"):
+                _remove_label(gh, repo, refs, label)
     return issue
 
 
@@ -6664,6 +6666,7 @@ FORCE_CLOSE_LABEL = "force-close"
 _REWRITTEN_FROM = tickets.REWRITTEN_FROM_RE
 # Rewrites before loom#462 ended the ticket with this line instead.
 _REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 
 
 def rewritten_from(body: Any) -> Optional[int]:
@@ -6673,6 +6676,30 @@ def rewritten_from(body: Any) -> Optional[int]:
     text_ = tickets.without_original(str(body or ""))
     found = _REWRITTEN_FROM.search(text_) or _REFS_LINE.search(text_)
     return int(found.group(1)) if found else None
+
+
+def rewritten_as(comments: Any, authors: Optional[Sequence[str]] = None) -> int:
+    """The ticket named by the newest trusted rewrite comment, or 0."""
+    for comment in reversed(trusted_comments(comments, authors)):
+        body = str(comment.get("body") or "")
+        match = REWRITTEN_AS_RE.search(body)
+        if TRIAGE_MARKER in body and match:
+            return int(match.group(1))
+    return 0
+
+
+def has_open_rewrite(gh: GitHub, repo: str, issue: Dict[str, Any],
+                     authors: Optional[Sequence[str]] = None) -> bool:
+    """Whether a rewritten source's work is on a replacement still open."""
+    if "loom:rewritten" not in _labels(issue):
+        return False
+    number = int(issue["number"])
+    ticket = rewritten_as(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), authors)
+    if not ticket or ticket == number:
+        return False
+    replacement = gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket), ok=(404,)).data
+    return (isinstance(replacement, dict) and replacement.get("state") == "open"
+            and "pull_request" not in replacement and "loom:ticket" in _labels(replacement))
 
 
 def _source_marker(ticket: int, outcome: str) -> str:

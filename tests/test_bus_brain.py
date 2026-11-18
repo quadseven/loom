@@ -1417,6 +1417,15 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
         self.assertEqual(fake.calls, [])
 
+    def test_brief_refuses_a_split_before_filing_or_rewriting(self):
+        text = BODY.replace("## What\n", "## What\nAdd iOS and Android discovery.\n")
+        for refs in (None, 19):
+            with self.subTest(refs=refs):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "split.*After:"):
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, refs=refs)
+                self.assertEqual(fake.calls, [])
+
     def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
         stub = BODY.replace("- [ ] ", "- ")
         for name in ("epic", "wayfinder:map"):
@@ -5192,8 +5201,9 @@ class HumanAndRefsTests(unittest.TestCase):
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertIn("closes as completed when that ticket is verified", fake.calls[5][2]["body"])
-        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
-        self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "POST", "DELETE"])
+        self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
+        self.assertTrue(fake.calls[7][1].endswith("/labels/loom%3Atriage"))
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     def test_brief_refs_refuses_a_ticket_or_closed_original(self):
@@ -5316,7 +5326,7 @@ class HumanAndRefsTests(unittest.TestCase):
                 self.assertTrue(fake.calls[3][2]["body"].endswith(
                     "\n\nRewritten from issue 6.\n\nPart of #2\n"))
                 self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
-                self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+                self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
                 self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
                 self.assertIn("#6 is rewritten as a new ticket", err.getvalue())
 

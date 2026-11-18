@@ -61,6 +61,23 @@ def section(body, heading, after):
 
 
 class ChainViewTest(unittest.TestCase):
+    def test_claim_counts_use_the_configured_operator_logins(self):
+        payload = dict(PAYLOAD, operator_claims={
+            "read_at": NOW,
+            "items": [{"owners": [{"login": "first-example"}]}],
+            "needs": [{"waiting_on": ["second-example"]}],
+        })
+        defaults = build(payload=payload)["mastermind"]
+        self.assertFalse(any(row["login"] for row in defaults))
+        configured = build(payload=payload, env={
+            "LOOM_CHAIN_OPERATOR": "First-Example",
+            "LOOM_CHAIN_SECOND_OPERATOR": "second-example",
+        })["mastermind"]
+        self.assertEqual(
+            [(row["login"], row["claimed"], row["waiting"]) for row in configured[:2]],
+            [("first-example", 1, 0), ("second-example", 0, 1)],
+        )
+
     def test_every_layer_heading_renders_in_order(self):
         body = chain_view.render_chain(build(stored()))
         found = [body.index('<h2 class="label">%s</h2>' % heading) for heading in HEADINGS]

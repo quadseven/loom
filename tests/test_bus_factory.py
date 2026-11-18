@@ -2733,17 +2733,73 @@ class ReviewBotThreads(Base):
         self.gh.ticket(5, "pr", lane=lane)
         if model:
             self.gh.issues[5]["body"] = "Model: %s\n" % model + self.gh.issues[5]["body"]
-        self.gh.comments[5].append({"body": FIX_MARKER + "\nPull request: x#50\n\n"
-                                    "### Thread PRRT_old (comment 1) at a.py:3\n\n"
-                                    "    grug-tribe: high | `rule-x` | quick win", "user": ME})
-        self.gh.pull(50, 5, resolved=False)
-        self.thread((author, "high | `rule-x` | quick win"))
-        self.gh.details[50]["reviewThreads"]["nodes"][0].update(path="a.py", line=5)
+        self.gh.comments[5].append({
+            "body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
+            "user": ME, "created_at": iso(120),
+        })
+        if author is None:
+            self.gh.pull(50, 5, green=False)
+            self.gh.runs["sha50"][1].update(conclusion="failure", output={
+                "title": "Elder markings - 1 blocking, 1 total",
+            })
+            finding = "### Check: %s\n\n    A blocking finding" % factory.DEFAULT_REVIEW_CHECK
+        else:
+            self.gh.pull(50, 5, resolved=False)
+            self.thread((author, "high | `rule-x` | quick win"))
+            self.gh.details[50]["reviewThreads"]["nodes"][0].update(path="a.py", line=5)
+            finding = ("### Thread PRRT_old (comment 1) at a.py:3\n\n"
+                       "    high | `rule-x` | quick win")
+        self.gh.comments[5].append({"body": FIX_MARKER + "\n\n" + finding, "user": ME})
         self.go()
 
     def test_the_review_bots_finding_posted_again_climbs_the_ladder(self):
         self.stuck_case(BOT)
         self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+
+    def run_second_review_rung(self, ending=None, claimed=True, author=BOT):
+        self.stuck_case(author)
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.gh.issues[5]["labels"] = [
+            {"name": "loom:pr"} if label["name"] == "loom:briefed" else label
+            for label in self.gh.issues[5]["labels"]
+        ]
+        if claimed:
+            self.gh.comments[5].append({
+                "body": "Claimed for lane %s (body sha256 0123456789ab)" % self.lane(5),
+                "user": ME, "created_at": iso(-60),
+            })
+        if ending:
+            self.gh.comments[5].append({
+                "body": "Lane %s stopped: %s" % (self.lane(5), ending),
+                "user": ME, "created_at": iso(-90),
+            })
+        self.fixed.clear()
+        self.go(now=NOW + 120)
+
+    def test_review_findings_persisting_on_two_rungs_ask_the_brain_to_split(self):
+        self.run_second_review_rung()
+        self.go(now=NOW + 180)
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(factory.rung_of(self.gh.comments[5]), 1)
+        self.assertIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
+        notes = [c["body"] for c in self.gh.comments[5] if "Split this ticket" in c["body"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("After:", notes[0])
+        self.assertEqual(self.closed, [])
+
+    def test_a_limit_on_the_second_rung_does_not_count_as_a_review_failure(self):
+        self.run_second_review_rung("[limit] quota exhausted")
+        self.assertNotIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
+        self.assertEqual(len(self.fixed), 1)
+
+    def test_an_unclaimed_rung_does_not_count_as_a_review_failure(self):
+        self.run_second_review_rung(claimed=False)
+        self.assertNotIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
+
+    def test_blocking_review_checks_without_threads_also_count(self):
+        self.run_second_review_rung(author=None)
+        self.assertEqual(self.fixed, [])
+        self.assertIn("needs-brain", [label["name"] for label in self.gh.issues[5]["labels"]])
 
     def test_a_stuck_send_back_past_the_last_rung_goes_to_the_hand_off_pool(self):
         self.stuck_case(BOT, lane="claude", model="claude-opus-5-5")

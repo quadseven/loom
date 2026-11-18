@@ -17,10 +17,8 @@ lists changes; an older open issue of the same invariant is folded into it.
 lane-no-success stays one issue per lane: the station reads its per-lane keys
 to release runaways a dead lane held.
 
-The kinds in ROLLED (lane-pr-stalled, plan-check-failed, epic-over-cap,
-epic-title-shared, closed-epic-open-tickets, goal-epics-over-cap) restate state the pull request, the epic or the dashboard
-already shows, so they file no issue per violation
-(loom#2099: 185 such tickets in 7 days). The filer folds each kind's breaches
+The kinds in ROLLED file no issue per violation (loom#2099: 185 such tickets
+in 7 days). The filer folds each kind's breaches
 into one tracking issue per (kind, subject repo), titled "Invariant: <kind> in
 <repo>", whose body lists every current violation, a line each with when it
 started. The list is rewritten in place only when it changes. A list that
@@ -207,12 +205,17 @@ WITHHELD = "(withheld: the line fails the written-text check)"
 # pull requests merged or closed, and an operator closed them by hand).
 EPIC_OVER_CAP = "epic-over-cap"
 SETTLES = ("lane-pr-stalled", EPIC_OVER_CAP)
-# Invariants that restate state the pull request, the epic or the dashboard
-# already shows: one tracking issue per (kind, subject repo), its list edited
-# in place, instead of one issue per violation (loom#2099). The settle path
+# Invariants that use one tracking issue per (kind, subject repo), its list
+# edited in place (loom#2099). The settle path
 # above now only closes per-violation issues filed before this.
+SCHEDULED_WORKFLOW_RED = "scheduled-workflow-red"
 ROLLED = ("lane-pr-stalled", "plan-check-failed", EPIC_OVER_CAP, "epic-title-shared",
-          "closed-epic-open-tickets", "goal-epics-over-cap")
+          "closed-epic-open-tickets", "goal-epics-over-cap", SCHEDULED_WORKFLOW_RED)
+SCHEDULED_RED = ("failure", "timed_out", "action_required", "startup_failure")
+SCHEDULED_STREAK = 3
+# Leave room in the 30-request allowance for the existing tracker filer.
+SCHEDULED_READ_MAX = 20
+SCHEDULED_PAGE_SIZE = 100
 ROLL_MARKER = "<!-- loom:invariant roll v1 -->"
 ROLL_TITLE = "Invariant: %s in %s"
 ROLL_TITLE_RE = re.compile(r"^Invariant: [a-z-]+ in (.+)$")
@@ -253,6 +256,8 @@ FOLD_MARKER = "<!-- loom:invariant roll-folded -->"
 FOLD_SUMMARY = "%d older per-violation issues closed into this list so far (last at %s)."
 FOLD_COUNT_RE = re.compile(r"^([0-9]+) older per-violation issues", re.M)
 ROLL_HINTS = {
+    SCHEDULED_WORKFLOW_RED: "Check the repository's Actions runs for the workflow and route "
+                            "the fix to the repository that owns it.",
     "lane-pr-stalled": "\n".join([
         "Each pull request here is open past %d hours with nothing driving it. Unstick it "
         "by its reason:" % (PR_STALLED // 3600),
@@ -475,6 +480,8 @@ class Facts:
     headerless: Optional[List[Ref]] = None
     # Each open base-check incident the station probes (loom#3084).
     incidents: Optional[List[Incident]] = None
+    # (repo, public name or private placeholder, failing workflow labels)
+    scheduled_workflows: Optional[List[Tuple[str, str, Tuple[str, ...]]]] = None
 
 
 @dataclass(frozen=True)
@@ -1251,6 +1258,106 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
     return out
 
 
+def _latest_scheduled_runs(runs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Keep the latest distinct completed scheduled runs of each workflow."""
+    newest: Dict[str, List[Dict[str, Any]]] = {}
+    for run in runs:
+        workflow = run.get("workflow_id")
+        if (isinstance(workflow, int) and isinstance(run.get("id"), int)
+                and run.get("event") == "schedule"
+                and run.get("status") == "completed" and isinstance(run.get("conclusion"), str)):
+            latest = newest.setdefault(str(workflow), [])
+            if len(latest) < SCHEDULED_STREAK and not any(r["id"] == run["id"] for r in latest):
+                latest.append(run)
+    return newest
+
+
+def _scheduled_failures(runs: List[Dict[str, Any]], prior: Dict[str, str],
+                        complete: bool, public: bool) -> Dict[str, str]:
+    # A partial history can prove a streak or break it, but missing runs
+    # cannot clear a previously reported workflow.
+    failures = {} if complete else dict(prior)
+    for workflow, latest in _latest_scheduled_runs(runs).items():
+        if any(run["conclusion"] not in SCHEDULED_RED for run in latest):
+            failures.pop(workflow, None)
+        elif len(latest) == SCHEDULED_STREAK:
+            name = str(latest[0].get("name") or "").strip()[:LINE_MAX]
+            fallback = "Workflow %s" % workflow
+            failures[workflow] = (name if public and name and name.isascii()
+                                  and len(name.splitlines()) == 1 and _checked(name) == name
+                                  else fallback)
+    return failures if public else {key: "Workflow %s" % key for key in failures}
+
+
+def _read_scheduled_run_pages(gh: Any, repos: Sequence[str], deferred: Callable[[], bool],
+                              say: Say) -> Tuple[Dict[str, List[Dict[str, Any]]], set[str], int]:
+    """Read newest runs first, giving each repo a page before reading deeper."""
+    runs: Dict[str, List[Dict[str, Any]]] = {}
+    complete = set()
+    queue = [(repo, 1) for repo in repos]
+    reads = first_pages = 0
+    while queue and reads < SCHEDULED_READ_MAX and not deferred():
+        repo, page = queue.pop(0)
+        reads += 1
+        first_pages += page == 1
+        try:
+            data = gh.rest("GET", "/repos/%s/actions/runs?event=schedule&status=completed"
+                           "&per_page=%d&page=%d" % (repo, SCHEDULED_PAGE_SIZE, page)).data
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            say("invariants: could not read scheduled workflow runs for %s: %s" % (repo, err))
+            continue
+        rows = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            say("invariants: invalid scheduled workflow runs for %s" % repo)
+            continue
+        runs.setdefault(repo, []).extend(rows)
+        if len(rows) < SCHEDULED_PAGE_SIZE:
+            complete.add(repo)
+        elif page * SCHEDULED_PAGE_SIZE < 1000:
+            # GitHub limits an event-filtered run listing to 1,000 rows.
+            queue.append((repo, page + 1))
+    return runs, complete, first_pages
+
+
+def read_scheduled_workflows(gh: Any, repos: Sequence[str], state: Dict[str, Any],
+                             deferred: Callable[[], bool], say: Say
+                             ) -> Tuple[List[Tuple[str, str, Tuple[str, ...]]], Tuple[str, ...]]:
+    """Update tracked failures and return the streaks and unread repos."""
+    repos = list(dict.fromkeys(repos))
+    cursor = state.get("cursor", 0)
+    cursor = cursor % len(repos) if repos and isinstance(cursor, int) else 0
+    ordered = repos[cursor:] + repos[:cursor]
+    prior = state.get("failures")
+    prior = prior if isinstance(prior, dict) else {}
+    runs, complete, first_pages = _read_scheduled_run_pages(gh, ordered, deferred, say)
+    state["cursor"] = cursor + (first_pages if first_pages < len(repos) else 1)
+    state["failures"] = failures = {repo: prior[repo] for repo in repos
+                                   if isinstance(prior.get(repo), dict)}
+    found = []
+    for repo, rows in runs.items():
+        repository = rows[0].get("repository") if rows else None
+        public = isinstance(repository, dict) and repository.get("private") is False
+        failures[repo] = _scheduled_failures(rows, failures.get(repo, {}), repo in complete, public)
+        if failures[repo]:
+            found.append((repo, repo if public else "a private repo",
+                          tuple(name for _, name in sorted(failures[repo].items()))))
+    return found, tuple(repo for repo in repos if repo not in runs)
+
+
+def scheduled_workflow_red(f: Facts) -> List[Breach]:
+    out = []
+    for repo, label, names in f.scheduled_workflows or []:
+        where = roll_title_where(repo, label, "")
+        out.append(Breach(SCHEDULED_WORKFLOW_RED, "%s in %s" % (SCHEDULED_WORKFLOW_RED, repo),
+                          ROLL_TITLE % (SCHEDULED_WORKFLOW_RED, where),
+                          tuple("%s: at least %d failed scheduled runs in a row"
+                                % (name, SCHEDULED_STREAK) for name in names),
+                          f.now, rolling=True, where=where))
+    return out
+
+
 INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     brain_failing, brain_silent, marker_cadence, lane_no_success, lane_failing_streak,
     lane_held,
@@ -1258,7 +1365,7 @@ INVARIANTS: Tuple[Callable[[Facts], List[Breach]], ...] = (
     epic_title_shared, plan_check_failed, lane_pr_stalled, remote_silent, silent_lane, gate_hold,
     repeated_failure, ticket_waiting,
     untrusted_labeler, roll_pin_off, merged_not_shipped, review_overdue, guard_no_check,
-    guard_unreadable, queued_ticket_no_headers, incident_unprobed)
+    guard_unreadable, queued_ticket_no_headers, incident_unprobed, scheduled_workflow_red)
 
 
 def check(facts: Facts, say: Say,
@@ -1337,7 +1444,8 @@ def roll_up(breaches: Iterable[Breach], filer_repo: str, now: float,
 # nothing about that kind, so its tracking issue is left as it is.
 ROLLED_FACTS = {"lane-pr-stalled": "lane_pulls", "plan-check-failed": "checks",
                 EPIC_OVER_CAP: "shapes", "epic-title-shared": "shapes",
-                "closed-epic-open-tickets": "shapes", "goal-epics-over-cap": "shapes"}
+                "closed-epic-open-tickets": "shapes", "goal-epics-over-cap": "shapes",
+                SCHEDULED_WORKFLOW_RED: "scheduled_workflows"}
 
 
 def read_kinds(facts: Facts) -> Tuple[str, ...]:
@@ -1543,16 +1651,19 @@ class Filer:
         listed = (["Current violations (%d):" % len(lines)] + ["- " + _checked(line)
                                                               for line in lines]
                   if lines else [ROLL_NONE, CLEAR_SINCE % utc(at)])
+        source = ("GitHub Actions shows the scheduled run conclusions."
+                  if invariant == SCHEDULED_WORKFLOW_RED
+                  else "The pull requests, epics and `python3 -m bus.brain status` already "
+                       "show these subjects.")
         return "\n".join(
             [MARKER % key, ROLL_MARKER,
              "One tracking issue for the `%s` invariant in %s: the station rewrites the list "
              "below in place when it changes and files no issue per violation." % (
                  invariant, where), ""] + listed +
             ["", ROLL_CHECKED % utc(at), "", ROLL_HINTS.get(invariant, ""),
-             "", "Invariant: `%s` (bus/invariants.py). The pull requests, epics and "
-                 "`python3 -m bus.brain status` already show these subjects. This issue "
+             "", "Invariant: `%s` (bus/invariants.py). %s This issue "
                  "closes once the list has been empty for %s and reopens when a violation "
-                 "returns." % (invariant, _hours(CLEAR_AFTER)),
+                 "returns." % (invariant, source, _hours(CLEAR_AFTER)),
              "", "Part of #%d" % self._home()])
 
     def _marker(self, b: Breach) -> str:

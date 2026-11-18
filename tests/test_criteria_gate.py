@@ -22,8 +22,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bus import criteria_gate, factory, station, status  # noqa: E402
-from bus.github import GitHub  # noqa: E402
+from bus import brain, criteria_gate, factory, station, status  # noqa: E402
+from bus.github import GitHub, GitHubError  # noqa: E402
 import test_bus_factory as tbs_factory  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
@@ -351,7 +351,6 @@ class LiveWaitAsk(tbs.Base):
     def test_a_failed_comment_read_defers_the_ask_to_the_next_pass(self):
         # A transient read failure must not re-add a label a brain removed
         # (the bug), so it holds without asking, says so, and the next pass asks.
-        from bus.github import GitHubError
         self.fake.private = False
         self.fake.add(1, lane="codex", body=body(AUDIT_OPERATOR[0]), state="shipped")
         real = GitHub.paginate
@@ -379,6 +378,109 @@ class LiveWaitAsk(tbs.Base):
         self.again()
         self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 1)  # the earlier ask alone
+
+
+class RewrittenSourceAsk(tbs.Base):
+    asks = DoneClose.asks
+
+    def setUp(self):
+        super().setUp()
+        self.fake.private = False
+        self.fake.add(1, body=body(AUDIT_OPERATOR[0]), state="shipped", author=self.fake.bot)
+        self.fake.issues[1]["labels"].append({"name": "loom:rewritten"})
+        self.fake.add(2, body=body(AUDIT_OPERATOR[0]) + "\nRewritten from issue 1.\n",
+                      state="queued", author=self.fake.bot)
+        self.fake.comments[1].append({
+            "body": brain.TRIAGE_MARKER + "\nRewritten as ticket #2, which refs this issue.",
+            "user": {"login": self.fake.bot}})
+        self.gh = GitHub("token", transport=self.fake)
+
+    def test_the_criteria_gate_does_not_ask_on_the_source_of_an_open_ticket(self):
+        station.Station(self.gh, self.settings).close_done_tickets()
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertEqual(self.asks(1), [])
+
+    def test_the_station_leaves_a_briefed_source_unclaimed(self):
+        issue = self.fake.issues[1]
+        issue["body"] = tbs.BODY_WITH_CRITERIA
+        issue["labels"] = [{"name": n} for n in ("loom:ticket", "loom:briefed", "lane:codex",
+                                                "loom:rewritten")]
+        station.Station(self.gh, self.settings).claim_new()
+        self.assertEqual(self.listing(), [])
+        self.assertIn("loom:briefed", self.fake.names(1))
+        self.assertEqual(len(self.fake.comments[1]), 1)
+
+    def test_the_verify_sweep_leaves_a_shipped_source_unclaimed(self):
+        self.fake.issues[1]["body"] = tbs.SHIPPED_BODY
+        self.fake.events[1] = tbs.shipped_at(30)
+        self.fake.pulls = [tbs.verify_merge(1)]
+        self.fake.issues[2]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:merged"}]
+        station.Station(self.gh, self.settings).claim_new()
+        self.assertEqual(self.listing(), [])
+        self.assertEqual(len(self.fake.comments[1]), 1)
+
+    def test_the_station_leaves_a_queued_source_unassigned(self):
+        issue = self.fake.issues[1]
+        issue["body"] = tbs.BODY_WITH_CRITERIA
+        issue["labels"] = [{"name": n} for n in ("loom:ticket", "loom:queued", "loom:rewritten")]
+        self.settings.factory_on = True
+        station.Station(self.gh, self.settings).assign_queued()
+        self.assertEqual(self.fake.names(1), ["loom:ticket", "loom:queued", "loom:rewritten"])
+        self.assertEqual(len(self.fake.comments[1]), 1)
+
+    def seed_gate_ask(self):
+        self.fake.issues[1]["labels"] = [{"name": "loom:rewritten"}, {"name": "loom:human"}]
+        self.fake.comments[1].append({
+            "body": "%s\n%s\nKind: decision" % (brain.HUMAN_MARKER, criteria_gate.ASK_OPENING),
+            "user": {"login": self.fake.bot}})
+        return list(self.fake.comments[1])
+
+    def assert_withdrawal_note(self, seeded_comments):
+        self.assertEqual(self.fake.comments[1], seeded_comments + [{
+            "body": ("Verification ask withdrawn. Ticket #2 is open and carries the work "
+                     "from this source issue."),
+            "user": {"login": self.fake.bot}}])
+
+    def test_the_station_withdraws_an_existing_gate_ask_on_the_first_pass(self):
+        seeded_comments = self.seed_gate_ask()
+        station.Station(self.gh, self.settings).settle_orphan_sources()
+        self.assertEqual(self.fake.names(1), ["loom:rewritten"])
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assert_withdrawal_note(seeded_comments)
+
+    def test_the_station_withdraws_a_gate_operator_ask_on_a_rewritten_source(self):
+        original_labels = self.fake.names(1)
+        brain.human(self.gh, REPO, 1, criteria_gate.ask([AUDIT_OPERATOR[0]]))
+        self.assertIn("needs:human", self.fake.names(1))
+        seeded_comments = list(self.fake.comments[1])
+        station.Station(self.gh, self.settings).settle_orphan_sources()
+        self.assertEqual(self.fake.names(1), original_labels)
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assert_withdrawal_note(seeded_comments)
+
+    def test_the_station_withdraws_an_existing_gate_ask_once(self):
+        seeded_comments = self.seed_gate_ask()
+        st = station.Station(self.gh, self.settings)
+        rest = self.gh.rest
+
+        def fail_delete(method, *args, **kwargs):
+            if method == "DELETE":
+                raise GitHubError("label removal refused", 502)
+            return rest(method, *args, **kwargs)
+
+        with mock.patch.object(self.gh, "rest", side_effect=fail_delete):
+            st.settle_orphan_sources()
+        self.assertIn("loom:human", self.fake.names(1))
+        self.assert_withdrawal_note(seeded_comments)
+        st.now += station.SETTLE_EVERY
+        st.settle_orphan_sources()
+        self.assertEqual(self.fake.names(1), ["loom:rewritten"])
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assert_withdrawal_note(seeded_comments)
+        st.now += station.SETTLE_EVERY
+        st.settle_orphan_sources()
+        self.assert_withdrawal_note(seeded_comments)
 
 
 class LaneProof(tbs.Base):

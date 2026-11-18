@@ -187,18 +187,26 @@ class StationAdapterProofTest(tbs.Base):
 
     def test_report_verify_records_a_missing_adapter_step_once(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
-        self.ship(body, hours_ago=2)
-        self.fake.issues[self.NUMBER]["labels"].append({"name": "awaiting-live-check"})
         self.settings.live_evidence_repos = [REPO]
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
-        with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
-              mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
-              mock.patch.object(station.brain, "human") as ask):
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-        ask.assert_not_called()
-        notes = "\n".join(c["body"] for c in self.fake.comments[self.NUMBER])
-        self.assertEqual(notes.count("no adapter_step was returned"), 1)
+        for number, wait in enumerate((None, "awaiting-live-check", "wait:live-event"), 1):
+            with self.subTest(wait=wait):
+                self.fake.add(number, body=body, state="shipped")
+                if wait:
+                    self.fake.issues[number]["labels"].append({"name": wait})
+                with (mock.patch.object(st, "_read_verify", return_value=({"missing": "no step"}, "")),
+                      mock.patch.object(st, "_adapter_can_verify", return_value=True),
+                      mock.patch.object(station.brain, "human") as ask):
+                    self.assertTrue(st._report_verify("codex", "done", REPO, number, "run"))
+                    self.assertTrue(st._report_verify("codex", "done", REPO, number, "run"))
+                ask.assert_not_called()
+                names = self.fake.names(number)
+                self.assertIn("loom:shipped", names)
+                self.assertNotIn("loom:human", names)
+                self.assertNotIn("needs:human", names)
+                notes = "\n".join(c["body"] for c in self.fake.comments[number])
+                self.assertEqual(notes.count(
+                    "Missing evidence: adapter proof (no adapter_step was returned)"), 1)
 
     def test_an_adapter_ticket_with_an_operator_box_still_asks_the_operator(self):
         operator = "Operator decides whether to approve the retention policy."
@@ -208,10 +216,13 @@ class StationAdapterProofTest(tbs.Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
         with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
               mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
-              mock.patch.object(station.brain, "human") as ask):
+              mock.patch.object(station.brain, "human", wraps=station.brain.human) as ask):
             st._report_verify("codex", "done", REPO, self.NUMBER, "run")
+            self.assertIn("needs:human", self.fake.names(self.NUMBER))
+            st.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs%%3Ahuman" % (REPO, self.NUMBER))
             st._report_verify("codex", "done", REPO, self.NUMBER, "run")
         ask.assert_called_once()
+        self.assertNotIn("needs:human", self.fake.names(self.NUMBER))
         self.assertIn(operator, ask.call_args.args[3])
         self.assertNotIn("adapter_step", ask.call_args.args[3])
 

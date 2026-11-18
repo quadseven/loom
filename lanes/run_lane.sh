@@ -91,12 +91,9 @@ LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # $LOOM_HOME/infra-public and fast-forwarded at most hourly
 # (keep_scanner_current). The default reads it from there.
 LEAK_SCANNER="${LOOM_LEAK_SCANNER:-$LOOM_HOME/infra-public/.github/scripts/check_private_leaks.py}"
-# The remote infra-public is cloned from, LOOM_CLONE_BASE-prefixed like the
-# ticket repos the lane clones. Override it on a machine without network.
+# The scanner remote is opt-in, LOOM_CLONE_BASE-prefixed like ticket repos.
 INFRA_PUBLIC="$LOOM_HOME/infra-public"
-# LOOM_INFRA_PUBLIC_REPO names it; the default is the public repo that
-# holds the shared scanner, which any clone can read.
-INFRA_PUBLIC_REMOTE="${LOOM_CLONE_BASE:-git@github.com:}${LOOM_INFRA_PUBLIC_REPO:-quadseven/infra-public}"
+INFRA_PUBLIC_REPO="${LOOM_INFRA_PUBLIC_REPO:-}"
 INFRA_PUBLIC_STAMP="$LOOM_HOME/run/infra-public.updated"
 # The SSM parameter of the shared deny-list: names and products with no
 # generic shape, which only this list catches. Every scan passes it.
@@ -149,22 +146,27 @@ leak_hits() {
 # gated by the stamp file. Returns 0 when the checkout is usable, 1 when it
 # cannot be had (the scanner stays missing and the run becomes an incident).
 keep_scanner_current() {
-  local now stamp=0
+  if [ -z "$INFRA_PUBLIC_REPO" ]; then
+    [ -f "$LEAK_SCANNER" ] && return 0
+    echo "set LOOM_INFRA_PUBLIC_REPO or LOOM_LEAK_SCANNER to provide the leak scanner" >&2
+    return 1
+  fi
+  local now stamp=0 remote="${LOOM_CLONE_BASE:-git@github.com:}$INFRA_PUBLIC_REPO"
   now="$(date +%s)"
   [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
   if [ -d "$INFRA_PUBLIC/.git" ]; then
     if [ $((now - stamp)) -ge 3600 ]; then
-      (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q origin \
+      (cd "$INFRA_PUBLIC" && timeout "$NET_TIMEOUT" git fetch -q "$remote" \
           && timeout "$NET_TIMEOUT" git merge -q --ff-only FETCH_HEAD) >> "$LOG" 2>&1 && date +%s > "$INFRA_PUBLIC_STAMP"
     fi
     return 0
   fi
   mkdir -p "$LOOM_HOME"
-  if timeout "$NET_TIMEOUT" git clone -q "$INFRA_PUBLIC_REMOTE" "$INFRA_PUBLIC" >> "$LOG" 2>&1; then
+  if timeout "$NET_TIMEOUT" git clone -q "$remote" "$INFRA_PUBLIC" >> "$LOG" 2>&1; then
     date +%s > "$INFRA_PUBLIC_STAMP"
     return 0
   fi
-  echo "could not clone the leak scanner's repo $INFRA_PUBLIC_REMOTE" >&2
+  echo "could not clone the leak scanner's repo $remote" >&2
   return 1
 }
 INBOX="$LOOM_HOME/briefs/$SLOT"
