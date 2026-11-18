@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import base64
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 import errno
 import faulthandler
@@ -37,6 +38,7 @@ from . import audit
 from . import bench
 from . import ci_gap
 from . import converge
+from . import disk_watchdog
 from . import brain_memory
 from . import brain_hold
 from . import claimed
@@ -47,6 +49,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import lane_markers
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -188,6 +191,7 @@ LOG_ROTATE_KEEP = 5
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
 DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
+DISK_WATCH_FILE = "disk-watchdog.json"
 FIX_OVERLAP_FILE = "fix-overlap-holds.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
@@ -1175,8 +1179,15 @@ class Settings:
                  decision_window_days: int = 3,
                  repo_pr_caps: Optional[Dict[str, int]] = None,
                  fabric_review_notes: str = "",
-                 review_sweep: Optional[review_sweep_mod.Config] = None) -> None:
+                 review_sweep: Optional[review_sweep_mod.Config] = None,
+                 disk_watch: Optional[disk_watchdog.Config] = None,
+                 metrics_reserve: int = metrics.REQUEST_RESERVE,
+                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
         self.home = home
+        # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
+        # loom#3187): off for a Settings built in code; from_env turns it on
+        # at 25 GB.
+        self.disk_watch = disk_watch or disk_watchdog.Config(trigger_gb=0)
         # The review sweep (bus/review_sweep.py); off unless LOOM_REVIEW_SWEEP=on.
         self.review_sweep = review_sweep or review_sweep_mod.Config()
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
@@ -1298,6 +1309,8 @@ class Settings:
         self.scope_url = scope_url
         self.scope_model = scope_model
         self.metrics_goal = metrics_goal
+        self.metrics_reserve = metrics_reserve
+        self.metrics_seconds = metrics_seconds
         self.transcript_url = transcript_url
         # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
         self.fabric_key_ssm = fabric_key_ssm
@@ -1369,10 +1382,15 @@ class Settings:
                    scope_url=env.get("LOOM_SCOPE_CHECK_URL", "").strip(),
                    scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
+                   metrics_reserve=_positive_int(env.get("LOOM_METRICS_RESERVE", ""),
+                                                 metrics.REQUEST_RESERVE),
+                   metrics_seconds=_positive_int(env.get("LOOM_METRICS_SECONDS", ""),
+                                                 metrics.STEP_SECONDS),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
                    review_sweep=review_sweep_mod.Config.from_env(env),
+                   disk_watch=disk_watchdog.Config.from_env(env),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -1674,6 +1692,11 @@ def _seconds(raw: str, default: int) -> int:
 def _decision_window_days(raw: str) -> int:
     """A positive decision-default window in whole days, else three."""
     return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+def _positive_int(raw: str, default: int) -> int:
+    raw = raw.strip()
+    return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -2909,7 +2932,9 @@ class Station:
                                     demoted_models=self._brief_demoted_models(lane),
                                     claim=self._lane_claim_label(),
                                     defaults=answer.default_notes(comments, self.s.authors,
-                                                                  answer.operators(trusted=self.s.authors)))
+                                                                  answer.operators(trusted=self.s.authors)),
+                                    operator_review=fix is not None and
+                                    answer.newest_held_pr(comments, self.s.authors) == fix.pr)
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -3356,12 +3381,11 @@ class Station:
         if not issues:
             return None
         latest = None
-        pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
         # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
         for comment in brain.trusted_comments(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
                 self.s.authors):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip())
+            match = lane_markers.heartbeat_match(comment.get("body"))
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -5205,6 +5229,10 @@ class Station:
         # (one pulls/comments post per finding), so the factory's fix rounds
         # and rebuttal reads meet them exactly like the review bot's threads.
         for finding in [f for f in blocking if "file" in f and "line" in f]:
+            if not notify.visible_text(finding.get("finding")):
+                _say("a Luna finding on %s#%d has no visible text; no review thread "
+                     "posted for it" % (repo, pr_number))
+                continue
             try:
                 self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
                     "commit_id": sha, "path": finding["file"],
@@ -6058,7 +6086,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found)
+        return self._apply_brief_hold(repo, number, found, body)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6081,7 +6109,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
+                          body: str = "") -> bool:
         """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
@@ -6119,7 +6148,7 @@ class Station:
                     "slices so each slice queues only when the one before it "
                     "has merged."))
             else:
-                brain.human(self.gh, repo, number, brief_check.ask(found))
+                brain.human(self.gh, repo, number, brief_check.ask(found, body))
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
@@ -6736,7 +6765,7 @@ class Station:
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
-        paused = self._paused_steps(steps)
+        paused = self._paused_steps((*steps, self.post_metrics))
         self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -6827,21 +6856,32 @@ class Station:
             _say("note_stale_shipped failed: %s" % err)
 
     def _run_due_steps(self, paused: Set[str]) -> None:
-        """score_lanes ahead of the rotation when its hour is up, so a slow
-        rotation does not hold an hourly step for hours (loom#3014: the
-        scorecard went 4.5 hours unrefreshed). The step stays in the rotation,
-        where a refresh that is not due only sends notices."""
-        if ("score_lanes" in paused or self._deferred()
-                or not scorecard.Scorecard(self.state, self.now).due()):
+        """Run scheduled work ahead of the rotation so it can resume each pass.
+
+        The scorecard also stays in the rotation to send notices (loom#3014).
+        """
+        if self._deferred():
             return
-        try:
-            self.score_lanes()
-        except TargetReached as err:
-            _say("step score_lanes carried over to the next pass: %s" % err)
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, ValueError) as err:
-            _say("score_lanes failed: %s" % err)
+        if "score_lanes" not in paused and scorecard.Scorecard(self.state, self.now).due():
+            try:
+                self.score_lanes()
+            except TargetReached as err:
+                _say("step score_lanes carried over to the next pass: %s" % err)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("score_lanes failed: %s" % err)
+        if not self.s.metrics_goal:
+            return
+        if "post_metrics" in paused:
+            _say("step post_metrics paused (LOOM_PAUSED_STEPS)")
+        elif not self._deferred():
+            try:
+                self._timed(self.post_metrics)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("post_metrics failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -7490,11 +7530,54 @@ class Station:
             return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            if self._ship_fallback(repo, number, note):
+                self._deployed_seen(key, False)
+                _say("shipped %s#%d (fallback): %s carries #%d" % (
+                    repo, number, what, int(pr["number"])))
+                return True
             self._deployed_seen(key, True)
             return False
         self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _ship_fallback(self, repo: str, number: int, note: str) -> bool:
+        """Retry a failed shipped move after checking the issue is still merged.
+
+        GitHub can reject the first label replacement while a deployed ticket
+        remains at loom:merged. Re-read its state before retrying the label
+        update, so a concurrent move or close is never overwritten.
+        """
+        try:
+            from . import labels as label_defs
+            wanted = label_defs.LABELS["loom:shipped"]
+            self.gh.rest("POST", "/repos/%s/labels" % repo,
+                         {"name": "loom:shipped", "color": wanted["color"],
+                          "description": wanted["description"]}, ok=(422,))
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+            if issue.get("state") != "open":
+                return False
+            names = _label_names(issue)
+            if "loom:verified" in names:
+                return False
+            if "loom:shipped" in names and "loom:merged" not in names:
+                return True
+            if "loom:merged" not in names:
+                return False
+            kept = brain._moved_labels(names, "shipped", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            notify.post(self.gh, repo, number, note, notify.SHIPPED)
+            return True
+        except RateLimited:
+            raise
+        except ShadowHeld as err:
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            return False
+        except (GitHubError, ValueError) as err:
+            _say("ship retry could not move %s#%d: %s" % (repo, number, err))
+            return False
 
     def _deployed_seen(self, key: str, seen: bool) -> None:
         """Keep when a ship rule first found the ticket deployed
@@ -10389,11 +10472,11 @@ class Station:
     def _lanes_body(self, rows: List[Tuple[str, str, str]],
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
-        disk = self._disk_status_line()
+        disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
-            + ([disk, ""] if disk else [])
+            + (disk + [""] if disk else [])
             + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
@@ -10496,6 +10579,7 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
+        values["disk watchdog"] = self._watchdog_notice() or ""
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -13942,13 +14026,18 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003). One log line per goal."""
+        seconds (decision 0003), resuming after a carried-over read. One log
+        line per goal."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
         checked = state.get("checked")
-        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+        finished = state.get("finished", [])
+        if not isinstance(finished, list):
+            finished = []
+        if (not finished and self._num(checked)
+                and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY):
             return
         try:
             homes = self._goal_homes()
@@ -13957,18 +14046,27 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("outside-epic: could not read the goal homes: %s" % err)
             return
+        completed = set(item for item in finished if isinstance(item, str))
         for repo, goal in homes:
             number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            if key in completed:
+                continue
             try:
                 moved, left = brain.move_outside_tickets(self.gh, repo, number)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not finished: a resumed pass retries this home.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
                 continue
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
+            completed.add(key)
+            state["finished"] = sorted(completed)
+            _write_json(path, state)
         state["checked"] = self.now
+        state["finished"] = []
         _write_json(path, state)
 
     # -- invariants -------------------------------------------------------
@@ -14242,15 +14340,21 @@ class Station:
         linked = brain.part_of_linked(self.gh, repo, [
             int(epic["number"]) for epic, _ in tree
             if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        stranded: Dict[int, List[invariants.Ref]] = {}
+        for ticket, parent in brain._closed_epic_tickets(tree):
+            stranded.setdefault(parent, []).append(ref(ticket))
         epics = []
         for epic, found in tree:
+            epic_number = int(epic["number"])
+            opened = epic.get("state", "open") == "open"
             union = {int(t.get("number") or 0): t for t in found}
-            for t in linked.get(int(epic["number"]), []):
+            for t in linked.get(epic_number, []):
                 union.setdefault(int(t.get("number") or 0), t)
             union.pop(0, None)
+            open_tickets = (tuple(ref(t) for t in union.values() if t.get("state") != "closed")
+                            if opened else tuple(stranded.get(epic_number, [])))
             epics.append(invariants.EpicShape(
-                ref(epic), epic.get("state", "open") == "open", len(union),
-                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                ref(epic), opened, len(union), open_tickets,
                 brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
                 title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
@@ -16354,9 +16458,9 @@ class Station:
     def _post_metrics_comment(self, path: str, today: str,
                               dated: Dict[str, Tuple[int, int]]) -> None:
         try:
-            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
-                                        self.now, self.s.review_check,
-                                        self.s.authors).collect()
+            with self._resume_metrics(path, today) as started:
+                numbers = metrics.Collector(self.gh, self.s.repos, self.s.home, started,
+                                            self.s.review_check, self.s.authors).collect()
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
@@ -16368,10 +16472,28 @@ class Station:
         yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
         streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
         body = metrics.render(numbers, today, streak)
-        # Outside the try above: a refused POST reaches run_pass, which logs
-        # "post_metrics failed", and today stays unposted for the next pass.
+        # A refused POST leaves today unposted for the next pass.
         self.gh.rest("POST", path, {"body": body})
         dated[today] = (passed, streak)
+
+    @contextmanager
+    def _resume_metrics(self, path: str, today: str) -> Iterator[float]:
+        if not isinstance(self.gh, GitHub) or not self.gh.cache_dir:
+            yield self.now
+            return
+        key = path + "#metrics-build"
+        saved = self.gh.recall(key, today)
+        if not saved or len(saved) != 2:
+            saved = [str(time.time_ns()), self.now]
+            self.gh.remember(key, today, saved)
+        scope, started = saved
+        with self.gh.resume_reads(scope):
+            yield started
+
+    def _check_metrics_reserve(self) -> None:
+        core = self._rates().get("core")
+        if core and core[0] <= self.s.metrics_reserve:
+            raise metrics.Deferred("GitHub core reserve reached (%d left)" % core[0])
 
     def _metrics_notice(self, today: str, key: str, line: str) -> None:
         ledger_path = os.path.join(self.state, "metrics.json")
@@ -16406,12 +16528,26 @@ class Station:
         if time.localtime(self.now).tm_hour < self.s.digest_hour:
             return
         path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        check = (self.gh.check_requests(self._check_metrics_reserve)
+                 if isinstance(self.gh, GitHub) else nullcontext())
+        try:
+            with check, metrics.time_cap(self.s.metrics_seconds):
+                self._check_metrics_reserve()
+                self._daily_metrics(path, today)
+        except metrics.Deferred as err:
+            _say("post_metrics will resume: %s" % err)
+
+    def _daily_metrics(self, path: str, today: str) -> None:
         # Read-then-post is safe: run() holds station.lock (flock) for the
         # whole pass, so no second pass can read the same day's comments
         # before this one has posted.
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
+        if today in dated and isinstance(self.gh, GitHub):
+            key = path + "#metrics-build"
+            if self.gh.recall(key, today):
+                self.gh.remember(key, today, [])
         if today in dated and not self.s.report_digest:
             # With a report digest the day's numbers ride in it instead.
             passed, streak = dated[today]
@@ -16894,6 +17030,51 @@ class Station:
         if not (self._num(free) and self._num(floor)):
             return "Claims paused: the loom home's disk is low on free space"
         return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
+
+    def tend_watchdog(self) -> None:
+        """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
+        the claim floor is reached (bus/disk_watchdog.py, loom#3187): Time
+        Machine local snapshots on macOS, old lane logs, finished run scratch, old lane trees (archived), then idle
+        lanes' tool caches. Nothing a waiting or running brief names, and no
+        busy lane's folder, is touched; an inbox that cannot be read stops it."""
+        if self.s.disk_watch.trigger_gb <= 0:
+            return
+        live: Set[str] = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's inbox, so the disk watchdog waits: %s" % (lane, err))
+                return
+        run = os.path.join(self.s.home, "run")
+        # Only the home's own tree folder: the agy folder sits in another
+        # user's home and is left to prune_trees.
+        roots = disk_watchdog.Roots(home=self.s.home,
+                                    trees=(os.path.join(self.s.home, "worktrees"),),
+                                    lanes=tuple(LANES), live=frozenset(live),
+                                    idle=frozenset(s for s in LANES if self._lane_idle(run, s)),
+                                    locked=lambda slot: self._lane_locked(run, slot))
+        path = os.path.join(self.state, DISK_WATCH_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        # LOOM_THIN_SNAPSHOTS=0 also keeps Time Machine local snapshots.
+        tm = disk_watchdog.TimeMachine.for_host() if self.s.thin_snapshots else None
+        out = disk_watchdog.tend(self.s.disk_watch, roots, disk_watchdog.RealDisk(),
+                                 self.s.disk_free_min_gb * GB, self.now, _say, saved, tm=tm)
+        if out != saved:
+            _write_json(path, out)
+        if out.get("at") == self.now:
+            # Read the free space again for the claim floor and the size line.
+            self._free_read = False
+
+    def _watchdog_notice(self) -> Optional[str]:
+        """The disk watchdog's lane status line while Loom's own data is
+        cleared and the disk is still under the floor, else None."""
+        saved = _read_json(os.path.join(self.state, DISK_WATCH_FILE), {}, strict=False)
+        notice = saved.get("notice") if isinstance(saved, dict) else None
+        return notice if isinstance(notice, str) and notice else None
 
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
@@ -17563,15 +17744,6 @@ class Station:
             except OSError as err:
                 _say("could not record the repo scans: %s" % err)
             self._run_steps()
-            # The day's metrics line goes out even below the budget floor: one post
-            # a day, and on 2026-10-18 the floor deferred it every pass, so the
-            # operator got no numbers for the day. Only a spent budget stops it.
-            try:
-                self.post_metrics()
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("post_metrics failed: %s" % err)
             try:
                 self.watch_logs()
             except RateLimited:
@@ -17647,7 +17819,7 @@ class Station:
         """Local housekeeping that needs no GitHub request: finished lane
         trees, old lane logs, the disk, the usage snapshot and the command
         chain snapshot."""
-        for local in (self.prune_trees, self.tend_disk):
+        for local in (self.prune_trees, self.tend_watchdog, self.tend_disk):
             try:
                 local()
             except OSError as err:

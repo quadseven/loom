@@ -2,12 +2,13 @@
 factory's brain_holds): a hold older than a day that Loom set is resolved, a
 person's hold never is, and a run resolves at most a few."""
 
+import json
 import os
 import tempfile
 import unittest
 from unittest import mock
 
-from bus import brain, brain_hold, factory, hunt_plan, labels, station, status
+from bus import brain, brain_hold, factory, hunt_plan, labels, rewrite, station, status
 from bus.github import GitHubError
 from tests.test_bus_factory import (BODY_FAIL, CHIEF, ME, NOW, PLAN_BODY, PLAN_TICKET, REPO,
                                     SIZE_FAIL, FakeGitHub, chief_summary, iso)
@@ -251,6 +252,52 @@ class TriageBrainHoldsTest(unittest.TestCase):
         self.assertEqual(report[REPO]["lifted"], 1)
         self.run_holds()
         self.assertEqual(len([e for e in self.events(5) if brain_hold.LIFT_MARKER in e]), 1)
+
+    def hold_by_rewrite(self, number, ask, seconds_ago):
+        """The rewrite step holds the issue itself (bus/rewrite.py
+        apply_answer on a person-only answer), and GitHub records the label
+        event, which the fake does not do for an issue."""
+        answer = {"action": "human", "kind": "decision", "ask": ask}
+        with mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": ME["login"]}), \
+                mock.patch("sys.stderr"):
+            out = rewrite.apply_answer(self.gh, REPO, 30, number, json.dumps(answer),
+                                       now=NOW - seconds_ago + 5)
+        self.assertEqual(out, "human")
+        self.assertIn(brain_hold.LABEL, self.names(number))
+        self.gh.events[number].append(
+            {"event": "labeled", "label": {"name": brain_hold.LABEL},
+             "actor": {"login": LOOM_APP}, "created_at": iso(seconds_ago)})
+
+    def test_a_hold_the_rewrite_set_has_its_ask_quoted_in_the_retry_and_hand_off_notes(self):
+        # loom#2936: no hand-seeded reason comment. The rewrite's own write is
+        # the only note on the issue, and its ask is longer than one short line.
+        first = ("Decide whether the old export format is still supported: the issue asks "
+                 "to remove it, the README promises it until the next major release, and "
+                 "no operator decision on record settles which of the two holds for now")
+        self.assertGreater(len(first), brain_hold.REASON_MAX)
+        triage_issue(self.gh, 5)
+        self.hold_by_rewrite(5, first + ".", 30 * 3600)
+        f = factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED)
+        why = brain_hold.reason(f._comments(REPO, 5), NOW - 30 * 3600, "triage")
+        self.assertIn("Kind: decision", why)
+        self.assertIn(first, why)
+        report = f.brain_holds()
+        self.assertEqual(report[REPO]["lifted"], 1)
+        self.assertNotIn(brain_hold.LABEL, self.names(5))
+        (retry,) = [e for e in self.events(5) if brain_hold.RETRY_MARKER in e]
+        self.assertIn(first, retry)
+        self.assertNotIn("no note names it", retry)
+        # The hold comes back after the retry, with another ask.
+        second = "Decide who owns the export format before any code changes"
+        self.hold_by_rewrite(5, second + ".", -10 * 3600)
+        later = factory.Factory(self.gh, [REPO], NOW + 40 * 3600, trusted=TRUSTED)
+        self.assertEqual(later.brain_holds()[REPO]["lifted"], 1)
+        self.assertIn(labels.HANDOFF, self.names(5))
+        (handoff,) = [e for e in self.events(5) if brain_hold.LIFT_MARKER in e]
+        self.assertIn(second, handoff)
+        self.assertNotIn("no note names it", handoff)
+        # Every note is an event on the one status comment.
+        self.assertEqual(len(self.gh.comments[5]), 1)
 
     def test_a_persons_triage_hold_is_left_alone_and_counted(self):
         triage_issue(self.gh, 5)

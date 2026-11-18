@@ -579,6 +579,23 @@ live_cluster_check() {
   LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
 }
 
+# Check the composed pull request checklist against only this run's log.
+live_acceptance_check() {
+  local gap
+  if ! gap="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import sys
+from bus.live_proof import lane_output_gap
+with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
+    log.seek(int(sys.argv[2]))
+    print(lane_output_gap(sys.stdin.read(), log))
+' "$LOG" "$LOG_START" 2>&1)"; then
+    printf '%s\n' "$gap" >> "$LOG"
+    park "$BRIEF" "could not check live acceptance criteria; nothing pushed" transient
+    return 1
+  fi
+  [ -z "$gap" ] || { park "$BRIEF" "$gap; nothing pushed"; return 1; }
+}
+
 # STRAY_FILES as one comma-separated line, at most ten names.
 stray_list() {
   local n
@@ -1026,13 +1043,14 @@ checked_text() {
   PYTHONPATH="$REPO_ROOT" python3 - "$1" <<'PY'
 import sys
 from pathlib import Path
-from bus import text
+from bus import notify, text
 path = Path(sys.argv[1])
 try:
     data = path.read_bytes()
     if len(data) > 32768: raise ValueError("answer is too large")
     value = data.decode("utf-8")
     if not value.strip(): raise ValueError("answer is empty")
+    if not notify.visible_text(value): raise ValueError("answer has no visible text")
     if not value.isascii(): raise ValueError("answer is not ASCII")
     text.check(value)
 except Exception as exc:
@@ -2529,18 +2547,26 @@ base_verdict_key() {
   printf '%s\n%s\n%s\n%s\n' "$REPO" "$1" "$C_CHECK" "$2" | sha256sum | cut -d' ' -f1
 }
 base_verdict_read() {  # key, now
-  local file="$BASE_VERDICT_DIR/$1" at exit ttl
+  local file="$BASE_VERDICT_DIR/$1" at exit uv_cache ttl
   [ -f "$file" ] || return 1
-  IFS=' ' read -r at exit < "$file" || return 1
+  IFS=' ' read -r at exit uv_cache < "$file" || return 1
   case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
+  # The verdict outlives the check home, but the packages do not. Rerun a
+  # passing check for a codex agent if it warmed uv or predates this marker.
+  if [ "$exit" -eq 0 ] && [ "$LANE" = codex ] && [ "$DELIVERABLE" != base-check ] &&
+     [ "$uv_cache" != plain ]; then
+    return 1
+  fi
   if [ "$exit" -eq 0 ]; then ttl="$BASE_VERDICT_TTL_GREEN"; else ttl="$BASE_VERDICT_TTL_RED"; fi
   [ "$2" -ge "$at" ] && [ "$(( $2 - $at ))" -lt "$ttl" ] || return 1
   BASELINE_EXIT="$exit"
   return 0
 }
 base_verdict_write() {  # key, exit
+  local uv_cache=plain
+  [ -d "$CHECK_HOME/.cache/uv" ] && uv_cache=uv
   mkdir -p "$BASE_VERDICT_DIR" || return 1
-  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1" || return 1
+  printf '%s %s %s\n' "$(date +%s)" "$2" "$uv_cache" > "$BASE_VERDICT_DIR/$1" || return 1
   # Every revision mints a new file; sweep the ones no read can use. A
   # failed sweep never fails the write.
   find "$BASE_VERDICT_DIR" -type f -mmin +"$(( BASE_VERDICT_TTL_GREEN / 60 ))" -delete 2>/dev/null || true
@@ -2746,18 +2772,18 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # retries the ticket on another lane, which files the incident if the base is
 # red there too: filed from the runner, it held nothing and waited for a
 # person to close it.
-# Optional 4th argument: log offset of the check run, to append error lines.
-note_base_check_failure() {  # kind, detail, reason_var_name [, log_offset]
+# Optional 5th argument: log offset of the check run, to append error lines.
+note_base_check_failure() {  # kind, detail, reason_var_name, revision [, log_offset]
   if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
     PARK_CLASS=factory
     printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
     echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
     return 0
   fi
-  local detail="$2"
-  if [ -n "${4:-}" ]; then
+  local detail="$2"$'\n'"Checked commit: $4"
+  if [ -n "${5:-}" ]; then
     local tail
-    tail="$(check_error_tail "$4")"
+    tail="$(check_error_tail "$5")"
     if [ -n "$tail" ]; then
       detail="${detail}"$'\n'"${tail}"
     fi
@@ -3045,11 +3071,11 @@ check_default_branch() {
     [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
   fi
   if [ "$rc" -eq 0 ]; then
-    local check_start failures=""
-    check_start="$(log_size)"
+    local failures=""
+    DEFAULT_CHECK_START="$(log_size)"
     contract_run "$C_CHECK"; DEFAULT_EXIT=$?
     DEFAULT_CHANGED="$(tracked_changes)"
-    [ "$DEFAULT_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
+    [ "$DEFAULT_EXIT" -eq 0 ] || failures="$(check_failures "$DEFAULT_CHECK_START")"
     record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
       "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
       "$(join_detail "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}" "$failures")"
@@ -3115,8 +3141,9 @@ sys.exit(0 if valid else 1)
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
-  local check_start=0 failures=""
+  local check_start="" failures=""
   SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
+  BASELINE_SOURCE="base"
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
@@ -3144,10 +3171,8 @@ prepare_validation() {
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
   if [ -n "$CONFLICTS" ]; then
-    local check_start
-    check_start="$(log_size)"
     check_default_branch || return 1
-    BASELINE_EXIT="$DEFAULT_EXIT"
+    BASELINE_EXIT="$DEFAULT_EXIT" BASELINE_SOURCE="default branch"
     if [ -n "$DEFAULT_CHANGED" ]; then
       SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
       return 1
@@ -3155,12 +3180,13 @@ prepare_validation() {
     if [ "$BASELINE_EXIT" -ne 0 ]; then
       check_exit_is_load "$BASELINE_EXIT" && { note_load_failure "$BASELINE_EXIT" SETUP_REASON; return 1; }
       repair_baseline_allowed && return 0
-      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
+      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch at $DEFAULT_REV"
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$DEFAULT_REV" "$DEFAULT_CHECK_START"
       return 1
     fi
     return 0
   fi
+  [ -z "$FIX_PR" ] || BASELINE_SOURCE="fix branch"
   # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
   # validated in load_contract: read only from the base branch (never the
   # agent's), one line of printable ASCII, at most 1000 characters; and
@@ -3206,13 +3232,12 @@ prepare_validation() {
     note_load_failure "$BASELINE_EXIT" SETUP_REASON
     return 1
   fi
-  # A check that cannot run, or is already red, on the unmodified base is
-  # the factory's problem, not the ticket's: file the incident and stop
-  # before the agent burns a run it can never validate.
-  case "$BASELINE_EXIT" in
-    125|126|127)
-      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
+  # A check that cannot run on the unmodified base is an environment fault.
+  # On a fix branch, these exits also need a default-branch check first.
+  case "$FIX_PR:$BASELINE_EXIT" in
+    :125|:126|:127)
+      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base at $baseline_rev"
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$baseline_rev"
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -3280,7 +3305,8 @@ prepare_validation() {
         SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
         return 1
       fi
-      BASELINE_EXIT="$DEFAULT_EXIT"
+      BASELINE_EXIT="$DEFAULT_EXIT" BASELINE_SOURCE="default branch"
+      baseline_rev="$DEFAULT_REV" check_start="$DEFAULT_CHECK_START"
       if check_exit_is_load "$BASELINE_EXIT"; then
         note_load_failure "$BASELINE_EXIT" SETUP_REASON
         return 1
@@ -3290,8 +3316,8 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
-    # A fresh run's own log names its failures; a cached verdict or a fix
-    # round's default-branch check does not, so those still file.
+    # Only a fresh check on the ordinary baseline can use the host-only
+    # failure check, which reruns validation in the current tree.
     if [ -z "$FIX_PR" ] && [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] &&
        host_red_base "$baseline_rev" "$check_start"; then
       # The next ticket reruns the check rather than reading this red verdict.
@@ -3299,12 +3325,8 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
-    SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    if [ "$cached_verdict" -eq 0 ]; then
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
-    else
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
-    fi
+    SETUP_REASON="base check exited $BASELINE_EXIT on the $BASELINE_SOURCE at $baseline_rev"
+    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$baseline_rev" "$check_start"
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
@@ -3487,7 +3509,11 @@ validation_round_note() {
   elif [ -n "$VALIDATED" ]; then
     printf 'Contract command result: %s. ' "$VALIDATED"
   fi
-  printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
+  if [ "${1:-}" = yes ]; then
+    printf 'CI and review run again on the new head before operator review.'
+  else
+    printf 'CI and review run again on the new head; the factory lands the pull request once they pass.'
+  fi
 }
 
 # The paths the pull request changes, one per line: the lane's commits on a
@@ -3743,8 +3769,8 @@ EOF
 # What the agent is told about the contract, after its brief.
 validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
-  printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
-    "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+  printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the %s it exited %s.\n\n    %s\n' \
+    "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_SOURCE" "$BASELINE_EXIT" "$C_CHECK"
   [ -z "${C_AFFECTED:-}" ] || printf '\nAfter the check passes it runs this affected command with your changed files on stdin (and in LOOM_CHANGED_FILES); it must pass the same way:\n\n    %s\n' "$C_AFFECTED"
   [ "$C_SUBMODULES" != yes ] || printf '\nNever edit files inside a submodule: the push carries only its pinned commit, so the runner refuses a run that does and pushes nothing.\n'
 }
@@ -4557,6 +4583,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
 
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
+  OPERATOR_REVIEW="$(field Operator-Review "$BRIEF" || true)"
   REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
   # A review brief (Deliverable: review) takes its pull request's branch the
   # same way a fix brief does: the tree under review is the PR's own head.
@@ -5110,7 +5137,10 @@ for BRIEF in "$INBOX"/*.md; do
   # sandbox. A miss is the lane's work to fix; a check that cannot run is a
   # note, not a stop.
   LIVE_NOTES=""
-  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
+  if [ "$COMMITTED" -eq 1 ]; then
+    live_cluster_check || continue
+    if [ -z "$FIX_PR" ]; then live_acceptance_check || continue; fi
+  fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then
@@ -5248,7 +5278,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
       # 2026-10-20: "pushed fixes for: the findings on the ticket" told the
       # reader nothing; the comment says what went up and what happens next.
       PUSHED="$(safe_git rev-list --count "$BASE..HEAD" 2>> "$LOG")"
-      CHECKED="$(validation_round_note)"
+      CHECKED="$(validation_round_note "$OPERATOR_REVIEW")"
       COMMENT="Lane $SLOT ($MODEL) pushed ${PUSHED:-the} commit$([ "$PUSHED" = 1 ] || echo s) for: ${ITEMS:-the fix round on the ticket}
 
 $(pushed_commits)
@@ -5275,9 +5305,11 @@ Dropped scratch files: ${DROPPED_SCRATCH_FILES//$'\n'/, }"
 
 Review threads this round left without a reply: $UNANSWERED"
     fi
-    # One comment per pull request, edited each round; the push and the body
-    # edit are already on the pull request's timeline.
-    if ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
+    # Operator review needs the decisions and finding replies on the pull
+    # request. Progress travels with the local run log.
+    if [ "$OPERATOR_REVIEW" = yes ]; then
+      printf '%s\n' "$COMMENT" >> "$LOG"
+    elif ! printf '%s' "$COMMENT" | upsert_sticky_comment "$REPO" "$FIX_PR" "$ROUND_MARKER" rounds; then
       echo "[$(date -u +%FT%TZ)] $TICKET: fixes are pushed but the comment on #$FIX_PR failed" >> "$LOG"
     fi
     if [ "$COMMITTED" -eq 1 ]; then

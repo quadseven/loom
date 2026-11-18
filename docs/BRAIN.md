@@ -654,9 +654,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain` (no comment), and the
-station leaves it alone from then on; the brain decides whether it becomes a
-ticket or `needs:human`. Free rewrite models labelled factory work as
+work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
+leaves it alone from then on; the brain decides whether it becomes a ticket
+or `needs:human`. The proposed ask is no comment to a person: it is one
+routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
+which the factory's hold notes quote as the reason for the hold and the
+prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
 person-only, and every `needs:human` reaches the operator's digest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
@@ -1513,6 +1516,14 @@ decision, not an accident. A routine event is not a kind: it is an event in the
 ticket's status comment (`status.add`; the station's `_routine`, the factory's
 `_status_note`).
 
+A body must show a reader something. `notify.post` raises `notify.EmptyComment`
+and sends nothing when only HTML comments, empty `<details>`/`<summary>` tags
+or whitespace remain (#3200: a marker-only remote-claim comment rendered
+empty and still emailed the operator). The REST client (`GitHub.rest`) checks
+the same for every new issue, review-thread and reply comment, and the lane
+runner's answer check refuses such an answer. A record Loom reads back puts its
+marker on the first line and a plain sentence after it.
+
 To post a new comment: call `notify.post(gh, repo, number, body, notify.KIND)`.
 To add a kind: first ask whether it is a routine event (then it is a status
 event, not a kind); if it is an outcome a person reads or a record Loom reads
@@ -1945,6 +1956,30 @@ Status prints `held by a fleet comment from LOGIN: <comment link>`, and
 `bus.brain merge` refuses with the same words. Comments that cannot be read
 block as `pull request comments unreadable`. Only the opener counts: no other
 comment text is read as a hold.
+A blocking comment blocks too (loom#2988, bus/comment_findings.py): a trusted
+login's plain pull request comment, by the API author and never by a name in
+its text (LOOM_BRIEF_AUTHORS), that is either a finding in the marker form
+`<!-- loom:finding v1 -->`, or the legacy form: a line opening with `Blocking`
+(not `Blocking: none`) that names a commit by 7 or more hex characters. A
+comment carrying any other `<!-- loom:` marker is never a legacy finding, so a
+Luna verdict for an older head does not block a newer one. A finding stays open
+across pushes: a commit, an empty commit or an unrelated one never clears it, and
+a newer head does not supersede it. Only a later trusted comment that links the
+finding as `#issuecomment-<id>` and states a resolution backed by evidence
+answers it: a line opening with `Fixed in <commit>` whose commit is one of the
+pull request's own commits, or one opening with `Declined` that gives its
+reason in three or more words and cites evidence: a file line such as
+`bus/brain.py:120`, one of the pull request's commits, or a link other than the
+finding's own. A link alone, an acknowledgement, a "still broken,
+investigating" reply, a fix naming a commit the pull request does not carry, a
+decline with no evidence or a repeated objection (a later finding that links
+it) leaves it open. The pull request's commits are read only when an answer
+names one; when they cannot be read the merge is refused as `pull request
+commits unreadable`. The factory reads the pull request's own comments,
+never its ticket's, and names each open finding's link when it waits. Status prints `blocked: unanswered blocking comment from LOGIN: <comment
+link>`, and `bus.brain merge` refuses with the same words. Unreadable comments
+block as `pull request comments unreadable, so a blocking comment cannot be ruled
+out`. Ordinary comments, including `Nonblocking` or `Blocking: none`, never block.
 For a line that would otherwise be READY, status also reads what `bus.brain
 merge` refuses on, through the same functions merge uses (loom#1643): a
 ticket not at `loom:pr` (`ticket at loom:failed, not loom:pr`; at `loom:briefed`

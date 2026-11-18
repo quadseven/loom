@@ -18,14 +18,14 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
-from . import tick_clock
+from . import lane_markers, tick_clock
 from . import home_repo
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -853,8 +853,7 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
-        remote_claim = re.fullmatch(r"<!-- loom:remote-claim v1 [^ ]+ ([0-9]+) [0-9.]+(?: [0-9.]+)? -->",
-                                    body.strip())
+        remote_claim = lane_markers.claim_match(body)
         login = tickets._login(comment.get("user")).lower()
         if login in claim_authors and (_CLAIM.fullmatch(body.strip()) or remote_claim):
             last_claim = i
@@ -1050,6 +1049,55 @@ def _hold_blocker(gh: GitHub, repo: str, number: int, head: Dict[str, Any],
     return "held by a fleet comment from %s: %s" % (comment_login(held), _hold_name(held))
 
 
+def _read_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
+    """Every comment on a pull request, read once for the comment gates (the
+    fleet hold and the blocking-comment check, loom#2988). Raises ValueError
+    when they cannot be read: a gate the comments never reached cannot be
+    passed."""
+    try:
+        return gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request comments unreadable, so a fleet hold or a "
+                         "blocking comment cannot be ruled out (%s)" % err) from err
+
+
+def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
+                     known: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """The blocker an unanswered blocking comment from a trusted login puts on a
+    pull request, else None (bus/comment_findings.py, loom#2988). Status and
+    merge both call it, so they agree. `known` is every comment, already read;
+    else they are read from REST, and unreadable comments block. The pull
+    request's commits are read only for an answer that names a commit, and
+    unreadable commits block too."""
+    if not [a for a in authors if a]:
+        return None
+    if known is None:
+        try:
+            known = _read_comments(gh, repo, number)
+        except ValueError as err:
+            return str(err).removeprefix("blocked: ")
+    try:
+        found = comment_findings.open_findings(list(known), authors,
+                                               pr_commit_reader(gh, repo, number))
+    except GitHubError as err:
+        return COMMITS_UNREADABLE % err
+    return comment_findings.blocker(found) if found else None
+
+
+COMMITS_UNREADABLE = ("pull request commits unreadable, so a fix named in an answer "
+                      "cannot be checked (%s)")
+
+
+def pr_commit_reader(gh: GitHub, repo: str, number: int) -> comment_findings.CommitReader:
+    """Reads pull request `number`'s commit SHAs, for an answer that names its
+    fix (bus/comment_findings.py). It reads only when called."""
+    def read() -> List[str]:
+        return [str(c.get("sha") or "") for c in
+                gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+                if isinstance(c, dict)]
+    return read
+
+
 def _one_line(value: Any, limit: int = 200) -> str:
     line = " ".join(str(value or "").split())
     return line if len(line) <= limit else line[:limit - 3] + "..."
@@ -1189,6 +1237,9 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                          hold, _node_comments(node))
     if hold:
         line = _add_blocker(line, hold)
+    finding = _finding_blocker(gh, repo, int(pr["number"]), authors, _node_comments(node))
+    if finding:
+        line = _add_blocker(line, finding)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
         line = _add_blocker(line, "held for the operator: operator steps before merge")
     return _goal_rule_line(gh, repo, pr, ticket, line)
@@ -2404,7 +2455,7 @@ def _issue_key(issue: Dict[str, Any], repo: str) -> Tuple[str, int]:
 
 
 def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
-              warnings: Optional[List[str]] = None
+              warnings: Optional[List[str]] = None, *, parallel: bool = True
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
     """(the goal's direct children that are not epics, [(epic, its tickets)]).
 
@@ -2440,9 +2491,11 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
                 found[(epic_repo, number)] = tickets
         subs = [found[(_epic_repo(e, repo), int(e.get("number") or 0))] for e in epics]
     else:
-        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (_epic_repo(epic, repo),
-                                                      int(epic.get("number") or 0))), epics)
+        def read_subs(epic: Dict[str, Any]) -> List[Any]:
+            return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                               % (_epic_repo(epic, repo), int(epic.get("number") or 0)))
+
+        subs = _read_each(read_subs, epics) if parallel else [read_subs(epic) for epic in epics]
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets,
                                          _epic_repo(epic, repo), repo)))
@@ -2663,11 +2716,11 @@ def _ticket_of_epic(item: Dict[str, Any], number: int, here: str) -> bool:
     return _names_goal(item.get("body"), number)
 
 
-def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+def goal_children(gh: GitHub, repo: str, goal: int, *, parallel: bool = True) -> List[Dict[str, Any]]:
     """Every ticket of the goal, each once: its direct children that are not
     epics, then each epic's tickets (goal_tree). The epics themselves are not
     listed: a count of tickets must not count an epic."""
-    return _flatten(*goal_tree(gh, repo, goal), repo=repo)
+    return _flatten(*goal_tree(gh, repo, goal, parallel=parallel), repo=repo)
 
 
 def _flatten(loose: List[Dict[str, Any]],
@@ -5290,10 +5343,17 @@ def merge(gh: GitHub, repo: str, number: int,
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    logins = hold_logins(env)
+    authors = trusted_authors(env)
+    # Neither gate reads anything without a trusted login, so none is read here.
+    comments = _read_comments(gh, repo, number) if (logins or authors) else []
     hold = _hold_blocker(gh, repo, number, _head_commit(details), str(sha),
-                         str((pr.get("user") or {}).get("login") or ""), hold_logins(env))
+                         str((pr.get("user") or {}).get("login") or ""), logins, comments)
     if hold:
         raise ValueError("blocked: " + hold)
+    finding = _finding_blocker(gh, repo, number, trusted_authors(env), comments)
+    if finding:
+        raise ValueError("blocked: " + finding)
     shadow_env = _shadow_env(env)
     refusal = shadow.merge_refusal(repo, shadow_env)
     if refusal:
@@ -6270,6 +6330,7 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
 
 def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
                     body: str, resolve: bool = False) -> None:
+    notify.check_visible(body, "a review reply on %s#%d" % (repo, number))
     _check_written_text(body)
     _check_decision_claim(gh, repo, number, body)
     gh.rest("POST", "/repos/%s/pulls/%d/comments/%d/replies" % (repo, number, comment_id), {"body": body})

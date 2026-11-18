@@ -187,6 +187,16 @@ Defaults on irreversible kinds are refused when written. Issues with a
 `blocked:<reason>` label are omitted from waiting counts and are not given a
 new `needs:human` ask while blocked.
 
+`/review-queue` shows open lane pull requests named by the latest trusted
+operator hold asks. Each card shows the risk tier, hold reason, Elder
+findings, and the evidence each ticket criterion needs before it can close.
+Approve and merge releases the operator hold for the displayed head and
+ask. The station runs the normal merge checks. Send back opens a fix round
+and passes the optional note to the lane. Held fix rounds keep progress in
+the local lane log and post replies to findings on the pull request.
+Sensitive pull requests show Approve for brain review so the brain can
+complete its required review and merge.
+
 Each card takes an answer in one tap (loom#1777). Its buttons come from the
 ask's own words (`bus.answer.options`, no model): "reply with one number" is
 a number field; a lane pull request held for the operator, or "merge ... or
