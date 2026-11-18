@@ -1432,8 +1432,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         # another task's API replies, kubectl hints. Posting its tail put that
         # noise on tickets as if it were the ticket's news (2026-11-18). The
         # ticket gets one readable outcome; the log stays on the lane host.
-        fixture = ("| wow-dev renders ac-playerbots-db-import | `333333333333` |\n"
-                   "  - fix: apply the repository (`kubectl apply -k manifests/wow-dev`)\n"
+        fixture = ("| dev renders app-db-import | `333333333333` |\n"
+                   "  - fix: apply the repository (`kubectl apply -k manifests/dev`)\n"
                    '{"url":"https://api.github.com/repos/example/other/issues/comments/1"}')
         result = self.run_failing_agent(fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
