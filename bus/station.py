@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import base64
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 import errno
 import faulthandler
@@ -380,7 +381,7 @@ CHAIN_EVERY = 600
 CHAIN_ROWS = 20
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
-WAIT_UNSEEN = 3600
+WAIT_UNSEEN = brain.LANE_WAIT_MAX_AGE
 # A wait reason reaches a public incident: only these characters, this long.
 WAIT_REASON_RE = re.compile(r"[A-Za-z0-9 ,:.()/@_-]{1,160}")
 # Rewrites across every backlog goal in any hour: each one comments on its
@@ -1179,7 +1180,9 @@ class Settings:
                  repo_pr_caps: Optional[Dict[str, int]] = None,
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None,
-                 disk_watch: Optional[disk_watchdog.Config] = None) -> None:
+                 disk_watch: Optional[disk_watchdog.Config] = None,
+                 metrics_reserve: int = metrics.REQUEST_RESERVE,
+                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
         self.home = home
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
         # loom#3187): off for a Settings built in code; from_env turns it on
@@ -1306,6 +1309,8 @@ class Settings:
         self.scope_url = scope_url
         self.scope_model = scope_model
         self.metrics_goal = metrics_goal
+        self.metrics_reserve = metrics_reserve
+        self.metrics_seconds = metrics_seconds
         self.transcript_url = transcript_url
         # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
         self.fabric_key_ssm = fabric_key_ssm
@@ -1377,6 +1382,10 @@ class Settings:
                    scope_url=env.get("LOOM_SCOPE_CHECK_URL", "").strip(),
                    scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
+                   metrics_reserve=_positive_int(env.get("LOOM_METRICS_RESERVE", ""),
+                                                 metrics.REQUEST_RESERVE),
+                   metrics_seconds=_positive_int(env.get("LOOM_METRICS_SECONDS", ""),
+                                                 metrics.STEP_SECONDS),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
@@ -1683,6 +1692,11 @@ def _seconds(raw: str, default: int) -> int:
 def _decision_window_days(raw: str) -> int:
     """A positive decision-default window in whole days, else three."""
     return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+def _positive_int(raw: str, default: int) -> int:
+    raw = raw.strip()
+    return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -2846,6 +2860,11 @@ class Station:
         comment, and a rung 0 comment ends a fix the same way: without it a
         restarted ticket replayed the round of a pull request that had ended
         (loom#2334). Raises ValueError for an unusable fix."""
+        found = self._fix_with_source(repo, comments)
+        return (found[0], found[1].get("id")) if found is not None else None
+
+    def _fix_with_source(self, repo: str, comments: List[Any]
+                         ) -> Optional[Tuple[tickets.Fix, Dict[str, Any]]]:
         allowed = {a.lower() for a in self.s.authors}
         comments = status.expand(comments, self.s.authors)
         last_end, newest_fix = -1, None
@@ -2865,7 +2884,17 @@ class Station:
         # posted may carry someone else's words.
         if newest_fix[1].get("updated_at") != newest_fix[1].get("created_at"):
             raise ValueError("the loom:fix comment was edited after it was posted")
-        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
+        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1]
+
+    def _pending_fix_at(self, repo: str, comments: List[Any]) -> Optional[float]:
+        """When the current fix round was posted, if it still needs a claim."""
+        found = self._fix_with_source(repo, comments)
+        if found is None:
+            return None
+        fix, source = found
+        if fix.pr in tickets.judged_pulls(c.get("body") or "" for c in comments):
+            return None
+        return self._epoch(str(source.get("created_at") or "")) or 0.0
 
     def _claim_time(self, comments: List[Any], fix_comment_id: Any) -> float:
         """When a claim is stamped: the pass time, or one second after the
@@ -2918,7 +2947,9 @@ class Station:
                                     demoted_models=self._brief_demoted_models(lane),
                                     claim=self._lane_claim_label(),
                                     defaults=answer.default_notes(comments, self.s.authors,
-                                                                  answer.operators(trusted=self.s.authors)))
+                                                                  answer.operators(trusted=self.s.authors)),
+                                    operator_review=fix is not None and
+                                    answer.newest_held_pr(comments, self.s.authors) == fix.pr)
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an
@@ -6745,7 +6776,7 @@ class Station:
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
-        paused = self._paused_steps(steps)
+        paused = self._paused_steps((*steps, self.post_metrics))
         self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -6836,21 +6867,32 @@ class Station:
             _say("note_stale_shipped failed: %s" % err)
 
     def _run_due_steps(self, paused: Set[str]) -> None:
-        """score_lanes ahead of the rotation when its hour is up, so a slow
-        rotation does not hold an hourly step for hours (loom#3014: the
-        scorecard went 4.5 hours unrefreshed). The step stays in the rotation,
-        where a refresh that is not due only sends notices."""
-        if ("score_lanes" in paused or self._deferred()
-                or not scorecard.Scorecard(self.state, self.now).due()):
+        """Run scheduled work ahead of the rotation so it can resume each pass.
+
+        The scorecard also stays in the rotation to send notices (loom#3014).
+        """
+        if self._deferred():
             return
-        try:
-            self.score_lanes()
-        except TargetReached as err:
-            _say("step score_lanes carried over to the next pass: %s" % err)
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, ValueError) as err:
-            _say("score_lanes failed: %s" % err)
+        if "score_lanes" not in paused and scorecard.Scorecard(self.state, self.now).due():
+            try:
+                self.score_lanes()
+            except TargetReached as err:
+                _say("step score_lanes carried over to the next pass: %s" % err)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("score_lanes failed: %s" % err)
+        if not self.s.metrics_goal:
+            return
+        if "post_metrics" in paused:
+            _say("step post_metrics paused (LOOM_PAUSED_STEPS)")
+        elif not self._deferred():
+            try:
+                self._timed(self.post_metrics)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("post_metrics failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -11893,18 +11935,14 @@ class Station:
             _say("rewrite %s: no agent command for this repo; skipped" % key)
             self._event("rewrite_skipped", "no agent command for this repo", key)
             return 0
-        # Intake refuses a brief at the goal's in-flight cap, so a model run
-        # then writes nothing (17 of 72 rewrites on 2026-10-21).
-        try:
-            flying = brain.goal_flying(self.gh, repo, goal)
-        except ValueError:
-            flying = []  # not an open goal: intake says why per issue
-        if len(flying) >= brain.goal_cap():
-            _say(self._at_cap(key, repo, rec, flying, brain.goal_cap()))
+        room, at_cap = self._rewrite_room(key, repo, goal, rec, room)
+        if room <= 0:
             return 0
-        rec.pop("cap", None)
+        candidates = rewrite.candidates(self.gh, repo)
+        if at_cap:
+            candidates = [issue for issue in candidates if brain.goal_cap_repair(issue)]
         done = 0
-        for issue in rewrite.candidates(self.gh, repo):
+        for issue in candidates:
             if done >= room or self._deferred():
                 break
             number = int(issue["number"])
@@ -11923,6 +11961,25 @@ class Station:
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 self._rewrite_failed(repo, number, err)
         return done
+
+    def _rewrite_room(self, key: str, repo: str, goal: int, rec: Dict[str, Any],
+                      room: int) -> Tuple[int, bool]:
+        """Cap planned rewrites before starting the agent. At the cap only
+        factory repairs can use any room left in the reserve."""
+        try:
+            flying = brain.goal_flying(self.gh, repo, goal)
+        except ValueError:
+            flying = []  # not an open goal: intake says why per issue
+        waiting = self._no_lane_since(self.now)
+        count, reserved = brain.goal_capacity_counts(flying, repo, waiting)
+        cap = brain.goal_cap()
+        if count < cap:
+            rec.pop("cap", None)
+            return room, False
+        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
+        _say(self._at_cap(key, rec, count, blocked, cap))
+        self._event("rewrite_held", "goal at its in-flight cap", key)
+        return min(room, cap + brain.GOAL_CAP_RESERVE - reserved), True
 
     def _rewrite_failed(self, repo: str, number: int, err: Exception) -> None:
         _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
@@ -11999,6 +12056,11 @@ class Station:
                 rec["tried"].pop(str(number), None)
             self._rewrite_failed(repo, number, err)
             action = ""
+        except brain.GoalCapacityHeld as err:
+            ref = "%s#%d" % (repo, number)
+            _say("rewrite %s held: %s" % (ref, err))
+            self._event("rewrite_held", str(err), ref)
+            action = ""
         except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
             self._rewrite_failed(repo, number, err)
             action = ""
@@ -12010,19 +12072,16 @@ class Station:
         _say("rewrite %s#%d: %s" % (repo, number, action))
         self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
 
-    def _at_cap(self, key: str, repo: str, rec: Dict[str, Any],
-                flying: List[Dict[str, Any]], cap: int) -> str:
+    def _at_cap(self, key: str, rec: Dict[str, Any], count: int, blocked: int, cap: int) -> str:
         """Keep in the goal's rewrite record since when it has been at its
-        in-flight cap and how many of its in-flight tickets wait with no lane
-        that takes them (ticket-waits.json no_lane_since), and return the skip
+        in-flight cap and how many tickets wait with no lane that takes them
+        (ticket-waits.json no_lane_since), and return the skip
         line: past GOAL_CAP_STUCK it says the goal is stuck (loom#1831)."""
-        waiting = self._no_lane_since()
-        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
         old = rec.get("cap") if isinstance(rec.get("cap"), dict) else {}
         since = old["since"] if self._num(old.get("since")) else self.now
-        rec["cap"] = {"since": since, "seen": self.now, "in_flight": len(flying), "cap": cap,
+        rec["cap"] = {"since": since, "seen": self.now, "in_flight": count, "cap": cap,
                       "no_lane": blocked}
-        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (len(flying), cap, blocked)
+        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (count, cap, blocked)
         if self.now - since > GOAL_CAP_STUCK:
             return "rewrite %s: goal stuck at its cap for %.0f hours: %s; skipped" % (
                 key, (self.now - since) / 3600, counts)
@@ -14004,13 +14063,18 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003). One log line per goal."""
+        seconds (decision 0003), resuming after a carried-over read. One log
+        line per goal."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
         checked = state.get("checked")
-        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+        finished = state.get("finished", [])
+        if not isinstance(finished, list):
+            finished = []
+        if (not finished and self._num(checked)
+                and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY):
             return
         try:
             homes = self._goal_homes()
@@ -14019,18 +14083,27 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("outside-epic: could not read the goal homes: %s" % err)
             return
+        completed = set(item for item in finished if isinstance(item, str))
         for repo, goal in homes:
             number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            if key in completed:
+                continue
             try:
                 moved, left = brain.move_outside_tickets(self.gh, repo, number)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not finished: a resumed pass retries this home.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
                 continue
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
+            completed.add(key)
+            state["finished"] = sorted(completed)
+            _write_json(path, state)
         state["checked"] = self.now
+        state["finished"] = []
         _write_json(path, state)
 
     # -- invariants -------------------------------------------------------
@@ -14304,15 +14377,21 @@ class Station:
         linked = brain.part_of_linked(self.gh, repo, [
             int(epic["number"]) for epic, _ in tree
             if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        stranded: Dict[int, List[invariants.Ref]] = {}
+        for ticket, parent in brain._closed_epic_tickets(tree):
+            stranded.setdefault(parent, []).append(ref(ticket))
         epics = []
         for epic, found in tree:
+            epic_number = int(epic["number"])
+            opened = epic.get("state", "open") == "open"
             union = {int(t.get("number") or 0): t for t in found}
-            for t in linked.get(int(epic["number"]), []):
+            for t in linked.get(epic_number, []):
                 union.setdefault(int(t.get("number") or 0), t)
             union.pop(0, None)
+            open_tickets = (tuple(ref(t) for t in union.values() if t.get("state") != "closed")
+                            if opened else tuple(stranded.get(epic_number, [])))
             epics.append(invariants.EpicShape(
-                ref(epic), epic.get("state", "open") == "open", len(union),
-                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                ref(epic), opened, len(union), open_tickets,
                 brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
                 title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
@@ -14411,6 +14490,15 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the lane pull requests: %s" % err)
+        if not isinstance(state.get("scheduled_workflows"), dict):
+            state["scheduled_workflows"] = {}
+        read_start = self._pass_counted()
+        facts.scheduled_workflows, unread = invariants.read_scheduled_workflows(
+            self.gh, [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)],
+            state["scheduled_workflows"],
+            lambda: (self._pass_counted() - read_start >= invariants.SCHEDULED_READ_MAX
+                     or self._deferred()), _say)
+        facts.unread = {**(facts.unread or {}), invariants.SCHEDULED_WORKFLOW_RED: unread}
         return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:
@@ -15958,7 +16046,7 @@ class Station:
             # twelve moves was lost to a carry-over (loom#2094).
             self._record_silent(runner.silent_running, runner.silent)
             self._return_silent_briefs(runner.silent_running)
-        self._record_waits(runner.waits, runner.settled)
+            self._record_waits(runner.waits, runner.settled)
 
     def lift_brain_holds(self) -> None:
         """Resolve the needs-brain holds older than a day that Loom set
@@ -16323,6 +16411,7 @@ class Station:
         settled as stalled (loom#3158)."""
         runner = self._factory()
         runner.in_inbox = self._inbox_tickets()
+        runner.pending_fix_at = self._pending_fix_at
         runner.capped = set(self._capped_repos(
             [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]))
         for repo in sorted(runner.capped):
@@ -16355,12 +16444,10 @@ class Station:
                 capped.append(repo)
         return capped
 
-    def _no_lane_since(self) -> Dict[str, float]:
+    def _no_lane_since(self, now: Optional[float] = None) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""
         saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
-        return {str(key): float(info["no_lane_since"]) for key, info in
-                (saved.items() if isinstance(saved, dict) else [])
-                if isinstance(info, dict) and self._num(info.get("no_lane_since"))}
+        return brain.no_lane_waits(saved, now)
 
     def _saved_waits(self) -> Dict[str, str]:
         """Each ticket's wait reason as the last pass recorded it (_record_waits)."""
@@ -16416,9 +16503,9 @@ class Station:
     def _post_metrics_comment(self, path: str, today: str,
                               dated: Dict[str, Tuple[int, int]]) -> None:
         try:
-            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
-                                        self.now, self.s.review_check,
-                                        self.s.authors).collect()
+            with self._resume_metrics(path, today) as started:
+                numbers = metrics.Collector(self.gh, self.s.repos, self.s.home, started,
+                                            self.s.review_check, self.s.authors).collect()
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
@@ -16430,10 +16517,28 @@ class Station:
         yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
         streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
         body = metrics.render(numbers, today, streak)
-        # Outside the try above: a refused POST reaches run_pass, which logs
-        # "post_metrics failed", and today stays unposted for the next pass.
+        # A refused POST leaves today unposted for the next pass.
         self.gh.rest("POST", path, {"body": body})
         dated[today] = (passed, streak)
+
+    @contextmanager
+    def _resume_metrics(self, path: str, today: str) -> Iterator[float]:
+        if not isinstance(self.gh, GitHub) or not self.gh.cache_dir:
+            yield self.now
+            return
+        key = path + "#metrics-build"
+        saved = self.gh.recall(key, today)
+        if not saved or len(saved) != 2:
+            saved = [str(time.time_ns()), self.now]
+            self.gh.remember(key, today, saved)
+        scope, started = saved
+        with self.gh.resume_reads(scope):
+            yield started
+
+    def _check_metrics_reserve(self) -> None:
+        core = self._rates().get("core")
+        if core and core[0] <= self.s.metrics_reserve:
+            raise metrics.Deferred("GitHub core reserve reached (%d left)" % core[0])
 
     def _metrics_notice(self, today: str, key: str, line: str) -> None:
         ledger_path = os.path.join(self.state, "metrics.json")
@@ -16468,12 +16573,26 @@ class Station:
         if time.localtime(self.now).tm_hour < self.s.digest_hour:
             return
         path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        check = (self.gh.check_requests(self._check_metrics_reserve)
+                 if isinstance(self.gh, GitHub) else nullcontext())
+        try:
+            with check, metrics.time_cap(self.s.metrics_seconds):
+                self._check_metrics_reserve()
+                self._daily_metrics(path, today)
+        except metrics.Deferred as err:
+            _say("post_metrics will resume: %s" % err)
+
+    def _daily_metrics(self, path: str, today: str) -> None:
         # Read-then-post is safe: run() holds station.lock (flock) for the
         # whole pass, so no second pass can read the same day's comments
         # before this one has posted.
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
+        if today in dated and isinstance(self.gh, GitHub):
+            key = path + "#metrics-build"
+            if self.gh.recall(key, today):
+                self.gh.remember(key, today, [])
         if today in dated and not self.s.report_digest:
             # With a report digest the day's numbers ride in it instead.
             passed, streak = dated[today]
@@ -17670,15 +17789,6 @@ class Station:
             except OSError as err:
                 _say("could not record the repo scans: %s" % err)
             self._run_steps()
-            # The day's metrics line goes out even below the budget floor: one post
-            # a day, and on 2026-10-18 the floor deferred it every pass, so the
-            # operator got no numbers for the day. Only a spent budget stops it.
-            try:
-                self.post_metrics()
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("post_metrics failed: %s" % err)
             try:
                 self.watch_logs()
             except RateLimited:

@@ -168,10 +168,10 @@ def options(ask: str, kind: str = "") -> Options:
     text = " ".join(_DEFAULT_RE.sub("", _REVERSIBLE_RE.sub("", str(ask or "")))
                     .replace("**", "").split())
     kind = (kind or ask_kind(str(ask or ""))).lower()
-    if _NUMBER_RE.search(text):
-        return Options(NUMBER)
     if HELD_PR_RE.search(text):
         return Options(CHOICE, (MERGE, HOLD, SEND_BACK))
+    if _NUMBER_RE.search(text):
+        return Options(NUMBER)
     if _MERGE_HOLD_RE.search(text):
         return Options(CHOICE, (MERGE, HOLD))
     if _KEEP_CLOSE_RE.search(text):

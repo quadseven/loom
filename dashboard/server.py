@@ -868,7 +868,7 @@ def _needs_you(document, state, *, source_missing=False, who=""):
 
 
 def _review_queue(state):
-    document = _backlog_document(_backlog_bytes() or b"{}")
+    document = _backlog_document(_backlog_raw(state) or b"{}")
     asks, claims, repos = _needs_sources(document, state)
     mode = answers_view.mode(state)
     entries, _ = needs_you_view.render(asks, claims, "", repos, answers_view.posted(state), mode)
@@ -879,13 +879,13 @@ def _review_queue(state):
     details = {}
     below_floor = getattr(state, "_below_floor", lambda: False)()
     if reader is not None and not below_floor:
-        for entry in review_queue.held(entries):
+        for entry in review_queue.candidates(entries):
             details["%s#%d" % (entry["repo"], entry["number"])] = reader.get(entry)
     content = ('<p class="page-lede">Review held changes, read their evidence, and choose the next step. '
                'Approval still runs every merge check.</p>' + _answer_bar(mode))
     if below_floor:
         content += '<p role="status">GitHub reads are waiting for the request budget to recover.</p>'
-    unknown = sum(1 for entry in entries if entry.get("comment_ask") is None)
+    unknown = sum(1 for result in details.values() if result.get("errors") and "review_ask" not in result)
     if unknown:
         content += ('<p role="status">%d asks are not classified yet. '
                     '<a href="/needs-you">Read their asks in Needs you</a>.</p>') % unknown

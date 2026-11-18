@@ -192,6 +192,12 @@ class MuseDocTest(unittest.TestCase):
     def test_the_doc_says_the_dashboard_host_is_not_the_base(self):
         self.assertTrue("never the Loom dashboard's host" in self.doc, "never the Loom dashboard's host")
 
+    def test_the_doc_says_the_overseer_bare_root_is_not_the_base(self):
+        # The other wrong base: the overseer host's bare root redirects or
+        # 404s every /api/v2 path, so the doc must keep saying so (loom#3033).
+        self.assertTrue("never the overseer host's bare root" in self.doc,
+                        "never the overseer host's bare root")
+
 
 if __name__ == "__main__":
     unittest.main()
