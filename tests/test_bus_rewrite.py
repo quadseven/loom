@@ -47,6 +47,7 @@ class FakeGitHub:
         self.removed = []
         self.linked = []
         self.goal_body = ""
+        self.goal_tickets = []
 
     @staticmethod
     def intake():
@@ -91,7 +92,8 @@ class FakeGitHub:
                 return reply(200, {"number": GOAL, "state": "open", "body": "",
                                    "labels": [{"name": "loom:goal"}]})
             if sub == "sub_issues":
-                return reply(201, {}) if method == "POST" else reply(200, [self.intake()])
+                return reply(201, {}) if method == "POST" else reply(
+                    200, [self.intake(), *self.goal_tickets])
         if number == INTAKE:
             if method == "GET" and sub is None:
                 return reply(200, self.intake())
@@ -454,6 +456,11 @@ class RewriteIssueTest(Base):
 
 
 class StationRewriteTest(Base):
+    @staticmethod
+    def ticket(number, state="running"):
+        return {"number": number, "state": "open", "labels": [
+            {"name": "loom:ticket"}, {"name": "loom:" + state}]}
+
     def test_nothing_runs_without_a_command(self):
         self.fake.add_triage(7)
         self.run_station(self.station())
@@ -469,24 +476,56 @@ class StationRewriteTest(Base):
         # 17 of 72 rewrites ran the model only for intake to refuse the brief
         # at the goal's in-flight cap (2026-10-21).
         self.fake.add_triage(7)
-        with mock.patch.object(brain, "goal_flying",
-                               return_value=[{"number": n} for n in range(brain.goal_cap())]):
-            err = self.run_station(self.station(cmd=self.agent(BRIEF)))
+        self.fake.goal_tickets = [self.ticket(100 + n) for n in range(brain.goal_cap())]
+        st = self.station(cmd=self.agent(BRIEF))
+        err = self.run_station(st)
         self.assertFalse(os.path.exists(self.prompt_file))
         self.assertEqual(self.fake.created, [])
         self.assertIn("tickets in flight", err)
+        with open(st.event_log) as events:
+            self.assertEqual([json.loads(line)["kind"] for line in events], ["rewrite_held"])
+
+    def test_a_cap_refusal_after_the_agent_runs_is_logged_as_a_hold(self):
+        self.fake.add_triage(7)
+        self.fake.goal_tickets = [self.ticket(50)]
+        st = self.station(cmd=self.agent(BRIEF))
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}), \
+                mock.patch.object(brain, "goal_flying", return_value=[]):
+            self.run_station(st)
+        self.assertEqual(self.fake.created, [])
+        with open(st.event_log) as events:
+            self.assertEqual([json.loads(line)["kind"] for line in events], ["rewrite_held"])
+
+    def test_a_factory_rewrite_can_run_at_the_goal_cap(self):
+        self.fake.add_triage(7)
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"].append({"name": "loom:factory"})
+        self.fake.goal_tickets = [self.ticket(50)]
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            self.run_station(self.station(cmd=self.agent(BRIEF)))
+        (ticket,) = self.fake.created
+        self.assertIn("Rewritten from issue 8.", ticket["body"])
+        self.assertIn("loom:factory", ticket["labels"])
+
+    def test_a_recorded_no_lane_wait_opens_a_slot_for_rewrites(self):
+        self.fake.add_triage(7)
+        self.fake.goal_tickets = [self.ticket(50, "queued")]
+        st = self.station(cmd=self.agent(BRIEF))
+        st._record_waits({"%s#50" % REPO: "no free lane in tier easy"})
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1", "LOOM_HOME": self.home}):
+            self.run_station(st)
+        self.assertEqual(len(self.fake.created), 1)
 
     def at_cap(self, st, blocked=()):
-        """Run the rewrite step with the goal at its cap and tickets 1.. in
-        flight, of which `blocked` wait with no lane (ticket-waits.json)."""
+        """Run the rewrite step with a full goal plus tickets waiting for a lane."""
         os.makedirs(st.state, exist_ok=True)
         with open(os.path.join(st.state, "ticket-waits.json"), "w") as fh:
             json.dump({"%s#%d" % (REPO, n): {"reason": "no free lane takes model claude-sonnet-5-5",
                                              "since": st.now, "seen": st.now,
                                              "no_lane_since": st.now} for n in blocked}, fh)
-        flying = [{"number": n} for n in range(1, brain.goal_cap() + 1)]
-        with mock.patch.object(brain, "goal_flying", return_value=flying):
-            return self.run_station(st)
+        self.fake.goal_tickets = ([self.ticket(100 + n) for n in range(brain.goal_cap())]
+                                  + [self.ticket(n, "queued") for n in blocked])
+        return self.run_station(st)
 
     def test_the_cap_skip_names_the_tickets_blocked_on_no_lane_and_a_stuck_goal(self):
         # loom#1831: a goal sat at 32 of 28 all day, most of it tickets no
@@ -511,8 +550,8 @@ class StationRewriteTest(Base):
         st = self.station(cmd=self.agent(BRIEF))
         self.at_cap(st)
         st.now += station.GOAL_CAP_STUCK + 3600
-        with mock.patch.object(brain, "goal_flying", return_value=[]):
-            self.run_station(st)
+        self.fake.goal_tickets = []
+        self.run_station(st)
         state = json.load(open(os.path.join(st.state, "rewrite.json")))
         self.assertEqual(st._stuck_goals(state), [])
         self.assertNotIn("cap", state["%s#%d" % (REPO, GOAL)])
