@@ -381,7 +381,7 @@ CHAIN_EVERY = 600
 CHAIN_ROWS = 20
 # A recorded ticket wait the factory has not repeated for this long is gone:
 # the ticket moved, or left the factory (invariants.ticket_waiting).
-WAIT_UNSEEN = 3600
+WAIT_UNSEEN = brain.LANE_WAIT_MAX_AGE
 # A wait reason reaches a public incident: only these characters, this long.
 WAIT_REASON_RE = re.compile(r"[A-Za-z0-9 ,:.()/@_-]{1,160}")
 # Rewrites across every backlog goal in any hour: each one comments on its
@@ -11930,18 +11930,14 @@ class Station:
             _say("rewrite %s: no agent command for this repo; skipped" % key)
             self._event("rewrite_skipped", "no agent command for this repo", key)
             return 0
-        # Intake refuses a brief at the goal's in-flight cap, so a model run
-        # then writes nothing (17 of 72 rewrites on 2026-10-21).
-        try:
-            flying = brain.goal_flying(self.gh, repo, goal)
-        except ValueError:
-            flying = []  # not an open goal: intake says why per issue
-        if len(flying) >= brain.goal_cap():
-            _say(self._at_cap(key, repo, rec, flying, brain.goal_cap()))
+        room, at_cap = self._rewrite_room(key, repo, goal, rec, room)
+        if room <= 0:
             return 0
-        rec.pop("cap", None)
+        candidates = rewrite.candidates(self.gh, repo)
+        if at_cap:
+            candidates = [issue for issue in candidates if brain.goal_cap_repair(issue)]
         done = 0
-        for issue in rewrite.candidates(self.gh, repo):
+        for issue in candidates:
             if done >= room or self._deferred():
                 break
             number = int(issue["number"])
@@ -11960,6 +11956,25 @@ class Station:
             except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
                 self._rewrite_failed(repo, number, err)
         return done
+
+    def _rewrite_room(self, key: str, repo: str, goal: int, rec: Dict[str, Any],
+                      room: int) -> Tuple[int, bool]:
+        """Cap planned rewrites before starting the agent. At the cap only
+        factory repairs can use any room left in the reserve."""
+        try:
+            flying = brain.goal_flying(self.gh, repo, goal)
+        except ValueError:
+            flying = []  # not an open goal: intake says why per issue
+        waiting = self._no_lane_since(self.now)
+        count, reserved = brain.goal_capacity_counts(flying, repo, waiting)
+        cap = brain.goal_cap()
+        if count < cap:
+            rec.pop("cap", None)
+            return room, False
+        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
+        _say(self._at_cap(key, rec, count, blocked, cap))
+        self._event("rewrite_held", "goal at its in-flight cap", key)
+        return min(room, cap + brain.GOAL_CAP_RESERVE - reserved), True
 
     def _rewrite_failed(self, repo: str, number: int, err: Exception) -> None:
         _say("rewrite %s#%d wrote nothing: %s" % (repo, number, err))
@@ -12036,6 +12051,11 @@ class Station:
                 rec["tried"].pop(str(number), None)
             self._rewrite_failed(repo, number, err)
             action = ""
+        except brain.GoalCapacityHeld as err:
+            ref = "%s#%d" % (repo, number)
+            _say("rewrite %s held: %s" % (ref, err))
+            self._event("rewrite_held", str(err), ref)
+            action = ""
         except (rewrite.Invalid, ValueError, GitHubError, OSError) as err:
             self._rewrite_failed(repo, number, err)
             action = ""
@@ -12047,19 +12067,16 @@ class Station:
         _say("rewrite %s#%d: %s" % (repo, number, action))
         self._event("rewrite_succeeded", action, "%s#%d" % (repo, number))
 
-    def _at_cap(self, key: str, repo: str, rec: Dict[str, Any],
-                flying: List[Dict[str, Any]], cap: int) -> str:
+    def _at_cap(self, key: str, rec: Dict[str, Any], count: int, blocked: int, cap: int) -> str:
         """Keep in the goal's rewrite record since when it has been at its
-        in-flight cap and how many of its in-flight tickets wait with no lane
-        that takes them (ticket-waits.json no_lane_since), and return the skip
+        in-flight cap and how many tickets wait with no lane that takes them
+        (ticket-waits.json no_lane_since), and return the skip
         line: past GOAL_CAP_STUCK it says the goal is stuck (loom#1831)."""
-        waiting = self._no_lane_since()
-        blocked = sum(1 for issue in flying if "%s#%s" % (repo, issue.get("number")) in waiting)
         old = rec.get("cap") if isinstance(rec.get("cap"), dict) else {}
         since = old["since"] if self._num(old.get("since")) else self.now
-        rec["cap"] = {"since": since, "seen": self.now, "in_flight": len(flying), "cap": cap,
+        rec["cap"] = {"since": since, "seen": self.now, "in_flight": count, "cap": cap,
                       "no_lane": blocked}
-        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (len(flying), cap, blocked)
+        counts = "%d tickets in flight (cap %d), %d blocked on no lane" % (count, cap, blocked)
         if self.now - since > GOAL_CAP_STUCK:
             return "rewrite %s: goal stuck at its cap for %.0f hours: %s; skipped" % (
                 key, (self.now - since) / 3600, counts)
@@ -16413,12 +16430,10 @@ class Station:
                 capped.append(repo)
         return capped
 
-    def _no_lane_since(self) -> Dict[str, float]:
+    def _no_lane_since(self, now: Optional[float] = None) -> Dict[str, float]:
         """Each ticket's first no-lane wait as _record_waits kept it."""
         saved = _read_json(os.path.join(self.state, "ticket-waits.json"), {}, strict=False)
-        return {str(key): float(info["no_lane_since"]) for key, info in
-                (saved.items() if isinstance(saved, dict) else [])
-                if isinstance(info, dict) and self._num(info.get("no_lane_since"))}
+        return brain.no_lane_waits(saved, now)
 
     def _saved_waits(self) -> Dict[str, str]:
         """Each ticket's wait reason as the last pass recorded it (_record_waits)."""
