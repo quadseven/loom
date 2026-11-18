@@ -81,6 +81,11 @@ def comment(body, login=OPERATOR, ago=60, ident=1, bot=False):
             "user": {"login": login, "type": "Bot" if bot else "User"}}
 
 
+def legacy_ask(verdict):
+    return "<!-- loom:stale-brief %s -->\n%s\nKind: decision" % (
+        brief_check.marker_key(verdict.key), verdict.reason)
+
+
 class Route:
     """GitHub by path: GETs from `routes` (longest prefix first), a missing
     path is a 404, a path in `fail` a 422; writes are recorded."""
@@ -90,9 +95,14 @@ class Route:
         self.fail = set()
         self.writes = []
         self.reads = []
+        self.last_edited_at = None
 
     def __call__(self, method, url, headers, body):
         path = url.split("api.github.com")[-1]
+        if method == "POST" and path == "/graphql":
+            self.reads.append(path)
+            data = {"repository": {"issue": {"lastEditedAt": self.last_edited_at}}}
+            return 200, {}, json.dumps({"data": data}).encode()
         if method != "GET":
             self.writes.append((method, path, json.loads(body) if body else None))
             return 200, {}, b"{}"
@@ -250,6 +260,26 @@ class Stale(unittest.TestCase):
         self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(90000), "title": "x"}
         self.assertIsNone(self.check(comments=said))
 
+    def test_a_body_edit_after_a_linked_merge_makes_it_context(self):
+        issue = ticket(body=STALE_REWRITE.replace(
+            "## Size", "https://github.com/%s/pull/45\n\n## Size" % OTHER))
+        self.fake.routes["/repos/%s/pulls/45" % OTHER] = {"merged_at": iso(3600), "title": "x"}
+        issue["updated_at"] = iso(60)
+        self.assertEqual(self.check(issue).key, "pr-%s#45" % OTHER)
+        self.fake.last_edited_at = iso(120)
+        self.assertIsNone(self.check(issue))
+
+    def test_a_body_edit_skips_earlier_cross_repo_merges_but_keeps_later_ones(self):
+        timeline = self.fake.routes["/repos/%s/issues/206/timeline" % REPO]
+        for number, ago in ((31, 3600), (32, 60)):
+            timeline.append({
+                "event": "cross-referenced", "source": {"type": "issue", "issue": {
+                    "number": number, "body": "Refs %s#206\n" % REPO, "title": "Ship the caller",
+                    "repository": {"full_name": OTHER},
+                    "pull_request": {"merged_at": iso(ago)}}}})
+        self.fake.last_edited_at = iso(120)
+        self.assertEqual(self.check().key, "pr-%s#32" % OTHER)
+
     def test_a_strangers_link_decides_nothing(self):
         # Security review: anyone can comment on a public ticket, and a
         # link to any merged pull request held it as shipped.
@@ -261,7 +291,7 @@ class Stale(unittest.TestCase):
     def test_evidence_the_operator_was_asked_about_holds_it_once(self):
         self.fake.routes["/repos/%s/issues/124" % REPO] = {
             "number": 124, "state": "closed", "state_reason": "completed"}
-        asked = comment(brief_check.ask(self.check()), login="loom-station[bot]", bot=True)
+        asked = comment(legacy_ask(self.check()), login="loom-station[bot]", bot=True)
         self.assertIsNone(self.check(comments=[asked]))
 
     def merged_in_other_repo(self, number, body=None):
@@ -293,7 +323,7 @@ class Stale(unittest.TestCase):
                                       "- Other work.\n" % REPO)
         got = self.check()
         self.assertEqual(got.key, "pr-%s#31" % OTHER)
-        self.assertIn("names this ticket", brief_check.ask(got))
+        self.assertIn("names this ticket", got.reason)
         # A Refs line counts even when it also says follow-up.
         self.merged_in_other_repo(32, "Refs %s#206 (a follow-up to the first slice)\n" % REPO)
         self.assertEqual(self.check().key, "pr-%s#32" % OTHER)
@@ -312,7 +342,7 @@ class Stale(unittest.TestCase):
         from bus import text
         self.merged_in_other_repo(31)
         first = self.check()
-        posted = text.scrub_public_body(brief_check.ask(first), REPO, [OTHER], [])
+        posted = text.scrub_public_body(legacy_ask(first), REPO, [OTHER], [])
         self.assertNotIn(OTHER, posted)
         asked = comment(posted, login="loom-station[bot]", bot=True)
         self.assertIsNone(self.check(comments=[asked]))
@@ -326,7 +356,7 @@ class Stale(unittest.TestCase):
     def test_new_evidence_still_holds_a_ticket_asked_about_before(self):
         from bus import text
         self.merged_in_other_repo(31)
-        posted = text.scrub_public_body(brief_check.ask(self.check()), REPO, [OTHER], [])
+        posted = text.scrub_public_body(legacy_ask(self.check()), REPO, [OTHER], [])
         asked = comment(posted, login="loom-station[bot]", bot=True)
         self.merged_in_other_repo(32)
         got = self.check(comments=[asked])
@@ -386,17 +416,19 @@ class StationClaim(unittest.TestCase):
     def labels_put(self, fake):
         return [b["labels"] for m, p, b in fake.writes if m == "PUT" and p.endswith("/labels")]
 
-    def test_a_stale_ticket_goes_back_to_the_queue_with_one_ask(self):
+    def test_a_stale_ticket_goes_back_to_the_queue_for_the_brain(self):
         issue = ticket()
         fake = self.routes(issue)
         held = self.station(fake)._brief_holds(REPO, issue, [])
         self.assertTrue(held)
         self.assertIn(["loom:ticket", "lane:codex", "loom:queued"], self.labels_put(fake))
-        asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
-        self.assertEqual(len(asks), 1)
-        self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
-        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs:human"]}),
+        notes = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Held for the brain", notes[0])
+        self.assertIn("issue #124", notes[0])
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs-brain"]}),
                       fake.writes)
+        self.assertFalse(any("needs:human" in str(b) for _, _, b in fake.writes))
 
     def test_a_health_ticket_with_no_cause_goes_to_the_brain(self):
         issue = ticket(body=HEALTH_INTAKE)
@@ -438,9 +470,9 @@ class StationClaim(unittest.TestCase):
         fake = self.routes(issue)
         fake.routes["/repos/%s/labels" % REPO] = [{"name": "area:billing"}]
         self.assertTrue(self.station(fake)._brief_holds(REPO, issue, []))
-        asks = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
-        self.assertEqual(len(asks), 1)
-        self.assertIn("<!-- loom:stale-brief source-124 -->", asks[0])
+        notes = [b["body"] for m, p, b in fake.writes if m == "POST" and p.endswith("/comments")]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("issue #124", notes[0])
 
     def test_an_area_label_read_that_fails_holds_it_and_writes_nothing(self):
         issue = ticket()

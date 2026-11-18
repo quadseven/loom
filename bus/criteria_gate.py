@@ -36,9 +36,8 @@ A live criterion that names a check Loom can run (`check_of`) gets one: an
 GitHub client, or a read-only `kubectl get ...` / `kubectl rollout status ...`
 (never a secret, never another cluster's credentials). The criterion's other
 backticked or double-quoted strings must appear in the answer. The result is
-kept in the station's state and written to the ticket's status. A criterion
-with no runnable check, a check that keeps failing, and every operator
-criterion send the ticket to needs:human with one ask, once.
+kept in the station's state and written to the ticket's status. The brain
+handles missing or failed checks. Operator criteria get one person ask.
 
 A live wait is not a person's job (loom#2805): a ticket labelled wait:*, or
 whose only unmet criteria are live and that is labelled awaiting-live-check or
@@ -355,17 +354,22 @@ def is_verification_ask(text: Any) -> bool:
     return ASK_OPENING in " ".join(str(text or "").split())
 
 
-def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
-    """The one ask for a shipped ticket Loom cannot verify on its own."""
+def describe_gaps(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
+    """Summarize the unverified criteria and why each lacks evidence."""
     lines = []
     for found, text in list(gaps)[:ASK_SHOWN]:
         why = failed.get(key(text)) or ("an operator action" if found == OPERATOR
                                          else "no check Loom can run")
         lines.append("%s (%s)" % (" ".join(text.split())[:ASK_WIDTH], why))
     more = " and %d more" % (len(gaps) - ASK_SHOWN) if len(gaps) > ASK_SHOWN else ""
-    return ("Kind: decision\n%s, and these have none it can gather: %s%s. "
-            "Check each one, tick it, and close the ticket, or reopen the work if one does "
-            "not hold." % (ASK_OPENING, "; ".join(lines), more))
+    return "; ".join(lines) + more
+
+
+def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
+    """The one ask for the operator actions on a shipped ticket."""
+    return ("Kind: decision\n%s, and these have none it can gather: %s. "
+            "Complete each operator action and record its outcome. Close the ticket "
+            "once every criterion has evidence." % (ASK_OPENING, describe_gaps(gaps, failed)))
 
 
 def lane_ticks(ticket_body: str, pull_body: str) -> List[str]:

@@ -138,7 +138,7 @@ class VerifyEligibilityTest(Base):
 
     def test_adapter_missing_answers_share_the_cap(self):
         with mock.patch.object(self.runner, "_adapter_can_verify", return_value=True), \
-                mock.patch.object(self.runner, "_adapter_human_ask") as ask:
+                mock.patch.object(self.runner, "_hold_adapter_evidence") as ask:
             for _ in range(station.VERIFY_REFUSAL_CAP):
                 self.missing()
         self.assertEqual(ask.call_count, station.VERIFY_REFUSAL_CAP - 1)
@@ -168,7 +168,7 @@ class VerifyEligibilityTest(Base):
 
     def test_replayed_result_does_not_spend_another_attempt(self):
         with mock.patch.object(self.runner, "_adapter_can_verify", return_value=True), \
-                mock.patch.object(self.runner, "_adapter_human_ask", side_effect=GitHubError("ask failed")):
+                mock.patch.object(self.runner, "_hold_adapter_evidence", side_effect=GitHubError("ask failed")):
             for _ in range(station.VERIFY_REFUSAL_CAP):
                 with self.assertRaises(GitHubError):
                     self.missing(name="one-verify-run")

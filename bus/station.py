@@ -4968,8 +4968,8 @@ class Station:
         if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
-            self._adapter_human_ask(repo, number, "no adapter_step was returned",
-                                    reason or "the verify answer did not contain a step")
+            self._hold_adapter_evidence(repo, number, "no adapter_step was returned",
+                                        reason or "the verify answer did not contain a step")
             return True
         if result is not None and set(result) == {"adapter_step"}:
             self._apply_adapter_verify(repo, number, result["adapter_step"])
@@ -5010,8 +5010,8 @@ class Station:
                                  VERIFY_INTERVAL // 3600))
         return True
 
-    def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
-        """Ask once when an adapter verify run could not supply station proof."""
+    def _hold_adapter_evidence(self, repo: str, number: int, step: str, reason: Any) -> None:
+        """Route an adapter verify run's missing evidence."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if needs_human(names):
@@ -5029,15 +5029,11 @@ class Station:
                                                       self._note_text(reason)))
             return
         if self._asked_already(repo, number, body, gaps):
-            # Asked for these same criteria and a brain or operator took the
-            # label off: it is not added back until the criteria change.
+            # Honor a settled verification ask or a trusted wait.
             return
-        ask = ("Kind: decision\nThe station could not verify the prose Live criterion. "
-               "Step tried: %s. Reason: %s. Restate the criterion with a safe "
-               "read-only check or resolve it by hand." %
-               (self._note_text(step), self._note_text(reason)))
-        brain.human(self.gh, repo, number, ask)
-        self._record_ask(repo, number, body)
+        self._hold_live_criteria(repo, issue, "the adapter could not verify the live "
+                                 "criterion (%s: %s)" %
+                                 (self._note_text(step), self._note_text(reason)))
 
     def _apply_adapter_verify(self, repo: str, number: int, answer: Any) -> None:
         """Run a verify lane's proposed adapter step and close only on its own read."""
@@ -5057,7 +5053,8 @@ class Station:
                              live: str) -> Optional[live_proof.Step]:
         """Validate a lane's proposed adapter step without trusting its result."""
         if not isinstance(answer, dict) or set(answer) != {"criterion", "step", "strings"}:
-            self._adapter_human_ask(repo, number, "invalid adapter_step", "the answer shape is invalid")
+            self._hold_adapter_evidence(repo, number, "invalid adapter_step",
+                                        "the answer shape is invalid")
             return None
         strings = answer["strings"]
         if (answer["criterion"] != live or not isinstance(strings, list)
@@ -5065,13 +5062,14 @@ class Station:
                 or not all(isinstance(x, str) and x.isascii() and len(x) <= 120
                            and x.strip() and "\n" not in x and "\r" not in x
                            for x in strings)):
-            self._adapter_human_ask(repo, number, str(answer.get("step")),
-                                    "the step needs this exact Live criterion and one to five "
-                                    "short ASCII strings")
+            self._hold_adapter_evidence(repo, number, str(answer.get("step")),
+                                        "the step needs this exact Live criterion and one to five "
+                                        "short ASCII strings")
             return None
         raw = answer["step"]
         if not isinstance(raw, str) or ":" not in raw:
-            self._adapter_human_ask(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
+            self._hold_adapter_evidence(repo, number, str(raw),
+                                        "the step is not log:<source> or sql:<SELECT>")
             return None
         kind, target = raw.split(":", 1)
         strings = tuple(strings)
@@ -5080,7 +5078,7 @@ class Station:
                                    source=target)
         if kind == "sql":
             return live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
-        self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
+        self._hold_adapter_evidence(repo, number, raw, "the step kind is unsupported")
         return None
 
     def _apply_adapter_step(self, repo: str, number: int, issue: Dict[str, Any],
@@ -5091,7 +5089,7 @@ class Station:
         passed, evidence_text = live_proof.run(step, self._shipped_stamp(repo, issue), sources,
                                                now=self.now)
         if not passed:
-            self._adapter_human_ask(repo, number, raw, evidence_text)
+            self._hold_adapter_evidence(repo, number, raw, evidence_text)
             return
         outcome = live_proof.prove(body, self._shipped_stamp(repo, issue), sources,
                                    now=self.now, passed=self._live_passed(
@@ -6052,7 +6050,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask, unless its
+        one goes back to the queue with needs-brain, unless its
         body and labels state a non-person wait. A labelled ticket stays held
         before remote reads. A stale event wait without the label gets blocked
         once, making its hold visible without another person ask.
@@ -6086,7 +6084,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found, body)
+        return self._apply_brief_hold(repo, number, found)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6109,9 +6107,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
-                          body: str = "") -> bool:
-        """Apply the existing health, area, criteria, split or person-ask hold."""
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Send a brief that needs review back to the brain."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
@@ -6147,8 +6144,13 @@ class Station:
                     "one ticket per platform, with `After:` lines between the "
                     "slices so each slice queues only when the one before it "
                     "has merged."))
-            else:
-                brain.human(self.gh, repo, number, brief_check.ask(found, body))
+            elif found.kind == brief_check.STALE:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                # Keep the evidence note outside the body the stale gate checks.
+                notify.post(self.gh, repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "Check what shipped and rewrite the brief around "
+                    "any remaining work."), notify.HELD)
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
@@ -12722,11 +12724,21 @@ class Station:
             return True
         return False
 
+    def _hold_live_criteria(self, repo: str, issue: Dict[str, Any], reason: str) -> None:
+        """Keep the ticket shipped and give the brain the evidence gap once."""
+        if "needs-brain" in _label_names(issue):
+            return
+        number = int(issue["number"])
+        self._routine(repo, number, "Held for the brain: %s. Review the live criteria "
+                      "and supply a runnable check or record the dependency." % reason)
+        self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": ["needs-brain"]})
+
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
         criterion has no evidence (bus/criteria_gate.py): a live one with a
-        check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to needs:human with one ask, once.
+        check Loom can run gets the check. The brain handles missing or
+        failed checks, and operator actions get one person ask.
         2026-10-22 audit: at least 12 tickets of the private deployment repo
         closed shipped on green CI with live criteria never checked."""
         number = int(issue["number"])
@@ -12734,8 +12746,9 @@ class Station:
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
-        if any(found == criteria_gate.LIVE and self._adapter_can_verify(repo, issue)
-               for found, _ in gaps):
+        actions = [(k, t) for k, t in gaps if k == criteria_gate.OPERATOR]
+        adapter = any(k == criteria_gate.LIVE for k, _ in gaps) and self._adapter_can_verify(repo, issue)
+        if adapter and not actions:
             return True
         failed = self._run_live_checks(repo, number, gaps)
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
@@ -12747,18 +12760,23 @@ class Station:
         names = _label_names(issue)
         if waiting or needs_human(names) or criteria_gate.live_wait(names, gaps, [body]):
             return True
-        if self._asked_already(repo, number, body, gaps) or not self._live_ask_room():
+        if self._asked_already(repo, number, body, gaps):
             return True
         try:
-            brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
+            live = [(k, t) for k, t in gaps if k == criteria_gate.LIVE]
+            if live and not adapter and not criteria_gate.live_wait(names, live, [body]):
+                self._hold_live_criteria(repo, issue, criteria_gate.describe_gaps(live, failed))
+            if not actions or not self._live_ask_room():
+                return True
+            brain.human(self.gh, repo, number, criteria_gate.ask(actions, {}))
         except RateLimited:
             raise
         except (ValueError, GitHubError) as err:
-            _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
+            _say("could not route the unverified criteria of %s#%d: %s" % (repo, number, err))
             return True
         self._record_ask(repo, number, body)
         _say("held done %s#%d for the operator: %d criteria have no evidence"
-             % (repo, number, len(gaps)))
+             % (repo, number, len(actions)))
         return True
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],

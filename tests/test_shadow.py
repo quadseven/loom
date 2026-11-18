@@ -469,7 +469,7 @@ class CallSiteTest(ShadowCase):
         self.assertIn("proof matches every criterion", entry["gates"])
 
     def test_the_station_done_close_leaves_the_ticket_open_and_unlabelled(self):
-        case = tbs.CloseDoneTest("test_a_shipped_ticket_with_no_searchable_live_string_closes")
+        case = tbs.CloseDoneTest()
         case.setUp()
         self.addCleanup(case.doCleanups)
         case.fake.private = False

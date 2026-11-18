@@ -1073,11 +1073,12 @@ merged after it was filed, or when every file its criteria ask to add already
 exists on the default branch. A mention under an Out of scope, Not in scope
 or Follow-ups heading, or on a line that says the ticket was filed for later
 ("filed for", "filed as", "follow-up"), names work not built and does not
-count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
-`needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
-gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
-once: once the operator removes `needs:human`, the same evidence does not hold
-it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+count; a `Refs` or `Part of` line always counts (loom#1856). A merge predating
+a body edit is context for the new brief. A stale ticket goes back to
+`loom:queued` with `needs-brain` and a note naming the evidence so the brain
+can review what shipped and rewrite any remaining work. Explicit event waits
+keep their wait path. Existing person-ask settlements still apply.
+The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
 caller and deny-list layer had shipped weeks before; the lane read "out of
 scope" as "must be absent" and deleted the working deny-list layer, in two
 repos.
@@ -2379,11 +2380,11 @@ Only a 2xx passes a URL check: a redirect is not followed, so a 3xx (a login
 or error page behind it) fails as "redirect not followed", unless every
 expected string names that exact status or Location.
 Each result is kept in the station's `live-checks.json` and written to the
-ticket's status; the answer itself is never written. A criterion with no
-runnable check, a failed check, or an operator criterion sends the ticket to
-`needs:human` with one ask (`Kind: decision`), once, and at most 4 such asks
-an hour. A verify lane's proof that passes a live or operator criterion
-without station evidence is refused.
+ticket's status. Missing or failed checks go to `needs-brain` for a runnable
+check or a recorded dependency. Tickets already waiting on a live event keep
+their wait. Operator criteria get one `needs:human` ask (`Kind: decision`),
+with at most 4 asks an hour. The station refuses a verify lane's proof that
+passes a live or operator criterion without station evidence.
 
 The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
 Each live criterion names at most one step: its log strings searched from the
@@ -2458,14 +2459,14 @@ default branch, drops its `sql` command, and counts the pair only while the
 lender is in `LOOM_LIVE_EVIDENCE_REPOS`. A repo not paired gets no adapter.
 
 When an opted-in repo has a prose Live box with no runnable check, the
-station hands a shipped ticket to a verify lane before asking a person. The
+station hands a shipped ticket to a verify lane. The
 brief lists that adapter's log sources and whether its SQL route is available.
 The lane may return one `adapter_step`: `log:<source>` with required strings,
 or `sql:<SELECT ...>` with strings that must occur in the rows. The station
 validates and runs the step through the repo adapter itself; lane prose never
-counts as evidence. A missing step or a failed station read raises one
-`loom:human` ask naming the attempted step and reason. Repos without an opted-in
-adapter keep the existing ask path.
+counts as evidence. A missing step or a failed station read goes to
+`needs-brain` with the attempted step and reason. A ticket already waiting on
+a live event keeps its wait.
 
 ### The evidence close
 

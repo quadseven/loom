@@ -13025,7 +13025,7 @@ class CloseDoneTest(Base):
     line names nothing a log search can find closes; one that names a string
     stays for a verify run."""
 
-    def test_a_shipped_ticket_with_no_searchable_live_string_closes(self):
+    def test_a_shipped_ticket_with_no_searchable_live_string_goes_to_the_brain(self):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
@@ -13040,10 +13040,10 @@ class CloseDoneTest(Base):
                       "- [ ] A test passes\n", state="shipped")
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        # A Live line with nothing to search is still a live criterion with no
-        # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
+        # A Live line with nothing to search goes to the brain for a check.
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("needs:human", self.fake.names(1))
+        self.assertIn("needs-brain", self.fake.names(1))
+        self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only
