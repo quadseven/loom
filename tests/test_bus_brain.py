@@ -5176,8 +5176,9 @@ class HumanAndRefsTests(unittest.TestCase):
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertIn("closes as completed when that ticket is verified", fake.calls[5][2]["body"])
-        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
-        self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "POST", "DELETE"])
+        self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
+        self.assertTrue(fake.calls[7][1].endswith("/labels/loom%3Atriage"))
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     def test_brief_refs_refuses_a_ticket_or_closed_original(self):
@@ -5300,7 +5301,7 @@ class HumanAndRefsTests(unittest.TestCase):
                 self.assertTrue(fake.calls[3][2]["body"].endswith(
                     "\n\nRewritten from issue 6.\n\nPart of #2\n"))
                 self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
-                self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+                self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
                 self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
                 self.assertIn("#6 is rewritten as a new ticket", err.getvalue())
 

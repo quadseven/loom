@@ -9,7 +9,7 @@ import os
 import sys
 import unittest
 import unittest.mock
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -91,6 +91,10 @@ class Repo:
                                           "user": {"login": "station-bot"}})
             return 201, {}, json.dumps({"html_url": url}).encode()
         if sub.startswith("labels"):
+            if method == "DELETE":
+                name = unquote(sub.split("/", 1)[1])
+                issue["labels"] = [label for label in issue["labels"] if label["name"] != name]
+                return 200, {}, b"[]"
             have = self.names(number) if method == "POST" else []
             issue["labels"] = [{"name": x} for x in have + [
                 x for x in (data or {}).get("labels", []) if x not in have]]
@@ -126,6 +130,15 @@ class SourceTests(unittest.TestCase):
     def close(self, reason="completed"):
         note = "No longer needed." if reason == "not_planned" else None
         return brain.close(self.gh, REPO, TICKET, reason, note, env=ENV)
+
+    def test_filing_a_rewrite_removes_ticket_and_state_labels_from_the_source(self):
+        self.repo.add(SOURCE, ["loom:ticket", "loom:shipped", "loom:triage", "bug"], "Original")
+        source = self.repo.issues[SOURCE]
+        with unittest.mock.patch.object(brain, "_file_ticket", return_value={"number": TICKET}):
+            brain._brief_issue(self.gh, REPO, 2, "Rewrite", ticket_body(), None, source,
+                               "the source is locked")
+        self.assertCountEqual(self.repo.names(SOURCE), ["loom:rewritten", "bug"])
+        self.assertIn("Rewritten as ticket #%d" % TICKET, self.repo.said(SOURCE)[0])
 
     def test_rewritten_from_reads_the_line_and_the_older_refs_line(self):
         self.assertEqual(brain.rewritten_from(ticket_body()), SOURCE)

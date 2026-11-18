@@ -209,6 +209,8 @@ def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, 
         for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
                                 % (repo, quote(lane, safe=""))):
             reason = _rejection_reason(item, lane)
+            if reason is None and brain.has_open_rewrite(gh, repo, item):
+                reason = "has an open rewrite ticket"
             if reason is None:
                 found.append((str(item.get("created_at") or ""), repo, item))
             elif isinstance(item, dict) and isinstance(item.get("number"), int):
