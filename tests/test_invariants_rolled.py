@@ -6,6 +6,7 @@ import re
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import invariants, station  # noqa: E402
 from bus.invariants import Facts, Ref  # noqa: E402
+from dashboard import results  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
 from bus.github import GitHubError  # noqa: E402
 from test_invariants import (  # noqa: E402
@@ -96,6 +98,19 @@ class RolledKindTest(unittest.TestCase):
 
     def test_a_cleared_kind_says_none_then_closes_after_the_clear_wait_and_reopens(self):
         self.clear_and_return()
+
+    def test_close_counts_skip_trackers_and_include_rewritten_work(self):
+        self.file(self.stalled([self.pull(201)]))
+        (tracker,) = self.gh.issues.values()
+        closed_at = stamp(T0)
+        rows = [dict(tracker, closed_at=closed_at, state_reason="not_planned"),
+                {"closed_at": closed_at, "state_reason": "not_planned"},
+                {"closed_at": closed_at, "state_reason": "completed",
+                 "body": self.legacy(99)["body"] + "\n\n## What\nRepair the issue."}]
+        data = results.build_results({"tickets": {REPO: rows}}, datetime.fromtimestamp(T0, timezone.utc))
+        counts = {row["name"]: row["values"] for row in data["rows"]}
+        self.assertEqual(counts["Tickets closed as not planned"], {"day": 1, "week": 1, "month": 1})
+        self.assertEqual(counts["Tickets closed as done"], {"day": 1, "week": 1, "month": 1})
 
     def clear_and_return(self):
         """Clear, wait, close, return: the tracking issue's number and when."""
