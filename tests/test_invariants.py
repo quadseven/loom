@@ -1549,6 +1549,24 @@ class InvariantTest(unittest.TestCase):
                 runs.insert(0, Run("zen", True, T0 - 9 * 3600, ""))
                 self.assertEqual(invariants.lane_failing_streak(Facts(T0, runs=runs)), [])
 
+    def test_runner_base_stops_do_not_count_as_lane_runs(self):
+        lane = "free-gemma"
+        reasons = (
+            "[transient] the base check of owner/app is red on this runner at "
+            "f248aa1f5582; another lane takes it",
+            "[transient] this runner image cannot run the base check of owner/app "
+            "(a tool it needs is missing); another lane takes it",
+        )
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                runs = [Run(lane, False, T0 - i * 60, reason) for i in range(6)]
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+                runs.extend(Run(lane, False, T0 - i * 60, "[transient] agent exited 1")
+                            for i in range(6, 10))
+                self.assertEqual(invariants.lane_no_success(Facts(T0, runs=runs)), [])
+                runs.append(Run(lane, True, T0 - 3600, ""))
+                self.assertEqual(invariants.lane_failing_streak(Facts(T0, runs=runs)), [])
+
     def test_a_lane_failing_its_last_runs_after_an_earlier_success_is_a_breach(self):
         runs = [Run("zen", True, T0 - 9 * 3600, "")]
         runs += [Run("zen", False, T0 - i * 600, "[transient] agent exited 1") for i in range(5)]
