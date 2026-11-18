@@ -235,8 +235,6 @@ NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
 HANDOFF_LABEL = labels.HANDOFF
 WAIT_SUPERSEDED = "wait:superseded"
 WAIT_BLOCKED = "wait:blocked"
-# What bus.brain writes on an issue it rewrote as a new ticket (_filed_rewrite).
-REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 # The states in which a lane has taken the ticket: its no-lane wait is over.
 LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
 
@@ -2973,7 +2971,7 @@ class Factory:
                  if n != number and tickets.rewritten_source(t.get("body")) == number]
         if "loom:rewritten" in _labels(ticket):
             found += [int(m.group(1)) for c in comments()
-                      for m in REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
+                      for m in brain.REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
                       if int(m.group(1)) != number]
         return max(found) if found else None
 
@@ -5391,6 +5389,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if brain.has_open_rewrite(self.gh, repo, issue, sorted(self.trusted)):
+            return "%s has an open rewrite ticket" % ref
         person = self._human_holder(repo, issue)
         if person:
             return "%s is claimed by %s" % (ref, person)

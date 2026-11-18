@@ -397,9 +397,9 @@ RESTATE_PER_HOUR = 4
 # drains over a few passes instead of one burst of API writes.
 CLOSE_DONE_PER_PASS = 25
 # A ticket carrying one of these stays open for the brain whatever its state.
-# An open loom:rewritten source whose ticket is closed is settled at most
-# once an hour, this many a run (settle_orphan_sources); a source's ticket is
-# read from its rewrite comment once and kept in SOURCES_FILE.
+# Rewritten sources are settled or have stale gate asks withdrawn at most
+# once an hour, this many a run. The ticket number from the rewrite comment
+# is kept in SOURCES_FILE.
 SETTLE_EVERY = 3600
 SETTLE_PER_RUN = 25
 REPO_ACCESS_EVERY = 3600
@@ -424,7 +424,6 @@ LIVE_ASKS_PER_HOUR = 4
 # verification ask was made for. The ask is made once per set (loom#2805).
 LIVE_ASKED_KEY = "_asked"
 SETTLE_LANDED = ("loom:merged", "loom:shipped", "loom:verified")
-REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 CLOSE_DONE_HOLDS = ("loom:regression", "loom:urgent", RUNAWAY)
 CLOSE_DONE_LABEL = "force-close"
 RESTATE_KEY = "_live_station"
@@ -3275,6 +3274,9 @@ class Station:
             return
         repo, number = m.group(1), int(m.group(2))
         issue = self._issue(repo, number)
+        if self._has_open_rewrite(repo, issue):
+            os.remove(path)
+            return
         names = _label_names(issue)
         if RUNNING in names:
             os.replace(path, path[:-len(".claiming")] + ".md")
@@ -3831,6 +3833,8 @@ class Station:
 
     def _add_claim_candidate(self, by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]],
                              free: List[str], repo: str, issue: Dict[str, Any]) -> None:
+        if self._has_open_rewrite(repo, issue):
+            return
         lane = _lane_of(issue)
         if lane in by_lane:
             by_lane[lane].append((repo, issue))
@@ -3856,11 +3860,11 @@ class Station:
 
     # -- verify runs ------------------------------------------------------
     def _tickets_open(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open tickets filed by a briefing login."""
+        """The repo's open tickets filed by a briefing login and still in use."""
         found = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
         return [i for i in found if isinstance(i, dict) and "pull_request" not in i
                 and tickets.brief_author_trusted(i, self.s.authors, self.s.briefers)
-                and not self._owned_elsewhere(repo, i)]
+                and not self._owned_elsewhere(repo, i) and not self._has_open_rewrite(repo, i)]
 
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]],
                       counts: Dict[Tuple[str, int], int]) -> set:
@@ -5707,7 +5711,8 @@ class Station:
         if not self._still_ours(fresh, labelled_lane or lane):
             _say("%s#%s changed before the claim; leaving it" % (repo, issue["number"]))
             return False
-        if self._owned_elsewhere(repo, fresh) or self._human_held(repo, fresh):
+        if (self._owned_elsewhere(repo, fresh) or self._human_held(repo, fresh)
+                or self._has_open_rewrite(repo, fresh)):
             return False
         if (fresh.get("body") or "") != (issue.get("body") or "") \
                 or fresh.get("updated_at") != issue.get("updated_at"):
@@ -6043,6 +6048,8 @@ class Station:
         A read the check needs that fails holds the ticket for the next pass.
         Otherwise a regression or revert ticket is checked for its cause only: its merged
         pull request is why it exists."""
+        if self._has_open_rewrite(repo, issue):
+            return True
         number = int(issue["number"])
         names = _label_names(issue)
         body = str(issue.get("body") or "")
@@ -12774,7 +12781,8 @@ class Station:
         return True
 
     def settle_orphan_sources(self) -> None:
-        """Settle each open loom:rewritten issue whose ticket is closed. A
+        """Withdraw criteria-gate asks on sources of open tickets, and
+        settle open loom:rewritten issues whose tickets are closed. A
         source was settled only when its ticket was verified or closed
         through brain.close, so a ticket the done close or a person closed
         left its source open: 87 such sources counted as open backlog on
@@ -12820,13 +12828,40 @@ class Station:
         for source in sources:
             if done >= left:
                 break
-            key = "%s#%d" % (repo, int(source["number"]))
+            number = int(source["number"])
+            key = "%s#%d" % (repo, number)
             if key not in pairs:
-                pairs[key] = self._rewritten_as(repo, int(source["number"]))
+                pairs[key] = brain.rewritten_as(
+                    self._paginate("/repos/%s/issues/%d/comments" % (repo, number)), self.s.authors)
             ticket = pairs[key]
-            if isinstance(ticket, int) and ticket and ticket not in still_open:
+            if not isinstance(ticket, int) or not ticket or ticket == number:
+                continue
+            if ticket in still_open:
+                done += self._withdraw_source_gate_ask(repo, source, ticket)
+            else:
                 done += self._settle_source_of(repo, key, ticket, pairs)
         return done
+
+    def _withdraw_source_gate_ask(self, repo: str, source: Dict[str, Any], ticket: int) -> bool:
+        """Withdraw the source's latest trusted ask if the criteria gate made it."""
+        labels = set(_label_names(source)) & {HUMAN, NEEDS_HUMAN}
+        if not labels:
+            return False
+        number = int(source["number"])
+        comments = brain.trusted_comments(
+            self._paginate("/repos/%s/issues/%d/comments" % (repo, number)), self.s.authors)
+        bodies = [str(c.get("body") or "") for c in comments]
+        ask = next((b for b in reversed(bodies) if b.startswith(HUMAN_MARKER)), "")
+        if not criteria_gate.is_verification_ask(ask):
+            return False
+        note = ("Verification ask withdrawn. Ticket #%d is open and carries the work "
+                "from this source issue." % ticket)
+        if note not in bodies:
+            notify.post(self.gh, repo, number, note, notify.SOURCE)
+        for label in sorted(labels):
+            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
+                         % (repo, number, quote(label, safe="")), ok=(404,))
+        return True
 
     def _settle_source_of(self, repo: str, key: str, ticket: int,
                           pairs: Dict[str, Any]) -> int:
@@ -13733,19 +13768,8 @@ class Station:
         _say("settle-claimed: closed %s#%d, merged as PR %s" % (repo, number, shown))
         return 1
 
-    def _rewritten_as(self, repo: str, number: int) -> int:
-        """The ticket the newest rewrite comment by a briefing login names, 0
-        for none: anyone may comment on a public issue."""
-        authors = {author.lower() for author in self.s.authors}
-        found = 0
-        for comment in self._paginate("/repos/%s/issues/%d/comments" % (repo, number)):
-            if not isinstance(comment, dict) or tickets._login(comment.get("user")) not in authors:
-                continue
-            body = str(comment.get("body") or "")
-            match = REWRITTEN_AS_RE.search(body)
-            if brain.TRIAGE_MARKER in body and match:
-                found = int(match.group(1))
-        return found
+    def _has_open_rewrite(self, repo: str, issue: Dict[str, Any]) -> bool:
+        return brain.has_open_rewrite(self.gh, repo, issue, self.s.authors)
 
     @staticmethod
     def _done_reason(issue: Dict[str, Any], earliest: Optional[datetime] = None) -> str:
