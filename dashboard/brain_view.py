@@ -234,6 +234,7 @@ def _build_lane_cards(lanes, tickets, pull_requests, comments, now):
         ticket = ticket_by_lane.get(name)
         lane_cards.append({"lane": name, "holder": "muse" if name == "muse" else "lane machine",
                            "heartbeat": lane.get("heartbeat"), "ticket": ticket,
+                           "state": lane.get("state"), "reason": lane.get("reason"),
                            "age": _age(lane.get("heartbeat"), now),
                            "run_started": claim_times.get(_ticket_key(ticket)),
                            "claim": next((label for label in (ticket or {}).get("labels", [])
@@ -307,6 +308,8 @@ def _render_lane_cards(lane_rows):
                 doing += ' / run started %s' % esc(lane["run_started"])
         else:
             doing = "idle"
+        if lane.get("reason"):
+            doing += " / " + esc(lane["reason"])
         if lane.get("claim"):
             doing += " / claimed by " + esc(lane["claim"].partition(":")[2])
         pr = lane.get("pull_request")
@@ -314,7 +317,7 @@ def _render_lane_cards(lane_rows):
                    esc(str(pr.get("html_url") or "#"))) if pr else ""
         lanes.append('<article class="card"><h3>%s</h3><p>%s / %s</p><p>%s%s</p><p>%s</p></article>' % (
             esc(lane.get("lane") or "lane"), esc(lane.get("holder") or "brain"),
-            esc("busy" if ticket else "idle"), doing, pr_link,
+            esc(lane.get("state") or ("busy" if ticket else "idle")), doing, pr_link,
             esc("last heartbeat " + lane["age"])))
     lane_html = "".join(lanes) or '<p class="empty-state">No lane heartbeats have been recorded.</p>'
     return lane_html

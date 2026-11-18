@@ -312,10 +312,13 @@ def _status(lanes: list[str], kinds: list[str], windows: list[dict[str, Any]]) -
 
 
 def _provider(name: str, rows: list[dict[str, Any]], holds: dict[str, str],
-              activity: dict[str, dict[str, Any]], models: dict[str, str], now: datetime) -> dict[str, Any]:
+              activity: dict[str, dict[str, Any]], models: dict[str, str], now: datetime,
+              published: dict[str, dict[str, str]]) -> dict[str, Any]:
     lanes = _unique(lane for row in rows for lane in row.get("lanes") or [])
     windows = [read_window(row, now) for row in rows]
-    states = {lane: lane_state(holds.get(lane, ""), now) for lane in lanes}
+    kinds = {"serving": "free", "limited": "held", "parked": "down", "off": "down"}
+    states = {lane: {"kind": kinds[published[lane]["state"]], "why": published[lane]["reason"]}
+              if lane in published else lane_state(holds.get(lane, ""), now) for lane in lanes}
     status, rank = _status(lanes, [s["kind"] for s in states.values()], windows)
     read = [w["collected"] for w in windows if w["collected"]]
     return {"name": name, "lanes": lanes, "windows": windows, "status": status, "rank": rank,
@@ -391,7 +394,8 @@ def all_holds(rows: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] | None = None,
-          models: dict[str, str] | None = None) -> dict[str, Any]:
+          models: dict[str, str] | None = None,
+          lane_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The Usage view's data from the stored readings: providers worst first,
     the asks for the operator, and how fresh the snapshot is."""
     rows = [row for row in rows if isinstance(row, dict)]
@@ -400,7 +404,8 @@ def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] |
     for row in rows:
         by_name.setdefault(str(row.get("provider") or "unknown"), []).append(row)
     activity = lane_activity(prs or [], now)
-    providers = sorted((_provider(name, items, holds, activity, models or {}, now)
+    published = {row["lane"]: row for row in lane_rows or [] if "state" in row}
+    providers = sorted((_provider(name, items, holds, activity, models or {}, now, published)
                         for name, items in by_name.items()),
                        key=lambda p: (p["rank"], -p["top"], p["name"]))
     newest = max((p["read"] for p in providers if p["read"]), default=None)

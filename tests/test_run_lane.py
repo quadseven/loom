@@ -6018,25 +6018,24 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         # keeps billing a spent model with no trace of why.
         reset = int(time.time()) + 18000
         self.write_provider_limit("opencode-go-2", limit_name="5-hour", retry_after=str(reset))
-        empty = self.loom / "no-catalogue"
-        empty.mkdir()
         script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
                                        "limit_group", "slot_model", "free_model", "setting_var",
                                        "lane_var", "write_beat", "utc", "record_model_limit",
                                        "model_limit_until", "ladder_reason", "heartbeat",
                                        "catalogue_cmd", "limited_models_json") + (
             'SLOT=opencode-go-2 LANE=opencode-go MODEL=opencode-go/mimo-v2.6-flash\n'
-            f'LOOM_ROOT="{empty}"\n'
+            'python3() { [ "$3" != bus.catalogue ] && command python3 "$@"; }\n'
             'MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"\n'
             'LIMIT_WHY="the provider 5-hour limit (429 GoUsageLimitError)"\n'
             'hold_provider_limit\n')
         env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go-2",
                "LANE": "opencode-go"}
-        result = subprocess.run(["bash", "-c", script, "bash"], env=env, cwd=empty,
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("bus.catalogue record-limit failed", result.stderr)
         self.assertIn("for opencode-go/mimo-v2.6-flash", result.stderr)
+        self.assertEqual(self.beat("opencode-go-2")["state"], "limited")
 
     # A sandbox that runs what it is given: the seatbelt itself is another
     # lane's subject (tests above), and this run is about the class an expired
@@ -6319,6 +6318,7 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((usage / "anthropic-2.json").read_text())
         self.assertFalse(beat["available"])
+        self.assertEqual(beat.get("state"), "parked")
         self.assertIn("remaining $3.50 is under the floor of $5.00", beat["reason"])
         self.assertFalse(any(c.startswith(("claude ", "aws ")) for c in self.calls()))
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())

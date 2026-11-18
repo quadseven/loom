@@ -7413,10 +7413,13 @@ class SilentLaneTest(Base):
         self.assertEqual(st._factory().no_lane_since, {key: start})
         st._record_waits({key: "waits for #5 to merge (After:)"})
         self.assertEqual(st._no_lane_since(), {})
-        st._record_waits({key: "no free lane in tier medium"})
+        st._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
         self.assertEqual(st._no_lane_since(), {key: st.now})
         st.now += 600
-        st._record_waits({}, settled={key})
+        with mock.patch.object(station, "_say") as say:
+            st._record_waits({}, settled={key})
+            st._record_waits({}, settled={key})
+        say.assert_called_once_with("%s model wait ended" % key)
         self.assertEqual(st._no_lane_since(), {})
         self.assertEqual(st._invariant_waits(), [])
 
@@ -10173,8 +10176,36 @@ class StatusTest(Base):
         self.assertEqual(self.fake.created[0]["labels"], ["loom:lanes"])
         body = self.fake.posts[0]
         self.assertTrue(body.startswith("<!-- loom:lanes v1 -->\nUpdated "))
-        self.assertIn("| codex | yes |", body)
-        self.assertIn("| agy | no | - |", body)
+        self.assertIn("| codex | serving |", body)
+        self.assertIn("| agy | off | - |", body)
+
+    def test_a_never_paid_lane_and_a_stale_lane_explain_why_they_take_no_work(self):
+        self.settings.anthropic = spend.Budget(usd=0)
+        self.heartbeat("anthropic")
+        self.heartbeat("codex-4", age=station.HEARTBEAT_MAX_AGE + 60)
+        self.go()
+        body = self.fake.posts[0]
+        self.assertRegex(body, r"\| anthropic \| parked \| [^|]+ \| No Anthropic budget \|")
+        self.assertRegex(body, r"\| codex-4 \| off \| [^|]+ \| Heartbeat is stale \|")
+
+    def test_launchd_station_prunes_only_stale_heartbeats_without_jobs(self):
+        self.heartbeat("codex-4", age=3600)
+        self.heartbeat("codex-5", age=3600)
+        self.heartbeat("free-openrouter", age=3600)
+        self.heartbeat("muse", age=3600)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        usage = os.path.join(self.home, "state", "usage")
+        for name in ("codex-4", "codex-5", "free-openrouter", "muse"):
+            os.utime(os.path.join(usage, name + ".json"), (st.now - 3600, st.now - 3600))
+        jobs = "PID\tStatus\tLabel\n%d\t0\tcom.loom.station\n-\t0\tcom.loom.codex-5\n" % os.getpid()
+        with mock.patch.object(station.sys, "platform", "darwin"), \
+                mock.patch.object(station.subprocess, "run", return_value=mock.Mock(stdout=jobs)), \
+                mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-openrouter"}):
+            st._refresh_lane_jobs()
+        self.assertFalse(os.path.exists(os.path.join(usage, "codex-4.json")))
+        for name in ("codex", "codex-5", "free-openrouter", "muse"):
+            self.assertTrue(os.path.isfile(os.path.join(usage, name + ".json")))
+        self.assertEqual(st._lane_state("codex-4").reason, "No lane job")
 
     def test_existing_issue_is_reused(self):
         self.fake.lanes_issues = [{"number": 1}]
@@ -10194,7 +10225,7 @@ class StatusTest(Base):
         self.heartbeat("codex", available=False)
         self.go(30)
         self.assertEqual(len(self.fake.edits), 1)
-        self.assertIn("| codex | no |", self.fake.edits[0])
+        self.assertIn("| codex | off |", self.fake.edits[0])
 
     def test_republished_after_an_hour(self):
         self.go()
@@ -10330,7 +10361,7 @@ class SpendTest(Base):
         self.assertEqual(self.listing("anthropic-4"), [])
         self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
                       self.fake.posts[0])
-        self.assertIn("| anthropic-4 | no |", self.fake.posts[0])
+        self.assertIn("| anthropic-4 | parked |", self.fake.posts[0])
         # Above the floor, the same heartbeat takes work again.
         self.settings.anthropic.floor = 3.0
         self.station(time.time()).run_pass()
@@ -12039,7 +12070,7 @@ class BrainTest(Base):
     def test_a_fresh_brain_is_published_and_quiet(self):
         self.tick(ok_age=60)
         self.go()
-        self.assertIn("| brain | yes |", self.fake.posts[0])
+        self.assertIn("| brain | serving |", self.fake.posts[0])
         self.assertEqual(self.sent, [])
 
     def test_a_stale_brain_is_told_once_then_its_return_once(self):
@@ -12049,7 +12080,7 @@ class BrainTest(Base):
         self.assertEqual(len(self.sent), 1)
         self.assertIn("Urgent: the Loom brain has not finished a tick since", self.sent[0])
         self.assertIn("failed (exit 124)", self.sent[0])
-        self.assertIn("| brain | no |", self.fake.posts[0])
+        self.assertIn("| brain | off |", self.fake.posts[0])
         self.tick(ok_age=0)
         self.go(120)
         self.go(180)

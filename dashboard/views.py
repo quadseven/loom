@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from urllib.parse import quote
 
-from bus import factory
+from bus import factory, lane_state as lane_states
 from bus.friction import clean_text as _clean_text, friction_lines
 
 METRICS_MARKER = "<!-- loom:metrics v1 -->"
@@ -409,6 +409,11 @@ def format_heartbeat(raw):
     return "heartbeat " + raw
 
 
+def lane_heartbeat(lane):
+    at = lane.get("heartbeat")
+    return "heartbeat " + at if "state" in lane and at and at != "-" else format_heartbeat(at)
+
+
 def format_age(dt, now=None):
     if not dt:
         return None
@@ -438,26 +443,28 @@ def format_age(dt, now=None):
 
 
 def parse_lane_rows(body):
-    rows = []
-    for line in str(body or "").splitlines():
-        match = re.match(r"\|\s*([^|]+)\|\s*(yes|no)\s*\|\s*([^|]+)\|", line, re.I)
-        if match and match.group(1).strip().lower() != "lane":
-            rows.append({"lane": match.group(1).strip(), "available": match.group(2).lower() == "yes",
-                         "heartbeat": match.group(3).strip()})
-    return rows
+    return lane_states.published_rows(str(body or ""))
 
 
 # Status words a reader sees, by the card's state class. The classes stay
 # busy/free/held (loom.css colors them); the words say what each means.
 LANE_STATES = (("held", "Held", "not taking work"),
+               ("off", "Off", "not taking work"),
+               ("parked", "Parked", "not taking work"),
+               ("limited", "Limited", "not taking work"),
                ("busy", "Working", "on a ticket now"),
-               ("free", "Ready", "waiting for work"))
+               ("free", "Ready", "waiting for work"),
+               ("serving", "Serving", "accepting work"))
 LANE_STATE_WORD = {key: word.lower() for key, word, _ in LANE_STATES}
+LANE_STATE_STYLE = {"off": "held", "parked": "held", "limited": "held", "serving": "free"}
+LANE_HELD = ("held", "off", "parked", "limited")
 TIER_ORDER = ("easy", "medium", "hard", "frontier", "unknown")
 
 
 def lane_state(lane):
-    """busy (on a ticket), free (available, no ticket) or held."""
+    """The published state, or the display state of an older status row."""
+    if "state" in lane:
+        return lane["state"]
     if lane.get("ticket"):
         return "busy"
     return "free" if lane.get("available") else "held"
@@ -486,8 +493,12 @@ def _lane_card(lane):
         doing = '<a href="%s">%s %s</a>' % (
             _ticket_href(ticket["repo"], ticket["number"]), esc(_short_ref(ticket["repo"], ticket["number"])),
             esc(str(ticket.get("title") or "ticket")))
-    elif state == "held":
+        if state in LANE_HELD:
+            doing += " / " + esc(_hold_text(lane))
+    elif state in LANE_HELD:
         doing = esc(_hold_text(lane))
+    elif state == "serving":
+        doing = esc(lane["reason"])
     else:
         doing = "waiting for work"
     quota = lane.get("quota")
@@ -503,8 +514,8 @@ def _lane_card(lane):
             '<p class="lane-doing">%s</p>'
             '<div class="lane-facts"><span class="lane-model">%s</span>'
             '<span class="lane-beat">%s</span><span class="lane-quota">%s</span></div></article>') % (
-        state, esc(lane["lane"]), LANE_STATE_WORD[state], doing,
-        esc(lane.get("model") or "model not reported"), esc(format_heartbeat(lane.get("heartbeat"))), quota_html)
+        LANE_STATE_STYLE.get(state, state), esc(lane["lane"]), LANE_STATE_WORD[state], doing,
+        esc(lane.get("model") or "model not reported"), esc(lane_heartbeat(lane)), quota_html)
 
 
 def _model_counts(counts):
@@ -553,7 +564,7 @@ def _lane_chip(name, states):
     state = states.get(name)
     word = LANE_STATE_WORD.get(state, "no status")
     return '<li class="lane-chip lane-%s" title="%s"><i class="lane-dot"></i>%s<span class="visually-hidden"> (%s)</span></li>' % (
-        state or "unknown", word, html.escape(name), word)
+        LANE_STATE_STYLE.get(state, state or "unknown"), word, html.escape(name), word)
 
 
 def _factory_tables(states=None):
@@ -582,9 +593,11 @@ def _lane_summary(lanes, share):
     Anthropic share against its cap, and the held lanes grouped by reason."""
     esc = html.escape
     counts = {key: sum(1 for lane in lanes if lane_state(lane) == key) for key, _, _ in LANE_STATES}
+    legacy = not any(counts[state] for state in lane_states.STATES)
     tiles = ['<li class="summary-tile lane-%s"><span class="summary-num">%d</span>'
              '<span class="summary-word"><i class="lane-dot"></i>%s</span><small>%s</small></li>' % (
-                 key, counts[key], word, sub) for key, word, sub in LANE_STATES]
+                 LANE_STATE_STYLE.get(key, key), counts[key], word, sub)
+             for key, word, sub in LANE_STATES if counts[key] or (legacy and key not in lane_states.STATES)]
     if share is None:
         share_html = '<small>missing: no lane run totals were available</small>'
         number = "-"
@@ -596,7 +609,8 @@ def _lane_summary(lanes, share):
                  '<span class="summary-word">Anthropic share</span>%s</li>' % (
                      " over" if share is not None and share > 50 else "", number, share_html))
     held = {}
-    for lane in sorted((l for l in lanes if lane_state(l) == "held"), key=lambda l: _lane_order(l["lane"])):
+    for lane in sorted((l for l in lanes if lane_state(l) in LANE_HELD),
+                       key=lambda l: _lane_order(l["lane"])):
         held.setdefault(_hold_text(lane), []).append(lane["lane"])
     if not lanes:
         attention = ""  # Lanes now says the status comment is missing.
@@ -660,9 +674,10 @@ def render_lanes(data):
     for key, word, sub in LANE_STATES:
         members = sorted((lane for lane in lanes if states[lane["lane"]] == key), key=lambda l: _lane_order(l["lane"]))
         if members:
+            style = LANE_STATE_STYLE.get(key, key)
             groups.append('<div class="lane-group lane-group-%s"><h3><i class="lane-dot lane-%s"></i>%s '
                           '<span class="machine-fact">%d, %s</span></h3><div class="lane-grid">%s</div></div>' % (
-                              key, key, word, len(members), sub, "".join(_lane_card(lane) for lane in members)))
+                              style, style, word, len(members), sub, "".join(_lane_card(lane) for lane in members)))
     if not lanes:
         groups.append('<p class="empty-state">Lane status is missing: no loom:lanes comment was found.</p>')
     parts.append(_section("now", "Lanes now",

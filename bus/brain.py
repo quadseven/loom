@@ -25,7 +25,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
                      strip_body as strip_status_body)
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
-from . import lane_markers, tick_clock
+from . import lane_markers, lane_state, tick_clock
 from . import home_repo
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -8622,7 +8622,7 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
     body = _lane_status(gh, lanes_repo, authors)
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    rows = [row["lane"] for row in lane_state.published_rows(body) if row["available"]]
     scorecard = globals().get("scorecard")
     if scorecard is None:
         from . import scorecard

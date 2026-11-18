@@ -1432,7 +1432,8 @@ def _dispatch_usage(handler, state):
     payload = state.response() if hasattr(state, "response") else {}
     lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
     models = {lane: model for lane in lanes for model in [bus_brain.lane_model(lane)] if model}
-    data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
+    data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models,
+                             lane_rows=_merge_lane_rows(payload.get("lanes", [])))
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
                                   status="stale" if payload.get("stale") else "live"))
 
@@ -1621,7 +1622,7 @@ def _merge_lane_rows(comments):
         if lane_name not in by_lane:
             lane_rows.append(remote)
             by_lane[lane_name] = remote
-        elif remote.get("available"):
+        elif "state" not in by_lane[lane_name] and remote.get("available"):
             by_lane[lane_name]["available"] = True
     return lane_rows
 
@@ -1698,7 +1699,7 @@ def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
         age_str = views.format_age(model_info["time"])
         model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
                          if age_str else model_info["model"])
-    reason = _hold_reason(lane_name, usage_records)
+    reason = item.get("reason") if "state" in item else _hold_reason(lane_name, usage_records)
     if item["available"] and reason == "no reason":
         reason = "available"
     item.update({

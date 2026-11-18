@@ -415,15 +415,11 @@ lane_setting() {
 # minutes, while the beat said available.
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
 write_beat() {
-  local slot="$1" reason retry="" models
+  local slot="$1" reason models
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
-  [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
   models="$(limited_models_json "$slot")"
-  mkdir -p "$LOOM_HOME/state/usage"
-  printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}}\n' \
-    "$slot" "$(date +%s)" "$2" "$reason" "$retry" "$models" > "$LOOM_HOME/state/usage/$slot.json.tmp" &&
-    mv "$LOOM_HOME/state/usage/$slot.json.tmp" "$LOOM_HOME/state/usage/$slot.json"
+  printf '%s' "$reason" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.lane_state "$slot" "$2" "${4:-}" "$models"
 }
 # The slot's model limits that have not lifted, as JSON object members
 # ("model": epoch, ...), from its MODEL_LIMIT_FILE rows; only names a model

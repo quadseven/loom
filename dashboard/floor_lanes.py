@@ -59,18 +59,21 @@ def _ticket_line(row: dict[str, Any], fixing: set[tuple[str, int]]) -> str:
 def lane_card(lane: dict[str, Any], own: list[dict[str, Any]], fixing: set[tuple[str, int]]) -> str:
     """One lane: its tickets with their activity, or idle (able or held)."""
     esc = html.escape
-    state = "busy" if own else views.lane_state(lane)
+    state = lane.get("state") or ("busy" if own else views.lane_state(lane))
     if own:
         body = '<ul class="lane-tickets">%s</ul>' % "".join(_ticket_line(row, fixing) for row in own)
-    elif state == "held":
-        body = '<p class="lane-doing">idle, held: %s</p>' % esc(views._hold_text(lane))
+        if state in views.LANE_HELD:
+            body += '<p class="lane-doing">%s</p>' % esc(views._hold_text(lane))
+    elif state in views.LANE_HELD:
+        body = '<p class="lane-doing">idle%s: %s</p>' % (
+            ", held" if state == "held" else "", esc(views._hold_text(lane)))
     else:
         body = '<p class="lane-doing">idle, able to take work</p>'
     return ('<article class="card lane-card lane-%s"><div class="lane-head"><i class="lane-dot"></i>'
             '<strong>%s</strong><span class="lane-state">%s</span></div>%s'
             '<div class="lane-facts"><span class="lane-beat">%s</span></div></article>') % (
-        state, esc(str(lane["lane"])), views.LANE_STATE_WORD[state], body,
-        esc(views.format_heartbeat(lane.get("heartbeat"))))
+        views.LANE_STATE_STYLE.get(state, state), esc(str(lane["lane"])), views.LANE_STATE_WORD[state], body,
+        esc(views.lane_heartbeat(lane)))
 
 
 def strip(lanes: list[dict[str, Any]], rows: list[dict[str, Any]], fixing: set[tuple[str, int]]) -> str:

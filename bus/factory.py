@@ -229,7 +229,8 @@ NO_LANE_HANDOFF = 24 * 3600
 # queued ticket no free lane of its model or tier takes, a briefed one stalled
 # with no other lane of its rung or tier, or one on a lane at a limit or down
 # with no free lane in its rung or tier.
-NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
+MODEL_WAIT = "no free lane takes model "
+NO_LANE_RE = re.compile(r"(" + MODEL_WAIT + r"|no free lane in tier "
                         r"|stalled on lane \S+: no other lane of its "
                         r"|on lane \S+, .*: no free lane in its |remote lane \S+ has not pulled it)")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
@@ -308,6 +309,11 @@ def hard_pin(issue: Dict[str, Any]) -> str:
 def no_lane(reason: str) -> bool:
     """Whether a wait reason (Factory.waits) says no lane takes the ticket."""
     return bool(NO_LANE_RE.match(str(reason or "")))
+
+
+def model_wait_reason(model: str) -> str:
+    return MODEL_WAIT + (model if len(model) <= 64 and tickets.MODEL_RE.fullmatch(model)
+                         else "(its Model: line names no model id)")
 # A ticket held by its After: line this long, with none of the tickets it
 # waits for merged, is reported to the brain once like a stuck ticket.
 HOLD_STUCK = 48 * 3600
@@ -4982,7 +4988,7 @@ class Factory:
         for this reason, not on each pass it repeats it: 716 identical stall
         lines in two days hid the ones that mattered (loom#1280)."""
         key = "%s#%s" % (repo, number)
-        if self.known_waits.get(key) != reason:
+        if self.waits.get(key, self.known_waits.get(key)) != reason:
             _say(message)
         self._waiting(repo, number, reason)
 
@@ -5410,8 +5416,8 @@ class Factory:
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up) across repos in tickets.work_order: FIRST labels,
-        then priority, then the oldest. A pass that gives none a lane says
-        how many wait and why the first does."""
+        then priority, then the oldest. A pass that gives none a lane can
+        summarize the first wait. Pinned model waits log their transitions."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         before = _placements(found_by_repo)
@@ -5420,10 +5426,13 @@ class Factory:
                   if _state(issue) == "queued" and HANDOFF_LABEL not in _labels(issue)]
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
-        if waits and all(waits):
+        if waits and all(waits) and MODEL_WAIT not in waits[0]:
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
         self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
+        self.settled.update(ref for ref, reason in self.known_waits.items()
+                            if reason.startswith(MODEL_WAIT) and ref not in self.waits
+                            and ref.rpartition("#")[0] in found_by_repo)
 
     def _return_hand_offs(self, found_by_repo: Dict[str, Dict[int, Dict[str, Any]]]) -> None:
         """Give a lane left free after every other queued ticket had its turn
@@ -5758,12 +5767,9 @@ class Factory:
             fell = self._pin_fallback(repo, issue, model)
             if fell is not None:
                 return fell
-            why = "%s waits: no free lane takes model %s" % (ref, model)
-            reason = "no free lane takes model %s" % (
-                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
-                else "(its Model: line names no model id)")
-            self._waiting(repo, issue["number"], reason)
-            _say("%s (known lanes checked for availability, limits and model support)" % why)
+            reason = model_wait_reason(model)
+            why = "%s waits: %s" % (ref, reason)
+            self._wait_said(repo, issue["number"], reason, why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
             _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))

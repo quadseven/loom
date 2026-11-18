@@ -62,6 +62,7 @@ import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
+from . import lane_state
 from .github import RateLimited
 from .labels import LANES
 
@@ -1049,6 +1050,7 @@ class Runners:
             if not models:
                 ledger["holds"].pop(slot, None)
         beat["limited_models"] = models
+        beat = lane_state.heartbeat_fields(slot, beat, self.home)
         _write(self._usage(slot, ".json"), (json.dumps(beat) + "\n").encode("utf-8"))
 
     def _prune(self, ledger: Dict[str, Any]) -> None:
