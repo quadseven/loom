@@ -470,16 +470,32 @@ def _rmtree(path: str) -> None:
 
 def _measure(path: str, deadline: float) -> int:
     """Bytes on disk under path, counted until deadline."""
-    size = 0
-    for top, dirs, names in os.walk(path, followlinks=False):
+    try:
+        start_stat = os.lstat(path)
+        start_dev = start_stat.st_dev
         if time.monotonic() > deadline:
-            break
-        for name in dirs + names:
-            try:
-                size += _bytes(os.lstat(os.path.join(top, name)))
-            except OSError:
-                continue
-    return size
+            return 0
+        size = _bytes(start_stat)
+        for top, dirs, names in os.walk(path, followlinks=False):
+            if time.monotonic() > deadline:
+                break
+            for name in dirs + names:
+                if time.monotonic() > deadline:
+                    break
+                try:
+                    sub_path = os.path.join(top, name)
+                    sub_stat = os.lstat(sub_path)
+                    sub_dev = sub_stat.st_dev
+                    if sub_dev != start_dev:
+                        continue
+                    size += _bytes(sub_stat)
+                except OSError:
+                    continue
+            if time.monotonic() > deadline:
+                break
+        return size
+    except OSError:
+        return 0
 
 
 def _private_dirs(folder: str) -> None:
