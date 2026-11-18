@@ -6206,6 +6206,7 @@ class Station:
         reported = _read_json(path, {})
         if not isinstance(reported, dict):
             raise StateError("state file %s does not hold an object" % path)
+        self._reconcile_reported_flakes(reported)
         self.retry_waiting_no_change()
         for lane, kind, brief, name in self._finished_briefs():
             key = "%s/%s" % (lane, name)
@@ -9008,6 +9009,47 @@ class Station:
         m = re.search(r"^%s:[ \t]*(.*?)[ \t]*$" % name, text, re.M)
         return m.group(1) if m else ""
 
+    def _reconcile_reported_flakes(self, reported: Dict[str, Any]) -> None:
+        """Revisit duplicate-creation races, batching completed sidecars by repo.
+
+        There is no local event counter: the issue body remains the shared store.
+        Missing sidecars cost no GitHub reads, and replayed ids cause no writes.
+        """
+        from bus import base_flake_tracker
+        grouped: Dict[str, List[Any]] = {}
+        for lane, _kind, brief, name in self._finished_briefs():
+            if "%s/%s" % (lane, name) not in reported:
+                continue
+            path = Path(self.s.home) / "logs" / lane / (name + ".base-flakes.jsonl")
+            if not path.exists():
+                continue
+            try:
+                with open(brief, encoding="utf-8") as stream:
+                    match = ISSUE_LINE_RE.search(stream.read(65536))
+                if not match or not self._repo_ok(match.group(1)):
+                    continue
+                repo = match.group(1)
+                rows = base_flake_tracker.read_events(path)
+                grouped.setdefault(repo, []).extend(dict(row, lane=lane) for row in rows
+                                                    if isinstance(row, dict))
+            except (OSError, GitHubError) as err:
+                _say("could not read base flakes for %s: %s" % (name, err))
+        for repo, rows in grouped.items():
+            if self._deferred():
+                break
+            try:
+                base_flake_tracker.publish(self.gh, repo, rows, None, self.now)
+            except RateLimited:
+                raise
+            except GitHubError as err:
+                _say("could not reconcile base flakes for %s: %s" % (repo, err))
+
+    def _record_base_flakes(self, repo: str, lane: str, name: str) -> None:
+        """Publish the completed brief's retry sidecar before acknowledging its outcome."""
+        from bus import base_flake_tracker
+        path = Path(self.s.home) / "logs" / lane / (name + ".base-flakes.jsonl")
+        base_flake_tracker.publish(self.gh, repo, base_flake_tracker.read_events(path), lane, self.now)
+
     def _report(self, lane: str, kind: str, path: str, name: str) -> bool:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
@@ -9019,6 +9061,7 @@ class Station:
         repo, number = m.group(1), int(m.group(2))
         if not self._repo_ok(repo):
             return True
+        self._record_base_flakes(repo, lane, name)
         if self._field(text, "Deliverable") == "verify":
             return self._report_verify(lane, kind, repo, number, name)
         if self._field(text, "Deliverable") == "review":
