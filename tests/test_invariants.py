@@ -675,7 +675,8 @@ class StationTest(StationBase):
                 (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
                 "Goal home #30: 7 open epics (cap 6)"),
             "closed-epic-open-tickets": (lambda: self.gh.subs.update({
-                (REPO, GOAL): [epic(40, state="closed")], (REPO, 40): [ticket(7)]}),
+                (REPO, GOAL): [epic(40, state="closed")],
+                (REPO, 40): [dict(ticket(7), id=9007)]}),
                 "Closed epic #40 of goal home #30: 1 open tickets, #7"),
             # loom#2030: two open epics in one repo with one title.
             "epic-title-shared": (lambda: self.gh.subs.update({
@@ -705,6 +706,26 @@ class StationTest(StationBase):
                 self.run_at(T0 + 2 * invariants.CHECK_EVERY)
                 self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
                 self.assertEqual(filed[0]["state"], "closed", self.said)
+
+    def test_closed_epic_report_clears_when_only_nonmovable_children_remain(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
+        triage = dict(ticket(7), id=9007, labels=[{"name": "loom:triage"}])
+        pull = dict(ticket(8), id=9008, pull_request={})
+        ask = dict(ticket(9), id=9009, labels=[{"name": "loom:ticket"}, {"name": "needs:human"}])
+        child_epic = dict(epic(10), id=9010)
+        closed = dict(ticket(11, state="closed"), id=9011)
+        stranded = dict(ticket(12), id=9012, body="Why.\n\nPart of #40\n")
+        self.gh.subs[(REPO, 40)] = [triage, pull, ask, child_epic, closed]
+        self.gh.tickets[REPO] = [stranded]
+
+        self.run_at(T0)
+        (report,) = self.gh.filed()
+        self.assertIn("Closed epic #40 of goal home #30: 1 open tickets, #12", report["body"])
+
+        self.gh.tickets[REPO].clear()
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.run_at(T0 + invariants.CHECK_EVERY + invariants.CLEAR_AFTER)
+        self.assertEqual(report["state"], "closed", self.said)
 
     def test_epic_over_cap_counts_sub_issues_and_part_of_links_once(self):
         """loom#2023: 13 sub-issues plus 4 issues linked only by a Part of
