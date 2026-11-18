@@ -2455,7 +2455,7 @@ def _issue_key(issue: Dict[str, Any], repo: str) -> Tuple[str, int]:
 
 
 def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
-              warnings: Optional[List[str]] = None
+              warnings: Optional[List[str]] = None, *, parallel: bool = True
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
     """(the goal's direct children that are not epics, [(epic, its tickets)]).
 
@@ -2491,9 +2491,11 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
                 found[(epic_repo, number)] = tickets
         subs = [found[(_epic_repo(e, repo), int(e.get("number") or 0))] for e in epics]
     else:
-        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (_epic_repo(epic, repo),
-                                                      int(epic.get("number") or 0))), epics)
+        def read_subs(epic: Dict[str, Any]) -> List[Any]:
+            return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                               % (_epic_repo(epic, repo), int(epic.get("number") or 0)))
+
+        subs = _read_each(read_subs, epics) if parallel else [read_subs(epic) for epic in epics]
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets,
                                          _epic_repo(epic, repo), repo)))
@@ -2714,11 +2716,11 @@ def _ticket_of_epic(item: Dict[str, Any], number: int, here: str) -> bool:
     return _names_goal(item.get("body"), number)
 
 
-def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+def goal_children(gh: GitHub, repo: str, goal: int, *, parallel: bool = True) -> List[Dict[str, Any]]:
     """Every ticket of the goal, each once: its direct children that are not
     epics, then each epic's tickets (goal_tree). The epics themselves are not
     listed: a count of tickets must not count an epic."""
-    return _flatten(*goal_tree(gh, repo, goal), repo=repo)
+    return _flatten(*goal_tree(gh, repo, goal, parallel=parallel), repo=repo)
 
 
 def _flatten(loose: List[Dict[str, Any]],
