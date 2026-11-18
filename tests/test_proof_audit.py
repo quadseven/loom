@@ -6,7 +6,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -236,6 +236,20 @@ class HeldTest(unittest.TestCase):
             audit_comment(1, lane="openrouter", login="someone-else")])
         held = audit.held(self.gh, [REPO], ["station-bot"], NOW.timestamp())
         self.assertEqual(held, {"zai": NOW.timestamp() - 2 * 3600 + audit.HOLD})
+
+    def test_the_ticket_list_is_asked_for_since_the_start_of_the_hour(self):
+        # loom#2357: every read inside one hour asks for the same URL, so
+        # the ETag cache can answer it; the hour is the one the window
+        # opens in (loom#2950).
+        for label, read in (("loom:verified", audit.due), (audit.LABEL, audit.held)):
+            for minute, second in ((0, 0), (10, 7), (59, 59)):
+                with self.subTest(label=label, minute=minute):
+                    del self.fake.calls[:]
+                    read(self.gh, [REPO], ["station-bot"],
+                         NOW.timestamp() + minute * 60 + second)
+                    asked = [parse_qs(urlsplit(path).query) for _, path, _ in self.fake.calls]
+                    self.assertEqual([(q["labels"], q["since"]) for q in asked],
+                                     [([label], ["2030-01-01T12:00:00Z"])])
 
     def test_a_failed_audit_after_the_proof_unproves_the_ticket(self):
         comments = [proof_comment(9), audit_comment(7)]
