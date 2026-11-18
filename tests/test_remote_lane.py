@@ -412,9 +412,8 @@ class ClaimRejectionTests(unittest.TestCase):
         gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS and on Android."))
         got, err = self.claim_err(gh)
         self.assertIsNone(got)
-        self.assertIn(self.rejection_line("spans more than one platform"), err)
-        self.assertEqual(lane._rejection_reason(gh.issues[4], "muse"),
-                         "spans more than one platform")
+        self.assertIn("spans more than one platform (iOS, Android)", err)
+        self.assertIn("After:", err)
 
     def test_a_single_platform_ticket_gets_no_split_reason(self):
         gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS."))

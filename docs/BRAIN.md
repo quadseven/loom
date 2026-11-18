@@ -1155,6 +1155,11 @@ fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
 requests a factory pass; the log names each request against that bound and the
 pull request that waits for the next pass.
 
+When review findings survive a fix round on two different model rungs, the
+factory leaves the pull request open, marks its ticket `needs-brain`, and
+asks the brain to split it into tickets with `After:` dependencies. Usage
+limits keep their usual routing.
+
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
 `plan-truncated` or `cross-cohort-module` (each asks the author to split the

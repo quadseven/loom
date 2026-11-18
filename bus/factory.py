@@ -392,7 +392,7 @@ LUNA_RETRY_AFTER = 3600
 LUNA_MAX_DISPATCHES = 3
 _LUNA_DISPATCH_RE = re.compile(r"<!-- loom:luna-dispatch at=(\d+) -->")
 LUNA_STUCK_TITLE = "Luna review of %s#%d head %s got no verdict after %d dispatches"
-_LUNA_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
+_REVIEW_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
 
 
 def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
@@ -402,7 +402,7 @@ def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
     text = str(body or "")
     if LUNA_REVIEW_MARKER % sha not in text:
         return None
-    found = _LUNA_MARKINGS_RE.search(text)
+    found = _REVIEW_MARKINGS_RE.search(text)
     return (int(found.group(1)), int(found.group(2))) if found else None
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
@@ -755,10 +755,12 @@ NO_AREA_NOTE = (
     "play, and this ticket carries no `area:` label. Add the one `area:` label that "
     "names its area; no lane takes it until then.")
 
-NO_SPLIT_NOTE = (
-    "Held for the brain (needs-brain): this brief spans more than one platform, so "
-    "it is more than one ticket. Split it into one ticket per platform, with "
-    "`After:` lines between the slices; no lane takes it until then.")
+REVIEW_FAILED_RUNG = "<!-- loom:review-failed-rung %d -->"
+REVIEW_FAILED_RUNG_RE = re.compile(r"<!-- loom:review-failed-rung (\d+) -->")
+REVIEW_SPLIT_NOTE = (
+    "Held for the brain: review findings survived fix rounds on two model rungs. "
+    "Split this ticket into smaller tickets with After: lines between dependent slices "
+    "before sending work to a lane.")
 
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
@@ -922,9 +924,8 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
         return True
-    last = next((str(c.get("body") or "") for c in reversed(comments)
-                 if str(c.get("body") or "").startswith(FIX_MARKER)), None)
-    if last is None:
+    last = _last_fix(comments)
+    if not last:
         return False
     if _finding_survived(last, open_threads, threads):
         return True
@@ -933,6 +934,11 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     if _unticked_left(last, unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
+
+
+def _last_fix(comments: Sequence[Dict[str, Any]]) -> str:
+    return next((str(c["body"]) for c in reversed(comments)
+                 if str(c.get("body") or "").startswith(FIX_MARKER)), "")
 
 
 def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
@@ -948,6 +954,17 @@ def _finding_survived(last: str, open_threads: Sequence[str],
     while checks still fail."""
     return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
             or bool(converge.persistent(last, (), threads)))
+
+
+def review_findings_remain(last: str, threads: Sequence[Dict[str, Any]],
+                           check: str, output: str) -> bool:
+    """Whether a fix round left a trusted thread or a blocking review check."""
+    if threads:
+        return _finding_survived(last, [str(t.get("id")) for t in threads], threads)
+    title, _, summary = output.partition("\n")
+    match = _REVIEW_MARKINGS_RE.search(title)
+    return bool(match and int(match[1]) > 0 and not degraded_review(title, summary)
+                and check in converge.asked_checks(last))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -2725,10 +2742,14 @@ class Factory:
                  % (repo, number, ", ".join(sorted(held)), why))
             return
         box_budget = no_change.active(comments) and bool(unproven_criteria(str(issue.get("body") or ""), ""))
+        threads = self._trusted_open(repo, pr, open_threads)
+        if (not conflict_only and not box_budget
+                and self._review_stuck(pr, _last_fix(comments), threads)
+                and self.hold_review_split(repo, issue, comments)):
+            return
         if checks_failing and not box_budget and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        threads = self._trusted_open(repo, pr, open_threads)
         # A conflict alone is mechanical (the fix brief's runner merges the
         # base), so it never climbs, waits for a rung or closes the pull
         # request past the ladder, however old the pull request is
@@ -2827,6 +2848,44 @@ class Factory:
         self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                          if 1 <= n <= len(CLIMB)])
         self._hand_off_failed(repo, issue)
+        return False
+
+    def _review_stuck(self, pr: Dict[str, Any], last: str,
+                      threads: Sequence[Dict[str, Any]]) -> bool:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        output = next((r.get("output") or {} for r in self._runs.get(sha, [])
+                       if r.get("name") == self.review_check and r.get("conclusion") == "failure"), {})
+        return review_findings_remain(last, threads, self.review_check,
+                                     "%s\n%s" % (output.get("title") or "", output.get("summary") or ""))
+
+    def hold_review_split(self, repo: str, issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> bool:
+        """Record distinct rungs that left findings open since the last restart."""
+        if (person_claim(issue) or RUNAWAY in _labels(issue)
+                or not attempts_since_brief(comments) or newest_ending_class(comments) != "work"):
+            return False
+        rung = current_rung(issue) or rung_of(comments)
+        previous = set()
+        for comment in reversed(comments):
+            body = str(comment.get("body") or "")
+            if history.rung_marker(0) in body.splitlines():
+                break
+            match = REVIEW_FAILED_RUNG_RE.fullmatch(body.partition("\n")[0])
+            if match:
+                previous.add(int(match[1]))
+        number = int(issue["number"])
+        if previous - {rung}:
+            if not any(c.get("body") == REVIEW_SPLIT_NOTE for c in comments):
+                notify.post(self.gh, repo, number, REVIEW_SPLIT_NOTE, notify.HELD)
+            names = _labels(issue) + ["needs-brain"]
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = [{"name": label} for label in names]
+            self.actions += 1
+            return True
+        if rung not in previous:
+            self._status_note(repo, number, "%s\nReview findings survived a fix round on rung %d."
+                              % (REVIEW_FAILED_RUNG % rung, rung))
         return False
 
     def _past_no_change(self, repo: str, issue: Dict[str, Any],
@@ -5558,25 +5617,21 @@ class Factory:
         return reason
 
     def _no_split(self, repo: str, issue: Dict[str, Any]) -> str:
-        """Why a queued brief that spans more than one platform gets no lane,
-        or "" (brief_check.split_verdict, the station's claim refusal). Like
-        _no_criteria it gains needs-brain and one note, once: a multi-platform
-        brief given a lane spent the whole model ladder before a person split
-        it by hand (loom#1651)."""
-        if not brief_check.split_hold(issue):
+        """Hold an oversized or multi-platform brief with one split request."""
+        split = brief_check.split_verdict(str(issue.get("body") or ""))
+        if split is None:
             return ""
         number = int(issue["number"])
         if "needs-brain" not in _labels(issue):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": ["needs-brain"]})
             issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
-            notify.post(self.gh, repo, number, NO_SPLIT_NOTE, notify.HELD)
+            notify.post(self.gh, repo, number, "Held for the brain: this brief %s." % split.reason,
+                        notify.HELD)
             self.actions += 1
-            _say("held queued %s#%d for the brain: spans more than one platform"
-                 % (repo, number))
-        reason = "spans more than one platform"
-        self._waiting(repo, number, reason)
-        return reason
+            _say("held queued %s#%d for the brain: %s" % (repo, number, split.reason))
+        self._waiting(repo, number, split.reason)
+        return split.reason
 
     def _repo_areas(self, repo: str) -> Optional[List[str]]:
         """The repo's `area:` labels, read once a pass, or None when the read
