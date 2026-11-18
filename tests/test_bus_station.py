@@ -2203,6 +2203,26 @@ class ShipDeployedTest(Base):
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertEqual(st._invariant_unshipped(), [])
 
+    def test_a_deployed_ticket_ships_when_the_move_label_write_is_retried(self):
+        self.merged(12, 99)
+        self.record_deploy()
+        real = self.fake
+        rejected = False
+
+        def transient_refusal(method, url, headers, body):
+            nonlocal rejected
+            if (method == "PUT" and urlsplit(url).path.endswith("/issues/12/labels")
+                    and not rejected):
+                rejected = True
+                return reply(422, {"message": "refused"})
+            return real(method, url, headers, body)
+
+        self.ship(transport=transient_refusal)
+        self.assertTrue(rejected)
+        self.assertIn("loom:shipped", self.fake.names(12))
+        self.assertNotIn("loom:merged", self.fake.names(12))
+        self.assertEqual(len(self.fake.comments[12]), 1)
+
     def test_self_repo_defaults_to_the_lanes_repo(self):
         env = {"LOOM_HOME": self.home, "LOOM_REPOS": REPO,
                "LOOM_STATUS_REPO": "example-owner/lanes"}
@@ -8539,6 +8559,89 @@ class DiskGuardTest(Base):
         self.assertEqual(station.Settings.from_env({"LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 12)
         self.assertEqual(station.Settings.from_env({"LOOM_MIN_FREE_GB": "20",
                                                     "LOOM_DISK_FREE_MIN_GB": "12"}).disk_free_min_gb, 20)
+
+
+class DiskWatchdogTest(Base):
+    """Below LOOM_DISK_WATCHDOG_GB the pass clears Loom's own data before the
+    claim floor (loom#3187), and the lane status says when it cannot."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings.disk_free_min_gb = station.DISK_FREE_MIN_GB
+        self.settings.disk_watch = station.disk_watchdog.Config()
+        # A root reached through a link (macOS's /var) is refused.
+        self.settings.home = os.path.realpath(self.home)
+        self.log = os.path.join(self.home, "logs", "codex", "old.log")
+        self.write(self.log, "x" * 4096)
+        old = time.time() - 30 * 86400
+        os.utime(self.log, (old, old))
+
+    def tend(self, free):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        usage = mock.Mock(free=free, total=500 * 1024 ** 3, used=0)
+        with mock.patch.object(station.shutil, "disk_usage", return_value=usage), \
+                mock.patch.object(station.disk_watchdog.RealDisk, "largest", return_value=[]), \
+                mock.patch("bus.station._say") as say:
+            runner.tend_watchdog()
+        return runner, [c.args[0] for c in say.call_args_list]
+
+    def test_from_env_turns_it_on_with_no_setting(self):
+        self.assertEqual(station.Settings.from_env({}).disk_watch.trigger_gb, 25.0)
+        self.assertEqual(station.Settings.from_env(
+            {"LOOM_DISK_WATCHDOG_GB": "0"}).disk_watch.trigger_gb, 0)
+
+    def test_above_the_trigger_old_logs_stay(self):
+        self.tend(40 * 1024 ** 3)
+        self.assertTrue(os.path.exists(self.log))
+
+    def test_below_the_trigger_old_logs_are_compressed(self):
+        runner, said = self.tend(20 * 1024 ** 3)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertTrue(os.path.exists(self.log + ".gz"))
+        self.assertTrue(any(s.startswith("disk watchdog: logs older than 7 days") for s in said),
+                        said)
+        self.assertNotIn("Disk watchdog:", runner._lanes_body([]))
+
+    def test_the_agy_tree_folder_is_left_alone(self):
+        agy = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, agy, True)
+        tree = os.path.join(agy, "quadseven.loom-1")
+        os.makedirs(tree)
+        old = time.time() - 30 * 86400
+        os.utime(tree, (old, old))
+        self.settings.agy_workdir = agy
+        self.tend(5 * 1024 ** 3)
+        self.assertTrue(os.path.isdir(tree))
+
+    def test_a_busy_lane_keeps_its_run_scratch(self):
+        check = os.path.join(self.settings.home, "run", "codex-check")
+        os.makedirs(check)
+        old = time.time() - 30 * 86400
+        os.utime(check, (old, old))
+        with mock.patch.object(station.Station, "_lane_idle", return_value=True), \
+                mock.patch.object(station.Station, "_lane_locked", return_value=True):
+            self.tend(20 * 1024 ** 3)
+        self.assertTrue(os.path.isdir(check))
+
+    def test_time_machine_snapshots_follow_the_thin_setting(self):
+        calls = []
+
+        def tmutil(args):
+            calls.append(list(args))
+            return 1, "", "no"
+        fake = station.disk_watchdog.TimeMachine(tmutil)
+        with mock.patch.object(station.disk_watchdog.TimeMachine, "for_host", return_value=fake):
+            runner, _ = self.tend(20 * 1024 ** 3)
+            self.assertEqual(calls, [])
+            self.settings.thin_snapshots = True
+            os.remove(os.path.join(runner.state, station.DISK_WATCH_FILE))
+            _, said = self.tend(20 * 1024 ** 3)
+        self.assertEqual(calls, [["listlocalsnapshots", "/"]])
+        self.assertTrue(any("Time Machine" in s for s in said), said)
+
+    def test_the_lane_status_says_when_the_floor_is_out_of_reach(self):
+        runner, _ = self.tend(5 * 1024 ** 3)
+        self.assertIn("Disk watchdog: Loom's own data is cleared", runner._lanes_body([]))
 
 
 class RewriteScratchTest(Base):
@@ -15636,6 +15739,12 @@ class RemoteClaimCountTest(unittest.TestCase):
         self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
         self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
 
+    def test_a_heartbeat_with_a_visible_line_after_its_marker_is_read(self):
+        beat = ("<!-- loom:remote-heartbeat v1 muse %d -->\nRemote lane muse is available."
+                % int(self.now))
+        self.gh.paginate = lambda path: [{"body": beat, "user": {"login": AUTHORS[0]}}]
+        self.assertEqual(int(self.now), self.runner()._read_remote_heartbeat("muse"))
+
     def test_lanes_body_builds_and_shows_remote_claims(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -15824,6 +15933,16 @@ class LunaReviewResultTest(Base):
         self.assertEqual(thread, {"commit_id": self.SHA, "path": "src/app.py",
                                   "line": 9, "side": "RIGHT",
                                   "body": "The null check is missing."})
+
+    def test_an_anchored_finding_with_no_visible_text_posts_no_review_thread(self):
+        self.result({"blocking": [
+                         {"file": "src/app.py", "line": 9, "finding": "<!-- x -->"},
+                         {"file": "src/app.py", "line": 12,
+                          "finding": "The null check is missing."}],
+                     "notes": [], "summary": "Two problems."})
+        self.assertTrue(self.report())
+        self.assertEqual(len(self.verdicts()), 1)
+        self.assertEqual([t["line"] for _, t in self.fake.reviews_posted], [12])
 
     def test_a_missing_review_json_posts_nothing(self):
         self.assertTrue(self.report())

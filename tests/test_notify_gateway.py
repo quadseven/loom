@@ -180,6 +180,37 @@ class GatewayTest(unittest.TestCase):
             self.assertEqual(gh.calls, [("POST", "/repos/owner/repo/issues/7/comments",
                                          {"body": "hello"})])
 
+    def test_a_body_with_nothing_visible_is_refused_and_posts_nothing(self):
+        # A marker-only comment renders empty on GitHub and still emails the
+        # operator a blank notification.
+        gh = self.Client()
+        for body in ("<!-- loom:remote-claim v1 muse 393 1794898097.761 -->",
+                     "<!-- loom:a -->\n\n<!-- loom:b -->\n",
+                     "", "   \n\t \n", None,
+                     "<details></details>",
+                     "<details>\n<summary></summary>\n<!-- loom:x -->\n</details>",
+                     "<!-- an unclosed comment hides the rest\nof the body"):
+            with self.assertRaises(notify.EmptyComment, msg=repr(body)):
+                notify.post(gh, "owner/repo", 7, body, notify.RECORD)
+        self.assertEqual(gh.calls, [])
+
+    def test_a_body_with_visible_text_posts(self):
+        for body in ("hello",
+                     "<!-- loom:remote-claim v1 muse 4 1000.000 -->\nClaimed by remote lane muse.",
+                     "<details><summary>Logs</summary></details>",
+                     "<details>\n<summary>Why</summary>\nBecause.\n</details>"):
+            gh = self.Client()
+            self.assertEqual(notify.post(gh, "owner/repo", 7, body, notify.RECORD), "response")
+            self.assertEqual(gh.calls, [("POST", "/repos/owner/repo/issues/7/comments",
+                                         {"body": body})])
+
+    def test_visible_text_strips_markers_and_empty_shells(self):
+        self.assertEqual(notify.visible_text("<!-- loom:x -->\nHi <!-- y --> there\n"),
+                         "Hi  there")
+        self.assertEqual(notify.visible_text("<details><summary></summary></details>"), "")
+        self.assertEqual(notify.visible_text(None), "")
+        self.assertEqual(notify.visible_text("<!-- x -->" + chr(0x200B) + "&nbsp;\n"), "")
+
     def test_the_kind_constants_are_the_kinds(self):
         named = {value for name, value in vars(notify).items()
                  if name.isupper() and isinstance(value, str) and name != "KINDS"}

@@ -161,6 +161,8 @@ unset variables.
 - On a host, a base check verdict is reused by repo, base revision, check
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
+  Before running a Codex agent, the lane reruns green checks that populated
+  uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
@@ -347,6 +349,11 @@ pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
 that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
 does not stop the run: the log and the pull request body (or the round's
 comment) carry `live-cluster check could not run: <reason>`.
+
+Before opening a pull request, the runner also checks each ticked live
+acceptance criterion. The criterion names its expected output lines in
+backticks or double quotes. Each line must appear in the current run's log.
+Leave the box unticked if the expected output is unspecified or missing.
 
 ## The brain tick
 
@@ -1354,6 +1361,33 @@ The loom home is kept bounded by the station and the runner (loom#643).
   when the state changes, `claims resumed: ...` once when the disk has that
   much free again, and the lane status shows a `Claims paused` line
   meanwhile. The state is kept in `state/station/disk-guard.json`.
+- Before that floor, the disk watchdog (`bus/disk_watchdog.py`, loom#3187)
+  acts. Once the disk has less than `LOOM_DISK_WATCHDOG_GB` free (default 25;
+  0 turns it off), at most every 5 minutes, it frees space in this order and
+  stops as soon as the disk is back above that: on macOS, Time Machine local
+  snapshots (`com.apple.TimeMachine.<date>.local`, oldest first, through
+  `tmutil deletelocalsnapshots`; deleted files free nothing while a snapshot
+  holds them, and no other snapshot such as `com.apple.os.update-*` is
+  touched; `LOOM_THIN_SNAPSHOTS=0` keeps them); then Loom's own data: lane logs and
+  rotated service logs unchanged for 7 days (moved to
+  `LOOM_DISK_ARCHIVE_DIR` when that folder is mounted, else compressed in
+  place); idle lanes' run scratch (`-check`, `-check-default`, `-tmp`,
+  `-intent.*`, `-gh.*`) unchanged for `LOOM_DISK_RUN_DAYS` (default 2);
+  lane trees unchanged for 2 days, archived to the archive folder or to
+  `archive/trees/` in the home and removed only once the archive reads back
+  whole (local tree archives go after 14 days); then idle lanes' tool caches
+  (`.cache`, `.cargo`, `.npm`, `tmp`, `Library/Caches` and the like). It never
+  touches a brief that is waiting or running, a busy lane's folders (the
+  lane lock is read again before each removal, and a lane home changed in
+  the last 10 minutes keeps its caches), a link, or any path outside
+  `logs/`, `run/`, `archive/` and `worktrees/` in the home; a home reached
+  through a link is refused, and the agy lane's tree folder is left to the
+  tree sweep. Archive folders it makes are 0700 and archives 0600.
+  Each step says `disk watchdog: ...` with what it freed. When the disk is
+  still under the floor it logs the largest folders beside the home once an
+  hour, and the lane status shows a `Disk watchdog:` line until the disk is
+  above the floor. The state is kept in `state/station/disk-watchdog.json`.
+  The station runs it, so it runs where the station runs (the Mac lane host).
 - When a run ends the runner drops the build output git ignores from its
   tree and its default-branch check copy: `.venv`, `node_modules`,
   `__pycache__` and `.pytest_cache` folders that `git check-ignore`

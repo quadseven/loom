@@ -24,6 +24,12 @@ lifted once, with the hold's reason (the rewrite's last refusal) quoted in
 a RETRY_MARKER note, so the rewrite step tries once more; a triage issue
 whose hold comes back after that note goes to the hand-off pool instead,
 with one LIFT_MARKER note saying what the rewrite could not do.
+
+The rewrite's ask (loom#2936): apply_answer printed the ask of a person-only
+answer to the station log and wrote nothing on the issue, so `reason` found
+no note and both notes above quoted no cause. It now leaves the ask as one
+routine event on the issue's status comment (ask_note, under ASK_MARKER),
+and `reason` returns that ask whole.
 """
 
 from __future__ import annotations
@@ -57,6 +63,10 @@ LIFT_MARKER = "<!-- loom:hold-lifted -->"
 # already on the issue goes to the hand-off pool instead.
 RETRY_MARKER = "<!-- loom:hold-retry -->"
 TRIAGE_LABEL = "loom:triage"
+# On a triage issue's status comment: the ask of the rewrite answer that held
+# the issue (loom#2936). Only proposed: it is not an ask to a person, and it
+# carries no HUMAN_MARKER.
+ASK_MARKER = "<!-- loom:rewrite-ask -->"
 # A note this close to the label event, before or after it, names the hold.
 REASON_WINDOW = 600
 REASON_MAX = 160
@@ -102,23 +112,54 @@ def setter(events: Sequence[Any], loom: Iterable[str]) -> Setter:
     return Setter(LOOM if login in ours else PERSON, login, at)
 
 
-def _first_line(body: str) -> str:
+def _first_line(body: str, limit: int = REASON_MAX) -> str:
+    """The body's first line with words, cleaned; cut at `limit` characters
+    (0: never cut)."""
     for line in body.splitlines():
         line = re.sub(r"<!--.*?-->", "", line).strip().lstrip("#>*- ").strip()
         if line:
             line = re.sub(r"[`@]", "", re.sub(r"\s+", " ", line))
-            if len(line) > REASON_MAX:
-                line = line[:REASON_MAX].rsplit(" ", 1)[0] + "..."
+            if limit and len(line) > limit:
+                line = line[:limit].rsplit(" ", 1)[0] + "..."
             return line
     return ""
 
 
+def ask_note(kind: str, ask: str) -> str:
+    """The routine event the rewrite step leaves when it holds a triage issue
+    for the brain: the kind and the ask its answer proposed, on one line (no
+    comment marker, backtick or at-sign of the model's survives, so the ask
+    can close no marker and mention nobody)."""
+    text = re.sub(r"<!--.*?-->", "", str(ask), flags=re.S)
+    text = re.sub(r"<!--|-->|[`@]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return ("%s\nThe rewrite proposed person-only work (Kind: %s) and held the issue for "
+            "the brain. Its ask: %s" % (ASK_MARKER, kind, text))
+
+
+def ask_of(body: Any) -> str:
+    """The line of an ask_note, whole and without its last full stop (the
+    notes that quote it add their own); "" for any other text."""
+    text = str(body or "")
+    if ASK_MARKER not in text:
+        return ""
+    line = _first_line(text, 0)
+    return line[:-1] if line.endswith(".") else line
+
+
 def reason(comments: Sequence[Any], at: float, state: str) -> str:
     """Why the ticket was held: the first line of the newest trusted note
-    within REASON_WINDOW of the label event, else what is known (its state)."""
+    within REASON_WINDOW of the label event, else what is known (its state).
+    The rewrite's own ask among those notes (ask_note) is the reason, whole:
+    it is what a retry or a hand-off needs to read."""
     near = [c for c in comments if isinstance(c, dict) and at
             and abs(_ts(c.get("created_at")) - at) <= REASON_WINDOW]
-    for comment in sorted(near, key=lambda c: _ts(c.get("created_at")), reverse=True):
+    near.sort(key=lambda c: _ts(c.get("created_at")), reverse=True)
+    for comment in near:
+        ask = ask_of(comment.get("body"))
+        if ask:
+            return ask
+    for comment in near:
         line = _first_line(str(comment.get("body") or ""))
         if line:
             return line

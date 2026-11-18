@@ -37,6 +37,7 @@ from . import audit
 from . import bench
 from . import ci_gap
 from . import converge
+from . import disk_watchdog
 from . import brain_memory
 from . import brain_hold
 from . import claimed
@@ -47,6 +48,7 @@ from . import closing
 from . import decision_claim
 from . import evidence_close
 from . import journal
+from . import lane_markers
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -188,6 +190,7 @@ LOG_ROTATE_KEEP = 5
 # lane run failed at once. The older name LOOM_DISK_FREE_MIN_GB is still read.
 DISK_FREE_MIN_GB = 15.0
 DISK_GUARD_FILE = "disk-guard.json"
+DISK_WATCH_FILE = "disk-watchdog.json"
 FIX_OVERLAP_FILE = "fix-overlap-holds.json"
 # A finished opencode run's session store under its log folder (lanes/
 # run_lane.sh archive_transcripts): 100-440 MB a run on 2026-10-25, 14 GB of
@@ -1175,8 +1178,13 @@ class Settings:
                  decision_window_days: int = 3,
                  repo_pr_caps: Optional[Dict[str, int]] = None,
                  fabric_review_notes: str = "",
-                 review_sweep: Optional[review_sweep_mod.Config] = None) -> None:
+                 review_sweep: Optional[review_sweep_mod.Config] = None,
+                 disk_watch: Optional[disk_watchdog.Config] = None) -> None:
         self.home = home
+        # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
+        # loom#3187): off for a Settings built in code; from_env turns it on
+        # at 25 GB.
+        self.disk_watch = disk_watch or disk_watchdog.Config(trigger_gb=0)
         # The review sweep (bus/review_sweep.py); off unless LOOM_REVIEW_SWEEP=on.
         self.review_sweep = review_sweep or review_sweep_mod.Config()
         self.repo_open_pr_caps = {"*": 8, **(repo_pr_caps or {})}
@@ -1373,6 +1381,7 @@ class Settings:
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
                    review_sweep=review_sweep_mod.Config.from_env(env),
+                   disk_watch=disk_watchdog.Config.from_env(env),
                    transcript_token_ssm=env.get("LOOM_TRANSCRIPT_TOKEN_SSM", "").strip(),
                    watched=watched,
                    rewrite_cmd=env.get("LOOM_REWRITE_CMD", "").strip(),
@@ -3356,12 +3365,11 @@ class Station:
         if not issues:
             return None
         latest = None
-        pattern = re.compile(r"^<!-- loom:remote-heartbeat v1 ([a-z0-9-]+) ([0-9.]+) -->$")
         # A trusted heartbeat only: a stranger's copy must not mark a lane alive.
         for comment in brain.trusted_comments(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issues[0]["number"]))),
                 self.s.authors):
-            match = pattern.fullmatch(str(comment.get("body") or "").strip())
+            match = lane_markers.heartbeat_match(comment.get("body"))
             if match and match.group(1) == lane:
                 try:
                     at = float(match.group(2))
@@ -5205,6 +5213,10 @@ class Station:
         # (one pulls/comments post per finding), so the factory's fix rounds
         # and rebuttal reads meet them exactly like the review bot's threads.
         for finding in [f for f in blocking if "file" in f and "line" in f]:
+            if not notify.visible_text(finding.get("finding")):
+                _say("a Luna finding on %s#%d has no visible text; no review thread "
+                     "posted for it" % (repo, pr_number))
+                continue
             try:
                 self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
                     "commit_id": sha, "path": finding["file"],
@@ -6058,7 +6070,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found)
+        return self._apply_brief_hold(repo, number, found, body)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6081,7 +6093,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
+                          body: str = "") -> bool:
         """Apply the existing health, area, criteria, split or person-ask hold."""
         try:
             brain.move(self.gh, repo, number, "queued")
@@ -6119,7 +6132,7 @@ class Station:
                     "slices so each slice queues only when the one before it "
                     "has merged."))
             else:
-                brain.human(self.gh, repo, number, brief_check.ask(found))
+                brain.human(self.gh, repo, number, brief_check.ask(found, body))
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
@@ -7490,11 +7503,54 @@ class Station:
             return False
         except (GitHubError, ValueError) as err:
             _say("could not ship %s#%d: %s" % (repo, number, err))
+            if self._ship_fallback(repo, number, note):
+                self._deployed_seen(key, False)
+                _say("shipped %s#%d (fallback): %s carries #%d" % (
+                    repo, number, what, int(pr["number"])))
+                return True
             self._deployed_seen(key, True)
             return False
         self._deployed_seen(key, False)
         _say("shipped %s#%d: %s carries #%d" % (repo, number, what, int(pr["number"])))
         return True
+
+    def _ship_fallback(self, repo: str, number: int, note: str) -> bool:
+        """Retry a failed shipped move after checking the issue is still merged.
+
+        GitHub can reject the first label replacement while a deployed ticket
+        remains at loom:merged. Re-read its state before retrying the label
+        update, so a concurrent move or close is never overwritten.
+        """
+        try:
+            from . import labels as label_defs
+            wanted = label_defs.LABELS["loom:shipped"]
+            self.gh.rest("POST", "/repos/%s/labels" % repo,
+                         {"name": "loom:shipped", "color": wanted["color"],
+                          "description": wanted["description"]}, ok=(422,))
+            issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+            if issue.get("state") != "open":
+                return False
+            names = _label_names(issue)
+            if "loom:verified" in names:
+                return False
+            if "loom:shipped" in names and "loom:merged" not in names:
+                return True
+            if "loom:merged" not in names:
+                return False
+            kept = brain._moved_labels(names, "shipped", None)
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": kept})
+            notify.post(self.gh, repo, number, note, notify.SHIPPED)
+            return True
+        except RateLimited:
+            raise
+        except ShadowHeld as err:
+            if (err.entry or {}).get("new"):
+                _say("shadow mode holds shipping %s#%d: %s" % (repo, number, err))
+            return False
+        except (GitHubError, ValueError) as err:
+            _say("ship retry could not move %s#%d: %s" % (repo, number, err))
+            return False
 
     def _deployed_seen(self, key: str, seen: bool) -> None:
         """Keep when a ship rule first found the ticket deployed
@@ -10389,11 +10445,11 @@ class Station:
     def _lanes_body(self, rows: List[Tuple[str, str, str]],
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
-        disk = self._disk_status_line()
+        disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
         body = "\n".join(
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
-            + ([disk, ""] if disk else [])
+            + (disk + [""] if disk else [])
             + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
             + ["| %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
@@ -10496,6 +10552,7 @@ class Station:
             self._scorecard_lines()).encode("utf-8")).hexdigest()[:16]
         # Claims paused or resumed for disk republishes (loom#1808).
         values["disk"] = "paused" if self._disk_status_line() else "ok"
+        values["disk watchdog"] = self._watchdog_notice() or ""
         if refresh_pr_counts:
             read_lines, read_at = self._repo_pr_lines(), self.now
             pr_lines = read_lines
@@ -13942,13 +13999,18 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003). One log line per goal."""
+        seconds (decision 0003), resuming after a carried-over read. One log
+        line per goal."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
         checked = state.get("checked")
-        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+        finished = state.get("finished", [])
+        if not isinstance(finished, list):
+            finished = []
+        if (not finished and self._num(checked)
+                and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY):
             return
         try:
             homes = self._goal_homes()
@@ -13957,18 +14019,27 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("outside-epic: could not read the goal homes: %s" % err)
             return
+        completed = set(item for item in finished if isinstance(item, str))
         for repo, goal in homes:
             number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            if key in completed:
+                continue
             try:
                 moved, left = brain.move_outside_tickets(self.gh, repo, number)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not finished: a resumed pass retries this home.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
                 continue
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
+            completed.add(key)
+            state["finished"] = sorted(completed)
+            _write_json(path, state)
         state["checked"] = self.now
+        state["finished"] = []
         _write_json(path, state)
 
     # -- invariants -------------------------------------------------------
@@ -16895,6 +16966,51 @@ class Station:
             return "Claims paused: the loom home's disk is low on free space"
         return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
 
+    def tend_watchdog(self) -> None:
+        """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
+        the claim floor is reached (bus/disk_watchdog.py, loom#3187): Time
+        Machine local snapshots on macOS, old lane logs, finished run scratch, old lane trees (archived), then idle
+        lanes' tool caches. Nothing a waiting or running brief names, and no
+        busy lane's folder, is touched; an inbox that cannot be read stops it."""
+        if self.s.disk_watch.trigger_gb <= 0:
+            return
+        live: Set[str] = set()
+        for lane in LANES:
+            try:
+                live |= {e[:-3] for e in os.listdir(self.inbox(lane)) if e.endswith(".md")}
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _say("cannot list lane %s's inbox, so the disk watchdog waits: %s" % (lane, err))
+                return
+        run = os.path.join(self.s.home, "run")
+        # Only the home's own tree folder: the agy folder sits in another
+        # user's home and is left to prune_trees.
+        roots = disk_watchdog.Roots(home=self.s.home,
+                                    trees=(os.path.join(self.s.home, "worktrees"),),
+                                    lanes=tuple(LANES), live=frozenset(live),
+                                    idle=frozenset(s for s in LANES if self._lane_idle(run, s)),
+                                    locked=lambda slot: self._lane_locked(run, slot))
+        path = os.path.join(self.state, DISK_WATCH_FILE)
+        saved = _read_json(path, {}, strict=False)
+        saved = saved if isinstance(saved, dict) else {}
+        # LOOM_THIN_SNAPSHOTS=0 also keeps Time Machine local snapshots.
+        tm = disk_watchdog.TimeMachine.for_host() if self.s.thin_snapshots else None
+        out = disk_watchdog.tend(self.s.disk_watch, roots, disk_watchdog.RealDisk(),
+                                 self.s.disk_free_min_gb * GB, self.now, _say, saved, tm=tm)
+        if out != saved:
+            _write_json(path, out)
+        if out.get("at") == self.now:
+            # Read the free space again for the claim floor and the size line.
+            self._free_read = False
+
+    def _watchdog_notice(self) -> Optional[str]:
+        """The disk watchdog's lane status line while Loom's own data is
+        cleared and the disk is still under the floor, else None."""
+        saved = _read_json(os.path.join(self.state, DISK_WATCH_FILE), {}, strict=False)
+        notice = saved.get("notice") if isinstance(saved, dict) else None
+        return notice if isinstance(notice, str) and notice else None
+
     def tend_disk(self) -> None:
         """Keep the loom home bounded and say how big it is (loom#643). Every
         DISK_EVERY seconds the service logs rotate, the lane logs past
@@ -17647,7 +17763,7 @@ class Station:
         """Local housekeeping that needs no GitHub request: finished lane
         trees, old lane logs, the disk, the usage snapshot and the command
         chain snapshot."""
-        for local in (self.prune_trees, self.tend_disk):
+        for local in (self.prune_trees, self.tend_watchdog, self.tend_disk):
             try:
                 local()
             except OSError as err:
