@@ -209,6 +209,8 @@ def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, 
         for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
                                 % (repo, quote(lane, safe=""))):
             reason = _rejection_reason(item, lane)
+            if reason is None and brain.has_open_rewrite(gh, repo, item):
+                reason = "has an open rewrite ticket"
             if reason is None:
                 found.append((str(item.get("created_at") or ""), repo, item))
             elif isinstance(item, dict) and isinstance(item.get("number"), int):
@@ -241,8 +243,9 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     # unrun by the runner (loom#2249).
     if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
         return "no acceptance criteria"
-    if brief_check.split_hold(item):
-        return "spans more than one platform"
+    split = brief_check.split_verdict(str(item.get("body") or ""))
+    if split is not None:
+        return split.reason
     # The factory's reading (its default tier for a ticket with no
     # Difficulty: line), so a ticket it reserved for this lane is one the
     # lane takes (a reserved ticket sat unclaimed under four Muse lanes).

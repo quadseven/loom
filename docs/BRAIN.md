@@ -1155,6 +1155,11 @@ fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
 requests a factory pass; the log names each request against that bound and the
 pull request that waits for the next pass.
 
+When review findings survive a fix round on two different model rungs, the
+factory leaves the pull request open, marks its ticket `needs-brain`, and
+asks the brain to split it into tickets with `After:` dependencies. Usage
+limits keep their usual routing.
+
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
 `plan-truncated` or `cross-cohort-module` (each asks the author to split the
@@ -1610,11 +1615,11 @@ reasons stay in the local viewer.
 
 ## Asks
 
-One label asks a person: `needs:human` (loom#2278). `needs-operator`,
-`needs:quadseven` and `loom:human` are old names of it: every reader treats
-them as `needs:human`, and the label pass (`bus/label_pass.py`) moves one to
-`needs:human` only when it writes to that ticket anyway. No pass relabels on
-its own, and none posts a comment.
+The label `needs:human` asks a person. The built-in aliases are
+`needs-operator` and `loom:human`. Set `LOOM_LEGACY_HUMAN_LABELS` on the
+station, brain and dashboard to recognize any deployment-specific aliases
+on existing tickets. The label pass (`bus/label_pass.py`) moves an alias
+to `needs:human` only when it writes to that ticket anyway.
 
 The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
 comment after the ask by an operator or trusted person that is not a

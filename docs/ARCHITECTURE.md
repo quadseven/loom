@@ -7,15 +7,16 @@ subscriptions are the crew. Nobody shares credentials across lanes.
 
 ## Components
 
-Six of the seven modules in `dispatch/` are docstring-only design notes (`dispatch.py`, `metrics.py`, `report.py`, `ship.py`, `usage_watch.py`, `verify.py`); only `dispatch/dispatcher.py` carries code, and only the tests call it. Sections below that name a `dispatch/` file describe the role that file's docstring specifies; the running implementation lives in `bus/`.
+The running goal loop lives in `bus/`. Six modules in `dispatch/` are
+docstring-only design notes (`dispatch.py`, `metrics.py`, `report.py`,
+`ship.py`, `usage_watch.py`, `verify.py`). The remaining module,
+`dispatch/dispatcher.py`, routes local ticket files and renders briefs.
+Its only callers are `tests/test_dispatcher.py` and `tests/test_repo_config.py`.
 
-### 1. Goal + scoreboard (`dispatch/metrics.py`)
+### 1. Goal and scoreboard (`bus/metrics.py`)
 
-As shipped today, `dispatch/metrics.py` is a docstring-only design note with no code; the running metric collection lives in `bus/` (notably `bus/metrics.py`). The text below describes the role, not that file's contents.
-
-Every 30 minutes, per active goal, measure the north-star metric and write it
-to `state/metrics/<goal>.jsonl` (append-only). Each goal defines its metric
-on its goal home issue, in the project's own repo.
+Each goal defines its metric on its goal home issue in the project's own
+repository. The station collects and publishes the factory metrics snapshot.
 
 ### 2. Ticket queue (GitHub issues)
 
@@ -64,33 +65,25 @@ Sources: OpenRouter key API, sparks nvidia-smi, official usage websites for
 Claude/Codex (their own dashboards, just looking), self-reported burn from
 worker logs everywhere else.
 
-The dispatcher scores each ticket easy/medium/hard and assigns the cheapest
-lane whose tier fits: frontier (Astra, Opus) for brain surgery, strong
-(Sol, Sonnet) for standard building, fast (Luna, Haiku) and free for volume.
-Model names are discovered at runtime, never hardcoded.
+The factory routes tickets using their difficulty, model pins, and lane
+availability.
 
-### 5. Shipper (`dispatch/ship.py`)
+### 5. Shipping (`bus/factory.py` and `bus/station.py`)
 
-As shipped today, `dispatch/ship.py` is a docstring-only design note with no code; the running shipper is the factory in `bus/`. The text below describes the role, not that file's contents.
-
-One shipper (Muse). Squash merges, answers every bot comment, batches ships.
-Every PR is reviewed by grug (Grug - Chief) before merge - no exceptions.
+The factory gates and merges reviewed pull requests. The station checks for
+deployment evidence and marks merged tickets shipped.
 Per-goal ship rules (deploy caps, windows when nothing may roll, pins that
 move together) live on each goal's home issue in the project's own repo.
 
-### 6. Verifier (`dispatch/verify.py`)
+### 6. Verification (`bus/station.py`)
 
-As shipped today, `dispatch/verify.py` is a docstring-only design note with no code; the running verifier is the station's live proof in `bus/`. The text below describes the role, not that file's contents.
+The station checks live proof for shipped tickets against their acceptance
+criteria.
 
-Tickets close only on live proof: the fix's proof log line AND the metric it
-targets moved. No green CI alone.
+### 7. Reporting (`bus/brain.py` and `bus/station.py`)
 
-### 7. Reporter (`dispatch/report.py`)
-
-As shipped today, `dispatch/report.py` is a docstring-only design note with no code; the running reporter is the brain in `bus/`. The text below describes the role, not that file's contents.
-
-Every 2 hours, five lines to the owner: metric deltas, cleared in order, top
-blocker, shipped and verified, next. Decisions indexed daily per goal doc.
+The brain records tick outcomes in goal journals. The station forwards
+reports and sends digests on the configured schedule.
 
 ## Documentation
 
