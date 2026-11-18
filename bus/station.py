@@ -14313,15 +14313,21 @@ class Station:
         linked = brain.part_of_linked(self.gh, repo, [
             int(epic["number"]) for epic, _ in tree
             if epic.get("state", "open") == "open" and not brain.standing_epic(epic)])
+        stranded: Dict[int, List[invariants.Ref]] = {}
+        for ticket, parent in brain._closed_epic_tickets(tree):
+            stranded.setdefault(parent, []).append(ref(ticket))
         epics = []
         for epic, found in tree:
+            epic_number = int(epic["number"])
+            opened = epic.get("state", "open") == "open"
             union = {int(t.get("number") or 0): t for t in found}
-            for t in linked.get(int(epic["number"]), []):
+            for t in linked.get(epic_number, []):
                 union.setdefault(int(t.get("number") or 0), t)
             union.pop(0, None)
+            open_tickets = (tuple(ref(t) for t in union.values() if t.get("state") != "closed")
+                            if opened else tuple(stranded.get(epic_number, [])))
             epics.append(invariants.EpicShape(
-                ref(epic), epic.get("state", "open") == "open", len(union),
-                tuple(ref(t) for t in union.values() if t.get("state") != "closed"),
+                ref(epic), opened, len(union), open_tickets,
                 brain.standing_epic(epic), brain.sub_issue_count(self.gh, repo, epic, found),
                 title=str(epic.get("title") or "")))
         return invariants.GoalShape(self._invariant_ref(repo, number),
