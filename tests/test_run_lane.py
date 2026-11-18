@@ -4093,7 +4093,7 @@ exec /usr/bin/git "$@"
         deny.mkdir(parents=True)
         (deny / "deny-list").write_text("secret-product-name\n")
 
-    def egress_run(self, *, opens=False, sandbox="bwrap"):
+    def egress_run(self, *, opens=False, sandbox="bwrap", **env):
         root = Path(self._tmp.name)
         started, completed, probes = (root / name for name in ("started", "completed", "probes"))
         deny, allow = "192.0.2.1", "allow.example.invalid"
@@ -4125,7 +4125,7 @@ touch {shlex.quote(str(completed))}
         inbox, result = self.pod_lane(LOOM_SANDBOX=sandbox, LOOM_CLUSTER_RUNNER="1",
                                       LOOM_EGRESS_DENY_PROBES=deny + ":443",
                                       LOOM_EGRESS_ALLOW_PROBE=allow + ":443",
-                                      LOOM_EGRESS_RECHECK_SECONDS="1")
+                                      LOOM_EGRESS_RECHECK_SECONDS="1", **env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(started.exists())
         calls = [line.split() for line in probes.read_text().splitlines()] if probes.exists() else []
@@ -4157,6 +4157,22 @@ touch {shlex.quote(str(completed))}
         incident = self.body.with_suffix(".md.issue").read_text()
         self.assertIn("Kind: egress-opened", incident)
         self.assertNotIn("192.0.2.1", incident)
+
+    def test_egress_failure_reports_credential_cleanup_failure(self):
+        self.write_tool(self.bin / "rm", """#!/bin/sh
+case "$1:$2" in
+  -rf:*/opencode-go-gh.*) [ ! -f "$2/hosts.yml" ] || exit 1 ;;
+esac
+exec /bin/rm "$@"
+""")
+        inbox, _, _ = self.egress_run(
+            opens=True, LOOM_GITHUB_APP_ID="124",
+            LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_test"))
+        self.assertTrue((inbox / "failed" / "T042-fix-the-thing.md").exists())
+        reason = self.failure_line(lane="opencode-go")
+        self.assertTrue(reason.startswith("[egress-opened] "), reason)
+        self.assertIn("could not remove the agent's gh credential store", reason)
+        self.assertIn("factory incident ", reason)
 
     def test_a_runner_rechecks_at_the_configured_interval_and_allows_provider_outages(self):
         inbox, completed, checks = self.egress_run()

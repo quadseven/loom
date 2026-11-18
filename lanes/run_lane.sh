@@ -4744,11 +4744,12 @@ for BRIEF in "$INBOX"/*.md; do
   STATUS=$?
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
+  GH_CLEANUP_FAILURE=""
   if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
+    GH_CLEANUP_FAILURE="could not remove the agent's gh credential store"
     if [ ! -s "$LOCK/egress-opened" ]; then
-      park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
+      park "$BRIEF" "$GH_CLEANUP_FAILURE" transient; continue
     fi
-    echo "could not remove the agent's gh credential store" >> "$LOG"
   fi
   is_api_lane && archive_transcripts
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
@@ -4767,7 +4768,8 @@ for BRIEF in "$INBOX"/*.md; do
     if [ "$TOKEN_READY" = 1 ]; then
       INCIDENT="$(file_factory_incident egress-opened "A deny probe connected during the agent run. See the sealed lane log for the address.")"
     fi
-    LOOM_LOG_TAIL=off park "$BRIEF" "egress probe connected; nothing pushed; $INCIDENT" egress-opened
+    LOOM_LOG_TAIL=off park "$BRIEF" \
+      "egress probe connected; nothing pushed; $INCIDENT${GH_CLEANUP_FAILURE:+; $GH_CLEANUP_FAILURE}" egress-opened
     break
   fi
   if [ "$TOKEN_READY" = 0 ]; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
