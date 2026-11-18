@@ -233,7 +233,10 @@ unset variables.
   127 as `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. When a final check has a green base verdict and every reported
+  test failure is a sandbox or network refusal, the runner parks it as a
+  factory environment fault and names the sandbox refusal in the reason;
+  `bus.validation_timeout` classifies the diagnostics.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's

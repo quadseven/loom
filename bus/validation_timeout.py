@@ -23,6 +23,31 @@ MAX_ERROR_SECTIONS = 512
 ERROR = re.compile(r"^ERROR: (.+)$", re.MULTILINE)
 TEST_MODULE = re.compile(r"\(([A-Za-z_][A-Za-z0-9_.]*)\)")
 EXCEPTION = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):", re.MULTILINE)
+SANDBOX_REFUSAL = re.compile(
+    r"PermissionError: \[Errno 1\] Operation not permitted|"
+    r"Operation not permitted|Connection refused|"
+    r"Could not resolve host|Temporary failure in name resolution|"
+    r"Network is unreachable|download.*refused",
+    re.IGNORECASE,
+)
+
+
+def only_sandbox_refusals(output: str) -> bool:
+    """Whether every reported test failure ends in a sandbox or network refusal."""
+    if len(output) > MAX_OUTPUT_CHARACTERS or "FAIL:" in output:
+        return False
+    failures = list(islice(ERROR.finditer(output), MAX_ERROR_SECTIONS + 1))
+    if not 1 <= len(failures) <= MAX_ERROR_SECTIONS:
+        return False
+    sections = [output[match.start():failures[i + 1].start()
+                       if i + 1 < len(failures) else len(output)]
+                for i, match in enumerate(failures)]
+    terminal = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*:.*)$", re.MULTILINE)
+    return all(
+        (matches := terminal.findall(section))
+        and SANDBOX_REFUSAL.search(matches[-1])
+        for section in sections
+    )
 
 
 def only_untouched_test_timeouts(output: str, changed_paths: set[str],
@@ -74,6 +99,9 @@ def _module_matches_test_path(module: str, path: str) -> bool:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--sandbox-refusal"]:
+        output = sys.stdin.read(MAX_OUTPUT_CHARACTERS + 1)
+        return 0 if only_sandbox_refusals(output) else 1
     if len(sys.argv) != 4:
         return 2
     # AI-REVIEW 2026-11-12 [deepseek-v4.1-flash/opencode-go + gpt-6.1-sol/native verification] E03 (PR #3019):

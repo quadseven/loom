@@ -3418,6 +3418,13 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ "$BASELINE_EXIT" -eq 0 ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_timeout --sandbox-refusal; then
+    PARK_CLASS=factory
+    VALIDATION_REASON="validation environment unavailable: sandbox refusal in the check"
+    note_factory_incident environment "$VALIDATION_REASON" VALIDATION_REASON
+  fi
   if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
      tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
        python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then

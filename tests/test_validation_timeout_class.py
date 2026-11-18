@@ -8,6 +8,28 @@ class ValidationTimeoutClass(unittest.TestCase):
 
         self.classify = only_untouched_test_timeouts
 
+    def test_only_sandbox_refusals_are_environment_failures(self):
+        from bus.validation_timeout import only_sandbox_refusals
+
+        output = """ERROR: test_download (test_service.ServiceTests.test_download)
+Traceback (most recent call last):
+  File "test_service.py", line 1, in test_download
+PermissionError: [Errno 1] Operation not permitted
+"""
+        self.assertTrue(only_sandbox_refusals(output))
+        self.assertFalse(only_sandbox_refusals(
+            output + "FAIL: test_logic (test_service.ServiceTests.test_logic)\n"
+            "AssertionError: mismatch\n"))
+        self.assertFalse(only_sandbox_refusals(
+            output + "\nRuntimeError: validation harness failed\n"))
+
+    def test_ordinary_assertion_is_not_a_sandbox_refusal(self):
+        from bus.validation_timeout import only_sandbox_refusals
+
+        self.assertFalse(only_sandbox_refusals(
+            "FAIL: test_case (test_example.Example.test_case)\n"
+            "AssertionError: mismatch\n"))
+
     @staticmethod
     def _timeout_report():
         return ("ERROR: test_case (test_example.Example.test_case)\n"
@@ -255,6 +277,7 @@ class ValidationTimeoutStationOutcome(unittest.TestCase):
 
 class ValidationTimeoutRunnerOutcome(unittest.TestCase):
     def _run_validation_failure(self, *, mixed_failure=False, changed_test=False,
+                                sandbox_refusal=False,
                                 error_tail=""):
         import test_run_lane as fixtures
 
@@ -268,9 +291,14 @@ class ValidationTimeoutRunnerOutcome(unittest.TestCase):
         test_file = work / "tests" / "test_example.py"
         test_file.parent.mkdir()
         test_file.write_text("VALUE = 'original'\n")
-        output = ("ERROR: test_case (test_example.Example.test_case)\n"
-                  "Traceback (most recent call last):\n"
-                  "subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds")
+        if sandbox_refusal:
+            output = ("ERROR: test_case (test_example.Example.test_case)\n"
+                      "Traceback (most recent call last):\n"
+                      "PermissionError: [Errno 1] Operation not permitted")
+        else:
+            output = ("ERROR: test_case (test_example.Example.test_case)\n"
+                      "Traceback (most recent call last):\n"
+                      "subprocess.TimeoutExpired: Command '['bash']' timed out after 60 seconds")
         output += error_tail
         if mixed_failure:
             output += "\nFAIL: test_other (test_example.Example.test_other)\nAssertionError: mismatch"
@@ -306,6 +334,11 @@ class ValidationTimeoutRunnerOutcome(unittest.TestCase):
         log = self._run_validation_failure()
         self.assertIn("failed: [transient] validation failed: only unchanged test files "
                       "reported TimeoutExpired errors", log)
+        self.assertNotIn("failed: [work]", log)
+
+    def test_final_sandbox_refusal_with_green_base_is_environment_fault(self):
+        log = self._run_validation_failure(sandbox_refusal=True)
+        self.assertIn("failed: [factory] validation environment unavailable: sandbox refusal", log)
         self.assertNotIn("failed: [work]", log)
 
     def test_final_validation_keeps_mixed_assertion_failures_as_work(self):
