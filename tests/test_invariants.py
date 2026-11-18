@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -58,6 +59,7 @@ class FakeGH:
         # (repo, number) -> a pull request as GET .../pulls/N answers it.
         self.pull_state = {}
         self.check_runs = {}
+        self.scheduled_runs = {}
         self.private = {OTHER}
         self.calls = []
         self.writes = []
@@ -108,6 +110,17 @@ class FakeGH:
             return Response(201, {"number": number, "id": 9000 + number})
         if method == "GET" and path.startswith("/search/issues?"):
             return Response(200, {"items": self.search_items})
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/actions/runs\?(.+)", path)
+        if method == "GET" and m:
+            runs = self.scheduled_runs.get(m.group(1), [])
+            if isinstance(runs, GitHubError):
+                raise runs
+            query = parse_qs(m.group(2))
+            assert query["event"] == ["schedule"] and query["status"] == ["completed"]
+            size = int(query["per_page"][0])
+            start = size * (int(query["page"][0]) - 1)
+            return Response(200, {"total_count": len(runs),
+                                  "workflow_runs": runs[start:start + size]})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues", path)
         if method == "POST" and m and int(m.group(2)) in self.refuse_subs:
             raise GitHubError("Validation Failed: sub-issue limit reached", 422)
@@ -675,7 +688,8 @@ class StationTest(StationBase):
                 (REPO, GOAL): [epic(n) for n in range(40, 47)]}),
                 "Goal home #30: 7 open epics (cap 6)"),
             "closed-epic-open-tickets": (lambda: self.gh.subs.update({
-                (REPO, GOAL): [epic(40, state="closed")], (REPO, 40): [ticket(7)]}),
+                (REPO, GOAL): [epic(40, state="closed")],
+                (REPO, 40): [dict(ticket(7), id=9007)]}),
                 "Closed epic #40 of goal home #30: 1 open tickets, #7"),
             # loom#2030: two open epics in one repo with one title.
             "epic-title-shared": (lambda: self.gh.subs.update({
@@ -705,6 +719,26 @@ class StationTest(StationBase):
                 self.run_at(T0 + 2 * invariants.CHECK_EVERY)
                 self.run_at(T0 + invariants.CLEAR_AFTER + 3 * invariants.CHECK_EVERY)
                 self.assertEqual(filed[0]["state"], "closed", self.said)
+
+    def test_closed_epic_report_clears_when_only_nonmovable_children_remain(self):
+        self.gh.subs[(REPO, GOAL)] = [epic(40, state="closed")]
+        triage = dict(ticket(7), id=9007, labels=[{"name": "loom:triage"}])
+        pull = dict(ticket(8), id=9008, pull_request={})
+        ask = dict(ticket(9), id=9009, labels=[{"name": "loom:ticket"}, {"name": "needs:human"}])
+        child_epic = dict(epic(10), id=9010)
+        closed = dict(ticket(11, state="closed"), id=9011)
+        stranded = dict(ticket(12), id=9012, body="Why.\n\nPart of #40\n")
+        self.gh.subs[(REPO, 40)] = [triage, pull, ask, child_epic, closed]
+        self.gh.tickets[REPO] = [stranded]
+
+        self.run_at(T0)
+        (report,) = self.gh.filed()
+        self.assertIn("Closed epic #40 of goal home #30: 1 open tickets, #12", report["body"])
+
+        self.gh.tickets[REPO].clear()
+        self.run_at(T0 + invariants.CHECK_EVERY)
+        self.run_at(T0 + invariants.CHECK_EVERY + invariants.CLEAR_AFTER)
+        self.assertEqual(report["state"], "closed", self.said)
 
     def test_epic_over_cap_counts_sub_issues_and_part_of_links_once(self):
         """loom#2023: 13 sub-issues plus 4 issues linked only by a Part of

@@ -274,6 +274,8 @@ class FakeGitHub:
             return reply(200, self.factory_incidents)
         if method == "GET" and parts.path == "/search/code":
             return self._code_search(parts.query)
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs", parts.path):
+            return reply(200, {"total_count": 0, "workflow_runs": []})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -3108,16 +3110,15 @@ class BudgetTest(Base):
         self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
 
-    def test_below_the_floor_the_daily_metrics_line_still_goes_out(self):
-        # 2026-10-18: the floor deferred every step after triage on every
-        # pass, post_metrics among them, and no metrics line posted that day.
+    def test_below_the_floor_the_daily_metrics_step_waits(self):
+        self.settings.metrics_goal = REPO + "#1"
         transport, reset = self.low()
         gh = GitHub("token", transport=transport)
         gh.rate["core"] = (500, 5000, reset)
         with mock.patch.object(station.Station, "post_metrics", autospec=True) as posted:
             _, err = self.passes(gh=gh)
         self.assertIn("budget low", err)
-        self.assertEqual(posted.call_count, 1)
+        posted.assert_not_called()
 
     def test_above_the_floor_nothing_is_deferred(self):
         self.settings.status_repo = REPO
@@ -5110,7 +5111,8 @@ class CorruptStateTest(Base):
         # ready-for-agent issues (loom#3092).
         # The last-pass shipped wait stamp adds one canonical all-repo read,
         # and the ended-run sweep one read of the running tickets (loom#3134).
-        self.assertEqual(self.run_pass().requests, 22)
+        # The invariant pass also reads the completed scheduled workflow runs.
+        self.assertEqual(self.run_pass().requests, 23)
 
 
 class TicketsTest(unittest.TestCase):
@@ -6266,6 +6268,17 @@ class FixTest(Base):
                                 "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
         self.run_pass()
         self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def test_a_fix_for_a_pull_request_sent_back_by_the_operator_uses_local_progress(self):
+        from bus import operator_hold
+        self.fake.add(12)
+        self.comment(12, answer.HUMAN_MARKER + "\n" + operator_hold.ask(99, ["deployment review"]))
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        brief = self.claimed_brief("example-owner.example-repo-12")
+        self.assertIn("Fix-PR: 99\nOperator-Review: yes\n", brief)
 
     def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
         # The claim was stamped with the pass's start time, earlier than the
@@ -7424,7 +7437,7 @@ class SilentLaneTest(Base):
         self.assertEqual([w.ticket.label for w in st._invariant_waits()],
                          [st._invariant_ref(REPO, 13).label])
 
-    def test_a_silent_move_is_recorded_when_the_factory_step_carries_over(self):
+    def test_silent_moves_and_waits_are_recorded_when_the_factory_step_carries_over(self):
         # loom#2094: on 2026-11-07 the factory moved twelve running tickets
         # off silent lanes, and every one of those passes carried the step
         # over at the request target. The moves were made on GitHub, but the
@@ -7437,7 +7450,8 @@ class SilentLaneTest(Base):
         class Runner:
             silent_running = {"codex": [(REPO, 12)]}
             silent = {"codex": 1860.0}
-            waits: dict = {}
+            waits = {"%s#13" % REPO:
+                     "parked fix round on lane codex: no free lane on its rung or the next"}
             settled: tuple = ()
 
             def run(self):
@@ -7450,6 +7464,8 @@ class SilentLaneTest(Base):
         self.assertEqual((run.lane, run.silent_for), ("codex", 1860.0))
         self.assertEqual(os.listdir(self.inbox("codex", "returned")),
                          ["example-owner.example-repo-12.md"])
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 13))
 
     def test_nothing_found_records_nothing(self):
         st = self.station()
@@ -7477,6 +7493,84 @@ class SilentLaneTest(Base):
     def test_returning_silent_briefs_tolerates_a_missing_inbox(self):
         st = self.station()
         st._return_silent_briefs({"codex": [(REPO, 12)]})  # no inbox dir: no crash
+
+
+class ParkedFixRoundTest(Base):
+    def park(self, age, lane="codex", model="gpt-6-luna"):
+        now = time.time()
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - age))
+        events = [dict(labeled(label, AUTHORS[0]), created_at=at)
+                  for label in ("loom:briefed", "lane:" + lane)]
+        body = "Difficulty: hard\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+        if model:
+            body = "Model: %s\n" % model + body
+        self.fake.add(12, lane=lane, body=body, events=events)
+        self.fake.comments[12].append({"id": 3, "body": FIX_BODY, "created_at": at,
+                                       "updated_at": at, "user": {"login": AUTHORS[0]}})
+        self.fake.pulls.append({"number": 99, "state": "open", "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        return now
+
+    def factory_pass(self, now, demoted=()):
+        self.settings.factory_on = True
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        os.makedirs(st.state, exist_ok=True)
+        with mock.patch.object(st, "demoted_lanes", return_value=dict.fromkeys(demoted, "scorecard")):
+            st.run_factory()
+        return st
+
+    def test_an_old_fix_on_a_demoted_lane_moves_to_a_free_lane_of_its_rung(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("claude")
+        now = self.park(3 * 3600, model=None)
+        with mock.patch.dict(os.environ, {"LOOM_CODEX_MODEL": "gpt-6-luna"}):
+            self.factory_pass(now, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex-2"])
+        self.assertIn("Model: gpt-6-luna\n", self.fake.issues[12]["body"])
+        self.assertEqual(self.fake.comments[12][0]["body"], FIX_BODY)
+
+    def test_an_old_fix_on_a_full_lane_moves_up_one_rung(self):
+        self.heartbeat("claude")
+        now = self.park(3 * 3600)
+        self.fake.add(13, state="running")
+        self.factory_pass(now)
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:claude"])
+        self.assertIn("Model: claude-opus-5-5\n", self.fake.issues[12]["body"])
+        self.assertEqual(self.fake.comments[12][0]["body"], FIX_BODY)
+        notes = status.expand(self.fake.comments[12], AUTHORS)
+        self.assertTrue(any("<!-- loom:rung 3 -->" in row["body"] for row in notes))
+
+    def test_no_free_lane_records_one_wait_with_age_across_passes(self):
+        self.heartbeat("claude")
+        now = self.park(3 * 3600)
+        self.fake.add(13, lane="claude", state="running")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.factory_pass(now, demoted=("codex",))
+            st = self.factory_pass(now + factory.FACTORY_CHECK, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex"])
+        self.assertEqual(output.getvalue().count("Fix round parked for 3 hours"), 1)
+        notes = status.expand(self.fake.comments[12], AUTHORS)
+        self.assertEqual(sum("Fix round parked for 3 hours" in row["body"] for row in notes), 1)
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 12))
+        self.assertEqual(wait.since, now)
+        self.assertIn("no free lane", wait.reason)
+
+        self.fake.issues[13]["state"] = "closed"
+        self.heartbeat("claude", age=-2 * factory.FACTORY_CHECK)
+        st = self.factory_pass(now + 2 * factory.FACTORY_CHECK, demoted=("codex",))
+        self.assertIn("lane:claude", self.fake.names(12))
+        self.assertEqual(st._invariant_waits(), [])
+
+    def test_a_new_fix_round_on_an_old_brief_stays_put(self):
+        self.heartbeat("codex-2")
+        now = self.park(3 * 3600)
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+        self.fake.comments[12][0].update(created_at=at, updated_at=at)
+        st = self.factory_pass(now, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex"])
+        self.assertEqual(st._invariant_waits(), [])
 
 
 class DeadLaneRunawayTest(Base):

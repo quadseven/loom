@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterator, List, Sequence
@@ -35,6 +37,27 @@ WORKABLE = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:fail
 TERMINAL_STATES = ("verified", "closed-unmerged")
 # A state needs this many tickets' waits before it can be the bottleneck.
 BOTTLENECK_MIN = 3
+REQUEST_RESERVE = 1500
+STEP_SECONDS = 300
+
+
+class Deferred(Exception):
+    """The daily build can continue in a later station pass."""
+
+
+@contextmanager
+def time_cap(seconds: float) -> Iterator[None]:
+    """Interrupt even an in-flight read in the station's main thread."""
+    def expired(_signum: int, _frame: Any) -> None:
+        raise Deferred("time cap reached")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def _state(event: Dict[str, Any]) -> str | None:
@@ -388,29 +411,35 @@ class Collector:
         self.gh, self.repos, self.home = gh, list(repos), home
         self.now, self.since, self.review_check = now, now - WINDOW, review_check
         self.trusted = {login.lower() for login in trusted}
-        self.events: Dict[tuple[str, int], List[Dict[str, Any]]] = {}
-        self.comments: Dict[tuple[str, int], List[Dict[str, Any]]] = {}
+        self.issue_reads: Dict[str, List[Dict[str, Any]]] = {}
 
     def list(self, path: str) -> List[Dict[str, Any]]:
         return [item for item in self.gh.paginate(path) if isinstance(item, dict)]
 
-    def issue_events(self, repo: str, number: int) -> List[Dict[str, Any]]:
-        key = (repo, number)
-        if key not in self.events:
-            self.events[key] = self.list("/repos/%s/issues/%d/events" % key)
-        return self.events[key]
+    def issue_list(self, repo: str, issue: Dict[str, Any], kind: str) -> List[Dict[str, Any]]:
+        path = "/repos/%s/issues/%d/%s" % (repo, int(issue["number"]), kind)
+        if path not in self.issue_reads:
+            self.issue_reads[path] = self._read_issue_list(path, issue.get("updated_at"))
+        return self.issue_reads[path]
 
-    def issue_comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
-        key = (repo, number)
-        if key not in self.comments:
-            self.comments[key] = self.list("/repos/%s/issues/%d/comments" % key)
-        return self.comments[key]
+    def _read_issue_list(self, path: str, updated: Any) -> List[Dict[str, Any]]:
+        if not isinstance(self.gh, GitHub) or not isinstance(updated, str) or not updated:
+            return self.list(path)
+        # Comments may include status events expanded from the issue body.
+        version = repr((updated, self.gh.status_in_body, sorted(self.gh.status_authors)))
+        key = path + "#metrics-issue"
+        kept = self.gh.recall(key, version)
+        if kept is not None:
+            return kept
+        items = self.list(path)
+        self.gh.remember(key, version, items)
+        return items
 
     def trusted_comment(self, comment: Dict[str, Any]) -> bool:
         return not self.trusted or str((comment.get("user") or {}).get("login") or "").lower() in self.trusted
 
     def label_time(self, repo: str, issue: Dict[str, Any], label: str) -> float:
-        found = [stamp(e.get("created_at")) for e in self.issue_events(repo, int(issue["number"]))
+        found = [stamp(e.get("created_at")) for e in self.issue_list(repo, issue, "events")
                  if e.get("event") == "labeled"
                  and (e.get("label") or {}).get("name") == label]
         return max(found, default=0.0)
@@ -558,27 +587,28 @@ class Collector:
         for goal in (g for g in goals if not naming.is_backlog_home(g)):
             key = "%s#%d" % (repo, goal["number"])
             newest = max((stamp(c.get("created_at"))
-                          for c in self.issue_comments(repo, int(goal["number"]))
+                          for c in self.issue_list(repo, goal, "comments")
                           if self.trusted_comment(c)
                           and str(c.get("body") or "").startswith(REPORT)), default=0.0)
             # Only a report past its reading time needs the quiet read.
             late = not newest or self.now >= brain.next_report_due(
                 datetime.fromtimestamp(newest, timezone.utc)).timestamp() + brain.REPORT_GRACE
-            if newest and late and self._quiet(repo, int(goal["number"]), issues):
+            if newest and late and self._quiet(repo, goal, issues):
                 total.quiet_goals.append(key)
                 continue
             total.report_ages[key] = self.now - newest if newest else float("inf")
             if late:
                 total.overdue_goals.append(key)
 
-    def _quiet(self, repo: str, number: int, issues: List[Dict[str, Any]]) -> bool:
+    def _quiet(self, repo: str, goal: Dict[str, Any], issues: List[Dict[str, Any]]) -> bool:
         """Whether the goal is quiet since its last report; a failed read
         counts it as not quiet, so its report age still counts."""
+        number = int(goal["number"])
         try:
-            children = brain.goal_children(self.gh, repo, number)
+            children = brain.goal_children(self.gh, repo, number, parallel=False)
         except GitHubError:
             return False
-        return quiet.quiet(self.issue_comments(repo, number), children,
+        return quiet.quiet(self.issue_list(repo, goal, "comments"), children,
                            brain.goal_breaches(issues, number),
                            datetime.fromtimestamp(self.now, timezone.utc),
                            sorted(self.trusted)) is not None
@@ -586,7 +616,7 @@ class Collector:
     def _urgent_regression(self, repo: str, issue: Dict[str, Any], created: float) -> bool:
         notes = [(created, str(issue.get("body") or ""))]
         notes += [(stamp(c.get("created_at")), str(c.get("body") or ""))
-                  for c in self.issue_comments(repo, int(issue["number"]))]
+                  for c in self.issue_list(repo, issue, "comments")]
         return any(REGRESSION.search(body) and self.now - at > 7200
                    for at, body in notes if at)
 
@@ -609,7 +639,7 @@ class Collector:
     def _ticket(self, repo: str, issue: Dict[str, Any], labels: set[str],
                 total: Totals) -> None:
         number = int(issue["number"])
-        comments = [c for c in self.issue_comments(repo, number) if self.trusted_comment(c)]
+        comments = [c for c in self.issue_list(repo, issue, "comments") if self.trusted_comment(c)]
         given_up = self._given_up(repo, number, comments)
         if (given_up and self.now - given_up > WINDOW
                 and issue.get("state") == "open" and "loom:failed" in labels):
@@ -620,7 +650,7 @@ class Collector:
             total.merged_tickets += 1
             if "loom:verified" in labels:
                 self._count_verified(comments, total)
-            self._merge_time(repo, number, merged, total)
+            self._merge_time(repo, issue, merged, total)
 
     @staticmethod
     def _count_verified(comments: List[Dict[str, Any]], total: Totals) -> None:
@@ -632,9 +662,9 @@ class Collector:
         total.verified_brain += newest.get("verified_by") == audit.BRAIN
         total.verified_lane += bool(audit.lane_of(newest))
 
-    def _merge_time(self, repo: str, number: int, merged: float, total: Totals) -> None:
+    def _merge_time(self, repo: str, issue: Dict[str, Any], merged: float, total: Totals) -> None:
         briefed = min((stamp(e.get("created_at"))
-                       for e in self.issue_events(repo, number)
+                       for e in self.issue_list(repo, issue, "events")
                        if e.get("event") == "labeled"
                        and (e.get("label") or {}).get("name") == "loom:briefed"),
                       default=0.0)
