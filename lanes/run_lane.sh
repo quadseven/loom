@@ -2530,18 +2530,26 @@ base_verdict_key() {
   printf '%s\n%s\n%s\n%s\n' "$REPO" "$1" "$C_CHECK" "$2" | sha256sum | cut -d' ' -f1
 }
 base_verdict_read() {  # key, now
-  local file="$BASE_VERDICT_DIR/$1" at exit ttl
+  local file="$BASE_VERDICT_DIR/$1" at exit uv_cache ttl
   [ -f "$file" ] || return 1
-  IFS=' ' read -r at exit < "$file" || return 1
+  IFS=' ' read -r at exit uv_cache < "$file" || return 1
   case "$at:$exit" in *[!0-9:]*|:*) return 1 ;; esac
+  # The verdict outlives the check home, but the packages do not. Rerun a
+  # passing check for a codex agent if it warmed uv or predates this marker.
+  if [ "$exit" -eq 0 ] && [ "$LANE" = codex ] && [ "$DELIVERABLE" != base-check ] &&
+     [ "$uv_cache" != plain ]; then
+    return 1
+  fi
   if [ "$exit" -eq 0 ]; then ttl="$BASE_VERDICT_TTL_GREEN"; else ttl="$BASE_VERDICT_TTL_RED"; fi
   [ "$2" -ge "$at" ] && [ "$(( $2 - $at ))" -lt "$ttl" ] || return 1
   BASELINE_EXIT="$exit"
   return 0
 }
 base_verdict_write() {  # key, exit
+  local uv_cache=plain
+  [ -d "$CHECK_HOME/.cache/uv" ] && uv_cache=uv
   mkdir -p "$BASE_VERDICT_DIR" || return 1
-  printf '%s %s\n' "$(date +%s)" "$2" > "$BASE_VERDICT_DIR/$1" || return 1
+  printf '%s %s %s\n' "$(date +%s)" "$2" "$uv_cache" > "$BASE_VERDICT_DIR/$1" || return 1
   # Every revision mints a new file; sweep the ones no read can use. A
   # failed sweep never fails the write.
   find "$BASE_VERDICT_DIR" -type f -mmin +"$(( BASE_VERDICT_TTL_GREEN / 60 ))" -delete 2>/dev/null || true

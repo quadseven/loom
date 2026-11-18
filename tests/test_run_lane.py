@@ -7531,6 +7531,7 @@ exit %d
             'printf "uv-env cache=%s python=%s offline=%s managed=%s pip=%s\\n" '
             '"${UV_CACHE_DIR:-unset}" "${UV_PYTHON_INSTALL_DIR:-unset}" "${UV_OFFLINE:-unset}" '
             '"${UV_MANAGED_PYTHON:-unset}" "${PIP_NO_INDEX:-unset}" >> "$FAKE_LOG"\n'
+            ': "${UV_CACHE_DIR:?missing uv cache}"\n'
             'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
             'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
         result = self.run_contract_lane()
@@ -7546,6 +7547,15 @@ exit %d
         self.assertIn("uv-pkg cached", calls)
         # The final check read its own cache, not the agent's copy.
         self.assertEqual([(r["phase"], r["ok"]) for r in self.records()][-1], ("final", True))
+
+        # The green verdict outlives the scratch home. The next agent still
+        # needs the base check's packages even though the revision is unchanged.
+        self.drop_brief("T043-fix-the-thing.md", BRIEF.replace("T042", "T043"))
+        result = self.run_contract_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.loom / "logs" / "codex" / "T043-fix-the-thing.log"
+        self.assertEqual(self.calls().count("uv-pkg cached"), 2, log.read_text())
+        self.assertTrue((self.inbox / "done" / "T043-fix-the-thing.md").exists(), log.read_text())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_codex_agent_without_a_uv_cache_runs_as_before(self):

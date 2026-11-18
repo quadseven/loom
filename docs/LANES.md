@@ -161,6 +161,8 @@ unset variables.
 - On a host, a base check verdict is reused by repo, base revision, check
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
+  Before running a Codex agent, the lane reruns green checks that populated
+  uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
