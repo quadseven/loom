@@ -2482,6 +2482,12 @@ What changes in a pod:
   pass because everything fails. Anything else holds the lane unavailable,
   with the reason in its heartbeat, so a policy the cluster network does not
   enforce holds the lane too.
+  While the agent runs, the runner repeats the probes every
+  `LOOM_EGRESS_RECHECK_SECONDS` seconds (default 60). If a deny probe
+  connects, the runner stops the agent, records the address in the sealed
+  lane log, and parks the brief as an `egress-opened` factory incident
+  without pushing. A failed allow probe is logged once per run and the
+  agent keeps running.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.

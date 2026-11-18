@@ -7887,6 +7887,17 @@ class FactoryIncidentTest(Base):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
         self.assertEqual(station.failure_class("[work] agent made no commit"), "work")
 
+    def test_egress_opened_holds_the_ticket_for_its_factory_incident(self):
+        self.heartbeat("muse")
+        self.fake.issues[99] = {"number": 99, "state": "open", "labels": [{"name": "loom:factory"}],
+                                "body": "<!-- loom:factory-incident v1 -->\n\nKind: egress-opened\n"}
+        self.failed(reason="[egress-opened] egress probe connected; nothing pushed; "
+                           "factory incident %s#99" % REPO)
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)),
+                         {"loom:ticket", "lane:muse", "loom:running", "wait:incident"})
+        self.assertTrue(any("when the factory incident closes" in b for b in self.bodies()))
+
     def test_a_factory_failure_holds_the_ticket_and_keeps_its_rung(self):
         self.heartbeat("muse")
         self.failed()

@@ -199,6 +199,7 @@ class RunnersTest(unittest.TestCase):
 
     # -- dispatch ------------------------------------------------------------
     def test_a_brief_is_dispatched_once_with_its_inputs(self):
+        self.env["LOOM_EGRESS_RECHECK_SECONDS"] = "15"
         self.drop_brief()
         self.runner().tend()
         posts = self.gh.posts("/dispatches")
@@ -213,6 +214,7 @@ class RunnersTest(unittest.TestCase):
         self.assertRegex(inputs["run_id"], r"^[0-9a-f]{32}$")
         self.assertTrue(inputs["report_key"].startswith("-----BEGIN PUBLIC KEY-----"))
         self.assertIn("LOOM_OPENCODE_GO_KEY_SSM=/x/oc\n", inputs["settings"])
+        self.assertIn("LOOM_EGRESS_RECHECK_SECONDS=15\n", inputs["settings"])
         self.assertNotIn("/station/app", inputs["settings"])
         # Still waiting: the brief stays in the inbox, the lane reads as alive.
         self.assertTrue((self.inbox / (TICKET + ".md")).exists())
