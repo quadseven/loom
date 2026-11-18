@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import base64
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta, timezone
 import errno
 import faulthandler
@@ -1179,7 +1180,9 @@ class Settings:
                  repo_pr_caps: Optional[Dict[str, int]] = None,
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None,
-                 disk_watch: Optional[disk_watchdog.Config] = None) -> None:
+                 disk_watch: Optional[disk_watchdog.Config] = None,
+                 metrics_reserve: int = metrics.REQUEST_RESERVE,
+                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
         self.home = home
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
         # loom#3187): off for a Settings built in code; from_env turns it on
@@ -1306,6 +1309,8 @@ class Settings:
         self.scope_url = scope_url
         self.scope_model = scope_model
         self.metrics_goal = metrics_goal
+        self.metrics_reserve = metrics_reserve
+        self.metrics_seconds = metrics_seconds
         self.transcript_url = transcript_url
         # SSM name of the Fabric workspace key (bus/fabric.py); empty, no question.
         self.fabric_key_ssm = fabric_key_ssm
@@ -1377,6 +1382,10 @@ class Settings:
                    scope_url=env.get("LOOM_SCOPE_CHECK_URL", "").strip(),
                    scope_model=env.get("LOOM_SCOPE_CHECK_MODEL", "").strip(),
                    metrics_goal=env.get("LOOM_METRICS_GOAL", "").strip(),
+                   metrics_reserve=_positive_int(env.get("LOOM_METRICS_RESERVE", ""),
+                                                 metrics.REQUEST_RESERVE),
+                   metrics_seconds=_positive_int(env.get("LOOM_METRICS_SECONDS", ""),
+                                                 metrics.STEP_SECONDS),
                    transcript_url=env.get("LOOM_TRANSCRIPT_URL", "").strip(),
                    fabric_key_ssm=env.get("LOOM_FABRIC_KEY_SSM", "").strip(),
                    fabric_review_notes=env.get("LOOM_FABRIC_REVIEW_NOTES", "").strip(),
@@ -1683,6 +1692,11 @@ def _seconds(raw: str, default: int) -> int:
 def _decision_window_days(raw: str) -> int:
     """A positive decision-default window in whole days, else three."""
     return int(raw) if str(raw).strip().isdigit() and int(raw) > 0 else 3
+
+
+def _positive_int(raw: str, default: int) -> int:
+    raw = raw.strip()
+    return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -6749,7 +6763,7 @@ class Station:
                      self.move_outside_tickets, self.check_invariants,
                      self.release_factory_held, self.apply_decision_defaults)
         self._note_every_pass()
-        paused = self._paused_steps(steps)
+        paused = self._paused_steps((*steps, self.post_metrics))
         self._run_due_steps(paused)
         rotation_path = os.path.join(self.state, STEP_ROTATION_FILE)
         rotation = _read_json(rotation_path, {}, strict=False)
@@ -6840,21 +6854,32 @@ class Station:
             _say("note_stale_shipped failed: %s" % err)
 
     def _run_due_steps(self, paused: Set[str]) -> None:
-        """score_lanes ahead of the rotation when its hour is up, so a slow
-        rotation does not hold an hourly step for hours (loom#3014: the
-        scorecard went 4.5 hours unrefreshed). The step stays in the rotation,
-        where a refresh that is not due only sends notices."""
-        if ("score_lanes" in paused or self._deferred()
-                or not scorecard.Scorecard(self.state, self.now).due()):
+        """Run scheduled work ahead of the rotation so it can resume each pass.
+
+        The scorecard also stays in the rotation to send notices (loom#3014).
+        """
+        if self._deferred():
             return
-        try:
-            self.score_lanes()
-        except TargetReached as err:
-            _say("step score_lanes carried over to the next pass: %s" % err)
-        except RateLimited:
-            raise
-        except (GitHubError, OSError, ValueError) as err:
-            _say("score_lanes failed: %s" % err)
+        if "score_lanes" not in paused and scorecard.Scorecard(self.state, self.now).due():
+            try:
+                self.score_lanes()
+            except TargetReached as err:
+                _say("step score_lanes carried over to the next pass: %s" % err)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("score_lanes failed: %s" % err)
+        if not self.s.metrics_goal:
+            return
+        if "post_metrics" in paused:
+            _say("step post_metrics paused (LOOM_PAUSED_STEPS)")
+        elif not self._deferred():
+            try:
+                self._timed(self.post_metrics)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, ValueError) as err:
+                _say("post_metrics failed: %s" % err)
 
     def _timed(self, step: Any) -> bool:
         """Run one pass step, logging it when it takes SLOW_STEP_SECONDS or
@@ -16425,9 +16450,9 @@ class Station:
     def _post_metrics_comment(self, path: str, today: str,
                               dated: Dict[str, Tuple[int, int]]) -> None:
         try:
-            numbers = metrics.Collector(self.gh, self.s.repos, self.s.home,
-                                        self.now, self.s.review_check,
-                                        self.s.authors).collect()
+            with self._resume_metrics(path, today) as started:
+                numbers = metrics.Collector(self.gh, self.s.repos, self.s.home, started,
+                                            self.s.review_check, self.s.authors).collect()
         except RateLimited:
             raise
         except (GitHubError, OSError) as err:
@@ -16439,10 +16464,28 @@ class Station:
         yesterday = (date.fromisoformat(today) - timedelta(days=1)).isoformat()
         streak = dated.get(yesterday, (0, 0))[1] + 1 if passed == 9 else 0
         body = metrics.render(numbers, today, streak)
-        # Outside the try above: a refused POST reaches run_pass, which logs
-        # "post_metrics failed", and today stays unposted for the next pass.
+        # A refused POST leaves today unposted for the next pass.
         self.gh.rest("POST", path, {"body": body})
         dated[today] = (passed, streak)
+
+    @contextmanager
+    def _resume_metrics(self, path: str, today: str) -> Iterator[float]:
+        if not isinstance(self.gh, GitHub) or not self.gh.cache_dir:
+            yield self.now
+            return
+        key = path + "#metrics-build"
+        saved = self.gh.recall(key, today)
+        if not saved or len(saved) != 2:
+            saved = [str(time.time_ns()), self.now]
+            self.gh.remember(key, today, saved)
+        scope, started = saved
+        with self.gh.resume_reads(scope):
+            yield started
+
+    def _check_metrics_reserve(self) -> None:
+        core = self._rates().get("core")
+        if core and core[0] <= self.s.metrics_reserve:
+            raise metrics.Deferred("GitHub core reserve reached (%d left)" % core[0])
 
     def _metrics_notice(self, today: str, key: str, line: str) -> None:
         ledger_path = os.path.join(self.state, "metrics.json")
@@ -16477,12 +16520,26 @@ class Station:
         if time.localtime(self.now).tm_hour < self.s.digest_hour:
             return
         path = "/repos/%s/issues/%d/comments" % (ref.group(1), int(ref.group(2)))
+        check = (self.gh.check_requests(self._check_metrics_reserve)
+                 if isinstance(self.gh, GitHub) else nullcontext())
+        try:
+            with check, metrics.time_cap(self.s.metrics_seconds):
+                self._check_metrics_reserve()
+                self._daily_metrics(path, today)
+        except metrics.Deferred as err:
+            _say("post_metrics will resume: %s" % err)
+
+    def _daily_metrics(self, path: str, today: str) -> None:
         # Read-then-post is safe: run() holds station.lock (flock) for the
         # whole pass, so no second pass can read the same day's comments
         # before this one has posted.
         dated = self._dated_metrics(path)
         if today not in dated:
             self._post_metrics_comment(path, today, dated)
+        if today in dated and isinstance(self.gh, GitHub):
+            key = path + "#metrics-build"
+            if self.gh.recall(key, today):
+                self.gh.remember(key, today, [])
         if today in dated and not self.s.report_digest:
             # With a report digest the day's numbers ride in it instead.
             passed, streak = dated[today]
@@ -17679,15 +17736,6 @@ class Station:
             except OSError as err:
                 _say("could not record the repo scans: %s" % err)
             self._run_steps()
-            # The day's metrics line goes out even below the budget floor: one post
-            # a day, and on 2026-10-18 the floor deferred it every pass, so the
-            # operator got no numbers for the day. Only a spent budget stops it.
-            try:
-                self.post_metrics()
-            except RateLimited:
-                raise
-            except (GitHubError, OSError, ValueError) as err:
-                _say("post_metrics failed: %s" % err)
             try:
                 self.watch_logs()
             except RateLimited:

@@ -3108,16 +3108,15 @@ class BudgetTest(Base):
         self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
 
-    def test_below_the_floor_the_daily_metrics_line_still_goes_out(self):
-        # 2026-10-18: the floor deferred every step after triage on every
-        # pass, post_metrics among them, and no metrics line posted that day.
+    def test_below_the_floor_the_daily_metrics_step_waits(self):
+        self.settings.metrics_goal = REPO + "#1"
         transport, reset = self.low()
         gh = GitHub("token", transport=transport)
         gh.rate["core"] = (500, 5000, reset)
         with mock.patch.object(station.Station, "post_metrics", autospec=True) as posted:
             _, err = self.passes(gh=gh)
         self.assertIn("budget low", err)
-        self.assertEqual(posted.call_count, 1)
+        posted.assert_not_called()
 
     def test_above_the_floor_nothing_is_deferred(self):
         self.settings.status_repo = REPO

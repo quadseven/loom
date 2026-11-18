@@ -35,7 +35,8 @@ import urllib.request
 import zlib
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from . import fixrounds, notify, proof, shadow, status, text as _text
 
@@ -690,6 +691,7 @@ class GitHub:
         # target check, so two threads cannot both pass the check one under
         # the target and land one over it (loom#3014).
         self._prepaid = threading.local()
+        self._request_scope = threading.local()
         self.requests = 0
         self.not_modified = 0
         # Requests by request_kind, 304s left out: what the budget counted.
@@ -991,6 +993,13 @@ class GitHub:
         acted = self._hold_in_shadow(method, path, body)
         refuse_incomplete_close(self, method, path, body)
         url = self._url(path)
+        scope = getattr(self._request_scope, "replay", "")
+        checkpoint = url + "#resumable" if scope and method == "GET" and not etag else ""
+        if checkpoint:
+            saved = self.recall(checkpoint, scope)
+            if saved and len(saved) == 4 and saved[0] in (200, 304) and isinstance(saved[3], dict):
+                self._release_prepaid()
+                return Response(*saved)
         # A caller's own ETag means the caller keeps the answer; otherwise
         # the cache does, when there is one.
         cached = self._cached(url) if method == "GET" and not etag else None
@@ -1000,13 +1009,17 @@ class GitHub:
         if acted is not None and 200 <= status < 300:
             shadow.record_acted(acted.action, acted.repo, acted.number, acted.kind)
         if status == 304 and cached is not None:
-            return self._from_cache(url, cached, resp_headers)
-        data = _json_or_none(text)
-        if method == "GET" and not etag:
-            self._keep_answer(url, status, data, resp_headers)
+            response = self._from_cache(url, cached, resp_headers)
+        else:
+            data = _json_or_none(text)
+            if method == "GET" and not etag:
+                self._keep_answer(url, status, data, resp_headers)
+            response = Response(status, data, resp_headers.get("etag"), resp_headers)
+        if checkpoint and response.status in (200, 304):
+            self.remember(checkpoint, scope, [response.status, response.data, response.etag, response.headers])
         if method != "GET":
-            self._note_write(path, data)
-        return Response(status, data, resp_headers.get("etag"), resp_headers)
+            self._note_write(path, response.data)
+        return response
 
     def _leave_thread(self, path: str, data: Any) -> None:
         """Unsubscribe the token's person from the issue a POST opened or
@@ -1202,7 +1215,7 @@ class GitHub:
         if self.limited_until is not None and time.time() < self.limited_until:
             raise RateLimited("%s %s: GitHub budget exhausted until %s" % (
                 method, path, _utc(self.limited_until)), 403, "", self.limited_until)
-        status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload)
+        status, raw_headers, raw = self._transport_with_retry(method, url, headers, payload, track_rate=True)
         resp_headers = {str(k).lower(): v for k, v in (raw_headers or {}).items()}
         # Read before any error is raised: a 403 at the limit carries them.
         self._note_rate(resp_headers)
@@ -1216,7 +1229,8 @@ class GitHub:
         return status, resp_headers, text
 
     def _transport_with_retry(self, method: str, url: str, headers: Dict[str, str],
-                              payload: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+                              payload: Optional[bytes], *, track_rate: bool = False
+                              ) -> Tuple[int, Dict[str, str], bytes]:
         """The transport's answer, a read retried after a dropped connection.
 
         GitHub closes connections in the middle of a burst of reads (2026-10-14:
@@ -1227,7 +1241,10 @@ class GitHub:
         write is never repeated: it may have landed before the connection
         dropped. Every attempt is counted."""
         delays = RETRY_DELAYS if method in ("GET", "HEAD") else ()
+        check = getattr(self._request_scope, "check", None)
         for attempt in range(len(delays) + 1):
+            if check is not None:
+                check()
             with self._count_lock:
                 if getattr(self._prepaid, "n", 0):
                     self._prepaid.n -= 1
@@ -1241,6 +1258,9 @@ class GitHub:
                 self._wait(delays[attempt])
                 continue
             if status in RETRY_STATUSES and attempt < len(delays):
+                if check is not None and track_rate:
+                    self._note_rate({str(k).lower(): v for k, v in (raw_headers or {}).items()})
+                    check()
                 self._wait(delays[attempt])
                 continue
             return status, raw_headers, raw
@@ -1363,6 +1383,32 @@ class GitHub:
     # a fragment no request sends, so it never answers that URL's 304.
     def _whole_key(self, path: str) -> str:
         return self._url(path) + "#whole"
+
+    def _release_prepaid(self) -> None:
+        with self._count_lock:
+            self.requests -= getattr(self._prepaid, "n", 0)
+            self._prepaid.n = 0
+
+    @contextmanager
+    def check_requests(self, check: Callable[[], None]) -> Iterator[None]:
+        """Check each wire attempt in a synchronous operation, including retries."""
+        previous = getattr(self._request_scope, "check", None)
+        self._request_scope.check = check
+        try:
+            yield
+        finally:
+            self._request_scope.check = previous
+            self._release_prepaid()
+
+    @contextmanager
+    def resume_reads(self, scope: str) -> Iterator[None]:
+        """Reuse successful GET pages from an interrupted collection."""
+        previous = getattr(self._request_scope, "replay", "")
+        self._request_scope.replay = scope
+        try:
+            yield
+        finally:
+            self._request_scope.replay = previous
 
     def recall(self, path: str, validator: str) -> Optional[List[Any]]:
         """The list kept for `path` under this validator, or None. A hit
