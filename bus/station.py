@@ -14468,6 +14468,15 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the lane pull requests: %s" % err)
+        if not isinstance(state.get("scheduled_workflows"), dict):
+            state["scheduled_workflows"] = {}
+        read_start = self._pass_counted()
+        facts.scheduled_workflows, unread = invariants.read_scheduled_workflows(
+            self.gh, [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)],
+            state["scheduled_workflows"],
+            lambda: (self._pass_counted() - read_start >= invariants.SCHEDULED_READ_MAX
+                     or self._deferred()), _say)
+        facts.unread = {**(facts.unread or {}), invariants.SCHEDULED_WORKFLOW_RED: unread}
         return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:

@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -58,6 +59,7 @@ class FakeGH:
         # (repo, number) -> a pull request as GET .../pulls/N answers it.
         self.pull_state = {}
         self.check_runs = {}
+        self.scheduled_runs = {}
         self.private = {OTHER}
         self.calls = []
         self.writes = []
@@ -108,6 +110,17 @@ class FakeGH:
             return Response(201, {"number": number, "id": 9000 + number})
         if method == "GET" and path.startswith("/search/issues?"):
             return Response(200, {"items": self.search_items})
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/actions/runs\?(.+)", path)
+        if method == "GET" and m:
+            runs = self.scheduled_runs.get(m.group(1), [])
+            if isinstance(runs, GitHubError):
+                raise runs
+            query = parse_qs(m.group(2))
+            assert query["event"] == ["schedule"] and query["status"] == ["completed"]
+            size = int(query["per_page"][0])
+            start = size * (int(query["page"][0]) - 1)
+            return Response(200, {"total_count": len(runs),
+                                  "workflow_runs": runs[start:start + size]})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/sub_issues", path)
         if method == "POST" and m and int(m.group(2)) in self.refuse_subs:
             raise GitHubError("Validation Failed: sub-issue limit reached", 422)
