@@ -1464,7 +1464,7 @@ def chief_orphans(summary: str) -> Optional[List[int]]:
 
 
 def acceptance_criteria(body: str) -> List[str]:
-    """Checkbox criteria in the Acceptance criteria section."""
+    """Ticket checkboxes in the Acceptance criteria section, excluding plan filler."""
     found = []
     active = False
     for line in (body or "").splitlines():
@@ -1475,8 +1475,10 @@ def acceptance_criteria(body: str) -> List[str]:
             break
         match = CRITERION_RE.match(line)
         if active and match:
-            found.append(("x" if match.group(1).lower() == "x" else "") +
-                         " " + match.group(2).strip())
+            text = match.group(2).strip()
+            if criterion_key(text) in _FILLER_CRITERION_KEYS:
+                continue
+            found.append(("x" if match.group(1).lower() == "x" else "") + " " + text)
     return found
 
 
@@ -1490,6 +1492,11 @@ def criterion_key(text: str) -> str:
     runs of whitespace or trailing punctuation, and case (loom#2026)."""
     text = _MD_MARK_RE.sub("", _MD_LINK_RE.sub(r"\1", NOT_BUILT_RE.sub("", text)))
     return " ".join(text.split()).rstrip(".;:,").strip().casefold()
+
+
+_FILLER_CRITERION_KEYS = frozenset(
+    criterion_key(bullet.removeprefix("- [x] ")) for bullet in hunt_plan.FILLER_BULLETS
+)
 
 
 def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
