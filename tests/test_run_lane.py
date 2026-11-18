@@ -1427,25 +1427,32 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.drop_brief()
         return self.run_lane(FAKE_AGENT="say", FAKE_OUT=output, FAKE_EXIT="1", FAKE_EDIT="1", **env)
 
-    def test_a_failed_run_posts_the_last_lines_of_its_log_to_the_ticket(self):
-        # The lane host's log is the only detail of a failed run; the ticket
-        # now carries its tail, so a reader who cannot reach the host sees it.
-        result = self.run_failing_agent("FAILED tests/test_x.py::test_y - AssertionError at line 429")
+    def test_a_failed_run_posts_its_outcome_and_never_its_log_lines(self):
+        # A run log holds the agent's whole session: test fixture tables,
+        # another task's API replies, kubectl hints. Posting its tail put that
+        # noise on tickets as if it were the ticket's news (2026-11-18). The
+        # ticket gets one readable outcome; the log stays on the lane host.
+        fixture = ("| wow-dev renders ac-playerbots-db-import | `333333333333` |\n"
+                   "  - fix: apply the repository (`kubectl apply -k manifests/wow-dev`)\n"
+                   '{"url":"https://api.github.com/repos/example/other/issues/comments/1"}')
+        result = self.run_failing_agent(fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
         [note] = self.tail_bodies()
-        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
-        self.assertIn("AssertionError at line 429", note)
-        self.assertIn("failed: [work]", note)
-        # The tail went through the leak scan before it was posted.
-        self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
+        for line in ("333333333333", "kubectl apply", "api.github.com", "```"):
+            self.assertNotIn(line, note)
+        self.assertIn("parked", note)
+        self.assertIn("[work]", note)
+        self.assertIn("The full run log stays on the lane host.", note)
 
-    def test_a_log_tail_the_leak_scan_refuses_is_withheld(self):
-        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
+    def test_a_park_reason_the_leak_scan_cannot_clear_is_withheld(self):
+        result = self.run_failing_agent("connecting to 10.1.2.3 failed", FAKE_DENY_UNREADABLE="1")  # leak-guard-allow
         self.assertEqual(result.returncode, 0, result.stderr)
         [note] = self.tail_bodies()
-        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
-        self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
         self.assertIn("withheld", note)
+        self.assertNotIn("agent exited", note)
+        self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
+        self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
+        self.assertIn("the leak scan refused the park reason", self.run_log())
 
     def test_the_log_tail_can_be_switched_off(self):
         result = self.run_failing_agent("FAILED tests/test_x.py::test_y", LOOM_LOG_TAIL="off")
@@ -1467,12 +1474,6 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.tail_bodies(), [])
         self.assertIn("could not mint the lane's GitHub App token", self.failure_line())
-
-    def test_the_scanners_words_stay_out_of_the_log_the_tail_is_cut_from(self):
-        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("the leak scan refused the log tail", self.run_log())
-        self.assertNotIn("private-range IP address", self.run_log())
 
     def test_a_brief_parked_before_its_repo_is_checked_posts_no_log_tail(self):
         # A brief is input: one refused before the owner check must not make
