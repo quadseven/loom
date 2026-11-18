@@ -83,8 +83,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="print an HTML page whose one button creates the App")
     a.add_argument("--role", choices=app.ROLES, default="station",
                    help="which writer's App: only the station's may dispatch workflow runs")
-    app_sub.add_parser("token", help="print the installation token of the App the "
+    a = app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
+    a.add_argument("--cache-file", help="reuse the station's private App token cache")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
@@ -193,7 +194,8 @@ def _app(args: argparse.Namespace, transport: Optional[Transport],
                                   args.role)
     try:
         if args.app_command == "token":
-            return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
+            return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign,
+                                   cache_file=args.cache_file)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
         return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)

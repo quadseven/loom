@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Print the current process App's installation token, or fail with no stdout.
+set -uo pipefail
+lanes="$(cd "$(dirname "$0")" && pwd)" || exit 1
+# shellcheck source=lanes/github_auth.sh
+. "$lanes/github_auth.sh" || exit 1
+
+if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
+  token="$("$LOOM_APP_TOKEN_CMD")" || exit 1
+else
+  cd "$lanes/.." || exit 1
+  token="$(python3 -m bus app token "$@")" || exit 1
+fi
+github_valid_token "$token" || { github_auth_error "no usable installation token"; exit 1; }
+printf '%s\n' "$token"

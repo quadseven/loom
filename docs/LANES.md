@@ -396,7 +396,7 @@ same CLI invocation `lanes/run_lane.sh` uses, from the shared
 |---|---|---|
 | `claude` | `LOOM_BRAIN_MODEL` (default the current Opus) | `claude -p`, every permission prompt skipped |
 | `codex` | `LOOM_CODEX_MODEL` | `codex exec` with full access (a lane's run has no network; the brain needs GitHub) |
-| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`) with the checkout as its tree, so its `.git` stays read-only; given this machine's GitHub token, a CA file for TLS and an allowlist of non-secret `LOOM_*` settings in its environment |
+| `spark` | `LOOM_SPARK_MODEL` at `LOOM_SPARK_URL` | opencode in the lane sandbox (`lanes/agent_sandbox.sh`) with the checkout as its tree, so its `.git` stays read-only; given the brain's App token, a CA file for TLS and an allowlist of non-secret `LOOM_*` settings in its environment |
 
 A run that fails with a limit, as `run_lane.sh` classes a lane's failure
 from the last lines of output, hands the same tick to the next rung with
@@ -495,33 +495,20 @@ no longer offers (`ProviderModelNotFoundError`, which it reports for a model
 models.dev marks deprecated). A missing model is a limit on that model for
 24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
-`LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
-install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
-`GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
+`LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the install environment
+(empty `LOOM_REPOS` keeps it idle). docs/BRAIN.md has the rules.
 
-GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
-`LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
-private key, never the key itself; region `LOOM_AWS_REGION`) all set, the
-station, the brain commands and any `bus` call in that environment send an
-App installation token instead, so their requests spend the installation's
-own hourly budget, not the operator account's. The token is minted at run
-time: the key is read from SSM, an RS256 JWT is signed with the `openssl`
-CLI (key on stdin, never on the command line or on disk), and
-`POST /app/installations/<id>/access_tokens` returns a token kept in memory
-until 5 minutes before its `expires_at`. The station runs one pass per process
-and GitHub's ETags differ per token, so it also keeps the token in
-`state/station/app-token.json` (mode 0600; the only other place a token is
-written is a lane agent's per-run gh store, below)
-and the next pass reuses it until 5 minutes before expiry; the ETags cached on
-the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
-requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. Instead of SSM, the station
-and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
-its path (it wins when both are set). `lanes/mac/install.sh` writes it into
-both plists, refuses a key file readable by group or others (it must be mode
-600), and refuses to install at all when only some of the App id, the
-installation id and a key setting are set, naming the missing one, so a half
-setup never quietly runs on the personal token. The station reads the App's
+The station, brain and lane runners require a GitHub App. Set
+`LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
+`LOOM_GITHUB_APP_KEY_SSM` (an SSM parameter name, with region
+`LOOM_AWS_REGION`), or use `LOOM_GITHUB_APP_KEY_FILE` for a mounted key.
+The file wins when both key settings are set and must be private to the job
+user (mode 600 or narrower). The installer rejects partial App settings.
+Loom signs an RS256 JWT with the key and uses it to check the App's slug
+and obtain an installation token. The station keeps its token in
+`state/station/app-token.json` (mode 0600) until five minutes before expiry
+so subsequent passes can reuse GitHub ETags. A 401 deletes the cache.
+The station's Python client reads the App's
 slug once per pass (`GET /app`, counted under `app login`) and trusts
 `<slug>[bot]` wherever `LOOM_BRIEF_AUTHORS` is, so the labels and comments the
 App writes need no hand-listed login; its startup log line `trusting briefing
@@ -543,31 +530,32 @@ the tokens it mints. The dashboard takes the same three settings when its host h
 the `openssl` and `aws` CLIs, and otherwise keeps
 `LOOM_DASHBOARD_GITHUB_TOKEN`.
 
-The station, the brain and the lanes each post as their own App, never as
-the operator (loom#1142). The installer writes the station's App
-(`LOOM_GITHUB_APP_*`) into the station and dashboard, `LOOM_LANES_GITHUB_APP_*`
-into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
-launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
-it has its own, and half an App's settings install nothing.
-`python3 -m bus app token` prints the installation token of the App those
-settings name, and fails with no output without them. A lane with the
-settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
-start of each run and again after its agent (a token lasts an hour), clones
-over https with `gh` as git's credential helper, and runs its agent without
-the token in its environment, the App settings or that helper; a failed mint
-parks the run `[transient]` before anything is posted. So that the agent's own
-`gh` calls spend the App's budget and not the operator's (loom#665), each run
-writes the token into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*`
-(mode 700, the token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR`
-at it and removes it when the agent exits. The brief tells the agent not to
-poll pull request checks or reviews, and the run's log records
-`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output. `lanes/mac/brain.sh` mints once per
-tick, after the lock, and gives every rung that token as `GH_TOKEN`,
-`GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
-`LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
-login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
-`LOOM_BRIEF_AUTHORS`, and a repo whose workflows admit only collaborators must
-admit the lanes' login for lane pull requests to run.
+The installer uses `LOOM_GITHUB_APP_*` for the station,
+`LOOM_LANES_GITHUB_APP_*` for the lanes, and `LOOM_BRAIN_GITHUB_APP_*` for
+the brain. Each launchd job sees its own settings as `LOOM_GITHUB_APP_*`.
+The dashboard also receives the station settings.
+
+The three shell entry points reject an ambient `GH_TOKEN` or a nonempty
+`GH_CONFIG_DIR`, then create a private run directory with an empty gh
+configuration. `lanes/fleet-token` prints just the current App's installation
+token and leaves stdout empty on failure. The runner keeps the token in a
+private file beside the config directory. Its gh wrapper requires that file
+and disables `gh auth login`, `refresh`, `setup-git`, `switch`, and `token`.
+GitHub clones and pushes use HTTPS and a Git credential helper scoped to
+`github.com`. The helper supplies the same App token and refuses prompts or
+stored credentials. The run directory is removed on exit.
+
+The station verifies its App identity before fetching or deploying. The brain
+does so before acquiring its GitHub lock and caps the agent tick at 50 minutes.
+A lane mints before making any GitHub calls for a brief and again after the
+agent exits. A failure parks the brief as `[transient]` without posting.
+The lane agent receives no App key settings or token environment variables.
+The brief tells the agent not to poll pull request checks or reviews and the
+log records its gh command count.
+
+Add the brain and lane bot logins (`<slug>[bot]`) to `LOOM_BRIEF_AUTHORS`.
+Repository workflow gates that admit only collaborators must also admit the
+appropriate App for lane or pin pull requests.
 A new App is easiest made from
 `https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
@@ -1425,7 +1413,7 @@ comment, not one per run.
   note that the tail was withheld, never the text.
 - Limit and auth parks post nothing (the station re-briefs them with the
   reason). A brief refused before its owner check posts nothing, and neither
-  does a lane with App settings whose token could not be minted.
+  does a lane whose token could not be minted.
 - A failed post is logged and never fails the park. `LOOM_LOG_TAIL=off` turns
   the comment off.
 - Not done here: uploading the whole log to object storage. That needs a

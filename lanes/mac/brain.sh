@@ -233,15 +233,10 @@ shadow_guard() {
 # The spark rung runs as the spark lane does: opencode inside the shared
 # sandbox, with an emptied environment and a scratch home. Its tree is the
 # brain's checkout, so the sandbox keeps that checkout's .git read-only. The
-# brain needs GitHub, so the agent gets this machine's GitHub token and the
+# brain needs GitHub, so the agent gets its App token and the
 # settings above in its environment, never in argv.
 spark_brain() {
-  local token kv
-  token="${LOOM_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-  [ -n "$token" ] || token="$(gh auth token 2> /dev/null)"
-  [ -n "$token" ] || { echo "no GitHub token for the spark brain" >&2; return 3; }
-  # An App installation token is ghs_ and a JWT-like body with dots and dashes.
-  case "$token" in *[!A-Za-z0-9_.-]*) echo "the GitHub token has unexpected characters" >&2; return 3 ;; esac
+  local kv
   AGENT_HOME="$LOOM_HOME/run/brain-home"
   rm -rf "$AGENT_HOME" && mkdir -p "$AGENT_HOME" || return 3
   shadow_guard "$AGENT_HOME/bin" || { echo "could not put the shadow gh guard in place" >&2; return 3; }
@@ -249,8 +244,9 @@ spark_brain() {
   NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
   # The sandbox denies the keychain server, which TLS verification asks for
   # the system roots; a CA file lets HTTPS clients verify without it.
-  AGENT_EXTRA_ENV="GH_TOKEN=$token"$'\n'"GITHUB_TOKEN=$token"$'\n'"LOOM_GITHUB_TOKEN=$token"$'\n'"SSL_CERT_FILE=/etc/ssl/cert.pem"
-  for kv in "${BRAIN_SETTINGS[@]}"; do
+  AGENT_EXTRA_ENV="SSL_CERT_FILE=/etc/ssl/cert.pem"
+  for kv in GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN GH_CONFIG_DIR LOOM_REAL_GH \
+            LOOM_APP_TOKEN_FILE "${BRAIN_SETTINGS[@]}"; do
     [ -n "${!kv:-}" ] || continue
     case "${!kv}" in *$'\n'*) continue ;; esac
     AGENT_EXTRA_ENV="$AGENT_EXTRA_ENV"$'\n'"$kv=${!kv}"
@@ -284,6 +280,25 @@ fi
 
 bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
 
+# Acquire the App identity before the first GitHub call, including the lock.
+. "$REPO_ROOT/lanes/github_auth.sh" || exit 1
+github_auth_init "$REPO_ROOT/lanes" || { beat failed 1; exit 1; }
+trap github_auth_cleanup EXIT
+trap 'exit 143' TERM INT
+[ "$MINUTES" -le 50 ] ||
+  { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
+brain_app_auth() {
+  local token
+  if ! github_auth_refresh 2>> "$LOG" || ! github_read_token token; then
+    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*)"
+    beat failed 1
+    return 1
+  fi
+  export GH_TOKEN="$token" GITHUB_TOKEN="$token" LOOM_GITHUB_TOKEN="$token"
+  MINTED_AT=$SECONDS
+}
+brain_app_auth || exit 1
+
 # The lock outlives the agent by 5 minutes (2 when bounded by another
 # brain's slot), so a tick cut off by the timeout still releases it below
 # before anyone else could take it.
@@ -315,36 +330,21 @@ done
 LOCKED_AT="$(date +%s)"
 [ "$TICK_MINUTES" -eq "$MINUTES" ] ||
   say "tick bounded to $TICK_MINUTES minutes: another brain's tick starts in $LOCK_MINUTES (LOOM_BRAIN_YIELD_AT $YIELD_AT)"
-trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1' EXIT
-# launchd stops a job with SIGTERM; exiting on it runs the EXIT trap.
-trap 'exit 143' TERM INT
-bus() { (cd "$REPO_ROOT" && python3 -m bus "$@"); }
+trap 'bus unlock "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1; github_auth_cleanup' EXIT
+# The configured lock wait can consume enough time that the token would
+# expire during the tick. Refresh before handing it to the agent.
+if [ "$(( SECONDS - MINTED_AT + TICK_MINUTES * 60 ))" -gt 3000 ]; then
+  brain_app_auth || exit 1
+fi
 brain() { (cd "$REPO_ROOT" && python3 -m bus.brain "$@"); }
 brain step lock --holder "$HOLDER" --lock-repo "$LOCK_REPO" --tick-minutes "$TICK_MINUTES" >> "$LOG" 2>&1 || say "could not record lock step"
 
-# With GitHub App settings (the Loom Brain App) the tick writes as that App,
-# never as the operator (loom#1142): every rung's gh and GitHub API calls get
-# the App's installation token, which lasts an hour, longer than a tick. A
-# personal token in the environment is dropped first, so a failed mint runs
-# no rung at all.
-if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
-  [ "$MINUTES" -le 50 ] ||
-    { say "LOOM_BRAIN_MINUTES must be 50 or less with a GitHub App: its token lasts an hour"; beat failed 1; exit 1; }
-  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN
-  if ! app_token="$(bus app token 2>> "$LOG")" || ! [[ "$app_token" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-    say "tick failed: could not mint the brain's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
-    beat failed 1
-    exit 1
-  fi
-  export GH_TOKEN="$app_token" GITHUB_TOKEN="$app_token" LOOM_GITHUB_TOKEN="$app_token"
-  unset app_token
-  # GET /user refuses an installation token, so the agent's journal is told
-  # the App's login; without it the journal fails, not the tick.
-  if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
-    export LOOM_GITHUB_LOGIN="$app_login"
-  else
-    say "could not read the brain's GitHub App login; its journal may not post"
-  fi
+# GET /user refuses an installation token, so the agent's journal is told
+# the App's login; without it the journal fails, not the tick.
+if app_login="$(bus app login 2>> "$LOG")" && [[ "$app_login" =~ ^[A-Za-z0-9-]+\[bot\]$ ]]; then
+  export LOOM_GITHUB_LOGIN="$app_login"
+else
+  say "could not read the brain's GitHub App login; its journal may not post"
 fi
 
 # A rung may have changed the checkout (a hook, a config, an edited

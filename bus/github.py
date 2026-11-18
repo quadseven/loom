@@ -554,6 +554,8 @@ class AppToken:
         if failure:
             raise GitHubError(failure)
         try:
+            if not key.strip():
+                raise SigningError("the App private key is empty")
             signature = self._sign(signing_input, key)
         except (SigningError, OSError, subprocess.SubprocessError) as err:
             failure = "could not sign the GitHub App JWT: %s" % (

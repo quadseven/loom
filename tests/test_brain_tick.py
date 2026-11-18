@@ -22,6 +22,11 @@ SCRIPT = LANES / "mac" / "brain.sh"
 # handoff` prints $FAKE_PACKET and exits $FAKE_PACKET_EXIT (default 0), and
 # `-m bus.shadow prompt` runs the real one under $FAKE_REAL_PYTHON or fails. Every call is appended to $FAKE_LOG.
 FAKE_PYTHON = """#!/usr/bin/env bash
+if [ "$3 $4" = "app token" ]; then
+  [ -n "${FAKE_APP_TOKEN:-}" ] || { echo "no App key" >&2; exit 2; }
+  printf '%s\\n' "$FAKE_APP_TOKEN"
+  exit 0
+fi
 printf 'python3 %s\\n' "$*" >> "$FAKE_LOG"
 if [ "$2 $3" = "bus.shadow prompt" ]; then
   # FAKE_REAL_PYTHON: run the real bus.shadow from the checkout; unset, the
@@ -37,12 +42,6 @@ if [ "$2" = bus.fabric ]; then
   printf 'fabric env LOOM_FABRIC_KEY_SSM=%s\\n' "${LOOM_FABRIC_KEY_SSM:-absent}" >> "$FAKE_LOG"
   printf '%s\\n' "${FAKE_FABRIC:-}"
   exit "${FAKE_FABRIC_EXIT:-0}"
-fi
-if [ "$3 $4" = "app token" ]; then
-  # FAKE_APP_TOKEN: the Brain App's installation token; unset, minting fails.
-  [ -n "${FAKE_APP_TOKEN:-}" ] || { echo "no App key" >&2; exit 2; }
-  printf '%s\\n' "$FAKE_APP_TOKEN"
-  exit 0
 fi
 if [ "$3 $4" = "app login" ]; then
   [ -n "${FAKE_APP_LOGIN:-}" ] || { echo "no App key" >&2; exit 2; }
@@ -90,7 +89,7 @@ exit "${FAKE_OPENCODE_EXIT:-0}"
 
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
-[ "$*" = "auth token" ] && echo gho_faketoken123
+[ "$*" = "auth token" ] && echo ghs_fake_brain
 exit 0
 """
 
@@ -121,6 +120,9 @@ class BrainTickTest(unittest.TestCase):
         for shared in ("agent_cli.sh", "agent_sandbox.sh"):
             if (LANES / shared).exists():
                 shutil.copy(LANES / shared, self.root / "lanes" / shared)
+        for shared in ("github_auth.sh", "fleet-token"):
+            shutil.copy(LANES / shared, self.root / "lanes" / shared)
+        shutil.copytree(LANES / "github-bin", self.root / "lanes" / "github-bin")
         (self.root / "docs").mkdir()
         (self.root / "docs" / "MUSE.md").write_text("# Muse tick instructions\n")
         git("init", "-q", "-b", "main", cwd=self.root)
@@ -148,6 +150,7 @@ class BrainTickTest(unittest.TestCase):
             "LOOM_REPOS": "example/project",
             "LOOM_STATUS_REPO": "example/loom",
             "FAKE_LOG": str(self.log),
+            "FAKE_APP_TOKEN": "ghs_fake_brain",
             # No other brain's slot bounds these ticks; the slot tests below
             # set their own (loom#2469).
             "LOOM_BRAIN_YIELD_AT": "",
@@ -388,8 +391,8 @@ class BrainTickTest(unittest.TestCase):
         run, calls = self.tick()
         self.assertEqual(0, run.returncode)
         self.assertIn("-m bus lock", calls[0])
-        self.assertEqual("python3 -m bus.brain step lock --holder lane-machine "
-                         "--lock-repo example/loom --tick-minutes 40", calls[1])
+        self.assertIn("python3 -m bus.brain step lock --holder lane-machine "
+                         "--lock-repo example/loom --tick-minutes 40", calls)
         claude = [c for c in calls if c.startswith("claude ")]
         self.assertEqual(1, len(claude))
         self.assertIn("--model claude-opus-5-5", claude[0])
@@ -653,8 +656,8 @@ class BrainTickTest(unittest.TestCase):
         self.assertTrue(opencode[0].startswith("opencode run -m spark/coder "), opencode)
         self.assertIn("%s/brain/loom/docs/MUSE.md" % self.home, opencode[0])
         # The token reaches the agent's environment, never its argv.
-        self.assertNotIn("gho_faketoken123", opencode[0])
-        self.assertIn("opencode env GH_TOKEN=gho_faketoken123 GITHUB_TOKEN=gho_faketoken123 "
+        self.assertNotIn("ghs_fake_brain", opencode[0])
+        self.assertIn("opencode env GH_TOKEN=ghs_fake_brain GITHUB_TOKEN=ghs_fake_brain "
                       "LOOM_REPOS=example/project HOME=%s/run/brain-home" % self.home, calls)
         last, _ = self.beat()
         self.assertEqual(("ok", "spark", "spark/coder"), (last["outcome"], last["lane"], last["model"]))
@@ -683,12 +686,10 @@ class BrainTickTest(unittest.TestCase):
                              FAKE_APP_LOGIN="loom-brain[bot]")
         self.assertIn("opencode login loom-brain[bot]", calls)
 
-    def test_a_tick_whose_app_token_cannot_be_minted_runs_no_rung(self):
-        self.usage("codex", True)
-        run, calls = self.tick(LOOM_BRAIN_LADDER="codex claude", LOOM_GITHUB_APP_ID="123",
-                               GITHUB_TOKEN="ghp_personal")
-        self.assertEqual([], self.agent_calls(calls, "codex") + self.agent_calls(calls, "claude"))
-        self.assertTrue(any(" unlock " in c for c in calls), calls)
+    def test_failed_mint_stops_before_the_github_lock(self):
+        run, calls = self.tick(FAKE_APP_TOKEN="")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertEqual(calls, [])
         last, ok = self.beat()
         self.assertEqual("failed", last["outcome"])
         self.assertFalse(ok)
@@ -718,7 +719,7 @@ class BrainTickTest(unittest.TestCase):
         self.assertIn("opencode setting LOOM_ASK_ANSWERERS=example-answerer", settings)
         self.assertIn("opencode setting LOOM_REPOS=example/project", settings)
         self.assertIn("opencode setting LOOM_BRIEF_AUTHORS=example-author", settings)
-        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=gho_faketoken123", settings)
+        self.assertIn("opencode setting LOOM_GITHUB_TOKEN=ghs_fake_brain", settings)
         # TLS inside the sandbox, which denies the keychain server.
         self.assertIn("opencode setting SSL_CERT_FILE=/etc/ssl/cert.pem", settings)
         self.assertFalse(any("foo-secret-value" in c or "LOOM_FOO_TOKEN" in c for c in calls))
@@ -801,6 +802,12 @@ class BrainTickTest(unittest.TestCase):
         ledger = self.tmp / "ledger.jsonl"
         env = {k: v for k, v in self.env.items() if not k.startswith("LOOM_SHADOW")}
         env.update(PATH="%s:%s" % (real, self.env["PATH"]), LOOM_SHADOW_LEDGER=str(ledger))
+        config = self.tmp / "gh-config"
+        config.mkdir()
+        token = self.tmp / "app-token"
+        token.write_text("ghs_fake_brain\n")
+        env.update(GH_CONFIG_DIR=str(config), LOOM_APP_TOKEN_FILE=str(token),
+                   LOOM_REAL_GH=str(self.tmp / "bin" / "gh"))
 
         def gh(*args, **extra):
             run = subprocess.run([guard, *args], env={**env, **extra}, capture_output=True,

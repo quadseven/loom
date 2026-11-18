@@ -264,11 +264,9 @@ db_env() {
 }
 
 # One writer's App settings as the job's LOOM_GITHUB_APP_*: $1 is "" for the
-# station's, LANES_ or BRAIN_. The brain keeps the station's App until it has
-# its own, so a reinstall never moves it back to the personal token.
+# station's, LANES_ or BRAIN_. Each job receives its own App settings.
 app_env() {
   local p="LOOM_${1}GITHUB_APP_" n v
-  [ "$1" = BRAIN_ ] && [ -z "${LOOM_BRAIN_GITHUB_APP_ID:-}" ] && p=LOOM_GITHUB_APP_
   for n in ID INSTALLATION_ID KEY_SSM KEY_FILE; do
     v="${p}$n"
     [ -n "${!v:-}" ] || continue

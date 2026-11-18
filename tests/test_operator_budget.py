@@ -238,22 +238,20 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn("signal", state)
             station.operator_reader.assert_called_once_with("operator", {}, NOW)
 
-    def test_production_hook_is_wired_without_live_auth_in_injected_tests(self):
+    def test_station_does_not_configure_a_personal_token_reader(self):
         from bus import station
-        for supplied in (False, True):
-            gh = SimpleNamespace(cache_dir="unused", app=None)
-            settings = SimpleNamespace(status_repo="")
-            with mock.patch.object(station, "Station") as constructor, \
-                 mock.patch.object(station, "_trust_app_login"), \
-                 mock.patch.object(station, "GitHub", return_value=gh), \
-                 mock.patch("bus.github.auth_from_env", return_value="synthetic-test-credential") as auth:
-                station._locked_pass(settings, "unused", gh if supplied else None, {})
-                if supplied:
-                    self.assertNotIn("operator_reader", constructor.call_args.kwargs)
-                    auth.assert_not_called()
-                else:
-                    self.assertIs(constructor.call_args.kwargs["operator_reader"], budget.read_core)
-                    auth.assert_called_once_with()
+        gh = SimpleNamespace(cache_dir="unused", app=None)
+        settings = SimpleNamespace(status_repo="")
+        with mock.patch.object(station, "Station") as constructor, \
+             mock.patch.object(station, "_trust_app_login"), \
+             mock.patch("bus.app.configured_client", return_value=gh) as client, \
+             mock.patch("bus.app.check_login") as check_login, \
+             mock.patch("bus.github.token_from_env") as personal_token:
+            station._locked_pass(settings, "unused", None, {})
+        self.assertNotIn("operator_reader", constructor.call_args.kwargs)
+        client.assert_called_once_with()
+        check_login.assert_called_once_with(gh)
+        personal_token.assert_not_called()
 
     def test_operator_sample_precedes_app_trust_failure(self):
         from bus import station

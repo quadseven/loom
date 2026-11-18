@@ -1,8 +1,8 @@
 # Operator REST budget samples
 
-The station samples the configured operator's GitHub core REST quota hourly,
-including when lanes are idle. This is separate from the station GitHub App's
-budget and does not change dispatch or merge gates.
+App-only station passes no longer sample the operator's GitHub core REST
+quota. The following describes the retained sampler and the historical
+`operator-budget.json` records it produced.
 
 The sampler uses the existing personal-token resolver. It creates no credentials,
 changes no authentication configuration, and makes only GET requests. The first

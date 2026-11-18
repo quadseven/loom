@@ -554,12 +554,12 @@ class InstallScriptTest(unittest.TestCase):
                          ("1", "/station/key"))
         self.assertFalse([k for k in station if not k.startswith("LOOM_GITHUB_APP_")], station)
 
-    def test_without_their_own_app_a_lane_gets_none_and_the_brain_keeps_the_stations(self):
+    def test_a_lane_and_brain_get_no_credentials_from_the_station_app(self):
         result = self.run_install(LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
                                   LOOM_GITHUB_APP_KEY_SSM="/station/key")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.job_env("com.loom.codex"), {})
-        self.assertEqual(self.job_env("com.loom.brain")["LOOM_GITHUB_APP_ID"], "1")
+        self.assertEqual(self.job_env("com.loom.brain"), {})
 
     def test_half_a_lanes_app_installs_nothing(self):
         result = self.run_install(LOOM_LANES_GITHUB_APP_ID="11",

@@ -26,21 +26,7 @@ STATE_DIR="${LOOM_HOME:-$HOME/loom}/state/station"
 say() { printf 'station: %s\n' "$*"; }
 g() { git -C "$REPO_ROOT" -c core.hooksPath=/dev/null "$@"; }
 
-api() {
-  local path="$1"
-  if [ -n "${LOOM_GITHUB_APP_ID:-}" ] &&
-     [ -n "${LOOM_GITHUB_APP_INSTALLATION_ID:-}" ] &&
-     { [ -n "${LOOM_GITHUB_APP_KEY_SSM:-}" ] || [ -n "${LOOM_GITHUB_APP_KEY_FILE:-}" ]; }; then
-    PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" timeout 30 python3 -c '
-import json, sys
-from bus.github import GitHub, auth_from_env
-response = GitHub(auth_from_env()).rest("GET", "/" + sys.argv[1].lstrip("/"))
-print(json.dumps(response.data))
-' "$path"
-  else
-    timeout 30 gh api "$path"
-  fi
-}
+api() { timeout 30 gh api "$1"; }
 
 record_deploy() {
   mkdir -p "$STATE_DIR" &&
@@ -112,10 +98,18 @@ deploy() {
   fi
 }
 
+. "$REPO_ROOT/lanes/github_auth.sh" || exit 1
+github_auth_init "$REPO_ROOT/lanes" || exit 1
+trap github_auth_cleanup EXIT
+trap 'exit 143' TERM INT
+if ! github_auth_refresh --cache-file "$STATE_DIR/app-token.json"; then
+  say "could not obtain the station's GitHub App token"
+  exit 1
+fi
 deploy
 if [ -n "${LOOM_PIN_TARGETS:-}" ] && [ "${LOOM_DEPLOY:-1}" != 0 ] &&
    [ "$(g symbolic-ref --short -q HEAD)" = "$BRANCH" ]; then
   LOOM_SELF_REPO="${LOOM_SELF_REPO:-$(g remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)$#\1#; s#\.git$##')}" \
     python3 -m bus.pin || say "pin pass failed; will retry on the next station pass"
 fi
-cd "$REPO_ROOT" && exec python3 -m bus station
+cd "$REPO_ROOT" && python3 -m bus station

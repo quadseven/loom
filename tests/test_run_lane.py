@@ -649,6 +649,12 @@ class LaneRunnerTest(unittest.TestCase):
         self.inbox.mkdir(parents=True)
         self.bin = root / "bin"
         self.bin.mkdir()
+        # Keep the isolated runner's real tools ahead of the macOS developer
+        # tool shims in /usr/bin. Individual tests can still override either.
+        self.tool_bin = root / "tools"
+        self.tool_bin.mkdir()
+        (self.tool_bin / "python3").symlink_to(sys.executable)
+        (self.tool_bin / "git").symlink_to(shutil.which("git"))
         self.log = root / "calls.log"
         self.log.touch()
         self.body = root / "body.md"
@@ -767,8 +773,9 @@ print('leak guard: clean (shape patterns only)')
     def lane_env(self, **env):
         return {
             "HOME": str(self.home),
-            "PATH": f"{self.bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
+            "PATH": f"{self.bin}:{self.tool_bin}:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin",
             "LOOM_CLONE_BASE": self.clone_base,
+            "LOOM_APP_TOKEN_CMD": self.app_token_cmd("echo ghs_fake_lanes"),
             # The factory and infra-public repos are settings now
             # (loom#2584): this harness's fakes serve them under these
             # names, so it configures exactly those.
@@ -937,15 +944,13 @@ print('leak guard: clean (shape patterns only)')
 
     def test_a_lane_started_without_a_clone_base_does_not_crash_on_an_unbound_variable(self):
         """launchd starts the local lanes without LOOM_CLONE_BASE; the scanner
-        remote must default like the ticket clone does (git@github.com:), or
+        remote must default like the ticket clone does, or
         every run dies at once under set -u and no lane works."""
         env = self.lane_env()
         del env["LOOM_CLONE_BASE"]
-        # The default remote is SSH. A real ssh here reaches out of the test:
-        # on a cluster runner the egress fence drops port 22, the clone hangs
-        # past the timeout below, and this one test failed every base check
-        # of this repo there (loom#2418).
-        self.write_tool(self.bin / "ssh", "#!/bin/sh\nexit 255\n")
+        # Stub the default HTTPS transport to keep the test offline.
+        self.write_tool(self.bin / "git-remote-https", "#!/bin/sh\nexit 1\n")
+        env["GIT_EXEC_PATH"] = str(self.bin)
         self.drop_brief()
         result = session_procs.run(["bash", str(RUNNER), "codex"], env=env, timeout=60)
         self.assertNotIn("unbound variable", result.stderr)
@@ -1422,7 +1427,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         count = Path(self._tmp.name) / "mints"
         self.drop_brief()
         result = self.run_lane(
-            LOOM_GITHUB_APP_ID="124", GH_TOKEN="ghp_personal",
+            LOOM_GITHUB_APP_ID="124",
             LOOM_APP_TOKEN_CMD=self.app_token_cmd(
                 'n=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
                 '[ "$n" = 0 ] && echo ghs_first.tok-en || { echo "key not found" >&2; exit 2; }'
@@ -6387,7 +6392,8 @@ exit %d
                 self.assertEqual(self.beat()["available"], want != "limit")
 
     def app_token_cmd(self, script):
-        cmd = Path(self._tmp.name) / "app-token"
+        with tempfile.NamedTemporaryFile(dir=self._tmp.name, delete=False) as file:
+            cmd = Path(file.name)
         self.write_tool(cmd, "#!/usr/bin/env bash\n" + script)
         return str(cmd)
 
@@ -6399,36 +6405,37 @@ exit %d
         stale = self.loom / "run" / "codex-gh.KILLED"
         stale.mkdir(parents=True)
         (stale / "hosts.yml").write_text("oauth_token: ghs_old\n")
-        self.run_lane(LOOM_GITHUB_APP_ID="124",
+        result = self.run_lane(LOOM_GITHUB_APP_ID="124",
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
-                      GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
+                      GITHUB_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
         # No token in its environment, nor the App's settings to mint one, nor
         # git's helper to borrow one.
         agent_env = seen_agent.read_text().splitlines()
         self.assertEqual(agent_env[:3], ["none", "none", "none"])
-        # loom#665: its gh reads the minted App token, never the operator's,
-        # from a per-run config directory the runner removes after the agent.
+        # The agent inherits the isolated config, which has no hosts.yml.
         store = Path(agent_env[3])
-        self.assertEqual(store.parent, self.loom / "run")
-        self.assertTrue(store.name.startswith("codex-gh."), store)
-        self.assertIn("oauth_token: ghs_lanes.tok-en ", agent_env[4])
-        self.assertNotIn("ghp_personal", agent_env[4])
+        self.assertTrue(store.parent.name.startswith("loom-github."), store)
+        self.assertEqual(agent_env[4:], [""])
         self.assertFalse(store.exists())
         self.assertFalse(stale.exists())
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertNotIn("ghs_lanes.tok-en", log)
 
-    def test_a_lane_without_app_settings_leaves_the_agent_gh_config_alone(self):
-        seen_agent = Path(self._tmp.name) / "agent-tokens"
+    def test_ambient_gh_token_stops_the_lane_before_authentication(self):
         self.drop_brief()
-        self.run_lane(FAKE_AGENT_ENV=str(seen_agent))
-        self.assertEqual(seen_agent.read_text().splitlines()[3], "none")
-        self.assertEqual(list((self.loom / "run").glob("codex-gh.*")), [])
+        untouched = self.loom / "not-an-auth-directory"
+        untouched.mkdir()
+        result = self.run_lane(GH_TOKEN="ghp_personal", LOOM_AUTH_DIR=str(untouched))
+        self.assertTrue(untouched.is_dir())
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ambient GH_TOKEN", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_the_brief_says_not_to_poll_and_the_run_reports_its_gh_calls(self):
         # loom#665: agents polled their own pull requests hundreds of times.
@@ -6449,21 +6456,25 @@ exit %d
         source = RUNNER.read_text()
         self.assertRegex(
             source,
-            r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
-            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
-            r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
+            r'cd "\$TREE" && unset "\$\{!LOOM_GITHUB_APP_@\}" '
+            r'"\$\{!GIT_CONFIG_@\}" LOOM_APP_TOKEN_CMD &&\s*'
             r'run_agent "\$RUN_BRIEF"',
         )
 
     def test_a_lane_whose_app_token_cannot_be_minted_posts_nothing_as_anyone(self):
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
-                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"),
-                      GH_TOKEN="ghp_personal")
+                      LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"))
         self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
         line = self.failure_line()
         self.assertTrue(line.startswith("[transient] "), line)
         self.assertIn("could not mint the lane's GitHub App token", line)
+
+    def test_a_lane_with_no_app_cannot_call_github(self):
+        self.drop_brief()
+        self.run_lane(LOOM_GITHUB_APP_ID="", LOOM_APP_TOKEN_CMD=self.app_token_cmd("exit 2"))
+        self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
+        self.assertIn("could not mint the lane's GitHub App token", self.failure_line())
 
     def test_a_lane_rests_after_three_transient_failures_in_a_row(self):
         # zen, 2026-10-19: a free model answered "Unexpected server error" to

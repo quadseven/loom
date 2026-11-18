@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -uo pipefail
+# shellcheck source=lanes/github_auth.sh
+. "${BASH_SOURCE[0]%/*}/../github_auth.sh" || exit 1
+die() { printf 'gh: %s\n' "$*" >&2; exit 1; }
+
+# Check the command even when a global option precedes it.
+previous=""
+for arg in "$@"; do
+  case "$previous:$arg" in
+    auth:login|auth:refresh|auth:setup-git|auth:switch|auth:token)
+      die "gh auth $arg is disabled for Loom jobs" ;;
+  esac
+  previous="$arg"
+done
+
+[ -d "${GH_CONFIG_DIR:-}" ] || die "GH_CONFIG_DIR must name the isolated config directory"
+[ ! -e "$GH_CONFIG_DIR/hosts.yml" ] && [ ! -L "$GH_CONFIG_DIR/hosts.yml" ] ||
+  die "GH_CONFIG_DIR contains a stored login"
+[ -n "${LOOM_REAL_GH:-}" ] || die "real gh is not configured"
+github_read_token token || die "no GitHub App token; refusing to run gh"
+unset GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+GH_TOKEN="$token" GH_HOST=github.com GH_PROMPT_DISABLED=1 exec "$LOOM_REAL_GH" "$@"

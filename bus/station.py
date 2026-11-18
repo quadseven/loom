@@ -17900,10 +17900,10 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
                  hooks: Dict[str, Any]) -> int:
     """The pass run() starts once it holds the lock."""
     if gh is None:
-        from .github import auth_from_env
-        gh = GitHub(auth_from_env())
+        from .app import check_login, configured_client
+        gh = configured_client()
+        check_login(gh)
         gh.status_in_body = True
-        hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")
@@ -17912,6 +17912,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         # GitHub's ETags differ per token: keep the App token across
         # passes (0600) so last pass's ETags still answer 304 (loom#1306).
         app.state_file = os.path.join(state, "station", "app-token.json")
+        gh.app_token()
     beat = None
     if settings.status_repo and station_beat.enabled(os.environ):
         # The cross-station guard (loom#3050): stand by while another

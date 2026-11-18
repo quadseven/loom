@@ -3,8 +3,11 @@ import base64
 import hashlib
 import json
 import os
+import tempfile
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from urllib.parse import quote
 
 from bus import hunt_plan, pin
@@ -324,31 +327,22 @@ class PinRebuildTest(unittest.TestCase):
 
 
 class PinAuthTest(unittest.TestCase):
-    def test_pin_pass_uses_personal_token_not_app_token(self):
-        from bus.github import GitHub, auth_from_env
-
-        names = ("LOOM_GITHUB_APP_ID", "LOOM_GITHUB_APP_INSTALLATION_ID",
-                 "LOOM_GITHUB_APP_KEY_SSM", "LOOM_GITHUB_TOKEN")
-        saved = {name: os.environ.get(name) for name in names}
-        try:
-            os.environ["LOOM_GITHUB_APP_ID"] = "1"
-            os.environ["LOOM_GITHUB_APP_INSTALLATION_ID"] = "1"
-            os.environ["LOOM_GITHUB_APP_KEY_SSM"] = "/example/ssm"
-            os.environ["LOOM_GITHUB_TOKEN"] = "personal-token"
-            # With the App configured, auth_from_env would send the App
-            # installation token, which the deployment repo's collaborator-only
-            # trust gate rejects (auth == "app").
-            self.assertEqual(GitHub(auth_from_env()).auth, "app")
-            # The pin pass must open the pull request with the operator's
-            # personal token instead (auth == "token"), so the trust gate
-            # passes and the pin pull request can merge.
-            self.assertEqual(pin._pin_client().auth, "token")
-        finally:
-            for name in names:
-                if saved[name] is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = saved[name]
+    def test_pin_pass_requires_the_configured_app(self):
+        with tempfile.TemporaryDirectory() as home:
+            state = Path(home) / "state" / "station"
+            state.mkdir(parents=True)
+            (state / "deployed.json").write_text(json.dumps({"revision": NEW}))
+            env = {"LOOM_HOME": home, "LOOM_SELF_REPO": SOURCE,
+                   "LOOM_PIN_TARGETS": json.dumps([SPEC]), "LOOM_GITHUB_TOKEN": "personal-token"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch("bus.pin.subprocess.check_output", return_value=NEW), \
+                 mock.patch("bus.pin.run") as run:
+                self.assertEqual(pin.main(), 1)
+                run.assert_not_called()
+                os.environ.update(LOOM_GITHUB_APP_ID="1", LOOM_GITHUB_APP_INSTALLATION_ID="2",
+                                  LOOM_GITHUB_APP_KEY_SSM="/example/ssm")
+                self.assertEqual(pin.main(), 0)
+                self.assertEqual(run.call_args.args[0].auth, "app")
 
 
 if __name__ == "__main__":

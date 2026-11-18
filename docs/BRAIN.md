@@ -235,8 +235,9 @@ twice, and opens or updates one pull request per target with the new revision
 and matching SHA-256, labelled `pin-bump`; a merge that changes nothing there
 opens none, and two downloads that differ open none. It lists merged Loom pull
 request titles in a Hunt Plan body that names the revision and the SHA-256. A person or normal review automation must review and merge that pull
-request; the station never merges it. The station needs GitHub write access to
-the target repository. If pinning fails, the next station pass retries.
+request; the station never merges it. The station's GitHub App needs write access to the target repository. Any
+workflow trust gate on the target must allow the App's pull requests. If
+pinning fails, the next station pass retries.
 
 ## Ticket issues
 
