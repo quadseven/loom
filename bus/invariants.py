@@ -343,7 +343,8 @@ class LanePull(NamedTuple):
 
 class EpicShape(NamedTuple):
     """One epic of a goal: open or closed, how many tickets it holds, and
-    which of them are still open."""
+    its open tickets. For a closed epic, only tickets the station can move
+    are reported as stranded."""
     epic: Ref
     open: bool
     tickets: int

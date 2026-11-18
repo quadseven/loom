@@ -851,6 +851,12 @@ day's slot sample may cover less than 24 hours; missing samples fail the
 spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
+The metrics step runs before the rotating steps, so it can resume on the
+next eligible pass. It leaves `LOOM_METRICS_RESERVE` core requests available
+(default 1500) and yields after `LOOM_METRICS_SECONDS` (default 300). It
+keeps completed API pages on disk and measures the window ending when the
+build started. Across builds, it reuses each issue's event and comment
+lists when `updated_at` matches. Changed lists use their saved ETags.
 
 Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
@@ -1451,9 +1457,7 @@ deadline writes every thread's Python stack to `station.log` and exits, so
 launchd starts a fresh one. The next pass finds the marker and logs one line:
 `the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
 marker is younger than its deadline (the pass was killed), `ended ...s into
-its ...s deadline without a clean finish`. The default sits above a daily
-metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
-its own (loom#1924).
+its ...s deadline without a clean finish`.
 
 ## Station lease
 
@@ -1540,8 +1544,8 @@ with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
 comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
 pass and counts as done, so the rotation moves on and nothing carries over. A
 name that is not a pass step logs `unknown paused step <name>, ignored` and
-pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
-paused; the work a pass does before or after it always runs.
+pauses nothing. The rotating steps and the scheduled metrics step can be
+paused through `Station._run_steps`.
 
 ## Log watch
 

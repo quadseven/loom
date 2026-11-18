@@ -3108,16 +3108,15 @@ class BudgetTest(Base):
         self.assertEqual(len(self.gets("loom:lanes")), 2)
         self.assertNotIn("budget low", err)
 
-    def test_below_the_floor_the_daily_metrics_line_still_goes_out(self):
-        # 2026-10-18: the floor deferred every step after triage on every
-        # pass, post_metrics among them, and no metrics line posted that day.
+    def test_below_the_floor_the_daily_metrics_step_waits(self):
+        self.settings.metrics_goal = REPO + "#1"
         transport, reset = self.low()
         gh = GitHub("token", transport=transport)
         gh.rate["core"] = (500, 5000, reset)
         with mock.patch.object(station.Station, "post_metrics", autospec=True) as posted:
             _, err = self.passes(gh=gh)
         self.assertIn("budget low", err)
-        self.assertEqual(posted.call_count, 1)
+        posted.assert_not_called()
 
     def test_above_the_floor_nothing_is_deferred(self):
         self.settings.status_repo = REPO
@@ -6266,6 +6265,17 @@ class FixTest(Base):
                                 "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
         self.run_pass()
         self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
+
+    def test_a_fix_for_a_pull_request_sent_back_by_the_operator_uses_local_progress(self):
+        from bus import operator_hold
+        self.fake.add(12)
+        self.comment(12, answer.HUMAN_MARKER + "\n" + operator_hold.ask(99, ["deployment review"]))
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        brief = self.claimed_brief("example-owner.example-repo-12")
+        self.assertIn("Fix-PR: 99\nOperator-Review: yes\n", brief)
 
     def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
         # The claim was stamped with the pass's start time, earlier than the

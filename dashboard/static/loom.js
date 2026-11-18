@@ -264,8 +264,12 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || `the answer failed (${response.status})`);
-      if (payload.label_error) status.textContent = payload.label_error;
-      replaceCard(form.closest('article'), payload.card);
+      if (payload.label_error) throw new Error(payload.label_error);
+      if (form.dataset.reviewPr) {
+        status.textContent = 'Decision recorded. The station will apply it.';
+      } else {
+        replaceCard(form.closest('article'), payload.card);
+      }
     } catch (error) {
       status.textContent = error.message;
       form.querySelectorAll('button').forEach((item) => { item.disabled = false; });
