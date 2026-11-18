@@ -1318,9 +1318,9 @@ post_park_note() {  # failure class, reason
   [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the park reason or could not run (exit $rc)" >> "$LOG"
   reason="$(cat "$file")"; rm -f "$file"
   if [ "$rc" -eq 0 ] && [ -n "$reason" ]; then
-    text="The $LANE lane parked this ticket after a [$class] failure: $reason"
+    text="The $LANE lane parked this ticket after a $class failure: $reason"
   else
-    text="The $LANE lane parked this ticket after a [$class] failure; the reason was withheld by the leak scan."
+    text="The $LANE lane parked this ticket after a $class failure; the reason was withheld by the leak scan."
   fi
   printf '%s\n' "$text" |
     upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" outcome \

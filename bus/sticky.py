@@ -121,7 +121,10 @@ def merge_outcome(old: Optional[str], marker: str, headline: str, text: str, now
     parameter so every mode has the same shape. The text cannot open a
     marker, mention anyone or start a code block."""
     line = next((l.strip() for l in text.splitlines() if l.strip()), "")
-    line = line.replace("<!--", "<!- -").replace("`", "'").replace("@", "@ ")
+    line = line.replace("`", "'").replace("@", "@ ")
+    # The reason can carry agent text: no link, image, tag or emphasis renders.
+    line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    line = re.sub(r"([\\\[\]()!*_|#~])", r"\\\1", line)
     if len(line) > MAX_OUTCOME:
         line = line[:MAX_OUTCOME].rstrip() + " ..."
     return "\n".join([marker, "%s, as of %s." % (headline, now), "", line, "", OUTCOME_FOOTER]) + "\n"

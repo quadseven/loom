@@ -1441,7 +1441,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         for line in ("333333333333", "kubectl apply", "api.github.com", "```"):
             self.assertNotIn(line, note)
         self.assertIn("parked", note)
-        self.assertIn("[work]", note)
+        self.assertIn("after a work failure", note)
         self.assertIn("The full run log stays on the lane host.", note)
 
     def test_a_park_reason_the_leak_scan_cannot_clear_is_withheld(self):

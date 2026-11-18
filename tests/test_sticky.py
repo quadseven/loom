@@ -121,6 +121,14 @@ class OutcomeTests(unittest.TestCase):
         self.assertNotIn("<!--", body.replace(TAIL, ""))
         self.assertNotIn("@someone", body)
 
+    def test_the_line_renders_no_link_image_or_tag(self):
+        body = sticky.merge_outcome(None, TAIL, "h", "see [here](https://x.test) ![i](https://x.test/i.png) <b>x</b>", "t")
+        line = body.splitlines()[3]
+        self.assertNotIn("](", line.replace("\\](", ""))
+        self.assertNotIn("<b>", line)
+        self.assertIn("&lt;b&gt;", line)
+        self.assertIn("\\[here\\]", line)
+
     def test_a_long_line_is_capped(self):
         body = sticky.merge_outcome(None, TAIL, "h", "x" * 5000, "t")
         self.assertLess(len(body), sticky.MAX_OUTCOME + 200)
