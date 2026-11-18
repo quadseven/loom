@@ -13999,13 +13999,18 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003). One log line per goal."""
+        seconds (decision 0003), resuming after a carried-over read. One log
+        line per goal."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
             state = {}
         checked = state.get("checked")
-        if self._num(checked) and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY:
+        finished = state.get("finished", [])
+        if not isinstance(finished, list):
+            finished = []
+        if (not finished and self._num(checked)
+                and 0 <= self.now - checked < OUTSIDE_EPIC_EVERY):
             return
         try:
             homes = self._goal_homes()
@@ -14014,18 +14019,27 @@ class Station:
         except (GitHubError, OSError) as err:
             _say("outside-epic: could not read the goal homes: %s" % err)
             return
+        completed = set(item for item in finished if isinstance(item, str))
         for repo, goal in homes:
             number = int(goal["number"])
+            key = "%s#%d" % (repo, number)
+            if key in completed:
+                continue
             try:
                 moved, left = brain.move_outside_tickets(self.gh, repo, number)
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not finished: a resumed pass retries this home.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
                 continue
             _say("outside-epic: moved %d, left %d for goal #%d in %s"
                  % (moved, left, number, repo))
+            completed.add(key)
+            state["finished"] = sorted(completed)
+            _write_json(path, state)
         state["checked"] = self.now
+        state["finished"] = []
         _write_json(path, state)
 
     # -- invariants -------------------------------------------------------

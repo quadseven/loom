@@ -11,7 +11,7 @@ from unittest import mock
 
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
-from bus import brain, claimed, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
+from bus import brain, claimed, comment_findings, factory, hunt_plan, labels, merge_tier, pr_repair, station, status, tickets
 from bus.github import GitHubError, RateLimited, Response, ShadowHeld
 from bus.tickets import FIX_MARKER
 
@@ -148,6 +148,10 @@ class FakeGitHub:
         m = re.search(r"/pulls/(\d+)/reviews$", path)
         if m:
             return list(self.reviews.get(int(m.group(1)), []))
+        m = re.search(r"/pulls/(\d+)/commits$", path)
+        if m:
+            # The pull request's commits; a test sets pr_commits to name them.
+            return [{"sha": x} for x in getattr(self, "pr_commits", {}).get(int(m.group(1)), [])]
         if re.search(r"^/repos/[^/]+/[^/]+/labels(?:\?|$)", path):
             # The repo's labels; a test sets repo_labels to define `area:` ones.
             return [{"name": n} for n in getattr(self, "repo_labels", ())]
@@ -6184,6 +6188,140 @@ class AbandonedReview(Base):
         self.assertIn("> " + finding_line, body)
         self.assertIn("> Grug Haunt notice: this PR was merged with 1 high/critical Elder finding(s) "
                       "from EARLIER in its review that never got a reply.", body)
+
+
+class BlockingFindings(Base):
+    """Factory merge refusal for PRs with unanswered blocking findings. The
+    findings are read from the pull request's comments (50), never from its
+    ticket's (5): the two stores are kept apart here on purpose."""
+
+    URL = "https://github.com/example-org/example-repo/pull/50#issuecomment-100"
+    SHA = "abc1234def5678abc1234def5678abc1234def56"
+
+    def setUp(self):
+        super().setUp()
+        self.gh.ticket(5, "pr", lane="codex")
+        self.gh.pull(50, 5, mergeable=True, green=True)
+        self.gh.comments[50] = []
+
+    def post(self, number, body, login="alice-example", ident=100,
+             at="2030-01-01T13:00:00Z"):
+        self.gh.comments[number].append({
+            "id": ident, "user": {"login": login}, "body": body, "created_at": at,
+            "html_url": "https://github.com/example-org/example-repo/pull/50#issuecomment-%d"
+                        % ident})
+
+    def finding(self, number=50, login="alice-example"):
+        self.post(number, "Blocking: test fails on %s." % self.SHA[:9], login=login)
+
+    def answer(self, body):
+        self.post(50, body + " " + self.URL, ident=101, at="2030-01-01T13:30:00Z")
+
+    def go_said(self):
+        with mock.patch("bus.factory._say") as say:
+            self.go()
+        return [c.args[0] for c in say.call_args_list]
+
+    def test_unanswered_blocking_finding_refuses_merge(self):
+        """A blocking finding from a trusted author without an answer blocks merge."""
+        self.finding()
+        said = self.go_said()
+        self.assertEqual(self.merged, [])
+        self.assertTrue(any(self.URL in line and "unanswered blocking comment" in line
+                            for line in said), said)
+
+    def test_a_pull_request_finding_refuses_although_the_ticket_has_none(self):
+        # The regression: the gate read the ticket's comments, so a finding
+        # on the pull request reached the merge.
+        self.finding(number=50)
+        self.post(5, "Lane run started.", ident=200)
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_a_ticket_comment_is_not_a_pull_request_finding(self):
+        self.finding(number=5)
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_unreadable_pull_request_comments_refuse_the_merge(self):
+        paginate = self.gh.paginate
+
+        def failing(path):
+            if path.endswith("/issues/50/comments"):
+                raise GitHubError("GET %s -> 502" % path, 502)
+            return paginate(path)
+
+        with mock.patch.object(self.gh, "paginate", side_effect=failing):
+            said = self.go_said()
+        self.assertEqual(self.merged, [])
+        self.assertTrue(any("pull request comments unreadable" in line for line in said), said)
+
+    def test_answered_blocking_finding_allows_merge(self):
+        """A blocking finding with a fix naming one of its commits allows merge."""
+        self.gh.pr_commits = {50: [self.SHA]}
+        self.finding()
+        self.answer("Fixed in %s: the test covers it." % self.SHA[:10])
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_fix_naming_a_commit_off_the_pull_request_refuses_merge(self):
+        self.gh.pr_commits = {50: ["fedcba9876543210fedcba9876543210fedcba98"]}
+        self.finding()
+        self.answer("Fixed in %s: the test covers it." % self.SHA[:10])
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_unreadable_commits_for_a_named_fix_refuse_the_merge(self):
+        self.finding()
+        self.answer("Fixed in %s: the test covers it." % self.SHA[:10])
+        paginate = self.gh.paginate
+
+        def failing(path):
+            if path.endswith("/pulls/50/commits"):
+                raise GitHubError("GET %s -> 502" % path, 502)
+            return paginate(path)
+
+        with mock.patch.object(self.gh, "paginate", side_effect=failing):
+            said = self.go_said()
+        self.assertEqual(self.merged, [])
+        self.assertTrue(any("pull request commits unreadable" in line for line in said), said)
+
+    def test_a_linked_reply_that_resolves_nothing_refuses_merge(self):
+        self.finding()
+        self.answer("Still broken, investigating:")
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_stranger_blocking_comment_does_not_block(self):
+        """A blocking comment from an untrusted author does not block merge."""
+        self.finding(login="mallory-example")
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_blocking_without_commit_sha_does_not_block(self):
+        """A blocking comment without a commit SHA is not a finding."""
+        self.post(50, "Blocking: test fails.")
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_marker_form_finding_blocks_merge(self):
+        """The marker form finding blocks merge even without a commit SHA."""
+        self.post(50, "<!-- loom:finding v1 -->\nTest fails.")
+        self.go()
+        self.assertEqual(self.merged, [])
+
+    def test_marker_form_finding_answered_allows_merge(self):
+        """The marker form finding with a reasoned decline allows merge."""
+        self.post(50, "<!-- loom:finding v1 -->\nTest fails.")
+        self.answer("Declined: the failing test is the flaky one at tests/test_a.py:7.")
+        self.go()
+        self.assertEqual(self.merged, [(50, (REPO, 5))])
+
+    def test_a_decline_without_evidence_refuses_merge(self):
+        self.post(50, "<!-- loom:finding v1 -->\nTest fails.")
+        self.answer("Declined: the failing test is the flaky one already tracked.")
+        self.go()
+        self.assertEqual(self.merged, [])
 
 
 if __name__ == "__main__":
