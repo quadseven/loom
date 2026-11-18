@@ -2747,18 +2747,18 @@ note_factory_incident() {  # kind, detail, reason_var_name
 # retries the ticket on another lane, which files the incident if the base is
 # red there too: filed from the runner, it held nothing and waited for a
 # person to close it.
-# Optional 4th argument: log offset of the check run, to append error lines.
-note_base_check_failure() {  # kind, detail, reason_var_name [, log_offset]
+# Optional 5th argument: log offset of the check run, to append error lines.
+note_base_check_failure() {  # kind, detail, reason_var_name, revision [, log_offset]
   if [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ]; then
     PARK_CLASS=factory
     printf -v "$3" '%s; %s' "${!3}" "no incident filed on a cluster runner: another lane runs the base check"
     echo "base check failed on a cluster runner; no incident filed" >> "$LOG"
     return 0
   fi
-  local detail="$2"
-  if [ -n "${4:-}" ]; then
+  local detail="$2"$'\n'"Checked commit: $4"
+  if [ -n "${5:-}" ]; then
     local tail
-    tail="$(check_error_tail "$4")"
+    tail="$(check_error_tail "$5")"
     if [ -n "$tail" ]; then
       detail="${detail}"$'\n'"${tail}"
     fi
@@ -3046,11 +3046,11 @@ check_default_branch() {
     [ "$rc" -eq 0 ] || SETUP_REASON="default branch setup exited $rc"
   fi
   if [ "$rc" -eq 0 ]; then
-    local check_start failures=""
-    check_start="$(log_size)"
+    local failures=""
+    DEFAULT_CHECK_START="$(log_size)"
     contract_run "$C_CHECK"; DEFAULT_EXIT=$?
     DEFAULT_CHANGED="$(tracked_changes)"
-    [ "$DEFAULT_EXIT" -eq 0 ] || failures="$(check_failures "$check_start")"
+    [ "$DEFAULT_EXIT" -eq 0 ] || failures="$(check_failures "$DEFAULT_CHECK_START")"
     record default-baseline "$C_CHECK" "$DEFAULT_EXIT" "$DEFAULT_REV" \
       "$([ "$DEFAULT_EXIT" -eq 0 ] && [ -z "$DEFAULT_CHANGED" ] && echo true || echo false)" \
       "$(join_detail "${DEFAULT_CHANGED:+changed tracked files: $DEFAULT_CHANGED}" "$failures")"
@@ -3116,8 +3116,9 @@ sys.exit(0 if valid else 1)
 # 1 with SETUP_REASON when the environment cannot be prepared.
 prepare_validation() {
   local rc interp="" subs="" changed what baseline_rev tool="" verdict_key interpreter_id now cached_verdict=0
-  local check_start=0 failures=""
+  local check_start="" failures=""
   SETUP_REASON="" HOST_RED_BASE="" CHECK_DESELECT=""
+  BASELINE_SOURCE="base"
   load_contract || { record prepare "$CONTRACT_FILE" 1 "$BASE" false "$SETUP_REASON"; return 1; }
   [ -n "$HAS_CONTRACT" ] || return 0
   what="interpreter ${C_INTERP:-none}; submodules $C_SUBMODULES"
@@ -3145,10 +3146,8 @@ prepare_validation() {
   rm -rf "$CHECK_HOME"
   mkdir -p "$CHECK_HOME/tmp"
   if [ -n "$CONFLICTS" ]; then
-    local check_start
-    check_start="$(log_size)"
     check_default_branch || return 1
-    BASELINE_EXIT="$DEFAULT_EXIT"
+    BASELINE_EXIT="$DEFAULT_EXIT" BASELINE_SOURCE="default branch"
     if [ -n "$DEFAULT_CHANGED" ]; then
       SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
       return 1
@@ -3156,12 +3155,13 @@ prepare_validation() {
     if [ "$BASELINE_EXIT" -ne 0 ]; then
       check_exit_is_load "$BASELINE_EXIT" && { note_load_failure "$BASELINE_EXIT" SETUP_REASON; return 1; }
       repair_baseline_allowed && return 0
-      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch"
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
+      SETUP_REASON="base check exited $BASELINE_EXIT on the default branch at $DEFAULT_REV"
+      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$DEFAULT_REV" "$DEFAULT_CHECK_START"
       return 1
     fi
     return 0
   fi
+  [ -z "$FIX_PR" ] || BASELINE_SOURCE="fix branch"
   # C_SETUP and C_CHECK are shell on purpose, like a CI run: step. They are
   # validated in load_contract: read only from the base branch (never the
   # agent's), one line of printable ASCII, at most 1000 characters; and
@@ -3207,13 +3207,12 @@ prepare_validation() {
     note_load_failure "$BASELINE_EXIT" SETUP_REASON
     return 1
   fi
-  # A check that cannot run, or is already red, on the unmodified base is
-  # the factory's problem, not the ticket's: file the incident and stop
-  # before the agent burns a run it can never validate.
-  case "$BASELINE_EXIT" in
-    125|126|127)
-      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base"
-      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
+  # A check that cannot run on the unmodified base is an environment fault.
+  # On a fix branch, these exits also need a default-branch check first.
+  case "$FIX_PR:$BASELINE_EXIT" in
+    :125|:126|:127)
+      SETUP_REASON="validation environment unavailable: the check exited $BASELINE_EXIT on the unmodified base at $baseline_rev"
+      note_base_check_failure environment "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$baseline_rev"
       return 1 ;;
   esac
   # One red run does not make the base red: Loom's own check timed out
@@ -3281,7 +3280,8 @@ prepare_validation() {
         SETUP_REASON="default branch check changed tracked files: $DEFAULT_CHANGED"
         return 1
       fi
-      BASELINE_EXIT="$DEFAULT_EXIT"
+      BASELINE_EXIT="$DEFAULT_EXIT" BASELINE_SOURCE="default branch"
+      baseline_rev="$DEFAULT_REV" check_start="$DEFAULT_CHECK_START"
       if check_exit_is_load "$BASELINE_EXIT"; then
         note_load_failure "$BASELINE_EXIT" SETUP_REASON
         return 1
@@ -3291,8 +3291,8 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
-    # A fresh run's own log names its failures; a cached verdict or a fix
-    # round's default-branch check does not, so those still file.
+    # Only a fresh check on the ordinary baseline can use the host-only
+    # failure check, which reruns validation in the current tree.
     if [ -z "$FIX_PR" ] && [ "$cached_verdict" -eq 0 ] && [ -z "$changed" ] &&
        host_red_base "$baseline_rev" "$check_start"; then
       # The next ticket reruns the check rather than reading this red verdict.
@@ -3300,12 +3300,8 @@ prepare_validation() {
       exclude_untracked
       return $?
     fi
-    SETUP_REASON="base check exited $BASELINE_EXIT on the unmodified repo"
-    if [ "$cached_verdict" -eq 0 ]; then
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$check_start"
-    else
-      note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON ""
-    fi
+    SETUP_REASON="base check exited $BASELINE_EXIT on the $BASELINE_SOURCE at $baseline_rev"
+    note_base_check_failure base-check "check: $C_CHECK (exit $BASELINE_EXIT)" SETUP_REASON "$baseline_rev" "$check_start"
     return 1
   fi
   [ -z "$changed" ] || { SETUP_REASON="setup or check changed tracked files on the base: $changed"; return 1; }
@@ -3744,8 +3740,8 @@ EOF
 # What the agent is told about the contract, after its brief.
 validation_note() {
   [ -n "$HAS_CONTRACT" ] || return 0
-  printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the base it exited %s.\n\n    %s\n' \
-    "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_EXIT" "$C_CHECK"
+  printf '\n\n## Validation environment\nThe runner prepared this tree from %s (interpreter: %s, submodules: %s, setup: %s). After you finish it runs the check below on your committed tree; the pull request opens only if it exits 0 and changes no tracked file. On the %s it exited %s.\n\n    %s\n' \
+    "$CONTRACT_FILE" "${C_INTERP:-any}" "$C_SUBMODULES" "${C_SETUP:-none}" "$BASELINE_SOURCE" "$BASELINE_EXIT" "$C_CHECK"
   [ -z "${C_AFFECTED:-}" ] || printf '\nAfter the check passes it runs this affected command with your changed files on stdin (and in LOOM_CHANGED_FILES); it must pass the same way:\n\n    %s\n' "$C_AFFECTED"
   [ "$C_SUBMODULES" != yes ] || printf '\nNever edit files inside a submodule: the push carries only its pinned commit, so the runner refuses a run that does and pushes nothing.\n'
 }
