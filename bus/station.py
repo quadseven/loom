@@ -2932,7 +2932,9 @@ class Station:
                                     demoted_models=self._brief_demoted_models(lane),
                                     claim=self._lane_claim_label(),
                                     defaults=answer.default_notes(comments, self.s.authors,
-                                                                  answer.operators(trusted=self.s.authors)))
+                                                                  answer.operators(trusted=self.s.authors)),
+                                    operator_review=fix is not None and
+                                    answer.newest_held_pr(comments, self.s.authors) == fix.pr)
         claiming = self._write_brief(lane, name, text)
         # No assignment: the claim:<login> label below marks the claim for
         # another operator's Loom (tickets.owned_elsewhere reads both), and an

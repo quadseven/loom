@@ -281,7 +281,8 @@ class Posting(AnswerTest):
         self.assertEqual(self.comments_posted(), [])
 
     def test_review_post_persists_exact_ask_binding_for_the_consumer(self):
-        self.read_ask(42)
+        item = next(item for item in self.store.operator_items if item['number'] == 42)
+        item['body_ask'] = 'Reply yes or no.'
         path = '/repos/%s/issues/42/comments?per_page=100&page=1' % REPO
         original = dict(self.gh.rest_data[path][0])
         code, result = self.call('POST', '/api/needs-you/answer', {
@@ -293,6 +294,13 @@ class Posting(AnswerTest):
         self.assertIsNotNone(answer.pr_verdict([original, posted], 8, [LOOM], [OWNER], head='a' * 40))
         original['body'] += '\nA new operator requirement.'
         self.assertIsNone(answer.pr_verdict([original, posted], 8, [LOOM], [OWNER], head='a' * 40))
+
+    def test_generic_reply_cannot_decide_a_review_hidden_by_the_body_ask(self):
+        item = next(item for item in self.store.operator_items if item['number'] == 42)
+        item['body_ask'] = 'Enter your decision.'
+        code, result = self.answer_it(number=42, choice='Merge')
+        self.assertEqual(code, 409, result)
+        self.assertEqual(self.comments_posted(), [])
 
     def test_edited_same_pr_ask_refuses_the_rendered_review_card(self):
         self._answer_after_review_ask_change(False)

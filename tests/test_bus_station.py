@@ -6266,6 +6266,17 @@ class FixTest(Base):
         self.run_pass()
         self.assertIn("Fix-PR: 99\n", self.claimed_brief("example-owner.example-repo-12"))
 
+    def test_a_fix_for_a_pull_request_sent_back_by_the_operator_uses_local_progress(self):
+        from bus import operator_hold
+        self.fake.add(12)
+        self.comment(12, answer.HUMAN_MARKER + "\n" + operator_hold.ask(99, ["deployment review"]))
+        self.comment(12, FIX_BODY)
+        self.fake.pulls.append({"number": 99, "state": "open", "merged_at": None,
+                                "base": {"ref": "main"}, "head": {"ref": "loom/12-fix-the-thing"}})
+        self.run_pass()
+        brief = self.claimed_brief("example-owner.example-repo-12")
+        self.assertIn("Fix-PR: 99\nOperator-Review: yes\n", brief)
+
     def test_a_claimed_fix_is_not_claimed_again_on_the_next_pass(self):
         # The claim was stamped with the pass's start time, earlier than the
         # fix comment the same pass had just posted, so the next pass read the
