@@ -63,7 +63,8 @@ CommitReader = Callable[[], Sequence[str]]
 
 def opens_finding(body: str) -> bool:
     """Whether a comment body is a blocking finding, in either form."""
-    if FINDING_MARKER in body:
+    # The marker form opens the comment; a marker quoted later is only text.
+    if body.lstrip().startswith(FINDING_MARKER):
         return True
     if _MACHINE_MARKER in body:
         return False

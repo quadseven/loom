@@ -47,6 +47,17 @@ class OpenFindingsTests(unittest.TestCase):
                      "2030-01-01T13:00:00Z", 1)], AUTHORS)
         self.assertEqual([c["id"] for c in found], [1])
 
+    def test_a_marker_quoted_later_in_a_comment_is_not_a_finding(self):
+        body = "Thanks. For reference, a finding opens with %s and a reason." % (
+            comment_findings.FINDING_MARKER)
+        found = comment_findings.open_findings(
+            [comment("example-brain", body, "2030-01-01T13:00:00Z", 1)], AUTHORS)
+        self.assertEqual(found, [])
+
+    def test_the_marker_may_follow_leading_whitespace(self):
+        body = "\n  %s retry fails." % comment_findings.FINDING_MARKER
+        self.assertTrue(comment_findings.opens_finding(body))
+
     def test_luna_verdicts_and_other_machine_markers_are_not_legacy_findings(self):
         verdict = comment("example-brain", "<!-- loom:luna-review v1 sha=%s -->\n"
                           "Blocking findings:\n- x" % SHA, "2030-01-01T13:00:00Z", 1)
