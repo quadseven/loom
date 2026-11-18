@@ -82,7 +82,7 @@ decides who acts:
 | `loom:ticket` | Every ticket issue. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
-| `loom:running` | The station handed it to that lane's runner. |
+| `loom:running` | A lane has claimed the ticket. The station clears a local run's running and lane labels when it reports the outcome, and requeues stale tickets with no local brief or pending outcome. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |

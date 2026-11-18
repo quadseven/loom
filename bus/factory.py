@@ -5459,6 +5459,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if labels.RUN_OUTCOME_HOLDS.intersection(_labels(issue)):
+            return "%s is held" % ref
         person = self._human_holder(repo, issue)
         if person:
             return "%s is claimed by %s" % (ref, person)

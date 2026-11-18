@@ -120,7 +120,7 @@ class NoChangeBudgetTest(Base):
         self.answer()
         self.assertIn("Model: model-next", self.fake.issues[12]["body"])
 
-    def test_busy_ladder_keeps_pending_escalation_without_requeue(self):
+    def test_busy_ladder_keeps_the_queued_ticket_held_for_escalation(self):
         self.answer()
         self.fake.issues[12]["labels"] = [{"name": n} for n in
             ("loom:ticket", "loom:running", "lane:codex")]
@@ -128,7 +128,7 @@ class NoChangeBudgetTest(Base):
         with mock.patch.object(self.runner, "_no_change_plan", return_value=None):
             self.runner._settle_no_change(REPO, 12, "codex", "pending")
         self.assertIn("wait:no-change", self.fake.names(12))
-        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:queued", "wait:no-change"})
         self.assertFalse(self.runner._no_change_pending(REPO, 12, "codex", "pending"))
         with mock.patch.object(self.runner, "_no_change_plan", return_value={
                 "lane": "claude", "model": "model-next", "rung": 2}):
@@ -483,6 +483,7 @@ class NoChangeBudgetTest(Base):
                     self.runner._settle_no_change(REPO, 12, "claude", name)
                 issue = self.fake.issues[12]
                 if changed == "newer":
+                    issue["labels"].append({"name": self.runner._lane_claim_label()})
                     self.fake.events[12].append({"event": "labeled", "label": {"name": "claim:alice-example"},
                                                 "created_at": "2099-01-01T00:00:00Z"})
                 else:
@@ -659,7 +660,6 @@ class NoChangeWaitingReportTest(Base):
 
     def test_later_pass_with_a_plan_promotes_the_ticket(self):
         self.assertTrue(self.report(None))
-        self.relabel_running()
         self.runner.now += station.NO_CHANGE_RETRY_EVERY
         plan = {"lane": "claude", "model": "model-next", "rung": 2}
         with mock.patch.object(self.runner, "_no_change_plan", return_value=plan):
@@ -780,7 +780,6 @@ class NoChangeWaitingReportTest(Base):
         self.assertIn("wait:no-change", self.fake.names(12))
         step = self.runner._no_change_data()["%s#12" % REPO]["runs"]["codex/" + self.name]
         self.assertEqual(step["fix"], 77)
-        self.relabel_running()
         self.runner.now += station.NO_CHANGE_RETRY_EVERY + 1
         plan = {"lane": "claude", "model": "model-next", "rung": 2}
         with mock.patch.object(self.runner, "_no_change_plan", return_value=plan):

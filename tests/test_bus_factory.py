@@ -3459,6 +3459,18 @@ class Queued(Base):
         self.assign(available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    def test_a_queued_outcome_hold_gets_no_lane(self):
+        self.queued(7)
+        self.queued(8)
+        self.queued(9)
+        self.gh.issues[7]["labels"].append({"name": "wait:incident"})
+        self.gh.issues[8]["labels"].append({"name": "wait:no-change"})
+
+        self.assign(available=["codex"])
+
+        self.assertEqual([factory._state(self.gh.issues[n]) for n in (7, 8, 9)],
+                         ["queued", "queued", "briefed"])
+
     OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
     OUT = factory.ANTHROPIC + ("claude",)
 

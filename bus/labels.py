@@ -14,6 +14,8 @@ from .stale_claims import OVERFLOW_CLAIM
 # for the second operator's session to claim it (docs/BRAIN.md).
 HANDOFF = "handoff:claude"
 
+RUN_OUTCOME_HOLDS = frozenset(("wait:incident", "wait:no-change"))
+
 LANES = ["codex", "claude", "openrouter", "opencode-go", "anthropic", "zen",
          "zai", "workersai", "agy", "spark", "copilot"]
 # Extra slots: parallel copies of a lane on the same provider (run_lane.sh
@@ -128,6 +130,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "wait:model-limit": {"color": "fef2c0", "description": "Waiting: its model or lane is at a limit until a reset"},
     "wait:lane": {"color": "fef2c0", "description": "Waiting: no free lane takes its model"},
     "wait:incident": {"color": "fef2c0", "description": "Waiting: held for an open factory incident"},
+    "wait:no-change": {"color": "fef2c0", "description": "Waiting: no lane is ready for a no-change promotion"},
     "wait:after": {"color": "fef2c0", "description": "Waiting: another ticket must merge first (After:)"},
     "wait:blocked": {"color": "fef2c0", "description": "Waiting: its Blocked on section names an issue still open"},
     "wait:superseded": {"color": "fef2c0", "description": "Waiting: its brief says another issue supersedes it; the brain closes or re-briefs it"},
