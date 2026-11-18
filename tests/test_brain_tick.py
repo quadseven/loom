@@ -50,6 +50,11 @@ if [ "$3 $4" = "app login" ]; then
   exit 0
 fi
 if [ "$3" = lock ]; then
+  [ -z "${FAKE_LOCK_LINE:-}" ] || printf '%s\\n' "$FAKE_LOCK_LINE"
+  if [ -n "${FAKE_BACKGROUND_LOCK:-}" ]; then
+    printf '%s\\n' "$FAKE_BACKGROUND_LOCK" >&2 &
+    wait "$!"
+  fi
   # FAKE_LOCK_FREE_AFTER=n: the lock is held for the first n tries.
   if [ -n "${FAKE_LOCK_FREE_AFTER:-}" ]; then
     n=$(grep -c ' lock ' "$FAKE_LOG")
@@ -369,10 +374,34 @@ class BrainTickTest(unittest.TestCase):
     # loom#2606: a stand-down for a peer's lock leaves its yield on that
     # lock, so the station counts it as alive, not stopped.
     def test_a_stand_down_for_a_held_lock_records_its_yield(self):
-        run, calls = self.tick(FAKE_LOCK="1")
+        lock_line = ("lock held by muse (not yours: you are lane-machine), "
+                     "held 12m since 2030-01-02T12:00:00Z, expires 2030-01-02T12:30:00Z")
+        stale_line = (lock_line.replace("held by muse", "held by stale-holder")
+                      .replace("12:30:00Z", "12:45:00Z"))
+        run, calls = self.tick(FAKE_LOCK="1", FAKE_LOCK_LINE=lock_line,
+                               FAKE_BACKGROUND_LOCK=stale_line)
         self.assertEqual(0, run.returncode)
         self.assertEqual("python3 -m bus yielded example/loom --holder lane-machine", calls[-1])
         self.assertEqual(("skipped", True), (self.beat()[0]["outcome"], self.beat()[1]))
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertEqual(["brain: tick skipped: " + lock_line],
+                         [line.split("] ", 1)[1] for line in log.splitlines()
+                          if "brain: tick skipped:" in line])
+
+    def test_muse_runs_despite_a_background_holder_message(self):
+        stale_line = ("lock held by stale-holder (not yours: you are muse), "
+                      "held 12m since 2030-01-02T12:00:00Z, expires 2030-01-02T12:45:00Z")
+        lock_line = "lock acquired: yours (holder muse), expires 2030-01-02T12:30:00Z"
+        run, calls = self.tick(LOOM_BRAIN_HOLDER="muse", FAKE_LOCK_LINE=lock_line,
+                               FAKE_BACKGROUND_LOCK=stale_line)
+        self.assertEqual(0, run.returncode)
+        self.assertTrue(any(c.startswith("claude ") for c in calls))
+        self.assertFalse(any(" -m bus yielded " in c for c in calls))
+        self.assertEqual("ok", self.beat()[0]["outcome"])
+        log = (self.home / "logs" / "brain.log").read_text()
+        self.assertIn(stale_line, log)
+        self.assertIn(lock_line, log)
+        self.assertNotIn("brain: tick skipped:", log)
 
     def test_a_failed_yield_record_is_logged_and_the_tick_still_ends_well(self):
         run, calls = self.tick(FAKE_LOCK="1", FAKE_YIELD="1")
