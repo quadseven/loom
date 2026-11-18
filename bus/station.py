@@ -2860,6 +2860,11 @@ class Station:
         comment, and a rung 0 comment ends a fix the same way: without it a
         restarted ticket replayed the round of a pull request that had ended
         (loom#2334). Raises ValueError for an unusable fix."""
+        found = self._fix_with_source(repo, comments)
+        return (found[0], found[1].get("id")) if found is not None else None
+
+    def _fix_with_source(self, repo: str, comments: List[Any]
+                         ) -> Optional[Tuple[tickets.Fix, Dict[str, Any]]]:
         allowed = {a.lower() for a in self.s.authors}
         comments = status.expand(comments, self.s.authors)
         last_end, newest_fix = -1, None
@@ -2879,7 +2884,17 @@ class Station:
         # posted may carry someone else's words.
         if newest_fix[1].get("updated_at") != newest_fix[1].get("created_at"):
             raise ValueError("the loom:fix comment was edited after it was posted")
-        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1].get("id")
+        return tickets.parse_fix(repo, newest_fix[2]), newest_fix[1]
+
+    def _pending_fix_at(self, repo: str, comments: List[Any]) -> Optional[float]:
+        """When the current fix round was posted, if it still needs a claim."""
+        found = self._fix_with_source(repo, comments)
+        if found is None:
+            return None
+        fix, source = found
+        if fix.pr in tickets.judged_pulls(c.get("body") or "" for c in comments):
+            return None
+        return self._epoch(str(source.get("created_at") or "")) or 0.0
 
     def _claim_time(self, comments: List[Any], fix_comment_id: Any) -> float:
         """When a claim is stamped: the pass time, or one second after the
@@ -16000,7 +16015,7 @@ class Station:
             # twelve moves was lost to a carry-over (loom#2094).
             self._record_silent(runner.silent_running, runner.silent)
             self._return_silent_briefs(runner.silent_running)
-        self._record_waits(runner.waits, runner.settled)
+            self._record_waits(runner.waits, runner.settled)
 
     def lift_brain_holds(self) -> None:
         """Resolve the needs-brain holds older than a day that Loom set
@@ -16365,6 +16380,7 @@ class Station:
         settled as stalled (loom#3158)."""
         runner = self._factory()
         runner.in_inbox = self._inbox_tickets()
+        runner.pending_fix_at = self._pending_fix_at
         runner.capped = set(self._capped_repos(
             [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)]))
         for repo in sorted(runner.capped):

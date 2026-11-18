@@ -612,7 +612,13 @@ rung. With no such lane it goes back to `loom:queued` with no lane label
 it stops holding its lane and any free lane can take it from the queue. A
 ticket whose brief sits in a lane inbox is never settled this way.
 
-It skips future `Not before:` times and tickets without a readable Difficulty.
+A pending fix round on a demoted or occupied lane keeps its brief for two
+hours from the later of the fix request and the lane assignment. It then
+takes a free lane on its rung, or a free lane on the next rung. If neither
+move is possible, it stays briefed and records one counted wait and one
+status event with its age.
+
+The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.

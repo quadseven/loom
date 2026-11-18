@@ -212,6 +212,7 @@ from .tickets import FIX_MARKER, PRIORITIES, priority_of
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+PARKED_FIX_WAIT = "parked fix round on lane "
 # Why a queued ticket of a repo at its open pull request cap gets no lane. One
 # fixed text, so its wait keeps its start while the count moves (loom#3158).
 CAP_WAIT = "its repo is at its open pull request cap"
@@ -2008,6 +2009,7 @@ class Factory:
         # "owner/repo#n" of each brief in a lane inbox: the station wrote it
         # and the run is starting, so the ticket is not stalled.
         self.in_inbox: Set[str] = set()
+        self.pending_fix_at: Optional[Callable[[str, List[Any]], Optional[float]]] = None
         # Lane -> seconds since its last heartbeat, for each local lane
         # without a live one; silent_running is the lanes found holding a
         # running ticket past SILENT_MAX, with those tickets.
@@ -2599,10 +2601,12 @@ class Factory:
     def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
                skip: int = 0, footer: Optional[Tuple[str, str]] = None,
-               before_apply: Optional[Callable[[str, str], bool]] = None) -> Optional[str]:
+               before_apply: Optional[Callable[[str, str], bool]] = None,
+               only_free_rung: int = 0) -> Optional[str]:
         """Put the ticket on its next rung (climb_rungs): its Model: line and
         lane label, and a rung marker. The rung it ran on counts as tried when
-        it failed there. Returns the lane, or None when no rung it may climb
+        it failed there. only_free_rung confines the climb to a specific rung
+        with an idle lane. Returns the lane, or None when no rung it may climb
         to has a lane up: every such rung was tried (_rungs_left says which),
         or each is down or at a limit and the ticket waits."""
         number = int(issue["number"])
@@ -2614,6 +2618,8 @@ class Factory:
             return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
         up = self._up_lanes(repo)
+        if only_free_rung:
+            up = {only_free_rung: tuple(x for x in up.get(only_free_rung, ()) if self._free(x))}
         rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached,
                          lanes=up)
         if not rung:
@@ -2633,6 +2639,7 @@ class Factory:
             kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept})
+            issue["body"] = body
             issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
                           "model ladder to rung %d, %s on lane %s." % (
@@ -4898,14 +4905,15 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
-        if "%s#%s" % (repo, issue["number"]) in self.held:
+        key = "%s#%s" % (repo, issue["number"])
+        if key in self.held:
             # The station holds it (a factory incident, the unproven-work
             # gate this pass, or its repo's open pull request cap): no lane is
             # late, so it is neither spread nor moved as stalled. Moving it
             # rotated loom#633 through every rung with a comment each time
             # while the gate held it (2026-10-18).
             return
-        if "%s#%s" % (repo, issue["number"]) in self.cap_held:
+        if key in self.cap_held:
             self._requeue(repo, issue, "its brief cannot be written while %s is at its open "
                           "pull request cap" % repo, counted=False)
             return
@@ -4914,6 +4922,11 @@ class Factory:
             # Waiting for another ticket is not this one's fault: it is not
             # stalled, so it climbs nothing, and only a long hold is reported.
             self._tell_held(repo, issue, waiting)
+            return
+        parked = self._parked_fix(repo, issue)
+        if self.known_waits.get(key, "").startswith(PARKED_FIX_WAIT) and key not in self.waits:
+            self.settled.add(key)
+        if parked:
             return
         if (_lane(issue) in self.limited or _lane(issue) in self.down
                 or not self._serves(_lane(issue), issue_model(issue))):
@@ -5037,6 +5050,61 @@ class Factory:
         return [x for x in pool if x != old and self._takes_work(x)
                 and (not rung or self._serves(x, CLIMB[rung - 1][1]))
                 and (x != "agy" or agy_takes_header(issue))]
+
+    def _parked_fix(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Handle a pending fix on a demoted or full lane before ordinary stalls."""
+        number, old = int(issue["number"]), _lane(issue)
+        # The briefed round itself already contributes one ticket to load.
+        if self.pending_fix_at is None or (old not in self.demoted and self.load.get(old, 0) <= 1):
+            return False
+        comments = self._comments(repo, number)
+        posted = self.pending_fix_at(repo, comments)
+        if posted is None:
+            return False
+        key = "%s#%d" % (repo, number)
+        if key in self.in_inbox or {RUNAWAY, "needs-brain", "wait:gate"} & set(_labels(issue)):
+            return True
+        since = max(posted, self._briefed_since(repo, issue, comments))
+        if since and self.now - since >= BRIEFED_STALL:
+            self._move_parked_fix(repo, issue, comments, (self.now - since) / 3600)
+        return True
+
+    def _move_parked_fix(self, repo: str, issue: Dict[str, Any],
+                         comments: List[Dict[str, Any]], hours: float) -> None:
+        number, old = int(issue["number"]), _lane(issue)
+        rung = current_rung(issue)
+        if not rung and issue_model(issue) == "unspecified":
+            model = brain.lane_model(old)
+            rungs = [n for n, (lanes, pin) in enumerate(CLIMB, 1)
+                     if old in lanes and (model is None or pin == model)]
+            rung = rungs[0] if len(rungs) == 1 else 0
+        if rung:
+            model = CLIMB[rung - 1][1]
+            lane = next((x for x in self._stall_lanes(repo, issue, rung) if self._free(x)), None)
+            if lane is not None:
+                if self._move_capped(repo, issue, comments):
+                    return
+                if issue_model(issue) == "unspecified":
+                    body = with_model(str(issue.get("body") or ""), model)
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+                    issue["body"] = body
+                self._move_stalled(repo, issue, lane, hours, rung)
+                return
+        lane = self._climb(repo, issue, comments, "briefed %.0f hours on lane %s" % (hours, old),
+                           head="Not a failure", failed_here=False, only_free_rung=rung + 1)
+        if lane is not None:
+            self.load[old] = self.load.get(old, 0) - 1
+            self.actions += 1
+            return
+        if "needs-brain" in _labels(issue):
+            return  # the move cap held the ticket
+        why = "no free lane on its rung or the next"
+        reason = PARKED_FIX_WAIT + old + ": " + why
+        if self.known_waits.get("%s#%d" % (repo, number)) != reason:
+            message = "Fix round parked for %.0f hours on lane %s: %s." % (hours, old, why)
+            self._status_note(repo, number, message)
+            _say("%s#%d: %s" % (repo, number, message))
+        self._waiting(repo, number, reason)
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
