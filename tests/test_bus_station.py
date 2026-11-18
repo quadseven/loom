@@ -9837,7 +9837,7 @@ class VerifyBeforeBuildTest(Base):
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
-        self.assertEqual(self.events(), [])
+        self.assertTrue(any(self.UNMET in event for event in self.events()))
 
     def test_an_unmet_answer_that_says_nothing_leaves_the_ticket_shipped(self):
         self.sent()
@@ -10584,10 +10584,19 @@ class AsksTest(Base):
         self.assertIn("Still open", text)
         self.assertNotIn("Waits", text)
 
-    def test_an_ask_filed_with_needs_human_is_listed(self):
+    def test_the_digest_counts_the_operator_ask_and_skips_a_legacy_verification_ask(self):
         self.fake.add_ask(5, title="New label", label="needs:human")
+        self.fake.add_ask(6, title="Legacy live check", label="needs:human",
+                          body="## Acceptance criteria\n- [ ] Live: the dashboard loads\n")
+        self.fake.asks[-1]["labels"].append({"name": "loom:shipped"})
+        self.fake.comments[6].append({
+            "body": answer.HUMAN_MARKER + "\n" + station.criteria_gate.ASK_OPENING
+                    + ", and these have none it can gather: Live: the dashboard loads.",
+            "user": {"login": self.fake.bot}, "created_at": "2030-01-01T00:00:00Z"})
         self.go(NOON)
-        self.assertIn("New label", self.sent[0][1]["content"])
+        text = self.sent[0][1]["content"]
+        self.assertIn("New label", text)
+        self.assertNotIn("Legacy live check", text)
 
     def test_an_unreadable_ask_holds_the_digest(self):
         self.fake.add_ask(5, title="Unknown")
@@ -13121,10 +13130,9 @@ class CloseDoneTest(Base):
                       "- [ ] A test passes\n", state="shipped")
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        # A Live line with nothing to search is still a live criterion with no
-        # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
+        # A Live line with nothing to search stays shipped for verification.
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("needs:human", self.fake.names(1))
+        self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only

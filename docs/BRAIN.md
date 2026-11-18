@@ -303,9 +303,10 @@ string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
 the log line, field or endpoint the proof will show, for example
 `overseer: summoned` or `/api/v2/health`. The station searches its log
-command for that string before it spends a verify run (bus/evidence.py), so
-a criterion written as prose can never be verified. Triage counts the same checks as missing sections. The size may
-be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
+command for that string before it spends a log-based verify lane run
+(`bus/evidence.py`). A shipped ticket with a prose criterion can reach the
+brain's verify hand-out. Triage counts the same checks as missing sections.
+The size may be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
 optionally bold); triage, `brief`, the rewrite check, the runner and PR
 repair all read it through `hunt_plan.stated_size`. The runner
 writes the Size as the letter whatever the brief says, and logs any plan
@@ -2381,11 +2382,17 @@ Only a 2xx passes a URL check: a redirect is not followed, so a 3xx (a login
 or error page behind it) fails as "redirect not followed", unless every
 expected string names that exact status or Location.
 Each result is kept in the station's `live-checks.json` and written to the
-ticket's status; the answer itself is never written. A criterion with no
-runnable check, a failed check, or an operator criterion sends the ticket to
-`needs:human` with one ask (`Kind: decision`), once, and at most 4 such asks
-an hour. A verify lane's proof that passes a live or operator criterion
-without station evidence is refused.
+ticket's status. A live criterion with no runnable check or a failed check
+stays shipped in the verify queue with a missing-evidence note or the
+observed failure. Once unclaimed live work has waited 23 hours, the next
+scheduled `resume` hands it to the brain holding the lock ahead of the
+ordinary verify slots. The brain reads the logs, running system, or code and
+records the evidence, the missing evidence, or the finding if the box is false.
+Only unticked operator criteria raise a `needs:human` ask (`Kind: decision`),
+once per set of criteria and at most 4 asks an hour. The digest omits legacy
+station verification asks that have no open operator criterion. A verify
+lane's proof that passes a live or operator criterion without station evidence
+is refused.
 
 The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
 Each live criterion names at most one step: its log strings searched from the
@@ -2460,14 +2467,13 @@ default branch, drops its `sql` command, and counts the pair only while the
 lender is in `LOOM_LIVE_EVIDENCE_REPOS`. A repo not paired gets no adapter.
 
 When an opted-in repo has a prose Live box with no runnable check, the
-station hands a shipped ticket to a verify lane before asking a person. The
-brief lists that adapter's log sources and whether its SQL route is available.
+station can hand the shipped ticket to a verify lane. The brief lists that
+adapter's log sources and whether its SQL route is available.
 The lane may return one `adapter_step`: `log:<source>` with required strings,
 or `sql:<SELECT ...>` with strings that must occur in the rows. The station
 validates and runs the step through the repo adapter itself; lane prose never
-counts as evidence. A missing step or a failed station read raises one
-`loom:human` ask naming the attempted step and reason. Repos without an opted-in
-adapter keep the existing ask path.
+counts as evidence. A missing step or a failed station read stays in the
+verify queue with a status note naming the attempted step and reason.
 
 ### The evidence close
 

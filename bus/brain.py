@@ -1559,6 +1559,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
 
 VERIFY_DUE_HEADING = "### Verify due"
 VERIFY_RESUME_MAX = 5
+VERIFY_DUTY_AFTER = timedelta(hours=23)
 SENSITIVE_RESUME_MAX = 5
 _LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
 
@@ -7937,18 +7938,34 @@ def _verify_due_in(gh: GitHub, repo: str, now: datetime
 def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                          due: Optional[List[Tuple[datetime, str, Dict[str, Any]]]] = None
                          ) -> List[str]:
-    """Up to VERIFY_RESUME_MAX shipped tickets across `repos` (or the `due`
-    already read for them), oldest ship first: after stage work, before new
-    briefs."""
+    """Hand unclaimed live gaps to the acting brain before a day passes,
+    then fill the ordinary verify slots oldest ship first."""
     if due is None:
         due = [item for repo in repos for item in _verify_due_in(gh, repo, now)]
     due = list(due)
     due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
-    out = ["", "## Verify due (up to %d, oldest ship first)" % VERIFY_RESUME_MAX]
-    for shipped, repo, issue in due[:VERIFY_RESUME_MAX]:
+    urgent, ordinary = [], []
+    for shipped, repo, issue in due:
+        labels = _labels(issue)
+        if issue.get("assignees") or any(n.lower().startswith(stale_claims.CLAIM_PREFIX) for n in labels):
+            continue
+        criteria = str(issue.get("body") or "")
+        live = [text for kind, text in criteria_gate.needing_evidence(criteria)
+                if kind == criteria_gate.LIVE]
+        if (live and now - shipped >= VERIFY_DUTY_AFTER
+                and not criteria_gate.open_operator_criteria(criteria)):
+            urgent.append((shipped, repo, issue, " ".join(live)))
+        else:
+            ordinary.append((shipped, repo, issue, live_criterion(criteria)))
+    out = ["", "## Verify due"]
+    if urgent:
+        out.append("The brain holding the lock owns the live evidence hand-out. "
+                   "Read logs, the running system, or code and record what you observed "
+                   "or what evidence is missing on each ticket.")
+    for shipped, repo, issue, criterion in urgent + ordinary[:VERIFY_RESUME_MAX]:
         out.append("- resume verify %s#%s shipped %s ago: %s" % (
-            repo, issue["number"], _since(shipped, now), live_criterion(issue.get("body"))))
-    return out if due else out + ["- none"]
+            repo, issue["number"], _since(shipped, now), _one_line(criterion, 240)))
+    return out if urgent or ordinary else out + ["- none"]
 
 
 def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,

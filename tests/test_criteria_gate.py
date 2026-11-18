@@ -22,7 +22,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bus import criteria_gate, factory, station  # noqa: E402
+from bus import criteria_gate, factory, station, status  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 import test_bus_factory as tbs_factory  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
@@ -215,7 +215,11 @@ class DoneClose(tbs.Base):
     def asks(self, number):
         return [c["body"] for c in self.fake.comments[number] if "Kind: decision" in c["body"]]
 
-    def test_the_audits_closed_tickets_stay_open_with_one_ask(self):
+    def notes(self, number):
+        return "\n".join(c["body"] for c in self.fake.comments[number]
+                         if status.is_status(c["body"]))
+
+    def test_live_criteria_without_a_check_stay_shipped_with_one_note(self):
         # Each closed as completed by the done close with live criteria unmet.
         roller = body(AUDIT_CODE[1], AUDIT_LIVE[0], AUDIT_LIVE[1])
         cost = body(AUDIT_LIVE[3], AUDIT_LIVE[2])
@@ -223,15 +227,17 @@ class DoneClose(tbs.Base):
         self.close(roller, cost, rbac)
         for n in (1, 2, 3):
             self.assertEqual(self.fake.issues[n]["state"], "open")
-            self.assertIn("needs:human", self.fake.names(n))
-            self.assertEqual(len(self.asks(n)), 1)
-        self.assertIn("no check Loom can run", self.asks(1)[0])
-        # A second pass asks nothing more.
+            self.assertIn("loom:shipped", self.fake.names(n))
+            self.assertNotIn("needs:human", self.fake.names(n))
+            self.assertEqual(self.asks(n), [])
+        note = self.notes(1)
+        self.assertIn("Missing evidence:", note)
+        self.assertIn("no check Loom can run", note)
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        self.assertEqual(len(self.asks(1)), 1)
+        self.assertEqual(self.notes(1), note)
 
-    def test_a_passing_station_check_closes_and_a_failing_one_asks(self):
+    def test_a_passing_check_closes_and_a_failing_check_records_the_finding(self):
         # Not a Live line: a Live line with strings waits for a verify run.
         live = "Verify `https://status.example.com/healthz` serves `ok` after the deploy."
         self.close(body(AUDIT_CODE[1], live))
@@ -242,17 +248,33 @@ class DoneClose(tbs.Base):
         self.setUp()
         self.close(body(AUDIT_CODE[1], live), fetch=lambda u, t: (503, "down", ""))
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("its check failed: HTTP 503, missing `ok`", self.asks(1)[0])
+        self.assertIn("loom:shipped", self.fake.names(1))
+        self.assertNotIn("needs:human", self.fake.names(1))
+        self.assertEqual(self.asks(1), [])
+        self.assertIn("HTTP 503, missing `ok`", self.notes(1))
 
     def test_an_operator_criterion_never_closes_on_its_own(self):
-        self.close(body(AUDIT_CODE[1], AUDIT_OPERATOR[0]))
+        st = self.close(body(AUDIT_LIVE[0], AUDIT_OPERATOR[0]),
+                        body(AUDIT_OPERATOR[0], ticked=True))
+        st.close_done_tickets()
         self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertEqual(len(self.asks(1)), 1)
         self.assertIn("an operator action", self.asks(1)[0])
+        self.assertNotIn(AUDIT_LIVE[0], self.asks(1)[0])
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertNotIn("needs:human", self.fake.names(2))
+        self.assertEqual(self.asks(2), [])
 
     def test_asks_are_capped_an_hour(self):
-        self.close(*[body(AUDIT_LIVE[n]) for n in range(station.LIVE_ASKS_PER_HOUR + 2)])
+        self.close(*[body(AUDIT_OPERATOR[0])] * (station.LIVE_ASKS_PER_HOUR + 2))
         asked = [n for n in range(1, station.LIVE_ASKS_PER_HOUR + 3) if self.asks(n)]
         self.assertEqual(len(asked), station.LIVE_ASKS_PER_HOUR)
+
+    def test_the_operator_box_is_asked_while_a_live_box_waits_for_verification(self):
+        self.close(body("Live: prints `daily status ready`", AUDIT_OPERATOR[0]))
+        self.assertEqual(len(self.asks(1)), 1)
+        self.assertIn(AUDIT_OPERATOR[0], self.asks(1)[0])
+        self.assertNotIn("daily status ready", self.asks(1)[0])
 
 
 class LiveWaitAsk(tbs.Base):
@@ -261,8 +283,6 @@ class LiveWaitAsk(tbs.Base):
 
     close = DoneClose.close
     asks = DoneClose.asks
-
-    LIVE = "Live: the daily line shows the roll"
 
     def label(self, number, *names):
         self.fake.issues[number]["labels"] += [{"name": n} for n in names]
@@ -275,10 +295,6 @@ class LiveWaitAsk(tbs.Base):
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         with mock.patch.object(criteria_gate, "_fetch", lambda u, t: (200, "ok", "")):
             st.close_done_tickets()
-
-    def test_the_wait_label_is_the_one_the_station_sets(self):
-        from bus import brain
-        self.assertEqual(criteria_gate.LIVE_CHECK_LABEL, brain.LIVE_CHECK_LABEL)
 
     def test_a_ticket_awaiting_a_live_check_gets_no_person_label(self):
         self.fake.private = False
@@ -309,8 +325,15 @@ class LiveWaitAsk(tbs.Base):
         self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 1)
 
+    def test_an_explicit_wait_holds_the_operator_ask(self):
+        self.fake.private = False
+        self.fake.add(1, lane="codex", body=body(AUDIT_OPERATOR[0]), state="shipped")
+        self.label(1, "wait:blocked")
+        self.again()
+        self.assertEqual(self.asks(1), [])
+
     def test_a_removed_label_is_not_re_added_until_the_criteria_change(self):
-        text = body(AUDIT_CODE[1], AUDIT_LIVE[0])
+        text = body(AUDIT_CODE[1], AUDIT_OPERATOR[0])
         self.close(text)
         self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 1)
@@ -320,7 +343,7 @@ class LiveWaitAsk(tbs.Base):
         self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 1)
         # The criteria change: the gate may ask again.
-        self.fake.issues[1]["body"] = body(AUDIT_CODE[1], AUDIT_LIVE[0], AUDIT_LIVE[5])
+        self.fake.issues[1]["body"] = body(AUDIT_CODE[1], AUDIT_OPERATOR[0], AUDIT_OPERATOR[1])
         self.again()
         self.assertIn("needs:human", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 2)
@@ -330,7 +353,7 @@ class LiveWaitAsk(tbs.Base):
         # (the bug), so it holds without asking, says so, and the next pass asks.
         from bus.github import GitHubError
         self.fake.private = False
-        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        self.fake.add(1, lane="codex", body=body(AUDIT_OPERATOR[0]), state="shipped")
         real = GitHub.paginate
 
         def flaky(gh, path, *a, **k):
@@ -349,9 +372,9 @@ class LiveWaitAsk(tbs.Base):
 
     def test_an_ask_made_before_the_station_kept_state_is_not_repeated(self):
         self.fake.private = False
-        self.fake.add(1, lane="codex", body=body(AUDIT_LIVE[0]), state="shipped")
+        self.fake.add(1, lane="codex", body=body(AUDIT_OPERATOR[0]), state="shipped")
         self.fake.comments[1].append({
-            "body": "<!-- loom:human v1 -->\n%s: x\nKind: decision" % criteria_gate.ASK_OPENING,
+            "body": "<!-- loom:human v1 -->\n%s: x\nKind: decision" % criteria_gate.OPERATOR_ASK_OPENING,
             "user": {"login": self.fake.bot}})
         self.again()
         self.assertNotIn("needs:human", self.fake.names(1))
