@@ -193,6 +193,24 @@ class StationAdapterProofTest(tbs.Base):
             self.assertTrue(st._evidence_holds(REPO, self.fake.issues[self.NUMBER]))
         human.assert_not_called()
         self.assertIn("needs-brain", self.fake.names(self.NUMBER))
+        self.assertIn("no check Loom can run", self.status_text())
+
+    def test_an_operator_box_without_a_wait_still_gets_one_ask_with_an_adapter(self):
+        live = "Live: the deployment keeps serving traffic."
+        action = "Decision: The operator decides whether to grant access."
+        self.ship(HEAD + "- [ ] " + live + "\n- [ ] " + action + "\n", hours_ago=2)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
+        runner = live_adapter.Runner(live_adapter.Adapter(
+            live_adapter.Command(("grep", "-F", "{needle}", "{source}"), 20),
+            ("worker",), None, {}))
+        with mock.patch.object(station.Station, "_live_adapter", return_value=runner):
+            st.close_done_tickets()
+            st.close_done_tickets()
+        self.assertIn("needs:human", self.fake.names(self.NUMBER))
+        asks = [body for body in self.plain_comments() if "Kind: decision" in body]
+        self.assertEqual(len(asks), 1)
+        self.assertIn(action, asks[0])
+        self.assertNotIn(live, asks[0])
 
     def test_report_verify_sends_a_missing_adapter_check_to_the_brain_once(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"

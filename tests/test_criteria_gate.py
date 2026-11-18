@@ -226,6 +226,9 @@ class DoneClose(tbs.Base):
             self.assertIn("needs-brain", self.fake.names(n))
             self.assertNotIn("needs:human", self.fake.names(n))
             self.assertEqual(self.asks(n), [])
+            notes = [c["body"] for c in self.fake.comments[n]
+                     if "no check Loom can run" in c["body"]]
+            self.assertEqual(len(notes), 1)
         notes = list(self.fake.comments[1])
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
