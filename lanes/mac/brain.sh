@@ -300,8 +300,13 @@ while :; do
     beat skipped 0
     exit 0
   fi
-  bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$LOCK_MINUTES" --run "$RUN_ID" >> "$LOG" 2>&1 && break
+  # Keep the lock record and exit status from this attempt together.
+  lock_status=0
+  lock_line="$(bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$LOCK_MINUTES" --run "$RUN_ID" 2>> "$LOG")" || lock_status=$?
+  [ -z "$lock_line" ] || printf '%s\n' "$lock_line" >> "$LOG"
+  [ "$lock_status" -eq 0 ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
+    say "tick skipped: ${lock_line:-lock command returned no holder record}"
     # The stand-down leaves its yield on the peer's lock (loom#2606): the
     # station's backup-brain check counts a recent yield as alive.
     bus yielded "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1 || say "no yield recorded on the lock"
