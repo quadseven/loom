@@ -11532,14 +11532,20 @@ class Station:
                 continue
             try:
                 loose, tree = brain.goal_tree(self.gh, repo, int(goal["number"]))
+                children = {brain._issue_key(i, repo): i for i in brain._flatten(loose, tree, repo)}
+                for issue in brain_hold.triaged(self.gh, repo):
+                    children[brain._issue_key(issue, repo)] = issue
             except RateLimited:
                 raise
             except GitHubError as err:
                 lines.append("- **%s** could not be read (%s)" % (self._short_name(goal),
                                                                   type(err).__name__))
                 continue
-            summary = self._standup_summary(
-                self._standup_ticket_groups(brain._flatten(loose, tree, repo), since))
+            groups = self._standup_ticket_groups(list(children.values()), since)
+            summary = self._standup_summary(groups)
+            aged = self._standup_triage_age(groups["aged_triage"])
+            if aged:
+                summary = "%s. %s" % (summary, aged)
             lines.append("- **%s** %s" % (self._short_name(goal), summary or "nothing moved"))
         return lines
 
@@ -15046,7 +15052,7 @@ class Station:
         went stuck, queued or asks the operator since `since` (loom#2898)."""
         groups = self._standup_ticket_groups(children, since)
         if any(groups[k] for k in ("merged", "verified", "sent_back", "failed", "regressed",
-                                   "aged_pr", "queued", "asks")):
+                                   "aged_pr", "aged_triage", "queued", "asks", "triage_waiting")):
             return True
         # A ticket opened or closed since the last report is news too, as in
         # bus/quiet.py.
@@ -15176,6 +15182,9 @@ class Station:
         summary = self._standup_summary(groups)
         first = ("%s since the last report." % summary) if summary else "Nothing moved since the last report."
         stuck = "Past the stuck age in PR: %s." % rows(groups["aged_pr"])
+        aged = self._standup_triage_age(groups["aged_triage"])
+        if aged:
+            stuck = "%s. %s" % (aged, stuck)
         if gate_hold is not None:
             stuck += (" Held by the unproven-work gate: goal #%d -- %d tickets shipped "
                       "without a proof (limit %d), %d briefed tickets waiting, "
@@ -15197,7 +15206,9 @@ class Station:
             (rows(groups["in_flight"]), rows(groups["queued"]), rows(groups["needs_difficulty"]))
             + (" Epics with every ticket closed (check the done-when, then close): %s."
                % rows(finished) if finished else ""),
-            "Needs you: Open asks: %s." % rows(groups["asks"]),
+            "Needs you: Open asks: %s." % rows(groups["asks"])
+            + (" Triage waiting on a person: %s." % rows(groups["triage_waiting"])
+               if groups["triage_waiting"] else ""),
             *([waiting] if waiting else []), "",
             STANDUP_FOOTER])
 
@@ -15206,7 +15217,9 @@ class Station:
         counts = [(len(groups[k]), word) for k, word in (
             ("merged", "merged"), ("verified", "verified"), ("sent_back", "shipped"),
             ("failed", "failed"), ("regressed", "regressed"), ("aged_pr", "stuck"),
-            ("in_flight", "in flight"), ("queued", "queued"), ("asks", "waiting on you"))
+            ("in_flight", "in flight"), ("queued", "queued"), ("triage", "in triage"),
+            ("triage_waiting", "waiting on a person"),
+            ("asks", "waiting on you"))
             if k in groups]
         st = station or self
         stale = getattr(st, "_stale_asks_withdrawn", 0)
@@ -15222,7 +15235,8 @@ class Station:
         tickets updated since the last report, so a standup says what changed."""
         groups: Dict[str, List[Dict[str, Any]]] = {key: [] for key in (
             "merged", "verified", "sent_back", "failed", "regressed", "aged_pr",
-            "in_flight", "queued", "needs_difficulty", "asks")}
+            "in_flight", "queued", "needs_difficulty", "triage", "aged_triage",
+            "triage_waiting", "asks")}
         for issue in children:
             if isinstance(issue, dict):
                 for group in self._standup_groups_of(issue, since):
@@ -15236,17 +15250,32 @@ class Station:
 
     def _standup_groups_of(self, issue: Dict[str, Any], since: Optional[float]) -> List[str]:
         """The standup headings one ticket belongs under."""
-        labels = set(self._issue_label_names(issue))
+        names = set(self._issue_label_names(issue))
         updated = self._epoch(str(issue.get("updated_at") or ""))
         recent = since is None or (updated is not None and updated >= since)
         found = [group for label, group in (("loom:merged", "merged"),
                                             ("loom:verified", "verified"),
                                             ("loom:shipped", "sent_back"))
-                 if label in labels and recent]
-        if issue.get("state") != "open" or "loom:ticket" not in labels:
+                 if label in names and recent]
+        if issue.get("state") != "open":
             return found
-        found.extend(self._open_standup_groups(issue, labels))
+        if labels.in_triage(names):
+            if labels.waiting_on_person(names):
+                return found + ["triage_waiting"]
+            created = self._epoch(str(issue.get("created_at") or ""))
+            found.append("triage")
+            if created is not None and self.now - created > quiet_rule.TRIAGE_STUCK_AGE:
+                found.append("aged_triage")
+        elif "loom:ticket" in names:
+            found.extend(self._open_standup_groups(issue, names))
         return found
+
+    def _standup_triage_age(self, aged: List[Dict[str, Any]]) -> str:
+        if not aged:
+            return ""
+        oldest = min(aged, key=lambda issue: issue["created_at"])
+        return "%d triage %s older than 7 days (oldest %s)" % (
+            len(aged), "item" if len(aged) == 1 else "items", self._standup_rows([oldest]))
 
     def _open_standup_groups(self, issue: Dict[str, Any], labels: Set[str]) -> List[str]:
         created = self._epoch(str(issue.get("created_at") or ""))

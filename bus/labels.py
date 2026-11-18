@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import sys
-from typing import Dict, Iterable, List
+from typing import Collection, Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
@@ -148,11 +148,22 @@ WAIT_PREFIX = "wait:"
 NEEDS_HUMAN = "needs:human"
 OLD_HUMAN_LABELS = ("needs-operator", "needs:quadseven", "loom:human")
 HUMAN_LABELS = (NEEDS_HUMAN,) + OLD_HUMAN_LABELS
+NEEDS_LOGIN_RE = re.compile(r"needs:[a-z0-9][a-z0-9-]{0,38}(?:\[bot\])?", re.I)
 
 
 def needs_human(names: Iterable[str]) -> bool:
     """A person is asked: `names` hold needs:human or an old name of it."""
     return any(name in HUMAN_LABELS for name in names)
+
+
+def waiting_on_person(names: Iterable[str]) -> bool:
+    """The issue has a human ask or names a login that needs to act."""
+    return any(name in HUMAN_LABELS or NEEDS_LOGIN_RE.fullmatch(name) for name in names)
+
+
+def in_triage(names: Collection[str]) -> bool:
+    """The issue is still labeled for triage and has yet to become a ticket."""
+    return "loom:triage" in names and "loom:ticket" not in names
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:

@@ -286,6 +286,11 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_a_triage_issue_waiting_on_a_person_is_not_rewritten(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "needs:release-owner"})
+        self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
+
     def test_a_handed_off_triage_issue_is_not_a_candidate(self):
         # loom#1884: the factory's hold pass puts a triage issue whose hold
         # returned after its retry into the hand-off pool (handoff:claude,
