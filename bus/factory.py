@@ -203,7 +203,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import human_claims, no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -4445,6 +4445,29 @@ class Factory:
         _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
              % (repo, number, sha[:12]))
 
+    def _finding_blocker(self, repo: str, number: int) -> Optional[str]:
+        """The refusal an unanswered blocking comment on pull request `number`
+        puts on its merge, naming each finding's link, else None (loom#2988).
+        Read from the pull request's own comments, never its ticket's; comments
+        that cannot be read refuse, since a finding cannot be ruled out, as do
+        commits that cannot be read when an answer names its fix. With
+        no trusted login nothing is a finding, so nothing is read, as in
+        brain._finding_blocker."""
+        if not self.trusted:
+            return None
+        try:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except (GitHubError, OSError) as err:
+            return ("pull request comments unreadable, so a blocking comment cannot be "
+                    "ruled out (%s)" % err)
+        try:
+            found = comment_findings.open_findings(
+                [c for c in comments if isinstance(c, dict)], sorted(self.trusted),
+                brain.pr_commit_reader(self.gh, repo, number))
+        except (GitHubError, OSError) as err:
+            return brain.COMMITS_UNREADABLE % err
+        return comment_findings.blocker(found) if found else None
+
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
         base = str((full.get("base") or {}).get("ref") or "")
         head = str((full.get("head") or {}).get("sha") or "")
@@ -4466,6 +4489,10 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             blockers.append("another pull request holds the landing lock")
+        finding = self._finding_blocker(repo, number)
+        if finding:
+            _say("%s#%d waits: %s" % (repo, number, finding))
+            blockers.append(finding)
         decision = merge_verdict.decide(full, issue, blockers,
                                         ("factory",) if blockers else ())
         if not decision.ready:
