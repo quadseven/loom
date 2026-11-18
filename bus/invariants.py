@@ -1258,9 +1258,8 @@ def untrusted_labeler(f: Facts) -> List[Breach]:
     return out
 
 
-def _scheduled_failures(runs: List[Dict[str, Any]], prior: Dict[str, str],
-                        complete: bool, public: bool) -> Dict[str, str]:
-    """Keep the latest three completed scheduled runs of each workflow."""
+def _latest_scheduled_runs(runs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Keep the latest distinct completed scheduled runs of each workflow."""
     newest: Dict[str, List[Dict[str, Any]]] = {}
     for run in runs:
         workflow = run.get("workflow_id")
@@ -1270,10 +1269,15 @@ def _scheduled_failures(runs: List[Dict[str, Any]], prior: Dict[str, str],
             latest = newest.setdefault(str(workflow), [])
             if len(latest) < SCHEDULED_STREAK and not any(r["id"] == run["id"] for r in latest):
                 latest.append(run)
+    return newest
+
+
+def _scheduled_failures(runs: List[Dict[str, Any]], prior: Dict[str, str],
+                        complete: bool, public: bool) -> Dict[str, str]:
     # A partial history can prove a streak or break it, but missing runs
     # cannot clear a previously reported workflow.
     failures = {} if complete else dict(prior)
-    for workflow, latest in newest.items():
+    for workflow, latest in _latest_scheduled_runs(runs).items():
         if any(run["conclusion"] not in SCHEDULED_RED for run in latest):
             failures.pop(workflow, None)
         elif len(latest) == SCHEDULED_STREAK:
@@ -1285,19 +1289,12 @@ def _scheduled_failures(runs: List[Dict[str, Any]], prior: Dict[str, str],
     return failures if public else {key: "Workflow %s" % key for key in failures}
 
 
-def read_scheduled_workflows(gh: Any, repos: Sequence[str], state: Dict[str, Any],
-                             deferred: Callable[[], bool], say: Say
-                             ) -> Tuple[List[Tuple[str, str, Tuple[str, ...]]], Tuple[str, ...]]:
+def _read_scheduled_run_pages(gh: Any, repos: Sequence[str], deferred: Callable[[], bool],
+                              say: Say) -> Tuple[Dict[str, List[Dict[str, Any]]], set[str], int]:
     """Read newest runs first, giving each repo a page before reading deeper."""
-    repos = list(dict.fromkeys(repos))
-    cursor = state.get("cursor", 0)
-    cursor = cursor % len(repos) if repos and isinstance(cursor, int) else 0
-    ordered = repos[cursor:] + repos[:cursor]
-    prior = state.get("failures")
-    prior = prior if isinstance(prior, dict) else {}
     runs: Dict[str, List[Dict[str, Any]]] = {}
     complete = set()
-    queue = [(repo, 1) for repo in ordered]
+    queue = [(repo, 1) for repo in repos]
     reads = first_pages = 0
     while queue and reads < SCHEDULED_READ_MAX and not deferred():
         repo, page = queue.pop(0)
@@ -1321,6 +1318,20 @@ def read_scheduled_workflows(gh: Any, repos: Sequence[str], state: Dict[str, Any
         elif page * SCHEDULED_PAGE_SIZE < 1000:
             # GitHub limits an event-filtered run listing to 1,000 rows.
             queue.append((repo, page + 1))
+    return runs, complete, first_pages
+
+
+def read_scheduled_workflows(gh: Any, repos: Sequence[str], state: Dict[str, Any],
+                             deferred: Callable[[], bool], say: Say
+                             ) -> Tuple[List[Tuple[str, str, Tuple[str, ...]]], Tuple[str, ...]]:
+    """Update tracked failures and return the streaks and unread repos."""
+    repos = list(dict.fromkeys(repos))
+    cursor = state.get("cursor", 0)
+    cursor = cursor % len(repos) if repos and isinstance(cursor, int) else 0
+    ordered = repos[cursor:] + repos[:cursor]
+    prior = state.get("failures")
+    prior = prior if isinstance(prior, dict) else {}
+    runs, complete, first_pages = _read_scheduled_run_pages(gh, ordered, deferred, say)
     state["cursor"] = cursor + (first_pages if first_pages < len(repos) else 1)
     state["failures"] = failures = {repo: prior[repo] for repo in repos
                                    if isinstance(prior.get(repo), dict)}
