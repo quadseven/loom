@@ -39,6 +39,8 @@ class Fake:
             issue = dict(data, number=len(self.issues) + 1, state="open")
             self.issues.append(issue)
             return SimpleNamespace(data=copy.deepcopy(issue))
+        if method == "POST" and path.endswith("/comments"):
+            return SimpleNamespace(data={"id": 1})
         issue = next(i for i in self.issues if "/issues/%d" % i["number"] in path)
         if method == "PATCH":
             if self.fail_patch:
@@ -77,10 +79,22 @@ class TrackerTests(unittest.TestCase):
         base_flakes.publish(other, REPO, [event(2)], "claude", NOW)
         duplicate = dict(other.issues[0], number=2)
         gh.issues.append(duplicate)
+        gh.calls.clear()
         base_flakes.publish(gh, REPO, [event(3)], "codex", NOW)
         self.assertEqual([i['state'] for i in gh.issues], ['open', 'closed'])
         self.assertIn('ready-for-agent', gh.issues[0]['labels'])
         self.assertIn('%032x' % 2, gh.issues[0]['body'])
+        issues_path = "/repos/%s/issues" % REPO
+        self.assertEqual([(method, path) for method, path, _ in gh.calls if method != "GET"], [
+            ("PATCH", issues_path + "/1"),
+            ("POST", issues_path + "/1/labels"),
+            ("POST", issues_path + "/2/comments"),
+            ("PATCH", issues_path + "/2"),
+        ])
+        self.assertIn(("POST", issues_path + "/2/comments", {
+            "body": "Duplicate consolidated into #1. All event rows were retained there.",
+        }), gh.calls)
+        self.assertEqual(gh.issues[1]["state_reason"], "not_planned")
 
     def test_failed_canonical_write_leaves_duplicate_open(self):
         gh = Fake()

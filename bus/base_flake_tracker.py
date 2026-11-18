@@ -1,6 +1,7 @@
 """A repository-local shared tracker for baseline retry events."""
 import json
 
+from bus import closing
 from bus.github import GitHubError
 
 # The shared counter is the originating repository's issue, not host state.
@@ -64,12 +65,9 @@ def _combined(issues, incoming):
     return rows
 
 
-def publish(gh, repo, events, lane, now):
-    """Idempotently record retry events and promote the shared tracker at three/day.
-
-    A duplicate is closed only after its rows are saved to the lower-numbered
-    canonical issue. Failures propagate so the station retries the sidecar.
-    """
+# AI-REVIEW 2026-11-18 [deepseek-v4.1-flash] 6965539373 (automated review, PR #3212):
+# Validate incoming rows separately to keep publish below the complexity cap.
+def _incoming_rows(repo, events, lane, now):
     incoming = {}
     for event in events:
         row = _row(event, lane)
@@ -78,6 +76,16 @@ def publish(gh, repo, events, lane, now):
             if row["id"] in incoming and incoming[row["id"]] != row:
                 raise GitHubError("base flake sidecar repeats an id with different evidence")
             incoming[row["id"]] = row
+    return incoming
+
+
+def publish(gh, repo, events, lane, now):
+    """Idempotently record retry events and promote the shared tracker at three/day.
+
+    A duplicate is closed only after its rows are saved to the lower-numbered
+    canonical issue. Failures propagate so the station retries the sidecar.
+    """
+    incoming = _incoming_rows(repo, events, lane, now)
     if not incoming:
         return
     found = gh.paginate("/repos/%s/issues?state=open&labels=loom:factory&per_page=100" % repo)
@@ -110,10 +118,8 @@ def _promote_and_consolidate(gh, repo, canonical, duplicates, rows, now):
     if sum(now - DAY <= r["at"] <= now for r in rows.values()) >= 3 and "ready-for-agent" not in names:
         gh.rest("POST", path + "/labels", {"labels": ["ready-for-agent"]})
     for duplicate in duplicates:
-        note = "\n\nDuplicate consolidated into #%d; all event rows retained there." % canonical["number"]
-        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, duplicate["number"]),
-                {"body": str(duplicate.get("body") or "") + note,
-                 "state": "closed", "state_reason": "not_planned"})
+        note = "Duplicate consolidated into #%d. All event rows were retained there." % canonical["number"]
+        closing.close(gh, repo, duplicate["number"], note, "not_planned")
 
 
 def read_events(path):

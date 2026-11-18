@@ -6202,6 +6202,7 @@ class Station:
                         yield lane, kind, os.path.join(folder, entry), entry[:-3]
 
     def report_outcomes(self) -> None:
+        """Reconcile base flakes and report finished briefs that still need acknowledgment."""
         path = os.path.join(self.state, "reported.json")
         reported = _read_json(path, {})
         if not isinstance(reported, dict):
