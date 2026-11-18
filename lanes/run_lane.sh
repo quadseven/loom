@@ -579,6 +579,23 @@ live_cluster_check() {
   LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
 }
 
+# Check the composed pull request checklist against only this run's log.
+live_acceptance_check() {
+  local gap
+  if ! gap="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import sys
+from bus.live_proof import lane_output_gap
+with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
+    log.seek(int(sys.argv[2]))
+    print(lane_output_gap(sys.stdin.read(), log))
+' "$LOG" "$LOG_START" 2>&1)"; then
+    printf '%s\n' "$gap" >> "$LOG"
+    park "$BRIEF" "could not check live acceptance criteria; nothing pushed" transient
+    return 1
+  fi
+  [ -z "$gap" ] || { park "$BRIEF" "$gap; nothing pushed"; return 1; }
+}
+
 # STRAY_FILES as one comma-separated line, at most ten names.
 stray_list() {
   local n
@@ -5111,7 +5128,10 @@ for BRIEF in "$INBOX"/*.md; do
   # sandbox. A miss is the lane's work to fix; a check that cannot run is a
   # note, not a stop.
   LIVE_NOTES=""
-  if [ "$COMMITTED" -eq 1 ]; then live_cluster_check || continue; fi
+  if [ "$COMMITTED" -eq 1 ]; then
+    live_cluster_check || continue
+    if [ -z "$FIX_PR" ]; then live_acceptance_check || continue; fi
+  fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
   if [ -n "$FIX_PR" ] && ! fix_pr_open; then

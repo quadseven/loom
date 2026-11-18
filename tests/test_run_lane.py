@@ -1074,6 +1074,43 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn(note, self.run_log())
         self.assertNotIn("connection refused", self.body.read_text())
 
+    def test_a_ticked_live_criterion_needs_output_from_this_run(self):
+        criterion = 'A canary passes and prints "canary: healthy".'
+        log = self.loom / "logs" / "codex" / "T042-fix-the-thing.log"
+        log.parent.mkdir(parents=True)
+        log.write_text("canary: healthy\n")
+        self.drop_brief(text=BRIEF.replace("The thing works", criterion))
+        summary = self.TICKED.replace("The thing works", criterion)
+
+        result = self.run_lane(FAKE_SUMMARY=summary, FAKE_AGENT_SAYS="- [x] " + criterion)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        heads = subprocess.check_output(["git", "ls-remote", "--heads", str(self.remote)], text=True)
+        self.assertNotIn("loom/T042-fix-the-thing", heads)
+        self.assertTrue(self.failure_line().startswith("[work] live acceptance criterion 1"))
+
+    def test_current_run_output_allows_the_live_tick_in_the_pull_request(self):
+        criterion = ('A pod runs on a node and `curl https://status.example.com/healthz` '
+                     'prints "web Running".')
+        self.drop_brief(text=BRIEF.replace("The thing works", criterion))
+
+        result = self.run_lane(FAKE_SUMMARY=self.TICKED.replace("The thing works", criterion),
+                               FAKE_AGENT_SAYS="web Running")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.body.is_file(), self.run_log())
+        self.assertIn("- [x] " + criterion, self.body_criteria())
+
+    def test_an_unticked_live_criterion_does_not_need_run_output(self):
+        criterion = "A pod runs on a node."
+        self.drop_brief(text=BRIEF.replace("The thing works", criterion))
+
+        result = self.run_lane()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("- [ ] " + criterion, self.body_criteria())
+
     def test_the_live_cluster_check_runs_only_after_the_leak_scan_passes(self):
         # It looks up names the agent wrote from outside the agent's sandbox.
         result = self.run_manifest_lane("edge", FAKE_DENY_UNREADABLE="1")

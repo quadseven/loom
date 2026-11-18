@@ -348,6 +348,11 @@ that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
 does not stop the run: the log and the pull request body (or the round's
 comment) carry `live-cluster check could not run: <reason>`.
 
+Before opening a pull request, the runner also checks each ticked live
+acceptance criterion. The criterion names its expected output lines in
+backticks or double quotes. Each line must appear in the current run's log.
+Leave the box unticked if the expected output is unspecified or missing.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
