@@ -179,6 +179,26 @@ def _overlap(log: TextIO, last: str, count: int) -> bool:
     return False
 
 
+def _append_fetched(fetched: TextIO, output: TextIO, cutoff: float, first: str | None,
+                    last_stamp: str, continuous: bool) -> str | None:
+    oldest = _time(first) if first else math.inf
+    head = fetched.readline()
+    if last_stamp and not continuous:
+        if not head:
+            raise ValueError("log cursor disappeared before a new record arrived")
+        new_stamp = head.split(maxsplit=1)[0]
+        if max(_time(last_stamp), _time(new_stamp)) >= cutoff:
+            output.write("%s %s %s\n" % (GAP, last_stamp, new_stamp))
+    for line in chain((head,) if head else (), fetched):
+        stamp = line.split(maxsplit=1)[0]
+        at = _time(stamp)
+        if at >= cutoff:
+            output.write(line.rstrip("\n") + "\n")
+            if at < oldest:
+                first, oldest = stamp, at
+    return first
+
+
 def update(path: Path, source: Source, now: float, retention: float) -> str | None:
     """Atomically replace one capture with its retained history and new lines."""
     prefix = ["kubectl", "-n", source.namespace]
@@ -197,27 +217,13 @@ def update(path: Path, source: Source, now: float, retention: float) -> str | No
             last_stamp = last.split(maxsplit=1)[0] if last else ""
             if last and same_pod:
                 args.append("--since-time=" + last_stamp)
-            oldest = _time(first) if first else math.inf
             with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace",
                                         dir=scratch) as fetched:
                 subprocess.run(args, check=True, stdout=fetched, stderr=subprocess.DEVNULL,
                                timeout=30)
                 fetched.seek(0)
-                continuous = last and same_pod and _overlap(fetched, last, count)
-                head = fetched.readline()
-                if last and not continuous:
-                    if not head:
-                        raise ValueError("log cursor disappeared before a new record arrived")
-                    new_stamp = head.split(maxsplit=1)[0]
-                    if max(_time(last_stamp), _time(new_stamp)) >= cutoff:
-                        output.write("%s %s %s\n" % (GAP, last_stamp, new_stamp))
-                for line in chain((head,) if head else (), fetched):
-                    stamp = line.split(maxsplit=1)[0]
-                    at = _time(stamp)
-                    if at >= cutoff:
-                        output.write(line.rstrip("\n") + "\n")
-                        if at < oldest:
-                            first, oldest = stamp, at
+                continuous = bool(last) and same_pod and _overlap(fetched, last, count)
+                first = _append_fetched(fetched, output, cutoff, first, last_stamp, continuous)
         os.replace(staged, path)
     return first
 

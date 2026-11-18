@@ -1,9 +1,7 @@
-"""Complexity caps for deferred high-complexity review findings.
+"""Complexity caps for functions flagged in review.
 
-The review bot caps a function at cyclomatic complexity 15. Deferred review
-findings flagged high complexity in `bus/brain.py` and `bus/station.py`
-(PR 301's two, and PR 120's `Station._claim`); this pins the refactored
-functions under the cap so the warnings stay resolved.
+The review bot caps a function at cyclomatic complexity 15. Keep the
+refactored functions under that cap so the warnings stay resolved.
 """
 import ast
 import pathlib
@@ -31,6 +29,7 @@ TARGETS = (
     ("bus/station.py", "Station._withdraw_held_pr_wait"),
     ("bus/station.py", "Station._apply_held_wait_withdrawal"),
     ("bus/station.py", "Station._held_wait_state"),
+    ("bus/log_capture.py", "update"),
 )
 
 
