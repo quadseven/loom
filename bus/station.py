@@ -13973,10 +13973,11 @@ class Station:
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not finished: a resumed pass retries this home.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
-            else:
-                _say("outside-epic: moved %d, left %d for goal #%d in %s"
-                     % (moved, left, number, repo))
+                continue
+            _say("outside-epic: moved %d, left %d for goal #%d in %s"
+                 % (moved, left, number, repo))
             completed.add(key)
             state["finished"] = sorted(completed)
             _write_json(path, state)

@@ -55,6 +55,28 @@ class OutsideEpicResume(unittest.TestCase):
         self.run_pass(1060, lambda gh, repo, goal: calls.append((repo, goal)) or (0, 0))
         self.assertEqual(calls, [("example-owner/two", 2), ("example-owner/three", 3)])
 
+    def test_a_failed_home_is_retried_when_the_pass_resumes(self):
+        from bus.github import GitHubError
+        calls = []
+
+        def first_pass(gh, repo, goal):
+            calls.append(goal)
+            if goal == 1:
+                raise GitHubError("boom")
+            if goal == 2:
+                raise TargetReached("read carried over at request target")
+            return 0, 0
+
+        with self.assertRaises(TargetReached):
+            self.run_pass(1000, first_pass)
+        path = os.path.join(self.tmp.name, "state", "station", "outside-epic.json")
+        finished = self.read_state().get("finished", []) if os.path.exists(path) else []
+        self.assertEqual(finished, [])
+
+        calls.clear()
+        self.run_pass(1060, lambda gh, repo, goal: calls.append(goal) or (0, 0))
+        self.assertEqual(calls, [1, 2, 3])
+
     def test_checked_is_written_after_last_home_then_next_round_restarts(self):
         calls = []
 
