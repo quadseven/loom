@@ -15,6 +15,8 @@ import html
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from bus.invariants import ROLL_MARKER
+
 WINDOWS = (("day", "Last day", timedelta(days=1)),
            ("week", "Last week", timedelta(days=7)),
            ("month", "Last month", timedelta(days=30)))
@@ -72,7 +74,8 @@ def _count_prs(prs: List[Dict[str, Any]], start: datetime, lane: bool, merged: b
 def _count_closed(tickets: List[Dict[str, Any]], start: datetime, reason: str) -> int:
     return sum(1 for t in tickets
                if (_when(t.get("closed_at")) or _EPOCH) >= start
-               and (t.get("state_reason") or "completed") == reason)
+               and (t.get("state_reason") or "completed") == reason
+               and ROLL_MARKER not in (t.get("body") or "").splitlines())
 
 
 def _count_comments(comments: List[Dict[str, Any]], start: datetime, test) -> int:
