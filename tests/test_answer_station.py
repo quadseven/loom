@@ -200,10 +200,17 @@ class BrainVerdict(unittest.TestCase):
     """bus.brain merge, the merge path the factory calls, reads the same
     answer from the ticket's comments."""
 
-    def merge(self, *thread, committed="2030-01-01T08:00:00Z"):
+    def merge(self, *thread, committed="2030-01-01T08:00:00Z", head="checked", checks="SUCCESS"):
         routes = brain_routes(PR_BODY, ["bus/a.py"], {})
-        routes["/graphql"]["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"][
-            "committedDate"] = committed
+        details = routes["/graphql"]["data"]["repository"]["pullRequest"]
+        details["headRefOid"] = head
+        commit = details["commits"]["nodes"][0]["commit"]
+        commit.update(committedDate=committed, statusCheckRollup={"state": checks})
+        routes["/repos/%s/pulls/8" % BRAIN_REPO]["head"]["sha"] = head
+        if head != "checked":
+            base = "/repos/%s/commits/" % BRAIN_REPO
+            routes[base + head + "/check-runs"] = routes[base + "checked/check-runs"]
+            routes["/repos/%s/compare/main...%s" % (BRAIN_REPO, head)] = {"behind_by": 0}
         routes["/repos/%s/issues/9/comments" % BRAIN_REPO] = list(thread)
         fake = Route(routes)
         env = {"LOOM_MERGE_SETTLE_SECONDS": "0", "LOOM_AUTO_MERGE_TIERS": ",".join(merge_tier.TIERS),
@@ -236,6 +243,21 @@ class BrainVerdict(unittest.TestCase):
         self.assertEqual(refused, "")
         self.assertTrue(self.merged(fake))
         self.assertEqual(self.asked(fake), [])
+
+    def test_dashboard_approval_merges_only_the_reviewed_head_with_green_checks(self):
+        ask = self.ask()
+        head = "a" * 40
+        decision = self.said("Merge")
+        decision["body"] += "\n\nReview target: #8 %s ask=%s" % (head, answer.review_ask_key(ask))
+        fake, refused = self.merge(ask, decision, head=head)
+        self.assertEqual(refused, "")
+        self.assertTrue(self.merged(fake))
+        fake, refused = self.merge(ask, decision, head=head, checks="FAILURE")
+        self.assertIn("checks", refused)
+        self.assertFalse(self.merged(fake))
+        fake, refused = self.merge(ask, decision, head="b" * 40)
+        self.assertIn("held for the operator", refused)
+        self.assertFalse(self.merged(fake))
 
     def test_hold_refuses_without_a_new_ask(self):
         fake, refused = self.merge(self.ask(), self.said("Hold"))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -11,9 +12,10 @@ import time
 import unittest
 from unittest import mock
 from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlsplit
 
 from bus import metrics, proof, station
-from bus.github import GitHubError, Response
+from bus.github import GitHub, GitHubError, Response
 
 REPO = "example-owner/example-repo"
 NOW = datetime(2030, 1, 2, 17, tzinfo=timezone.utc).timestamp()
@@ -29,6 +31,7 @@ def label(name):
 
 class Fake:
     def __init__(self):
+        self.rate = {}
         self.goal = {"number": 1, "labels": [label("loom:goal")]}
         self.ticket = {"number": 2, "labels": [label(x) for x in
                        ("loom:ticket", "loom:merged", "loom:verified")],
@@ -77,6 +80,46 @@ class Fake:
         raise AssertionError((method, path))
 
 
+class MetricsTransport:
+    def __init__(self, data):
+        self.data = data
+        self.remaining = 5000
+        self.reads = []
+        self.reset = int(NOW + 3600)
+        self.issue_pages = 1
+
+    def __call__(self, method, url, headers, body):
+        parsed = urlsplit(url)
+        path, query = parsed.path, parse_qs(parsed.query)
+        response_headers = {}
+        if method == "POST":
+            data = self.data.rest(method, path, json.loads(body)).data
+        else:
+            self.reads.append((path, headers.get("If-None-Match")))
+            if "/check-runs" in path:
+                data = self.data.rest(method, path + "?" + parsed.query).data
+            elif path.endswith("/issues"):
+                page = int(query.get("page", [1])[0])
+                if self.issue_pages > 1:
+                    data = self.data.issues[page - 1:page]
+                    if page < self.issue_pages:
+                        response_headers["Link"] = '<%s://%s%s?state=all&per_page=100&page=%d>; rel="next"' % (
+                            parsed.scheme, parsed.netloc, path, page + 1)
+                else:
+                    data = self.data.issues
+            elif path.endswith("/pulls"):
+                data = self.data.pulls
+            else:
+                data = self.data.paginate(path)
+        payload = json.dumps(data).encode()
+        etag = '"%s"' % hashlib.sha256(payload).hexdigest()
+        status = 304 if headers.get("If-None-Match") == etag else 200
+        self.remaining -= status != 304
+        response_headers.update({"ETag": etag, "X-RateLimit-Remaining": str(self.remaining),
+                                 "X-RateLimit-Limit": "5000", "X-RateLimit-Reset": str(self.reset)})
+        return status, response_headers, b"" if status == 304 else payload
+
+
 class MetricsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -96,6 +139,99 @@ class MetricsTest(unittest.TestCase):
 
     def numbers(self):
         return metrics.Collector(self.gh, [REPO], self.home, NOW, "Review").collect()
+
+    def metrics_pass(self, transport, now=NOW):
+        client = GitHub("test-token", transport=transport,
+                        cache_dir=os.path.join(self.home, "state", "station", "etags"))
+        client.rate["core"] = (transport.remaining, 5000, transport.reset)
+        settings = station.Settings(self.home, [REPO], ["trusted-bot"], [], digest_hour=0,
+                                    metrics_goal=REPO + "#1", review_check="Review")
+        return station.Station(client, settings, now=now)
+
+    def test_metrics_stops_at_reserve_and_resumes_to_the_same_numbers(self):
+        transport = MetricsTransport(self.gh)
+        for issue in self.gh.issues:
+            issue["updated_at"] = iso(NOW - 500)
+        transport.issue_pages = 2
+        expected = metrics.render(self.numbers(), time.strftime("%Y-%m-%d", time.localtime(NOW)), 1)
+        transport.remaining = 1502
+        first = self.metrics_pass(transport)
+        first.post_metrics()
+        self.assertEqual(transport.remaining, 1500)
+        self.assertEqual(first.gh.counted, 2)
+        self.assertEqual(self.gh.posts, [])
+        for _ in range(5):
+            transport.remaining = 1502
+            resumed = self.metrics_pass(transport, now=NOW + 600)
+            resumed.post_metrics()
+            self.assertGreaterEqual(transport.remaining, 1500)
+            self.assertEqual(resumed.gh.counted, 1502 - transport.remaining)
+            if self.gh.posts:
+                break
+        self.assertEqual(self.gh.posts, [expected])
+        self.assertEqual([path for path, _ in transport.reads].count("/repos/%s/issues" % REPO), 2)
+
+    def test_second_build_revalidates_only_the_changed_issues(self):
+        self.gh.goal["updated_at"] = self.gh.ticket["updated_at"] = iso(NOW - 500)
+        transport = MetricsTransport(self.gh)
+
+        def collect():
+            st = self.metrics_pass(transport)
+            return metrics.Collector(st.gh, [REPO], self.home, NOW, "Review").collect()
+
+        first = collect()
+        self.gh.ticket["updated_at"] = iso(NOW - 100)
+        self.gh.events[2].pop()
+        transport.reads.clear()
+        remaining = transport.remaining
+        second = collect()
+        details = [(path.rsplit("/", 2)[1:], etag) for path, etag in transport.reads
+                   if path.endswith(("/events", "/comments"))]
+        self.assertCountEqual([path for path, _ in details], [["2", "comments"], ["2", "events"]])
+        self.assertTrue(all(etag for _, etag in details))
+        self.assertEqual(remaining - transport.remaining, 2)
+        self.assertNotEqual(first[1], second[1])
+        self.assertIn("verified 0/0", second[1].value)
+
+    def test_metrics_deadline_interrupts_a_read_and_housekeeping_runs(self):
+        transport = MetricsTransport(self.gh)
+        st = self.metrics_pass(transport)
+        st.s.metrics_seconds = 0.05
+        path = "/repos/%s/issues" % REPO
+        attempted = []
+
+        def slow_read(method, url, headers, body):
+            if urlsplit(url).path == path:
+                attempted.append(True)
+                time.sleep(1)
+            return transport(method, url, headers, body)
+
+        st.gh.transport = slow_read
+        steps = []
+
+        def timed(step):
+            steps.append(step.__name__)
+            return station.Station._timed(st, step) if step == st.post_metrics else True
+
+        with mock.patch.multiple(st, sample_operator_budget=mock.DEFAULT, check_repo_access=mock.DEFAULT,
+                                 _publish_lanes_when_old=mock.DEFAULT, sync_labels=mock.DEFAULT,
+                                 finish_claims=mock.DEFAULT, report_outcomes=mock.DEFAULT,
+                                 _feed_lanes=mock.DEFAULT, record_scans=mock.DEFAULT, disk_low=mock.DEFAULT,
+                                 _note_every_pass=mock.DEFAULT,
+                                 _refresh_shipped_priority_stamp=mock.DEFAULT, watch_logs=mock.DEFAULT,
+                                 _end_pass_locally=mock.DEFAULT) as mocked, \
+                mock.patch.object(station.scorecard.Scorecard, "due", return_value=False), \
+                mock.patch.object(st, "_timed", timed):
+            mocked["disk_low"].return_value = False
+            started = time.monotonic()
+            st.run_pass()
+            elapsed = time.monotonic() - started
+        self.assertIn("post_metrics", steps)
+        self.assertEqual(attempted, [True])
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(self.gh.posts, [])
+        mocked["watch_logs"].assert_called_once()
+        mocked["_end_pass_locally"].assert_called_once()
 
     def test_all_nine_pass_on_a_complete_day(self):
         result = self.numbers()

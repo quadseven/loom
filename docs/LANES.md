@@ -55,9 +55,11 @@ lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
 `/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
-machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
-and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
-script's path when using another checkout. A scanner that is still missing
+machine clones `LOOM_INFRA_PUBLIC_REPO` into `$LOOM_HOME/infra-public` when
+first needed and fast-forwards it at most hourly. With that setting unset,
+the lane uses the existing local scanner at the default path or the path
+specified by `LOOM_LEAK_SCANNER`. The cluster workflow provides its pinned
+public scanner checkout through `LOOM_LEAK_SCANNER`. A scanner that is missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
 another reason parks the brief `[transient]`. A hit parks the brief with
@@ -350,6 +352,11 @@ that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
 does not stop the run: the log and the pull request body (or the round's
 comment) carry `live-cluster check could not run: <reason>`.
 
+Before opening a pull request, the runner also checks each ticked live
+acceptance criterion. The criterion names its expected output lines in
+backticks or double quotes. Each line must appear in the current run's log.
+Leave the box unticked if the expected output is unspecified or missing.
+
 ## The brain tick
 
 `lanes/mac/install.sh` also installs `com.loom.brain`, which runs
@@ -607,7 +614,13 @@ rung. With no such lane it goes back to `loom:queued` with no lane label
 it stops holding its lane and any free lane can take it from the queue. A
 ticket whose brief sits in a lane inbox is never settled this way.
 
-It skips future `Not before:` times and tickets without a readable Difficulty.
+A pending fix round on a demoted or occupied lane keeps its brief for two
+hours from the later of the fix request and the lane assignment. It then
+takes a free lane on its rung, or a free lane on the next rung. If neither
+move is possible, it stays briefed and records one counted wait and one
+status event with its age.
+
+The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
@@ -846,6 +859,12 @@ day's slot sample may cover less than 24 hours; missing samples fail the
 spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
+The metrics step runs before the rotating steps, so it can resume on the
+next eligible pass. It leaves `LOOM_METRICS_RESERVE` core requests available
+(default 1500) and yields after `LOOM_METRICS_SECONDS` (default 300). It
+keeps completed API pages on disk and measures the window ending when the
+build started. Across builds, it reuses each issue's event and comment
+lists when `updated_at` matches. Changed lists use their saved ETags.
 
 Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
@@ -1446,9 +1465,7 @@ deadline writes every thread's Python stack to `station.log` and exits, so
 launchd starts a fresh one. The next pass finds the marker and logs one line:
 `the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
 marker is younger than its deadline (the pass was killed), `ended ...s into
-its ...s deadline without a clean finish`. The default sits above a daily
-metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
-its own (loom#1924).
+its ...s deadline without a clean finish`.
 
 ## Station lease
 
@@ -1535,8 +1552,8 @@ with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
 comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
 pass and counts as done, so the rotation moves on and nothing carries over. A
 name that is not a pass step logs `unknown paused step <name>, ignored` and
-pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
-paused; the work a pass does before or after it always runs.
+pauses nothing. The rotating steps and the scheduled metrics step can be
+paused through `Station._run_steps`.
 
 ## Log watch
 

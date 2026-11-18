@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import hunt_plan, lane, lane_markers, notify, station  # noqa: E402
+from bus import brain, hunt_plan, lane, lane_markers, notify, station  # noqa: E402
 from bus.github import GitHubError  # noqa: E402
 
 # The lane's own App login, trusted as the station's LOOM_BRIEF_AUTHORS is
@@ -112,6 +112,15 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(len(gh.comments[4]), 1)
         self.assertEqual(labels(gh)[-1], "loom:running")
         self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+
+    def test_a_queued_source_of_an_open_ticket_is_not_claimed(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"].append({"name": "loom:rewritten"})
+        gh.issues[5] = {"state": "open", "labels": [{"name": "loom:ticket"}]}
+        gh.comments[4].append({"body": brain.TRIAGE_MARKER + "\nRewritten as ticket #5, see it.",
+                               "user": {"login": APP}})
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+        self.assertIn("loom:queued", labels(gh))
 
     def test_private_repo_is_never_claimed_and_expired_claim_returns_to_queue(self):
         private = FakeGitHub(private=True)
@@ -412,9 +421,8 @@ class ClaimRejectionTests(unittest.TestCase):
         gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS and on Android."))
         got, err = self.claim_err(gh)
         self.assertIsNone(got)
-        self.assertIn(self.rejection_line("spans more than one platform"), err)
-        self.assertEqual(lane._rejection_reason(gh.issues[4], "muse"),
-                         "spans more than one platform")
+        self.assertIn("spans more than one platform (iOS, Android)", err)
+        self.assertIn("After:", err)
 
     def test_a_single_platform_ticket_gets_no_split_reason(self):
         gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS."))

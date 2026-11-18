@@ -1,6 +1,7 @@
 """The label set from docs/BRAIN.md and an idempotent way to create it."""
 from __future__ import annotations
 
+import os
 import re
 import sys
 from typing import Dict, Iterable, List
@@ -146,7 +147,11 @@ WAIT_PREFIX = "wait:"
 # One label asks a person. The old names read as it until a write to the
 # ticket migrates them (bus/label_pass.py, loom#2278).
 NEEDS_HUMAN = "needs:human"
-OLD_HUMAN_LABELS = ("needs-operator", "needs:quadseven", "loom:human")
+OLD_HUMAN_LABELS = tuple(dict.fromkeys(
+    ("needs-operator", "loom:human")
+    + tuple(name for name in os.environ.get("LOOM_LEGACY_HUMAN_LABELS", "").split()
+            if name != NEEDS_HUMAN)
+))
 HUMAN_LABELS = (NEEDS_HUMAN,) + OLD_HUMAN_LABELS
 
 

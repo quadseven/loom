@@ -5,7 +5,7 @@ from bus import answer, operator_hold
 
 class ReviewChoices(unittest.TestCase):
     def test_held_pull_request_offers_send_back(self):
-        offered = answer.options(operator_hold.ask(18, ["deployment review"]))
+        offered = answer.options(operator_hold.ask(18, ["the runbook says reply with one number"]))
         self.assertEqual(offered.choices, ("Merge", "Hold", "Send back"))
 
     def test_send_back_supersedes_an_older_merge_verdict(self):
@@ -92,7 +92,9 @@ class ReviewReads(unittest.TestCase):
                 if '/issues/' in path:
                     return SimpleNamespace(data={'body': '## Acceptance criteria\n- [ ] Check rollback'})
                 if '/check-runs?' in path:
-                    return SimpleNamespace(data={'total_count': 0, 'check_runs': []})
+                    return SimpleNamespace(data={'total_count': 1, 'check_runs': [{
+                        'name': 'Elder review', 'conclusion': 'success',
+                        'output': {'summary': 'Check the rollout window.'}}]})
                 return SimpleNamespace(data={'state': 'open', 'head': {'sha': 'a' * 40}, 'labels': []})
             def paginate(self, path):
                 if path.endswith('/comments'):
@@ -104,8 +106,9 @@ class ReviewReads(unittest.TestCase):
                         'author': {'login': 'grug-tribe[bot]'}}]}}],
                     'pageInfo': {'hasNextPage': False, 'endCursor': None}}}}}
         entry = {'repo': 'example-org/example-repo', 'number': 7,
-                 'comment_full': operator_hold.ask(18, ['review']), 'body_ask': ''}
+                 'body_ask': 'Reply yes or no.', 'labels': ['loom:pr', 'needs:human']}
         with mock.patch.dict('os.environ', {'LOOM_REVIEW_BOT': 'grug-tribe[bot]',
+                                             'LOOM_REVIEW_CHECK': 'Elder review',
                                              'LOOM_BRIEF_AUTHORS': 'station-bot'}):
             details = Details(GH()).get(entry)
         self.assertEqual(details['errors'], {})
@@ -115,7 +118,27 @@ class ReviewReads(unittest.TestCase):
         self.assertIn('data-review-head="' + 'a' * 40 + '"', html)
         self.assertIn('data-review-ask="' + answer.review_ask_key(ask) + '"', html)
         self.assertIn('FULL ASK TAIL', html)
+        self.assertIn('Check the rollout window.', html)
         self.assertIn('No matching trusted proof record', html)
+        self.assertIn('Approve and merge', html)
+
+    def test_a_valid_proof_for_an_older_revision_does_not_verify_this_head(self):
+        from dashboard import review_queue
+        from bus import proof
+        from unittest import mock
+        body = '## Acceptance criteria\n- [x] Live: Confirm the rollout'
+        prior = proof.render({
+            'kind': 'docs', 'revision': 'b' * 40,
+            'observed': {'start': '2030-01-01T10:00:00Z', 'end': '2030-01-01T11:00:00Z'},
+            'criteria': [{'criterion': 'Live: Confirm the rollout', 'result': 'pass',
+                          'evidence': 'The endpoint responded.'}],
+            'sources': ['Release record'],
+        }, body)
+        comments = [{'body': prior, 'user': {'login': 'station-bot'}}]
+        with mock.patch.dict('os.environ', {'LOOM_BRIEF_AUTHORS': 'station-bot'}):
+            status, recorded = review_queue.Details._proof_status(comments, body, 'a' * 40)
+        self.assertIn('different revision', status)
+        self.assertIn('Awaiting station evidence', review_queue.criteria(body, recorded))
 
     def test_every_thread_page_is_read_without_showing_other_commenters(self):
         from dashboard.review_queue import Details
@@ -184,7 +207,7 @@ class ReviewTarget(unittest.TestCase):
                 return SimpleNamespace(data=[outsider] if 'page=2' in path else
                                        [trusted] + [{'body': 'ordinary reply'}] * 99)
         entry = {'repo': 'example-org/example-repo', 'number': 7,
-                 'comment_full': operator_hold.ask(18, ['review']), 'body_ask': ''}
+                 'body_ask': 'Reply yes or no.'}
         comments = answers._comments(GH(), entry['repo'], 7, 100)
         self.assertEqual(len(comments), 101)
         with mock.patch.dict('os.environ', {'LOOM_BRIEF_AUTHORS': 'station-bot'}):
