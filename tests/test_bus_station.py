@@ -274,6 +274,8 @@ class FakeGitHub:
             return reply(200, self.factory_incidents)
         if method == "GET" and parts.path == "/search/code":
             return self._code_search(parts.query)
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs", parts.path):
+            return reply(200, {"total_count": 0, "workflow_runs": []})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -5109,7 +5111,8 @@ class CorruptStateTest(Base):
         # ready-for-agent issues (loom#3092).
         # The last-pass shipped wait stamp adds one canonical all-repo read,
         # and the ended-run sweep one read of the running tickets (loom#3134).
-        self.assertEqual(self.run_pass().requests, 22)
+        # The invariant pass also reads the completed scheduled workflow runs.
+        self.assertEqual(self.run_pass().requests, 23)
 
 
 class TicketsTest(unittest.TestCase):
