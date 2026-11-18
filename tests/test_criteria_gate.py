@@ -407,11 +407,28 @@ class RewrittenSourceAsk(tbs.Base):
         self.assertEqual(self.fake.names(1), ["loom:ticket", "loom:queued", "loom:rewritten"])
         self.assertEqual(len(self.fake.comments[1]), 1)
 
-    def test_the_station_withdraws_an_existing_gate_ask_once(self):
+    def seed_gate_ask(self):
         self.fake.issues[1]["labels"] = [{"name": "loom:rewritten"}, {"name": "loom:human"}]
         self.fake.comments[1].append({
             "body": "%s\n%s\nKind: decision" % (brain.HUMAN_MARKER, criteria_gate.ASK_OPENING),
             "user": {"login": self.fake.bot}})
+        return list(self.fake.comments[1])
+
+    def assert_withdrawal_note(self, seeded_comments):
+        self.assertEqual(self.fake.comments[1], seeded_comments + [{
+            "body": ("Verification ask withdrawn. Ticket #2 is open and carries the work "
+                     "from this source issue."),
+            "user": {"login": self.fake.bot}}])
+
+    def test_the_station_withdraws_an_existing_gate_ask_on_the_first_pass(self):
+        seeded_comments = self.seed_gate_ask()
+        station.Station(self.gh, self.settings).settle_orphan_sources()
+        self.assertEqual(self.fake.names(1), ["loom:rewritten"])
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assert_withdrawal_note(seeded_comments)
+
+    def test_the_station_withdraws_an_existing_gate_ask_once(self):
+        seeded_comments = self.seed_gate_ask()
         st = station.Station(self.gh, self.settings)
         rest = self.gh.rest
 
@@ -423,18 +440,15 @@ class RewrittenSourceAsk(tbs.Base):
         with mock.patch.object(self.gh, "rest", side_effect=fail_delete):
             st.settle_orphan_sources()
         self.assertIn("loom:human", self.fake.names(1))
-        self.assertEqual(len(self.fake.comments[1]), 3)
+        self.assert_withdrawal_note(seeded_comments)
         st.now += station.SETTLE_EVERY
         st.settle_orphan_sources()
         self.assertEqual(self.fake.names(1), ["loom:rewritten"])
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertEqual(len(self.fake.comments[1]), 3)
-        note = self.fake.comments[1][-1]["body"]
-        self.assertIn("withdrawn", note)
-        self.assertIn("#2", note)
+        self.assert_withdrawal_note(seeded_comments)
         st.now += station.SETTLE_EVERY
         st.settle_orphan_sources()
-        self.assertEqual(len(self.fake.comments[1]), 3)
+        self.assert_withdrawal_note(seeded_comments)
 
 
 class LaneProof(tbs.Base):
