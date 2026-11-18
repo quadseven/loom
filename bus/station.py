@@ -13999,8 +13999,9 @@ class Station:
     def move_outside_tickets(self) -> None:
         """Move each goal home's own open tickets that sit under no epic into
         an open intake epic of that goal, at most every OUTSIDE_EPIC_EVERY
-        seconds (decision 0003), resuming after a carried-over read. One log
-        line per goal."""
+        seconds (decision 0003), resuming after a carried-over read at the
+        first goal home not yet moved; a goal home that failed is retried on
+        resume. One log line per goal."""
         path = os.path.join(self.state, "outside-epic.json")
         state = _read_json(path, {}, strict=False)
         if not isinstance(state, dict):
@@ -14030,10 +14031,11 @@ class Station:
             except RateLimited:
                 raise
             except (GitHubError, OSError, ValueError) as err:
+                # Not marked finished: a carried-over turn retries it.
                 _say("outside-epic: goal #%d in %s failed: %s" % (number, repo, err))
-            else:
-                _say("outside-epic: moved %d, left %d for goal #%d in %s"
-                     % (moved, left, number, repo))
+                continue
+            _say("outside-epic: moved %d, left %d for goal #%d in %s"
+                 % (moved, left, number, repo))
             completed.add(key)
             state["finished"] = sorted(completed)
             _write_json(path, state)

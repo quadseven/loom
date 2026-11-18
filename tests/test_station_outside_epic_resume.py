@@ -12,7 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bus import brain, state_store, station  # noqa: E402
-from bus.github import GitHub, TargetReached  # noqa: E402
+from bus.github import GitHub, GitHubError, TargetReached  # noqa: E402
 
 
 class OutsideEpicResume(unittest.TestCase):
@@ -54,6 +54,25 @@ class OutsideEpicResume(unittest.TestCase):
         calls.clear()
         self.run_pass(1060, lambda gh, repo, goal: calls.append((repo, goal)) or (0, 0))
         self.assertEqual(calls, [("example-owner/two", 2), ("example-owner/three", 3)])
+
+    def test_a_failed_goal_home_is_retried_after_a_carried_over_read(self):
+        calls = []
+
+        def first_pass(gh, repo, goal):
+            calls.append(goal)
+            if goal == 1:
+                raise GitHubError("server error")
+            if goal == 2:
+                raise TargetReached("read carried over at request target")
+            return 0, 0
+
+        with self.assertRaises(TargetReached):
+            self.run_pass(1000, first_pass)
+        self.assertEqual(calls, [1, 2])
+
+        calls.clear()
+        self.run_pass(1060, lambda gh, repo, goal: calls.append(goal) or (0, 0))
+        self.assertEqual(calls, [1, 2, 3])
 
     def test_checked_is_written_after_last_home_then_next_round_restarts(self):
         calls = []
