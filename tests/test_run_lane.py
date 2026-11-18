@@ -951,13 +951,22 @@ print('leak guard: clean (shape patterns only)')
         self.assertNotIn("unbound variable", result.stderr)
 
     def test_a_missing_leak_scanner_is_a_factory_incident(self):
-        # No infra-public checkout and no remote to clone it from: the scanner
-        # cannot be had, so a public-repo push is a factory incident (one issue
-        # filed, the ticket held) instead of a transient failure that the
-        # station re-briefs endlessly.
+        # A fresh lane must leave the original scanner remote alone until
+        # configured, even when that remote is available.
+        remotes = Path(self._tmp.name) / "remotes"
+        remote = remotes / "quadseven" / "infra-public"
+        remote.parent.mkdir(parents=True)
+        git("init", "-q", "-b", "main", str(remote))
+        scripts = remote / ".github" / "scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
+        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
+        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
+            "commit", "-qm", "scanner", cwd=remote)
         self.drop_brief()
-        result = self.run_lane(LOOM_LEAK_SCANNER="")
+        result = self.run_lane(LOOM_LEAK_SCANNER="", LOOM_INFRA_PUBLIC_REPO="")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.loom / "infra-public").exists())
         self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
         line = self.failure_line()
         self.assertTrue(line.startswith("[factory] "), line)
@@ -970,17 +979,6 @@ print('leak guard: clean (shape patterns only)')
 
         # With an infra-public remote holding the scanner but no local
         # checkout, the lane clones it before the scan and the push opens.
-        root = Path(self._tmp.name)
-        remotes = root / "remotes"
-        remote = remotes / "quadseven" / "infra-public"
-        remote.parent.mkdir(parents=True)
-        git("init", "-q", "-b", "main", str(remote))
-        scripts = remote / ".github" / "scripts"
-        scripts.mkdir(parents=True)
-        (scripts / "check_private_leaks.py").write_text(self.scanner.read_text())
-        git("add", ".github/scripts/check_private_leaks.py", cwd=remote)
-        git("-c", "user.name=t", "-c", "user.email=t@example.invalid",
-            "commit", "-qm", "scanner", cwd=remote)
         self.log.write_text("")
         self.drop_brief("T043-next.md", BRIEF.replace("T042-fix-the-thing", "T043-next"))
         result = self.run_lane(LOOM_LEAK_SCANNER="")
