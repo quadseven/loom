@@ -62,12 +62,15 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
         return State("off", "Heartbeat lacks availability", at)
     reason = str(beat.get("reason") or "")
     if reason.startswith(LIMIT):
-        until = epoch(beat.get("retry_at"))
-        if until is not None and until <= now:
-            return State("off", "Limit ended, waiting for a heartbeat", at)
-        why = "Out of credit" if "out of credit" in reason else "Runner reported a limit"
-        return State("limited", why, at, until)
+        return _limit_state(reason, at, epoch(beat.get("retry_at")), now)
     return State("off", RUNNER_UNAVAILABLE, at)
+
+
+def _limit_state(reason: str, at: float, until: Optional[float], now: float) -> State:
+    if until is not None and until <= now:
+        return State("off", "Limit ended, waiting for a heartbeat", at)
+    why = "Out of credit" if "out of credit" in reason else "Runner reported a limit"
+    return State("limited", why, at, until)
 
 
 def heartbeat_fields(slot: str, beat: Dict[str, Any], home: str) -> Dict[str, Any]:

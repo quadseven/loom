@@ -588,16 +588,20 @@ def _section(key, title, note, body, fact=""):
         key, key, key, title, '<span class="machine-fact">%s</span>' % fact if fact else "", note, body)
 
 
+def _lane_summary_tiles(lanes):
+    counts = {key: sum(1 for lane in lanes if lane_state(lane) == key) for key, _, _ in LANE_STATES}
+    legacy = not any(counts[state] for state in lane_states.STATES)
+    return ['<li class="summary-tile lane-%s"><span class="summary-num">%d</span>'
+             '<span class="summary-word"><i class="lane-dot"></i>%s</span><small>%s</small></li>' % (
+                 LANE_STATE_STYLE.get(key, key), counts[key], word, sub)
+             for key, word, sub in LANE_STATES if counts[key] or (legacy and key not in lane_states.STATES)]
+
+
 def _lane_summary(lanes, share):
     """The top strip: how many lanes are held, working and ready, the
     Anthropic share against its cap, and the held lanes grouped by reason."""
     esc = html.escape
-    counts = {key: sum(1 for lane in lanes if lane_state(lane) == key) for key, _, _ in LANE_STATES}
-    legacy = not any(counts[state] for state in lane_states.STATES)
-    tiles = ['<li class="summary-tile lane-%s"><span class="summary-num">%d</span>'
-             '<span class="summary-word"><i class="lane-dot"></i>%s</span><small>%s</small></li>' % (
-                 LANE_STATE_STYLE.get(key, key), counts[key], word, sub)
-             for key, word, sub in LANE_STATES if counts[key] or (legacy and key not in lane_states.STATES)]
+    tiles = _lane_summary_tiles(lanes)
     if share is None:
         share_html = '<small>missing: no lane run totals were available</small>'
         number = "-"

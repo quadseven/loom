@@ -297,30 +297,31 @@ def _render_brain_cards(brain_rows):
 
 
 def _render_lane_cards(lane_rows):
+    return "".join(_render_lane_card(lane) for lane in lane_rows) or (
+        '<p class="empty-state">No lane heartbeats have been recorded.</p>')
+
+
+def _render_lane_card(lane):
     esc = html.escape
-    lanes = []
-    for lane in lane_rows:
-        ticket = lane.get("ticket")
-        if ticket:
-            href = "/t/%s/%s" % (esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")))
-            doing = '<a href="%s">%s</a>' % (href, esc(ticket.get("title") or "ticket"))
-            if lane.get("run_started"):
-                doing += ' / run started %s' % esc(lane["run_started"])
-        else:
-            doing = "idle"
-        if lane.get("reason"):
-            doing += " / " + esc(lane["reason"])
-        if lane.get("claim"):
-            doing += " / claimed by " + esc(lane["claim"].partition(":")[2])
-        pr = lane.get("pull_request")
-        pr_link = (' <a href="%s">open PR</a> / brain review' %
-                   esc(str(pr.get("html_url") or "#"))) if pr else ""
-        lanes.append('<article class="card"><h3>%s</h3><p>%s / %s</p><p>%s%s</p><p>%s</p></article>' % (
-            esc(lane.get("lane") or "lane"), esc(lane.get("holder") or "brain"),
-            esc(lane.get("state") or ("busy" if ticket else "idle")), doing, pr_link,
-            esc("last heartbeat " + lane["age"])))
-    lane_html = "".join(lanes) or '<p class="empty-state">No lane heartbeats have been recorded.</p>'
-    return lane_html
+    ticket = lane.get("ticket")
+    if ticket:
+        href = "/t/%s/%s" % (esc(str(ticket.get("repo") or "")), esc(str(ticket.get("number") or "")))
+        doing = '<a href="%s">%s</a>' % (href, esc(ticket.get("title") or "ticket"))
+        if lane.get("run_started"):
+            doing += ' / run started %s' % esc(lane["run_started"])
+    else:
+        doing = "idle"
+    if lane.get("reason"):
+        doing += " / " + esc(lane["reason"])
+    if lane.get("claim"):
+        doing += " / claimed by " + esc(lane["claim"].partition(":")[2])
+    pr = lane.get("pull_request")
+    pr_link = (' <a href="%s">open PR</a> / brain review' %
+               esc(str(pr.get("html_url") or "#"))) if pr else ""
+    return '<article class="card"><h3>%s</h3><p>%s / %s</p><p>%s%s</p><p>%s</p></article>' % (
+        esc(lane.get("lane") or "lane"), esc(lane.get("holder") or "brain"),
+        esc(lane.get("state") or ("busy" if ticket else "idle")), doing, pr_link,
+        esc("last heartbeat " + lane["age"]))
 
 
 def _render_incidents(lane_rows):

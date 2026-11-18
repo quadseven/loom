@@ -409,9 +409,13 @@ def build(rows: list[dict[str, Any]], now: datetime, prs: list[dict[str, Any]] |
                         for name, items in by_name.items()),
                        key=lambda p: (p["rank"], -p["top"], p["name"]))
     newest = max((p["read"] for p in providers if p["read"]), default=None)
-    groups = [g for p in providers for g in p["groups"]]
     return {"providers": providers, "asks": _asks(providers, newest, now), "now": now, "newest": newest,
-            "lanes": sum(len(p["lanes"]) for p in providers), "free": sum(p["free"] for p in providers),
+            **_lane_totals(providers)}
+
+
+def _lane_totals(providers: list[dict[str, Any]]) -> dict[str, int]:
+    groups = [g for p in providers for g in p["groups"]]
+    return {"lanes": sum(len(p["lanes"]) for p in providers), "free": sum(p["free"] for p in providers),
             "held": sum(len(g["lanes"]) for g in groups if g["kind"] == "held"),
             "down": sum(len(g["lanes"]) for g in groups if g["kind"] == "down")}
 

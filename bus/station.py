@@ -16321,6 +16321,13 @@ class Station:
                  and str(saved[key].get("reason") or "").startswith(factory.MODEL_WAIT)
                  and saved[key]["reason"] != found.get(key)]
         dropped = [key for key in settled if saved.pop(key, None) is not None]
+        kept = self._refresh_waits(saved, found)
+        if saved or dropped:
+            _write_json(path, kept)
+        for key in ended:
+            _say("%s model wait ended" % key)
+
+    def _refresh_waits(self, saved: Dict[str, Any], found: Dict[str, str]) -> Dict[str, Any]:
         for key, reason in found.items():
             old = saved.get(key)
             if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
@@ -16332,12 +16339,8 @@ class Station:
                 entry["no_lane_since"] = kept_since if self._num(kept_since) else self.now
             else:
                 entry.pop("no_lane_since", None)
-        kept = {key: info for key, info in saved.items() if isinstance(info, dict)
+        return {key: info for key, info in saved.items() if isinstance(info, dict)
                 and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
-        if kept or saved or dropped:
-            _write_json(path, kept)
-        for key in ended:
-            _say("%s model wait ended" % key)
 
     def _invariant_waits(self) -> List[invariants.Wait]:
         """The ticket waits _record_waits kept, each ticket named for a
