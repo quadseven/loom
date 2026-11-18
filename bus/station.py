@@ -580,7 +580,7 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # keeps its rung, and the brain re-queues it when the incident closes.
 # An [auth] one is the operator's key, which no lane can renew: it is not a
 # failure, not an attempt spent and never a runaway.
-CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
+CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth|egress-opened)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Whether this process has said the send-back comparison is off (unset target).
@@ -2038,7 +2038,8 @@ NOT_WORK = ("factory", "transient", "limit", "auth")
 
 def failure_class(reason: str) -> str:
     m = CLASS_RE.match(reason)
-    return m.group(1) if m else "work"
+    klass = m.group(1) if m else "work"
+    return "factory" if klass == "egress-opened" else klass
 
 
 def ending_class(reason: str) -> str:

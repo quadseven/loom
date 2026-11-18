@@ -64,7 +64,8 @@
 # LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
 # needs LOOM_EGRESS_DENY_PROBES, IPv4:port addresses the pod's egress policy
 # blocks, and LOOM_EGRESS_ALLOW_PROBE, a host:port it must reach; see
-# egress_denied),
+# egress_denied), LOOM_EGRESS_RECHECK_SECONDS (seconds between checks during
+# a bwrap agent run, default 60),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
 # pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
@@ -226,6 +227,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   # The agent's watchdog and its tail reader run in a group of their own; a
   # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
   stop_orphaned_agent "$(cat "$LOCK/watchdog_pgid" 2>/dev/null || true)"
+  stop_orphaned_agent "$(cat "$LOCK/egress_pgid" 2>/dev/null || true)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -4149,6 +4151,34 @@ agent_watchdog() {
   rm -f "$fifo"
 }
 
+# Run outside bwrap, with a process group the runner can stop along with
+# any in-flight probe. The marker takes priority over the agent's exit code.
+agent_egress_watchdog() {
+  local agent="$1" interval="${LOOM_EGRESS_RECHECK_SECONDS:-60}" warned="" group groups
+  [[ "$interval" =~ ^[1-9][0-9]{0,8}$ ]] || interval=60
+  set +m
+  while sleep "$interval" && kill -0 "$agent" 2>/dev/null; do
+    if egress_denied; then
+      continue
+    fi
+    if [ -n "$EGRESS_CONNECTED" ]; then
+      printf '%s\n' "$EGRESS_CONNECTED" > "$LOCK/egress-opened"
+      # Kill the timeout and sandbox groups before their parent wrapper.
+      groups="$(agent_groups "$agent" | sort -u)"
+      for group in $groups; do
+        case "$group" in "$agent"|0|1) continue ;; esac
+        kill -KILL -- "-$group" 2>/dev/null || true
+      done
+      kill -KILL -- "-$agent" 2>/dev/null || true
+      return
+    fi
+    if [ -z "$warned" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: egress allow probe failed during the run" >> "$LOG"
+      warned=1
+    fi
+  done
+}
+
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
 
 # The anthropic lanes spend API credits. The CLI's JSON result carries the
@@ -4680,7 +4710,7 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
-  rm -f "$LOCK/watchdog-limit"
+  rm -f "$LOCK/watchdog-limit" "$LOCK/egress-opened"
   # The job's proof that an agent started: without it a cluster run fails in
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
@@ -4693,17 +4723,32 @@ for BRIEF in "$INBOX"/*.md; do
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
     watchdog_pid=$!
     echo $watchdog_pid > "$LOCK/watchdog_pgid"
+    egress_pid=""
+    if [ "${LOOM_SANDBOX:-}" = bwrap ] && [ -n "${LOOM_EGRESS_DENY_PROBES:-}" ]; then
+      ( agent_egress_watchdog "$agent_pid" ) &
+      egress_pid=$!
+      echo "$egress_pid" > "$LOCK/egress_pgid"
+    fi
     wait $agent_pid
     agent_status=$?
+    if [ -n "$egress_pid" ]; then
+      # Once the watchdog records an open probe, let it finish the kill.
+      [ -s "$LOCK/egress-opened" ] || kill -TERM -- "-$egress_pid" 2>/dev/null || true
+      wait "$egress_pid" 2>/dev/null || true
+      rm -f "$LOCK/egress_pgid"
+    fi
     kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
     wait $watchdog_pid 2>/dev/null || true
     exit $agent_status ) &
   wait $!
   STATUS=$?
-  AGENT_GH_CALLS="$(agent_gh_calls)"
+  [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
-    park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
+    if [ ! -s "$LOCK/egress-opened" ]; then
+      park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
+    fi
+    echo "could not remove the agent's gh credential store" >> "$LOG"
   fi
   is_api_lane && archive_transcripts
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
@@ -4713,7 +4758,19 @@ for BRIEF in "$INBOX"/*.md; do
       echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
     fi
   fi
-  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  TOKEN_READY=1
+  lane_app_token || TOKEN_READY=0
+  if [ -s "$LOCK/egress-opened" ]; then
+    # The address belongs in the lane log and the sealed runner report.
+    echo "[$(date -u +%FT%TZ)] $TICKET egress probe connected: $(cat "$LOCK/egress-opened")" >> "$LOG"
+    INCIDENT="factory incident filing failed ($APP_TOKEN_WHY)"
+    if [ "$TOKEN_READY" = 1 ]; then
+      INCIDENT="$(file_factory_incident egress-opened "A deny probe connected during the agent run. See the sealed lane log for the address.")"
+    fi
+    LOOM_LOG_TAIL=off park "$BRIEF" "egress probe connected; nothing pushed; $INCIDENT" egress-opened
+    break
+  fi
+  if [ "$TOKEN_READY" = 0 ]; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit
