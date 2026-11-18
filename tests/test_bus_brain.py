@@ -16,7 +16,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, factory, hold_boxes, journal, metrics, notify, proof, station, text, tickets
+from bus import brain, factory, health, hold_boxes, journal, metrics, notify, proof, station, text, tickets
 from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 import sub_issue_graphql  # noqa: E402
@@ -1419,6 +1419,15 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
         self.assertEqual(fake.calls, [])
 
+    def test_brief_refuses_a_split_before_filing_or_rewriting(self):
+        text = BODY.replace("## What\n", "## What\nAdd iOS and Android discovery.\n")
+        for refs in (None, 19):
+            with self.subTest(refs=refs):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "split.*After:"):
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, refs=refs)
+                self.assertEqual(fake.calls, [])
+
     def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
         stub = BODY.replace("- [ ] ", "- ")
         for name in ("epic", "wayfinder:map"):
@@ -1622,7 +1631,7 @@ class SensitiveResumeTests(unittest.TestCase):
                 for s in states]
 
     def test_brief_capacity_refusal(self):
-        children = self._children(*(["briefed", "running", "pr", "failed"] * 4))
+        children = self._children(*(["queued", "briefed", "running", "pr"] * 4))
         fake = Fake(reply(200, goal()), reply(200, children))
         gh = GitHub("t", transport=fake)
         with self.assertRaises(ValueError):
@@ -5178,8 +5187,9 @@ class HumanAndRefsTests(unittest.TestCase):
         self.assertNotIn("#6", fake.calls[3][2]["body"])
         self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
         self.assertIn("closes as completed when that ticket is verified", fake.calls[5][2]["body"])
-        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "DELETE", "POST"])
-        self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+        self.assertEqual([c[0] for c in fake.calls[5:]], ["POST", "POST", "DELETE"])
+        self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
+        self.assertTrue(fake.calls[7][1].endswith("/labels/loom%3Atriage"))
         self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
 
     def test_brief_refs_refuses_a_ticket_or_closed_original(self):
@@ -5302,7 +5312,7 @@ class HumanAndRefsTests(unittest.TestCase):
                 self.assertTrue(fake.calls[3][2]["body"].endswith(
                     "\n\nRewritten from issue 6.\n\nPart of #2\n"))
                 self.assertIn("Rewritten as ticket #20", fake.calls[5][2]["body"])
-                self.assertEqual(fake.calls[7][2], {"labels": ["loom:rewritten"]})
+                self.assertEqual(fake.calls[6][2], {"labels": ["loom:rewritten"]})
                 self.assertFalse(any(c[0] == "PATCH" for c in fake.calls))
                 self.assertIn("#6 is rewritten as a new ticket", err.getvalue())
 
@@ -5686,6 +5696,52 @@ class RepairBriefTests(unittest.TestCase):
 
     def brief(self, fake, **kw):
         return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex", **kw)
+
+    def test_a_ticket_waiting_for_a_lane_does_not_fill_the_goal(self):
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:queued"]),
+                         item(11, labels=["loom:ticket", "loom:briefed", "wait:lane"])])
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "2"}):
+            self.brief(fake)
+        self.assertEqual(len(fake.created()), 1)
+
+    def test_factory_repairs_can_use_two_slots_past_the_goal_cap(self):
+        repairs = [item(n, labels=["loom:factory"], user={"login": "brain-bot[bot]"},
+                        html_url="https://example.com/t/%d" % n) for n in (11, 12, 13)]
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"]), *repairs])
+        env = {"LOOM_GOAL_CAP": "1", "LOOM_BRIEF_AUTHORS": "brain-bot[bot]"}
+        with unittest.mock.patch.dict(os.environ, env):
+            with self.assertRaisesRegex(ValueError, "1 tickets in flight"):
+                self.brief(fake)
+            self.assertEqual(self.brief(fake, refs=11), repairs[0]["html_url"])
+            self.assertEqual(self.brief(fake, refs=12), repairs[1]["html_url"])
+            with self.assertRaisesRegex(ValueError, "reserve"):
+                self.brief(fake, refs=13)
+        self.assertNotIn("loom:ticket", fake.names(13))
+
+    def test_health_findings_use_the_reserve_even_when_intake_cannot_open_an_epic(self):
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"])])
+        for n in range(20, 20 + brain.GOAL_EPIC_CAP - 1):
+            fake.issues[n] = epic_issue(number=n, id=1000 + n, title="Epic: work %d" % n)
+            fake.subs[1].append(n)
+        gh = GitHub("t", transport=fake)
+
+        def file_finding(key):
+            finding = health.Finding(key, "Slow search", "search", 3, 5, 15, "Reads stall.", "")
+            return brain.brief_intake(gh, REPO, 1, health.ticket_title(finding),
+                                      health.ticket_body(finding), difficulty="medium")
+
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            for key in ("first", "second"):
+                self.assertTrue(file_finding(key))
+            with self.assertRaisesRegex(ValueError, "reserve"):
+                file_finding("third")
+            fake.issues[10]["state"] = "closed"
+            self.assertTrue(file_finding("third"))
+            with self.assertRaisesRegex(ValueError, "reserve"):
+                file_finding("fourth")
+        epics = [i for i in fake.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
+        self.assertEqual(len(epics), 1)
+        self.assertEqual(len(fake.subs[epics[0]["number"]]), 3)
 
     def test_an_ordinary_brief_over_the_limit_is_refused(self):
         fake = self.over_limit()
@@ -6261,7 +6317,7 @@ class GoalWalksEpicsTest(unittest.TestCase):
         gh = GitHub("t", transport=EpicWalk())
         with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "7"}):
             with self.assertRaisesRegex(ValueError, "7 tickets in flight"):
-                brain._check_goal_capacity(brain.goal_children(gh, REPO, 1), 1)
+                brain._check_goal_capacity(brain.goal_children(gh, REPO, 1), REPO)
 
     def test_a_goal_without_epics_reads_no_ticket_list(self):
         walk = EpicWalk()

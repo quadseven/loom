@@ -89,8 +89,9 @@ Per finding, on each read:
   (`<!-- loom:health key=<sha1> -->`): it briefs one under the goal's intake
   epic through `bus.brain brief`, with Difficulty medium, Size M, the quoted finding in
   Why, and the Live criterion "the finding is absent from the health endpoint for 24
-  hours". At most 3 new tickets a pass, and never past the goal's cap
-  (`LOOM_GOAL_CAP`).
+  hours". At most 3 new tickets a pass. Health findings share two slots with
+  factory repairs above the goal's in-flight cap (`LOOM_GOAL_CAP`). If the
+  goal cannot open another intake epic, the findings go to its repairs epic.
   A health ticket gets no lane until its body names the cause on a `Cause:`
   line: the station sends it to the brain with `needs-brain` first, and a
   cause or a change that only moves the measurement is refused

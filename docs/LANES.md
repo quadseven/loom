@@ -55,9 +55,11 @@ lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
 `/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
-machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
-and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
-script's path when using another checkout. A scanner that is still missing
+machine clones `LOOM_INFRA_PUBLIC_REPO` into `$LOOM_HOME/infra-public` when
+first needed and fast-forwards it at most hourly. With that setting unset,
+the lane uses the existing local scanner at the default path or the path
+specified by `LOOM_LEAK_SCANNER`. The cluster workflow provides its pinned
+public scanner checkout through `LOOM_LEAK_SCANNER`. A scanner that is missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
 another reason parks the brief `[transient]`. A hit parks the brief with
