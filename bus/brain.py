@@ -2105,14 +2105,14 @@ def _check_model(model: Optional[str]) -> None:
 
 
 def _check_laneable(body: str) -> None:
-    """Refuse a brief no lane can meet: every acceptance criterion is a check
-    on a live host or network (operator_hold.host_only). 2026-10-22: such a
-    ticket was laned; the lane replaced a README to have a diff, and it
-    merged."""
+    """Refuse host-only briefs and briefs that need to be split before filing."""
     if operator_hold.host_only(body):
         raise ValueError("every acceptance criterion is a check on a live host or network: "
                          "no lane can meet it; file it as a needs-operator ask, or add a "
                          "criterion a pull request can meet")
+    split = brief_check.split_verdict(body)
+    if split is not None:
+        raise ValueError("this brief " + split.reason)
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],

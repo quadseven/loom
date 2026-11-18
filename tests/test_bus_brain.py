@@ -1417,6 +1417,15 @@ class SensitiveResumeTests(unittest.TestCase):
             brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", stub, "codex")
         self.assertEqual(fake.calls, [])
 
+    def test_brief_refuses_a_split_before_filing_or_rewriting(self):
+        text = BODY.replace("## What\n", "## What\nAdd iOS and Android discovery.\n")
+        for refs in (None, 19):
+            with self.subTest(refs=refs):
+                fake = Fake()
+                with self.assertRaisesRegex(ValueError, "split.*After:"):
+                    brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", text, refs=refs)
+                self.assertEqual(fake.calls, [])
+
     def test_a_rewrite_of_an_epic_or_a_map_is_not_refused_for_its_criteria(self):
         stub = BODY.replace("- [ ] ", "- ")
         for name in ("epic", "wayfinder:map"):

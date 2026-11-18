@@ -3772,7 +3772,13 @@ class LadderReviewFake(ReviewFake):
             self.issue["body"] = data["body"]
             self.writes.append(("PATCH", path, data))
             return mock.Mock(data=self.issue)
+        if method == "POST" and path == "/repos/%s/issues/12/labels" % REPO:
+            names = [label["name"] for label in self.issue["labels"]]
+            data = {"labels": list(dict.fromkeys(names + data["labels"]))}
         return super().rest(method, path, data)
+
+    def paginate(self, path):
+        return status.expand(super().paginate(path), AUTHORS)
 
 
 READY = station.READY_TEXT
@@ -4319,6 +4325,32 @@ class StuckFixRoundTest(unittest.TestCase):
         self.run_hand_back(threads=[self.thread("PRRT_new", 59, "unvalidated-external-input")])
         self.assertIn("lane:claude", self.names())
         self.assertNotIn("lane:spark", self.names())
+
+    def test_hand_back_holds_the_second_review_failed_rung_for_a_split(self):
+        self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    high | _security_ | `resource-leak` | quick win")
+        threads = [self.thread("PRRT_new", 59, "resource-leak")]
+        for lane in ("spark", "claude"):
+            self.gh.comments.append({
+                "user": self.gh.comments[0]["user"],
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.station.now - 1)),
+                "body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
+            })
+            self.run_hand_back(threads=threads)
+            if lane == "spark":
+                self.assertIn("loom:briefed", self.names())
+                self.assertIn("lane:claude", self.names())
+                self.gh.issue["labels"] = [
+                    {"name": "loom:pr"} if label["name"] == "loom:briefed" else label
+                    for label in self.gh.issue["labels"]
+                ]
+                self.station.now += 120
+        self.run_hand_back(checks=[("unittest", "failed")])
+        self.assertIn("needs-brain", self.names())
+        self.assertIn("loom:pr", self.names())
+        self.assertIn("lane:claude", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertEqual(sum("Split this ticket" in c["body"] for c in self.gh.comments), 1)
 
     def test_a_new_finding_is_progress_and_stays_on_its_lane(self):
         self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"

@@ -140,6 +140,11 @@ Deliverable: answer (optional; the station also writes verify, review and base-c
 The `# T0001: <short title>` heading becomes the pull request title; without
 it the title is the ticket id.
 
+When you have a diff estimate, put a line such as `Estimated diff: 650 lines`
+after the size letter. Loom asks the brain to split a brief when its estimate
+exceeds 800 lines or its What or acceptance criteria span multiple platforms.
+File the slices separately and use `After:` to name their dependencies.
+
 The runner uses the `Why`, `What`, `Acceptance criteria`, `Size`, `Out of
 scope` and `Operator steps before merge` sections when it builds the pull
 request body. Keep these headings exactly as written; the one exception is

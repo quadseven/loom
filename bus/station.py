@@ -6164,11 +6164,7 @@ class Station:
                 # Added, not put: the label list read before the move is stale.
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
-                self._routine(repo, number, brief_check.HEALTH_NOTE % (
-                    found.reason, "A lane gets it once the brain has split it into "
-                    "one ticket per platform, with `After:` lines between the "
-                    "slices so each slice queues only when the one before it "
-                    "has merged."))
+                self._routine(repo, number, "Held for the brain: this brief %s." % found.reason)
             else:
                 brain.human(self.gh, repo, number, brief_check.ask(found, body))
         except ValueError as err:
@@ -8940,13 +8936,19 @@ class Station:
         its rung, the rounds stop (_stop_fix_rounds). A check in `flaky`
         failed on the infrastructure (bus/flake.py) and is never read as a
         failure the last round left."""
+        if "needs-brain" in names:
+            return
         authors = {author.lower() for author in self.s.authors}
         failing = [name for name, _ in failed]
+        last = converge.last_fix_body(comments, authors, (repo, pr_number))
         persisted = converge.persistent(
-            converge.last_fix_body(comments, authors, (repo, pr_number)),
-            failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
-        if persisted:
-            lane = self._climb_stuck(repo, number, pr_number, detail, comments, persisted)
+            last, failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
+        review_output = next((tail for name, tail in failed if name == self.s.review_check), "")
+        review_failed = factory.review_findings_remain(
+            last or "", threads, self.s.review_check, review_output)
+        if persisted or review_failed:
+            reasons = persisted or ["check " + self.s.review_check]
+            lane = self._climb_stuck(repo, number, pr_number, detail, comments, reasons, review_failed)
             if lane is None:
                 return
             names = _label_names(self._issue(repo, number))
@@ -8970,13 +8972,16 @@ class Station:
              or (isinstance(c, dict) and factory.ts_of(c.get("created_at")) > since)], authors)
 
     def _climb_stuck(self, repo: str, number: int, pr_number: int, detail: Dict[str, Any],
-                     comments: List[Any], persisted: List[str]) -> Optional[str]:
+                     comments: List[Any], persisted: List[str], review_failed: bool) -> Optional[str]:
         """Move a ticket whose last fix round left the same failures up the
         model ladder (factory.Factory._climb, which keeps the operator's
         model and private-repo rules). The new lane, or None when it waits for
         a lane of its next rung or its rounds stopped with no rung left."""
         runner = self._factory()
         issue = self._issue(repo, number)
+        if review_failed and runner.hold_review_split(
+                repo, issue, factory.history.trusted_comments(comments, self.s.authors)):
+            return None
         found = converge.summary(persisted)
         footer = runner._footer(repo, detail)
         lane = runner._climb(repo, issue, comments, "the same failures came back after a fix "
