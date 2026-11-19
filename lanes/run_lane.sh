@@ -1475,9 +1475,7 @@ agy_agent() {
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
     LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
-    "$AGY_BIN" -p "$1
-
-$AGY_TOOLS_NOTE" --mode accept-edits --disable-slash-commands --model "$MODEL" < /dev/null 2>&1 | timeout "$((AGENT_TIMEOUT + 60))" cat
+    "$AGY_BIN" -p "$@" --disable-slash-commands --model "$MODEL" < /dev/null | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
   # A failed restore must fail the run, even if agy itself succeeded. Only the
   # copy of the file that agy_settings prints goes to /dev/null, not its status.
@@ -2054,8 +2052,42 @@ record_model_limit() {
   tmp="$MODEL_LIMIT_FILE.tmp"
   mkdir -p "$(dirname "$MODEL_LIMIT_FILE")"
   { [ ! -f "$MODEL_LIMIT_FILE" ] || awk -v m="$model" '$1 != m' "$MODEL_LIMIT_FILE"
-    printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"; } > "$tmp"
-  mv "$tmp" "$MODEL_LIMIT_FILE"
+    if [ "$ends" != 0 ]; then
+      printf '%s %s %s\n' "$model" "$ends" "$(printf '%s' "$why" | tr -cd '[:alnum:] ._:-')"
+    fi
+  } > "$tmp" && mv "$tmp" "$MODEL_LIMIT_FILE"
+}
+
+# The model file's modification time is the last refusal or recheck, including
+# holds written before CLI probes existed. Touch it even if no provider answers.
+recheck_agy_models() {
+  local model dir="" reply only at status err="$LOCK/agy-probe.err"
+  local configured=" ${CONFIGURED_MODELS//[[:space:]]/ } "
+  [ -s "$MODEL_LIMIT_FILE" ] || return 0
+  at="$(python3 -c 'import os, sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$MODEL_LIMIT_FILE")" || return 1
+  [ "$(( $(date +%s) - at ))" -ge "$LIMIT_RECHECK" ] || return 0
+  only="$(lane_setting ONLY_MODEL)"
+  for model in gemini-3.8-flash-{high,medium,low}; do
+    [[ "$configured" = *" $model "* && "$model" = "$only"* ]] || continue
+    model_limit_until "$model" >/dev/null || continue
+    if [ -z "$dir" ]; then
+      touch "$MODEL_LIMIT_FILE" || return 1
+      # An empty directory readable by the lane user, outside every ticket.
+      dir="$(mktemp -d "$WORKDIR/.quota.XXXXXX")" || return 1
+      chmod 755 "$dir" || { rmdir "$dir"; return 1; }
+    fi
+    status=0
+    reply="$(cd "$dir" && MODEL="$model" AGENT_TIMEOUT="$PROBE_TIMEOUT" \
+      agy_agent 'Reply with just OK.' 2>"$err")" || status=$?
+    classify_failure "$status" "$reply"$'\n'"$(cat "$err")" ""
+    rm -f "$err"
+    if [ -n "$STATED_RETRY_AT" ]; then
+      record_model_limit "$model" "$STATED_RETRY_AT" "provider limit reached"
+    elif [ "$status" -eq 0 ] && [ "$FAIL_CLASS" = work ] && [[ "$reply" =~ [^[:space:]] ]]; then
+      record_model_limit "$model" 0 ""
+    fi
+  done
+  [ -z "$dir" ] || rmdir "$dir"
 }
 # The epoch the last of the lane's configured models comes off its limit;
 # fails when one of them is not limited now.
@@ -4209,7 +4241,9 @@ Do not search the whole filesystem (for example, find /). Search within the chec
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
     anthropic) anthropic_agent "$brief_text" ;;
-    agy) agy_agent "$brief_text" ;;
+    agy) agy_agent "$brief_text
+
+$AGY_TOOLS_NOTE" --mode accept-edits ;;
     copilot) api_agent COPILOT_GITHUB_TOKEN copilot -p "$brief_text" --allow-all-tools ;;
     *) echo "unknown lane $LANE" >&2; return 2 ;;
   esac
@@ -4334,8 +4368,9 @@ lane_ready() {
     "${AGY_RUNAS[@]}" test -x "$AGY_BIN" > /dev/null 2>&1 ||
       { READY_REASON="cannot run $AGY_BIN as $AGY_USER"; return 1; }
     agy_key || return 1
-    agy_unlock
-    return
+    agy_unlock || return 1
+    recheck_agy_models
+    return 0
   fi
   case "$LANE" in
     codex) cli=codex ;; claude|anthropic) cli=claude ;; copilot) cli=copilot ;;

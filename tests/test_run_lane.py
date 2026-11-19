@@ -2822,6 +2822,84 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
 
+    def held_agy_lane(self, models, holds, reply):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        limits = usage / "agy.models"
+        limits.write_text("".join(f"{model} {until} account quota reached\n"
+                                  for model, until in holds.items()))
+        old = time.time() - 3600
+        os.utime(limits, (old, old))
+        lane_home = self.home / "lane-user"
+        cli = lane_home / "bin" / "agy"
+        self.write_tool(cli, '#!/bin/bash\n'
+                        '[ "$1" = -p ] && [ -n "$2" ] || exit 2\n'
+                        'while [ "$#" -gt 1 ] && [ "$1" != --model ]; do shift; done\n'
+                        '[ "$1" = --model ] || exit 2\n'
+                        'echo "$2" >> "$HOME/probes"\n' + reply)
+        self.write_tool(self.bin / "runas", FAKE_RUNAS)
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\n[ "$1" = -p ] || exit 2\nshift 2\nexec "$@"\n')
+        self.write_tool(self.bin / "codesign", '#!/bin/sh\necho "CodeDirectory flags=0x10000(runtime)"\n')
+        env = dict(LOOM_AGY_HOME=str(lane_home), LOOM_AGY_BIN=str(cli),
+                   LOOM_AGY_RUNAS=str(self.bin / "runas"), LOOM_AGY_KEY_SSM="/k/kc",
+                   FAKE_SECRET__k_kc="test", LOOM_AGY_MODELS=" ".join(models))
+        return env, lane_home / "probes"
+
+    def test_held_agy_lane_is_available_on_the_pass_its_cli_answers(self):
+        high, low = "gemini-3.8-flash-high", "gemini-3.8-flash-low"
+        until = int(time.time()) + 86400
+        env, probes = self.held_agy_lane([high, low], {high: until, low: until},
+                                         'if [[ "$2" = *-low ]]; then echo "Ready."; else echo "Starting" >&2; fi\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertTrue(beat["available"], beat)
+        self.assertEqual(beat["limited_models"], {high: until})
+        self.assertEqual(probes.read_text().splitlines(), [high, low])
+
+    def test_refused_agy_recheck_records_the_stated_reset(self):
+        model = "gemini-3.8-flash-low"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "Individual quota reached. Resets in 2h3m." >&2\nexit 1\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 7380)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 7380)
+        self.assertEqual(beat["limited_models"], {model: beat["retry_at"]})
+
+    def test_agy_rechecks_only_held_configured_flash_models_once_per_interval(self):
+        high, medium, low = ("gemini-3.8-flash-" + effort for effort in ("high", "medium", "low"))
+        other = "gemini-4-argon-high"
+        now = int(time.time())
+        env, probes = self.held_agy_lane([high, high, low, other],
+                                         {high: now + 3600, medium: now + 3600,
+                                          low: now - 1, other: now + 3600},
+                                         'echo "Individual quota reached." >&2\nexit 1\n')
+        for _ in range(2):
+            result = self.run_lane("agy", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(probes.read_text().splitlines(), [high])
+        self.assertEqual(self.beat("agy")["limited_models"][high], now + 3600)
+        limits = self.loom / "state" / "usage" / "agy.models"
+        os.utime(limits, (now - 1800, now - 1800))
+        self.run_lane("agy", **env)
+        self.assertEqual(probes.read_text().splitlines(), [high, high])
+
+    def test_agy_recheck_honors_retry_after_even_if_the_cli_exits_zero(self):
+        model = "gemini-3.8-flash-medium"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "HTTP 429: Retry-After: 900" >&2\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 900)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 900)
+
     def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
         self.drop_brief("T042-fix-the-thing.md",
                         BRIEF.replace("Difficulty: medium", "Difficulty: medium\nModel: gpt-test-high"))
@@ -7012,6 +7090,15 @@ exit %d
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
         self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
+
+    def test_a_retry_after_header_uses_all_duration_digits(self):
+        before = int(time.time())
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="HTTP 429: Retry-After: 740")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retry_at = self.beat()["retry_at"]
+        self.assertGreaterEqual(retry_at, before + 740)
+        self.assertLessEqual(retry_at, int(time.time()) + 740)
 
     def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
         usage = self.loom / "state" / "usage"
