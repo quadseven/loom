@@ -8,7 +8,7 @@ Last checked against the code: 2026-12-29.
 
 - Live. The station, the lanes and the brain run as launchd agents on one operator-run macOS machine. The running copy is a plain clone of this repo.
 - Not paused on 2026-11-01: the station deployed the head of main that day, and the journal in issue 30 holds no pause. The code has no pause switch. A pause is the operator's word, carried out by booting out the launchd agents, so read the journal and the station log for the current state.
-- Shadow mode is on. For the 17 repos in `LOOM_SHADOW_REPOS`, Loom records merges and closes instead of taking them, except the narrow evidence close. This repo is not in that list, so Loom merges its own pull requests.
+- Shadow mode is on. For the 17 repos in `LOOM_SHADOW_REPOS`, Loom records merges and closes instead of taking them, except the evidence close. This repo is not in that list, so Loom merges its own pull requests.
 - Some lanes run on Kubernetes through `.github/workflows/lane.yml`. The operator's dashboard also runs on Kubernetes. Its address is not in this repo.
 - Unverified: a fresh install on a new machine, and the moved text in `docs/OVERVIEW.md` and `docs/ROLL_PINS.md`.
 
