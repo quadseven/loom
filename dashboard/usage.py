@@ -317,8 +317,12 @@ def _provider(name: str, rows: list[dict[str, Any]], holds: dict[str, str],
     lanes = _unique(lane for row in rows for lane in row.get("lanes") or [])
     windows = [read_window(row, now) for row in rows]
     kinds = {"serving": "free", "limited": "held", "parked": "down", "off": "down"}
-    states = {lane: {"kind": kinds[published[lane]["state"]], "why": published[lane]["reason"]}
-              if lane in published else lane_state(holds.get(lane, ""), now) for lane in lanes}
+    # A published row counts only when its state is one of the four above:
+    # any other word, or none, falls back to the lane's own hold reading.
+    states = {lane: {"kind": kinds[published[lane]["state"]],
+                     "why": str(published[lane].get("reason") or "")}
+              if published.get(lane, {}).get("state") in kinds
+              else lane_state(holds.get(lane, ""), now) for lane in lanes}
     status, rank = _status(lanes, [s["kind"] for s in states.values()], windows)
     read = [w["collected"] for w in windows if w["collected"]]
     return {"name": name, "lanes": lanes, "windows": windows, "status": status, "rank": rank,
