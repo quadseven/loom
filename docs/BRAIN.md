@@ -1147,8 +1147,13 @@ title carries a partial-review form such as `WARN Elder review low
 confidence`) is not sent back: a lane cannot fix it. The station leaves the
 ticket at `loom:pr` with no fix comment, no round counted and no
 `loom:ready`, and the factory asks the review bot to review the head again
-(`/grug improve`, once per head commit). Real failures beside it are sent
-back without it. The same request goes to any open lane pull request whose
+(`/grug improve`, once per head commit). When the re-run is degraded or
+partial too, the pull request stays held at `loom:pr` until the review
+check reruns on the head with a verdict: review is the review bot's alone
+(operator decision, 2026-11-16), so no lane reviews it and nothing stands
+in for the check, in the factory or in `bus.brain merge`. A person or brain
+can comment `/grug improve` again once the review route recovers. Real
+failures beside it are sent back without it. The same request goes to any open lane pull request whose
 review check failed degraded, whatever state its ticket is in or whatever else
 fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
 requests a factory pass; the log names each request against that bound and the

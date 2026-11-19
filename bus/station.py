@@ -728,9 +728,9 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
-# A Luna review verdict's findings (loom#2142): at most this many per list,
-# each finding's text collapsed and capped, so a lane's review.json can
-# never turn the verdict comment into a wall.
+# A sweep review's findings: at most this many per list, each finding's
+# text collapsed and capped, so a lane's review.json can never turn the
+# posted review into a wall.
 REVIEW_FINDINGS_MAX = 50
 REVIEW_FINDING_CHARS = 500
 # A shipped ticket whose Live box has seen no matching log line this many days
@@ -4513,35 +4513,6 @@ class Station:
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
 
-    def _write_review_brief(self, repo: str, pr_number: int, sha: str,
-                            issue: Dict[str, Any]) -> bool:
-        """The factory's Luna review writer (loom#2142): render the review
-        brief for the pull request's current head and hand it to the Luna
-        review slot. False when the pull request cannot be read or its head
-        has moved since the factory asked: no verdict may ever be posted
-        for a commit nobody asked about."""
-        try:
-            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
-        except GitHubError as err:
-            _say("could not read %s#%d for its Luna review brief: %s" % (repo, pr_number, err))
-            return False
-        head = pr.get("head") or {}
-        base = pr.get("base") or {}
-        if (str(head.get("sha") or "") != sha or not head.get("ref") or not base.get("ref")):
-            return False
-        stamp = int(self.now)
-        text = tickets.render_review_brief(
-            repo, issue, factory.LUNA_REVIEW_LANE, stamp, pr_number,
-            str(head["ref"]), str(base["ref"]), sha)
-        claiming = self._write_brief(
-            factory.LUNA_REVIEW_LANE,
-            tickets.review_name(repo, int(issue["number"]), stamp), text)
-        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
-        _say("handed %s#%d head %s to lane %s to review"
-             % (repo, pr_number, sha[:12], factory.LUNA_REVIEW_LANE))
-        return True
-
-    # -- the review sweep (bus/review_sweep.py) ---------------------------
     def sweep_reviews(self) -> None:
         """At most once per LOOM_REVIEW_SWEEP_EVERY seconds, hand each open
         pull request with no independent verdict on its head to a review
@@ -5175,73 +5146,56 @@ class Station:
             out.append(item)
         return out
 
-    @staticmethod
-    def _finding_line(finding: Dict[str, Any]) -> str:
-        where = ""
-        if "file" in finding:
-            where = "`%s`%s: " % (finding["file"],
-                                  " (line %d)" % finding["line"] if "line" in finding else "")
-        return where + finding["finding"]
-
     def _report_review(self, lane: str, kind: str, repo: str, number: int,
                        name: str, text: str) -> bool:
-        """Apply a finished Luna review run (loom#2142): post the lane's
-        review.json on the pull request as a verdict in the Elder's markings
-        shape, with its blocking findings as review threads when they name a
-        file and a line, so the factory's gate and fix rounds read them
-        exactly like the review bot's own. A failed run, an unreadable
-        result or a result in the wrong shape posts nothing: the factory
-        dispatches again after its retry window. A result also posts
-        nothing when it did not come from the review slot's own Luna run:
-        the gate trusts the posted verdict, so no other lane or model may
-        speak it.
-
-        Two kinds of review run report here. A sweep run (one the station's
+        """Apply a finished review run. Only a sweep run (one the station's
         review sweep dispatched, by its own record of the brief: never a
-        line of the brief's text, which carries a pull request body) is
-        posted by the lane's reviewer App as a formal review
+        line of the brief's text, which carries a pull request body) posts:
+        the lane's reviewer App posts it as a formal review
         (_post_sweep_review), and only from the lane the record names,
         running that lane's model (review_sweep.model_ok). Any other review
-        run is a degraded-Elder Luna run: posted as the station's Luna
-        verdict only from the Luna slot on gpt-6-luna. The pull request and
-        head come from the brief's header block only."""
+        run posts nothing: review is the review bot's alone (2026-11-16),
+        and the degraded-Elder Luna fallback that once posted such runs is
+        gone. A failed run, an unreadable result or a result in the wrong
+        shape posts nothing either. The pull request and head come from the
+        brief's header block only."""
         if kind == "failed":
             _say("review run %s on lane %s failed; %s#%d keeps waiting for "
                  "a verdict" % (name, lane, repo, number))
             return True
         header = text.split("\n## ", 1)[0]
         record = self._sweep_record(name)
-        if not self._review_run_trusted(lane, name, header, record):
+        if record is None:
+            self._say_unswept(name, header)
+            return True
+        if not self._review_run_trusted(lane, name, record):
             return True
         found = self._review_result(lane, name, header)
         if found is None:
             return True
         pr_number, sha, blocking, notes, summary = found
-        if record is not None:
-            if (record.get("sha"), record.get("number")) != (sha, pr_number):
-                _say("review run %s names %s#%d head %s, not what the sweep sent; "
-                     "nothing posted" % (name, repo, pr_number, sha[:12]))
-                return True
-            self._post_sweep_review(lane, repo, pr_number, sha, (blocking, notes, summary))
+        if (record.get("sha"), record.get("number")) != (sha, pr_number):
+            _say("review run %s names %s#%d head %s, not what the sweep sent; "
+                 "nothing posted" % (name, repo, pr_number, sha[:12]))
             return True
-        self._post_luna_verdict(lane, repo, pr_number, sha, blocking, notes, summary)
+        self._post_sweep_review(lane, repo, pr_number, sha, (blocking, notes, summary))
         return True
 
-    def _review_run_trusted(self, lane: str, name: str, header: str,
-                            record: Optional[Dict[str, Any]]) -> bool:
-        """Whether a review run may speak: a sweep run from the lane the
-        sweep sent it to, on that lane's model; any other run from the Luna
-        slot on gpt-6-luna. Says why not."""
-        model = self._review_model(lane, name)
-        if record is None and self._field(header, "Review-Mode") == "sweep":
+    def _say_unswept(self, name: str, header: str) -> None:
+        """Say why a review run the sweep has no record of posts nothing."""
+        if self._field(header, "Review-Mode") == "sweep":
             _say("review run %s is marked as a sweep review the sweep has no record "
                  "of; its verdict is not posted" % name)
-            return False
-        if record is not None:
-            trusted = (record.get("lane") == lane and lane in self.s.review_sweep.lanes
-                       and review_sweep_mod.model_ok(lane, model, self.s.review_sweep))
         else:
-            trusted = lane == factory.LUNA_REVIEW_LANE and model == factory.LUNA_MODEL
+            _say("review run %s was not dispatched by the review sweep; review is "
+                 "the review bot's alone, so nothing is posted" % name)
+
+    def _review_run_trusted(self, lane: str, name: str, record: Dict[str, Any]) -> bool:
+        """Whether a sweep run may speak: from the lane the sweep sent it
+        to, on that lane's model. Says why not."""
+        model = self._review_model(lane, name)
+        trusted = (record.get("lane") == lane and lane in self.s.review_sweep.lanes
+                   and review_sweep_mod.model_ok(lane, model, self.s.review_sweep))
         if not trusted:
             _say("review run %s on lane %s (model %s) is not from the lane and model "
                  "its brief went to; its verdict is not posted" % (name, lane, model or "none"))
@@ -5266,49 +5220,6 @@ class Station:
                  "nothing posted" % name)
             return None
         return int(pr_field), sha, blocking, notes, summary
-
-    def _post_luna_verdict(self, lane: str, repo: str, pr_number: int, sha: str,
-                           blocking: List[Dict[str, Any]], notes: List[Dict[str, Any]],
-                           summary: str) -> None:
-        """The degraded-Elder Luna verdict: a station comment in the Elder's
-        markings shape, read by the factory's gate for this head only."""
-        # Each anchored blocking finding becomes a review thread of its own
-        # (one pulls/comments post per finding), so the factory's fix rounds
-        # and rebuttal reads meet them exactly like the review bot's threads.
-        for finding in [f for f in blocking if "file" in f and "line" in f]:
-            if not notify.visible_text(finding.get("finding")):
-                _say("a Luna finding on %s#%d has no visible text; no review thread "
-                     "posted for it" % (repo, pr_number))
-                continue
-            try:
-                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
-                    "commit_id": sha, "path": finding["file"],
-                    "line": finding["line"], "side": "RIGHT",
-                    "body": finding["finding"]})
-            except GitHubError as err:
-                _say("could not post a Luna review thread on %s#%d (%s); the "
-                     "finding still lands in the verdict comment" % (repo, pr_number, err))
-        lines = [factory.LUNA_REVIEW_MARKER % sha,
-                 "Elder markings - %d blocking, %d total"
-                 % (len(blocking), len(blocking) + len(notes)),
-                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
-                 "",
-                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
-                 "through `codex exec`) while the Elder review route is degraded. "
-                 "The merge gate reads it for this head in the degraded check's "
-                 "place." % lane]
-        if blocking:
-            lines += ["", "Blocking findings:"] + \
-                     ["- " + self._finding_line(f) for f in blocking]
-        if notes:
-            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
-        try:
-            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
-        except GitHubError as err:
-            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
-            return
-        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
-             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
 
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
         """A verify run's answer that the merged change does not meet the
@@ -16521,8 +16432,7 @@ class Station:
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(),
-                               no_lane_since=self._no_lane_since(),
-                               review_brief=self._write_review_brief, **extra)
+                               no_lane_since=self._no_lane_since(), **extra)
 
     def _load_factory(self) -> factory.Factory:
         """The factory for the steps that count lane load (run and
