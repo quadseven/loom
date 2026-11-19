@@ -4758,7 +4758,26 @@ class Station:
                  % (repo, issue.get("number"), error))
         return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
 
-    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True
+    def _pulls_for_facts(self, repo: str, issue: Dict[str, Any],
+                         from_ticket: bool) -> List[Dict[str, Any]]:
+        numbers = evidence_close.ticket_pull_numbers(
+            self.gh, repo, issue, status.logins(self.gh, self.s.authors)) if from_ticket else []
+        if not numbers:
+            return [dict(pr) for pr in self._closed_pulls(repo) if _covers_pr(issue, repo, pr)]
+        linked = []
+        for number in numbers:
+            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data
+            if not isinstance(pr, dict) or not self._verify_link_fields(pr):
+                raise ValueError("unreadable linked pull request")
+            if _covers_pr(issue, repo, pr):
+                merged, complete = self._closed_page([pr])
+                if not merged or not complete:
+                    raise ValueError("linked pull request has no confirmed merge")
+                linked.extend(merged)
+        return linked
+
+    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True,
+                           from_ticket: bool = False
                            ) -> Tuple[str, List[Dict[str, Any]], str]:
         """(default branch, merged pull requests, error) for a ticket: its
         pull requests linked the way reconcile links them, newest first, the
@@ -4771,8 +4790,7 @@ class Station:
         read: List[Dict[str, Any]] = []
         try:
             branch = self._default_branch(repo)
-            linked = sorted((dict(pr) for pr in self._closed_pulls(repo)
-                             if _covers_pr(issue, repo, pr)),
+            linked = sorted(self._pulls_for_facts(repo, issue, from_ticket),
                             key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
             # Only the pull requests the section shows are read in full.
             for pr in linked[:verify_data.MAX_PULLS]:
@@ -12327,7 +12345,7 @@ class Station:
             return evidence_close.WAIT
         run.left[1] -= 1
         run.counts["read"] += 1
-        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        branch, pulls, error = self._merged_pull_facts(repo, issue, from_ticket=True)
         verdict, why = evidence_close.pulls_verdict(pulls, error)
         if verdict == evidence_close.WAIT:
             return verdict
@@ -12337,7 +12355,7 @@ class Station:
             evidence_close.note_refused(state, ticket, why, self.now)
             _say("evidence close: not closing %s: %s" % (ticket, why))
             return evidence_close.OTHER
-        return self._close_unproven(repo, issue, boxes)
+        return self._close_unproven(repo, issue, boxes, verify_data.close_facts(branch, pulls))
 
     def _live_has_own_proof(self, repo: str, issue: Dict[str, Any],
                             boxes: Sequence[str]) -> bool:
@@ -12380,7 +12398,8 @@ class Station:
             "%s#%d" % (repo, int(issue["number"]))), unmeetable.key(live))
         return "" if known is False else "its Live box could not be looked up"
 
-    def _close_unproven(self, repo: str, issue: Dict[str, Any], boxes: Sequence[str]) -> str:
+    def _close_unproven(self, repo: str, issue: Dict[str, Any], boxes: Sequence[str],
+                        facts: str) -> str:
         """List each unproven Live box in the repo's Proof due issue, then
         close the ticket. Nothing closes unlisted."""
         number = int(issue["number"])
@@ -12396,7 +12415,7 @@ class Station:
                  "what they changed is still on the default branch. Each unproven Live box " \
                  "is listed in #%d" % where
         with shadow.evidence_close(repo, number):
-            landed = self._close_done_ticket(repo, issue, reason, unproven=True)
+            landed = self._close_done_ticket(repo, issue, reason, evidence_facts=facts)
         if not landed and (self._issue_state(repo, number) or ("",))[0] != "closed":
             return evidence_close.WAIT
         evidence_close.record(self._evidence_state, repo, number, boxes, self.now)
@@ -12804,12 +12823,13 @@ class Station:
              % (repo, number, len(criteria)))
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
-                           reason: str, unproven: bool = False) -> bool:
+                           reason: str, evidence_facts: Optional[str] = None) -> bool:
         """Close one done ticket with `reason`; True when the close writes
-        landed, False when GitHub refused and the run moves on. `unproven` is
-        the evidence close, which carries its label and is not held in shadow
+        landed, False when GitHub refused and the run moves on. The evidence
+        close supplies its checked facts, carries its label and passes shadow
         (bus/shadow.py evidence_close)."""
         number = int(issue["number"])
+        unproven = evidence_facts is not None
         marks = [CLOSE_DONE_LABEL] + ([evidence_close.LABEL] if unproven else [])
         if shadow.active(repo) and not unproven:
             # Before the status note and the force-close label.
@@ -12818,9 +12838,11 @@ class Station:
             if held["new"]:
                 _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
             return False
-        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-        if error:
-            _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+        if evidence_facts is None:
+            branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+            if error:
+                _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+            evidence_facts = verify_data.close_facts(branch, pulls, error)
         try:
             # force-close is the close-completeness guard's escape hatch:
             # this close is by rule, not a claim that each box was seen to
@@ -12830,7 +12852,7 @@ class Station:
                          {"labels": marks})
             closing.close(self.gh, repo, number,
                           "Closed: %s. %s Not verified live; its criteria were not ticked "
-                          "one by one." % (reason, verify_data.close_facts(branch, pulls, error)),
+                          "one by one." % (reason, evidence_facts),
                           "completed")
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),

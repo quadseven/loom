@@ -2530,6 +2530,13 @@ all of these hold:
   (`bus/unmeetable.py` reads that one line; a live box beside it is not
   looked up).
 
+For each ticket within the read budget, the station reads its timeline once.
+It takes same-repo pull request numbers from cross-references, connected events
+and the lane's opening notice in the ticket's status comment or body. It reads
+those pull requests directly and checks that they cover the ticket. If the
+ticket names none, it searches the newest 500 closed pull requests. An
+incomplete timeline holds the evidence close for that ticket.
+
 A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
 refused ticket goes to the usual done close and is read again after 6 hours.
 Checks still running leave the ticket for a later pass with no ask.

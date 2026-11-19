@@ -91,6 +91,49 @@ class Case(tbs.Base):
 
 
 class Closes(Case):
+    def test_timeline_finds_pull_older_than_the_newest_500(self):
+        self.ticket(1)
+        self.fake.pulls[:0] = [{"number": n, "state": "closed", "merged_at": None}
+                               for n in range(2000, 2500)]
+        self.fake.ticket_links[1] = [{"__typename": "CrossReferencedEvent", "source": {
+            "__typename": "PullRequest", "number": 101, "repository": {"nameWithOwner": REPO}}}]
+        self.close_pass()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertIn(LABEL, self.fake.names(1))
+        self.assertEqual(self.fake.timeline_reads, [1])
+        self.assertFalse(any("/pulls?state=closed" in p for p in self.fake.paths("GET")))
+        self.assertIn("#101", " ".join(c["body"] for c in self.fake.comments[1]))
+
+    def test_empty_timeline_uses_the_closed_pull_window(self):
+        self.ticket(1)
+        self.close_pass()
+        self.assertEqual(self.fake.timeline_reads, [1])
+        self.assertTrue(any("/pulls?state=closed" in p for p in self.fake.paths("GET")))
+        self.assertIn(LABEL, self.fake.names(1))
+
+    def test_connected_and_lane_status_pulls_survive_the_window(self):
+        for n in (1, 2, 3):
+            self.ticket(n)
+        self.fake.pulls[:0] = [{"number": n, "state": "closed", "merged_at": None}
+                               for n in range(2000, 2500)]
+        self.fake.ticket_links[1] = [{"__typename": "ConnectedEvent", "source": {
+            "__typename": "Issue"}, "subject": {"__typename": "PullRequest", "number": 101,
+                                                "repository": {"nameWithOwner": REPO}}}]
+        for n in (2, 3):
+            event = ("2030-01-02T00:00:00Z",
+                     "Lane codex opened a pull request: https://github.com/%s/pull/%d"
+                     % (REPO, 100 + n))
+            issue = self.fake.issues[n]
+            if n == 2:
+                issue["body"] = status.with_body_events(BODY, [event])
+            else:
+                self.fake.ticket_links[n] = [{"__typename": "IssueComment", "author": {
+                    "__typename": "User", "login": issue["user"]["login"]},
+                    "body": status.render([event])}]
+        self.close_pass()
+        for n in (1, 2, 3):
+            self.assertIn(LABEL, self.fake.names(n))
+
     def test_a_qualifying_ticket_closes_with_the_label_and_the_guard_hatch(self):
         self.ticket(1)
         self.close_pass()
@@ -391,6 +434,8 @@ class Guardrail(Case):
         said = self.close_pass()
         [line] = [s for s in said if "at most" in s]
         self.assertIn("0 closed, 20 read, 2 waiting", line)
+        self.assertEqual(len(self.fake.timeline_reads), 20)
+        self.assertEqual(len(set(self.fake.timeline_reads)), 20)
 
     def test_the_day_is_bounded(self):
         now = time.time()

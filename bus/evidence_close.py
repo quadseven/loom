@@ -59,11 +59,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from . import claimed, criteria_gate, labels, merge_effect, merge_tier, proof, verify_data
+from . import claimed, criteria_gate, labels, merge_effect, merge_tier, proof, status, verify_data
+from .github import GitHub, rest_login
 
 LABEL = "closed-unproven"
 PROOF_LABEL = "loom:proof-due"
@@ -101,6 +103,62 @@ TIERS = (merge_tier.DOCS_TESTS, merge_tier.APP_CODE)
 
 # What the station does with a ticket after reading it.
 CLOSED, WAIT, OTHER = "closed", "wait", "other"
+
+TICKET_LINKS = """
+query TicketPulls($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT, CONNECTED_EVENT, ISSUE_COMMENT]) {
+        pageInfo { hasNextPage }
+        nodes {
+          __typename
+          ... on CrossReferencedEvent { source { ...pull } }
+          ... on ConnectedEvent { source { ...pull } subject { ...pull } }
+          ... on IssueComment { author { login __typename } body }
+        }
+      }
+    }
+  }
+}
+fragment pull on PullRequest { __typename number repository { nameWithOwner } }
+"""
+
+
+def ticket_pull_numbers(gh: GitHub, repo: str, issue: Mapping[str, Any],
+                        authors: Iterable[str]) -> List[int]:
+    """Same-repo PR candidates from one timeline read and the ticket's status."""
+    owner, name = repo.split("/")
+    data = gh.graphql(TICKET_LINKS, {"owner": owner, "name": name, "number": issue["number"]})
+    try:
+        page = data["repository"]["issue"]["timelineItems"]
+        nodes = page["nodes"]
+        if page["pageInfo"]["hasNextPage"] is not False or not isinstance(nodes, list):
+            raise ValueError("incomplete ticket timeline")
+    except (KeyError, TypeError) as err:
+        raise ValueError("missing ticket timeline") from err
+
+    allowed = {a.lower() for a in authors}
+    events = status.body_events(issue.get("body")) if status._ours(issue, allowed) else []
+    numbers = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            raise ValueError("unreadable timeline event")
+        for ref in (node.get("source") or {}, node.get("subject") or {}):
+            if (ref.get("__typename") == "PullRequest"
+                    and ref["repository"]["nameWithOwner"].lower() == repo.lower()):
+                numbers.add(ref["number"])
+        if (node.get("__typename") == "IssueComment" and status.is_status(node.get("body"))
+                and rest_login(node.get("author")).lower() in allowed):
+            events.extend(status.parse(node["body"]))
+    opened = re.compile(r"Lane \S+ opened a pull request: https://github\.com/%s/pull/(\d+)"
+                        % re.escape(repo), re.I)
+    for _, event in events:
+        match = opened.fullmatch(event)
+        if match:
+            numbers.add(int(match.group(1)))
+    if len(numbers) > verify_data.MAX_PULLS:
+        raise ValueError("too many linked pull requests")
+    return sorted(numbers)
 
 
 class Pass(NamedTuple):
