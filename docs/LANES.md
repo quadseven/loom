@@ -24,9 +24,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
   moves it as for a lane at a limit (a ladder ticket waits on its rung).
-- Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
-  whose CLI or key is missing reports `available: false` and leaves its briefs
-  alone; the dispatcher routes only to fresh, available lanes.
+- Each pass writes `state/usage/<lane>.json` with the lane state, runner
+  readiness, and time. A lane whose CLI or key is missing reports unavailable
+  and leaves its briefs alone. The station routes only to serving lanes.
 
 ## How a lane is told to work
 
@@ -643,17 +643,19 @@ The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
 
-Lane status: every pass the station reads each lane's heartbeat (`yes` when
-available and at most 600 seconds older than the pass's start, else `no`; a
-beat written while the pass runs counts, one stamped more than a minute
-ahead of the clock does not) and keeps one comment on the
+Lane status: every pass the station reads each lane's heartbeat and evaluates
+whether it is serving, limited, parked, or off. Local heartbeats are usable
+for 600 seconds. A beat written while the pass runs counts, with a minute
+of tolerance for clock skew. The station keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and when
+when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-It never publishes the heartbeat's reason. `bus.brain status` prints the
-table's age beside `Updated` and calls it stale past the same age. With anthropic
+The table uses fixed reason text so raw runner details stay local. The
+launchd station removes stale heartbeat files for slots with no loaded job.
+Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
+prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
