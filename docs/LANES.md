@@ -55,9 +55,11 @@ lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
 `/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
-machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
-and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
-script's path when using another checkout. A scanner that is still missing
+machine clones `LOOM_INFRA_PUBLIC_REPO` into `$LOOM_HOME/infra-public` when
+first needed and fast-forwards it at most hourly. With that setting unset,
+the lane uses the existing local scanner at the default path or the path
+specified by `LOOM_LEAK_SCANNER`. The cluster workflow provides its pinned
+public scanner checkout through `LOOM_LEAK_SCANNER`. A scanner that is missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
 another reason parks the brief `[transient]`. A hit parks the brief with
@@ -612,7 +614,13 @@ rung. With no such lane it goes back to `loom:queued` with no lane label
 it stops holding its lane and any free lane can take it from the queue. A
 ticket whose brief sits in a lane inbox is never settled this way.
 
-It skips future `Not before:` times and tickets without a readable Difficulty.
+A pending fix round on a demoted or occupied lane keeps its brief for two
+hours from the later of the fix request and the lane assignment. It then
+takes a free lane on its rung, or a free lane on the next rung. If neither
+move is possible, it stays briefed and records one counted wait and one
+status event with its age.
+
+The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
@@ -1659,8 +1667,9 @@ Each invariant is one function returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done (one issue per lane:
   the station reads these to release a runaway a dead lane held).
-- Lanes whose newest 5 runs all failed after a success earlier in the day,
-  limits, expired keys and factory incidents aside.
+- Lanes whose newest 5 runs all failed after a success earlier in the day.
+  Both lane checks exclude limits, expired keys, factory incidents and
+  briefs parked before the agent ran, including runner base stops.
 - Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
@@ -2474,6 +2483,12 @@ What changes in a pod:
   pass because everything fails. Anything else holds the lane unavailable,
   with the reason in its heartbeat, so a policy the cluster network does not
   enforce holds the lane too.
+  While the agent runs, the runner repeats the probes every
+  `LOOM_EGRESS_RECHECK_SECONDS` seconds (default 60). If a deny probe
+  connects, the runner stops the agent, records the address in the sealed
+  lane log, and parks the brief as an `egress-opened` factory incident
+  without pushing. A failed allow probe is logged once per run and the
+  agent keeps running.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.

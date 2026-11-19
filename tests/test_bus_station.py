@@ -274,6 +274,8 @@ class FakeGitHub:
             return reply(200, self.factory_incidents)
         if method == "GET" and parts.path == "/search/code":
             return self._code_search(parts.query)
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/actions/runs", parts.path):
+            return reply(200, {"total_count": 0, "workflow_runs": []})
         rest = re.match(r"/repos/%s/(.*)" % REPO, parts.path).group(1)
         if method == "GET" and rest == "labels":
             return reply(200, [{"name": name, "color": value["color"],
@@ -465,6 +467,9 @@ class FakeGitHub:
         if "labels=loom%3Aticket" in query or "labels=loom:ticket&" in query:
             return reply(200, [i for i in self.issues.values() if i["state"] == "open"
                                and "loom:ticket" in self.names(i["number"])])
+        if "labels=loom:triage&" in query:
+            return reply(200, [i for i in self.issues.values() if i["state"] == "open"
+                               and "loom:triage" in self.names(i["number"])])
         if "needs-operator" in query:
             return self._list_asks(headers, "needs-operator")
         if "needs:human" in query or "needs:quadseven" in query:
@@ -3770,7 +3775,13 @@ class LadderReviewFake(ReviewFake):
             self.issue["body"] = data["body"]
             self.writes.append(("PATCH", path, data))
             return mock.Mock(data=self.issue)
+        if method == "POST" and path == "/repos/%s/issues/12/labels" % REPO:
+            names = [label["name"] for label in self.issue["labels"]]
+            data = {"labels": list(dict.fromkeys(names + data["labels"]))}
         return super().rest(method, path, data)
+
+    def paginate(self, path):
+        return status.expand(super().paginate(path), AUTHORS)
 
 
 READY = station.READY_TEXT
@@ -4317,6 +4328,32 @@ class StuckFixRoundTest(unittest.TestCase):
         self.run_hand_back(threads=[self.thread("PRRT_new", 59, "unvalidated-external-input")])
         self.assertIn("lane:claude", self.names())
         self.assertNotIn("lane:spark", self.names())
+
+    def test_hand_back_holds_the_second_review_failed_rung_for_a_split(self):
+        self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
+                        "    high | _security_ | `resource-leak` | quick win")
+        threads = [self.thread("PRRT_new", 59, "resource-leak")]
+        for lane in ("spark", "claude"):
+            self.gh.comments.append({
+                "user": self.gh.comments[0]["user"],
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.station.now - 1)),
+                "body": "Claimed for lane %s (body sha256 0123456789ab)" % lane,
+            })
+            self.run_hand_back(threads=threads)
+            if lane == "spark":
+                self.assertIn("loom:briefed", self.names())
+                self.assertIn("lane:claude", self.names())
+                self.gh.issue["labels"] = [
+                    {"name": "loom:pr"} if label["name"] == "loom:briefed" else label
+                    for label in self.gh.issue["labels"]
+                ]
+                self.station.now += 120
+        self.run_hand_back(checks=[("unittest", "failed")])
+        self.assertIn("needs-brain", self.names())
+        self.assertIn("loom:pr", self.names())
+        self.assertIn("lane:claude", self.names())
+        self.assertEqual(len(self.rounds()), 2)
+        self.assertEqual(sum("Split this ticket" in c["body"] for c in self.gh.comments), 1)
 
     def test_a_new_finding_is_progress_and_stays_on_its_lane(self):
         self.last_round("### Thread PRRT_old (comment 5) at web/staged.js:54\n\n"
@@ -5109,7 +5146,8 @@ class CorruptStateTest(Base):
         # ready-for-agent issues (loom#3092).
         # The last-pass shipped wait stamp adds one canonical all-repo read,
         # and the ended-run sweep one read of the running tickets (loom#3134).
-        self.assertEqual(self.run_pass().requests, 22)
+        # The invariant pass also reads the completed scheduled workflow runs.
+        self.assertEqual(self.run_pass().requests, 23)
 
 
 class TicketsTest(unittest.TestCase):
@@ -7434,7 +7472,7 @@ class SilentLaneTest(Base):
         self.assertEqual([w.ticket.label for w in st._invariant_waits()],
                          [st._invariant_ref(REPO, 13).label])
 
-    def test_a_silent_move_is_recorded_when_the_factory_step_carries_over(self):
+    def test_silent_moves_and_waits_are_recorded_when_the_factory_step_carries_over(self):
         # loom#2094: on 2026-11-07 the factory moved twelve running tickets
         # off silent lanes, and every one of those passes carried the step
         # over at the request target. The moves were made on GitHub, but the
@@ -7447,7 +7485,8 @@ class SilentLaneTest(Base):
         class Runner:
             silent_running = {"codex": [(REPO, 12)]}
             silent = {"codex": 1860.0}
-            waits: dict = {}
+            waits = {"%s#13" % REPO:
+                     "parked fix round on lane codex: no free lane on its rung or the next"}
             settled: tuple = ()
 
             def run(self):
@@ -7460,6 +7499,8 @@ class SilentLaneTest(Base):
         self.assertEqual((run.lane, run.silent_for), ("codex", 1860.0))
         self.assertEqual(os.listdir(self.inbox("codex", "returned")),
                          ["example-owner.example-repo-12.md"])
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 13))
 
     def test_nothing_found_records_nothing(self):
         st = self.station()
@@ -7487,6 +7528,84 @@ class SilentLaneTest(Base):
     def test_returning_silent_briefs_tolerates_a_missing_inbox(self):
         st = self.station()
         st._return_silent_briefs({"codex": [(REPO, 12)]})  # no inbox dir: no crash
+
+
+class ParkedFixRoundTest(Base):
+    def park(self, age, lane="codex", model="gpt-6-luna"):
+        now = time.time()
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - age))
+        events = [dict(labeled(label, AUTHORS[0]), created_at=at)
+                  for label in ("loom:briefed", "lane:" + lane)]
+        body = "Difficulty: hard\n\n## Why\nBecause.\n\n## What\nDo it.\n"
+        if model:
+            body = "Model: %s\n" % model + body
+        self.fake.add(12, lane=lane, body=body, events=events)
+        self.fake.comments[12].append({"id": 3, "body": FIX_BODY, "created_at": at,
+                                       "updated_at": at, "user": {"login": AUTHORS[0]}})
+        self.fake.pulls.append({"number": 99, "state": "open", "base": {"ref": "main"},
+                                "head": {"ref": "loom/12-fix-the-thing"}})
+        return now
+
+    def factory_pass(self, now, demoted=()):
+        self.settings.factory_on = True
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        os.makedirs(st.state, exist_ok=True)
+        with mock.patch.object(st, "demoted_lanes", return_value=dict.fromkeys(demoted, "scorecard")):
+            st.run_factory()
+        return st
+
+    def test_an_old_fix_on_a_demoted_lane_moves_to_a_free_lane_of_its_rung(self):
+        self.heartbeat("codex-2")
+        self.heartbeat("claude")
+        now = self.park(3 * 3600, model=None)
+        with mock.patch.dict(os.environ, {"LOOM_CODEX_MODEL": "gpt-6-luna"}):
+            self.factory_pass(now, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex-2"])
+        self.assertIn("Model: gpt-6-luna\n", self.fake.issues[12]["body"])
+        self.assertEqual(self.fake.comments[12][0]["body"], FIX_BODY)
+
+    def test_an_old_fix_on_a_full_lane_moves_up_one_rung(self):
+        self.heartbeat("claude")
+        now = self.park(3 * 3600)
+        self.fake.add(13, state="running")
+        self.factory_pass(now)
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:claude"])
+        self.assertIn("Model: claude-opus-5-5\n", self.fake.issues[12]["body"])
+        self.assertEqual(self.fake.comments[12][0]["body"], FIX_BODY)
+        notes = status.expand(self.fake.comments[12], AUTHORS)
+        self.assertTrue(any("<!-- loom:rung 3 -->" in row["body"] for row in notes))
+
+    def test_no_free_lane_records_one_wait_with_age_across_passes(self):
+        self.heartbeat("claude")
+        now = self.park(3 * 3600)
+        self.fake.add(13, lane="claude", state="running")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.factory_pass(now, demoted=("codex",))
+            st = self.factory_pass(now + factory.FACTORY_CHECK, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex"])
+        self.assertEqual(output.getvalue().count("Fix round parked for 3 hours"), 1)
+        notes = status.expand(self.fake.comments[12], AUTHORS)
+        self.assertEqual(sum("Fix round parked for 3 hours" in row["body"] for row in notes), 1)
+        (wait,) = st._invariant_waits()
+        self.assertEqual(wait.ticket, st._invariant_ref(REPO, 12))
+        self.assertEqual(wait.since, now)
+        self.assertIn("no free lane", wait.reason)
+
+        self.fake.issues[13]["state"] = "closed"
+        self.heartbeat("claude", age=-2 * factory.FACTORY_CHECK)
+        st = self.factory_pass(now + 2 * factory.FACTORY_CHECK, demoted=("codex",))
+        self.assertIn("lane:claude", self.fake.names(12))
+        self.assertEqual(st._invariant_waits(), [])
+
+    def test_a_new_fix_round_on_an_old_brief_stays_put(self):
+        self.heartbeat("codex-2")
+        now = self.park(3 * 3600)
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+        self.fake.comments[12][0].update(created_at=at, updated_at=at)
+        st = self.factory_pass(now, demoted=("codex",))
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:briefed", "lane:codex"])
+        self.assertEqual(st._invariant_waits(), [])
 
 
 class DeadLaneRunawayTest(Base):
@@ -7770,6 +7889,17 @@ class FactoryIncidentTest(Base):
     def test_factory_is_a_failure_class_not_work(self):
         self.assertEqual(station.failure_class("[factory] setup failed: x"), "factory")
         self.assertEqual(station.failure_class("[work] agent made no commit"), "work")
+
+    def test_egress_opened_holds_the_ticket_for_its_factory_incident(self):
+        self.heartbeat("muse")
+        self.fake.issues[99] = {"number": 99, "state": "open", "labels": [{"name": "loom:factory"}],
+                                "body": "<!-- loom:factory-incident v1 -->\n\nKind: egress-opened\n"}
+        self.failed(reason="[egress-opened] egress probe connected; nothing pushed; "
+                           "factory incident %s#99" % REPO)
+        self.run_pass()
+        self.assertEqual(set(self.fake.names(12)),
+                         {"loom:ticket", "lane:muse", "loom:running", "wait:incident"})
+        self.assertTrue(any("when the factory incident closes" in b for b in self.bodies()))
 
     def test_a_factory_failure_holds_the_ticket_and_keeps_its_rung(self):
         self.heartbeat("muse")
@@ -11004,9 +11134,13 @@ class ReportDigestTest(Base):
              "labels": [{"name": "loom:ticket"}, {"name": "loom:merged"}]},
             {"number": 45, "title": "Queued one", "state": "open",
              "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
+        self.fake.add_open_issue(46, title="Old input", created=time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.base - 8 * 24 * 3600)))
+        self.fake.issues[46]["labels"] = [{"name": "loom:triage"}]
         self.at(10, 1)
         text = self.sent[0]["content"]
-        self.assertIn("Backlogs, 1:\n- **Goal forty-three** 1 merged, 1 queued", text)
+        self.assertIn("Backlogs, 1:\n- **Goal forty-three** 1 merged, 1 queued, 1 in triage", text)
+        self.assertIn("1 triage item older than 7 days (oldest #46 Old input)", text)
         self.assertIn("Quiet: 1 goal, nothing moved.", text)
         self.assertEqual([c for c in self.fake.comments[43]
                           if str(c.get("body", "")).startswith(station.REPORT_MARKER)], [])
@@ -11603,6 +11737,24 @@ class ReportsTest(Base):
         self.standup_fresh()
         self.assertEqual(len(self.fake.comments[40]), 1)
         self.assertEqual(self.fake.edits, [])
+
+    def test_standup_counts_triage_and_person_waits_and_names_the_oldest_triage_issue(self):
+        day = 24 * 3600
+        issues = [
+            (41, "New input", 2, ["loom:triage"]),
+            (42, "Older input", 8, ["loom:triage"]),
+            (43, "Oldest input", 9, ["loom:triage"]),
+            (44, "Needs a ruling", 10, ["loom:triage", "needs:release-owner"]),
+        ]
+        self._overdue_goal_with([
+            {"number": number, "title": title, "state": "open", "created_at": self.ago(days * day),
+             "labels": [{"name": name} for name in names]}
+            for number, title, days, names in issues])
+        self.standup_fresh()
+        body = self.fake.comments[40][-1]["body"]
+        self.assertIn("3 in triage, 1 waiting on a person", body)
+        self.assertIn("2 triage items older than 7 days (oldest #43 Oldest input)", body)
+        self.assertIn("Triage waiting on a person: #44 Needs a ruling.", body)
 
     def test_a_goal_that_moved_edits_the_stations_standup_in_place(self):
         # loom#2898: one status comment per goal; a later move edits it.

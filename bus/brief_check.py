@@ -50,10 +50,9 @@ Before the station hands a ticket to a lane (`check`), it reads:
   goes back the same way a health ticket does. An answer ticket opens no
   pull request and is exempt, as at the runner.
 - split: a brief whose What or acceptance criteria name more than one
-  platform gets no lane (`split_verdict`): it is more than one ticket,
-  and lanes spent a whole model ladder on one such brief before a person
-  split it by hand. Splitting it into one slice per platform, with
-  After: lines between the slices, is the brain's intake work, so the
+  platform, or whose estimated diff exceeds 800 lines, gets no lane
+  (`split_verdict`). Splitting the work into smaller tickets, with After:
+  lines between dependent slices, is the brain's intake work, so the
   ticket goes back the same way a health ticket does.
 
 A read that fails holds the ticket for the next pass: a gate that cannot
@@ -279,6 +278,11 @@ PLATFORM_PATTERNS = (
 
 # `Split: no` lifts the hold only with a reason on the same line.
 SPLIT_NO_RE = re.compile(r"^[ \t]*Split:[ \t]*no\b[ \t:,.(-]*[^\s:,.(-]", re.I | re.M)
+DIFF_ESTIMATE_RE = re.compile(
+    r"^[ \t]*Estimated diff:[ \t]*~?[ \t]*"
+    r"([0-9]{1,3}(?:,[0-9]{3}){1,2}|[0-9]{1,9})[ \t]+lines?\b",
+    re.I | re.M)
+SPLIT_DIFF_LIMIT = 800
 
 
 def platforms_named(body: str) -> List[str]:
@@ -293,27 +297,23 @@ def platforms_named(body: str) -> List[str]:
 
 
 def split_verdict(body: str) -> Optional[Verdict]:
-    """Why a brief naming more than one platform gets no lane, or None: it
-    is refused at queue time with a split request, and the brain files one
-    slice per platform with After: lines between them. Splitting is the
-    brain's intake work, so the ticket goes back the same way a health
-    ticket does. Reads nothing."""
-    found = platforms_named(body)
-    if len(found) < 2:
-        return None
-    if SPLIT_NO_RE.search(brief_text(body or "")):
-        return None    # the author says why this is one ticket
-    stamp = hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
+    """Give the brain a split request for a multi-platform or oversized brief."""
+    text = brief_text(body)
+    estimated = DIFF_ESTIMATE_RE.search(text)
+    lines = int(estimated[1].replace(",", "")) if estimated else 0
+    if lines > SPLIT_DIFF_LIMIT:
+        reason = "has an estimated diff of %d lines (limit %d)" % (lines, SPLIT_DIFF_LIMIT)
+        slices = "smaller tickets"
+    else:
+        found = platforms_named(body)
+        if len(found) < 2 or SPLIT_NO_RE.search(text):
+            return None
+        reason = "spans more than one platform (%s)" % ", ".join(found)
+        slices = "one ticket per platform"
+    stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     return Verdict(SPLIT, "split-" + stamp,
-                   "its What or acceptance criteria name more than one platform "
-                   "(%s): split it into one slice per platform, with After: lines "
-                   "between the slices, before it can be queued" % ", ".join(found))
-
-
-def split_hold(issue: Mapping[str, Any]) -> bool:
-    """Whether the factory gives the queued ticket no lane: a brief that
-    spans more than one platform. Reads nothing."""
-    return split_verdict(str(issue.get("body") or "")) is not None
+                   "%s: split it into %s with After: lines between dependent slices "
+                   "before it can be queued" % (reason, slices))
 
 
 # -- area ---------------------------------------------------------------------

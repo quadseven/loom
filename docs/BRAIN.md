@@ -654,13 +654,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
-leaves it alone from then on; the brain decides whether it becomes a ticket
-or `needs:human`. The proposed ask is no comment to a person: it is one
-routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
-which the factory's hold notes quote as the reason for the hold and the
-prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
-person-only, and every `needs:human` reaches the operator's digest.
+work, the issue keeps `loom:triage`, gains `needs-brain`, and records the
+proposed ask as a status event (`<!-- loom:rewrite-ask -->`). The brain can
+rule on it before the station escalates the hold. Issues with a
+`needs:<login>` label wait on that person and are skipped by the rewriter.
+The standup and dashboard count those issues as waiting on a person. The
+standup also counts triage issues older than seven days and names the oldest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
 `lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`
@@ -1156,6 +1155,11 @@ fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
 requests a factory pass; the log names each request against that bound and the
 pull request that waits for the next pass.
 
+When review findings survive a fix round on two different model rungs, the
+factory leaves the pull request open, marks its ticket `needs-brain`, and
+asks the brain to split it into tickets with `After:` dependencies. Usage
+limits keep their usual routing.
+
 A review check that failed only on a split request is not sent back either.
 When its summary carries a `Reviewability` note of kind `cross-cohort-proof`,
 `plan-truncated` or `cross-cohort-module` (each asks the author to split the
@@ -1611,11 +1615,11 @@ reasons stay in the local viewer.
 
 ## Asks
 
-One label asks a person: `needs:human` (loom#2278). `needs-operator`,
-`needs:quadseven` and `loom:human` are old names of it: every reader treats
-them as `needs:human`, and the label pass (`bus/label_pass.py`) moves one to
-`needs:human` only when it writes to that ticket anyway. No pass relabels on
-its own, and none posts a comment.
+The label `needs:human` asks a person. The built-in aliases are
+`needs-operator` and `loom:human`. Set `LOOM_LEGACY_HUMAN_LABELS` on the
+station, brain and dashboard to recognize any deployment-specific aliases
+on existing tickets. The label pass (`bus/label_pass.py`) moves an alias
+to `needs:human` only when it writes to that ticket anyway.
 
 The label comes off when the answer is in the ticket (`bus/ask_state.py`): a
 comment after the ask by an operator or trusted person that is not a
@@ -1702,14 +1706,15 @@ Order (#35): read lane status; gather events since the last journal entry
 (every diff, green checks and the review bot, every thread answered); merge
 only `loom:ready` pull requests, after confirming the verdict matches the
 current head and checks are green;
-verify shipped work live and close only then; pick the next problems by
-impact and brief lanes up to capacity, at most `LOOM_GOAL_CAP` (default 16)
-tickets in flight per goal (queued, briefed, running, pr or failed; merged
-and shipped tickets hold no slot, nor does a ticket in the hand-off pool
-unless it is at pr), except one regression slot (see
-Regression slot);
-write the journal; report when due; release the lock. No retry loops: a
-failed step is journalled and left for the next tick.
+verify shipped work live and close only then. Pick the next problems by
+impact and brief lanes up to `LOOM_GOAL_CAP` (default 16) tickets in flight
+per goal. Running tickets and tickets at a pull request
+hold slots, as do queued or briefed tickets eligible for a lane. Factory
+repairs and health findings share two extra slots above the cap. Held repairs
+and health findings still use room in that reserve. Measured regressions
+have their own slot (see Regression slot). Write the journal, report when
+due, and release the lock. A failed step goes in the journal and waits for
+the next tick.
 
 ## Tickets no lane takes
 
@@ -1717,7 +1722,7 @@ A ticket the factory leaves waiting because no lane takes it (no free lane
 takes its model, no free lane in its tier, or on a lane at a limit with no
 free lane in its rung or tier; a briefed ticket stalled with no other lane of
 its rung or tier goes back to the queue instead, docs/LANES.md)
-holds its goal's in-flight cap without moving. On 2026-10-25, 89 tickets
+does not hold a slot under its goal's in-flight cap. On 2026-10-25, 89 tickets
 waited so, some for two days, and a goal at its cap had every triage rewrite
 skipped (loom#1831). The station keeps when each such ticket first waited
 (`no_lane_since` in `state/station/ticket-waits.json`, kept across its
@@ -1756,9 +1761,10 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   and adds one event to its status comment. With no lane free it is left as
   it is, with no wait or note. On 2026-11-06, 120 unclaimed pool tickets
   waited while lanes of their tiers sat idle.
-- The rewrite skip line names how many of a goal's in-flight tickets wait with
-  no lane, and says `goal stuck at its cap for N hours` past 6 hours; the
-  station sends the stuck goals to the dashboard (`POST /api/goal-caps`),
+- A rewrite held by the cap records `rewrite_held`. The skip line shows the
+  cap count and how many tickets wait with no lane, and says
+  `goal stuck at its cap for N hours` past 6 hours. The station sends the
+  stuck goals to the dashboard (`POST /api/goal-caps`),
   whose Needs-you page lists each with that count.
 
 ## needs-brain holds nothing answers
@@ -1780,6 +1786,10 @@ factory's `brain_holds`) resolves a hold older than 24 hours that Loom set:
   running, pr or failed to `loom:failed`, out of the goal's in-flight count.
   Either way one event on the status comment, edited in place, names who held
   it, for how long and why (the note beside the label event, else its state).
+- A triage issue that has waited 24 hours goes to `needs:human` and loses
+  `loom:triage` and `needs-brain`. The station posts the recorded ask once.
+  When the hold has no recorded ask, it asks the operator to decide how to
+  triage the issue. An existing person hold is left in place.
 - At most 5 a run, oldest first, and a run at most every 30 minutes, stamped
   however it ends. The run sends each repo's count of holds older than a day
   that it left (`POST /api/brain-holds`), and the dashboard's Needs-you page
@@ -1815,9 +1825,8 @@ fixes a measured regression of ticket M:
   the evidence and how many other tickets are in flight. The slot is held
   while any `loom:regression` ticket of the goal is in flight; a second
   regression past the cap waits for it.
-- Ordinary briefs and triage still count every ticket in flight, the
-  regression one included, so they wait until the goal is back under its
-  cap. The slot never becomes room for new work.
+- A runnable regression ticket counts toward the cap for ordinary briefs
+  and triage. They wait until the goal is back under its cap.
 - Briefing the same regression again while its ticket is in flight files
   nothing and prints that ticket.
 
@@ -1836,8 +1845,9 @@ limit:
   failed); the third is refused and names the two.
 - The station claims a repair ticket while fewer than two other repair
   tickets of the goal are running or at a pull request.
-- The in-flight cap (`LOOM_GOAL_CAP`) still applies; only the
-  unproven-work limit is passed. Ordinary tickets still wait.
+- Priority and repair epic membership pass the unproven-work limit.
+  The goal's separate in-flight reserve applies to `loom:factory` repairs
+  and health findings.
 
 Set `LOOM_REPAIR_EPICS` on the station and on every brain, so both agree
 on what passes.

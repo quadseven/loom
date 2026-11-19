@@ -521,18 +521,33 @@ class FactoryQueue(unittest.TestCase):
 
     def test_a_queued_two_platform_brief_gains_needs_brain_and_one_note(self):
         # loom#2929: the split hold (loom#1651) at the factory queue gate.
-        self.queued(7, "Difficulty: medium\n\n" + Split.MULTI)
-        self.queued(9, "Difficulty: medium\n\n" + Split.SINGLE)
+        self.queued(7, Split.MULTI)
+        single = "Difficulty: medium\n\n" + Split.SINGLE
+        self.queued(9, single)
         for _ in range(2):
             worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
             worker.assign_queued()
-        self.assertEqual(worker.waits["%s#7" % self.repo], "spans more than one platform")
+        self.assertIn("spans more than one platform", worker.waits["%s#7" % self.repo])
         self.assertEqual(self.lane_of(7), [])
         self.assertIn("needs-brain", [x["name"] for x in self.gh.issues[7]["labels"]])
         notes = [c for c in self.gh.comments.get(7, [])
                  if "more than one platform" in str(c.get("body"))]
         self.assertEqual(len(notes), 1)
+        self.assertIn("After:", notes[0]["body"])
         self.assertNotIn("%s#9" % self.repo, worker.waits)
+        self.assertNotEqual(self.lane_of(9), [])
+        self.assertEqual(self.gh.issues[9]["body"], single)
+
+    def test_a_diff_estimate_over_800_lines_asks_for_a_split_before_assignment(self):
+        for number, size in ((7, "1,200"), (9, "800")):
+            self.queued(number, "Difficulty: medium\n\n" + Split.SINGLE
+                        + "\nEstimated diff: %s lines\n" % size)
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+        worker.assign_queued()
+        self.assertEqual(self.lane_of(7), [])
+        note = self.gh.comments[7][0]["body"]
+        self.assertIn("1200 lines", note)
+        self.assertIn("After:", note)
         self.assertNotEqual(self.lane_of(9), [])
 
     def test_a_ticket_with_no_area_label_in_an_area_repo_gets_no_lane_and_one_note(self):
@@ -771,14 +786,33 @@ class Split(unittest.TestCase):
     split it by hand in minutes. The hold is at the same intake seam as the
     criteria hold, so the ticket costs no claim and no lane run."""
 
-    MULTI = ("## Why\n\nDiscovery is missing on the phones the field team "
-             "carries, and the credentials it finds are never checked.\n\n"
-             "## What\n\n- Add iOS discovery.\n- Add Android discovery.\n"
-             "- Add Go credential checks.\n- Change the UI list.\n\n"
+    # The discovery issue's brief as filed, with its project identifiers replaced.
+    MULTI = ("Difficulty: hard\n\n"
+             "## Why\n"
+             "The app cannot discover other authenticated example devices on the same network. "
+             "Currently, peers must be manually configured in the router's example.toml, and "
+             "new devices like Android phones are invisible until an operator edits the config. "
+             "The router only knows pre-configured legs and cannot provide visibility into "
+             "unconfigured devices or function in client mode where two phones share no router view.\n"
+             "## What\n"
+             "Implement same-LAN service discovery using Bonjour (NWListener/NWBrowser on iOS, "
+             "NSD on Android) for a `_example._tcp` service. Discovered services must prove "
+             "identity by presenting credentials from the pairing ceremony before being trusted. "
+             "Only verified peers should be offered as configurable legs, eliminating the need "
+             "for manual router config edits.\n"
              "## Acceptance criteria\n"
-             "- [ ] iOS discovery lists nearby devices.\n"
-             "- [ ] Android discovery lists nearby devices.\n"
-             "- [ ] The Go core verifies a found credential.\n")
+             "- [ ] Implement Bonjour service advertisement and browsing for `_example._tcp` "
+             "on iOS and NSD-based discovery on Android\n"
+             "- [ ] Require discovered peers to present pairing credentials and verify them "
+             "against claimed client id using existing Go primitives\n"
+             "- [ ] Offer verified peers as configurable legs in the UI without requiring "
+             "manual router config edits\n"
+             "## Size\nM\n"
+             "## Out of scope\n"
+             "- Bluetooth peer discovery\n"
+             "- Server-side lookup or centralized discovery mechanism\n"
+             "- Trusting discovered services without credential verification\n\n"
+             "Rewritten from issue 144.\n\nPart of #305\n")
     APP_AND_CORE = ("## Why\n\nThe app shows stale results because the core "
                     "never tells it a check finished.\n\n"
                     "## What\n\n- Change the app code to refresh.\n"
@@ -792,7 +826,8 @@ class Split(unittest.TestCase):
               "- [ ] iOS discovery lists nearby devices.\n")
 
     def setUp(self):
-        self.fake = Route({"/repos/%s/issues/206/timeline" % REPO: []})
+        self.fake = Route({"/repos/%s/issues/206/timeline" % REPO: [],
+                           "/repos/%s/issues/144" % REPO: {"state": "open"}})
 
     def check(self, body):
         gh = GitHub("t", transport=self.fake)
@@ -811,6 +846,11 @@ class Split(unittest.TestCase):
     def test_a_single_platform_brief_queues_unchanged(self):
         self.assertIsNone(brief_check.split_verdict(self.SINGLE))
         self.assertIsNone(self.check(self.SINGLE))
+
+    def test_a_large_diff_estimate_is_a_split_verdict_at_claim(self):
+        found = self.check(self.SINGLE + "\nEstimated diff: 801 lines\n")
+        self.assertEqual(found.kind, brief_check.SPLIT)
+        self.assertIn("801 lines", found.reason)
 
     def test_the_ui_beside_one_platform_is_two_platforms(self):
         body = ("## Why\n\nDiscovery is missing on one phone platform.\n\n"

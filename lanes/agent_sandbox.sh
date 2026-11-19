@@ -66,10 +66,12 @@ sandbox_ready() {
 # gateway's HTTPS endpoint) must connect, so a pod with no network or no DNS
 # does not pass because every connection fails. Each try takes at most
 # LOOM_EGRESS_PROBE_SECONDS (default 3). Sets SANDBOX_WHY when it fails.
+# EGRESS_CONNECTED is empty unless a deny probe connected.
 # shellcheck disable=SC2034 # SANDBOX_WHY is read by sandbox_ready's callers
 egress_denied() {
   local target host port wait="${LOOM_EGRESS_PROBE_SECONDS:-3}" denied allow="${LOOM_EGRESS_ALLOW_PROBE:-}"
   local ipv4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+  EGRESS_CONNECTED=""
   [[ "$wait" =~ ^[1-9][0-9]?$ ]] || wait=3
   denied="${LOOM_EGRESS_DENY_PROBES:-}"
   denied="${denied//,/ }"
@@ -85,6 +87,7 @@ egress_denied() {
     [[ "$host" =~ $ipv4 && "$port" =~ ^[1-9][0-9]{0,4}$ ]] ||
       { SANDBOX_WHY="egress probe '$target' is not IPv4:port (a name could fail to resolve and pass as blocked)"; return 1; }
     if probe_connects "$host" "$port" "$wait"; then
+      EGRESS_CONNECTED="$target"
       SANDBOX_WHY="egress not narrowed: $target accepts connections, so no agent runs here"
       return 1
     fi
@@ -99,7 +102,7 @@ egress_denied() {
 # Whether a TCP connection to $1:$2 opens within $3 seconds.
 probe_connects() {
   # shellcheck disable=SC2016 # $1 and $2 expand in the child shell
-  timeout "$3" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$1" "$2" > /dev/null 2>&1
+  timeout --foreground "$3" bash -c 'exec 3<> "/dev/tcp/$1/$2"' _ "$1" "$2" > /dev/null 2>&1
 }
 
 # SANDBOX_CMD: the command words that run a command inside the profile $1

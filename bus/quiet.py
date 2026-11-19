@@ -32,13 +32,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence
 
 from . import handoff
-from .labels import HUMAN_LABELS
+from .labels import HUMAN_LABELS, in_triage, waiting_on_person
 from .github import rest_login
 
 JOURNAL_MARKER = "<!-- loom:journal v1 -->"
 REPORT_MARKER = "<!-- loom:report v1 -->"
 # A quiet goal's one heartbeat per this long, edited into its last report.
 HEARTBEAT_EVERY = 7 * 24 * 3600
+TRIAGE_STUCK_AGE = 7 * 24 * 3600
 # The last line of a heartbeat: the report is edited in place, never reposted.
 HEARTBEAT_STAMP = "Still quiet as of %s; this report is edited in place until something moves."
 MOVED_LABELS = ("loom:merged", "loom:shipped", "loom:verified", "loom:failed")
@@ -159,8 +160,12 @@ def _standing(issue: Dict[str, Any], now: datetime, stuck_age: float) -> List[st
     out = []
     if INVARIANT_LABEL in names:
         out.append("invariant breach #%s is open" % n)
+    triage = in_triage(names)
+    waiting = triage and waiting_on_person(names)
     if names & set(ASK_LABELS):
         out.append("#%s asks the operator" % n)
+    elif waiting:
+        out.append("#%s waits on a person" % n)
     stuck = [x for x in STUCK_LABELS if x in names]
     created = _at(issue.get("created_at"))
     if stuck:
@@ -168,6 +173,9 @@ def _standing(issue: Dict[str, Any], now: datetime, stuck_age: float) -> List[st
     elif "loom:pr" in names and created is not None \
             and (now - created).total_seconds() > stuck_age:
         out.append("#%s is stuck in loom:pr" % n)
+    elif triage and not waiting and created is not None \
+            and (now - created).total_seconds() > TRIAGE_STUCK_AGE:
+        out.append("#%s is stuck in loom:triage" % n)
     return out
 
 
