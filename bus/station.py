@@ -9306,6 +9306,16 @@ class Station:
             # (2026-10-20).
             self._relabel(repo, number, "loom:failed")
             return True
+        # A pick_held stop (no model of the slot can run at all) is not a
+        # briefed wait on the same slot: kept briefed with its lane, the
+        # ticket was claimed by that slot again and again and ended failed
+        # (loom#3226). It goes back to the queue with no lane, as a
+        # transient requeue does, and the slot's own heartbeat hold keeps
+        # the station from claiming for it until the hold ends.
+        if (bare.startswith("limit: no model can run") or bare.startswith("no model can run")) \
+                and not fix_pr.isdigit():
+            self._requeue_no_model(repo, number, lane, reason)
+            return True
         # Thermal-limit briefs carry "limit:" with or without a class and
         # return to the factory. Provider limits have a class but no marker,
         # so they take the bounded retry path below.
@@ -9636,6 +9646,24 @@ class Station:
                 continue
             return event.startswith(prefix)
         return False
+
+    def _requeue_no_model(self, repo: str, number: int, lane: str, reason: str) -> None:
+        """A run that stopped because no model of its slot can run
+        (pick_held in lanes/run_lane.sh): the slot did no work, so it is no
+        failure and costs no rung, and the ticket must not wait briefed on
+        that slot, which claimed it again on every pass (loom#3226). It
+        goes back to loom:queued with its lane label removed and
+        wait:model-limit; the factory gives it a lane that can run, or it
+        waits for the slot's hold to end. A status event, not a comment,
+        ends the claim as [limit]."""
+        names = _label_names(self._issue(repo, number))
+        if RUNNING not in names:
+            return
+        labels = ticket_move.next_labels(names, "queued", lane="", wait="model-limit",
+                                         own_logins=self.s.authors, clear_needs_brain=False)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        self._stopped(repo, number, lane, "limit", reason)
+        _say("requeued %s#%d after a no model can run stop on lane %s" % (repo, number, lane))
 
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
