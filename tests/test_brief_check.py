@@ -1080,6 +1080,27 @@ class HandFiled(unittest.TestCase):
         body = tickets.with_original(self.NO_TEST, {"title": "Old", "body": brief_check.TEST_MARKER})
         self.assertIsNotNone(brief_check.hand_filed_verdict(self.issue(body, self.AFTER)))
 
+    def test_a_marker_a_stranger_writes_buys_no_lane(self):
+        # The marker is trusted as far as the body is. The station's claim
+        # checks the body's author and last editor before any lane sees the
+        # ticket, so a marker in a stranger's issue, or one a stranger edits
+        # into a trusted ticket, never reaches a lane.
+        from bus import tickets
+        marked = brief_check.with_test_marker(self.NO_TEST)
+        mine = dict(self.issue(marked, self.AFTER), user={"login": OPERATOR},
+                    repository_url="https://api.github.com/repos/%s" % REPO)
+        owners = [REPO.split("/")[0]]
+        events = [{"event": "labeled", "label": {"name": name}, "actor": {"login": OPERATOR}}
+                  for name in ("loom:briefed", "lane:muse")]
+        self.assertEqual(tickets.trusted(mine, events, OPERATOR, TRUSTED, owners), (True, "ok"))
+        theirs = dict(mine, user={"login": "a-stranger"})
+        ok, why = tickets.trusted(theirs, events, None, TRUSTED, owners)
+        self.assertFalse(ok)
+        self.assertIn("issue author a-stranger", why)
+        ok, why = tickets.trusted(mine, events, "a-stranger", TRUSTED, owners)
+        self.assertFalse(ok)
+        self.assertIn("body last edited by a-stranger", why)
+
     def test_the_three_readings_agree(self):
         # The brief check (the station's claim), the factory's hold and the
         # lane's own check: a ticket one holds and another takes is handed

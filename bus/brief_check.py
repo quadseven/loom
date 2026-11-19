@@ -323,6 +323,14 @@ test_verdict.__test__ = False  # a name unittest and pytest must not collect
 # Loom also writes it into a ticket it files from a template of its own (a
 # validation contract, an adopted pull request, criteria a lane left
 # unbuilt): no person wrote that ticket by hand, so the hold is not for it.
+#
+# The marker is words in the body, so it is trusted exactly as far as the
+# body is and no further: nothing here verifies who wrote it. The station's
+# claim does that for the whole body before any lane sees the ticket
+# (tickets.trusted: the author, every labeller and the body's last editor are
+# briefing logins), so a marker a stranger writes into an issue buys no lane.
+# A briefing login who types the marker by hand has made the same statement
+# as typing a test path into a box, and is as answerable for it.
 TEST_MARKER = "<!-- loom:test-named -->"
 # The rule reads only a ticket created at or after this time (UTC). It is a
 # fixed time just after the hold shipped, never the clock: a ticket created

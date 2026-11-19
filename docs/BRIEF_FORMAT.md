@@ -101,7 +101,9 @@ ticket's own creation time, so a ticket created before it is never held by
 this rule, whatever it contains. A regression or revert ticket is exempt,
 and so is a ticket Loom files from a template of its own (a validation
 contract, an adopted pull request, criteria a lane left unbuilt), which
-carries the marker too.
+carries the marker too. The marker is words in the body and is trusted only
+as far as the body is: the station's trust rules (docs/BRAIN.md, Trust)
+check the body's author and last editor before any lane sees the ticket.
 
 A `Live:` box is written only when it names a read-only check Loom can run by
 itself: an `https://` URL, a `gh api <path>` read, a read-only `kubectl get
