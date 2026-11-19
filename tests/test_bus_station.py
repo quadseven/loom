@@ -5360,6 +5360,23 @@ class ClaimTest(Base):
     def test_settings_read_from_the_environment_turn_the_host_load_gate_on(self):
         self.assertTrue(station.Settings.from_env({"LOOM_HOME": self.home}).host_load_gate)
 
+    def test_a_half_written_claim_is_finished_while_the_gate_holds_new_claims(self):
+        """The gate holds a new claim, never one already half made: with the gate
+        on and the host loaded, a .claiming brief of a running ticket is still
+        renamed. (test_a_claiming_file_whose_ticket_is_running_is_just_renamed
+        covers the same rename for a station with the gate off.)"""
+        self.settings.host_load_gate = True
+        self.fake.add(12, state="running")
+        name = "example-owner.example-repo-12"
+        self.write(self.inbox("codex", name + ".claiming"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.run_pass()
+        self.assertEqual(self.listing(), [name + ".md"])
+        self.assertEqual(self.fake.paths("PUT"), [])
+
     def test_local_claim_waits_until_the_host_load_falls(self):
         self.settings.host_load_gate = True
         load = Path(self.home) / "loadavg"
@@ -5945,7 +5962,6 @@ class ClaimTest(Base):
         name = "example-owner.example-repo-12"
         self.write(self.inbox("codex", name + ".claiming"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
-        self.settings.host_load_gate = True
         load = Path(self.home) / "loadavg"
         load.write_text("90 90 1\n")
         with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
