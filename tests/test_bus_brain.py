@@ -1558,11 +1558,46 @@ class SensitiveResumeTests(unittest.TestCase):
         with unittest.mock.patch.object(brain, "_read", return_value=BODY), \
                 unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
                 unittest.mock.patch.object(brain, "_check_live_criterion"), \
+                unittest.mock.patch.object(brain, "_check_test_named"), \
                 unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
                 contextlib.redirect_stdout(io.StringIO()):
             code = brain.main(argv)
         self.assertEqual(code, 0)
         self.assertEqual(make.call_args.kwargs["repairs_incident"], 7)
+
+    def brief_from_the_command_line(self, body):
+        err = io.StringIO()
+        with unittest.mock.patch.object(brain, "_read", return_value=body), \
+                unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = brain.main(["brief", REPO, "--epic", "2", "--title", "Ticket", "--file", "unused",
+                               "--lane", "codex"])
+        return code, err.getvalue(), make
+
+    def test_the_brief_command_refuses_a_body_whose_boxes_name_no_test(self):
+        # Owner ruling of 2026-11-19 (#3277): a new ticket names the test
+        # that proves it; the body goes back to its writer before it is filed.
+        code, err, make = self.brief_from_the_command_line(BODY)
+        self.assertEqual(code, 1)
+        self.assertIn("names the test that proves it", err)
+        self.assertIn("a test file path", err)
+        make.assert_not_called()
+
+    def test_the_brief_command_files_a_body_that_names_its_test(self):
+        code, err, make = self.brief_from_the_command_line(
+            BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers the slow query"))
+        self.assertEqual(code, 0, err)
+        make.assert_called_once()
+
+    def test_the_brief_command_refuses_a_live_line_with_no_runnable_check_and_lists_the_forms(self):
+        code, err, make = self.brief_from_the_command_line(
+            BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers the slow query")
+                .replace("- [ ] live", "- [ ] Live: the page log shows `cache hit`"))
+        self.assertEqual(code, 1)
+        for form in ("https://", "gh api", "log:<source>"):
+            self.assertIn(form, err)
+        make.assert_not_called()
 
     def test_brief_refuses_invalid_repair_incident_before_writing(self):
         for number in (0, -1, True, "#7"):
@@ -1604,7 +1639,7 @@ class SensitiveResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             path = os.path.join(home, "brief.md")
             with open(path, "w") as fh:
-                fh.write(BODY)
+                fh.write(BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers it"))
             err = io.StringIO()
             with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
@@ -6061,14 +6096,43 @@ class LiveCriterionTest(unittest.TestCase):
                 "- [ ] %s\n\n## Size\nS\n\n## Out of scope\nz\n" % live)
 
     def test_a_prose_live_criterion_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "names no exact string"):
+        with self.assertRaisesRegex(ValueError, "names no check Loom can run by itself"):
             brain._check_live_criterion(self.body(
                 "Live: the station log for the 24 hours after deploy shows it working"))
 
-    def test_a_live_criterion_naming_a_string_passes(self):
-        brain._check_live_criterion(self.body(
-            "Live: the station log shows `deployed` within a pass of the merge"))
-        brain._check_live_criterion(self.body('Live: "/api/v2/health" reports no finding'))
+    def test_a_quoted_string_with_no_window_is_refused_and_the_message_lists_the_forms(self):
+        # Owner ruling of 2026-11-19 (#3277): a Live box is written only when
+        # Loom can run its check. A string alone names no time to read the
+        # log for, so 18 such boxes sat on shipped tickets and none was ever
+        # proven.
+        for live in ("Live: the station log shows `deployed`",
+                     'Live: "/api/v2/health" reports no finding'):
+            with self.subTest(live=live):
+                with self.assertRaises(ValueError) as caught:
+                    brain._check_live_criterion(self.body(live))
+                message = str(caught.exception)
+                for form in ("https://", "gh api", "kubectl get", "log:<source>", "time window"):
+                    self.assertIn(form, message)
+                self.assertIn("names the test", message)
+
+    def test_a_live_criterion_naming_a_check_loom_can_run_passes(self):
+        for live in ("Live: https://example.invalid/api/v2/health answers `ok`",
+                     "Live: `gh api repos/example/thing/issues/3` shows `closed`",
+                     "Live: `kubectl get deploy web -n shop` shows `2/2`",
+                     "Live: `log:station` shows `claimed 3`",
+                     "Live: the station log shows `deployed` within 24 hours of the merge",
+                     "Live: no `Traceback` line appears in the station log for 24 hours"):
+            with self.subTest(live=live):
+                brain._check_live_criterion(self.body(live))
+
+    def test_the_intake_templates_keep_their_one_live_box(self):
+        # The station's own absence tracking proves these two boxes
+        # (bus/health.py, bus/friction_intake.py), so they stay as written.
+        from bus import friction_intake, health
+        for box in (health.LIVE_BOX, friction_intake.LIVE_BOX):
+            with self.subTest(box=box):
+                self.assertTrue(box.startswith("- [ ] Live:"), box)
+                brain._check_live_criterion(self.body(box[len("- [ ] "):]))
 
     def test_a_body_with_no_live_criterion_is_left_alone(self):
         brain._check_live_criterion(self.body("A test fails without the change"))
@@ -6088,19 +6152,19 @@ class RestateLiveTest(unittest.TestCase):
     def test_a_shipped_ticket_gets_its_live_line_replaced_in_place(self):
         fake = Fake(reply(200, self.issue()), reply(200, {}))
         brain.restate_live(GitHub("t", transport=fake), REPO, 8,
-                           "Live: the station log shows `deployed` within a pass", env=self.ENV)
+                           "Live: the station log shows `deployed` within 24 hours of the merge", env=self.ENV)
         self.assertEqual(fake.calls[1][0], "PATCH")
         self.assertEqual(fake.calls[1][2]["body"], self.BODY.replace(
             "Live: the logs show it working after deploy",
-            "Live: the station log shows `deployed` within a pass"))
+            "Live: the station log shows `deployed` within 24 hours of the merge"))
 
     def test_refusals_make_no_writes(self):
         cases = [
             (self.issue(), "Live: the logs show it"),                       # names no string
             (self.issue(), "live: the station log shows `deployed`"),        # not read as Live
             (self.issue(), "The station log shows `deployed`"),             # not a Live line
-            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows"),
-            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows"),
+            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows within 24 hours"),
+            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows within 24 hours"),
         ]
         for issue, text in cases:
             with self.subTest(text=text):

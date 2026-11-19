@@ -2141,19 +2141,44 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
 
 
 def _check_live_criterion(body: str) -> None:
-    """A Live criterion names at least one exact string the station can look
-    for: a log line, field or endpoint in backticks or double quotes. Without
-    one, no verify brief carries log data and the ticket can only stay
-    shipped (2026-10-18: 3 of 72 merged tickets verified, most refused for
-    missing evidence on criteria written as prose)."""
+    """A Live criterion names a check Loom can run by itself, or the brief
+    writes no Live box at all.
+
+    Owner ruling of 2026-11-19 (#3277): proof belongs in a test that runs in
+    CI or a throwaway environment at build time, not in a live observation
+    after the fact. Until then a Live line passed when it quoted one string,
+    and the box then waited for an observation nobody could collect: 16 of
+    the 21 shipped tickets read that day carried one, and none of their 18
+    boxes named a check Loom could run. The accepted forms are the ones
+    bus/live_proof.py runnable_form reads. The one templated box of a health
+    or friction intake ticket passes as written: the station's own absence
+    tracking proves it."""
     found = _LIVE_LINE.search(body or "")
     if not found:
         return
-    from .evidence import needles
-    if not needles(found.group(1)):
-        raise ValueError("the Live criterion names no exact string the station can look "
-                         "for: put the log line, field or endpoint it means in backticks, "
-                         "for example `overseer: summoned` or `/api/v2/health`")
+    from . import friction_intake, health, live_proof
+    line = " ".join(found.group(1).split())
+    templated = {" ".join(box.split("Live:", 1)[1].split())
+                 for box in (health.LIVE_BOX, friction_intake.LIVE_BOX)}
+    if " ".join(line.split(":", 1)[-1].split()) in templated:
+        return
+    if not live_proof.runnable_form(line):
+        raise ValueError(
+            "the Live criterion names no check Loom can run by itself. Write a Live box only "
+            "with one of: %s. Otherwise leave the Live box out and write a box that names the "
+            "test that proves the ticket: a test file path, or a command that runs in CI or a "
+            "throwaway environment" % "; ".join(live_proof.RUNNABLE_FORMS))
+
+
+def _check_test_named(body: str) -> None:
+    """A new build ticket names the test that proves it in an acceptance box
+    (bus/brief_check.py test_verdict, owner ruling of 2026-11-19, #3277).
+    Checked where a ticket is filed, the brief command and the rewrite, so
+    a body that names none goes back to its writer and no ticket already on
+    the board is read by this rule."""
+    found = brief_check.test_verdict(body)
+    if found is not None:
+        raise ValueError(found.reason)
 
 
 def plan_problems(body: str) -> List[str]:
@@ -9015,6 +9040,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     # Hand-written briefs only: health and friction intake are verified by
     # the station's own absence tracking, not by a log string.
     _check_live_criterion(body)
+    _check_test_named(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,

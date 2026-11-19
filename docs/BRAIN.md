@@ -2787,6 +2787,14 @@ reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.
 
+A ticket filed from here on names the test that proves it in an acceptance
+box, and carries a Live box only when the box names a read-only check Loom
+can run by itself (docs/BRIEF_FORMAT.md lists the forms). The `brief`
+command, the rewrite and a restated Live line are all held to this, so the
+"Verify due" list below stops filling with boxes nobody can prove. The
+restate prompt asks the rewrite command for such a check, never for a quoted
+string alone.
+
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it
 shipped and its Live criterion (the acceptance line that starts with

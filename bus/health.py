@@ -746,6 +746,12 @@ def quoted(f: Finding) -> str:
     return "\n".join(["```text"] + lines + ["```"])
 
 
+
+# The one Live box a health ticket carries. The station's own absence tracking
+# proves it, so it is a check Loom runs by itself and the brief's Live rule
+# (brain._check_live_criterion) accepts it as written.
+LIVE_BOX = "- [ ] Live: the finding is absent from the health endpoint for 24 hours."
+
 def ticket_body(f: Finding, diagnosed: str = "") -> str:
     """Loom writes every section; the finding's words appear only inside the
     fenced quote, and the goal's diagnosis (diagnosis()) only inside its own."""
@@ -771,7 +777,7 @@ def ticket_body(f: Finding, diagnosed: str = "") -> str:
         "- [ ] The pull request names the cause with the numbers that show it, and how the "
         "affected count falls because of the fix.",
         "- [ ] A test fails without the fix and passes with it.",
-        "- [ ] Live: the finding is absent from the health endpoint for 24 hours.", "",
+        LIVE_BOX, "",
         "## Size", "", "M", "",
         "## Out of scope", "",
         "Health findings of other causes: each cause has its own ticket.", "",

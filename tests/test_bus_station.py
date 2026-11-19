@@ -14032,10 +14032,31 @@ class VerifyDispatchTest(Base):
         st.now = time.time()
         with mock.patch.object(st, "_rewrite_goals", return_value=[]), \
              mock.patch.object(st, "_rewrite_command", return_value="agent"), \
-             mock.patch.object(station.rewrite, "run_agent", return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+             mock.patch.object(station.rewrite, "run_agent", return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}'):
             st.restate_shipped_live()
-        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+        self.assertIn("Live: `log:station` shows `the string`", self.fake.issues[2]["body"])
         self.assertEqual(self.fake.comments[2], [])
+
+    def test_the_restate_prompt_asks_for_a_read_only_check_loom_can_run(self):
+        # Owner ruling of 2026-11-19 (#3277): a restated Live line names a
+        # check Loom runs by itself, not a quoted string alone.
+        self.fake.private = False
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        self.settings.rewrite_cmd = "agent"
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time()
+        with mock.patch.object(st, "_rewrite_goals", return_value=[]), \
+             mock.patch.object(st, "_rewrite_command", return_value="agent"), \
+             mock.patch.object(station.rewrite, "run_agent",
+                               return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}') as agent:
+            st.restate_shipped_live()
+        prompt = agent.call_args[0][1]
+        self.assertIn("a read-only check Loom can run by itself", prompt)
+        for form in ("`https://` URL", "`gh api <path>`", "`kubectl get", "`log:<source>`", "time window"):
+            self.assertIn(form, prompt)
+        self.assertIn("A quoted string alone is not a check", prompt)
+        self.assertNotIn("naming an exact string", prompt)
 
     def test_restate_runs_when_the_rewrite_step_spent_its_hourly_allowance(self):
         # Sharing one allowance, the rewrite step spent it every hour and no
@@ -14051,9 +14072,9 @@ class VerifyDispatchTest(Base):
             json.dump({station.REWRITE_STATION_KEY: [st.now - 60] * station.REWRITE_STATION_PER_HOUR}, fh)
         with mock.patch.object(st, "_rewrite_command", return_value="agent"), \
              mock.patch.object(station.rewrite, "run_agent",
-                               return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+                               return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}'):
             st.restate_shipped_live()
-        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+        self.assertIn("Live: `log:station` shows `the string`", self.fake.issues[2]["body"])
 
     def test_a_log_line_for_the_live_criterion_hands_the_run_and_quotes_it_once(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(

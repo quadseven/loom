@@ -747,6 +747,64 @@ class Criteria(unittest.TestCase):
         self.assertIsNone(brief_check.criteria_verdict(self.ANSWER))
 
 
+class TestAsProof(unittest.TestCase):
+    """Owner ruling of 2026-11-19 (#3277): proof belongs in a test that runs
+    in CI or a throwaway environment at build time. A new build ticket names
+    that test in an acceptance box; one that names none is refused where it
+    is filed (the brief command and the rewrite), so it goes back to be
+    rewritten before any lane sees it."""
+
+    BASE = "## Why\n\nThe totals are wrong.\n\n## What\n\n- Fix the total.\n\n## Acceptance criteria\n"
+
+    def body(self, *boxes):
+        return self.BASE + "".join("- [ ] %s\n" % box for box in boxes)
+
+    def test_a_build_ticket_whose_boxes_name_no_test_is_sent_back(self):
+        got = brief_check.test_verdict(self.body("The total is right.", "The page shows it."))
+        self.assertEqual(got.kind, brief_check.CRITERIA)
+        self.assertTrue(got.key.startswith("test-"), got.key)
+        self.assertIn("names the test that proves it", got.reason)
+        for form in ("a test file path", "a command that runs in CI or a throwaway environment"):
+            self.assertIn(form, got.reason)
+
+    def test_a_box_naming_a_test_file_or_a_test_command_is_enough(self):
+        for box in ("tests/test_totals.py covers the rounding case.",
+                    "A new case in `bus/tests/test_totals.py` fails on main.",
+                    "`internal/ledger/total_test.go` proves the sum.",
+                    "`web/src/total.spec.ts` covers the empty cart.",
+                    "`python3 -m unittest tests.test_totals` passes.",
+                    "`uv run pytest -q tests/test_totals.py` passes.",
+                    "`go test ./internal/ledger/...` passes.",
+                    "`npm test -- total` passes in CI.",
+                    "`bash scripts/tests/test_totals.sh` passes.",
+                    "A test fails without the fix and passes with it.",
+                    "A test fails without the cache.",
+                    "A new test fails on main."):
+            with self.subTest(box=box):
+                self.assertIsNone(brief_check.test_verdict(self.body("The total is right.", box)))
+
+    def test_a_mention_of_testing_that_names_no_test_is_not_enough(self):
+        for box in ("The change is tested.", "Tested by hand on the phone.",
+                    "The contest page still loads.", "CI is green."):
+            with self.subTest(box=box):
+                self.assertIsNotNone(brief_check.test_verdict(self.body(box)))
+
+    def test_an_answer_ticket_stays_exempt(self):
+        self.assertIsNone(brief_check.test_verdict("Deliverable: answer\n\n" + self.body("Say why.")))
+
+    def test_a_ticket_with_no_criteria_is_left_to_the_criteria_verdict(self):
+        self.assertIsNone(brief_check.test_verdict("## Why\n\nx\n\n## What\n\n- y\n"))
+
+    def test_the_intake_templates_pass_with_their_templated_boxes(self):
+        from bus import friction_intake, health
+        for box in (health.LIVE_BOX, friction_intake.LIVE_BOX):
+            with self.subTest(box=box):
+                body = self.BASE + "- [ ] A test fails without the fix and passes with it.\n" + box + "\n"
+                self.assertIsNone(brief_check.test_verdict(body))
+                from bus import brain
+                brain._check_live_criterion(body)
+
+
 class Split(unittest.TestCase):
     """A brief that spans more than one platform is split before it reaches
     a lane (loom#1651): the multi-platform discovery brief behind this rule
