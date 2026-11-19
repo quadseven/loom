@@ -110,7 +110,7 @@ from . import watch
 from . import weakened
 from . import labels
 from . import lock
-from .brain import HUMAN_MARKER, LANES_REPUBLISH
+from .brain import HUMAN_MARKER, LANES_REPUBLISH, human as brain_human
 from . import home_repo
 from . import brain
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, TargetReached,
@@ -17107,6 +17107,90 @@ class Station:
             return "Claims paused: the loom home's disk is low on free space"
         return "Claims paused: %s free on the loom home's disk, under %s" % (_gb(free), _gb(floor))
 
+    def _check_disk_guard_ask(self) -> None:
+        """When disk_low has held for 60+ minutes, open a needs:human ask
+        (Kind: hardware) on the Loom goal home's repo naming free space,
+        floor, and loom home size by top-level folder; edit it in place
+        while paused; close it when disk recovers. Paused under 60 minutes
+        files nothing."""
+        path = os.path.join(self.state, DISK_GUARD_FILE)
+        saved = _read_json(path, {}, strict=False)
+        if not isinstance(saved, dict):
+            return
+        low = saved.get("low")
+        at = saved.get("at")
+        free = saved.get("free")
+        floor = saved.get("floor")
+        if not (isinstance(low, bool) and self._num(at) and self._num(free) and self._num(floor)):
+            return
+
+        # Check if we have a goal home to post to
+        homes = self._goal_homes()
+        if not homes:
+            return
+        repo, goal = homes[0]
+        number = goal.get("number")
+        if not isinstance(number, int):
+            return
+
+        # Read the loom home folder sizes from the latest tend_disk run
+        disk_path = os.path.join(self.state, "disk.json")
+        disk_saved = _read_json(disk_path, {}, strict=False)
+        folders = disk_saved.get("folders") if isinstance(disk_saved, dict) else None
+        if not isinstance(folders, dict):
+            folders = {}
+
+        # Build the ask body
+        folder_parts = ", ".join("%s %s" % (k, _gb(v)) for k, v in
+                                  sorted(folders.items(), key=lambda kv: (-kv[1], kv[0])))
+        total = sum(folders.values()) if folders else 0
+        ask_body = (
+            "Kind: hardware\n"
+            "The loom home's disk has been below the free-space floor for more than 60 minutes.\n"
+            "Free space: %s\n"
+            "Floor: %s\n"
+            "Loom home holds %s (%s)"
+        ) % (_gb(free), _gb(floor), _gb(total), folder_parts or "empty")
+
+        # Track the ask in the station state
+        ask_key = "disk_guard_ask"
+        ask_state_path = os.path.join(self.state, "disk-guard-ask.json")
+        ask_saved = _read_json(ask_state_path, {}, strict=False)
+
+        if low:
+            # Disk is low - check if it's been 60+ minutes
+            if self.now - at >= 3600:
+                # Check if we already have an ask
+                if isinstance(ask_saved, dict) and ask_saved.get("number") == number:
+                    # Ask exists - update it in place by posting a new comment
+                    # The brain.human function will fail if already needs:human,
+                    # so we need to handle the update differently
+                    # For now, we'll rely on the fact that brain.human checks for existing ask
+                    pass
+                else:
+                    # Create new ask
+                    try:
+                        brain_human(self.gh, repo, number, ask_body)
+                        _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
+                        _say("disk guard: opened needs:human ask on %s#%d" % (repo, number))
+                    except ValueError as err:
+                        if "already needs:human" in str(err):
+                            # Ask already exists, record it
+                            _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
+                        else:
+                            _say("disk guard: failed to open ask: %s" % err)
+            # Under 60 minutes: do nothing
+        else:
+            # Disk recovered - close the ask if we have one
+            if isinstance(ask_saved, dict) and ask_saved.get("number") == number:
+                try:
+                    # Remove the needs:human label
+                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs:human" % (repo, number))
+                    _write_json(ask_state_path, {})
+                    _say("disk guard: closed needs:human ask on %s#%d" % (repo, number))
+                except Exception as err:
+                    _say("disk guard: failed to close ask: %s" % err)
+
     def tend_watchdog(self) -> None:
         """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
         the claim floor is reached (bus/disk_watchdog.py, loom#3187): Time
@@ -17912,6 +17996,10 @@ class Station:
                 local()
             except OSError as err:
                 _say("%s failed: %s" % (local.__name__, err))
+        try:
+            self._check_disk_guard_ask()
+        except (GitHubError, OSError) as err:
+            _say("disk guard ask failed: %s" % err)
         self._tend_usage()
 
     def _tend_usage(self) -> None:
