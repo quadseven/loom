@@ -317,7 +317,15 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+HEAVY_LOCK=""
+heavy_lock() {
+  python3 -IB "$LOOM_ROOT/lanes/heavy_repo.py" "$@"
+}
+release_heavy_repo() {
+  [ -z "$HEAVY_LOCK" ] || heavy_lock release "$HEAVY_LOCK"
+  HEAVY_LOCK=""
+}
+trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -2950,22 +2958,31 @@ release_check_slot() {
 
 wait_for_agent() {
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || return 0
-  local start=$SECONDS noted=""
-  while check_load_high; do
-    if [ -z "$noted" ]; then
-      noted=1
-      echo "waiting to start agent: $CHECK_LOAD_NOTE" >> "$LOG"
+  local requested="${1:-}" start=$SECONDS noted="" why left poll="$CHECK_SLOT_POLL"
+  while :; do
+    if check_load_high; then
+      why="$CHECK_LOAD_NOTE"
+    elif [ -n "$requested" ] && ! heavy_lock take "$requested"; then
+      why="heavy repo lock for $REPO"
+    else
+      HEAVY_LOCK="$requested"
+      if [ "$CHECK_LOAD_NOTE" = unread ]; then
+        echo "host load could not be read before agent start" >> "$LOG"
+      fi
+      return 0
     fi
-    if [ $((SECONDS - start)) -ge "$CHECK_SLOT_WAIT" ]; then
-      echo "agent deferred until next pass: $CHECK_LOAD_NOTE" >> "$LOG"
+    if [ -z "$noted" ]; then
+      echo "waiting to start agent: $why" >> "$LOG"
+      noted=1
+    fi
+    left=$((10#$CHECK_SLOT_WAIT - (SECONDS - start)))
+    if [ "$left" -le 0 ]; then
+      echo "agent deferred until next pass: $why" >> "$LOG"
       return 1
     fi
-    sleep "$CHECK_SLOT_POLL"
+    if [ "${poll%%.*}" -ge "$left" ]; then poll="$left"; fi
+    sleep "$poll"
   done
-  if [ "$CHECK_LOAD_NOTE" = unread ]; then
-    echo "host load could not be read before agent start" >> "$LOG"
-  fi
-  return 0
 }
 
 # A check that never ran for want of a slot (75) or that the timeout killed
@@ -4846,8 +4863,16 @@ for BRIEF in "$INBOX"/*.md; do
     mv "$BRIEF" "$INBOX/done/"
     continue
   fi
-  wait_for_agent || exit 0
   resume_earlier_attempt
+  repo_lock=""
+  if [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && [ -n "${LOOM_HEAVY_REPOS:-}" ]; then
+    repo_key="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+    heavy_repos="$(printf '%s' "$LOOM_HEAVY_REPOS" | tr '[:upper:]' '[:lower:]' | tr ',[:space:]' ' ')"
+    case " $heavy_repos " in
+      *" $repo_key "*) repo_lock="$LOOM_HOME/run/heavy-repos/${repo_key/\//+}.lock" ;;
+    esac
+  fi
+  wait_for_agent "$repo_lock" || exit 0
   [ "$LANE" = opencode-go ] && { catalogue_cmd record-call "$MODEL" >> "$LOG" 2>&1 || true; }
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -4855,13 +4880,21 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
-  if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
+  if ! agent_gh_config; then
+    release_heavy_repo
+    park "$BRIEF" "$AGENT_GH_WHY" transient; continue
+  fi
   rm -f "$LOCK/watchdog-limit" "$LOCK/egress-opened"
   # The job's proof that an agent started: without it a cluster run fails in
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    (if [ -n "$HEAVY_LOCK" ]; then
+       # This process group can outlive the runner. Keep its own PID in the lock.
+       heavy_lock adopt "$HEAVY_LOCK" "$$" || exit 1
+       trap 'release_heavy_repo' EXIT
+     fi
+     cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
@@ -4888,6 +4921,7 @@ for BRIEF in "$INBOX"/*.md; do
     exit $agent_status ) &
   wait $!
   STATUS=$?
+  release_heavy_repo
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   GH_CLEANUP_FAILURE=""

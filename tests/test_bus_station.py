@@ -5929,7 +5929,10 @@ class ClaimTest(Base):
         name = "example-owner.example-repo-12"
         self.write(self.inbox("codex", name + ".claiming"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
-        self.run_pass()
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.run_pass()
         self.assertEqual(self.listing(), [name + ".md"])
         self.assertEqual(self.fake.paths("PUT"), [])
         self.assertEqual(self.fake.comments[12], [])
@@ -16092,7 +16095,10 @@ class RunnerSlotClaimTest(Base):
 
     def test_a_public_ticket_labeled_for_a_runner_slot_is_claimed_there(self):
         self.fake.private = False
-        self.claim()
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.claim()
         self.assertEqual(len(self.listing("free-gemma")), 1)
         self.assertIn("lane:free-gemma", self.fake.names(12))
 

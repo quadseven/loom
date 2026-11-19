@@ -2,6 +2,7 @@
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -134,7 +135,7 @@ if [ "$1" = api ]; then
       printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
-  [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
+  [ "$*" = "api repos/${FAKE_GH_REPO:-example/repo} --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
 if [ "$1 $2" = "pr list" ]; then
@@ -8657,16 +8658,109 @@ echo fixed > fix.txt
                 self.log.write_text("")
 
     def test_agent_load_timeout_leaves_the_same_brief_for_the_next_pass(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
         self.drop_brief()
-        result = self.run_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 0)),
-                               LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="0")
+        result = self.run_contract_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 0)),
+                                        LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="60", timeout=12)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
         self.assertFalse(list((self.inbox / "failed").iterdir()))
         self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
         self.assertIn("load", self.run_log())
-        self.assertEqual(self.run_lane().returncode, 0)
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.run_contract_lane().returncode, 0)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agent_rechecks_load_after_preparing_the_clone(self):
+        self.drop_brief()
+        load = self.load_file(0, 0)
+        self.write_tool(self.bin / "git", '#!/bin/sh\n'
+                        'if [ "$1" = clone ]; then echo "1 20 1" > "$LOOM_CHECK_LOAD_FILE"; fi\n'
+                        f'exec {shlex.quote(shutil.which("git"))} "$@"\n')
+        result = self.run_lane(LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_5M="18",
+                               LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5-minute load", self.run_log())
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_cluster_agent_ignores_local_host_load_and_heavy_repo_lock(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(os.getpid()))
+        result = self.run_lane(LOOM_CLUSTER_RUNNER="1", LOOM_HEAVY_REPOS="example/repo",
+                               LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                               LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((lock / "pid").read_text(), str(os.getpid()))
+
+    def test_heavy_repo_agents_take_turns_while_another_repo_runs(self):
+        self.drop_brief()
+        light = self.remote.with_name("light.git")
+        git("clone", "-q", "--bare", str(self.remote), str(light))
+        for slot, repo, name in [("codex-2", "repo", "T043"), ("codex-3", "light", "T044")]:
+            folder = self.inbox.with_name(slot)
+            folder.mkdir()
+            (folder / (name + ".md")).write_text(BRIEF.replace("example/repo", "example/" + repo))
+        marks = Path(self._tmp.name) / "starts"
+        release = marks.with_name("release")
+        self.write_tool(self.bin / "codex", '#!/bin/bash\ncat >/dev/null\n'
+                        'echo "start $TAG" >> "$MARKS"\n'
+                        'while [ "$TAG" = first ] && [ ! -e "$RELEASE" ]; do sleep 0.1; done\n'
+                        'echo "end $TAG" >> "$MARKS"\nexit 3\n')
+        env = dict(LOOM_HEAVY_REPOS="example/unused,example/repo", LOOM_CHECK_SLOT_POLL="0.1",
+                   MARKS=str(marks), RELEASE=str(release))
+        with ThreadPoolExecutor(3) as pool:
+            first = pool.submit(self.run_lane, TAG="first", **env)
+            try:
+                self.wait_for_run_text(marks, "start first", first)
+                holder = (self.loom / "run/heavy-repos/example+repo.lock/pid").read_text()
+                self.assertEqual(holder, (self.loom / "run/codex.lock/pgid").read_text())
+                second = pool.submit(self.run_lane, "codex-2", TAG="second", **env)
+                third = pool.submit(self.run_lane, "codex-3", TAG="third", FAKE_GH_REPO="example/light", **env)
+                self.wait_for_run_text(self.loom / "logs/codex-2/T043.log", "heavy repo", second)
+                self.assertEqual(third.result().returncode, 0)
+                self.assertEqual(marks.read_text().splitlines(), ["start first", "start third", "end third"])
+            finally:
+                release.touch()
+            self.assertEqual(first.result().returncode, 0)
+            self.assertEqual(second.result().returncode, 0)
+        self.assertEqual(marks.read_text().splitlines()[-3:], ["end first", "start second", "end second"])
+        self.assertFalse((self.loom / "run/heavy-repos/example+repo.lock").exists())
+
+    def test_busy_heavy_repo_guard_cannot_extend_the_wait_limit(self):
+        self.drop_brief()
+        root = self.loom / "run/heavy-repos"
+        root.mkdir(parents=True)
+        with ThreadPoolExecutor(1) as pool, (root / ".guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            run = pool.submit(self.run_lane, LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+            log = self.loom / "logs/codex/T042-fix-the-thing.log"
+            self.wait_for_run_text(log, "deferred until next pass", run)
+            self.assertEqual(run.result(timeout=5).returncode, 0)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_heavy_repo_lock_respects_an_external_pid_and_reclaims_it_after_exit(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        env = dict(LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+        with subprocess.Popen(["sleep", "60"]) as other:
+            try:
+                (lock / "pid").write_text(str(other.pid) + "\n")
+                self.assertEqual(self.run_lane(**env).returncode, 0)
+                self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+                self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                self.assertEqual((lock / "pid").read_text().strip(), str(other.pid))
+            finally:
+                other.terminate()
+        self.assertEqual(self.run_lane(**env).returncode, 0)
+        self.assertTrue((self.inbox / "done/T042-fix-the-thing.md").exists())
+        self.assertFalse(lock.exists())
 
     def wait_for_slot_log(self, text, seconds=20):
         log = Path(self._tmp.name) / "slots.log"

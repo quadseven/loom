@@ -252,6 +252,28 @@ unset variables.
   After `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) it leaves the same
   brief in the inbox for the next pass. Heartbeats, brief handoffs and
   cluster agent starts proceed independently of this gate.
+- `LOOM_HEAVY_REPOS` lists comma- or space-separated `owner/name` entries.
+  It defaults to empty, which disables repo locking. Each listed repo has
+  its own lock for the duration of a local agent run. Other build jobs on
+  the host can use the same protocol or call the helper directly. From
+  the shell that stays alive for the build, run
+  `python3 lanes/heavy_repo.py take "$lock"` and retry if busy. After the
+  build, run `python3 lanes/heavy_repo.py release "$lock"`.
+  Use the same `LOOM_HOME` and set `lock` to the
+  directory `$LOOM_HOME/run/heavy-repos/<owner>+<name>.lock`, with owner
+  and name in lowercase. Its `pid` file holds one positive decimal PID.
+  - Take an exclusive `flock(2)` on the persistent file
+    `$LOOM_HOME/run/heavy-repos/.guard` while reading or updating a lock.
+    Release the guard before building or waiting. Leave the guard file in place.
+  - If the PID is alive, release the guard and retry. A permission error
+    checking the PID also means busy. If the directory is absent, create
+    it. If the holder died or left an unfinished directory without a PID,
+    reclaim it. Write the new PID by renaming a temporary file to `pid`
+    before releasing the guard.
+  - On completion, take the guard, verify the PID still belongs to the
+    holder or the recorded process has exited, then remove `pid` and the
+    lock directory. The lane uses the same poll interval and wait limit as
+    for host load.
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
   hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
