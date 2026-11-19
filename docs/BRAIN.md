@@ -2826,6 +2826,13 @@ command, the rewrite and a restated Live line are all held to this, so the
 restate prompt asks the rewrite command for such a check, never for a quoted
 string alone.
 
+A ticket filed by hand (it carries no `<!-- loom:test-named -->` marker, which
+the `brief` command and the rewrite write) that was created at or after
+2026-11-21T00:00:00Z and names no test in an acceptance box gets no lane: it
+gains `needs-brain` and one note naming the missing box. Add the box, or
+rewrite the ticket. A ticket created before that time is never held by this
+rule.
+
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it
 shipped and its Live criterion (the acceptance line that starts with

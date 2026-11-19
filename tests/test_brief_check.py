@@ -106,6 +106,10 @@ class Route:
 
 
 def ticket(body=STALE_REWRITE, number=206, labels=("loom:ticket", "loom:briefed", "lane:codex")):
+    # A ticket the brief command or the rewrite filed: it carries their
+    # marker (brief_check.TEST_MARKER), so the hold on a ticket filed by hand
+    # (#3299, the HandFiled class) passes it over.
+    body = brief_check.with_test_marker(body)
     return {"number": number, "state": "open", "body": body, "created_at": iso(86400),
             "user": {"login": "loom-brain[bot]"}, "labels": [{"name": n} for n in labels]}
 
@@ -934,3 +938,224 @@ class Split(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HandFiled(unittest.TestCase):
+    """#3299: a ticket that reached the board without the brief command or
+    the rewrite (a person put the ticket label on a hand-written issue) was
+    not read by the test rule of #3277, so a lane could still get a ticket
+    that names no test. It now gets no lane at the claim-time checks. The
+    cutoff is the marker and the ticket's own creation time, never the
+    clock: a ticket created before the rule is not held, whatever it says."""
+
+    BEFORE = "2026-11-20T23:59:59Z"
+    AFTER = brief_check.TEST_RULE_SINCE
+    NO_TEST = ("Difficulty: medium\n\n## Why\n\nThe totals are wrong on every page.\n\n## What\n\n"
+               "- Fix the total.\n\n## Acceptance criteria\n- [ ] The total is right.\n"
+               "- [ ] The page shows it.\n\n## Size\nS\n\n## Out of scope\n- Other pages.\n")
+    WITH_TEST = NO_TEST.replace("- [ ] The page shows it.",
+                                "- [ ] tests/test_totals.py shows the total right.")
+    ANSWER = "Deliverable: answer\n" + NO_TEST
+
+    def setUp(self):
+        from test_bus_factory import FakeGitHub, REPO as FREPO
+        self.repo = FREPO
+        self.gh = FakeGitHub()
+        lanes = mock.patch.dict(os.environ, {"LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"})
+        lanes.start()
+        self.addCleanup(lanes.stop)
+
+    def issue(self, body, created, number=7, extra=()):
+        return {"number": number, "state": "open", "title": "Fix the total", "body": body,
+                "created_at": created, "user": {"login": "a-person"},
+                "labels": [{"name": n} for n in
+                           ("loom:ticket", "loom:queued", "lane:muse") + tuple(extra)]}
+
+    def check(self, issue):
+        fake = Route({"/repos/%s/issues/%d/timeline" % (REPO, issue["number"]): []})
+        return brief_check.check(GitHub("t", transport=fake), REPO, issue, [], TRUSTED, "main")
+
+    def queue(self, issue):
+        """The ticket on the factory's queue; the pass that reads it."""
+        number = issue["number"]
+        self.gh.ticket(number, "queued", body=issue["body"])
+        self.gh.issues[number]["labels"] = [x for x in issue["labels"]
+                                            if not x["name"].startswith("lane:")]
+        self.gh.issues[number]["created_at"] = issue["created_at"]
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+        worker.assign_queued()
+        return worker
+
+    def lane_of(self, number):
+        return [x["name"] for x in self.gh.issues[number]["labels"] if x["name"].startswith("lane:")]
+
+    def said(self, number):
+        return "\n".join(str(c.get("body") or "") for c in self.gh.comments[number])
+
+    def test_the_cutoff_is_a_fixed_time_and_not_the_clock(self):
+        self.assertEqual(brief_check.TEST_RULE_SINCE, "2026-11-21T00:00:00Z")
+        self.assertGreater(brief_check._ts(brief_check.TEST_RULE_SINCE), 0)
+
+    def test_a_ticket_created_after_the_cutoff_with_no_marker_and_no_test_gets_no_lane(self):
+        got = self.check(self.issue(self.NO_TEST, self.AFTER))
+        self.assertEqual(got.kind, brief_check.CRITERIA)
+        self.assertIn("none of its acceptance boxes names the test that proves it", got.reason)
+        self.assertTrue(got.key.startswith("test-"), got.key)
+
+    def test_the_same_ticket_created_before_the_cutoff_passes(self):
+        self.assertIsNone(self.check(self.issue(self.NO_TEST, self.BEFORE)))
+        self.assertIsNone(brief_check.hand_filed_verdict(self.issue(self.NO_TEST, self.BEFORE)))
+
+    def test_a_ticket_already_on_the_board_is_never_held_whatever_it_contains(self):
+        from bus import lane
+        for created in ("2020-01-01T00:00:00Z", "2026-11-19T09:35:03Z", self.BEFORE):
+            for body in (self.NO_TEST, self.NO_TEST.replace("- [ ] The page shows it.\n", "")):
+                with self.subTest(created=created):
+                    issue = self.issue(body, created)
+                    self.assertIsNone(brief_check.hand_filed_verdict(issue))
+                    self.assertIsNone(self.check(issue))
+                    self.assertIsNone(lane._rejection_reason(issue, "muse"))
+        worker = self.queue(self.issue(self.NO_TEST, self.BEFORE))
+        self.assertNotIn("%s#7" % self.repo, worker.waits)
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[7]))
+        self.assertNotIn("Held for the brain", self.said(7))
+        self.assertNotEqual(self.lane_of(7), [])
+
+    def test_a_ticket_whose_creation_time_cannot_be_read_is_not_shown_to_be_new(self):
+        for created in (None, "", "yesterday"):
+            with self.subTest(created=created):
+                self.assertIsNone(brief_check.hand_filed_verdict(self.issue(self.NO_TEST, created)))
+
+    def test_a_ticket_that_names_its_test_passes_without_the_marker(self):
+        self.assertIsNone(self.check(self.issue(self.WITH_TEST, self.AFTER)))
+
+    def test_the_marker_is_written_once(self):
+        once = brief_check.with_test_marker(self.WITH_TEST)
+        self.assertEqual(once.count(brief_check.TEST_MARKER), 1)
+        self.assertEqual(brief_check.with_test_marker(once), once)
+
+    def test_a_ticket_the_brief_command_filed_carries_the_marker_and_is_never_held(self):
+        import contextlib
+        import io
+        from bus import brain
+        with mock.patch.object(brain, "_read", return_value=self.WITH_TEST.split("\n\n", 1)[1]), \
+                mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                mock.patch.object(brain, "brief", return_value="filed") as make, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = brain.main(["brief", REPO, "--epic", "2", "--title", "Fix the total",
+                               "--file", "unused", "--lane", "codex"])
+        self.assertEqual(code, 0)
+        filed = make.call_args.args[4]
+        self.assertIn(brief_check.TEST_MARKER, filed)
+        self.never_held(filed)
+
+    def test_a_ticket_the_rewrite_filed_carries_the_marker_and_is_never_held(self):
+        from bus import rewrite
+        action, fields = rewrite.validate({
+            "action": "brief", "title": "Fix the total", "difficulty": "medium",
+            "body": self.WITH_TEST.split("\n\n", 1)[1]})
+        self.assertEqual(action, "brief")
+        self.assertIn(brief_check.TEST_MARKER, fields["body"])
+        self.never_held(fields["body"])
+
+    def never_held(self, filed):
+        """A ticket carrying the marker is passed over by all three readings,
+        even after its test box was edited away."""
+        from bus import lane, tickets
+        edited = "Difficulty: medium\n\n" + filed.replace(
+            "- [ ] tests/test_totals.py shows the total right.", "- [ ] The page shows it.")
+        self.assertIsNotNone(brief_check.test_verdict(edited))
+        # An in-place rewrite keeps the source's text below the brief.
+        for body in (edited, tickets.with_original(edited, {"title": "Old", "body": "old words"})):
+            issue = self.issue(body, "2027-01-01T00:00:00Z")
+            self.assertIsNone(brief_check.hand_filed_verdict(issue))
+            self.assertIsNone(self.check(issue))
+            self.assertIsNone(lane._rejection_reason(issue, "muse"))
+        worker = self.queue(self.issue(edited, "2027-01-01T00:00:00Z"))
+        self.assertNotIn("%s#7" % self.repo, worker.waits)
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[7]))
+
+    def test_a_marker_only_in_the_quoted_original_text_does_not_count(self):
+        from bus import tickets
+        body = tickets.with_original(self.NO_TEST, {"title": "Old", "body": brief_check.TEST_MARKER})
+        self.assertIsNotNone(brief_check.hand_filed_verdict(self.issue(body, self.AFTER)))
+
+    def test_the_three_readings_agree(self):
+        # The brief check (the station's claim), the factory's hold and the
+        # lane's own check: a ticket one holds and another takes is handed
+        # from lane to lane (loom#2249).
+        from bus import lane
+        marked = brief_check.with_test_marker(self.NO_TEST)
+        cases = (("held", self.NO_TEST, self.AFTER, (), True),
+                 ("later", self.NO_TEST, "2027-03-01T12:00:00Z", (), True),
+                 ("before", self.NO_TEST, self.BEFORE, (), False),
+                 ("marked", marked, self.AFTER, (), False),
+                 ("test named", self.WITH_TEST, self.AFTER, (), False),
+                 ("answer", self.ANSWER, self.AFTER, (), False),
+                 ("regression", self.NO_TEST, self.AFTER, ("loom:regression",), False),
+                 ("revert", self.NO_TEST, self.AFTER, ("loom:revert",), False))
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+        for number, (name, body, created, extra, held) in enumerate(cases, start=20):
+            with self.subTest(name):
+                issue = self.issue(body, created, number=number, extra=extra)
+                self.gh.ticket(number, "queued", body=body)
+                self.assertEqual(self.check(issue) is not None, held)
+                self.assertEqual(lane._rejection_reason(issue, "muse") is not None, held)
+                self.assertEqual(bool(worker._no_test(self.repo, issue)), held)
+                self.assertEqual(brief_check.hand_filed_verdict(issue) is not None, held)
+
+    def test_the_lane_names_the_reason_it_does_not_take_the_ticket(self):
+        from bus import lane
+        self.assertEqual(lane._rejection_reason(self.issue(self.NO_TEST, self.AFTER), "muse"),
+                         "no acceptance box names a test")
+
+    def test_the_hold_posts_its_note_once_and_adds_needs_brain_once(self):
+        issue = self.issue(self.NO_TEST, self.AFTER)
+        for _ in range(3):
+            worker = self.queue_again(issue)
+        self.assertEqual(worker.waits["%s#7" % self.repo], "names no test in an acceptance box")
+        self.assertEqual(self.lane_of(7), [])
+        self.assertIn("needs-brain", factory._labels(self.gh.issues[7]))
+        (note,) = [c["body"] for c in self.gh.comments[7]]
+        self.assertIn("names the test that proves it", note)
+        self.assertIn("a test file path", note)
+        adds = [w for w in self.gh.writes if w[0] == "POST" and w[1].endswith("/issues/7/labels")
+                and "needs-brain" in (w[2] or {}).get("labels", [])]
+        self.assertEqual(len(adds), 1)
+
+    def queue_again(self, issue):
+        if issue["number"] not in self.gh.issues:
+            return self.queue(issue)
+        worker = factory.Factory(self.gh, [self.repo], NOW, trusted=["alice-example"])
+        worker.assign_queued()
+        return worker
+
+    def test_the_station_holds_it_at_the_claim_with_the_note_naming_the_missing_box(self):
+        claim = StationClaim()
+        issue = self.issue(self.NO_TEST, self.AFTER, number=206)
+        issue["labels"] = [{"name": n} for n in ("loom:ticket", "loom:briefed", "lane:codex")]
+        fake = claim.routes(issue)
+        self.assertTrue(claim.station(fake)._brief_holds(REPO, issue, []))
+        self.assertIn(["loom:ticket", "lane:codex", "loom:queued"], claim.labels_put(fake))
+        self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO, {"labels": ["needs-brain"]}),
+                      fake.writes)
+        said = json.dumps([b for _, _, b in fake.writes])
+        self.assertIn("none of its acceptance boxes names the test that proves it", said)
+        self.assertIn("A lane gets it once one acceptance box names the test", said)
+        self.assertNotIn("names each acceptance criterion as a checkbox", said)
+        # Created before the cutoff, the station claims it as it always did.
+        old = dict(issue, created_at=self.BEFORE,
+                   labels=[{"name": n} for n in ("loom:ticket", "loom:briefed", "lane:codex")])
+        fake = claim.routes(old)
+        self.assertFalse(claim.station(fake)._brief_holds(REPO, old, []))
+        self.assertEqual(fake.writes, [])
+
+    def test_an_answer_ticket_stays_exempt(self):
+        issue = self.issue(self.ANSWER, self.AFTER)
+        self.assertIsNone(brief_check.hand_filed_verdict(issue))
+        self.assertIsNone(self.check(issue))
+        worker = self.queue(issue)
+        self.assertNotIn("needs-brain", factory._labels(self.gh.issues[7]))
+        self.assertNotIn("Held for the brain", self.said(7))
+        self.assertNotIn("%s#7" % self.repo, worker.waits)
+        self.assertNotEqual(self.lane_of(7), [])

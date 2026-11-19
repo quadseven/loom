@@ -50,6 +50,11 @@ Before the station hands a ticket to a lane (`check`), it reads:
   failure. Writing criteria is the brain's rewrite work, so the ticket
   goes back the same way a health ticket does. An answer ticket opens no
   pull request and is exempt, as at the runner.
+- test: a build ticket that reached the board without the brief command
+  or the rewrite (it carries no `TEST_MARKER`), was created at or after
+  `TEST_RULE_SINCE`, and names no test in an acceptance box gets no lane
+  (`hand_filed_verdict`), and goes back the same way. A ticket created
+  before that time is never held by this rule.
 - split: a brief whose What or acceptance criteria name more than one
   platform, or whose estimated diff exceeds 800 lines, gets no lane
   (`split_verdict`). Splitting the work into smaller tickets, with After:
@@ -310,6 +315,55 @@ def test_verdict(body: str) -> Optional[Verdict]:
 
 
 test_verdict.__test__ = False  # a name unittest and pytest must not collect
+
+
+# -- a ticket filed by hand -----------------------------------------------------
+# The marker the brief command and the rewrite write into the body of a
+# ticket they file: the test rule was applied where the ticket was written.
+# Loom also writes it into a ticket it files from a template of its own (a
+# validation contract, an adopted pull request, criteria a lane left
+# unbuilt): no person wrote that ticket by hand, so the hold is not for it.
+TEST_MARKER = "<!-- loom:test-named -->"
+# The rule reads only a ticket created at or after this time (UTC). It is a
+# fixed time just after the hold shipped, never the clock: a ticket created
+# earlier was on the board before the rule and is never held by it, whatever
+# it contains, so the hold needs no bulk rewrite (#3299).
+TEST_RULE_SINCE = "2026-11-21T00:00:00Z"
+# A regression or revert ticket is exempt, as it is from the stale reads at
+# the station's claim: holding one back keeps a broken change live.
+TEST_RULE_EXEMPT = frozenset({"loom:regression", "loom:revert"})
+TEST_HINT = ("A lane gets it once one acceptance box names the test that proves it: a test "
+             "file path, a command that runs tests in CI or a throwaway environment, or a "
+             "test that fails without the change and passes with it.")
+
+
+def with_test_marker(body: str) -> str:
+    """The body with the marker of a ticket the test rule was applied to
+    (TEST_MARKER), written once."""
+    body = body or ""
+    if TEST_MARKER in body:
+        return body
+    return body.rstrip("\n") + "\n\n" + TEST_MARKER + "\n"
+
+
+def hand_filed_verdict(issue: Mapping[str, Any]) -> Optional[Verdict]:
+    """Why a ticket that reached the board without the brief command or the
+    rewrite gets no lane, or None: it carries no TEST_MARKER, was created at
+    or after TEST_RULE_SINCE, and none of its acceptance boxes names a test
+    (test_verdict). A ticket whose creation time is absent or unreadable is
+    not shown to be new, so it is not held. The one reading the brief check,
+    the factory's hold and the lane's own claim share, so they cannot
+    disagree about a ticket. Reads nothing."""
+    body = str(issue.get("body") or "")
+    if TEST_MARKER in tickets.without_original(body):
+        return None
+    if _ts(issue.get("created_at")) < _ts(TEST_RULE_SINCE):
+        return None
+    names = {str(n.get("name") if isinstance(n, dict) else n)
+             for n in issue.get("labels") or []}
+    if names & TEST_RULE_EXEMPT:
+        return None
+    return test_verdict(body)
 
 
 # -- split --------------------------------------------------------------------
@@ -847,6 +901,8 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     # that verdict and its ask, and the criteria park still waits for every
     # ticket the stale reads pass over.
     criteria = criteria_verdict(body)
+    if criteria is None:
+        criteria = hand_filed_verdict(issue)
     split = split_verdict(body)
     done = asked(comments, trusted)
     operator = tickets.operator_login(trusted) or ""

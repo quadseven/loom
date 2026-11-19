@@ -48,7 +48,7 @@ BODY = "Difficulty: hard\nModel: model-x\n\n## Why\nBecause.\n\n## What\nDo it.\
 # passes dispatch their tickets set the fake's default_body to this; tests
 # that want the criteria-free body pass BODY itself.
 BODY_WITH_CRITERIA = (BODY + "\n## Acceptance criteria\n"
-                      "- [ ] A test shows the thing is fixed.\n")
+                      "- [ ] A test fails without the fix and passes with it.\n")
 
 
 def reply(status=200, body=None, headers=None):
@@ -1716,6 +1716,12 @@ class AdoptUntrackedPullRequestTest(Base):
         self.assertEqual(made[0]["labels"], ["loom:ticket", "loom:queued"])
         body = made[0]["body"]
         self.assertTrue(body.startswith("Difficulty: medium\n\n## Why\n"))
+        # Loom's own template, no ticket filed by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        self.assertIsNotNone(brief_check.test_verdict(body))
+        self.assertIsNone(brief_check.hand_filed_verdict(
+            {"body": body, "created_at": brief_check.TEST_RULE_SINCE}))
         for section in ("## What", "## Acceptance criteria", "## Size", "## Out of scope",
                         "## Definition of done"):
             self.assertIn(section, body)
@@ -5282,6 +5288,12 @@ class ValidationContractTest(Base):
         self.assertIn(".loom/validation.conf", file_ticket.call_args.args[4])
         # The brief says which commands a lane machine can run (loom#1290).
         self.assertIn("no secrets, simulators or unset variables", file_ticket.call_args.args[4])
+        # Loom's own template, no ticket filed by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        made = {"body": file_ticket.call_args.args[4], "created_at": brief_check.TEST_RULE_SINCE}
+        self.assertIsNotNone(brief_check.test_verdict(made["body"]))
+        self.assertIsNone(brief_check.hand_filed_verdict(made))
 
         worker.gh.rest = mock.Mock(return_value=type("Response", (), {"data": [
             {"number": 3, "title": "Add the repository validation contract"}
@@ -5529,14 +5541,15 @@ class ClaimTest(Base):
         text = self.claimed_brief(
             "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
             "## Acceptance criteria\n- [ ] A test: the report reads each run row "
-            "from the runs table.\n")
+            "from the runs table.\n- [ ] tests/test_report.py passes.\n")
         self.assertIn(tickets.FIXTURE_NOTE, text)
         self.assertNotIn("Fixture-Source", text)
 
     def test_a_brief_for_a_ticket_that_reads_no_rows_has_no_fixture_line(self):
         text = self.claimed_brief(
             "Difficulty: medium\n\n## Why\nTest\n\n## What\nDo it\n\n"
-            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n")
+            "## Acceptance criteria\n- [ ] A test: the status line names the base.\n"
+            "- [ ] tests/test_status.py passes.\n")
         self.assertNotIn(tickets.FIXTURE_NOTE, text)
 
     def test_a_limit_on_another_model_or_one_that_lifted_does_not_hold_the_claim(self):
@@ -5931,7 +5944,7 @@ class ClaimTest(Base):
         self.heartbeat("spark")
         self.fake.add(12)
         self.fake.add(13, body="Difficulty: medium\n\n## Why\nx\n"
-                      "\n## Acceptance criteria\n\n- [ ] x\n", state="queued")
+                      "\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n", state="queued")
         self.fake.issues[13]["labels"] = [{"name": "loom:ticket"}, {"name": "loom:queued"}]
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time() - 300)
@@ -6540,7 +6553,7 @@ EASY = PLAIN.replace("hard", "easy")
 # PLAIN with the criterion a dispatchable ticket carries (loom#2162), for
 # the helpers below whose tickets a pass goes on to claim or re-brief.
 PLAIN_WITH_CRITERIA = (PLAIN + "\n## Acceptance criteria\n"
-                       "- [ ] A test shows the thing is fixed.\n")
+                       "- [ ] A test fails without the fix and passes with it.\n")
 
 
 class RetryTest(Base):
@@ -7676,7 +7689,7 @@ class DeadLaneRunawayTest(Base):
     lane of its tier, naming the lane fault; this is not a failure, so the
     ladder does not move."""
     MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
-              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
+              "## Acceptance criteria\n- [ ] A test fails without the fix and passes with it.\n")
 
     def bodies(self, number=12):
         return [c["body"] for c in status.expand(self.fake.comments[number], AUTHORS)]
@@ -9888,7 +9901,10 @@ class VerifyBeforeBuildTest(Base):
     def sent(self):
         """Ticket 12 shipped after the station sent pull request 77 to verify."""
         self.fake.private = False
-        self.fake.add(12, lane="codex", body=SHIPPED_BODY, state="shipped",
+        # The box names its test: sent back to a build lane, the ticket is
+        # one the claim takes (#3299).
+        self.fake.add(12, lane="codex", state="shipped",
+                      body=SHIPPED_BODY.replace("A test passes", "tests/test_daily.py passes"),
                       events=[labeled("loom:briefed", "alice-example"),
                               labeled("lane:codex", "bob-example")] + shipped_at(30))
         self.merged()
@@ -16025,7 +16041,7 @@ class RunnerSlotClaimTest(Base):
     (loom#1917)."""
 
     MEDIUM = ("Difficulty: medium\n\n## Why\nBecause.\n\n## What\nDo it.\n\n"
-              "## Acceptance criteria\n- [ ] A test shows the thing is fixed.\n")
+              "## Acceptance criteria\n- [ ] A test fails without the fix and passes with it.\n")
 
     def claim(self):
         with mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-gemma"}):

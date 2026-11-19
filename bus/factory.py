@@ -714,6 +714,14 @@ NO_CRITERIA_NOTE = (
     "can prove. Add an `## Acceptance criteria` section with at least one `- [ ]` "
     "checkbox; no lane takes it until then.")
 
+# The one note on a queued ticket filed by hand that names no test
+# (Factory._no_test, brief_check.hand_filed_verdict).
+NO_TEST_NOTE = (
+    "Held for the brain (needs-brain): none of this ticket's acceptance boxes names the "
+    "test that proves it. Add one `- [ ] ` box that names a test file path, a command "
+    "that runs tests in CI or a throwaway environment, or a test that fails without the "
+    "change and passes with it; no lane takes it until then.")
+
 NO_AREA_NOTE = (
     "Held for the brain (needs-brain): this repo files every ticket under an area of "
     "play, and this ticket carries no `area:` label. Add the one `area:` label that "
@@ -4185,7 +4193,11 @@ class Factory:
         body = ("Difficulty: medium\n\n## Why\nThe lane pull request marked these ticket criteria as not built.\n\n"
                 "## What\nComplete the remaining acceptance criteria.\n\n## Acceptance criteria\n" +
                 "\n".join("- [ ] " + item for item in criteria) +
-                "\n\n## Size\nS\n\n## Out of scope\n- None\n\nPart of #%d\n" % epic)
+                # The marker: the factory wrote this ticket from one a lane
+                # already built, no person by hand, so the claim-time test
+                # hold passes it over (brief_check.hand_filed_verdict).
+                "\n\n## Size\nS\n\n## Out of scope\n- None\n\n%s\n\nPart of #%d\n"
+                % (brief_check.TEST_MARKER, epic))
         made = self.gh.rest("POST", "/repos/%s/issues" % repo, {
             "title": title, "body": body, "labels": ["loom:ticket", "loom:queued"]}).data or {}
         if placed:
@@ -5493,7 +5505,7 @@ class Factory:
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
-                or self._no_split(repo, issue)
+                or self._no_test(repo, issue) or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
         if held:
             return "waits: " + held
@@ -5539,6 +5551,27 @@ class Factory:
             self.actions += 1
             _say("held queued %s#%d for the brain: no acceptance criteria" % (repo, number))
         reason = "has no acceptance criteria"
+        self._waiting(repo, number, reason)
+        return reason
+
+    def _no_test(self, repo: str, issue: Dict[str, Any]) -> str:
+        """Why a queued ticket filed by hand whose boxes name no test gets no
+        lane, or "" (brief_check.hand_filed_verdict, the reading the station's
+        claim and the lane's own check share). Like _no_criteria it gains
+        needs-brain and one note naming the missing box, once. A ticket the
+        brief command or the rewrite filed, and one created before the rule,
+        are never held here."""
+        if brief_check.hand_filed_verdict(issue) is None:
+            return ""
+        number = int(issue["number"])
+        if "needs-brain" not in _labels(issue):
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
+            notify.post(self.gh, repo, number, NO_TEST_NOTE, notify.HELD)
+            self.actions += 1
+            _say("held queued %s#%d for the brain: no acceptance box names a test" % (repo, number))
+        reason = "names no test in an acceptance box"
         self._waiting(repo, number, reason)
         return reason
 

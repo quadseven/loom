@@ -3306,8 +3306,10 @@ class Station:
                           for issue in open_issues)
             if pending:
                 continue
-            brain.brief_intake(self.gh, repo, int(goal["number"]), title, body,
-                               difficulty="medium")
+            # Loom's own template, not a ticket filed by hand: the claim-time
+            # test hold passes it over (brief_check.hand_filed_verdict).
+            brain.brief_intake(self.gh, repo, int(goal["number"]), title,
+                               brief_check.with_test_marker(body), difficulty="medium")
 
     def _still_ours(self, issue: Dict[str, Any], lane: str) -> bool:
         names = _label_names(issue)
@@ -6103,7 +6105,8 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
                 self._routine(repo, number, brief_check.HEALTH_NOTE % (
-                    found.reason, "A lane gets it once its body names each acceptance "
+                    found.reason, brief_check.TEST_HINT if found.key.startswith("test-")
+                    else "A lane gets it once its body names each acceptance "
                     "criterion as a checkbox under `## Acceptance criteria`, stated as "
                     "an observable result: the brief restates each one as the check "
                     "that proves it."))
@@ -6969,8 +6972,11 @@ class Station:
             self._adoption_refused(repo, rec, "no goal home to file adoption tickets on")
             return
         try:
+            # Loom's own template, not a ticket filed by hand: the claim-time
+            # test hold passes it over (brief_check.hand_filed_verdict).
             url = brain.brief_intake(self.gh, repo, goal, self._adoption_title(repo, pr),
-                              adoption_body(number), difficulty="medium")
+                                     brief_check.with_test_marker(adoption_body(number)),
+                                     difficulty="medium")
         except ValueError as err:
             # The goal is at its cap or holds too much unproven work: tried
             # again after ADOPT_RETRY.

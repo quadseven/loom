@@ -30,7 +30,9 @@ NO_OPUS = ("claude",) + factory.ANTHROPIC
 
 # An acceptance criteria section with one box: a queued ticket without one
 # gets no lane (loom#2249).
-ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] x\n"
+# The box names a test: a ticket created after brief_check.TEST_RULE_SINCE
+# whose boxes name none gets no lane (#3299).
+ACCEPTANCE = "\n## Acceptance criteria\n\n- [ ] tests/test_x.py passes\n"
 
 
 def lane_models(**models):
@@ -586,6 +588,12 @@ class PullRequests(Base):
         self.assertEqual(self.merged, [(50, (REPO, 5))])
         self.assertEqual(len(self.gh.filed), 1)
         self.assertIn("- [ ] A5", self.gh.filed[0]["body"])
+        # The factory wrote the ticket, no person by hand: created after the
+        # cutoff with no test named, it is still not held (#3299).
+        from bus import brief_check
+        made = dict(self.gh.filed[0], created_at=brief_check.TEST_RULE_SINCE)
+        self.assertIsNotNone(brief_check.test_verdict(made["body"]))
+        self.assertIsNone(brief_check.hand_filed_verdict(made))
 
     def test_moves_are_counted_since_the_last_claim_or_hold(self):
         def note(at, body, who=ME["login"]):

@@ -17,7 +17,7 @@ import subprocess
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from . import brain, brain_hold, labels, status, tickets
+from . import brain, brain_hold, brief_check, labels, status, tickets
 from .kinds import HUMAN_KINDS, refused_as_hold
 from .text import SECRET_RE, scrub_paths
 from .github import GitHub
@@ -391,7 +391,10 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         brain._check_test_named(body)
     except ValueError as err:
         raise Invalid(str(err)) from None
-    return "brief", {"title": title, "difficulty": difficulty, "body": body}
+    # The rule was applied here: the ticket says so, and the claim-time hold
+    # for a ticket filed by hand passes it over.
+    return "brief", {"title": title, "difficulty": difficulty,
+                     "body": brief_check.with_test_marker(body)}
 
 
 def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:

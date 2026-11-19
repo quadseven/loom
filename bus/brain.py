@@ -9081,6 +9081,9 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     # the station's own absence tracking, not by a log string.
     _check_live_criterion(body)
     _check_test_named(body)
+    # The rule was applied here: the ticket says so, and the claim-time hold
+    # for a ticket filed by hand passes it over.
+    body = brief_check.with_test_marker(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,

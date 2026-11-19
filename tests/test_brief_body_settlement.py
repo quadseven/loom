@@ -11,7 +11,7 @@ from tests.test_brief_check import (REPO, TRUSTED, OPERATOR, STALE_REWRITE,
 class BodySettlementTests(unittest.TestCase):
     def setUp(self):
         self.issue = ticket()
-        digest = hashlib.sha256(STALE_REWRITE.encode()).hexdigest()
+        digest = hashlib.sha256(self.issue['body'].encode()).hexdigest()
         self.notes = [comment('<!-- loom:stale-brief comment-99 -->\n'
                               '<!-- loom:stale-body %s -->' % digest,
                               login='loom-station[bot]', bot=True, ago=120)]

@@ -90,6 +90,19 @@ observation of the live system after the fact (owner ruling of 2026-11-19).
 goes back to its writer before it is filed; an answer ticket is exempt, and
 tickets already on the board are not read by this rule.
 
+Both write the marker `<!-- loom:test-named -->` into the body of the ticket
+they file. A ticket that reaches the board another way (a person puts the
+ticket label on a hand-written issue) carries no marker: when it was created
+at or after 2026-11-21T00:00:00Z and none of its boxes names a test, it gets
+no lane. The station's claim, the factory's queue and a lane's own claim
+share one reading (`bus/brief_check.py` `hand_filed_verdict`), and the ticket
+gains `needs-brain` and one note naming the missing box. The cutoff is the
+ticket's own creation time, so a ticket created before it is never held by
+this rule, whatever it contains. A regression or revert ticket is exempt,
+and so is a ticket Loom files from a template of its own (a validation
+contract, an adopted pull request, criteria a lane left unbuilt), which
+carries the marker too.
+
 A `Live:` box is written only when it names a read-only check Loom can run by
 itself: an `https://` URL, a `gh api <path>` read, a read-only `kubectl get
 ...` or `kubectl rollout status ...`, a `log:<source>` or `sql:` step for the
