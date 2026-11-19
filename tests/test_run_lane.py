@@ -80,6 +80,9 @@ printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
 if [ -n "${FAKE_GH_HANG:-}" ]; then exec sleep 30; fi
 if [ "$1" = api ]; then
   [ -z "${FAKE_GH_API_FAIL:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  if [ "$2" = repos/example/repo/issues/42 ] && [ -n "${FAKE_GH_TICKET:-}" ]; then
+    cat "$FAKE_GH_TICKET"; exit $?
+  fi
   # Comments the lane edits in place live in "$FAKE_LOG.comments": file ID is
   # the body, ID.on is "OWNER/NAME NUMBER". A listing prints the IDs whose body
   # starts with $MARKER; $FAKE_GH_COMMENTS_FAIL fails every comment read.
@@ -679,6 +682,8 @@ class LaneRunnerTest(unittest.TestCase):
 import os, re, subprocess, sys
 args = sys.argv[1:]
 mode, value = args[0], args[1]
+if mode == '--diff' and os.environ.get('FAKE_REMOVE_BRIEF'):
+    os.unlink(os.environ['FAKE_REMOVE_BRIEF'])
 # Each call's arguments, one a line, for the tests that check what it was asked.
 with open(os.environ['FAKE_LOG'] + '.scanner', 'a', encoding='utf-8') as calls:
     calls.write(' '.join(args) + '\\n')

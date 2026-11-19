@@ -721,22 +721,45 @@ pr_body() {
 PLAN_HOLD_MARKER="<!-- loom:plan-hold v1 -->"
 PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
 
-# The body of a new pull request, in PR_BODY. A body that fails the review
-# bot's plan checks (bus/hunt_plan.py) has the failing parts rebuilt from the
-# brief by bus/pr_repair.py, the code the factory and fix rounds use. What the
-# brief still lacks goes in PLAN_GAPS, one per line: the pull request opens
-# anyway (the work is done), marked so the factory sends it no lane round,
-# whose agent edits code and never the body (loom#1837).
+# Compose from the filed brief, or render the ticket again if the run lost it.
+# Keep the recovered copy outside the inbox so it cannot start another run.
 compose_pr_body() {
-  local problems body_file out_file summary=() private=()
+  local recovered
   PLAN_GAPS=""
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  if [ -f "$BRIEF" ]; then
+    compose_pr_body_from "$BRIEF"
+    return
+  fi
+  if [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
+     timeout "$NET_TIMEOUT" gh api "repos/$REPO/issues/$ISSUE_NUMBER" 2>> "$LOG" |
+       PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import json, sys
+from bus.tickets import render_brief
+issue = json.load(sys.stdin)
+if not (issue.get("body") or "").strip():
+    sys.exit("ticket body is empty")
+print(render_brief(sys.argv[1], issue, sys.argv[2]))
+' "$REPO" "$LANE" > "$recovered" 2>> "$LOG"; then
+    compose_pr_body_from "$recovered"
+  else
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] brief file missing: ${BRIEF##*/}; could not rebuild from ticket" >> "$LOG"
+    PR_BODY="$(pr_body /dev/null "$TICKET")"
+  fi
+  [ -z "${recovered:-}" ] || rm -f "$recovered"
+}
+
+# Repair a failing body from the same source used to compose it. PLAN_GAPS
+# holds any sections that source still lacks for the ticket's plan-hold note.
+compose_pr_body_from() {
+  local problems dir summary=() private=()
+  PR_BODY="$(pr_body "$1" "$TICKET")"
   problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
   echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
-  if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
-    PLAN_GAPS="$problems"; return 0
+  if ! dir="$(mktemp -d "$TMPDIR/pr-plan.XXXXXX")"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] could not create scratch files for plan repair" >> "$LOG"
+    return 0
   fi
-  printf '%s\n' "$PR_BODY" > "$body_file"
+  printf '%s\n' "$PR_BODY" > "$dir/body"
   if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
     summary=(--summary "$WORKDIR/$TICKET.summary.md")
   elif [ -f "$TREE/$SUMMARY_FILE" ]; then
@@ -744,16 +767,17 @@ compose_pr_body() {
   fi
   repo_is_public || private=(--private)
   if PLAN_GAPS="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -B -m bus.pr_repair plan \
-       "$BRIEF" "$body_file" "$LANE" "$MODEL" "$TICKET" --out "$out_file" --repo "$REPO" \
+       "$1" "$dir/body" "$LANE" "$MODEL" "$TICKET" --out "$dir/out" --repo "$REPO" \
        ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} 2>> "$LOG")"; then
-    PR_BODY="$(cat "$out_file")"
+    PR_BODY="$(cat "$dir/out")"
     PLAN_GAPS=""
     echo "[$(date -u +%FT%TZ)] $TICKET pull request body rebuilt from the brief; it passes the plan checks" >> "$LOG"
-  else
-    [ -n "$PLAN_GAPS" ] || PLAN_GAPS="$problems"
+  elif [ -n "$PLAN_GAPS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET the brief lacks for the plan checks: $(printf '%s' "$PLAN_GAPS" | tr '\n' ';')" >> "$LOG"
+  else
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] could not check the brief for plan gaps" >> "$LOG"
   fi
-  rm -f "$body_file" "$out_file"
+  rm -rf "$dir"
 }
 
 # The ticket's one plan-hold note, edited in place on every later pull
@@ -5562,5 +5586,5 @@ Review threads this round left without a reply: $UNANSWERED"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
   printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
-  mv "$BRIEF" "$INBOX/done/"
+  if [ -f "$BRIEF" ]; then mv "$BRIEF" "$INBOX/done/"; fi
 done
