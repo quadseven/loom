@@ -16433,6 +16433,14 @@ class Station:
         ask = scope_fit.asker(self.s.scope_url, self.s.scope_model)
         # Passed only when the check is on, so the factory's default stays off.
         extra = {"scope": ask} if ask is not None else {}
+        slots = runners.runner_slots(os.environ)
+        if slots:
+            # The factory's lane pick reads the runner ledger's base-red
+            # stops through the same read dispatch makes (loom#3211).
+            runner_repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+            extra["runner_stops"] = runners.Runners(
+                self.gh, self.s.home, runner_repo, slots, dict(os.environ),
+                self._public, _say, now=self.now).stops
         pairs = self.benched_pairs()
         return factory.Factory(self.gh, repos, self.now, trusted=self.s.authors,
                                briefers=self.s.briefers,

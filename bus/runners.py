@@ -607,6 +607,26 @@ class Runners:
             return None
         return red
 
+    def stops(self, slot: str, repo: str, base: str) -> bool:
+        """Whether the slot's live base-red record stops `repo` on `base`,
+        read exactly as dispatch reads it (_base_red), for a caller choosing
+        work for the slot before dispatch (the factory's lane pick,
+        loom#3211): a stop the pick cannot see is a ticket claimed for a
+        slot whose runner only parks it. A record _base_red clears (a moved
+        head, the day probe) is saved back, as a dispatch pass leaves it. A
+        ledger that cannot be read stops nothing here: dispatch reads the
+        same ledger and stops every dispatch on it, so no brief is sent
+        either way."""
+        try:
+            ledger = self.load()
+        except ReportError:
+            return False
+        before = json.dumps(ledger["base_red"], sort_keys=True)
+        red = self._base_red(ledger, slot, repo, base)
+        if json.dumps(ledger["base_red"], sort_keys=True) != before:
+            self.save(ledger)
+        return red is not None
+
     def _note_image(self, ledger: Dict[str, Any], slot: str, files: Dict[str, bytes],
                     ticket: str) -> None:
         """A run on a new runner image clears the slot's red repos: the image
