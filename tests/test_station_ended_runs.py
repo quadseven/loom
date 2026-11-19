@@ -32,14 +32,14 @@ class EndedRunTest(Base):
         runner.settle_ended_runs()
         return runner
 
-    def test_a_reported_park_clears_the_running_and_lane_labels(self):
+    def test_a_reported_park_clears_the_running_label_and_keeps_its_lane(self):
         path = self.brief("failed", 0)
         self.write(os.path.join(self.home, "logs", "workersai",
                                 Path(path).stem + ".log"),
                    "[t] ticket failed: [work] validation failed\n")
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         runner.report_outcomes()
-        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:failed"})
+        self.assertEqual(set(self.fake.names(12)), {"loom:ticket", "loom:failed", "lane:workersai"})
 
     def test_a_pass_requeues_a_stale_ticket_on_a_lane_with_a_live_run(self):
         path = self.brief("failed", 0)

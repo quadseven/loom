@@ -748,8 +748,8 @@ class ThisRunSectionTest(unittest.TestCase):
                             "AGENTS.md")
         with open(path, encoding="utf-8") as f:
             text = " ".join(f.read().split())
-        self.assertIn("a `claim:quadseven` label on a `loom:running` ticket is the station's "
-                      "lane claim, so it is the lane's own claim", text)
+        self.assertIn("On a `loom:running` ticket, the station's lane claim uses the operator "
+                      "login from `LOOM_BRIEF_AUTHORS` and the lane works under that claim", text)
         self.assertIn("lanes skip the claim, Buzz and journal steps", text)
 
 

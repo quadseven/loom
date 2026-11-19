@@ -3,6 +3,7 @@ digest (loom#2278, loom#2261)."""
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import unittest
 
@@ -40,12 +41,25 @@ def state(item, comments=(), events=(added("needs-operator"),), blockers=()):
 
 class Alias(unittest.TestCase):
     def test_each_old_label_reads_as_needs_human(self):
-        for old in ("needs-operator", "needs:quadseven", "loom:human", "needs:human"):
+        for old in ("needs-operator", "loom:human", "needs:human"):
             with self.subTest(old):
                 self.assertTrue(labels.needs_human([old, "loom:ticket"]))
 
     def test_other_labels_do_not(self):
         self.assertFalse(labels.needs_human(["needs:someone", "needs-brain", "loom:ticket"]))
+
+    def test_legacy_operator_label_requires_configuration(self):
+        code = (
+            "from bus.labels import needs_human; "
+            "print(needs_human(['needs:quadseven']), needs_human(['needs:old-operator']))"
+        )
+        for setting, expected in (("", "False False"), ("needs:old-operator", "False True")):
+            with self.subTest(setting=setting):
+                result = subprocess.check_output(
+                    [sys.executable, "-B", "-c", code], text=True,
+                    env=dict(os.environ, LOOM_LEGACY_HUMAN_LABELS=setting),
+                )
+                self.assertEqual(result.strip(), expected)
 
     def test_needs_human_is_a_managed_label(self):
         self.assertIn(labels.NEEDS_HUMAN, labels.LABELS)

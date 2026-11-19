@@ -132,7 +132,7 @@ Loom is a software factory: it turns goals into tickets, has AI lanes build them
 Layout:
 
 - `bus/`: the station, brain, factory and every gate. `python3 -m bus <command>` is the entry point.
-- `dispatch/`: design notes for the goal loop, not the loop itself. Six of its seven modules (`dispatch.py`, `metrics.py`, `report.py`, `ship.py`, `usage_watch.py`, `verify.py`) are docstring-only and hold no code; only `dispatcher.py` carries code, and only `tests/test_dispatcher.py` calls it. The running loop lives in `bus/`.
+- `dispatch/` holds six docstring-only goal loop design notes (`dispatch.py`, `metrics.py`, `report.py`, `ship.py`, `usage_watch.py`, `verify.py`). Only `dispatcher.py` contains code, and its callers are tests. The running loop lives in `bus/`.
 - `dashboard/`: the live view. Run it with `python3 -m dashboard`.
 - `lanes/`: the lane runner `run_lane.sh`, the agent sandbox, the Mac installer `mac/install.sh` and the cluster job `k8s/lane_job.py`.
 - `tests/`: unittest modules.
@@ -185,7 +185,7 @@ Deploy: `lanes/mac/station.sh` runs every 60 seconds and fast-forwards the stati
 
 Several AI brains work this repo beside the operator: Claude Code, Muse, Dot and the Loom factory. Loom has a station that dispatches, a brain that briefs and merges, and lanes that build. No brain outranks another. Each acts under its own GitHub App, never a person's account, and signs posts `-- <name>`.
 
-**Claims.** Put `claim:<name>` on a ticket before starting, and create the label if this repo lacks it. Check first and skip a ticket already held. One claim per ticket: the station keeps the earliest and removes the rest. A claim expires after 2 hours with no real activity, unless a comment holds it with `waiting: <what> until <time>`, or an open PR the claimer wrote and referenced holds it for up to 7 days. `claim:quadseven` is a person: leave those tickets alone, except that a `claim:quadseven` label on a `loom:running` ticket is the station's lane claim, so it is the lane's own claim and the lane run works it. A lane run has no network, so lanes skip the claim, Buzz and journal steps here. On stopping, push the work and say what is done, what is next, and the branch and head. Take over only an expired or plainly dead claim, after reading the holder's comments and open PRs.
+**Claims.** Put `claim:<name>` on a ticket before starting, and create the label if this repo lacks it. Check first and skip a ticket already held. One claim per ticket: the station keeps the earliest and removes the rest. A claim expires after 2 hours with no real activity, unless a comment holds it with `waiting: <what> until <time>`, or an open PR the claimer wrote and referenced holds it for up to 7 days. Leave operator claims alone. On a `loom:running` ticket, the station's lane claim uses the operator login from `LOOM_BRIEF_AUTHORS` and the lane works under that claim. A lane run has no network, so lanes skip the claim, Buzz and journal steps here. On stopping, push the work and say what is done, what is next, and the branch and head. Take over only an expired or plainly dead claim, after reading the holder's comments and open PRs.
 
 **Labels.** Loom sets one state label per ticket:
 

@@ -199,10 +199,7 @@ def triage_issue(gh, number):
 
 
 class TriageBrainHoldsTest(unittest.TestCase):
-    """loom#1884: a triage issue's needs-brain hold has an owner too: an old
-    hold Loom set is given one more rewrite attempt (the refusal reason
-    quoted), and a hold that comes back after that attempt goes to the
-    hand-off pool. A person's hold is left and counted."""
+    """A day-old triage hold Loom set goes to a person with one exact ask."""
 
     def setUp(self):
         self.gh = FakeGitHub()
@@ -217,7 +214,7 @@ class TriageBrainHoldsTest(unittest.TestCase):
     def events(self, number):
         return [c["body"] for c in status.expand(self.gh.comments[number], [ME["login"]])]
 
-    def test_an_old_loom_triage_hold_is_freed_for_one_more_rewrite_with_the_reason_quoted(self):
+    def test_an_old_triage_hold_without_a_recorded_ask_requests_a_triage_decision(self):
         triage_issue(self.gh, 5)
         held_by(self.gh, 5, LOOM_APP)
         self.gh.comments[5].append({"id": 70, "user": ME, "created_at": iso(30 * 3600 - 5),
@@ -225,33 +222,18 @@ class TriageBrainHoldsTest(unittest.TestCase):
         report = self.run_holds()
         names = self.names(5)
         self.assertNotIn(brain_hold.LABEL, names)
-        self.assertIn("loom:triage", names)
-        self.assertNotIn(labels.HANDOFF, names)
-        notes = [e for e in self.events(5) if brain_hold.RETRY_MARKER in e]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("Rewrite refused: no acceptance criteria named.", notes[0])
+        self.assertNotIn("loom:triage", names)
+        self.assertIn(labels.NEEDS_HUMAN, names)
+        (ask,) = [e for e in self.events(5) if e.startswith(brain_hold.HUMAN_MARKER)]
+        self.assertIn("Should Loom turn this issue into a ticket, hold it, or close it?", ask)
         self.assertEqual(report[REPO]["lifted"], 1)
-        # Freed once: a later run posts no second retry note.
-        self.run_holds()
-        self.assertEqual(len([e for e in self.events(5) if brain_hold.RETRY_MARKER in e]), 1)
 
-    def test_a_triage_hold_that_returns_after_its_retry_goes_to_the_hand_off_pool(self):
+    def test_a_triage_hold_already_waiting_on_a_person_does_not_create_another_ask(self):
         triage_issue(self.gh, 5)
-        self.gh.comments[5].append({"id": 69, "user": ME, "created_at": iso(50 * 3600),
-                                    "body": brain_hold.RETRY_MARKER + "\nFreed for one more rewrite."})
         held_by(self.gh, 5, LOOM_APP)
-        self.gh.comments[5].append({"id": 70, "user": ME, "created_at": iso(30 * 3600 - 5),
-                                    "body": "Rewrite refused again: still no acceptance criteria."})
-        report = self.run_holds()
-        names = self.names(5)
-        self.assertNotIn(brain_hold.LABEL, names)
-        self.assertIn(labels.HANDOFF, names)
-        notes = [e for e in self.events(5) if brain_hold.LIFT_MARKER in e]
-        self.assertEqual(len(notes), 1)
-        self.assertIn("still no acceptance criteria", notes[0])
-        self.assertEqual(report[REPO]["lifted"], 1)
-        self.run_holds()
-        self.assertEqual(len([e for e in self.events(5) if brain_hold.LIFT_MARKER in e]), 1)
+        self.gh.issues[5]["labels"].append({"name": "needs:release-owner"})
+        self.assertEqual(self.run_holds()[REPO]["lifted"], 0)
+        self.assertEqual(self.gh.writes, [])
 
     def hold_by_rewrite(self, number, ask, seconds_ago):
         """The rewrite step holds the issue itself (bus/rewrite.py
@@ -268,36 +250,44 @@ class TriageBrainHoldsTest(unittest.TestCase):
             {"event": "labeled", "label": {"name": brain_hold.LABEL},
              "actor": {"login": LOOM_APP}, "created_at": iso(seconds_ago)})
 
-    def test_a_hold_the_rewrite_set_has_its_ask_quoted_in_the_retry_and_hand_off_notes(self):
-        # loom#2936: no hand-seeded reason comment. The rewrite's own write is
-        # the only note on the issue, and its ask is longer than one short line.
-        first = ("Decide whether the old export format is still supported: the issue asks "
-                 "to remove it, the README promises it until the next major release, and "
-                 "no operator decision on record settles which of the two holds for now")
-        self.assertGreater(len(first), brain_hold.REASON_MAX)
+    def test_at_a_day_the_station_posts_the_rewrites_exact_ask_and_moves_once(self):
+        question = ("Should the old export format stay supported until the next major release, "
+                    "as the documentation promises, or should Loom use the issue's proposed "
+                    "earlier removal date for the next release?")
+        self.assertGreater(len(question), brain_hold.REASON_MAX)
         triage_issue(self.gh, 5)
-        self.hold_by_rewrite(5, first + ".", 30 * 3600)
-        f = factory.Factory(self.gh, [REPO], NOW, trusted=TRUSTED)
-        why = brain_hold.reason(f._comments(REPO, 5), NOW - 30 * 3600, "triage")
-        self.assertIn("Kind: decision", why)
-        self.assertIn(first, why)
-        report = f.brain_holds()
-        self.assertEqual(report[REPO]["lifted"], 1)
-        self.assertNotIn(brain_hold.LABEL, self.names(5))
-        (retry,) = [e for e in self.events(5) if brain_hold.RETRY_MARKER in e]
-        self.assertIn(first, retry)
-        self.assertNotIn("no note names it", retry)
-        # The hold comes back after the retry, with another ask.
-        second = "Decide who owns the export format before any code changes"
-        self.hold_by_rewrite(5, second + ".", -10 * 3600)
-        later = factory.Factory(self.gh, [REPO], NOW + 40 * 3600, trusted=TRUSTED)
-        self.assertEqual(later.brain_holds()[REPO]["lifted"], 1)
-        self.assertIn(labels.HANDOFF, self.names(5))
-        (handoff,) = [e for e in self.events(5) if brain_hold.LIFT_MARKER in e]
-        self.assertIn(second, handoff)
-        self.assertNotIn("no note names it", handoff)
-        # Every note is an event on the one status comment.
-        self.assertEqual(len(self.gh.comments[5]), 1)
+        self.hold_by_rewrite(5, question, DAY)
+        self.assertEqual(self.run_holds()[REPO]["lifted"], 1)
+        self.assertEqual(self.names(5), [labels.NEEDS_HUMAN])
+        (ask,) = [e for e in self.events(5) if e.startswith(brain_hold.HUMAN_MARKER)]
+        self.assertIn("\n" + question + "\nKind: decision", ask)
+        writes = list(self.gh.writes)
+        self.assertEqual(self.run_holds()[REPO]["lifted"], 0)
+        self.assertEqual(self.gh.writes, writes)
+        # If an operator returns it to triage, a later hold does not send
+        # the issue back to them a second time.
+        self.gh.issues[5]["labels"] = [{"name": "loom:triage"}]
+        held_by(self.gh, 5, LOOM_APP, seconds_ago=-3600)
+        later = factory.Factory(self.gh, [REPO], NOW + DAY + 3600, trusted=TRUSTED)
+        self.assertEqual(later.brain_holds()[REPO]["lifted"], 0)
+        self.assertEqual(self.gh.writes, writes)
+
+    def test_a_failed_label_move_retries_without_posting_the_ask_again(self):
+        triage_issue(self.gh, 5)
+        held_by(self.gh, 5, LOOM_APP, seconds_ago=DAY)
+        rest = self.gh.rest
+
+        def fail_relabel(method, path, *args, **kwargs):
+            if method == "PUT" and path.endswith("/issues/5/labels"):
+                raise GitHubError("label write failed", 500)
+            return rest(method, path, *args, **kwargs)
+
+        with mock.patch.object(self.gh, "rest", side_effect=fail_relabel):
+            self.assertEqual(self.run_holds()[REPO]["lifted"], 0)
+        self.assertIn("loom:triage", self.names(5))
+        self.assertEqual(self.run_holds()[REPO]["lifted"], 1)
+        self.assertEqual(self.names(5), [labels.NEEDS_HUMAN])
+        self.assertEqual(sum(e.startswith(brain_hold.HUMAN_MARKER) for e in self.events(5)), 1)
 
     def test_a_persons_triage_hold_is_left_alone_and_counted(self):
         triage_issue(self.gh, 5)

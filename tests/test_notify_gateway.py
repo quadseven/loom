@@ -232,7 +232,7 @@ class FirstPullRequestTest(fixtures.Base):
         self.fake.pulls = [{"html_url": "https://example.com/pull/99"}]
         self.run_pass()
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:pr"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:pr"])
         # One comment, the ticket's status comment, which later events edit.
         self.assertEqual([status.is_status(c["body"]) for c in self.fake.comments[12]], [True])
         self.assertEqual([text for _, text in status.parse(self.fake.comments[12][0]["body"])],

@@ -401,6 +401,7 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
                         "&sort=created&direction=asc&per_page=100" % repo)
     pool = [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
+            and not labels.waiting_on_person(_names(i))
             and labels.HANDOFF not in _names(i)
             and not brain.not_work_reason(i)]
     if not pool:
@@ -449,8 +450,8 @@ def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str,
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
         # The ask goes on the issue too, as a routine event on its one status
         # comment (an edit, no email), timed beside the label event: it was
-        # only printed here, so brain_hold.reason found no note and the
-        # factory's retry and hand-off notes quoted no cause (loom#2936).
+        # only printed here. The factory reads this event if it sends the
+        # unanswered hold to the operator.
         status.add(gh, repo, number,
                    brain_hold.ask_note(fields["kind"], fields["ask"].split("\n", 1)[1]),
                    time.time() if now is None else now, brain.trusted_authors())
