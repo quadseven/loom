@@ -303,8 +303,9 @@ unset variables.
     the two wins: the test runner gets the smaller as
     `PYTEST_XDIST_AUTO_NUM_WORKERS`, and `LOOM_CHECK_WORKERS` is lowered to
     the cap when it is the larger.
-  - With `LOOM_BUILD_JOBS=0` none of these names is set and `PATH` is left
-    as it was.
+  - With `LOOM_BUILD_JOBS=0` Loom adds none of these names and leaves `PATH`
+    as it was. A name the runner's own environment already holds (a host
+    `MAKEFLAGS`, say) still reaches a lane that inherits that environment.
   - Not covered: a tool that reads the core count for itself and takes no
     setting; a build tool started by its full path or through `xcrun`, past
     the wrapper; a command that sets its own job count, which wins; and
