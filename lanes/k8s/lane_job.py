@@ -92,12 +92,13 @@ def _settings() -> Dict[str, str]:
 
 
 def rebase_gateway(slot: str, settings: Dict[str, str], gateway: str) -> Dict[str, str]:
-    """A spark or free slot's endpoint URLs moved onto the cluster gateway:
+    """A spark, free or zai slot's endpoint URLs moved onto the cluster gateway:
     the runner reaches the gateway's in-cluster address, not the name the
     station uses. The path of each URL is kept; a free slot with no gateway
-    setting gets the gateway as LOOM_FREE_GATEWAY_URL."""
+    setting gets the gateway as LOOM_FREE_GATEWAY_URL, and a zai slot with
+    no endpoint of its own gets the gateway's zai route."""
     lane = runners.provider(slot)
-    if not gateway or lane not in ("spark", "free"):
+    if not gateway or lane not in ("spark", "free", "zai"):
         return settings
     if not GATEWAY_RE.fullmatch(gateway):
         raise JobError("LOOM_RUNNER_GATEWAY_URL is not scheme://host[:port]")
@@ -107,6 +108,8 @@ def rebase_gateway(slot: str, settings: Dict[str, str], gateway: str) -> Dict[st
             out[name] = ORIGIN_RE.sub(gateway, value, count=1)
     if lane == "free":
         out.setdefault("LOOM_FREE_GATEWAY_URL", gateway)
+    if lane == "zai":
+        out.setdefault("LOOM_ZAI_URL", gateway + "/zai/v1")
     return out
 
 

@@ -156,14 +156,16 @@ bwrap_profile() {
 
 # The ports an API-lane agent may connect to, space-separated: 443, its
 # provider's HTTPS API (and the CLI's own catalogue and package fetches, and
-# GitHub for the brain's spark rung), plus on spark and free lanes the port of
-# SPARK_URL (its scheme's default when the URL names none). An endpoint URL
+# GitHub for the brain's spark rung), plus on spark, free and gateway zai
+# lanes the port of SPARK_URL (its scheme's default when the URL names
+# none). An endpoint URL
 # with no usable port is refused, which refuses the sandbox.
 provider_ports() {
   local rest port="" endpoint=spark
   case "$LANE" in
     spark) ;;
     free) endpoint="free endpoint" ;;
+    zai) [ -n "${SPARK_URL:-}" ] || { printf '443'; return 0; } endpoint="zai endpoint" ;;
     *) printf '443'; return 0 ;;
   esac
   case "$SPARK_URL" in
@@ -499,6 +501,9 @@ opencode_config() {
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  # A zai slot with a gateway URL (SPARK_URL holds lane_setting URL) runs
+  # through the gateway's zai provider, which holds the key: no key is set.
+  [ "$LANE" = zai ] && [ -n "${SPARK_URL:-}" ] && provider=", \"provider\": {\"zai\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Z.ai gateway\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\"}}}}"
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }

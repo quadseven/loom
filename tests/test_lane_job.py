@@ -173,6 +173,21 @@ class LaneJobTest(unittest.TestCase):
         self.assertEqual(self.step("prepare", LOOM_RUNNER_GATEWAY_URL="http://gateway.example:8080").returncode, 0)
         self.assertIn("LOOM_FREE_GATEWAY_URL=http://gateway.example:8080\n", (self.job / "lane.env").read_text())
 
+    def test_a_zai_slot_is_moved_onto_the_cluster_gateway(self):
+        self.inputs(slot="zai", settings="LOOM_ZAI_MODEL=zai/glm-4.7-flash\n"
+                                         "LOOM_ZAI_URL=http://zai.example.internal:9000/zai/v1\n")
+        result = self.step("prepare", LOOM_RUNNER_GATEWAY_URL="http://gateway.example:8080")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = (self.job / "lane.env").read_text()
+        self.assertIn("LOOM_ZAI_URL=http://gateway.example:8080/zai/v1\n", env)
+        self.assertNotIn("KEY_SSM", env)
+        # With no endpoint of its own, the slot gets the gateway's zai route.
+        self.inputs(slot="zai", settings="LOOM_ZAI_MODEL=zai/glm-4.7-flash\n")
+        result = self.step("prepare", LOOM_RUNNER_GATEWAY_URL="http://gateway.example:8080")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LOOM_ZAI_URL=http://gateway.example:8080/zai/v1\n",
+                      (self.job / "lane.env").read_text())
+
     def load(self):
         spec = importlib.util.spec_from_file_location("lane_job", self.root / "lanes" / "k8s" / "lane_job.py")
         job = importlib.util.module_from_spec(spec)

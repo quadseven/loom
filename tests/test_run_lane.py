@@ -5308,6 +5308,17 @@ echo fixed > fix.txt
         self.assertIn("lane zai, model zai/glm-4.7-flash", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_zai_cluster_lane_uses_its_gateway_without_a_key(self):
+        _, result = self.api_lane("zai", LOOM_ZAI_URL="http://gateway.example.invalid/zai/v1",
+                                  LOOM_ZAI_MODEL="zai/glm-4.7-flash")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        self.assertFalse(any("ZHIPU_API_KEY" in call for call in calls), calls)
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["zai"]["options"],
+                         {"baseURL": "http://gateway.example.invalid/zai/v1"})
+
     @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
     def test_zai_lane_refuses_a_paid_model(self):
         # Z.ai's GLM-5.3 Flash is billed per token; only 4.7 and 4.5 Flash are free.

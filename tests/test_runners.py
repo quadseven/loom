@@ -138,7 +138,7 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
+                         ["claude", "zen", "free-kilo", "free-openrouter", "zai", "workersai",
                           "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
@@ -146,7 +146,7 @@ class RunnersTest(unittest.TestCase):
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                         ["free-gemma", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4"])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
@@ -157,6 +157,22 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(settings["LOOM_WORKERSAI_MODEL"],
                          "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b")
         self.assertEqual(settings["LOOM_WORKERSAI_ACCOUNT_SSM"], "/workersai/account")
+
+    def test_zai_and_zen_are_tracked_slots_and_carry_no_key_setting(self):
+        # Z.ai runs through the gateway, which holds its key, and Zen's free
+        # models need no key: neither slot's settings may name a key, on the
+        # dispatch or in the station's own environment.
+        zai = runners.lane_settings("zai", {"LOOM_ZAI_KEY_SSM": "/zai/key",
+                                            "LOOM_ZAI_URL": "http://zai.example.internal:9000/zai/v1"})
+        self.assertEqual(zai["LOOM_ZAI_MODEL"], "zai/glm-4.7-flash")
+        self.assertEqual(zai["LOOM_ZAI_URL"], "http://zai.example.internal:9000/zai/v1")
+        self.assertFalse([n for n in zai if n.endswith("_KEY_SSM")], zai)
+        zen = runners.lane_settings("zen", {"LOOM_ZEN_KEY_SSM": "/zen/key"})
+        self.assertEqual(zen["LOOM_ZEN_MODEL"], "opencode/deepseek-v4.1-flash-free")
+        self.assertFalse([n for n in zen if n.endswith("_KEY_SSM")], zen)
+        station = runners.station_env({"LOOM_RUNNER_SLOTS": "zai zen",
+                                       "LOOM_ZAI_KEY_SSM": "/zai/key", "LOOM_ZEN_KEY_SSM": "/zen/key"})
+        self.assertFalse([n for n in station if n.endswith("_KEY_SSM")], station)
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",

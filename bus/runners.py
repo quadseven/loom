@@ -81,12 +81,17 @@ RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "w
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
 TRACKED_SLOTS = {
     "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "zai": {"LOOM_ZAI_MODEL": "zai/glm-4.7-flash"},
+    "zen": {"LOOM_ZEN_MODEL": "opencode/deepseek-v4.1-flash-free"},
     "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
     "opencode-go-1": {"LOOM_OPENCODE_GO_1_MODEL": "opencode-go/mimo-v2.6-flash"},
     "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
     "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
 }
+# Tracked slots whose runner runs carry no key name: the gateway holds
+# zai's key, and zen's free models need none.
+NO_KEY_SLOTS = ("zai", "zen")
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 OPENCODE_GO_KEY_SSM = "LOOM_OPENCODE_GO_KEY_SSM"
 # A run no runner has taken after this many seconds is cancelled and parked:
@@ -224,6 +229,9 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
     out: Dict[str, str] = dict(TRACKED_SLOTS.get(slot, {}))
     for name, value in env.items():
         if name.startswith("LOOM_GITHUB_APP_"):
+            continue
+        if slot in NO_KEY_SLOTS and name.endswith("_KEY_SSM") \
+                and name != "LOOM_LANES_GITHUB_APP_KEY_SSM":
             continue
         name = LANES_APP.get(name, name)
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
@@ -1098,7 +1106,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
             out[name] = env[name]
     for slot in TRACKED_SLOTS:
         lane = provider(slot)
-        if lane == "free":
+        if lane == "free" or lane in NO_KEY_SLOTS:
             continue
         name = _prefix(lane) + "KEY_SSM"
         value = env.get(name, "")
@@ -1107,6 +1115,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
     for slot in runner_slots(env):
         for name, value in env.items():
             if (setting_allowed(slot, name) and not name.startswith("LOOM_GITHUB_APP_")
+                    and not (slot in NO_KEY_SLOTS and name.endswith("_KEY_SSM"))
                     and name not in STATION_OWN and not name.endswith(("_MODEL", "_MODELS"))
                     and value and VALUE_RE.fullmatch(value)):
                 out[name] = value

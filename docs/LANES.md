@@ -2680,8 +2680,9 @@ What the cluster side must provide:
   (one would change the token's subject).
 - Repository variables `LOOM_LANE_DISPATCHERS`, `LOOM_LANE_ROLE_ARN`, `LOOM_LANE_AWS_REGION`,
   `LOOM_LANE_EGRESS_ALLOW_PROBE` (`host:port`, the gateway service) and
-  `LOOM_RUNNER_GATEWAY_URL` (the gateway's in-cluster origin; a spark or free
-  slot's endpoint URLs are moved onto it, path kept), and the repository
+  `LOOM_RUNNER_GATEWAY_URL` (the gateway's in-cluster origin; a spark, free
+  or zai slot's endpoint URLs are moved onto it, path kept, and a zai slot
+  with no endpoint of its own gets its `/zai/v1` route), and the repository
   secret `LOOM_LANE_EGRESS_DENY_PROBES` (literal `IPv4:port` addresses the
   runner must not reach), a secret so its private addresses are masked in
   the public log.
