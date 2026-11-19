@@ -519,10 +519,12 @@ class SensitiveResumeTests(unittest.TestCase):
         # (loom#2078), then the pull requests, then the lane comments.
         gh = GitHub("t", transport=Fake(
             reply(200, [lanes_issue]), reply(200, []),
-            reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z",
+            reply(200, [{"body": "<!-- loom:lanes v1 -->\n"
+                         "| codex | off | 2030-01-01 00:00:00Z | Heartbeat is stale |",
+                         "created_at": "2030-01-01T00:00:00Z",
                          "user": {"login": "example-brain"}}])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED)
-        self.assertIn("| codex | yes |", report)
+        self.assertIn("| codex | off | 2030-01-01 00:00:00Z | Heartbeat is stale |", report)
         self.assertEqual(gh.requests, 3)
 
     def test_status_lists_a_sensitive_pull_request(self):
