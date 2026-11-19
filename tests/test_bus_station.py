@@ -3273,6 +3273,7 @@ class TriageTest(Base):
                 if "sort=created&direction=asc" in p and "labels=ready-for-agent" not in p]
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
         self.fake.add_open_issue(100, body=READY_BODY)
         self.fake.add_open_issue(101, body="It is slow.")
@@ -3342,6 +3343,7 @@ class TriageTest(Base):
         self.assertIn("loom:triage", self.fake.names(102))
 
     def test_a_goal_without_backlog_home_is_triaged_and_rewritten(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(31, title="Ship the thing")
         self.fake.add_open_issue(102, body=READY_BODY)
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -13294,11 +13296,9 @@ class ClaimDropTest(Base):
 
 
 class CloseDoneTest(Base):
-    """The operator's close rule (2026-10-19): a shipped ticket whose Live
-    line names nothing a log search can find closes; one that names a string
-    stays for a verify run."""
+    """The done close keeps tickets open while their criteria need evidence."""
 
-    def test_a_shipped_ticket_with_no_searchable_live_string_closes(self):
+    def test_a_shipped_ticket_with_no_searchable_live_string_stays_in_verification(self):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
@@ -13315,6 +13315,8 @@ class CloseDoneTest(Base):
         st.close_done_tickets()
         # A Live line with nothing to search stays shipped for verification.
         self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertIn("loom:shipped", self.fake.names(1))
+        self.assertNotIn("needs-brain", self.fake.names(1))
         self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
@@ -15773,6 +15775,7 @@ class TwoLoomsTest(Base):
                       err)
 
     def test_a_goal_home_naming_our_operator_is_worked(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
         self.fake.goals[0]["body"] = "Operator: Alice-Example\n\n## Destination\nAll of it."
         self.fake.add_open_issue(100, body=READY_BODY)
