@@ -1442,6 +1442,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
             self.assertNotIn(line, note)
         self.assertIn("parked", note)
         self.assertIn("after a work failure", note)
+        self.assertIn("agent exited 1", note)
         self.assertIn("The full run log stays on the lane host.", note)
 
     def test_a_park_reason_the_leak_scan_cannot_clear_is_withheld(self):
@@ -1453,6 +1454,17 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
         self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
         self.assertIn("the leak scan refused the park reason", self.run_log())
+
+    def test_a_refused_park_reason_and_the_scanner_diagnostic_stay_private(self):
+        result = self.run_failing_agent("agent failed", FAKE_GH_PRIVATE="true", FAKE_PERSONAL_HIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.tail_bodies()
+        self.assertIn("withheld", note)
+        self.assertNotIn("agent exited", note)
+        self.assertNotIn("personal-deny-list", note)
+        log = self.run_log()
+        self.assertIn("the leak scan refused the park reason or could not run (exit 1)", log)
+        self.assertNotIn("personal-deny-list", log)
 
     def test_the_log_tail_can_be_switched_off(self):
         result = self.run_failing_agent("FAILED tests/test_x.py::test_y", LOOM_LOG_TAIL="off")
