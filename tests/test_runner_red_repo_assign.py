@@ -141,5 +141,20 @@ class AssignTest(Base):
         self.assertEqual(factory._state(self.gh.issues[7]), "briefed")
         self.assertEqual(self.lane(7), SLOT)
 
+    def test_an_unreadable_ledger_blocks_only_cluster_slots(self):
+        for slots, state, lane in (([SLOT, OTHER], "queued", ""),
+                                   ([SLOT], "briefed", OTHER)):
+            with self.subTest(slots=slots), tempfile.TemporaryDirectory() as home:
+                self.queued(7)
+                runner = runners.Runners(Heads("aaa"), home, "example-org/loom",
+                                         slots, {}, lambda repo: True, lambda line: None,
+                                         now=NOW)
+                ledger = Path(runner.ledger_path)
+                ledger.parent.mkdir(parents=True)
+                ledger.write_text("{", encoding="utf-8")
+                self.assign(runner.stops)
+                self.assertEqual(factory._state(self.gh.issues[7]), state)
+                self.assertEqual(self.lane(7), lane)
+
 if __name__ == "__main__":
     unittest.main()

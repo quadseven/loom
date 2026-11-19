@@ -613,14 +613,15 @@ class Runners:
         work for the slot before dispatch (the factory's lane pick,
         loom#3211): a stop the pick cannot see is a ticket claimed for a
         slot whose runner only parks it. A record _base_red clears (a moved
-        head, the day probe) is saved back, as a dispatch pass leaves it. A
-        ledger that cannot be read stops nothing here: dispatch reads the
-        same ledger and stops every dispatch on it, so no brief is sent
-        either way."""
+        head, the day probe) is saved back, as a dispatch pass leaves it.
+        An unreadable ledger blocks assignment to cluster slots because
+        dispatch requires the same ledger. Local lanes can still take work."""
+        if slot not in self.slots:
+            return False
         try:
             ledger = self.load()
         except ReportError:
-            return False
+            return True
         before = json.dumps(ledger["base_red"], sort_keys=True)
         red = self._base_red(ledger, slot, repo, base)
         if json.dumps(ledger["base_red"], sort_keys=True) != before:
