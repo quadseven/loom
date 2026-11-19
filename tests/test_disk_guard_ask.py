@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -259,8 +260,9 @@ class DiskGuardAskTest(unittest.TestCase):
         self.assertEqual(repo, GOAL_REPO)
         self.assertEqual(number, GOAL_NUMBER)
         self.assertIn("Kind: hardware", body)
-        self.assertIn("free", body.lower())
-        self.assertIn("floor", body.lower())
+        self.assertIn("Free space: 7.5 GB\n", body)
+        self.assertIn("Floor: 15.0 GB\n", body)
+        self.assertIn("Free disk space on the lane machine.", body)
 
     def test_ask_edited_in_place_while_paused(self):
         """The ask comment is edited in place (not a new comment) while disk stays low."""
@@ -292,6 +294,8 @@ class DiskGuardAskTest(unittest.TestCase):
 
         # Second check (later pass) should edit in place, not create new
         st.now = NOW + 3600  # One hour later
+        st._free = 9 * GB
+        station._write_json(os.path.join(st.state, "disk.json"), {"folders": {"logs": 2 * GB}})
         st._check_disk_guard_ask()
 
         # Should still have only one ask (edited in place)
@@ -300,9 +304,11 @@ class DiskGuardAskTest(unittest.TestCase):
         self.assertEqual(len(st.gh.patched_comments), 1, "Comment should be patched once")
         repo, comment_id, body = st.gh.patched_comments[0]
         self.assertEqual(repo, GOAL_REPO)
+        self.assertEqual(comment_id, st.gh.comments[(GOAL_REPO, GOAL_NUMBER)][0]["id"])
         self.assertIn("Kind: hardware", body)
-        self.assertIn("Free space:", body)
-        self.assertIn("Floor:", body)
+        self.assertIn("Free space: 9.0 GB\n", body)
+        self.assertIn("Floor: 15.0 GB\n", body)
+        self.assertIn("Loom home holds 2.0 GB (logs 2.0 GB)", body)
 
     def test_ask_closed_when_disk_recovers(self):
         """When disk recovers (free space above floor), the ask is closed."""
@@ -333,6 +339,10 @@ class DiskGuardAskTest(unittest.TestCase):
         st._free = int(2 * FLOOR)  # Above floor
         st._free_read = False  # Force re-read
         self._write_disk_guard(False, int(2 * FLOOR), NOW)
+
+        with mock.patch.object(st.gh, "rest", side_effect=TypeError("invalid close call")):
+            with self.assertRaisesRegex(TypeError, "invalid close call"):
+                st._check_disk_guard_ask()
 
         # Next check should close the ask
         st._check_disk_guard_ask()

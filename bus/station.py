@@ -17148,13 +17148,14 @@ class Station:
             return
         repo, number = goal
 
-        folders = self._read_loom_home_folders()
-        ask_body = self._build_ask_body(guard["free"], guard["floor"], folders)
-
         ask_state = self._read_ask_state()
         ask_state_path = os.path.join(self.state, "disk-guard-ask.json")
 
         if guard["low"]:
+            free = self._disk_free()
+            folders = self._read_loom_home_folders()
+            ask_body = self._build_ask_body(guard["free"] if free is None else free,
+                                            guard["floor"], folders)
             self._handle_disk_low(repo, number, guard, ask_body, ask_state, ask_state_path)
         else:
             self._handle_disk_recovered(repo, number, ask_state, ask_state_path)
@@ -17201,6 +17202,7 @@ class Station:
         return (
             "Kind: hardware\n"
             "The loom home's disk has been below the free-space floor for more than 60 minutes.\n"
+            "Free disk space on the lane machine.\n"
             "Free space: %s\n"
             "Floor: %s\n"
             "Loom home holds %s (%s)"
@@ -17259,7 +17261,7 @@ class Station:
                 self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs:human" % (repo, number))
                 _write_json(ask_state_path, {})
                 _say("disk guard: closed needs:human ask on %s#%d" % (repo, number))
-            except Exception as err:
+            except (GitHubError, OSError) as err:
                 _say("disk guard: failed to close ask: %s" % err)
 
     def _edit_ask_comment(self, repo: str, number: int, ask_body: str) -> None:
