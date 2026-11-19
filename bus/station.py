@@ -17757,6 +17757,43 @@ class Station:
             # has a bug. Name the fault without logging private error details.
             _say("operator budget sampler failed: %s" % type(err).__name__)
 
+    def ask_operator_login(self) -> None:
+        """File one ask in the status repository once GitHub has answered 401
+        to the operator login on operator_budget.REJECTED_ASK reads in a row
+        (loom#3273): 35 passes failed that way on 2026-11-18 and nothing
+        surfaced it. No ask is filed while the last one filed is open or
+        cannot be read, and none on a pass that made no read."""
+        path = os.path.join(self.state, operator_budget.FILE)
+        state = operator_budget.load(path)
+        home, login = self.s.status_repo, tickets.operator_login(self.s.authors)
+        if (state.get("rejected", 0) < operator_budget.REJECTED_ASK
+                or state.get("attempted_at") != self.now or not home or not login):
+            return
+        try:
+            asked = state.get("ask")
+            if asked and (self._issue_state(home, asked) or ("",))[0] != "closed":
+                return
+            made = self.gh.rest("POST", "/repos/%s/issues" % home, {
+                "title": "Sign the operator login %s in again on the station" % login,
+                "body": "## Ask\nGitHub answered 401 to the operator login `%s` on %d station "
+                        "reads in a row, so the token the station holds for it is rejected. "
+                        "Sign that login in again on the station host (`gh auth login`), or "
+                        "say why its token is rejected. The pin pass and the operator budget "
+                        "sample use this login and fail until then."
+                        % (login, state["rejected"]),
+                "labels": [NEEDS_HUMAN]}).data
+            if not isinstance(made, dict) or "number" not in made:
+                raise GitHubError("no operator login ask was created in %s" % home)
+            state["ask"] = int(made["number"])
+            operator_budget.save(path, state)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            # The answer may quote a request; name the fault only.
+            _say("operator login ask could not be filed: %s" % type(err).__name__)
+            return
+        _say("asked for the operator login to be signed in again: %s#%d" % (home, state["ask"]))
+
     def capture_pod_logs(self) -> None:
         for source in self.s.log_sources:
             try:
@@ -17781,6 +17818,7 @@ class Station:
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
         try:
+            self.ask_operator_login()
             self._publish_lanes_when_old()
             self.sync_labels()
             self.finish_claims()

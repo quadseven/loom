@@ -56,6 +56,9 @@
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_CHECK_SLOTS (check runs at once across all lanes on the host, default 3),
 # LOOM_CHECK_SLOT_WAIT (seconds a check waits for a slot, default 5400),
+# LOOM_CHECK_LOAD_1M and LOOM_CHECK_LOAD_5M (a check takes a slot only while
+# the host's 1-minute and 5-minute load averages are at or under these,
+# defaults 24 and 18; 0 turns that limit off),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
 # from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
@@ -2807,6 +2810,14 @@ note_base_check_failure() {  # kind, detail, reason_var_name, revision [, log_of
 # (default 5400) polling every LOOM_CHECK_SLOT_POLL (default 5); waiting is
 # no failure and the lane's keepalive stamp keeps the station reading it as
 # alive. A wait that runs out returns 75, which callers class as transient.
+# A free slot is not room on the host: three checks alone took a 12-core
+# host to a 1-minute load of 31.5 (#3279). So a slot is taken only while the
+# 1-minute load average is at or under LOOM_CHECK_LOAD_1M (default 24) and
+# the 5-minute one at or under LOOM_CHECK_LOAD_5M (default 18); 0 turns that
+# limit off. A load wait counts toward LOOM_CHECK_SLOT_WAIT like a slot wait.
+# The reading is the first two fields of LOOM_CHECK_LOAD_FILE (default
+# /proc/loadavg), or of `sysctl -n vm.loadavg` where that file is absent
+# (macOS). A host whose load cannot be read is not gated, and the log says so.
 CHECK_SLOTS="${LOOM_CHECK_SLOTS:-3}"
 CHECK_SLOT_WAIT="${LOOM_CHECK_SLOT_WAIT:-5400}"
 CHECK_SLOT_POLL="${LOOM_CHECK_SLOT_POLL:-5}"
@@ -2815,6 +2826,45 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
+CHECK_LOAD_1M="${LOOM_CHECK_LOAD_1M:-24}"
+CHECK_LOAD_5M="${LOOM_CHECK_LOAD_5M:-18}"
+CHECK_LOAD_FILE="${LOOM_CHECK_LOAD_FILE:-/proc/loadavg}"
+CHECK_LOAD_NOTE=""
+[[ "$CHECK_LOAD_1M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_1M=24
+[[ "$CHECK_LOAD_5M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_5M=18
+
+# Print the host's 1-minute and 5-minute load averages as "<1m> <5m>";
+# return 1 when there is no reading.
+check_load_reading() {
+  local line="" one="" five="" rest=""
+  if [ -r "$CHECK_LOAD_FILE" ]; then
+    IFS= read -r line < "$CHECK_LOAD_FILE" || [ -n "$line" ] || return 1
+  else
+    line="$(sysctl -n vm.loadavg 2>/dev/null || /usr/sbin/sysctl -n vm.loadavg 2>/dev/null)" || return 1
+  fi
+  # macOS prints "{ 2.92 3.15 3.21 }", and a comma for the point in some locales.
+  line="${line//[\{\}]/ }"
+  line="${line//,/.}"
+  read -r one five rest <<< "$line"
+  [[ "$one" =~ ^[0-9]+(\.[0-9]+)?$ && "$five" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s %s\n' "$one" "$five"
+}
+
+# Return 0 when the host load is above a limit, with CHECK_LOAD_NOTE saying
+# which reading and limit; 1 when there is room, both limits are 0, or the
+# load cannot be read (CHECK_LOAD_NOTE is then "unread").
+check_load_high() {
+  local reading one five
+  CHECK_LOAD_NOTE=""
+  [[ "$CHECK_LOAD_1M" =~ ^0+(\.0+)?$ && "$CHECK_LOAD_5M" =~ ^0+(\.0+)?$ ]] && return 1
+  reading="$(check_load_reading)" || { CHECK_LOAD_NOTE=unread; return 1; }
+  read -r one five <<< "$reading"
+  CHECK_LOAD_NOTE="$(awk -v a="$one" -v b="$five" -v la="$CHECK_LOAD_1M" -v lb="$CHECK_LOAD_5M" 'BEGIN {
+    if (la + 0 > 0 && a + 0 > la + 0) printf "1-minute load %s is above %s", a, la
+    else if (lb + 0 > 0 && b + 0 > lb + 0) printf "5-minute load %s is above %s", b, lb
+  }')"
+  [ -n "$CHECK_LOAD_NOTE" ]
+}
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
@@ -2847,21 +2897,45 @@ try_check_slot() {
 }
 
 acquire_check_slot() {
-  local waited=0 next_note=0 start
+  local waited=0 next_note=0 start why="" noted="" for_slot="" for_load="" unread="" what
   start="$(date +%s)"
-  while ! try_check_slot; do
-    if [ "$waited" -ge "$next_note" ]; then
-      echo "[$(date -u +%FT%TZ)] waiting for a check slot: all $CHECK_SLOTS in use; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+  while :; do
+    if check_load_high; then
+      why=load; for_load=1
+    else
+      if [ "$CHECK_LOAD_NOTE" = unread ] && [ -z "$unread" ]; then
+        unread=1
+        echo "[$(date -u +%FT%TZ)] host load could not be read; check slots are taken without the load limit" >> "$LOG"
+      fi
+      try_check_slot && break
+      why=slot; for_slot=1
+    fi
+    if [ "$waited" -ge "$next_note" ] || [ "$why" != "$noted" ]; then
+      if [ "$why" = load ]; then
+        echo "[$(date -u +%FT%TZ)] waiting for host load before taking a check slot: $CHECK_LOAD_NOTE; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+      else
+        echo "[$(date -u +%FT%TZ)] waiting for a check slot: all $CHECK_SLOTS in use; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+      fi
+      noted="$why"
       next_note=$((waited + 300))
     fi
     if [ "$waited" -ge "$CHECK_SLOT_WAIT" ]; then
-      echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s; the check did not run (transient)" >> "$LOG"
+      if [ "$why" = load ]; then
+        echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s: host load stayed high ($CHECK_LOAD_NOTE); the check did not run (transient)" >> "$LOG"
+      else
+        echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s; the check did not run (transient)" >> "$LOG"
+      fi
       return 1
     fi
     sleep "$CHECK_SLOT_POLL"
     waited=$(( $(date +%s) - start ))
   done
-  [ "$waited" -eq 0 ] || echo "[$(date -u +%FT%TZ)] got check slot ${CHECK_SLOT_HELD##*-} after ${waited}s" >> "$LOG"
+  if [ -n "$for_slot$for_load" ]; then
+    what="a slot"
+    [ -z "$for_load" ] || what="host load"
+    [ -z "$for_slot" ] || [ -z "$for_load" ] || what="a slot and host load"
+    echo "[$(date -u +%FT%TZ)] got check slot ${CHECK_SLOT_HELD##*-} after ${waited}s (waited for $what)" >> "$LOG"
+  fi
   return 0
 }
 
