@@ -1921,6 +1921,13 @@ cannot query the viewer or any other local service.
   gives no reset holds the lane for a week, the fallback for a window the
   runner does not know. Any other answer lets the run go ahead. Another
   provider can name its own endpoint in the same setting.
+- A hold the lane read from its limit file (`state/usage/<slot>.limit`, written
+  by the runner itself or by the fleet pacer) is marked `"from_limit_file":
+  true` in the heartbeat, and ends on the first pass after that file is
+  removed: the file's writer withdrew the hold. A hold from the provider's own
+  refusal carries no such mark and stands until its time or a passing
+  re-check. The cluster `free-openrouter` slot is the exception: its limit
+  file does not survive a pod restart, so a missing file there ends nothing.
 - A lane held by such a limit asks the provider again every 30 minutes and
   comes back as soon as it serves the lane again, because the provider's
   allowance refills while the lane sleeps (OpenCode Go refills 20% of a
