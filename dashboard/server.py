@@ -11,6 +11,7 @@ import ssl
 import statistics
 import socket
 import socketserver
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -1408,15 +1409,19 @@ def _ticket_detail_data(state, repo, number):
 
 NOT_READY_LOG_SECONDS = 60
 _not_ready_logged = [0.0]
+_not_ready_lock = threading.Lock()
 
 
 def _log_not_ready(state, now=None):
     """Log why /readyz answers 503, at most once a NOT_READY_LOG_SECONDS: the
     probe asks every few seconds, and the answer used to say nothing."""
     now = time.monotonic() if now is None else now
-    if _not_ready_logged[0] and now - _not_ready_logged[0] < NOT_READY_LOG_SECONDS:
-        return False
-    _not_ready_logged[0] = now
+    # The server is threaded: check and set under one lock, so two probes
+    # arriving together cannot both log.
+    with _not_ready_lock:
+        if _not_ready_logged[0] and now - _not_ready_logged[0] < NOT_READY_LOG_SECONDS:
+            return False
+        _not_ready_logged[0] = now
     reason = getattr(state, "not_ready_reason", None)
     LOG.warning("readyz answered 503: %s", reason() if reason else "the first snapshot is not ready")
     return True

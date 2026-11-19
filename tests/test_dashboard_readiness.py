@@ -65,6 +65,25 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("readyz answered 503", logs.output[0])
         self.assertIn("first refresh pass", logs.output[0])
 
+    def test_probes_arriving_together_log_the_reason_once(self):
+        self.store._pass_begun = self.store._stage_since = 1.0
+        server._not_ready_logged[0] = 0.0
+        start = threading.Barrier(8)
+        results = []
+
+        def probe():
+            start.wait()
+            results.append(server._log_not_ready(self.store, now=100.0))
+
+        threads = [threading.Thread(target=probe) for _ in range(8)]
+        with self.assertLogs("dashboard.server", level="WARNING") as logs:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(len(logs.output), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
