@@ -306,6 +306,18 @@ class NeedsTest(unittest.TestCase):
         self.assertNotIn("Waiting on a person", empty)
         self.assertNotIn("Waiting on a person", server._floor(State({})))
 
+    def test_the_floor_counts_triage_items_with_a_named_holder_as_waiting(self):
+        from dashboard import server
+
+        store = self.store()
+        self.gh.pages["/repos/%s/issues?state=open" % REPO] = [
+            _issue(30, "New input", ["loom:triage"]),
+            _issue(31, "Needs a ruling", ["loom:triage", "needs:" + THIRD]),
+        ]
+        store.refresh()
+        floor = server._floor(store)
+        self.assertIn("1 untriaged, 1 waiting on a person", floor)
+
     def test_needs_reads_ride_the_interval_reuse_unchanged_asks_and_stop_below_the_floor(self):
         store = self.store()
         store.refresh()

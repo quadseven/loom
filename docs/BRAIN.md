@@ -654,13 +654,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
-leaves it alone from then on; the brain decides whether it becomes a ticket
-or `needs:human`. The proposed ask is no comment to a person: it is one
-routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
-which the factory's hold notes quote as the reason for the hold and the
-prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
-person-only, and every `needs:human` reaches the operator's digest.
+work, the issue keeps `loom:triage`, gains `needs-brain`, and records the
+proposed ask as a status event (`<!-- loom:rewrite-ask -->`). The brain can
+rule on it before the station escalates the hold. Issues with a
+`needs:<login>` label wait on that person and are skipped by the rewriter.
+The standup and dashboard count those issues as waiting on a person. The
+standup also counts triage issues older than seven days and names the oldest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
 `lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`
@@ -1786,6 +1785,10 @@ factory's `brain_holds`) resolves a hold older than 24 hours that Loom set:
   running, pr or failed to `loom:failed`, out of the goal's in-flight count.
   Either way one event on the status comment, edited in place, names who held
   it, for how long and why (the note beside the label event, else its state).
+- A triage issue that has waited 24 hours goes to `needs:human` and loses
+  `loom:triage` and `needs-brain`. The station posts the recorded ask once.
+  When the hold has no recorded ask, it asks the operator to decide how to
+  triage the issue. An existing person hold is left in place.
 - At most 5 a run, oldest first, and a run at most every 30 minutes, stamped
   however it ends. The run sends each repo's count of holds older than a day
   that it left (`POST /api/brain-holds`), and the dashboard's Needs-you page

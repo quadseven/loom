@@ -6084,7 +6084,7 @@ class Factory:
                 _say("could not read the held tickets of %s: %s" % (repo, err))
                 continue
             try:
-                for issue in self._triaged(repo):
+                for issue in brain_hold.triaged(self.gh, repo):
                     by_number.setdefault(int(issue["number"]), issue)
             except GitHubError as err:
                 _say("could not read the triage issues of %s: %s" % (repo, err))
@@ -6102,9 +6102,11 @@ class Factory:
                     continue
                 counts["old"] += 1
                 counts[found.kind] += 1
+                names = _labels(issue)
+                triage = labels.in_triage(names)
+                if triage and (not found.at or labels.waiting_on_person(names)):
+                    continue
                 if found.kind == brain_hold.LOOM:
-                    triage = (brain_hold.TRIAGE_LABEL in _labels(issue)
-                              and "loom:ticket" not in _labels(issue))
                     due.append((age, repo, issue, found, triage))
         for age, repo, issue, found, triage in sorted(due, key=lambda d: -d[0]):
             if not write or limit <= 0:
@@ -6118,42 +6120,30 @@ class Factory:
                 limit -= 1
         return report
 
-    def _triaged(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open triage issues (bus/rewrite.py candidates reads the
-        same listing): issues at loom:triage, not tickets and not pull
-        requests, whatever their other labels."""
-        data = self.gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open" % repo)
-        return [i for i in data if isinstance(i, dict) and "pull_request" not in i
-                and "number" in i and "loom:ticket" not in _labels(i)]
-
     def _lift_triage_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
-                          age: float, done: List[bool]) -> None:
-        """Resolve one triage issue's hold Loom set (loom#1884): with no
-        retry note yet, take needs-brain off and leave the issue at
-        loom:triage with one retry note quoting why it was held (the
-        rewrite's last refusal), so the rewrite step -- whose candidates
-        leave held issues out -- tries once more. With a retry note already
-        on it, the rewrite could not turn it into a brief: put it in the
-        hand-off pool with one note, as _hold_hand_off does for a ticket."""
+                          _age: float, done: List[bool]) -> None:
+        """Send a day-old triage hold to a person, with one ask."""
         number = int(issue["number"])
-        comments = self._comments(repo, number)
-        why = brain_hold.reason(comments, found.at, "triage")
-        hours = age / 3600
-        if any(brain_hold.RETRY_MARKER in str(c.get("body") or "") for c in comments):
-            kept = list(dict.fromkeys(
-                [x for x in _labels(issue) if x != brain_hold.LABEL] + [HANDOFF_LABEL]))
-            self._relabel(repo, issue, kept)
-            self._status_note(repo, number, brain_hold.triage_handoff_note(
-                found, hours, why, HANDOFF_LABEL))
-            _say("handed off %s#%d: its triage needs-brain hold returned after its "
-                 "rewrite retry" % (repo, number))
-        else:
-            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
-                         % (repo, number, brain_hold.LABEL), ok=(404,))
-            issue["labels"] = [{"name": x} for x in _labels(issue) if x != brain_hold.LABEL]
-            self._status_note(repo, number, brain_hold.triage_retry_note(found, hours, why))
-            _say("freed %s#%d's triage needs-brain hold for one more rewrite attempt"
-                 % (repo, number))
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        names = _labels(issue)
+        required = {brain_hold.TRIAGE_LABEL, brain_hold.LABEL}
+        if (issue.get("state") != "open" or not required.issubset(names)
+                or "loom:ticket" in names or labels.waiting_on_person(names)
+                or any(name.startswith("blocked:") for name in names)):
+            return
+        comments = brain.trusted_comments(self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                           sorted(status.logins(self.gh, self.trusted)))
+        prior = next((c for c in comments if brain_hold.TRIAGE_ASK_MARKER
+                      in str(c.get("body") or "").splitlines()), None)
+        # If the label write failed, finish the same move. A later hold on
+        # an issue someone returned to triage does not repeat the handoff.
+        if prior is not None and _ts(prior.get("created_at")) < found.at:
+            return
+        if prior is None:
+            ask = brain_hold.triage_ask(comments, found.at)
+            brain._check_written_text(ask)
+            notify.post(self.gh, repo, number, ask, notify.ASK)
+        self._relabel(repo, issue, [name for name in names if name not in required] + [NEEDS_HUMAN])
         done.append(True)
 
     def _lift_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
