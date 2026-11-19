@@ -115,12 +115,14 @@ def main() -> None:
     # The shell runner supplies its existing model-limit JSON and hold fields.
     import json
 
-    slot, available, retry, models = sys.argv[1:]
+    slot, available, retry, models, from_limit_file = sys.argv[1:]
     home = os.environ["LOOM_HOME"]
     beat = {"lane": slot, "at": int(time.time()), "available": available == "true",
             "reason": sys.stdin.read(), "limited_models": json.loads("{" + models + "}")}
     if retry.isascii() and retry.isdigit():
         beat["retry_at"] = int(retry)
+        if available == "false" and from_limit_file == "1":
+            beat["from_limit_file"] = True
     path = os.path.join(home, "state", "usage", slot + ".json")
     state_store.FileStore().write_json(path, heartbeat_fields(slot, beat, home))
 

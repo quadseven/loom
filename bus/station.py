@@ -107,6 +107,7 @@ from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
 from . import watch
+from . import workersai
 from . import weakened
 from . import labels
 from . import lock
@@ -581,7 +582,7 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # keeps its rung, and the brain re-queues it when the incident closes.
 # An [auth] one is the operator's key, which no lane can renew: it is not a
 # failure, not an attempt spent and never a runaway.
-CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth|egress-opened)\] ")
+CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|egress-opened)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Whether this process has said the send-back comparison is off (unset target).
@@ -2073,7 +2074,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("factory", "transient", "limit", "auth")
+NOT_WORK = ("size", "factory", "transient", "limit", "auth")
 
 
 def failure_class(reason: str) -> str:
@@ -2395,6 +2396,7 @@ class Station:
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
+        self._evidence: Optional[evidence_close.Pass] = None
         # Rewrite agent jobs this pass started, by issue (_start_rewrite).
         self._rewrite_procs: Dict[str, Any] = {}
         self.read_secret = read_secret or read_ssm
@@ -2471,6 +2473,7 @@ class Station:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._closed_complete: Dict[str, bool] = {}
+        self._unmerged_refs: Dict[str, Set[int]] = {}
         # The claimed settle's re-review requests, by "repo#pull request", as
         # saved in claimed.json, and how many it has written this run.
         self._claimed_rereviews: Dict[str, Any] = {}
@@ -2886,6 +2889,7 @@ class Station:
         allowed = {a.lower() for a in self.s.authors}
         comments = status.expand(comments, self.s.authors)
         last_end, newest_fix = -1, None
+        before_workersai = None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
@@ -2893,7 +2897,11 @@ class Station:
             trusted = tickets._login(c.get("user")) in allowed
             # A stranger's claim or rung marker must not hide a trusted fix.
             if trusted and (CLAIM_RE.fullmatch(body.strip()) or _restarts_ladder(body)):
+                before_workersai = last_end if body.startswith("Claimed for lane workersai ") else None
                 last_end = i
+            elif trusted and body.startswith(history.WORKERSAI_SIZE_STOP) and before_workersai is not None:
+                # The next lane must resume the open pull on this same fix round.
+                last_end, before_workersai = before_workersai, None
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
         if newest_fix is None or newest_fix[0] < last_end:
@@ -2934,7 +2942,7 @@ class Station:
         its fix comment cannot be used (refused, as an untrusted ticket is),
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
-        if not self._can_claim(lane):
+        if not self._can_claim(lane, issue):
             return False
         number = int(issue["number"])
         comments = self._claim_comments(repo, issue, number)
@@ -3590,19 +3598,20 @@ class Station:
             self._claim_candidates([])
             self._record_slot_sample(False)
             return
-        cands = self._claim_candidates(free)
-        before = {lane: len(cands[lane]) for lane in free}
+        builders = [lane for lane in free if self._code_ready(lane)]
+        cands = self._claim_candidates(builders)
+        before = {lane: len(cands[lane]) for lane in builders}
         by_lane = self._apply_unproven_gate(cands)
         # The lanes that had briefed tickets and the gate left with nothing:
         # they sit idle while the gate holds the work (loom#564).
-        idle = [lane for lane in free if before[lane] and not by_lane[lane]]
+        idle = [lane for lane in builders if before[lane] and not by_lane[lane]]
         for hold in self._gate_holds.values():
             hold["idle"] = len(idle)
-        for lane in free:
-            self._claim_for_lane(lane, by_lane[lane], free)
+        for lane in builders:
+            self._claim_for_lane(lane, by_lane[lane], builders)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
-                                     for lane in free))
-        self._hand_verifies([lane for lane in free if not by_lane[lane]])
+                                     for lane in builders))
+        self._hand_verifies([lane for lane in free if not by_lane.get(lane)])
 
     # -- dead-lane runaway release (loom#565) ------------------------------
     def _open_lane_no_success(self) -> Dict[str, Tuple[int, str]]:
@@ -3951,6 +3960,8 @@ class Station:
                 lanes.update(model_lanes(model.group(1)))
             else:
                 lanes.update(factory.lanes_of(factory.difficulty_of(issue), not self._public(repo)))
+        if not self._code_ready("workersai"):
+            lanes.discard("workersai")
         return lanes
 
     def _proven(self, repo: str, number: int) -> bool:
@@ -4477,25 +4488,30 @@ class Station:
         for lane in lanes:
             if limit and handed >= limit:
                 return
+            if lane == "workersai" and workersai.daily_pct(self.s.home, self.now) == 100:
+                continue
             if lane in held or self._verify_lane_held(lane):
                 continue
             for repo, issue in list(pool):
                 if needs_public_repo(lane, "") and not self._public(repo):
                     continue
+                missing = self._no_live_evidence(repo, issue)
+                text = None
+                if lane == "workersai" and not missing:
+                    text = self._verify_brief_text(repo, lane, issue)
+                    if not workersai.short_verify(text):
+                        continue
                 pool.remove((repo, issue))
                 attempts["%s#%s" % (repo, issue["number"])] = self.now
                 _write_json(path, attempts)
-                if self._no_live_evidence(repo, issue):
+                if missing:
                     continue
-                self._write_verify_brief(repo, lane, issue)
+                self._write_verify_brief(repo, lane, issue, text)
                 handed += 1
                 break
 
-    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
+    def _verify_brief_text(self, repo: str, lane: str, issue: Dict[str, Any]) -> str:
         number = int(issue["number"])
-        self._clear_awaiting(repo, number)
-        if brain.WAIT_LIVE_EVENT in _label_names(issue):
-            self._clear_live_event(repo, number)
         stamp = int(self.now)
         adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
                         if self._adapter_can_verify(repo, issue) else None)
@@ -4516,7 +4532,17 @@ class Station:
         if (self._adapter_can_verify(repo, issue)
                 and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
             station_data += self._adapter_verify_section(repo)
-        text = text.replace("\n## Verify\n", "\n" + station_data + "\n## Verify\n", 1)
+        return text.replace("\n## Verify\n", "\n" + station_data + "\n## Verify\n", 1)
+
+    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any],
+                            text: Optional[str] = None) -> None:
+        number = int(issue["number"])
+        stamp = int(self.now)
+        if text is None:
+            text = self._verify_brief_text(repo, lane, issue)
+        self._clear_awaiting(repo, number)
+        if brain.WAIT_LIVE_EVENT in _label_names(issue):
+            self._clear_live_event(repo, number)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -4652,7 +4678,7 @@ class Station:
             slug = config.app(lane)
             if not slug or author == review_sweep_mod.bot(slug):
                 continue
-            if self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
+            if not self._code_ready(lane) or self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
                 continue
             return lane
         return None
@@ -4766,7 +4792,8 @@ class Station:
                  % (repo, issue.get("number"), error))
         return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
 
-    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True
+    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True,
+                           linked: Optional[List[Dict[str, Any]]] = None
                            ) -> Tuple[str, List[Dict[str, Any]], str]:
         """(default branch, merged pull requests, error) for a ticket: its
         pull requests linked the way reconcile links them, newest first, the
@@ -4779,8 +4806,9 @@ class Station:
         read: List[Dict[str, Any]] = []
         try:
             branch = self._default_branch(repo)
-            linked = sorted((dict(pr) for pr in self._closed_pulls(repo)
-                             if _covers_pr(issue, repo, pr)),
+            if linked is None:
+                linked = [pr for pr in self._closed_pulls(repo) if _covers_pr(issue, repo, pr)]
+            linked = sorted((dict(pr) for pr in linked),
                             key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
             # Only the pull requests the section shows are read in full.
             for pr in linked[:verify_data.MAX_PULLS]:
@@ -5014,12 +5042,12 @@ class Station:
 
     def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
         klass = failure_class(self._failure_reason(lane, name))
-        if klass in ("transient", "limit"):
+        if klass in ("transient", "size", "limit"):
             # The run never looked at the ticket: it costs the ticket no
             # cooldown, and a lane failing this way twice sits out an hour
             # (loom#714).
             self._forget_verify_attempt(repo, number)
-            held = klass == "transient" and self._verify_strike(lane)
+            held = klass in ("transient", "size") and self._verify_strike(lane)
             _say("verify run %s failed [%s]; %s#%d is due again now%s"
                  % (name, klass, repo, number,
                     "; lane %s takes no verify run for an hour after %d transient "
@@ -7044,18 +7072,24 @@ class Station:
         requests survives."""
         if repo not in self._closed_cache:
             pulls: List[Dict[str, Any]] = []
+            unmerged: Set[int] = set()
             complete = True
             url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                                   "&direction=desc&per_page=100" % repo)
             for page in range(SHIP_PAGES):
                 resp = self.gh.rest("GET", url)
                 merged, known = self._closed_page(resp.data)
+                if isinstance(resp.data, list):
+                    for pr in resp.data:
+                        if isinstance(pr, dict) and not pr.get("merged_at"):
+                            unmerged.update(_refs_numbers(repo, str(pr.get("body") or "")))
                 pulls.extend(merged)
                 url, pagination_known = self._closed_next(repo, resp, page)
                 complete = complete and known and pagination_known
                 if not url:
                     break
             self._closed_complete[repo] = complete and not url
+            self._unmerged_refs[repo] = unmerged
             self._closed_cache[repo] = pulls
         return self._closed_cache[repo]
 
@@ -9228,6 +9262,15 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        if lane == "workersai" and klass == "size":
+            names = _label_names(self._issue(repo, number))
+            if RUNNING in names and "lane:workersai" in names:
+                self._stopped(repo, number, lane, klass, reason)
+                queued = ticket_move.next_labels(names, "queued", lane="", wait="lane",
+                                                 own_logins=self.s.authors, clear_needs_brain=False)
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": queued})
+                _say("requeued %s#%d after a coding-size refusal on workersai" % (repo, number))
+            return True
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
@@ -9525,7 +9568,8 @@ class Station:
         demoted, not the failed lane's provider, whose runner takes the model
         and, for a public-only lane, a public repo. public caches the repo
         lookup across candidates."""
-        if cand not in LANES or cand in demoted or not self._heartbeat_ok(cand):
+        if (cand not in LANES or cand in demoted or not self._code_ready(cand, model)
+                or not self._heartbeat_ok(cand)):
             return False
         if provider(cand) == provider(failed):
             return False
@@ -12213,9 +12257,8 @@ class Station:
         proof due first (_evidence_close, bus/evidence_close.py)."""
         if self._deferred():
             return
-        self._live_budget = LIVE_CHECKS_PER_PASS
-        self._proof_budget = LIVE_PROOFS_PER_PASS
-        self._evidence = self._evidence_pass()
+        if self._evidence is None:
+            self._evidence = self._evidence_pass()
         try:
             self._close_done_repos(CLOSE_DONE_PER_PASS)
         finally:
@@ -12328,7 +12371,8 @@ class Station:
         except GitHubError as err:
             _say("could not write the evidence close pause: %s" % err)
 
-    def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
+    def _evidence_close(self, repo: str, issue: Dict[str, Any],
+                        linked: Optional[List[Dict[str, Any]]] = None) -> str:
         """The evidence close of one ticket (bus/evidence_close.py): CLOSED
         when it closed, WAIT when it stays for a later pass with no other
         close path run on it, OTHER when the usual done close decides."""
@@ -12336,27 +12380,93 @@ class Station:
         boxes = evidence_close.boxes(str(issue.get("body") or ""))
         names = _label_names(issue)
         ticket = "%s#%d" % (repo, int(issue["number"]))
-        state = self._evidence_state
         if (run.paused or not boxes or evidence_close.label_hold(names)
-                or evidence_close.refused_recently(state, ticket, self.now)
-                or self._live_has_own_proof(repo, issue, boxes)):
+                or evidence_close.refused_recently(self._evidence_state, ticket, self.now)):
+            return evidence_close.OTHER
+        if linked is None and ("loom:shipped" not in names
+                               or self._live_has_own_proof(repo, issue, boxes)):
             return evidence_close.OTHER
         if min(run.left) <= 0:
             run.counts["waiting"] += 1
             return evidence_close.WAIT
         run.left[1] -= 1
         run.counts["read"] += 1
-        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        branch, pulls, error = self._merged_pull_facts(repo, issue, linked=linked)
         verdict, why = evidence_close.pulls_verdict(pulls, error)
         if verdict == evidence_close.WAIT:
             return verdict
         why = why or evidence_close.tier_refusal(repo, pulls, str(issue.get("body") or "")) \
-            or self._symbol_refusal(repo, branch, pulls) or self._unmeetable_refusal(repo, issue)
+            or self._symbol_refusal(repo, branch, pulls)
+        if not why and linked is not None:
+            return self._close_claimed_live(repo, issue, branch, pulls, boxes)
+        why = why or self._unmeetable_refusal(repo, issue)
         if why:
-            evidence_close.note_refused(state, ticket, why, self.now)
-            _say("evidence close: not closing %s: %s" % (ticket, why))
-            return evidence_close.OTHER
+            return self._refuse_evidence(repo, issue, why)
         return self._close_unproven(repo, issue, boxes)
+
+    def _refuse_evidence(self, repo: str, issue: Dict[str, Any], why: str) -> str:
+        ticket = "%s#%d" % (repo, int(issue["number"]))
+        evidence_close.note_refused(self._evidence_state, ticket, why, self.now)
+        _say("evidence close: not closing %s: %s" % (ticket, why))
+        return evidence_close.OTHER
+
+    def _close_claimed_live(self, repo: str, issue: Dict[str, Any], branch: str,
+                            pulls: List[Dict[str, Any]], boxes: Sequence[str]) -> str:
+        closed = self._closed_pulls(repo)
+        if any(self._reverted(repo, pr, closed, quote(branch, safe="/")) for pr in pulls):
+            return self._refuse_evidence(repo, issue, "a linked pull request was reverted")
+        remaining = self._claimed_live_checks(repo, issue, boxes, pulls)
+        if remaining is None:
+            return evidence_close.WAIT
+        if not remaining:
+            reason = "Closed after its merge and live checks passed."
+            return (evidence_close.CLOSED if self._close_done_ticket(repo, issue, reason)
+                    else evidence_close.WAIT)
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live in (" ".join(box.split()) for box in remaining):
+            why = self._unmeetable_refusal(repo, issue)
+            if why:
+                return self._refuse_evidence(repo, issue, why)
+        return self._close_unproven(repo, issue, remaining)
+
+    def _claimed_live_checks(self, repo: str, issue: Dict[str, Any], boxes: Sequence[str],
+                             pulls: Sequence[Dict[str, Any]]) -> Optional[List[str]]:
+        """Run the claim's due read-only checks. A failed or deferred check holds the issue."""
+        sources = self._proof_sources(repo)
+        unchecked = []
+        newest = pulls[0]  # _merged_pull_facts returns the newest merge first.
+        since = metrics.stamp(newest["merged_at"])
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, issue["number"]), {})
+        for box in boxes:
+            if _live_time_window(box):
+                return None
+            if criteria_gate.check_of(box) is None and not self._station_step(box, sources):
+                unchecked.append(box)
+                continue
+            # As on the ticket path, only a trusted author can supply a check to run.
+            if not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers):
+                return None
+            step, _ = live_proof.step_of(box)
+            if step is None or (step.hours and self.now < since + step.hours * 3600):
+                return None
+            key = criteria_gate.key(box)
+            last = mine.get(key, {})
+            if last.get("revision") == newest["merge_commit_sha"]:
+                if last.get("result") == "pass":
+                    continue
+                if self.now - last["at"] < LIVE_CHECK_RETRY:
+                    return None
+            if self._live_budget <= 0:
+                return None
+            self._live_budget -= 1
+            passed, seen = live_proof.run(step, since, sources, now=self.now)
+            mine[key] = {"result": "pass" if passed else "fail", "at": self.now,
+                         "seen": seen, "revision": newest["merge_commit_sha"]}
+            _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+            if not passed:
+                return None
+        return unchecked
 
     def _live_has_own_proof(self, repo: str, issue: Dict[str, Any],
                             boxes: Sequence[str]) -> bool:
@@ -12837,9 +12947,14 @@ class Station:
             if held["new"]:
                 _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
             return False
-        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-        if error:
-            _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+        shipped = "loom:shipped" in _label_names(issue)
+        listed_claim = unproven and not shipped
+        if shipped:
+            branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+            if error:
+                _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+            reason = ("Closed: %s. %s Not verified live; its criteria were not ticked "
+                      "one by one." % (reason, verify_data.close_facts(branch, pulls, error)))
         try:
             # force-close is the close-completeness guard's escape hatch:
             # this close is by rule, not a claim that each box was seen to
@@ -12847,10 +12962,8 @@ class Station:
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": marks})
-            closing.close(self.gh, repo, number,
-                          "Closed: %s. %s Not verified live; its criteria were not ticked "
-                          "one by one." % (reason, verify_data.close_facts(branch, pulls, error)),
-                          "completed")
+            # For a claimed evidence close, Proof due already carries the public reason.
+            closing.close(self.gh, repo, number, reason, "completed", said=listed_claim)
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept + [m for m in marks if m not in kept]})
@@ -13025,6 +13138,8 @@ class Station:
         finally:
             self._stamp_every(state, mark)
             _write_json(path, state)
+            if self._evidence is not None and self._evidence_state is not None:
+                _write_json(self._evidence_path(), self._evidence_state)
 
     def queue_stateless_tickets(self) -> None:
         """Queue each open loom:ticket issue that carries no state label and
@@ -13664,12 +13779,23 @@ class Station:
         it was settled. One issue GitHub or the text checks refuse is logged
         and skipped; it does not stop the others."""
         number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        if criteria_gate.open_operator_criteria(body) or evidence_close.label_hold(_label_names(issue)):
+            return 0
         pulls = [pr for pr in self._closed_pulls(repo)
                  if number in _refs_numbers(repo, str(pr.get("body") or ""))]
-        if not pulls or len(pulls) > claimed.MAX_PULLS:
+        if not pulls or len(pulls) > claimed.MAX_PULLS or number in self._unmerged_refs[repo]:
             return 0
-        branch = self._default_branch(repo)
         try:
+            if self.s.settle_claimed == "on" and evidence_close.boxes(body):
+                if self._evidence is None:
+                    self._evidence = self._evidence_pass()
+                verdict = self._evidence_close(repo, issue, linked=pulls)
+                if verdict != evidence_close.OTHER:
+                    return int(verdict == evidence_close.CLOSED)
+            if claimed.LIVE_LABEL in _label_names(issue):
+                return 0
+            branch = self._default_branch(repo)
             checked = self._claimed_pulls(repo, number, branch, pulls, pacer)
             if checked is None:
                 return 0
@@ -13807,7 +13933,7 @@ class Station:
         number = int(issue["number"])
         body = str(issue.get("body") or "")
         act = self.s.settle_claimed == "on"
-        live = claimed.live_boxes(body)
+        live = evidence_close.boxes(body) or claimed.live_boxes(body)
         if live:
             if act:
                 pacer.wait()
@@ -16416,9 +16542,17 @@ class Station:
                      merges if isinstance(merges, dict) else {})
         card.save()
 
-    def _can_claim(self, lane: str) -> bool:
+    def _code_ready(self, lane: str, model: str = "") -> bool:
+        return lane != "workersai" or workersai.code_ready(
+            self.s.home, model or brain.lane_model(lane))
+
+    def _can_claim(self, lane: str, issue: Optional[Dict[str, Any]] = None) -> bool:
         """Whether a lane may claim a brief: not demoted, or a zero-done
         demoted lane whose probe gate is open."""
+        if lane == "workersai" and issue is not None:
+            model = brief_model(lane, tickets.parse(issue.get("body"))[0])
+            if not self._code_ready(lane, model):
+                return False
         return lane not in self.demoted_lanes() or scorecard.Scorecard(self.state, self.now).can_probe(lane)
 
     def _not_demoted(self, free: List[str]) -> List[str]:
@@ -16470,7 +16604,8 @@ class Station:
                                available=[x for x in LANES if self._heartbeat_ok(x)],
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
-                               down=self.down_lanes() + self.benched_lanes(pairs),
+                               down=self.down_lanes() + self.benched_lanes(pairs)
+                               + ([] if self._code_ready("workersai") else ["workersai"]),
                                demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),

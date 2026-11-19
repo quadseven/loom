@@ -1276,7 +1276,7 @@ def _is_brief(body: str) -> bool:
 # The head of the note _give_up leaves when a ticket is past the last rung.
 GAVE_UP = "The factory tried every rung of the model ladder"
 # The class bus/station.py's CLASS_RE reads off a reported reason.
-ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
+ENDING_CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth)\] ")
 
 
 # A run cut off at a timeout: the agent's (lanes/agent_cli.sh classes exit 124

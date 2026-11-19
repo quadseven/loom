@@ -235,13 +235,16 @@ def write(path: str, record: Dict[str, Any]) -> None:
 def main(argv: Optional[List[str]] = None, stdin: Any = None, now: Optional[float] = None,
          fetch: Fetch = _urlopen) -> int:
     args = sys.argv[1:] if argv is None else argv
+    refresh = args[-1:] == ["--refresh"]
+    if refresh:
+        args = args[:-1]
     if len(args) not in (2, 3):
-        print("usage: python3 -m bus.meter <lane> <out.json> [url]", file=sys.stderr)
+        print("usage: python3 -m bus.meter <lane> <out.json> [url] [--refresh]", file=sys.stderr)
         return 2
     lane, out = args[0], args[1]
     url = args[2] if len(args) == 3 and args[2] else None
     now = time.time() if now is None else now
-    if fresh(out, now):
+    if not refresh and fresh(out, now):
         return 0
     lines = (stdin or sys.stdin).read().splitlines()
     key = lines[0].strip() if lines else ""
