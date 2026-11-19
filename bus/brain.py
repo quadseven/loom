@@ -4602,19 +4602,31 @@ def _oldest_open_issues(gh: GitHub, repo: str):
         url = _next_link(resp.headers.get("link", ""))
 
 
+def _queue_triaged_issue(gh: GitHub, repo: str, issue: Dict[str, Any],
+                        goal: int, epic: int, area: Optional[str]) -> None:
+    number = int(issue["number"])
+    if not _link_to_goal(gh, repo, epic, issue, under=goal):
+        # GitHub refused the sub-issue link: the Part of line links it instead.
+        gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                {"body": _with_part_of(str(issue.get("body") or ""), epic)})
+    gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+            {"labels": ["loom:ticket", "loom:queued"] +
+             (["area:" + area] if area and "area:" + area not in _labels(issue) else [])})
+
+
 def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[str]:
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
     anything with a loom: label. A ready issue (every brief section,
-    checkboxes under Acceptance criteria) becomes a loom:queued ticket under
-    the goal, while the goal has room; the rest get loom:triage, and the
-    returned line names what is missing. No comment: each one emailed the
-    issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
-    intake epic (intake_epic). Only labels, sub-issue links and
-    an intake epic when one is needed are written, plus a Part of line at the
-    end of a ready issue's body when GitHub refuses the sub-issue link: an issue is never closed or
-    retitled, and nothing else in it is edited.
+    checkboxes under Acceptance criteria) from a trusted author becomes a
+    loom:queued ticket when the goal has room. Incomplete issues and ready
+    issues from untrusted authors get loom:triage and a line naming the
+    reason. No comment: each one emailed the issue's author, and 161 older
+    issues got one on 2026-10-20. A queued ticket goes under the goal's intake
+    epic (intake_epic). Triage writes labels, sub-issue links, and an intake
+    epic when needed. If GitHub refuses a sub-issue link, triage appends a
+    Part of line to the queued ticket's body.
     Returns one line per issue looked at.
     """
     if limit < 1:
@@ -4636,7 +4648,16 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing:
+        reason = ""
+        if missing:
+            reason = "missing " + ", ".join(missing)
+        elif not tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
+            reason = "untrusted author"
+        if reason:
+            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                    {"labels": ["loom:triage"]})
+            lines.append("#%d loom:triage, %s" % (number, reason))
+        else:
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -4651,21 +4672,10 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             elif intake is None or intake[1] >= EPIC_TICKET_CAP:
                 found = intake_epic(gh, repo, goal)
                 intake = (found, len(_epic_tickets(gh, repo, found)))
-            if not _link_to_goal(gh, repo, intake[0], issue, under=goal):
-                # GitHub refused the sub-issue link: the Part of line links it
-                # instead.
-                gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
-                        {"body": _with_part_of(str(issue.get("body") or ""), intake[0])})
-            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                    {"labels": ["loom:ticket", "loom:queued"] +
-                     (["area:" + area] if area and "area:" + area not in _labels(issue) else [])})
+            _queue_triaged_issue(gh, repo, issue, goal, intake[0], area)
             in_flight += 1
             intake = (intake[0], intake[1] + 1)
             lines.append("#%d queued under #%d" % (number, intake[0]))
-        else:
-            gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
-                    {"labels": ["loom:triage"]})
-            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
         done += 1
     return lines
 
