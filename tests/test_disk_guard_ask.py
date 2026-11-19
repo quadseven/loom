@@ -30,6 +30,7 @@ class FakeGH:
         self.labels_added = []  # (repo, number, labels)
         self.labels_removed = []  # (repo, number, labels)
         self.comments = {}  # (repo, number) -> [comment]
+        self.patched_comments = []  # (repo, comment_id, body)
 
     def rest(self, method, path, data=None):
         if method == "GET" and path.startswith("/repos/") and "/issues/" in path and not path.endswith("/labels") and not "/comments" in path:
@@ -49,7 +50,23 @@ class FakeGH:
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
             number = int(parts[5])
-            self.posted.append((repo, number, data.get("body", "")))
+            comment_id = len(self.comments.get((repo, number), [])) + 1
+            body = data.get("body", "")
+            comment = {"id": comment_id, "body": body}
+            self.comments.setdefault((repo, number), []).append(comment)
+            self.posted.append((repo, number, body))
+        if method == "PATCH" and "/issues/comments/" in path:
+            parts = path.split("/")
+            repo = parts[2] + "/" + parts[3]
+            comment_id = int(parts[6])
+            body = data.get("body", "")
+            # Find and update the comment
+            for comments_list in self.comments.values():
+                for c in comments_list:
+                    if c.get("id") == comment_id:
+                        c["body"] = body
+                        break
+            self.patched_comments.append((repo, comment_id, body))
         if method == "DELETE" and path.endswith("/labels/needs:human"):
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
@@ -61,11 +78,16 @@ class FakeGH:
         if "/comments" in path:
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
-            number = int(parts[4])
+            # Path format: /repos/{owner}/{repo}/issues/{number}/comments
+            # or /repos/{owner}/{repo}/issues/comments/{comment_id}
+            if "issues/comments" in path:
+                # PATCH path - not used for paginate
+                return []
+            number = int(parts[5])
             return self.comments.get((repo, number), [])
         if "/issues?" in path:
             return [{"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}],
-                     "pull_request": None, "html_url": "https://github.com/" + GOAL_REPO + "/issues/" + str(GOAL_NUMBER)}]
+                      "pull_request": None, "html_url": "https://github.com/" + GOAL_REPO + "/issues/" + str(GOAL_NUMBER)}]
         return []
 
     def graphql(self, query, variables):
@@ -274,6 +296,13 @@ class DiskGuardAskTest(unittest.TestCase):
 
         # Should still have only one ask (edited in place)
         self.assertEqual(len(st.gh.posted), first_posted, "Ask should be edited in place, not duplicated")
+        # Verify the comment was actually patched
+        self.assertEqual(len(st.gh.patched_comments), 1, "Comment should be patched once")
+        repo, comment_id, body = st.gh.patched_comments[0]
+        self.assertEqual(repo, GOAL_REPO)
+        self.assertIn("Kind: hardware", body)
+        self.assertIn("Free space:", body)
+        self.assertIn("Floor:", body)
 
     def test_ask_closed_when_disk_recovers(self):
         """When disk recovers (free space above floor), the ask is closed."""

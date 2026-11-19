@@ -17139,38 +17139,66 @@ class Station:
         floor, and loom home size by top-level folder; edit it in place
         while paused; close it when disk recovers. Paused under 60 minutes
         files nothing."""
+        guard = self._read_disk_guard_state()
+        if guard is None:
+            return
+
+        goal = self._get_goal_home()
+        if goal is None:
+            return
+        repo, number = goal
+
+        folders = self._read_loom_home_folders()
+        ask_body = self._build_ask_body(guard["free"], guard["floor"], folders)
+
+        ask_state = self._read_ask_state()
+        ask_state_path = os.path.join(self.state, "disk-guard-ask.json")
+
+        if guard["low"]:
+            self._handle_disk_low(repo, number, guard, ask_body, ask_state, ask_state_path)
+        else:
+            self._handle_disk_recovered(repo, number, ask_state, ask_state_path)
+
+    def _read_disk_guard_state(self) -> Optional[Dict[str, Any]]:
+        """Read and validate the disk guard state file. Returns None if invalid."""
         path = os.path.join(self.state, DISK_GUARD_FILE)
         saved = _read_json(path, {}, strict=False)
         if not isinstance(saved, dict):
-            return
+            return None
         low = saved.get("low")
         at = saved.get("at")
         free = saved.get("free")
         floor = saved.get("floor")
         if not (isinstance(low, bool) and self._num(at) and self._num(free) and self._num(floor)):
-            return
+            return None
+        return {"low": low, "at": at, "free": free, "floor": floor}
 
-        # Check if we have a goal home to post to
+    def _get_goal_home(self) -> Optional[Tuple[str, int]]:
+        """Get the goal home repo and issue number. Returns None if not available."""
         homes = self._goal_homes()
         if not homes:
-            return
+            return None
         repo, goal = homes[0]
         number = goal.get("number")
         if not isinstance(number, int):
-            return
+            return None
+        return (repo, number)
 
-        # Read the loom home folder sizes from the latest tend_disk run
+    def _read_loom_home_folders(self) -> Dict[str, int]:
+        """Read the loom home folder sizes from the latest tend_disk run."""
         disk_path = os.path.join(self.state, "disk.json")
         disk_saved = _read_json(disk_path, {}, strict=False)
         folders = disk_saved.get("folders") if isinstance(disk_saved, dict) else None
         if not isinstance(folders, dict):
-            folders = {}
+            return {}
+        return folders
 
-        # Build the ask body
+    def _build_ask_body(self, free: int, floor: int, folders: Dict[str, int]) -> str:
+        """Build the ask body from free space, floor, and folder sizes."""
         folder_parts = ", ".join("%s %s" % (k, _gb(v)) for k, v in
                                   sorted(folders.items(), key=lambda kv: (-kv[1], kv[0])))
         total = sum(folders.values()) if folders else 0
-        ask_body = (
+        return (
             "Kind: hardware\n"
             "The loom home's disk has been below the free-space floor for more than 60 minutes.\n"
             "Free space: %s\n"
@@ -17178,44 +17206,75 @@ class Station:
             "Loom home holds %s (%s)"
         ) % (_gb(free), _gb(floor), _gb(total), folder_parts or "empty")
 
-        # Track the ask in the station state
-        ask_key = "disk_guard_ask"
+    def _read_ask_state(self) -> Dict[str, Any]:
+        """Read the ask tracking state."""
         ask_state_path = os.path.join(self.state, "disk-guard-ask.json")
         ask_saved = _read_json(ask_state_path, {}, strict=False)
+        return ask_saved if isinstance(ask_saved, dict) else {}
 
-        if low:
-            # Disk is low - check if it's been 60+ minutes
-            if self.now - at >= 3600:
-                # Check if we already have an ask
-                if isinstance(ask_saved, dict) and ask_saved.get("number") == number:
-                    # Ask exists - update it in place by posting a new comment
-                    # The brain.human function will fail if already needs:human,
-                    # so we need to handle the update differently
-                    # For now, we'll rely on the fact that brain.human checks for existing ask
-                    pass
-                else:
-                    # Create new ask
-                    try:
-                        brain_human(self.gh, repo, number, ask_body)
-                        _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
-                        _say("disk guard: opened needs:human ask on %s#%d" % (repo, number))
-                    except ValueError as err:
-                        if "already needs:human" in str(err):
-                            # Ask already exists, record it
-                            _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
-                        else:
-                            _say("disk guard: failed to open ask: %s" % err)
+    def _handle_disk_low(
+        self,
+        repo: str,
+        number: int,
+        guard: Dict[str, Any],
+        ask_body: str,
+        ask_state: Dict[str, Any],
+        ask_state_path: str,
+    ) -> None:
+        """Handle the case when disk is low."""
+        if self.now - guard["at"] < 3600:
             # Under 60 minutes: do nothing
+            return
+
+        if ask_state.get("number") == number and ask_state.get("repo") == repo:
+            # Ask exists - edit it in place
+            self._edit_ask_comment(repo, number, ask_body)
+            _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
+            _say("disk guard: updated needs:human ask on %s#%d" % (repo, number))
         else:
-            # Disk recovered - close the ask if we have one
-            if isinstance(ask_saved, dict) and ask_saved.get("number") == number:
-                try:
-                    # Remove the needs:human label
-                    self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs:human" % (repo, number))
-                    _write_json(ask_state_path, {})
-                    _say("disk guard: closed needs:human ask on %s#%d" % (repo, number))
-                except Exception as err:
-                    _say("disk guard: failed to close ask: %s" % err)
+            # Create new ask
+            try:
+                brain_human(self.gh, repo, number, ask_body)
+                _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
+                _say("disk guard: opened needs:human ask on %s#%d" % (repo, number))
+            except ValueError as err:
+                if "already needs:human" in str(err):
+                    # Ask already exists, record it and edit
+                    self._edit_ask_comment(repo, number, ask_body)
+                    _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
+                else:
+                    _say("disk guard: failed to open ask: %s" % err)
+
+    def _handle_disk_recovered(
+        self,
+        repo: str,
+        number: int,
+        ask_state: Dict[str, Any],
+        ask_state_path: str,
+    ) -> None:
+        """Handle the case when disk has recovered."""
+        if ask_state.get("number") == number and ask_state.get("repo") == repo:
+            try:
+                # Remove the needs:human label
+                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs:human" % (repo, number))
+                _write_json(ask_state_path, {})
+                _say("disk guard: closed needs:human ask on %s#%d" % (repo, number))
+            except Exception as err:
+                _say("disk guard: failed to close ask: %s" % err)
+
+    def _edit_ask_comment(self, repo: str, number: int, ask_body: str) -> None:
+        """Edit the existing needs:human comment with updated body."""
+        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        for comment in comments:
+            if isinstance(comment, dict):
+                body = str(comment.get("body") or "")
+                if body.startswith(HUMAN_MARKER):
+                    comment_id = comment.get("id")
+                    if comment_id is not None:
+                        new_body = "%s\n%s\nKind: hardware" % (HUMAN_MARKER, ask_body)
+                        self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, comment_id),
+                                     {"body": new_body})
+                    break
 
     def tend_watchdog(self) -> None:
         """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before
