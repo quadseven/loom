@@ -331,6 +331,11 @@ AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
+# The job cap an agent run and each check step start under (LOOM_BUILD_JOBS,
+# default 4, 0 for none): BUILD_JOBS_ENV, BUILD_JOBS_CHECK_ENV, BUILD_JOBS_BIN
+# and build_jobs_export.
+# shellcheck source=lanes/build_jobs.sh
+. "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
@@ -1482,7 +1487,7 @@ agy_agent() {
   settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
-    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+    LANG="${LANG:-en_US.UTF-8}" ${BUILD_JOBS_ENV[@]+"${BUILD_JOBS_ENV[@]}"} timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$@" --disable-slash-commands --model "$MODEL" < /dev/null | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
   # A failed restore must fail the run, even if agy itself succeeded. Only the
@@ -3090,13 +3095,18 @@ contract_run_sandboxed() {
     # (2026-10-16).
     # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
     # the scratch home, where agent_uv_cache copies them for a codex agent.
-    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${BUILD_JOBS_BIN:+$BUILD_JOBS_BIN:}${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
     export LOOM_CHECK_WORKERS="$CHECK_WORKERS"
+    # The job cap (lanes/build_jobs.sh). This environment was emptied above,
+    # so the cap is set here, not inherited; it lowers LOOM_CHECK_WORKERS
+    # when that is the larger of the two. The wrapper directory is first on
+    # PATH above. With LOOM_BUILD_JOBS=0 the list is empty.
+    for kv in ${BUILD_JOBS_CHECK_ENV[@]+"${BUILD_JOBS_CHECK_ENV[@]}"}; do export "${kv?}"; done
     # Host-red tests to set aside (host_red_deselected_passes): node ids
     # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
     # names them for a check that reads them itself.
@@ -4894,6 +4904,8 @@ for BRIEF in "$INBOX"/*.md; do
        heavy_lock adopt "$HEAVY_LOCK" "$$" || exit 1
        trap 'release_heavy_repo' EXIT
      fi
+     # The job cap, in this subshell only (lanes/build_jobs.sh).
+     build_jobs_export &&
      cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &

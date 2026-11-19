@@ -274,6 +274,47 @@ unset variables.
     holder or the recorded process has exited, then remove `pid` and the
     lock directory. The lane uses the same poll interval and wait limit as
     for host load.
+- A lane agent run and every check step start under a job cap,
+  `LOOM_BUILD_JOBS` (default 4; 0 turns it off; a value that is not a whole
+  number counts as 4). The load gates above only stop a run from starting,
+  and a run in flight could still take every core. The default is 4
+  because the three check slots at that cap fit a 12-core lane host; a
+  host with fewer cores should set it lower. Set it in the lane
+  runner's environment, like `LOOM_CHECK_WORKERS`. The cap reaches build
+  tools two ways (`lanes/build_jobs.sh`):
+  - Through the environment, for the tools that read it: `MAKEFLAGS`
+    (`-jN`), `CMAKE_BUILD_PARALLEL_LEVEL`, `PYTEST_XDIST_AUTO_NUM_WORKERS`,
+    `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `GRADLE_OPTS`
+    (`-Dorg.gradle.workers.max=N`), `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`
+    and `npm_config_jobs`, each at the cap, and `UV_CONCURRENT_BUILDS=1`.
+    An agent or check with an emptied environment has them set where that
+    environment is built. A subscription lane's agent inherits the
+    runner's environment, so there the cap is added after any `MAKEFLAGS`
+    or `GRADLE_OPTS` the host already set.
+  - Through a wrapper first on `PATH`, for the two tools that take a job
+    count only as a flag: `lanes/jobcap/xcodebuild` adds `-jobs N` to a call
+    that builds or tests, and `lanes/jobcap/swift` adds `--jobs N` to
+    `swift build`, `swift test` and `swift run`. Each runs the next tool of
+    its name on `PATH` with every argument unchanged. A call that names its
+    own job count, or builds nothing (`xcodebuild -list`, `swift package`),
+    passes through untouched. The sandbox lets a run read that one
+    directory and write nothing in it.
+  - In a check, `LOOM_CHECK_WORKERS` keeps its meaning and the smaller of
+    the two wins: the test runner gets the smaller as
+    `PYTEST_XDIST_AUTO_NUM_WORKERS`, and `LOOM_CHECK_WORKERS` is lowered to
+    the cap when it is the larger.
+  - With `LOOM_BUILD_JOBS=0` none of these names is set and `PATH` is left
+    as it was.
+  - Not covered: a tool that reads the core count for itself and takes no
+    setting; a build tool started by its full path or through `xcrun`, past
+    the wrapper; a command that sets its own job count, which wins; and
+    the agy lane where its user cannot read the loom checkout (the wrappers
+    are skipped there, the environment caps still apply). `MAKEFLAGS=-jN`
+    also makes a plain `make` run N jobs where it ran one, so a Makefile
+    that is not safe to run in parallel needs `.NOTPARALLEL` or its own
+    `-j1`. The cap is per run, not per host: how many runs start is the
+    load gates' and check slots' part, and one build at a time in a heavy
+    repo is `LOOM_HEAVY_REPOS`' part.
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
   hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
