@@ -2366,6 +2366,11 @@ Plan:
   `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
   `-high` keeps its suffix. A model outside the catalog is refused as a
   transient lane mismatch before agy starts.
+- Every 30 minutes, even with an empty inbox, agy can recheck held models
+  in its configured ladder. It sends one small print-mode request per held
+  `gemini-3.8-flash` effort (high, medium, or low). An answer releases
+  that model on the same pass. A refusal keeps the hold and updates its
+  expiry if the provider gives a reset time.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default

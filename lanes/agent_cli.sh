@@ -179,7 +179,8 @@ if not done:
 # the tree. $2 is the run's whole output (from LOG_START in the lane runner,
 # log_start in the brain) and $4 is the short tail (its last five non-blank
 # lines); the limit and credit patterns match $2 while auth and transient
-# match $4. On limit also sets RETRY_AT. A key the provider will not take is
+# match $4. On limit also sets RETRY_AT, and STATED_RETRY_AT when the provider
+# gives a reset time or duration. A key the provider will not take is
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal, a network fault or a provider fault on one request is transient;
@@ -210,7 +211,7 @@ classify_failure() {
   # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
   seen="$whole"
   [ "$status" -eq 0 ] && seen="$tail"
-  FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON=""
+  FAIL_CLASS=work RETRY_AT="" STATED_RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON=""
   now="$(date +%s)"
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
@@ -236,11 +237,11 @@ classify_failure() {
     elif [[ "$whole" =~ $OUT_OF_CREDIT_RE ]] || [[ "$tail" =~ $CREDIT_CODE_RE ]]; then
       OUT_OF_CREDIT=1 RETRY_AT=$((now + LIMIT_WAIT_MAX))
     elif [[ "$whole" =~ $EPOCH_RE ]]; then
-      RETRY_AT="${BASH_REMATCH[2]}"
+      RETRY_AT="${BASH_REMATCH[2]}" stated="${BASH_REMATCH[2]}"
     elif [[ "$whole" =~ $AFTER_RE ]]; then
       n="${BASH_REMATCH[2]}"
       case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
-      RETRY_AT=$((now + n))
+      RETRY_AT=$((now + n)) stated=$((now + n))
     elif [[ "$whole" =~ $DAILY_RE ]]; then
       RETRY_AT=$((now - now % 86400 + 86400))
     elif [[ "$whole" =~ $MONTHLY_RE ]]; then
@@ -251,6 +252,7 @@ classify_failure() {
     if [ "$monthly" -eq 0 ] && [ "$RETRY_AT" -gt $((now + cap)) ]; then
       RETRY_AT=$((now + cap))
     fi
+    [ -z "$stated" ] || STATED_RETRY_AT="$RETRY_AT"
   elif [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
        [[ "$tail" =~ $NET_RE ]]; then
