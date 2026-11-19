@@ -104,6 +104,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
+    "loom:health": {"color": "d93f0b", "description": "Filed by health intake for a live finding of the goal's health endpoint"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs:human": {"color": "b60205", "description": "One exact ask for a person; see the comment. Comes off when the answer is in the ticket"},
     "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},

@@ -109,6 +109,7 @@ decides who acts:
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 | `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
+| `loom:health` | A ticket health intake filed for a live finding (docs/HEALTH.md). With `loom:factory`, one of the two labels that admit a ticket to the reserve above the goal cap. |
 | `class:logic` | A change to behavior; every revert ticket carries it. |
 | `tier:<name>` | The pull request's `bus/merge_tier.py` tier when it opened. It reports and decides nothing. |
 
@@ -1719,7 +1720,12 @@ impact and brief lanes up to `LOOM_GOAL_CAP` (default 16) tickets in flight
 per goal. Running tickets and tickets at a pull request
 hold slots, as do queued or briefed tickets eligible for a lane. Factory
 repairs and health findings share two extra slots above the cap. Held repairs
-and health findings still use room in that reserve. Measured regressions
+and health findings still use room in that reserve. A label is the only
+evidence for it: `loom:factory` for a repair, `loom:health` for a finding
+health intake filed. Only a collaborator sets a label. The health marker in
+a body grants nothing, whoever wrote the issue, since anyone can paste it and
+a rewrite can copy it. A rewrite is judged by the labels of the issue it
+rewrites, and a marker in its brief is dropped. Measured regressions
 have their own slot (see Regression slot). Write the journal, report when
 due, and release the lock. A failed step goes in the journal and waits for
 the next tick.
