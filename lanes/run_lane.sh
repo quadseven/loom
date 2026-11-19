@@ -420,12 +420,19 @@ lane_setting() {
 # to that model is not claimed for this lane again before the reset: a pinned
 # model's limit parked the same ticket here every pass, 24 claims in 90
 # minutes, while the beat said available.
+# A hold the lane read from its limit file is marked "from_limit_file", so the
+# next pass can tell it from a hold the provider's own refusal set: the first
+# ends when the file is removed, the second only at its time or on a passing
+# provider re-check (HOLD_FROM_FILE, set by limit_held and mark_limit).
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
+HOLD_FROM_FILE=""
 write_beat() {
   local slot="$1" reason retry="" models
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
+  [ "$2" = false ] && [ -n "$retry" ] && [ -n "$HOLD_FROM_FILE" ] && [ "$slot" = "$SLOT" ] &&
+    retry="$retry, \"from_limit_file\": true"
   models="$(limited_models_json "$slot")"
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}}\n' \
@@ -1309,7 +1316,7 @@ post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
   [ -z "${LOOM_GITHUB_APP_ID:-}" ] || [ -n "${GH_TOKEN:-}" ] || return 0
   local class="${1:-work}" reason file scan=() rc=0 text
-  case "$class" in limit|auth) return 0 ;; esac
+  case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
@@ -1555,7 +1562,7 @@ mark_limit() {
   LIMIT_UNTIL=$(( $(date +%s) + hold ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
-  LIMITED=1
+  LIMITED=1 HOLD_FROM_FILE=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
   heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
 }
@@ -1568,8 +1575,13 @@ limit_held() {
   read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
   [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_MAX_HOLD )) ] || return 1
-  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
+  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1 HOLD_FROM_FILE=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
+}
+
+# Whether the hold in the heartbeat was read from the limit file.
+beat_hold_from_file() {
+  grep -q '"from_limit_file": true' "$BEAT" 2> /dev/null
 }
 
 spark_ready() {
@@ -1755,7 +1767,7 @@ lane_meter() {
   [ -z "$url" ] || [[ "$url" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] || return 0
   printf '%s\n%s\n' "$API_KEY" "$LANE_ACCOUNT" |
     PYTHONPATH="$LOOM_ROOT" timeout "$PROBE_TIMEOUT" python3 -B -m bus.meter "$LANE" \
-      "$LOOM_HOME/state/usage/$SLOT.meter.json" "$url" > /dev/null 2>&1 || true
+      "$LOOM_HOME/state/usage/$SLOT.meter.json" "$url" "$@" > /dev/null 2>&1 || true
 }
 
 # The slots that bill the same provider account as this slot, and so the same
@@ -2241,6 +2253,8 @@ opencode_agent_continuing() {
        ! grep -qiE "$NO_CHANGE_RE" "$TREE/$SUMMARY_FILE"; } &&
      opencode_described_step "$events"; then
     echo "[$(date -u +%FT%TZ)] $TICKET: continuing a text-only $LANE step once"
+    # Keep the first response as evidence if the continuation is refused.
+    [ "$LANE" != workersai ] || events="$events.continued"
     opencode_json_pass "$key_var" "$view" "$events" --continue \
       "Continue: carry out the step you just described, then commit or write .loom/summary.md"
     status=$?
@@ -4165,8 +4179,17 @@ agent_uv_cache() {
   fi
 }
 
+workersai_request() (
+  cd "$LOOM_ROOT" && python3 -EsB -m bus.workersai "$@"
+)
+
 run_agent() {
   local brief_text
+  if [ "$LANE:$DELIVERABLE" = workersai:verify ]; then
+    printf '%s\n%s\n' "$API_KEY" "$LANE_ACCOUNT" |
+      workersai_request verify "$1" "$MODEL" "$WORKDIR/$TICKET.verify-response" "$LOOM_HOME"
+    return $?
+  fi
   brief_text="$(cat "$1")$(work_note)$(validation_note)$(summary_note)"
   if [ "$LANE" = spark ]; then
     brief_text="$brief_text
@@ -4230,7 +4253,7 @@ agent_watchdog() {
     fi
     if [ "$seen_limit" -eq 1 ] && [[ "$line" =~ AI_RetryError ]]; then
       # A picked model is paused after the run, and the slot stays available.
-      if [ -z "$MODEL_PICKED" ]; then
+      if [ -z "$MODEL_PICKED" ] && [ "$LANE" != workersai ]; then
         provider_at_limit || true
         hold_provider_limit
       fi
@@ -4420,6 +4443,19 @@ if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_mode
   grep -q "$GO_LIMIT_ERROR" "$BEAT" 2>/dev/null; then
   echo "[$(date -u +%FT%TZ)] lane $SLOT runs free model $(slot_model "$SLOT"), outside the Go allowance: dropping its Go limit hold" >&2
   rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  LIMIT_UNTIL=""
+fi
+# A hold the lane read from its limit file ends when that file is removed: its
+# writer withdrew it (the fleet pacer lifts a pacing hold by deleting the
+# file). 2026-11-19: lane openrouter sat idle for 22 hours on a pacing hold
+# whose file was gone, with 887 of its 1000 free requests unused, because only
+# a provider probe could end a recorded hold and the lane has no probe URL.
+# The cluster free-openrouter slot is left out: its limit file does not
+# survive a pod restart, so a missing file there says nothing (see below).
+if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ] && [ ! -f "$LIMIT_FILE" ] &&
+   [ "$SLOT" != free-openrouter ] && beat_hold_from_file; then
+  echo "[$(date -u +%FT%TZ)] lane $SLOT: its limit file is gone, so the hold it recorded ends" >&2
+  heartbeat true ""
   LIMIT_UNTIL=""
 fi
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] &&
@@ -4846,7 +4882,11 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "$GH_CLEANUP_FAILURE" transient; continue
     fi
   fi
-  is_api_lane && archive_transcripts
+  if [ "$LANE:$DELIVERABLE" != workersai:verify ] && is_api_lane; then archive_transcripts; fi
+  if [ "$LANE" = workersai ] && [ "${LOOM_CLUSTER_RUNNER:-}" = 1 ] && [ "$STATUS" -eq 0 ]; then
+    # The pod gets no idle heartbeat after this job to sample its usage.
+    lane_meter --refresh
+  fi
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
     # An unknown spend fails closed: the marker stops paid picks for an hour.
     if ! model_pick settle "$MODEL" < "$WORKDIR/$TICKET.opencode-events" 2>> "$LOG"; then
@@ -4874,7 +4914,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
   # A run that timed out may have been retrying a usage limit all along.
-  if [ -z "$MODEL_PICKED" ] && { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
+  if [ "$LANE" != workersai ] && [ -z "$MODEL_PICKED" ] && { [ "$STATUS" -eq 124 ] || [ -f "$LOCK/watchdog-limit" ]; } && provider_at_limit; then
     hold_provider_limit
     park "$BRIEF" "limit: $LIMIT_WHY (agent exited $STATUS)" limit; continue
   fi
@@ -4905,6 +4945,15 @@ for BRIEF in "$INBOX"/*.md; do
     FAIL_CLASS=transient RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON="killed by SIGTERM"
   fi
   [ -f "$LOCK/watchdog-limit" ] && FAIL_CLASS=limit
+  if [ "$LANE" = workersai ] && [ "$FAIL_CLASS" = limit ] && [ -z "$EDITED" ]; then
+    lane_meter
+    EVENTS="$WORKDIR/$TICKET.opencode-events"
+    [ "$DELIVERABLE" != verify ] || EVENTS=/dev/null
+    if printf '%s\n' "$RUN_OUTPUT" | workersai_request refused "$LOOM_HOME" "$EVENTS" "${DELIVERABLE:-coding}"; then
+      park "$BRIEF" "first ${DELIVERABLE:-coding} request refused with daily usage below half" size
+      continue
+    fi
+  fi
   # What ran and how it ended, so a green run that did nothing shows.
   if [ -n "$MODEL_PICKED" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET model report: $MODEL ($MODEL_KIND), fallback: $MODEL_NOTE; exit $STATUS, ${EDITED:-no edits}, class $FAIL_CLASS" >> "$LOG"
@@ -5015,9 +5064,10 @@ for BRIEF in "$INBOX"/*.md; do
     # The station reads the result from the log folder and applies it; the
     # runner moves no label and opens no pull request.
     RESULT="$TREE/verify.json"
+    [ "$LANE" != workersai ] || RESULT="$WORKDIR/$TICKET.verify-response"
     # Only a file the agent made counts: one the repo tracks was there before.
     if [ ! -f "$RESULT" ] || [ -L "$RESULT" ] || [ "$(wc -c < "$RESULT")" -gt 65536 ] ||
-       [ -n "$(safe_git ls-files ':(icase)verify.json')" ]; then
+       { [ "$LANE" != workersai ] && [ -n "$(safe_git ls-files ':(icase)verify.json')" ]; }; then
       park "$BRIEF" "no verify.json written"; continue
     fi
     cp "$RESULT" "$LOGDIR/$TICKET.verify.json"

@@ -32,7 +32,7 @@ from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError, RateLimited, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
-from bus import handoff  # noqa: E402
+from bus import handoff, workersai  # noqa: E402
 
 REPO = "example-owner/example-repo"
 # A goal report this old is past its next reading time and grace whatever the
@@ -6280,6 +6280,19 @@ class FixTest(Base):
     def fix_of(self, comments):
         return station.Station(GitHub("token", transport=self.fake), self.settings)._fix_for(REPO, comments)
 
+    def test_size_refusal_reuses_the_same_fix_round_on_the_same_pull(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY + "\n<!-- loom:fix-head abc123 -->")
+        self.comment(12, "Claimed for lane workersai (body sha256 0123456789ab)")
+        self.comment(12, "Lane workersai stopped: [size] first coding request refused", author="stranger")
+        self.assertIsNone(self.fix_of(self.fake.comments[12]))
+        self.comment(12, "Lane workersai stopped: [size] first coding request refused")
+        fix, source = self.fix_of(self.fake.comments[12])
+        self.assertEqual((fix.pr, source), (99, 1))
+        self.assertEqual(station.Station._fix_round_count(self.fake.comments[12], set(AUTHORS)), 1)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.assertIsNone(self.fix_of(self.fake.comments[12]))
+
     def test_a_fix_posted_before_the_status_comment_claim_is_not_current(self):
         self.assertIsNone(self.fix_of([self.fix_comment(), self.status_comment("2030-01-02T00:00:01Z")]))
         # The status comment keeps its place in the list and its first post
@@ -6642,6 +6655,54 @@ class RetryTest(Base):
         self.run_pass()
         self.assertIn("moved from lane anthropic-2 to lane codex.", self.bodies()[-2])
         self.assertIn("lane:codex", self.fake.names(12))
+
+    def test_workersai_size_refusal_requeues_without_spending_the_rung(self):
+        self.failed(lane="workersai", reason="[size] coding request refused")
+        self.fake.comments[12].insert(0, {"body": factory.RUNG_MARKER % 2})
+        self.fake.private = False
+        self.heartbeat("workersai")
+        self.fake.add(13, lane="workersai", body=PLAIN_WITH_CRITERIA)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        model = brain.lane_model("workersai")
+
+        def check(tokens):
+            response = {"choices": [{"message": {"content": "OK"}}], "usage": {"prompt_tokens": tokens}}
+            with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(response).encode())):
+                return workersai.main(["check", self.home, model], io.StringIO("test\nexample\n"))
+
+        self.assertEqual(check(65536), 0)
+        usage = Path(self.home) / "state" / "usage"
+        (usage / "workersai.meter.json").write_text(json.dumps({
+            "lane": "workersai", "at": time.time(),
+            "windows": [{"window": "daily", "unit": "neurons", "used_pct": 20}]}))
+        events = usage / "events"
+        events.write_text("")
+        self.assertEqual(workersai.main(["refused", self.home, str(events), "coding"],
+                                       io.StringIO("AI_APICallError: Too Many Requests")), 0)
+        self.assertFalse(workersai.code_ready(self.home, model))
+        st.report_outcomes()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("lane:workersai", self.fake.names(12))
+        comments = [{"body": body} for body in self.bodies()]
+        self.assertEqual(factory.tried_rungs(comments), set())
+        self.assertEqual(factory.rung_of(comments), 2)
+        self.assertTrue(any("stopped: [size]" in c["body"] for c in comments))
+        for tokens in (0, 66, 65536):
+            if tokens:
+                self.assertEqual(check(tokens) == 0, tokens == 65536)
+            st = station.Station(GitHub("token", transport=self.fake), self.settings)
+            st.claim_new()
+            self.assertEqual("loom:running" in self.fake.names(13), tokens == 65536)
+            self.assertEqual("workersai" in st._factory().down, tokens != 65536)
+
+    def test_delayed_size_report_leaves_a_new_claim_on_another_lane(self):
+        self.failed(lane="workersai", reason="[size] first coding request refused")
+        self.fake.issues[12]["labels"] = [{"name": n} for n in ("loom:ticket", "loom:running", "lane:codex")]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.report_outcomes()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        self.assertFalse(any("stopped: [size]" in body for body in self.bodies()))
 
     def test_a_provider_limit_from_the_runner_uses_the_bounded_retry(self):
         self.heartbeat("codex-2")
@@ -13687,6 +13748,20 @@ class VerifyDispatchTest(Base):
         self.assertIn("A lane never moves a label", text)
         self.assertIn("loom:shipped", self.fake.names(2))
         self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_workersai_gets_only_a_short_verify_and_skips_a_full_meter(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        path = os.path.join(self.home, "state", "usage", "workersai.meter.json")
+        for pct in (100, 20):
+            self.write(path, json.dumps({"lane": "workersai", "at": st.now,
+                                         "windows": [{"window": "daily", "unit": "neurons",
+                                                      "used_pct": pct}]}))
+            self.fake.issues[2]["title"] = "x" * 10000
+            st._hand_verifies(["workersai"])
+            self.assertEqual(len(self.briefs("workersai")), int(pct == 20))
+        self.assertIn("Issue: %s#1" % REPO, self.text("workersai"))
+        attempts = station._read_json(os.path.join(st.state, station.VERIFY_FILE), {})
+        self.assertNotIn("%s#2" % REPO, attempts)
 
     def test_verify_brief_carries_a_proof_template_with_every_required_key(self):
         self.run_pass()

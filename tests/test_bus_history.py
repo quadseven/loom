@@ -52,6 +52,14 @@ class ReadHistory(unittest.TestCase):
         self.assertEqual(found.rung, 2)
         self.assertEqual(found.tried_rungs, {2})
 
+    def test_size_refusal_preserves_prior_work_and_the_next_claims_rung(self):
+        refused = comment("Lane workersai stopped: [size] first coding request refused")
+        claim = comment("Claimed for lane workersai (body sha256 0123456789ab)")
+        marker = comment(history.rung_marker(2))
+        comments = [marker, claim, refused]
+        self.assertEqual(history.tried_rungs(comments + [CLAIM]), {2})
+        self.assertEqual(history.tried_rungs([marker, CLAIM] + comments), {2})
+
     def test_a_rung_with_no_claim_is_not_tried(self):
         comments = [comment(history.rung_marker(1)), CLAIM, comment(history.rung_marker(2))]
         self.assertEqual(history.read_history(comments, TRUSTED).tried_rungs, {1})
