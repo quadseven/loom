@@ -1,7 +1,7 @@
-"""Complexity caps for deferred high-complexity review findings.
+"""Complexity caps for functions flagged in review.
 
-The review bot caps a function at cyclomatic complexity 15. This pins
-refactored functions under the cap so the warnings stay resolved.
+The review bot caps a function at cyclomatic complexity 15. Keep the
+refactored functions under that cap so the warnings stay resolved.
 """
 import ast
 import pathlib
@@ -31,6 +31,10 @@ TARGETS = (
     ("bus/station.py", "Station._held_wait_state"),
     ("bus/invariants.py", "_scheduled_failures"),
     ("bus/invariants.py", "read_scheduled_workflows"),
+    ("bus/log_capture.py", "update"),
+    # AI-REVIEW 2026-11-18 [automated review summary] station complexity (PR #3237):
+    # Keep environment parsing below the cap as new settings are added.
+    ("bus/station.py", "Settings.from_env"),
 )
 
 

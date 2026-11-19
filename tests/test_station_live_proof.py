@@ -148,15 +148,17 @@ class StationLiveProofTest(tbs.Base):
         text = self.status_text()
         self.assertIn("Live proof missing:", text)
         self.assertIn("`kubectl delete pod web-0` is not a read-only step", " ".join(text.split()))
+        self.assertIn("verify queue", text)
 
-    def test_a_shipped_ticket_with_no_runnable_proof_is_left_to_the_done_close(self):
+    def test_a_shipped_ticket_with_no_runnable_proof_gets_a_missing_evidence_note(self):
         body = LOG_BODY.replace("prints `daily status ready`", "shows the daily line")
         self.ship(body, hours_ago=30)
         log = FakeLog([])
         self.close_pass(log)
         self.assertEqual(log.reads, [])
         self.assertNotIn("Live proof missing:", self.status_text())
-        self.assertIn("needs-brain", self.fake.names(self.NUMBER))
+        self.assertIn("Missing evidence:", self.status_text())
+        self.assertIn("loom:shipped", self.fake.names(self.NUMBER))
         self.assertNotIn("needs:human", self.fake.names(self.NUMBER))
 
 
