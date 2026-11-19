@@ -3606,7 +3606,7 @@ class Queued(Base):
         self.queued(8, age=60)
         with mock.patch("bus.factory._say") as say:
             self.assign(available=[])
-        say.assert_called_with("assigned 0 of 2 queued: %s#7 waits: no free lane takes "
+        say.assert_called_with("%s#7 waits: no free lane takes "
                                "model claude-opus-5-5" % REPO)
 
     def test_a_queued_ticket_with_no_free_tier_lane_names_its_tier(self):
@@ -3615,6 +3615,19 @@ class Queued(Base):
             self.assign(available=[])
         say.assert_called_once_with("assigned 0 of 1 queued: %s#7 waits: no free lane "
                                     "in tier medium" % REPO)
+
+    def test_a_pinned_model_wait_is_recorded_each_pass_and_logged_once(self):
+        self.queued(7, body="Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n")
+        known = {}
+        with mock.patch("bus.factory._say") as say:
+            for _ in range(5):
+                worker = factory.Factory(self.gh, [REPO], NOW, available=[], known_waits=known,
+                                         trusted=[self.gh.issues[7]["user"]["login"]])
+                worker.assign_queued()
+                known = worker.waits
+                self.assertEqual(known, {"%s#7" % REPO: "no free lane takes model claude-opus-5-5"})
+        self.assertEqual(sum("no free lane takes model" in call.args[0]
+                             for call in say.call_args_list), 1)
 
     def test_a_queued_ticket_with_no_difficulty_takes_a_medium_lane(self):
         # A queued ticket whose body had no Difficulty line was in no tier, so

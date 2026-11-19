@@ -57,7 +57,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
-from . import runners
+from . import lane_state, runners
 from . import station_beat
 from . import scope_fit
 from . import shadow
@@ -121,7 +121,7 @@ from .journal import REPLY_RE
 from .labels import LANES
 from .labels import REMOTE_LANES
 
-HEARTBEAT_MAX_AGE = 600
+HEARTBEAT_MAX_AGE = lane_state.HEARTBEAT_MAX_AGE
 BRIEFED = "loom:briefed"
 RUNNING = "loom:running"
 RUNAWAY = "loom:runaway"
@@ -261,7 +261,7 @@ RESOLVE_MUTATION = ('mutation($id:ID!) { resolveReviewThread(input:{threadId:$id
 # goes back to briefed, and the factory moves it to the next lane. It follows
 # the class prefix ("[limit] limit: ...") and, unlike a classed provider limit
 # that _retry handles, never counts against LOOM_RETRY_MAX.
-LIMIT = "limit:"
+LIMIT = lane_state.LIMIT
 # The runner's reason when a fix brief's push was refused because another
 # push moved the pull request's branch during the run. Not a failure: the
 # ticket goes back to loom:pr, and the factory judges the new head.
@@ -2129,7 +2129,7 @@ def beat_fresh(at: float, now: float, window: float = HEARTBEAT_MAX_AGE) -> bool
     beats long after it began, so a beat written since is fresh: measured
     against `now` alone, every lane that beat in a pass's first minutes read
     as down and the station gave no queued ticket a lane (loom#717)."""
-    return now - at <= window and at - max(now, time.time()) <= 60
+    return lane_state.fresh(at, now, window)
 
 
 def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
@@ -2137,16 +2137,6 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     configured beat_max (labels.REMOTE_LANES), else HEARTBEAT_MAX_AGE."""
     window = REMOTE_LANES.get(lane, {}).get("beat_max", HEARTBEAT_MAX_AGE)
     return at is not None and beat_fresh(at, now, window)
-
-
-def hold_expired(beat: Dict[str, Any], now: float) -> bool:
-    """Whether a lane's limit hold has run out: the reset it names is in the
-    past. A beat with no reset has no known end, so its hold stands. The Usage
-    view reads the same heartbeat the same way (bus/usage.py _limit_hold)."""
-    until = beat.get("retry_at")
-    if isinstance(until, bool) or not isinstance(until, (int, float)):
-        return False
-    return until <= now
 
 
 def needs_public_repo(lane: str, model: str) -> bool:
@@ -2441,6 +2431,7 @@ class Station:
         # The tickets named by After: lines, read once a pass.
         self._depends: Dict[str, Optional[Dict[str, Any]]] = {}
         self._remote_beats: Dict[str, Optional[float]] = {}
+        self._missing_lane_jobs: Set[str] = set()
         # The review sweep's reads kept for one pass: each repo's required
         # checks by base branch, and each reviewer App's client by slug.
         self._sweep_rules: Dict[str, List[str]] = {}
@@ -3002,12 +2993,21 @@ class Station:
             _say("rendered %s#%d fix brief from loom:fix comment %s"
                  % (repo, number, fix_comment_id if fix_comment_id is not None else "with unknown id"))
         _say("claimed %s#%d for lane %s as %s" % (repo, number, lane, name))
+        self._end_claim_wait(repo, issue)
         # A claim for the goal succeeded, so the unproven-work gate no longer
         # holds it and its refusal tracking clears (loom#564).
         goal = self._goal_of(repo, issue)
         if goal is not None:
             self._gate_holds.pop("%s#%d" % (repo, goal), None)
         return True
+
+    def _end_claim_wait(self, repo: str, issue: Dict[str, Any]) -> None:
+        names = _label_names(issue)
+        ref = "%s#%s" % (repo, issue["number"])
+        if WAIT + "model-limit" in names:
+            _say("%s model limit wait ended" % ref)
+        if WAIT + "lane" in names:
+            self._record_waits({}, settled={ref})
 
     def _note_claimed_probe(self, lane: str) -> None:
         """Record that a zero-done demoted lane was given its probe brief."""
@@ -3381,23 +3381,54 @@ class Station:
             self._spend = spend.summarize(self.s.home, self.s.anthropic, self.now)
         return self._spend
 
-    def _heartbeat_ok(self, lane: str) -> bool:
+    def _local_beat(self, lane: str) -> Any:
+        return _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
+                          None, strict=False)
+
+    def _refresh_lane_jobs(self) -> None:
+        """Only the launchd station has an authoritative list of local jobs."""
+        if sys.platform != "darwin":
+            return
+        try:
+            result = subprocess.run(["launchctl", "list"], check=True, text=True,
+                                    capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return
+        jobs = {cols[2]: cols[0] for line in result.stdout.splitlines()
+                if len(cols := line.split()) == 3}
+        if jobs.get("com.loom.station") != str(os.getpid()):
+            return
+        nonlocal_lanes = set(runners.runner_slots()) | set(REMOTE_LANES)
+        self._missing_lane_jobs = {lane for lane in LANES if lane not in nonlocal_lanes
+                                   and "com.loom." + lane not in jobs}
+        for lane in sorted(self._missing_lane_jobs):
+            self._prune_lane_heartbeat(lane)
+
+    def _prune_lane_heartbeat(self, lane: str) -> None:
+        path = os.path.join(self.s.home, "state", "usage", lane + ".json")
+        try:
+            # Give a newly started runner time to appear in the job listing.
+            if self.now - os.stat(path).st_mtime > HEARTBEAT_MAX_AGE:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _say("could not remove the retired heartbeat for lane %s" % lane)
+
+    def _lane_state(self, lane: str, parked: str = "") -> lane_state.State:
         if lane in REMOTE_LANES:
             if lane not in self._remote_beats:
                 self._remote_beats[lane] = self._remote_heartbeat(lane)
-            return remote_beat_fresh(lane, self._remote_beats[lane], self.now)
-        # Credit under the floor stops the anthropic slots even before their
-        # runner next reports it.
-        if lane.split("-")[0] == "anthropic" and self._anthropic_spend().under_floor():
-            return False
-        beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                          None, strict=False)
-        if not isinstance(beat, dict) or beat.get("available") is not True:
-            return False
-        at = beat.get("at")
-        if isinstance(at, bool) or not isinstance(at, (int, float)):
-            return False
-        return beat_fresh(at, self.now)
+            return lane_state.evaluate({"at": self._remote_beats[lane], "available": True},
+                                       self.now, window=REMOTE_LANES[lane]["beat_max"],
+                                       parked=parked)
+        credit = self._anthropic_spend() if labels.base_lane(lane) == "anthropic" else None
+        beat = self._local_beat(lane)
+        return lane_state.evaluate(beat, self.now, credit=credit, parked=parked,
+                                   has_job=lane not in self._missing_lane_jobs)
+
+    def _heartbeat_ok(self, lane: str) -> bool:
+        return self._lane_state(lane).available
 
     def _remote_heartbeat(self, lane: str) -> Optional[float]:
         """Latest heartbeat posted by a remote worker on the lane status issue."""
@@ -3449,19 +3480,13 @@ class Station:
 
     def limited_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable at a limit."""
-        return list(self._limit_reasons())
+        return list(self._limit_holds())
 
     def limit_until(self) -> Dict[str, float]:
         """Lane -> epoch its limit lifts (its heartbeat's retry_at), for each
         lane limited_lanes names whose heartbeat gives one."""
-        out: Dict[str, float] = {}
-        for lane in self._limit_reasons():
-            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                              None, strict=False)
-            until = beat.get("retry_at") if isinstance(beat, dict) else None
-            if isinstance(until, (int, float)) and not isinstance(until, bool):
-                out[lane] = float(until)
-        return out
+        return {lane: state.retry_at for lane, (state, _) in self._limit_holds().items()
+                if state.retry_at is not None}
 
     def down_lanes(self) -> List[str]:
         """Lanes whose fresh heartbeat says unavailable for a reason other
@@ -3470,34 +3495,18 @@ class Station:
         quiet without being down."""
         out: List[str] = []
         for lane in LANES:
-            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                              None, strict=False)
-            if not isinstance(beat, dict) or beat.get("available") is not False:
-                continue
-            at = beat.get("at")
-            if isinstance(at, bool) or not isinstance(at, (int, float)):
-                continue
-            if beat_fresh(at, self.now) and not str(beat.get("reason") or "").startswith(LIMIT):
+            if lane_state.evaluate(self._local_beat(lane), self.now).reason == lane_state.RUNNER_UNAVAILABLE:
                 out.append(lane)
         return out
 
-    def _limit_reasons(self) -> Dict[str, str]:
-        """Lane -> the reason of its fresh heartbeat that says unavailable
-        at a limit. A hold whose reset has passed is no hold: the lane is
-        free again, as the Usage view reads the same heartbeat."""
-        out: Dict[str, str] = {}
+    def _limit_holds(self) -> Dict[str, Tuple[lane_state.State, str]]:
+        """Fresh runner limit states and the local text used by the top-up rule."""
+        out = {}
         for lane in LANES:
-            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                              None, strict=False)
-            if not isinstance(beat, dict) or beat.get("available") is not False:
-                continue
-            at = beat.get("at")
-            if isinstance(at, bool) or not isinstance(at, (int, float)):
-                continue
-            reason = str(beat.get("reason") or "")
-            if beat_fresh(at, self.now) and reason.startswith(LIMIT) \
-                    and not hold_expired(beat, self.now):
-                out[lane] = reason
+            beat = self._local_beat(lane)
+            state = lane_state.evaluate(beat, self.now)
+            if state.state == "limited":
+                out[lane] = (state, str(beat["reason"]))
         return out
 
     def _no_topup_lanes(self) -> Tuple[str, ...]:
@@ -3505,7 +3514,7 @@ class Station:
         wait for the credit to renew, as the operator chose."""
         if not self.s.no_topup:
             return ()
-        return tuple(lane for lane, reason in self._limit_reasons().items()
+        return tuple(lane for lane, (_, reason) in self._limit_holds().items()
                      if provider(lane) in self.s.no_topup and usage.OUT_OF_CREDIT in reason)
 
     def model_limits(self) -> Dict[str, Dict[str, float]]:
@@ -3518,12 +3527,11 @@ class Station:
         for lane in LANES:
             if lane in REMOTE_LANES:
                 continue
-            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                              None, strict=False)
+            beat = self._local_beat(lane)
             if not isinstance(beat, dict) or not isinstance(beat.get("limited_models"), dict):
                 continue
-            at = beat.get("at")
-            if isinstance(at, bool) or not isinstance(at, (int, float)) or not beat_fresh(at, self.now):
+            at = lane_state.epoch(beat.get("at"))
+            if at is None or not beat_fresh(at, self.now):
                 continue
             held = {str(model): float(until) for model, until in beat["limited_models"].items()
                     if isinstance(until, (int, float)) and not isinstance(until, bool)
@@ -6132,8 +6140,9 @@ class Station:
         until = self.model_limited(lane, model)
         if until is None:
             return False
-        _say("%s#%s waits: model %s is limited on lane %s until %s"
-             % (repo, issue["number"], model, lane, self._utc(until)))
+        if WAIT + "model-limit" not in _label_names(issue):
+            _say("%s#%s waits: model %s is limited on lane %s until %s"
+                 % (repo, issue["number"], model, lane, self._utc(until)))
         self._set_wait(repo, issue, "model-limit")
         return True
 
@@ -6143,6 +6152,7 @@ class Station:
                        if candidate in free and self._inbox_empty(candidate)
                        and (not needs_public_repo(candidate, model) or self._public(repo))), None)
         number = int(issue["number"])
+        ref = "%s#%d" % (repo, number)
         names = [name for name in _label_names(issue) if not name.startswith("lane:")]
         already_waiting = WAIT + "lane" in names
         if target is None:
@@ -6150,12 +6160,11 @@ class Station:
                 + ["loom:queued", WAIT + "lane"]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": names})
-            # A log line, not a comment: each comment emails the operator
-            # (2026-10-18), and the ticket's labels already say it waits.
-            _say("%s#%d waits: no free lane takes model %s" % (repo, number, model))
-            if not already_waiting:
-                self._event("model_wait", "no free lane takes model %s" % model,
-                            "%s#%d" % (repo, number), lane, model)
+            reason = factory.model_wait_reason(model)
+            if not already_waiting and self._saved_waits().get(ref) != reason:
+                _say("%s waits: %s" % (ref, reason))
+                self._event("model_wait", reason, ref, lane, model)
+            self._record_waits({ref: reason})
             return None
         names.append("lane:" + target)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -6165,7 +6174,8 @@ class Station:
              % (repo, number, lane, target, model))
         if already_waiting:
             self._event("model_wait_succeeded", "found free lane %s for model %s" % (target, model),
-                        "%s#%d" % (repo, number), lane, model)
+                        ref, lane, model)
+            self._record_waits({}, settled={ref})
         return target
 
     # -- outcomes -------------------------------------------------------
@@ -10431,22 +10441,23 @@ class Station:
     def _utc(at: float) -> str:
         return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at))
 
-    def _lane_rows(self) -> List[Tuple[str, str, str]]:
+    def _lane_rows(self) -> List[Tuple[str, str, str, str]]:
         rows = []
+        demoted = self.demoted_lanes()
+        benched = set(self.benched_lanes(self.benched_pairs()))
         for lane in LANES:
-            beat = _read_json(os.path.join(self.s.home, "state", "usage", lane + ".json"),
-                              None, strict=False)
-            at = beat.get("at") if isinstance(beat, dict) else None
-            if lane in REMOTE_LANES:
-                at = self._remote_heartbeat(lane)
-            when = (self._utc(at) if not isinstance(at, bool) and isinstance(at, (int, float))
-                    else "-")
-            rows.append((lane, "yes" if self._heartbeat_ok(lane) else "no", when))
+            reason = ("Lane is demoted" if lane in demoted else
+                      "Configured model is benched" if lane in benched else "")
+            state = self._lane_state(lane, parked=reason)
+            when = self._utc(state.at) if state.at is not None else "-"
+            rows.append((lane, state.state, when, state.reason))
         brain = self._brain()
         if brain is not None:
             ok_at = brain[1]
-            rows.append(("brain", "yes" if self._brain_fresh(ok_at) else "no",
-                         self._utc(ok_at) if ok_at is not None else "-"))
+            fresh = self._brain_fresh(ok_at)
+            rows.append(("brain", "serving" if fresh else "off",
+                         self._utc(ok_at) if ok_at is not None else "-",
+                         "Brain is up" if fresh else "No fresh brain heartbeat"))
         return rows
 
     def _lanes_issue(self, repo: str) -> int:
@@ -10480,7 +10491,7 @@ class Station:
         return saved if fresh else None
 
     def _lanes_unchanged(self, repo: str, values: Dict[str, str]) -> bool:
-        """Same yes/no values published to the same repo within the age."""
+        """Same states and reasons published to the same repo within the age."""
         saved = self._fresh_lanes_record(repo)
         return saved is not None and saved.get("values") == values
 
@@ -10511,7 +10522,7 @@ class Station:
             return summary
         return None
 
-    def _lanes_body(self, rows: List[Tuple[str, str, str]],
+    def _lanes_body(self, rows: List[Tuple[str, str, str, str]],
                     pr_lines: Optional[List[str]] = None) -> str:
         summary = self._spend_shown()
         disk = [line for line in (self._disk_status_line(), self._watchdog_notice()) if line]
@@ -10519,8 +10530,8 @@ class Station:
             [LANES_MARKER, "Updated " + self._utc(self.now),
              station_beat.stamp_line(station_beat.station_settings(os.environ)[0]), ""]
             + (disk + [""] if disk else [])
-            + ["| lane | available | heartbeat (UTC) |", "|---|---|---|"]
-            + ["| %s | %s | %s |" % row for row in rows]
+            + ["| lane | state | heartbeat (UTC) | reason |", "|---|---|---|---|"]
+            + ["| %s | %s | %s | %s |" % row for row in rows]
             + ["", "Remote claims: muse %d/%d" % (
                 self._remote_claim_count("muse"), REMOTE_LANES["muse"]["slots"])]
             + (pr_lines or [])
@@ -10609,7 +10620,7 @@ class Station:
             _say("ignoring LOOM_STATUS_REPO %r: not OWNER/NAME" % repo)
             return
         rows = self._lane_rows()
-        values = {lane: yn for lane, yn, _ in rows}
+        values = {lane: state + ": " + reason for lane, state, _, reason in rows}
         summary = self._spend_shown()
         if summary is not None:
             # A new run (or a budget change) republishes; the clock alone waits
@@ -16419,7 +16430,19 @@ class Station:
         path = os.path.join(self.state, "ticket-waits.json")
         saved = _read_json(path, {}, strict=False)
         saved = saved if isinstance(saved, dict) else {}
+        settled = set(settled)
+        ended = [key for key in sorted(settled | found.keys())
+                 if isinstance(saved.get(key), dict)
+                 and str(saved[key].get("reason") or "").startswith(factory.MODEL_WAIT)
+                 and saved[key]["reason"] != found.get(key)]
         dropped = [key for key in settled if saved.pop(key, None) is not None]
+        kept = self._refresh_waits(saved, found)
+        if saved or dropped:
+            _write_json(path, kept)
+        for key in ended:
+            _say("%s model wait ended" % key)
+
+    def _refresh_waits(self, saved: Dict[str, Any], found: Dict[str, str]) -> Dict[str, Any]:
         for key, reason in found.items():
             old = saved.get(key)
             if isinstance(old, dict) and old.get("reason") == reason and self._num(old.get("since")):
@@ -16431,10 +16454,8 @@ class Station:
                 entry["no_lane_since"] = kept_since if self._num(kept_since) else self.now
             else:
                 entry.pop("no_lane_since", None)
-        kept = {key: info for key, info in saved.items() if isinstance(info, dict)
+        return {key: info for key, info in saved.items() if isinstance(info, dict)
                 and self._num(info.get("seen")) and self.now - info["seen"] <= WAIT_UNSEEN}
-        if kept or saved or dropped:
-            _write_json(path, kept)
 
     def _invariant_waits(self) -> List[invariants.Wait]:
         """The ticket waits _record_waits kept, each ticket named for a
@@ -18256,6 +18277,7 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
 def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
                  hooks: Dict[str, Any]) -> int:
     """The pass run() starts once it holds the lock."""
+    use_launchd = gh is None
     if gh is None:
         from .github import auth_from_env
         gh = GitHub(auth_from_env())
@@ -18283,6 +18305,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         beat.stamp()
     st = Station(gh, settings, **hooks)
     try:
+        if use_launchd:
+            st._refresh_lane_jobs()
         st.sample_operator_budget()
         _trust_app_login(settings, gh)
         writers = getattr(gh, "status_authors", None)
