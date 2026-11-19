@@ -969,7 +969,7 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
-            return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
+            return parts[2] in [slot + suffix for suffix in usage_suffixes(slot)]
         return False
 
     def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:
@@ -1069,13 +1069,17 @@ class Runners:
             del ledger["runs"][key]
 
 
+def usage_suffixes(slot: str) -> Tuple[str, ...]:
+    return USAGE_SUFFIXES + ((".code-refused.json",) if slot == "workersai" else ())
+
+
 def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     """What a runner job copies into its report, relative to its loom home,
     as globs: what the station reads for a run (Runners.allowed_path)."""
     return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
             "logs/%s/%s.*" % (slot, ticket)) + tuple(
-                "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+                "state/usage/%s%s" % (slot, s) for s in usage_suffixes(slot))
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never

@@ -198,6 +198,14 @@ class RunnersTest(unittest.TestCase):
             "LOOM_OPENCODE_GO_KEY_SSM": "/x/oc", "LOOM_RUNNER_SLOTS": "opencode-go-2"})
 
     # -- dispatch ------------------------------------------------------------
+    def test_workersai_report_carries_the_coding_refusal_but_cannot_certify_a_check(self):
+        runner = self.runner()
+        refusal = "state/usage/workersai.code-refused.json"
+        self.assertIn(refusal, runners.run_report_paths("workersai", TICKET))
+        runner.apply("workersai", TICKET, {refusal: b"123"})
+        self.assertEqual((self.home / refusal).read_bytes(), b"123")
+        self.assertFalse(runner.allowed_path("workersai", TICKET, "state/usage/workersai-code.json"))
+
     def test_workersai_dispatch_waits_for_both_provider_settings(self):
         runner = self.runner()
         runner.slots = ["workersai"]
