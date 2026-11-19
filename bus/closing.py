@@ -19,7 +19,9 @@ this module.
 
 `said=True` is for a caller that already put this reason in the thread: a note
 edited in place, or one a failed close left behind. The reason is still
-required, and the guard test lists every caller that passes it.
+required, and the guard test lists every caller that passes it. For a
+claimed issue closed unproven, the station writes the reason and the
+outstanding boxes in the repo's Proof due issue before closing quietly.
 """
 
 from __future__ import annotations
