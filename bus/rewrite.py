@@ -139,8 +139,14 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "sentence. Acceptance criteria has at least three checkboxes. Size is one of XS, "
         "S, M or L. Out of scope names at least one thing. Do not write header lines "
         "such as Priority, Difficulty, After or Not before; the station adds those.",
-        "A Live criterion, if you write one, names the exact log line, field or endpoint "
-        "its proof will show, in backticks.",
+        "At least one acceptance checkbox names the test that proves the ticket: a test file "
+        "path, or a command that runs in CI or a throwaway environment at build time. Proof "
+        "is that test, not an observation of the live system after the fact.",
+        "Write a Live checkbox only when it names a read-only check Loom can run by itself: "
+        "an `https://` URL, a `gh api <path>` read, a read-only `kubectl get ...` or `kubectl "
+        "rollout status ...`, a `log:<source>` step for the repo's adapter, or a quoted log "
+        "string with a time window (\"within 24 hours\"). When no such check exists, write no "
+        "Live checkbox.",
         "Use human only when the work needs money, hardware, an account, a credential, "
         "someone physically present or an operator decision nobody has made, and name that "
         "reason as kind. A credential is a secret only the owner holds, not repository or "
@@ -382,6 +388,7 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
             raise Invalid("body lacks: %s" % ", ".join(missing))
         brain._check_written_text(title + "\n" + body)
         brain._check_live_criterion(body)
+        brain._check_test_named(body)
     except ValueError as err:
         raise Invalid(str(err)) from None
     return "brief", {"title": title, "difficulty": difficulty, "body": body}

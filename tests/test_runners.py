@@ -198,6 +198,32 @@ class RunnersTest(unittest.TestCase):
             "LOOM_OPENCODE_GO_KEY_SSM": "/x/oc", "LOOM_RUNNER_SLOTS": "opencode-go-2"})
 
     # -- dispatch ------------------------------------------------------------
+    def test_workersai_report_carries_the_coding_refusal_but_cannot_certify_a_check(self):
+        runner = self.runner()
+        refusal = "state/usage/workersai.code-refused.json"
+        self.assertIn(refusal, runners.run_report_paths("workersai", TICKET))
+        runner.apply("workersai", TICKET, {refusal: b"123"})
+        self.assertEqual((self.home / refusal).read_bytes(), b"123")
+        self.assertFalse(runner.allowed_path("workersai", TICKET, "state/usage/workersai-code.json"))
+
+    def test_workersai_dispatch_waits_for_both_provider_settings(self):
+        runner = self.runner()
+        runner.slots = ["workersai"]
+        self.inbox = self.home / "briefs" / "workersai"
+        self.inbox.mkdir()
+        for index, setting in enumerate(("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")):
+            self.drop_brief(name="ticket-%d" % index)
+            runner.tend()
+            self.assertFalse(self.gh.posts("/dispatches"))
+            self.assertEqual(runner.load()["holds"]["workersai"]["needs"], setting)
+            runner.env[setting] = "/example/provider-setting"
+        self.drop_brief(name="ticket-ready")
+        runner.tend()
+        inputs = self.gh.posts("/dispatches")[0][2]["inputs"]
+        self.assertEqual(inputs["slot"], "workersai")
+        self.assertIn("LOOM_WORKERSAI_KEY_SSM=/example/provider-setting", inputs["settings"])
+        self.assertIn("LOOM_WORKERSAI_ACCOUNT_SSM=/example/provider-setting", inputs["settings"])
+
     def test_a_brief_is_dispatched_once_with_its_inputs(self):
         self.env["LOOM_EGRESS_RECHECK_SECONDS"] = "15"
         self.drop_brief()

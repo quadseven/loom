@@ -255,6 +255,46 @@ def step_of(text: str) -> Tuple[Optional[Step], str]:
     return None, "no proof Loom can run"
 
 
+# The forms of a Live criterion Loom can check by itself, as a brief is told
+# them (brain._check_live_criterion, the rewrite and restate prompts).
+RUNNABLE_FORMS = (
+    "an `https://` URL the station fetches",
+    "a `gh api <path>` read",
+    "a read-only `kubectl get ...` or `kubectl rollout status ...`",
+    "a `log:<source>` or `sql:` step for the repo's adapter, or a `SELECT`",
+    "a quoted log string with a time window (\"within 24 hours\", \"for 3 days\")",
+)
+
+
+def runnable_form(text: str) -> str:
+    """The check Loom can run by itself for a live criterion, by name, or "".
+
+    "url", "gh" and "kubectl" are the checks criteria_gate.check_of reads;
+    "adapter" is a templated `log:<source>` or `sql:` step; "query" is a
+    SELECT; "log window" is a quoted string, present or absent, over a stated
+    time window, which the station's log command answers. A quoted string
+    with no window is none of these: it names no time to read the log for,
+    and such a box could only wait (owner ruling of 2026-11-19, #3277). A
+    refused step (a write, a secret) is no form either."""
+    spans = _spans(text)
+    if any(refusal(span) for span in spans):
+        return ""
+    hours = evidence.required_span(text) or 0.0
+    step, why = _adapter_step(text, spans, hours)
+    if step is not None:
+        return "adapter"
+    if why:
+        return ""
+    if any(_select(span) for span in spans):
+        return "query"
+    check = criteria_gate.check_of(text)
+    if check is not None:
+        return check.kind
+    if hours > 0 and (evidence.needles(text) or evidence.absent_needles(text)):
+        return "log window"
+    return ""
+
+
 def lane_output_gap(body: str, log: Iterable[str]) -> str:
     """The first checked live box missing its stated output in this lane run."""
     checked_live = [(index, text) for index, (checked, text) in enumerate(proof.criteria(body), 1)
@@ -510,8 +550,13 @@ def status_line(outcome: Outcome) -> str:
     text, why = outcome.missing[0]
     more = " and %d more" % (len(outcome.missing) - 1) if len(outcome.missing) > 1 else ""
     first_line = why.splitlines()[0] if why else why
-    after = ("next check %s" % _when(outcome.next_at) if outcome.next_at is not None
-             else "no further check: a person decides")
+    if outcome.next_at is not None:
+        after = "next check %s" % _when(outcome.next_at)
+    elif all(criteria_gate.kind(criterion) == criteria_gate.OPERATOR
+             for criterion, _ in outcome.missing):
+        after = "no further check: a person decides"
+    else:
+        after = "no further automated check, stays in the verify queue"
     return "Live proof missing: %s (%s)%s; %s." % (
         " ".join(text.split())[:STATUS_WIDTH], first_line, more, after)
 

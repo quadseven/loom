@@ -623,12 +623,13 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    diff, answer or resolve each review thread, then run
    `python3 -m bus.brain merge OWNER/NAME#PR --ticket OWNER/NAME#N` when ready.
    Do not wait for the other brain's next tick.
-   `resume` then lists up to 5 verify-due tickets (open `loom:shipped`, no
-   proof yet), oldest ship first, as `resume verify` items after the stage
-   work and before any new brief. Verify them as step 4 says; write a proof
-   only from evidence you saw in this tick, and otherwise leave a one-line
-   note on the ticket naming what evidence is missing. Last, `resume` lists
-   one lane-made proof to audit as a `resume audit` item; audit it in step 4.
+   `resume` then hands you unclaimed live criteria that have waited 23 hours
+   after shipping, followed by up to 5 other verify-due tickets, oldest ship
+   first. Take these `resume verify` items before any new brief. Verify them
+   as step 4 says. Write proof from evidence you saw in this tick, or leave
+   a one-line note naming the missing evidence or the observed failure.
+   Last, `resume` lists a lane-made proof as a `resume audit` item. Audit it
+   in step 4.
    Review every ticket in the `Runaway tickets` section before merge or briefs.
    Read its latest run log tail and record one decision on the ticket: factory
    fault (file a factory ticket and keep the runaway hold), brief problem
@@ -659,12 +660,11 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    project's goal home issue says who deploys. Never deploy, bump a pinned
    image or restart a live service unless that issue makes it yours; where
    it does, `move --to shipped` only once it is out.
-4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped tickets against the live system named in the ticket. A
-   shipped ticket whose Live criterion names no exact string (no backticks
-   or quotes) can never be verified, by you or a lane: restate it first with
-   `python3 -m bus.brain live OWNER/NAME#N --text "Live: ... \`the log line or endpoint\` ..."`,
-   naming the string its proof will show, so the station can look for it. Tick
-   each acceptance criterion in the ticket body only once you have seen it
+4. First run `python3 -m bus.brain step verify --holder muse`. Verify shipped
+   tickets against the live system named in the ticket. For a prose Live box,
+   read the logs, running system, or code to find what would show it holds.
+   When you find a repeatable check, record it on the ticket for the station.
+   Tick each acceptance criterion in the ticket body only once you have seen it
    hold, write the proof record (docs/BRAIN.md, Proof), then run
    `python3 -m bus.brain move OWNER/NAME#N --to verified --proof PROOF.json`
    and close the ticket with `python3 -m bus.brain close OWNER/NAME#N`. Both

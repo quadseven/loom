@@ -62,6 +62,7 @@ import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
+from . import lane_state
 from .github import RateLimited
 from .labels import LANES
 
@@ -513,14 +514,18 @@ class Runners:
             self._refuse(ledger, entry, red_reason(repo, red))
             return
         settings = self._dispatch_settings(slot)
-        if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
-            why = "missing required runner setting %s" % OPENCODE_GO_KEY_SSM
+        required = (OPENCODE_GO_KEY_SSM,) if slot in OPENCODE_GO_SLOTS else ()
+        if slot == "workersai":
+            required = ("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")
+        missing = next((name for name in required if not settings.get(name, "").strip()), None)
+        if missing:
+            why = "missing required runner setting %s" % missing
             self._refuse(ledger, entry, why)
             # Hold the slot, or its heartbeat reads healthy and the factory
             # assigns it work it refuses again (loom#2910). The hold lifts on
             # the first pass that finds the setting (_lift_setting_holds).
             self._hold(ledger, slot, self.now + SETTING_HOLD_SECONDS, why)
-            ledger["holds"][slot]["needs"] = OPENCODE_GO_KEY_SSM
+            ledger["holds"][slot]["needs"] = missing
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
@@ -606,6 +611,27 @@ class Runners:
             del ledger["base_red"][slot][repo]
             return None
         return red
+
+    def stops(self, slot: str, repo: str, base: str) -> bool:
+        """Whether the slot's live base-red record stops `repo` on `base`,
+        read exactly as dispatch reads it (_base_red), for a caller choosing
+        work for the slot before dispatch (the factory's lane pick,
+        loom#3211): a stop the pick cannot see is a ticket claimed for a
+        slot whose runner only parks it. A record _base_red clears (a moved
+        head, the day probe) is saved back, as a dispatch pass leaves it.
+        An unreadable ledger blocks assignment to cluster slots because
+        dispatch requires the same ledger. Local lanes can still take work."""
+        if slot not in self.slots:
+            return False
+        try:
+            ledger = self.load()
+        except ReportError:
+            return True
+        before = json.dumps(ledger["base_red"], sort_keys=True)
+        red = self._base_red(ledger, slot, repo, base)
+        if json.dumps(ledger["base_red"], sort_keys=True) != before:
+            self.save(ledger)
+        return red is not None
 
     def _note_image(self, ledger: Dict[str, Any], slot: str, files: Dict[str, bytes],
                     ticket: str) -> None:
@@ -965,7 +991,7 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
-            return parts[2] in [slot + suffix for suffix in USAGE_SUFFIXES]
+            return parts[2] in [slot + suffix for suffix in usage_suffixes(slot)]
         return False
 
     def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:
@@ -1050,6 +1076,7 @@ class Runners:
             if not models:
                 ledger["holds"].pop(slot, None)
         beat["limited_models"] = models
+        beat = lane_state.heartbeat_fields(slot, beat, self.home)
         _write(self._usage(slot, ".json"), (json.dumps(beat) + "\n").encode("utf-8"))
 
     def _prune(self, ledger: Dict[str, Any]) -> None:
@@ -1065,13 +1092,17 @@ class Runners:
             del ledger["runs"][key]
 
 
+def usage_suffixes(slot: str) -> Tuple[str, ...]:
+    return USAGE_SUFFIXES + ((".code-refused.json",) if slot == "workersai" else ())
+
+
 def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     """What a runner job copies into its report, relative to its loom home,
     as globs: what the station reads for a run (Runners.allowed_path)."""
     return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
             "logs/%s/%s.*" % (slot, ticket)) + tuple(
-                "state/usage/%s%s" % (slot, s) for s in USAGE_SUFFIXES)
+                "state/usage/%s%s" % (slot, s) for s in usage_suffixes(slot))
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never

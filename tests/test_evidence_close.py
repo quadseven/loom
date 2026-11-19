@@ -1,5 +1,5 @@
-"""The narrow evidence close (loom#2325), driven through the public close
-seam, Station.close_done_tickets.
+"""The evidence close (loom#2325, widened by the owner's ruling of 2026-11-19),
+driven through the public close seam, Station.close_done_tickets.
 
 Each refusal test runs a qualifying twin in the same pass, so it fails on a
 station without this close: the twin stays open there.
@@ -30,6 +30,11 @@ LABEL = "closed-unproven"
 BODY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
         "- [x] A test passes\n"
         "- [ ] Live: the status page shows the new count\n")
+# Two unticked Live boxes beside an unticked code box.
+MANY = ("Difficulty: easy\n\n## Why\nBecause.\n\n## Acceptance criteria\n"
+        "- [ ] A test passes\n"
+        "- [ ] Live: the status page shows the new count\n"
+        "- [ ] Live: the nightly report names the run\n")
 PATCH = "@@ -1 +1,3 @@\n+def made_here():\n+    return 1\n old = 1\n"
 SOURCE = "def made_here():\n    return 1\n"
 
@@ -117,6 +122,40 @@ class Closes(Case):
             self.assertIn("#%d" % number, issue["body"])
             self.assertIn(words, issue["body"])
 
+    def test_two_live_boxes_and_a_code_box_close_with_both_live_boxes_listed(self):
+        self.ticket(1, body=MANY)
+        self.close_pass()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertIn(LABEL, self.fake.names(1))
+        [issue] = self.proof_issues()
+        self.assertIn("- #1: Live: the status page shows the new count\n"
+                      "- #1: Live: the nightly report names the run\n", issue["body"])
+        self.assertNotIn("A test passes", issue["body"])
+
+    def test_a_live_box_with_no_live_prefix_closes_and_is_listed(self):
+        self.ticket(1, body=BODY.replace("Live: the status page shows",
+                                         "Verify the status page shows"))
+        self.close_pass()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.assertIn("Verify the status page shows the new count",
+                      self.proof_issues()[0]["body"])
+
+    def test_a_live_event_wait_does_not_hold_and_another_wait_does(self):
+        self.ticket(1, labels=("wait:live-event",))
+        self.ticket(2, labels=("wait:blocked",))
+        self.assert_twin()
+
+    def test_a_close_recorded_with_one_box_stays_listed(self):
+        # The state file's shape before this rule: one `box` a close.
+        self.write(os.path.join(self.home, "state", "station", "evidence-close.json"),
+                   json.dumps({"closes": [{"repo": REPO, "number": 7, "at": time.time() - 60,
+                                           "box": "Live: an earlier box", "reopened": False}]}))
+        self.ticket(1)
+        self.close_pass()
+        body = self.proof_issues()[0]["body"]
+        self.assertIn("- #7: Live: an earlier box", body)
+        self.assertIn("- #1: Live: the status page shows the new count", body)
+
     def test_no_close_when_the_list_cannot_be_written(self):
         self.ticket(1)
         with mock.patch.object(station.Station, "_proof_due_issue",
@@ -174,15 +213,21 @@ class Refuses(Case):
         self.fake.head_files["bus/huge.py"] = SOURCE
         self.assert_twin()
 
-    def test_an_unticked_code_box(self):
-        self.ticket(1)
-        self.ticket(2, body=BODY.replace("- [x] A test", "- [ ] A test"))
-        self.assert_twin()
-
     def test_an_unticked_operator_box(self):
         self.ticket(1)
         self.ticket(2, body=BODY + "- [ ] The operator signs off\n")
         self.assert_twin()
+
+    def test_an_operator_or_decision_box_beside_live_and_code_boxes(self):
+        self.ticket(1, body=MANY)
+        held = ("The operator signs off", "Operator decides whether the old count stays",
+                "Decision: keep or drop the old count")
+        for number, box in enumerate(held, 2):
+            self.ticket(number, body=MANY + "- [ ] %s\n" % box)
+        self.assert_twin()
+        for number in (3, 4):
+            self.assertEqual(self.fake.issues[number]["state"], "open")
+            self.assertNotIn(LABEL, self.fake.names(number))
 
     def test_a_ticket_with_no_live_box(self):
         self.ticket(1)
@@ -225,14 +270,16 @@ class Refuses(Case):
         self.ticket(2, labels=("needs:human",))
         self.assert_twin()
 
-    def test_a_waiting_ticket(self):
-        self.ticket(1)
-        self.ticket(2, labels=("wait:live-event",))
-        self.assert_twin()
-
     def test_a_box_loom_can_check_itself(self):
         self.ticket(1)
         self.ticket(2, body=BODY.replace("the status page shows the new count",
+                                         "`https://status.example.com/healthz` serves `ok`"))
+        with mock.patch("bus.criteria_gate._fetch", return_value=(500, "down", "")):
+            self.assert_twin()
+
+    def test_one_box_of_several_that_loom_can_check_itself(self):
+        self.ticket(1, body=MANY)
+        self.ticket(2, body=MANY.replace("the nightly report names the run",
                                          "`https://status.example.com/healthz` serves `ok`"))
         with mock.patch("bus.criteria_gate._fetch", return_value=(500, "down", "")):
             self.assert_twin()
@@ -327,34 +374,60 @@ class Guardrail(Case):
         self.fake.issues[number]["state"] = "open"
 
     def test_the_pass_is_bounded_and_says_its_bound(self):
-        for number in range(1, 6):
+        for number in range(1, 13):
             self.ticket(number)
         said = self.close_pass()
-        closed = [n for n in range(1, 6) if self.fake.issues[n]["state"] == "closed"]
-        self.assertEqual(len(closed), 3)
+        closed = [n for n in range(1, 13) if self.fake.issues[n]["state"] == "closed"]
+        self.assertEqual(len(closed), 10)
         line = [s for s in said if s.startswith("evidence close:")]
         self.assertEqual(len(line), 1)
-        self.assertIn("3 closed", line[0])
-        self.assertIn("at most 3 closes", line[0])
+        self.assertIn("10 closed", line[0])
+        self.assertIn("at most 10 closes and 20 reads a pass, 150 closes a day", line[0])
         self.assertIn("2 waiting", line[0])
+
+    def test_the_reads_of_a_pass_are_bounded(self):
+        for number in range(1, 23):
+            self.ticket(number, conclusion="failure")
+        said = self.close_pass()
+        [line] = [s for s in said if "at most" in s]
+        self.assertIn("0 closed, 20 read, 2 waiting", line)
 
     def test_the_day_is_bounded(self):
         now = time.time()
-        for number in range(1, 14):
+        # 145 closes already made today leave room for 5 of the 150.
+        self.write(os.path.join(self.home, "state", "station", "evidence-close.json"),
+                   json.dumps({"closes": [
+                       {"repo": REPO, "number": 1000 + n, "boxes": ["Live: an earlier box"],
+                        "at": now - 60, "reopened": False} for n in range(145)]}))
+        for number in range(1, 9):
             self.ticket(number)
-        for step in range(5):
-            self.close_pass(now + step * 300)
-        closed = [n for n in range(1, 14) if self.fake.issues[n]["state"] == "closed"]
-        self.assertEqual(len(closed), 10)
+
+        def closed():
+            return len([n for n in range(1, 9) if self.fake.issues[n]["state"] == "closed"])
+        self.close_pass(now)
+        self.assertEqual(closed(), 5)
+        self.close_pass(now + 300)
+        self.assertEqual(closed(), 5)
         self.close_pass(now + 90000)
-        closed = [n for n in range(1, 14) if self.fake.issues[n]["state"] == "closed"]
-        self.assertEqual(len(closed), 13)
+        self.assertEqual(closed(), 8)
 
     def test_a_reopen_above_the_limit_stops_this_close(self):
         self.ticket(1)
         self.close_pass()
         self.reopen(1)
         self.ticket(2)
+        said = self.close_pass()
+        self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertTrue(any("evidence close paused" in s for s in said), said)
+        self.assertIn("1 of 1", self.control("status"))
+        self.assertIn("Paused", self.proof_issues()[0]["body"])
+
+    def test_a_reopen_of_a_ticket_closed_on_several_boxes_stops_this_close(self):
+        self.ticket(1, body=MANY)
+        self.close_pass()
+        self.assertEqual(self.fake.issues[1]["state"], "closed")
+        self.reopen(1)
+        self.ticket(2, body=MANY)
         said = self.close_pass()
         self.assertEqual(self.fake.issues[2]["state"], "open")
         self.assertTrue(any("evidence close paused" in s for s in said), said)
@@ -474,7 +547,7 @@ class Guardrail(Case):
         self.assertFalse([p for m, p in self.fake.calls[reads:] if "check-runs" in p])
 
     def test_a_ticket_that_needs_no_reads_costs_none(self):
-        self.ticket(1, body=BODY.replace("- [x] A test", "- [ ] A test"))
+        self.ticket(1, body=BODY + "- [ ] The operator signs off\n")
         self.close_pass()
         self.assertFalse([p for m, p in self.fake.calls if "check-runs" in p])
 

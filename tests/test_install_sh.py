@@ -478,6 +478,13 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertNotIn("KUBECONFIG", after)
 
+    def test_log_capture_settings_reach_the_station(self):
+        sources = '[{"source":"service","namespace":"example","selector":"app=service"}]'
+        plist = self.station_plist_with(LOOM_LOG_CAPTURE=sources,
+                                        LOOM_LOG_CAPTURE_RETENTION_HOURS="36")
+        self.assertIn("<key>LOOM_LOG_CAPTURE</key><string>%s</string>" % sources, plist)
+        self.assertIn("<key>LOOM_LOG_CAPTURE_RETENTION_HOURS</key><string>36</string>", plist)
+
     def test_station_pass_env_skips_unset_loom_and_written_names(self):
         plist = self.station_plist_with(LOOM_STATION_PASS_ENV="KUBECONFIG, PATH HOME LOOM_X bad-name",
                                         LOOM_X="x")

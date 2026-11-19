@@ -125,17 +125,47 @@ def fetch_failure_reason(stderr: str) -> str:
     return "unknown"
 
 
-def process_cwds() -> Optional[List[str]]:
-    """Real paths of every visible process's cwd, or None when they cannot be
-    listed (then every tree counts as in use)."""
+def _lsof_cwds(lsof: str) -> List[str]:
+    """Real paths of every visible process's cwd as lsof lists them, or an
+    empty list when lsof is not installed, fails, or lists none."""
     try:
-        done = subprocess.run([LSOF, "-a", "-d", "cwd", "-F", "n"], capture_output=True,
+        done = subprocess.run([lsof, "-a", "-d", "cwd", "-F", "n"], capture_output=True,
                               text=True, timeout=120)
     except (OSError, subprocess.SubprocessError):
-        return None
-    cwds = [os.path.realpath(line[1:]) for line in done.stdout.splitlines()
+        return []
+    return [os.path.realpath(line[1:]) for line in done.stdout.splitlines()
             if line.startswith("n") and len(line) > 1]
-    return cwds or None
+
+
+def _proc_cwds(proc_dir: str) -> List[str]:
+    """Real paths of every visible process's cwd as the cwd links under
+    proc_dir list them, skipping a process whose link cannot be read. An
+    empty list when proc_dir cannot be listed or no link can be read."""
+    try:
+        names = sorted(os.listdir(proc_dir))
+    except OSError:
+        return []
+    cwds = []
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(proc_dir, name, "cwd"))
+        except OSError:
+            continue
+        cwds.append(os.path.realpath(target))
+    return cwds
+
+
+def process_cwds(lsof: Optional[str] = None,
+                 proc_dir: str = "/proc") -> Optional[List[str]]:
+    """Real paths of every visible process's cwd, or None when they cannot be
+    listed (then every tree counts as in use). lsof is tried first, so the
+    Mac behavior does not change; on a host with no lsof, such as a Linux
+    runner, the /proc/<pid>/cwd links are the fallback. None only when
+    neither source lists any directory."""
+    cwds = _lsof_cwds(LSOF if lsof is None else lsof)
+    if cwds:
+        return cwds
+    return _proc_cwds(proc_dir) or None
 
 
 def reason_key(reason: str) -> str:

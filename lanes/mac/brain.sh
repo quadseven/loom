@@ -420,11 +420,12 @@ database access, put on the ticket for Muse to act on; and a ship or roll \
 that is due when Muse has not done it within its tick. Before any measurement, run timeout 120 python3 -m bus.brain \
 resume \$LOOM_REPOS --holder $HOLDER --lock-repo $LOCK_REPO (it walks every goal on GitHub, so a stall must not eat the tick) and finish every resume item it lists: work \
 another brain yielded, yours however fresh its journals are. Spend at most \
-$((TICK_MINUTES / 3)) minutes on them. Resume also lists up to 5 verify-due \
-tickets (shipped, no proof yet): spend up to a third of the tick on them, \
-oldest first. Write a proof only from evidence you saw in this tick; for a \
-ticket you cannot verify, leave a one-line note on it naming what evidence is \
-missing. Resume also lists one lane-made proof to audit: re-read the \
+$((TICK_MINUTES / 3)) minutes on them. Take the live evidence hand-out in \
+resume before the ordinary verify slots. Read the logs, running system, or \
+code and record what you observed on each ticket. Spend up to a third of \
+the tick on ordinary verifies. Write a proof only from evidence you saw in \
+this tick. When a box is false or the evidence is missing, record the finding \
+and leave the ticket shipped. Resume also lists one lane-made proof to audit: re-read the \
 evidence each criterion names and record it with python3 -m bus.brain audit \
 (docs/BRAIN.md, Proof audits). Resume's sensitive pull requests are yours even when another brain \
 journaled in the last 2 hours: read the ticket and diff, answer or resolve \

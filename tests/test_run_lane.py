@@ -786,6 +786,9 @@ print('leak guard: clean (shape patterns only)')
             # loopback port, never the real provider, unless a test serves one.
             "LOOM_OPENROUTER_METER_URL": "http://127.0.0.1:9/meter",
             "LOOM_WORKERSAI_METER_URL": "http://127.0.0.1:9/meter",
+            # A check slot is taken whatever the load of the machine running
+            # this suite; the load limits have their own tests, which set them.
+            "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
@@ -1425,25 +1428,44 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.drop_brief()
         return self.run_lane(FAKE_AGENT="say", FAKE_OUT=output, FAKE_EXIT="1", FAKE_EDIT="1", **env)
 
-    def test_a_failed_run_posts_the_last_lines_of_its_log_to_the_ticket(self):
-        # The lane host's log is the only detail of a failed run; the ticket
-        # now carries its tail, so a reader who cannot reach the host sees it.
-        result = self.run_failing_agent("FAILED tests/test_x.py::test_y - AssertionError at line 429")
+    def test_a_failed_run_posts_its_outcome_and_never_its_log_lines(self):
+        # A run log holds the agent's whole session: test fixture tables,
+        # another task's API replies, kubectl hints. Posting its tail put that
+        # noise on tickets as if it were the ticket's news (2026-11-18). The
+        # ticket gets one readable outcome; the log stays on the lane host.
+        fixture = ("| dev renders app-db-import | `333333333333` |\n"
+                   "  - fix: apply the repository (`kubectl apply -k manifests/dev`)\n"
+                   '{"url":"https://api.github.com/repos/example/other/issues/comments/1"}')
+        result = self.run_failing_agent(fixture)
         self.assertEqual(result.returncode, 0, result.stderr)
         [note] = self.tail_bodies()
-        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
-        self.assertIn("AssertionError at line 429", note)
-        self.assertIn("failed: [work]", note)
-        # The tail went through the leak scan before it was posted.
-        self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
+        for line in ("333333333333", "kubectl apply", "api.github.com", "```"):
+            self.assertNotIn(line, note)
+        self.assertIn("parked", note)
+        self.assertIn("after a work failure", note)
+        self.assertIn("agent exited 1", note)
+        self.assertIn("The full run log stays on the lane host.", note)
 
-    def test_a_log_tail_the_leak_scan_refuses_is_withheld(self):
-        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
+    def test_a_park_reason_the_leak_scan_cannot_clear_is_withheld(self):
+        result = self.run_failing_agent("connecting to 10.1.2.3 failed", FAKE_DENY_UNREADABLE="1")  # leak-guard-allow
         self.assertEqual(result.returncode, 0, result.stderr)
         [note] = self.tail_bodies()
-        self.assertTrue(note.startswith(self.LOG_TAIL_MARKER), note)
-        self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
         self.assertIn("withheld", note)
+        self.assertNotIn("agent exited", note)
+        self.assertNotIn("10.1.2.3", note)  # leak-guard-allow
+        self.assertTrue(any("--text-file" in call for call in self.scanner_calls()))
+        self.assertIn("the leak scan refused the park reason", self.run_log())
+
+    def test_a_refused_park_reason_and_the_scanner_diagnostic_stay_private(self):
+        result = self.run_failing_agent("agent failed", FAKE_GH_PRIVATE="true", FAKE_PERSONAL_HIT="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [note] = self.tail_bodies()
+        self.assertIn("withheld", note)
+        self.assertNotIn("agent exited", note)
+        self.assertNotIn("personal-deny-list", note)
+        log = self.run_log()
+        self.assertIn("the leak scan refused the park reason or could not run (exit 1)", log)
+        self.assertNotIn("personal-deny-list", log)
 
     def test_the_log_tail_can_be_switched_off(self):
         result = self.run_failing_agent("FAILED tests/test_x.py::test_y", LOOM_LOG_TAIL="off")
@@ -1465,12 +1487,6 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.tail_bodies(), [])
         self.assertIn("could not mint the lane's GitHub App token", self.failure_line())
-
-    def test_the_scanners_words_stay_out_of_the_log_the_tail_is_cut_from(self):
-        result = self.run_failing_agent("connecting to 10.1.2.3 failed")  # leak-guard-allow
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("the leak scan refused the log tail", self.run_log())
-        self.assertNotIn("private-range IP address", self.run_log())
 
     def test_a_brief_parked_before_its_repo_is_checked_posts_no_log_tail(self):
         # A brief is input: one refused before the owner check must not make
@@ -2805,6 +2821,84 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
+
+    def held_agy_lane(self, models, holds, reply):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        limits = usage / "agy.models"
+        limits.write_text("".join(f"{model} {until} account quota reached\n"
+                                  for model, until in holds.items()))
+        old = time.time() - 3600
+        os.utime(limits, (old, old))
+        lane_home = self.home / "lane-user"
+        cli = lane_home / "bin" / "agy"
+        self.write_tool(cli, '#!/bin/bash\n'
+                        '[ "$1" = -p ] && [ -n "$2" ] || exit 2\n'
+                        'while [ "$#" -gt 1 ] && [ "$1" != --model ]; do shift; done\n'
+                        '[ "$1" = --model ] || exit 2\n'
+                        'echo "$2" >> "$HOME/probes"\n' + reply)
+        self.write_tool(self.bin / "runas", FAKE_RUNAS)
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\n[ "$1" = -p ] || exit 2\nshift 2\nexec "$@"\n')
+        self.write_tool(self.bin / "codesign", '#!/bin/sh\necho "CodeDirectory flags=0x10000(runtime)"\n')
+        env = dict(LOOM_AGY_HOME=str(lane_home), LOOM_AGY_BIN=str(cli),
+                   LOOM_AGY_RUNAS=str(self.bin / "runas"), LOOM_AGY_KEY_SSM="/k/kc",
+                   FAKE_SECRET__k_kc="test", LOOM_AGY_MODELS=" ".join(models))
+        return env, lane_home / "probes"
+
+    def test_held_agy_lane_is_available_on_the_pass_its_cli_answers(self):
+        high, low = "gemini-3.8-flash-high", "gemini-3.8-flash-low"
+        until = int(time.time()) + 86400
+        env, probes = self.held_agy_lane([high, low], {high: until, low: until},
+                                         'if [[ "$2" = *-low ]]; then echo "Ready."; else echo "Starting" >&2; fi\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertTrue(beat["available"], beat)
+        self.assertEqual(beat["limited_models"], {high: until})
+        self.assertEqual(probes.read_text().splitlines(), [high, low])
+
+    def test_refused_agy_recheck_records_the_stated_reset(self):
+        model = "gemini-3.8-flash-low"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "Individual quota reached. Resets in 2h3m." >&2\nexit 1\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 7380)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 7380)
+        self.assertEqual(beat["limited_models"], {model: beat["retry_at"]})
+
+    def test_agy_rechecks_only_held_configured_flash_models_once_per_interval(self):
+        high, medium, low = ("gemini-3.8-flash-" + effort for effort in ("high", "medium", "low"))
+        other = "gemini-4-argon-high"
+        now = int(time.time())
+        env, probes = self.held_agy_lane([high, high, low, other],
+                                         {high: now + 3600, medium: now + 3600,
+                                          low: now - 1, other: now + 3600},
+                                         'echo "Individual quota reached." >&2\nexit 1\n')
+        for _ in range(2):
+            result = self.run_lane("agy", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(probes.read_text().splitlines(), [high])
+        self.assertEqual(self.beat("agy")["limited_models"][high], now + 3600)
+        limits = self.loom / "state" / "usage" / "agy.models"
+        os.utime(limits, (now - 1800, now - 1800))
+        self.run_lane("agy", **env)
+        self.assertEqual(probes.read_text().splitlines(), [high, high])
+
+    def test_agy_recheck_honors_retry_after_even_if_the_cli_exits_zero(self):
+        model = "gemini-3.8-flash-medium"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "HTTP 429: Retry-After: 900" >&2\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 900)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 900)
 
     def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
         self.drop_brief("T042-fix-the-thing.md",
@@ -4452,6 +4546,33 @@ exec /bin/rm "$@"
         self.assertIn("small=cloudflare-workers-ai/@cf/vendor/model", agent[0])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_workersai_first_request_refusal_with_room_is_size(self):
+        self.write_tool(self.bin / "sandbox-exec", self.FAKE_SANDBOX)
+        self.write_tool(self.bin / "opencode", """#!/bin/sh
+case "$1" in
+    --version) echo 1.18.4 ;;
+    models) echo cloudflare-workers-ai/@cf/example/model ;;
+    run) echo 'AI_APICallError: Too Many Requests' >&2
+         echo 'AI_RetryError: retries exhausted' >&2
+         sleep 30 ;;
+esac
+""")
+        inbox = self.loom / "briefs" / "workersai"
+        inbox.mkdir()
+        name = "T042-fix-the-thing"
+        (inbox / (name + ".md")).write_text(BRIEF.replace("Lane: codex", "Lane: workersai"))
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / "workersai.meter.json").write_text(json.dumps({
+            "lane": "workersai", "at": time.time(), "windows": [
+                {"window": "daily", "unit": "neurons", "used_pct": 12}]}))
+        self.run_lane("workersai", LOOM_WORKERSAI_KEY_SSM="/example/key",
+                      FAKE_SECRET__example_key="test", LOOM_WORKERSAI_ACCOUNT_SSM="/example/account",
+                      FAKE_SECRET__example_account="example", LOOM_WORKERSAI_MODEL="cloudflare-workers-ai/@cf/example/model")
+        self.assertIn("failed: [size]", (self.loom / "logs" / "workersai" / (name + ".log")).read_text())
+        self.assertTrue(self.beat("workersai")["available"])
+        self.assertFalse((usage / "workersai.limit").exists())
+
     def meter_server(self, body):
         """A fake provider meter on loopback: answers every request with BODY
         and records the request's method, path, headers and body."""
@@ -5948,6 +6069,85 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
         self.assertFalse(beat["available"])
 
+    def write_limit_file(self, until, why="pacing: fleet_fuel daily quota", lane="codex"):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / (lane + ".limit")).write_text("%d %s\n" % (until, why))
+        return usage / (lane + ".limit")
+
+    def test_a_hold_read_from_the_limit_file_ends_on_the_first_pass_after_the_file_is_removed(self):
+        # 2026-11-19 (#3270): the fleet pacer lifted its pacing hold on lane
+        # openrouter by deleting the limit file, and the lane kept the hold for
+        # 22 more hours: the heartbeat still carried the retry time, and only a
+        # provider probe could end a recorded hold. The lane has no probe URL.
+        until = int(time.time()) + 20 * 3600
+        limit = self.write_limit_file(until)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        held = self.beat()
+        self.assertFalse(held["available"], held)
+        self.assertEqual(held["retry_at"], until)
+        self.assertIn("pacing: fleet_fuel daily quota", held["reason"])
+        self.assertIs(held.get("from_limit_file"), True, held)
+        limit.unlink()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertTrue(beat["available"], beat)
+        self.assertEqual(beat["reason"], "")
+        self.assertNotIn("retry_at", beat)
+        self.assertNotIn("from_limit_file", beat)
+
+    def test_a_hold_from_a_provider_refusal_stays_when_no_limit_file_was_ever_written(self):
+        # A hold the provider's own refusal set is not a file hold: with no
+        # limit file ever written it stands until its time, or until a
+        # provider re-check passes, exactly as before (#3270).
+        until = int(time.time()) + 20 * 3600
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        reason = "limit: provider limit reached; lane waits until later"
+        (usage / "codex.json").write_text(json.dumps({
+            "lane": "codex", "at": int(time.time()) - 60, "available": False,
+            "reason": reason, "retry_at": until, "limited_models": {}}) + "\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertFalse(beat["available"], beat)
+        self.assertEqual(beat["retry_at"], until)
+        self.assertEqual(beat["reason"], reason)
+        self.assertNotIn("from_limit_file", beat)
+
+    def test_a_limit_file_rewritten_with_a_new_time_moves_the_heartbeat_to_that_time(self):
+        first = int(time.time()) + 2 * 3600
+        self.write_limit_file(first)
+        self.run_lane()
+        self.assertEqual(self.beat()["retry_at"], first)
+        second = int(time.time()) + 5 * 3600
+        self.write_limit_file(second)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertFalse(beat["available"], beat)
+        self.assertEqual(beat["retry_at"], second)
+        self.assertIs(beat.get("from_limit_file"), True, beat)
+
+    def test_the_cluster_free_openrouter_slot_keeps_a_hold_whose_limit_file_a_restart_lost(self):
+        # Its limit file does not survive a pod restart, so a missing file
+        # there is not a withdrawn hold (#3270 leaves this slot as it was).
+        script = self.source_functions("beat_hold_from_file") + (
+            'BEAT="$LOOM_HOME/state/usage/free-openrouter.json"\n'
+            'beat_hold_from_file; echo "rc=$?"')
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / "free-openrouter.json").write_text(json.dumps({
+            "lane": "free-openrouter", "at": 1, "available": False, "reason": "limit: x",
+            "retry_at": int(time.time()) + 3600, "from_limit_file": True, "limited_models": {}}) + "\n")
+        result = subprocess.run(["bash", "-c", script], env={**self.lane_env(), "LOOM_HOME": str(self.loom)},
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        runner = RUNNER.read_text()
+        self.assertIn('[ "$SLOT" != free-openrouter ] && beat_hold_from_file', runner)
+
     def test_a_hold_the_agent_cli_recorded_is_not_lifted_by_the_probe(self):
         # The agent CLI's own hold (a model it no longer offers) carries no
         # provider limit: no probe says otherwise, so it stands.
@@ -6115,25 +6315,24 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         # keeps billing a spent model with no trace of why.
         reset = int(time.time()) + 18000
         self.write_provider_limit("opencode-go-2", limit_name="5-hour", retry_after=str(reset))
-        empty = self.loom / "no-catalogue"
-        empty.mkdir()
         script = self.source_functions("hold_provider_limit", "limit_until", "key_group",
                                        "limit_group", "slot_model", "free_model", "setting_var",
                                        "lane_var", "write_beat", "utc", "record_model_limit",
                                        "model_limit_until", "ladder_reason", "heartbeat",
                                        "catalogue_cmd", "limited_models_json") + (
             'SLOT=opencode-go-2 LANE=opencode-go MODEL=opencode-go/mimo-v2.6-flash\n'
-            f'LOOM_ROOT="{empty}"\n'
+            'python3() { [ "$3" != bus.catalogue ] && command python3 "$@"; }\n'
             'MODEL_LIMIT_FILE="$LOOM_HOME/state/usage/$SLOT.models"\n'
             'LIMIT_WHY="the provider 5-hour limit (429 GoUsageLimitError)"\n'
             'hold_provider_limit\n')
         env = {**self.lane_env(), "LOOM_HOME": str(self.loom), "SLOT": "opencode-go-2",
                "LANE": "opencode-go"}
-        result = subprocess.run(["bash", "-c", script, "bash"], env=env, cwd=empty,
+        result = subprocess.run(["bash", "-c", script, "bash"], env=env,
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("bus.catalogue record-limit failed", result.stderr)
         self.assertIn("for opencode-go/mimo-v2.6-flash", result.stderr)
+        self.assertEqual(self.beat("opencode-go-2")["state"], "limited")
 
     # A sandbox that runs what it is given: the seatbelt itself is another
     # lane's subject (tests above), and this run is about the class an expired
@@ -6416,6 +6615,7 @@ exit %d
         self.assertEqual(result.returncode, 0, result.stderr)
         beat = json.loads((usage / "anthropic-2.json").read_text())
         self.assertFalse(beat["available"])
+        self.assertEqual(beat.get("state"), "parked")
         self.assertIn("remaining $3.50 is under the floor of $5.00", beat["reason"])
         self.assertFalse(any(c.startswith(("claude ", "aws ")) for c in self.calls()))
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
@@ -6890,6 +7090,15 @@ exit %d
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
         self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
+
+    def test_a_retry_after_header_uses_all_duration_digits(self):
+        before = int(time.time())
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="HTTP 429: Retry-After: 740")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retry_at = self.beat()["retry_at"]
+        self.assertGreaterEqual(retry_at, before + 740)
+        self.assertLessEqual(retry_at, int(time.time()) + 740)
 
     def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
         usage = self.loom / "state" / "usage"
@@ -8399,15 +8608,188 @@ echo fixed > fix.txt
 
     def slot_script(self, body, **env):
         """Run the runner's check-slot functions, as written in run_lane.sh,
-        in a bash of their own with LOG and LOOM_HOME set."""
+        in a bash of their own with LOG and LOOM_HOME set. The load limits
+        are off unless a test sets them, so the load of the machine running
+        the suite never holds a slot."""
         text = RUNNER.read_text()
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
             ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
-                 **env},
+                 "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def load_file(self, one, five):
+        """A fake load reading, in the /proc/loadavg shape, that a test rewrites."""
+        path = Path(self._tmp.name) / "loadavg"
+        fresh = path.with_name("loadavg.new")
+        fresh.write_text(f"{one} {five} 1.00 1/100 1\n")
+        fresh.replace(path)
+        return path
+
+    def wait_for_slot_log(self, text, seconds=20):
+        log = Path(self._tmp.name) / "slots.log"
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if log.exists() and text in log.read_text():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def check_waits_for_load_then_takes_the_slot(self, high, name, **limits):
+        """One free slot and a load reading above a limit: the check waits,
+        takes nothing, and takes the slot once the reading falls."""
+        tmp = Path(self._tmp.name)
+        marks = tmp / "marks"
+        load = self.load_file(*high)
+        proc = self.slot_script('acquire_check_slot || exit 3\necho got >> "$MARKS"\n'
+                                'cat "$CHECK_SLOT_HELD/pid" > /dev/null || exit 4\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_SLOT_WAIT="60",
+                                LOOM_CHECK_LOAD_FILE=str(load), MARKS=str(marks), **limits)
+        try:
+            self.assertTrue(self.wait_for_slot_log("waiting for host load"),
+                            "the check never waited for load")
+            time.sleep(0.5)
+            self.assertIsNone(proc.poll(), "the check ended while the load was high")
+            self.assertFalse(marks.exists())
+            self.assertFalse((self.loom / "run" / "check-slots" / "slot-1").exists())
+            self.load_file("2.00", "2.00")
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(marks.read_text().split(), ["got"])
+        log = (tmp / "slots.log").read_text()
+        self.assertIn(f"{name} load", log)
+        self.assertNotIn("waiting for a check slot", log)
+        self.assertIn("got check slot 1", log)
+        self.assertIn("(waited for host load)", log)
+
+    def test_a_check_waits_with_a_free_slot_while_the_one_minute_load_is_high(self):
+        # Three lane checks alone took a 12-core host to a 1-minute load of
+        # 31.5 with every slot granted the moment it was free (#3279).
+        self.check_waits_for_load_then_takes_the_slot(("31.50", "2.00"), "1-minute",
+                                                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+
+    def test_a_check_waits_with_a_free_slot_while_the_five_minute_load_is_high(self):
+        self.check_waits_for_load_then_takes_the_slot(("2.00", "19.50"), "5-minute",
+                                                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+
+    def test_the_load_limits_default_to_24_and_18(self):
+        text = RUNNER.read_text()
+        funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        out = subprocess.run(["bash", "-c", funcs + 'echo "$CHECK_LOAD_1M $CHECK_LOAD_5M"\n'],
+                             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom)},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "24 18", out.stderr)
+
+    def test_a_load_limit_of_zero_turns_that_limit_off(self):
+        tmp = Path(self._tmp.name)
+        load = self.load_file("99.00", "99.00")
+        body = 'acquire_check_slot || exit 3\nrelease_check_slot\n'
+        both_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                    LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                    LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="0")
+        out, err = both_off.communicate(timeout=30)
+        self.assertEqual(both_off.returncode, 0, err)
+        # Each limit is off alone: the other one still reads its own average.
+        self.load_file("99.00", "2.00")
+        one_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                   LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                   LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="18")
+        out, err = one_off.communicate(timeout=30)
+        self.assertEqual(one_off.returncode, 0, err)
+        self.load_file("2.00", "99.00")
+        five_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                    LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                    LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="0")
+        out, err = five_off.communicate(timeout=30)
+        self.assertEqual(five_off.returncode, 0, err)
+        log = tmp / "slots.log"
+        self.assertNotIn("waiting", log.read_text() if log.exists() else "")
+        # The same reading holds the slot once the limit is back on.
+        held = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = held.communicate(timeout=30)
+        self.assertEqual(held.returncode, 3, err)
+
+    def test_a_host_whose_load_cannot_be_read_takes_the_slot_and_says_so(self):
+        tmp = Path(self._tmp.name)
+        unreadable = tmp / "loadavg"
+        unreadable.write_text("not a load reading\n")
+        proc = self.slot_script('acquire_check_slot || exit 3\nrelease_check_slot\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.1",
+                                LOOM_CHECK_LOAD_FILE=str(unreadable),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("host load could not be read", (tmp / "slots.log").read_text())
+
+    def test_a_load_wait_that_runs_out_is_exit_75_with_a_log_line_naming_load(self):
+        tmp = Path(self._tmp.name)
+        load = self.load_file("31.50", "2.00")
+        text = RUNNER.read_text()
+        contract_run = re.search(r"^contract_run\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        proc = self.slot_script(contract_run + 'contract_run_sandboxed() { echo ran; }\n'
+                                'contract_run "true"\necho "rc $?"\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.2",
+                                LOOM_CHECK_LOAD_FILE=str(load),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.split("\n")[:-1], ["rc 75"], err)
+        log = (tmp / "slots.log").read_text()
+        self.assertIn("waiting for host load", log)
+        self.assertIn("1-minute load 31.50 is above 24", log)
+        self.assertIn("host load stayed high", log)
+        self.assertFalse((self.loom / "run" / "check-slots" / "slot-1").exists())
+
+    def test_a_lane_whose_load_wait_runs_out_parks_transient_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        load = self.load_file("31.50", "2.00")
+        result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="0.2", LOOM_CHECK_LOAD_FILE=str(load),
+                                        LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("waiting for host load", log)
+        self.assertIn("host load stayed high (1-minute load 31.50 is above 24)", log)
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("failed: [factory]", log)
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        slots = self.loom / "run" / "check-slots"
+        self.assertEqual(list(slots.iterdir()) if slots.exists() else [], [])
+
+    def test_a_slot_another_job_holds_is_respected_while_its_pid_lives_and_reclaimed_after(self):
+        # The protocol docs/LANES.md states for any job on the host: a
+        # directory slot-N under run/check-slots holding the holder's pid.
+        slots = self.loom / "run" / "check-slots"
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        (slots / "slot-1").mkdir(parents=True)
+        (slots / "slot-1" / "pid").write_text(f"{other.pid}\n")
+        body = 'acquire_check_slot\necho "rc $? ${CHECK_SLOT_HELD##*/}"\n'
+        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_WAIT": "1", "LOOM_CHECK_SLOT_POLL": "0.2"}
+        proc = self.slot_script(body, **env)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.strip(), "rc 1", err)
+        self.assertEqual((slots / "slot-1" / "pid").read_text().strip(), str(other.pid))
+        other.kill()
+        other.wait()
+        proc = self.slot_script(body + 'cat "$CHECK_SLOT_HELD/pid"\n', **env)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.split()[:3], ["rc", "0", "slot-1"], err)
+        self.assertNotEqual(out.split()[3], str(other.pid))
+        self.assertIn(f"held by pid {other.pid}, which is gone; reclaimed",
+                      (Path(self._tmp.name) / "slots.log").read_text())
 
     def test_two_checks_at_once_run_one_at_a_time_with_one_slot(self):
         # Fifteen lanes each started a full suite at once and drove the host

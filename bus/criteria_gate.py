@@ -36,15 +36,13 @@ A live criterion that names a check Loom can run (`check_of`) gets one: an
 GitHub client, or a read-only `kubectl get ...` / `kubectl rollout status ...`
 (never a secret, never another cluster's credentials). The criterion's other
 backticked or double-quoted strings must appear in the answer. The result is
-kept in the station's state and written to the ticket's status. A criterion
-with no runnable check, a check that keeps failing, and every operator
-criterion send the ticket to needs:human with one ask, once.
+kept in the station's state and written to the ticket's status. A live
+criterion with no runnable check or a failed check stays in the verify
+queue with its missing evidence or finding recorded. The brain reads the
+available logs, running system, or code and records what it finds.
 
-A live wait is not a person's job (loom#2805): a ticket labelled wait:*, or
-whose only unmet criteria are live and that is labelled awaiting-live-check or
-states a `waiting:` line, gets no ask (`live_wait`). An ask is made once per
-set of criteria (`criteria_key`): a brain or operator that takes the label off
-with the criteria unchanged is not overruled on the next pass.
+Only unticked operator criteria raise an ask. An ask is made once per set
+of criteria (`criteria_key`).
 """
 from __future__ import annotations
 
@@ -55,11 +53,10 @@ import shlex
 import subprocess
 import http.client
 import urllib.parse
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Callable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import claimed, operator_hold, proof, tickets
 from .github import GitHubError
-from .labels import WAIT_PREFIX
 
 CODE = "code"
 LIVE = "live"
@@ -107,12 +104,6 @@ _KUBECTL_FORBIDDEN = re.compile(
     r"|--client-key|--client-certificate|\bexec\b|\bport-forward\b", re.I)
 CHECK_TIMEOUT = 30
 BODY_LIMIT = 1 << 20
-# A ticket that waits on a live event (loom#2805): a wait:* label
-# (WAIT_PREFIX), or awaiting-live-check, the same value as bus/brain.py
-# LIVE_CHECK_LABEL (not imported: bus/brain.py imports this module).
-LIVE_CHECK_LABEL = "awaiting-live-check"
-# A stated wait: `waiting: <what> until <time>` (the goal's claim rule).
-WAITING_LINE_RE = re.compile(r"^[ \t>*-]*waiting[ \t]*:[ \t]*\S", re.I | re.M)
 ASK_SHOWN = 4
 ASK_WIDTH = 160
 
@@ -200,6 +191,12 @@ def needing_evidence(body: str) -> List[Tuple[str, str]]:
     return out
 
 
+def open_operator_criteria(body: str) -> List[str]:
+    """Operator criteria that still need someone to act."""
+    return [text for checked, text in proof.criteria(body)
+            if not checked and kind(text) == OPERATOR]
+
+
 def unverified(body: str, passed: Sequence[str]) -> List[Tuple[str, str]]:
     """The live and operator criteria with no station evidence; `passed`
     holds the keys of criteria the station checked itself: a passing live
@@ -217,26 +214,6 @@ def criteria_key(body: str) -> str:
     lines = ["%s %s" % ("x" if checked else " ", " ".join(text.split()))
              for checked, text in proof.criteria(body or "")]
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
-
-
-def states_wait(text: Any) -> bool:
-    """`text` holds a stated `waiting:` line."""
-    return bool(WAITING_LINE_RE.search(str(text or "")))
-
-
-def live_wait(labels: Sequence[str], gaps: Sequence[Tuple[str, str]],
-              texts: Sequence[Any] = ()) -> bool:
-    """Whether a shipped ticket with these unverified criteria waits on a
-    live event rather than a person (loom#2805): a wait:* label, or every gap
-    is live and the ticket is labelled awaiting-live-check or one of `texts`
-    (its body, its trusted comments) states a `waiting:` line. An operator
-    criterion is a person's job, so it is still asked."""
-    names = [str(n) for n in labels]
-    if any(n.startswith(WAIT_PREFIX) for n in names):
-        return True
-    if not gaps or any(found != LIVE for found, _ in gaps):
-        return False
-    return LIVE_CHECK_LABEL in names or any(states_wait(t) for t in texts)
 
 
 def _spans(text: str) -> List[str]:
@@ -344,28 +321,25 @@ def run(check: Check, gh: Any,
     return ok, seen + found
 
 
-# How the verification ask opens. bus/needs_you.py reads a trusted comment
-# carrying it as the station's tag, apart from an ask a person wrote.
+# The old verification openings remain readable on existing tickets.
 ASK_OPENING = ("This ticket shipped, but Loom closes a ticket only when every "
                "acceptance criterion has evidence")
+OPERATOR_ASK_OPENING = "This shipped ticket needs an operator action"
 
 
 def is_verification_ask(text: Any) -> bool:
-    """`text` is the ask of `ask`, the station's own verification tag."""
-    return ASK_OPENING in " ".join(str(text or "").split())
+    """`text` is a legacy station verification tag."""
+    body = " ".join(str(text or "").split())
+    return (ASK_OPENING in body
+            or "The station could not verify the prose Live criterion." in body)
 
 
-def ask(gaps: Sequence[Tuple[str, str]], failed: Dict[str, str]) -> str:
-    """The one ask for a shipped ticket Loom cannot verify on its own."""
-    lines = []
-    for found, text in list(gaps)[:ASK_SHOWN]:
-        why = failed.get(key(text)) or ("an operator action" if found == OPERATOR
-                                         else "no check Loom can run")
-        lines.append("%s (%s)" % (" ".join(text.split())[:ASK_WIDTH], why))
-    more = " and %d more" % (len(gaps) - ASK_SHOWN) if len(gaps) > ASK_SHOWN else ""
-    return ("Kind: decision\n%s, and these have none it can gather: %s%s. "
-            "Check each one, tick it, and close the ticket, or reopen the work if one does "
-            "not hold." % (ASK_OPENING, "; ".join(lines), more))
+def ask(criteria: Sequence[str]) -> str:
+    """The one ask for the shipped ticket's unticked operator criteria."""
+    lines = [" ".join(text.split())[:ASK_WIDTH] for text in criteria[:ASK_SHOWN]]
+    more = " and %d more" % (len(criteria) - ASK_SHOWN) if len(criteria) > ASK_SHOWN else ""
+    return ("Kind: decision\n%s: %s%s. Complete each action and tick its criterion "
+            "once it holds." % (OPERATOR_ASK_OPENING, "; ".join(lines), more))
 
 
 def lane_ticks(ticket_body: str, pull_body: str) -> List[str]:

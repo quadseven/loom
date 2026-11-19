@@ -481,8 +481,8 @@ the cost of a station-side stand-in for `Grug - Chief`.
   that shipped means merged to the default branch. Verified means one of: the
   owner marked it read (an `Operator answer` line), a later document cites it,
   or the weekly source recheck loaded its sources. The evidence close may close
-  a low-tier ticket as `closed-unproven` with its Live box listed in the Proof
-  due issue, as today.
+  a low-tier ticket as `closed-unproven` with its unproven live boxes listed in
+  the Proof due issue, as today.
 - **Asks.** Holds and asks for a business repo go to the owner: a
   `needs:<owner login>` label, one exact question, and the weekly digest. The
   owner's login is in `LOOM_ASK_ANSWERERS` so an `Operator answer` line counts,

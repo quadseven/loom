@@ -36,9 +36,19 @@ signal; if work becomes active before that observation expires or its quota rese
 the station may flag that fresh observation without another API read. Failed reads
 do not clear an outstanding signal. A successful observation at or above the
 threshold clears it. The station surfaces the durable factory flag in its normal output, including
-when the station App budget is exhausted. This observer does not publish issues
-or change existing merge, close, or reporting gates. The sampling client never
-publishes anything.
+when the station App budget is exhausted. This observer does not change existing
+merge, close, or reporting gates. The sampling client never publishes anything.
+
+A 401 answer is not transient: GitHub rejects the stored login until a person
+signs it in again. The state file counts 401 answers in a row (`rejected`). A
+successful read clears the count; any other failed read leaves it as it was.
+At three in a row the station, with its own client, files one `needs:human` ask
+in the status repository (`LOOM_STATUS_REPO`) that names the operator login, and
+keeps the ask's number in the state file (`ask`). While that ask is open, or
+cannot be read, no second ask is filed. Once it is closed and the login is
+still rejected, the next failed read files a new one. The check runs only on a
+pass that made a read, so it costs at most one request per five minutes. Reads
+keep retrying as before. With no status repository set, nothing is filed.
 
 Tests are entirely offline:
 

@@ -229,7 +229,8 @@ NO_LANE_HANDOFF = 24 * 3600
 # queued ticket no free lane of its model or tier takes, a briefed one stalled
 # with no other lane of its rung or tier, or one on a lane at a limit or down
 # with no free lane in its rung or tier.
-NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
+MODEL_WAIT = "no free lane takes model "
+NO_LANE_RE = re.compile(r"(" + MODEL_WAIT + r"|no free lane in tier "
                         r"|stalled on lane \S+: no other lane of its "
                         r"|on lane \S+, .*: no free lane in its |remote lane \S+ has not pulled it)")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
@@ -306,6 +307,11 @@ def hard_pin(issue: Dict[str, Any]) -> str:
 def no_lane(reason: str) -> bool:
     """Whether a wait reason (Factory.waits) says no lane takes the ticket."""
     return bool(NO_LANE_RE.match(str(reason or "")))
+
+
+def model_wait_reason(model: str) -> str:
+    return MODEL_WAIT + (model if len(model) <= 64 and tickets.MODEL_RE.fullmatch(model)
+                         else "(its Model: line names no model id)")
 # A ticket held by its After: line this long, with none of the tickets it
 # waits for merged, is reported to the brain once like a stuck ticket.
 HOLD_STUCK = 48 * 3600
@@ -364,45 +370,10 @@ def degraded_review(title: str, summary: str) -> bool:
 # partial review, so a second partial result on the same head goes back.
 REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
 
-# The Codex Luna review fallback (loom#2142). When the review bot's model
-# route is exhausted, its check on a blocking repo concludes failure with a
-# degraded output - not a verdict - and the re-ask (`/grug improve`) degrades
-# the same way, so the pull request can only bounce through fix rounds no
-# lane can close. Instead, one codex lane slot reviews the head: every codex
-# slot runs gpt-6-luna only, through `codex exec` on the operator's Codex
-# login, and LUNA_REVIEW_LANE names the slot the review briefs go to. The
-# station posts the lane's verdict as a pull request comment carrying
-# LUNA_REVIEW_MARKER and the Elder's own markings line; the gate below reads
-# it for that head commit only, from trusted authors only, exactly like a
-# verdict from the review bot itself.
-LUNA_REVIEW_LANE = "codex-2"
-# The model the review brief pins and the station checks the run recorded:
-# the codex lanes' only model (bus/tickets.py writes the same pin into the
-# brief itself).
+# The model the codex lanes run (bus/tickets.py pins it in a review brief;
+# the review sweep, bus/review_sweep.py, checks a codex review run used it).
 LUNA_MODEL = "gpt-6-luna"
-LUNA_REQUEST_MARKER = "<!-- loom:luna-request v1 sha=%s -->"
-LUNA_REVIEW_MARKER = "<!-- loom:luna-review v1 sha=%s -->"
-# A dispatched review that produced no verdict is dispatched again after
-# this long: its lane run may have failed, or never picked the brief up.
-LUNA_RETRY_AFTER = 3600
-# One request comment per head records every dispatch (loom#2207): each adds a
-# line and a hidden stamp to it, and after LUNA_MAX_DISPATCHES without a
-# verdict the head is not dispatched again and a factory ticket is filed.
-LUNA_MAX_DISPATCHES = 3
-_LUNA_DISPATCH_RE = re.compile(r"<!-- loom:luna-dispatch at=(\d+) -->")
-LUNA_STUCK_TITLE = "Luna review of %s#%d head %s got no verdict after %d dispatches"
 _REVIEW_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
-
-
-def parse_luna_verdict(body: Any, sha: str) -> Optional[Tuple[int, int]]:
-    """(blocking, total) from a Luna verdict comment for this head commit,
-    else None: the comment must carry the verdict marker for the head and
-    the Elder's markings line."""
-    text = str(body or "")
-    if LUNA_REVIEW_MARKER % sha not in text:
-        return None
-    found = _REVIEW_MARKINGS_RE.search(text)
-    return (int(found.group(1)), int(found.group(2))) if found else None
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The codex lane and its fifteen slots, all on gpt-6-luna (labels.SLOTS). Every
@@ -1305,7 +1276,7 @@ def _is_brief(body: str) -> bool:
 # The head of the note _give_up leaves when a ticket is past the last rung.
 GAVE_UP = "The factory tried every rung of the model ladder"
 # The class bus/station.py's CLASS_RE reads off a reported reason.
-ENDING_CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth)\] ")
+ENDING_CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth)\] ")
 
 
 # A run cut off at a timeout: the agent's (lanes/agent_cli.sh classes exit 124
@@ -1839,6 +1810,16 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
+def base_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Base: line, "" (the default branch) when it has none
+    readable: the base a runner brief for the ticket names, as the
+    dispatch stop reads it (bus/runners.py _base_red)."""
+    try:
+        return str(tickets.parse(issue.get("body"))[0].get("Base") or "")
+    except ValueError:
+        return ""
+
+
 def public_only(lane: str) -> bool:
     """Whether the lane takes public repos only, by the station's claim rule
     (station.needs_public_repo): PUBLIC_ONLY, a slot sent to cluster runners
@@ -1964,12 +1945,12 @@ class Factory:
                  place: Callable[..., Any] = brain.place_under_epic,
                  plan_check: str = DEFAULT_PLAN_CHECK,
                  scope: Optional[scope_fit.Ask] = None,
-                 review_brief: Optional[Callable[..., Any]] = None,
                  demoted: Optional[Dict[str, str]] = None,
                  operators: Optional[Sequence[str]] = None,
                  no_lane_since: Optional[Dict[str, float]] = None,
                  reroute_after: Optional[float] = None,
-                 lint_run: Callable[..., Optional[bool]] = merge_tier.run_ruff) -> None:
+                 lint_run: Callable[..., Optional[bool]] = merge_tier.run_ruff,
+                 runner_stops: Optional[Callable[[str, str, str], bool]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -2058,9 +2039,6 @@ class Factory:
         # Sends the scope check's prompt to a cheap model (bus/scope_fit.py);
         # None skips the check.
         self.scope = scope
-        # Writes one Luna review brief (loom#2142): the station's writer,
-        # passed only when the fallback is on, so the default stays off.
-        self.review_brief = review_brief
         self.actions = 0
         self.load: Dict[str, int] = {}
         self.landed: set = set()
@@ -2095,6 +2073,13 @@ class Factory:
         self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
         # Each repo's `area:` labels, read once a pass by _repo_areas.
         self._areas: Dict[str, Optional[List[str]]] = {}
+        # Whether a runner slot's live base-red record stops a repo on a
+        # base (bus/runners.py Runners.stops, the dispatch read), or None
+        # when no reader was wired (a factory built away from the station):
+        # a lane pick skips a stopped slot (loom#3211). Read once per
+        # (lane, repo, base) a pass.
+        self.runner_stops = runner_stops
+        self._stops_cache: Dict[Tuple[str, str, str], bool] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -2196,6 +2181,20 @@ class Factory:
         running ticket."""
         return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
+    def _runner_stops(self, lane: str, repo: str, base: str) -> bool:
+        """Whether the runner ledger stops `repo` on `lane`'s slot for
+        `base`, through the station's runner_stops (bus/runners.py
+        Runners.stops, the read dispatch itself makes): a slot it stops is
+        skipped like a busy one, a normal skip with no note or park, so the
+        next lane of the tier takes the ticket (loom#3211). No reader wired
+        stops nothing."""
+        if self.runner_stops is None:
+            return False
+        key = (lane, repo, base)
+        if key not in self._stops_cache:
+            self._stops_cache[key] = bool(self.runner_stops(lane, repo, base))
+        return self._stops_cache[key]
+
     def _tier_move(self, repo: str, issue: Dict[str, Any],
                    old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
         """(lane, fallback) for a tier move off lane `old`: the first free lane
@@ -2204,10 +2203,11 @@ class Factory:
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
+        base = base_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
         own = [x for x in lanes_of(difficulty, private)
                if x != old and (allow_remote or x not in REMOTE_LANES)
-               and (x != "agy" or agy_ok)]
+               and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
@@ -2219,7 +2219,8 @@ class Factory:
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
-                              and (x != "agy" or agy_ok)]
+                              and (x != "agy" or agy_ok)
+                              and not self._runner_stops(x, repo, base)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
@@ -3324,17 +3325,6 @@ class Factory:
         # it, and the fix round then read it as a stuck failure (loom#1962).
         if "failing checks" in faults and self._rerun_infra_flakes(repo, number, sha):
             return
-        if faults == ["failing checks"] and self._review_degraded(sha):
-            # A degraded review is not a verdict (loom#2142): a clean Luna
-            # verdict for this head stands in for the review check, so the
-            # pull request is judged on everything else. A blocking verdict
-            # leaves the faults as they are: the pull request goes back with
-            # the lane's findings as review threads, as the bot's would.
-            verdict = self._luna_verdict(repo, number, sha)
-            if verdict is not None and verdict[0] == 0:
-                faults = []
-                _say("%s#%d: the Luna review of head %s is clean and stands in "
-                     "for the degraded review check" % (repo, number, sha[:12]))
         if faults == ["failing checks"] and (
                 self._split_pr(repo, number, full, issue, comments, sha)
                 or self._repair_body_leak(repo, number, full, issue, comments, sha)
@@ -3343,7 +3333,7 @@ class Factory:
                 or self._update_base_fixed(repo, number, full, sha)
                 or self._run_again(repo, number, sha)
                 or self._review_again(repo, number, full, sha)
-                or self._luna_review(repo, number, full, issue, sha)):
+                or self._hold_degraded(repo, number, sha)):
             return
         if faults:
             self._send_back(repo, full, issue, comments,
@@ -4410,111 +4400,19 @@ class Factory:
         return degraded_review(str(output.get("title") or ""),
                                str(output.get("summary") or ""))
 
-    def _luna_verdict(self, repo: str, number: int, sha: str) -> Optional[Tuple[int, int]]:
-        """The Luna lane's (blocking, total) verdict for this head, from the
-        trusted verdict comment on the pull request, else None."""
-        for comment in self._trusted_comments(repo, number):
-            verdict = parse_luna_verdict(comment.get("body"), sha)
-            if verdict is not None:
-                return verdict
-        return None
-
-    def _luna_review(self, repo: str, number: int, full: Dict[str, Any],
-                     issue: Dict[str, Any], sha: str) -> bool:
-        """Dispatch one Codex Luna review brief for this head (loom#2142),
-        when the only failing check is a degraded review and the review bot's
-        re-ask already failed on this head. The brief writer is the station's
-        (the factory's review_brief); without one this does nothing, as it
-        does when a verdict for this head already stands or a request younger
-        than LUNA_RETRY_AFTER is in flight. True when it dispatched."""
-        if self.review_brief is None or not self._review_degraded(sha):
+    def _hold_degraded(self, repo: str, number: int, sha: str) -> bool:
+        """Hold a pull request whose only failing check is a degraded review
+        after the review bot was already asked again for this head
+        (_review_again). A degraded review is not a verdict and no lane can
+        fix it by editing code, and review is the review bot's alone
+        (2026-11-16): nothing stands in for the check, so the pull request
+        waits for the check to rerun instead of going back to a fix round.
+        True when it holds."""
+        if not self._review_degraded(sha):
             return False
-        request, stamps, asked = self._luna_requests(repo, number, sha)
-        if asked is None:
-            return False  # the lane already answered for this head
-        if not asked:
-            return False  # the review bot has not had its re-ask yet
-        newest = max(stamps, default=0)
-        if newest and self.now - newest <= LUNA_RETRY_AFTER:
-            # A review for this head is already in flight: the pull request
-            # waits for the lane's verdict instead of bouncing through a fix
-            # round that cannot answer a degraded review.
-            _say("%s#%d waits for the Luna review of head %s dispatched %ds ago"
-                 % (repo, number, sha[:12], int(self.now - newest)))
-            return True
-        if len(stamps) >= LUNA_MAX_DISPATCHES:
-            self._luna_stuck(repo, number, sha, len(stamps))
-            return True  # the filed ticket carries it from here
-        if not self.review_brief(repo, number, sha, issue):
-            return False
-        self._luna_note(repo, number, sha, request, len(stamps) + 1)
-        self.actions += 1
-        _say("dispatched a Luna review of %s#%d head %s on lane %s"
-             % (repo, number, sha[:12], LUNA_REVIEW_LANE))
+        _say("%s#%d waits for the review check to rerun on head %s: its review "
+             "was degraded and it was already asked again" % (repo, number, sha[:12]))
         return True
-
-    def _luna_requests(self, repo: str, number: int, sha: str
-                       ) -> Tuple[Optional[Dict[str, Any]], List[int], Optional[bool]]:
-        """(the head's first request comment, each dispatch's epoch seconds,
-        whether the review bot was re-asked); asked is None once a verdict
-        for this head stands."""
-        asked = False
-        request: Optional[Dict[str, Any]] = None
-        stamps: List[int] = []
-        for comment in self._trusted_comments(repo, number):
-            body = str(comment.get("body") or "")
-            if parse_luna_verdict(body, sha) is not None:
-                return None, [], None
-            asked = asked or REVIEW_AGAIN_MARKER % sha in body
-            if LUNA_REQUEST_MARKER % sha in body:
-                request = request or comment
-                # A request written before the stamps counts as one dispatch
-                # at its creation time.
-                stamps += [int(x) for x in _LUNA_DISPATCH_RE.findall(body)] or [
-                    int(_ts(comment.get("created_at")))]
-        return request, stamps, asked
-
-    def _luna_note(self, repo: str, number: int, sha: str,
-                   request: Optional[Dict[str, Any]], sent: int) -> None:
-        """Record dispatch number `sent` on the head's request comment: post
-        it the first time, then edit it in place."""
-        stamp = int(self.now)
-        line = ("Dispatch %d at %s UTC.\n<!-- loom:luna-dispatch at=%d -->"
-                % (sent, datetime.fromtimestamp(stamp, timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M"), stamp))
-        if request is not None:
-            self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(request["id"])),
-                         {"body": str(request.get("body") or "").rstrip() + "\n" + line})
-            return
-        notify.post(self.gh, repo, number,
-                    "%s\nThe review check is degraded on this head and its re-run "
-                    "was degraded too, so a Codex Luna review was dispatched on "
-                    "lane %s (gpt-6-luna, through `codex exec`). Its verdict will "
-                    "be posted here for this head, and the merge gate reads it "
-                    "while the review route is down. A dispatch with no verdict "
-                    "is retried on this comment, up to %d times.\n\n%s"
-                    % (LUNA_REQUEST_MARKER % sha, LUNA_REVIEW_LANE,
-                       LUNA_MAX_DISPATCHES, line), notify.NOTE)
-
-    def _luna_stuck(self, repo: str, number: int, sha: str, sent: int) -> None:
-        """File one factory ticket for a head whose Luna review got no verdict
-        after `sent` dispatches, unless an open one already names it."""
-        title = LUNA_STUCK_TITLE % (repo, number, sha[:12], sent)
-        for found in self.gh.paginate("/repos/%s/issues?labels=loom:factory&state=open" % repo):
-            if isinstance(found, dict) and found.get("title") == title and self._trusted(found):
-                return
-        body = ("The review check is degraded on pull request #%d head %s and its re-run "
-                "was too, so its review was dispatched to lane %s %d times with no "
-                "verdict. No further dispatch is made for this head: the pull request "
-                "waits until the lane answers or a new head is pushed.\n\n"
-                "## Why\nThe lane cannot answer, or its run never records a verdict.\n"
-                % (number, sha[:12], LUNA_REVIEW_LANE, sent))
-        brain._check_written_text(title + "\n" + body)
-        self.gh.rest("POST", "/repos/%s/issues" % repo,
-                     {"title": title, "body": body, "labels": ["loom:factory"]})
-        self.actions += 1
-        _say("filed a factory ticket: Luna review of %s#%d head %s stuck"
-             % (repo, number, sha[:12]))
 
     def _finding_blocker(self, repo: str, number: int) -> Optional[str]:
         """The refusal an unanswered blocking comment on pull request `number`
@@ -5039,7 +4937,7 @@ class Factory:
         for this reason, not on each pass it repeats it: 716 identical stall
         lines in two days hid the ones that mattered (loom#1280)."""
         key = "%s#%s" % (repo, number)
-        if self.known_waits.get(key) != reason:
+        if self.waits.get(key, self.known_waits.get(key)) != reason:
             _say(message)
         self._waiting(repo, number, reason)
 
@@ -5467,8 +5365,8 @@ class Factory:
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up) across repos in tickets.work_order: FIRST labels,
-        then priority, then the oldest. A pass that gives none a lane says
-        how many wait and why the first does."""
+        then priority, then the oldest. A pass that gives none a lane can
+        summarize the first wait. Pinned model waits log their transitions."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         before = _placements(found_by_repo)
@@ -5477,10 +5375,13 @@ class Factory:
                   if _state(issue) == "queued" and HANDOFF_LABEL not in _labels(issue)]
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
-        if waits and all(waits):
+        if waits and all(waits) and MODEL_WAIT not in waits[0]:
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
         self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
+        self.settled.update(ref for ref, reason in self.known_waits.items()
+                            if reason.startswith(MODEL_WAIT) and ref not in self.waits
+                            and ref.rpartition("#")[0] in found_by_repo)
 
     def _return_hand_offs(self, found_by_repo: Dict[str, Dict[int, Dict[str, Any]]]) -> None:
         """Give a lane left free after every other queued ticket had its turn
@@ -5815,12 +5716,9 @@ class Factory:
             fell = self._pin_fallback(repo, issue, model)
             if fell is not None:
                 return fell
-            why = "%s waits: no free lane takes model %s" % (ref, model)
-            reason = "no free lane takes model %s" % (
-                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
-                else "(its Model: line names no model id)")
-            self._waiting(repo, issue["number"], reason)
-            _say("%s (known lanes checked for availability, limits and model support)" % why)
+            reason = model_wait_reason(model)
+            why = "%s waits: %s" % (ref, reason)
+            self._wait_said(repo, issue["number"], reason, why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
             _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))
@@ -5834,13 +5732,16 @@ class Factory:
         first free one of its FALLBACK tiers, with fallback saying so."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
-        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip]
+        base = base_of(issue)
+        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip
+               and not self._runner_stops(x, repo, base)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
             lane = next((x for x in lanes_of(tier, private)
-                         if x not in REMOTE_LANES and x not in skip and self._free(x)), None)
+                         if x not in REMOTE_LANES and x not in skip and self._free(x)
+                         and not self._runner_stops(x, repo, base)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
         return None, ""

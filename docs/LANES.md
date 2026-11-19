@@ -24,9 +24,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
   moves it as for a lane at a limit (a ladder ticket waits on its rung).
-- Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
-  whose CLI or key is missing reports `available: false` and leaves its briefs
-  alone; the dispatcher routes only to fresh, available lanes.
+- Each pass writes `state/usage/<lane>.json` with the lane state, runner
+  readiness, and time. A lane whose CLI or key is missing reports unavailable
+  and leaves its briefs alone. The station routes only to serving lanes.
 
 ## How a lane is told to work
 
@@ -246,8 +246,16 @@ unset variables.
   (default 1800).
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
-  hold the runner's pid; a slot whose pid is gone is reclaimed. A lane waits
-  up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
+  hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
+  is taken only while the host has room: the 1-minute load average at or
+  under `LOOM_CHECK_LOAD_1M` (default 24) and the 5-minute one at or under
+  `LOOM_CHECK_LOAD_5M` (default 18). A value of 0 turns that limit off, and
+  a host whose load cannot be read is not gated (the log says so). The
+  reading is the first two fields of `LOOM_CHECK_LOAD_FILE` (default
+  `/proc/loadavg`), or of `sysctl -n vm.loadavg` where that file is absent.
+  A lane waits up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) for a
+  slot and for load together, with a log line that says which (`waiting for
+  a check slot` or `waiting for host load`), and
   its keepalive stamp stays fresh while it waits. A wait that runs out, or a
   base check that times out (exit 124), parks the brief `[transient]` and
   files no base-check incident: both mean host load, not a red base. A
@@ -262,6 +270,16 @@ unset variables.
   |---|---|---|
   | Loom `.github/unittest_parallel.py` | `.loom/validation.conf` | Honors `LOOM_CHECK_WORKERS`; defaults to four when unset. |
   | Other repositories | Each repo's `.loom/validation.conf` command | Repo-defined; Loom does not keep a central inventory or detect whether the command honors the variable. Confirm in that repo's runner and contract. |
+- The slot protocol is open to any other heavy job on the host (a full suite
+  before a pull request opens, say), so it queues with the lane checks
+  instead of running beside them. To take slot N, for N from 1 to
+  `LOOM_CHECK_SLOTS`: `mkdir <LOOM_HOME>/run/check-slots/slot-N` (the
+  `mkdir` is the lock: only one caller's succeeds), then write the holder's
+  pid to `slot-N/pid`. To release it, remove the directory. A slot whose
+  pid is alive is left alone by every lane; one whose pid is gone is
+  reclaimed by the next waiter; one with no `pid` file yet is treated as
+  being taken and left alone, so write the pid at once. The pid must stay
+  alive for as long as the job runs.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still
@@ -625,17 +643,19 @@ The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
 
-Lane status: every pass the station reads each lane's heartbeat (`yes` when
-available and at most 600 seconds older than the pass's start, else `no`; a
-beat written while the pass runs counts, one stamped more than a minute
-ahead of the clock does not) and keeps one comment on the
+Lane status: every pass the station reads each lane's heartbeat and evaluates
+whether it is serving, limited, parked, or off. Local heartbeats are usable
+for 600 seconds. A beat written while the pass runs counts, with a minute
+of tolerance for clock skew. The station keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and when
+when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-It never publishes the heartbeat's reason. `bus.brain status` prints the
-table's age beside `Updated` and calls it stale past the same age. With anthropic
+The table uses fixed reason text so raw runner details stay local. The
+launchd station removes stale heartbeat files for slots with no loaded job.
+Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
+prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
@@ -1430,27 +1450,30 @@ The loom home is kept bounded by the station and the runner (loom#643).
   however old, and a link is never followed. The station logs
   `removed N stale rewrite scratch folder(s), X GB, from ...`.
 
-## Failed-run log tail
+## Parked-run outcome note
 
 A run that ends parked leaves its detail in the lane host's log, which a
 reader of the ticket often cannot reach. When a lane parks a brief after its
-repo passed the owner check, `post_log_tail` in `lanes/run_lane.sh` posts the
-last `LOOM_LOG_TAIL_LINES` lines (default 40) of this run's log as one comment
-on the ticket, found by `<!-- loom:lane-log-tail v1 -->` and replaced by the
-next failure (`bus/sticky.py tail`), so a ticket that keeps failing has one
-comment, not one per run.
+repo passed the owner check, `post_park_note` in `lanes/run_lane.sh` posts one
+readable line on the ticket: the lane, the failure class and the first line of
+the park reason, then "The full run log stays on the lane host." It is found
+by `<!-- loom:lane-log-tail v1 -->` and replaced by the next park
+(`bus/sticky.py outcome`), so a ticket that keeps failing has one comment, not
+one per run.
 
-- Local paths and control characters are removed, then the text goes through
-  the leak scan: the full scan for a repo not known to be private, the
-  personal data scan for a private one. A refused or unavailable scan posts a
-  note that the tail was withheld, never the text.
+- The run log is never posted. Its tail (posted until 2026-11-18) carried the
+  agent's whole session: test fixture tables, other tasks' API replies,
+  commands to run. The marker is unchanged so a ticket's next park replaces
+  an old tail.
+- Local paths and control characters are removed, then the reason line goes
+  through the leak scan: the full scan for a repo not known to be private,
+  the personal data scan for a private one. A refused or unavailable scan
+  posts the outcome without the reason.
 - Limit and auth parks post nothing (the station re-briefs them with the
   reason). A brief refused before its owner check posts nothing, and neither
   does a lane with App settings whose token could not be minted.
 - A failed post is logged and never fails the park. `LOOM_LOG_TAIL=off` turns
   the comment off.
-- Not done here: uploading the whole log to object storage. That needs a
-  bucket and a credential, which the operator supplies.
 
 ## Pass deadline
 
@@ -1900,6 +1923,13 @@ cannot query the viewer or any other local service.
   gives no reset holds the lane for a week, the fallback for a window the
   runner does not know. Any other answer lets the run go ahead. Another
   provider can name its own endpoint in the same setting.
+- A hold the lane read from its limit file (`state/usage/<slot>.limit`, written
+  by the runner itself or by the fleet pacer) is marked `"from_limit_file":
+  true` in the heartbeat, and ends on the first pass after that file is
+  removed: the file's writer withdrew the hold. A hold from the provider's own
+  refusal carries no such mark and stands until its time or a passing
+  re-check. The cluster `free-openrouter` slot is the exception: its limit
+  file does not survive a pod restart, so a missing file there ends nothing.
 - A lane held by such a limit asks the provider again every 30 minutes and
   comes back as soon as it serves the lane again, because the provider's
   allowance refills while the lane sleeps (OpenCode Go refills 20% of a
@@ -1979,7 +2009,7 @@ cannot query the viewer or any other local service.
   group of its own. An expired key still holds all four.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
-  read-only meter with the key they already hold, at most every five minutes,
+  read-only meter with the key they already hold, at most every five minutes on heartbeat,
   through `bus/meter.py` (key and account id on stdin, never argv or a log),
   into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
   `GET /api/v1/key`, the key's free-model requests in the current UTC day and
@@ -2135,25 +2165,20 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
-## Elder fallback reviews: the codex-2 slot on Luna
+## A degraded Elder check: held, with no fallback reviewer
 
-When the review bot's model route is exhausted, its check on a lane pull
-request concludes as a degraded review - not a verdict - and the re-ask
-degrades the same way (loom#2142). The factory then dispatches one review
-brief to the `codex-2` slot instead of another fix round: a
-`Deliverable: review` brief in the verify brief's shape, whose tree is the
-pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
-codex lanes run), through `codex exec` on the operator's Codex login, on
-the same lane machine as the other codex slots. The lane changes no code;
-it writes `review.json` (blocking findings, notes, a summary). The station
-posts the verdict on the pull request in the Elder's markings shape
-(`Elder markings - N blocking, M total`, under a
-`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
-also posted as review threads, and the factory's merge gate reads the
-verdict for that head in the degraded check's place: a clean verdict lets
-the pull request land, a blocking one sends it back through the ordinary
-fix rounds. A dispatched review that produces no verdict is dispatched
-again after an hour.
+Review is `grug`'s alone (operator decision, 2026-11-16). When the review
+bot's model route is exhausted, its check on a lane pull request concludes
+as a degraded review, which is not a verdict. The factory asks the bot to
+review the head again once (`/grug improve`, docs/BRAIN.md). When the re-run
+degrades too, the pull request is held at `loom:pr` until the check reruns
+with a verdict. It is not sent to a fix round, since no lane can fix a
+degraded review by editing code.
+
+The codex-2 Luna fallback that once reviewed such a head (loom#2142) is
+gone. The factory dispatches no review brief, the station posts no Luna
+verdict, and neither the factory nor `bus.brain merge` reads an old
+`<!-- loom:luna-review v1 sha=... -->` comment in the check's place.
 
 ## The review sweep: independent reviews by the reviewer Apps
 
@@ -2194,8 +2219,8 @@ that is not held after transient failures, has a fresh heartbeat, and
 whose reviewer App did not write the pull request. A scorecard demotion
 does not stop a review: it judges the lane's builds, and a review is not
 one; a stale block goes first to the lane of the App that blocked,
-since only that App's new review replaces its block. The brief is the Luna
-review brief with `Review-Mode: sweep`; a codex slot is pinned to
+since only that App's new review replaces its block. The brief is a review
+brief with `Review-Mode: sweep`; a codex slot is pinned to
 `gpt-6-luna`, and agy runs its own model. The station records each
 dispatch (brief name, lane, pull request, head) in its state, and that
 record, not the brief's text, makes a finished run a sweep run: a pull
@@ -2203,9 +2228,8 @@ request body copied into the brief cannot choose the posting mode, and
 the pull request and head are read from the brief's header block only and
 must match the record. A sweep verdict counts only from the lane the
 record names, running that lane's model: `gpt-6-luna` on a codex slot,
-and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
-a degraded-Elder Luna run and counts only from the `codex-2` slot on
-`gpt-6-luna`.
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run
+posts nothing.
 
 The verdict is posted as one formal review on the head commit by the
 lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
@@ -2260,6 +2284,22 @@ App wrote.
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+The station holds coding tickets by default. To test coding capacity on demand,
+run `python3 -B -m bus.workersai check "$LOOM_HOME" "$LOOM_WORKERSAI_MODEL"`
+with the lane's token and account ID piped on standard input, one per line.
+The check sends a synthetic prompt. It enables the checked model only when the
+provider returns an answer and reports at least 65,536 input tokens. A first
+coding request refused with HTTP 429 while a fresh daily meter is below 50
+percent clears that check. The station requeues the ticket on its current rung.
+
+Workers AI can still verify shipped tickets using the evidence in the brief.
+The lane sends one request with an 8,192-token budget. It counts one input
+token per UTF-8 byte, reserves 128 tokens for the chat template and caps the
+reply at 1,024 tokens. The runner checks the daily neuron meter before sending
+the request. Larger verify briefs stay eligible for other lanes. Cluster
+dispatch requires both provider parameter settings, and a successful cluster
+run refreshes the meter for its report.
 
 ## free provider slots on the spark-gateway
 
@@ -2351,6 +2391,11 @@ Plan:
   `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
   `-high` keeps its suffix. A model outside the catalog is refused as a
   transient lane mismatch before agy starts.
+- Every 30 minutes, even with an empty inbox, agy can recheck held models
+  in its configured ladder. It sends one small print-mode request per held
+  `gemini-3.8-flash` effort (high, medium, or low). An answer releases
+  that model on the same pass. A refusal keeps the hold and updates its
+  expiry if the provider gives a reset time.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default

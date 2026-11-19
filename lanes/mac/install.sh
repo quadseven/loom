@@ -514,6 +514,8 @@ cat > "$PLIST" <<EOF
     <key>LOOM_FABRIC_REVIEW_NOTES</key><string>$(xml "${LOOM_FABRIC_REVIEW_NOTES:-}")</string>
     <key>LOOM_WATCH</key><string>$(xml "${LOOM_WATCH:-}")</string>
     <key>LOOM_EVIDENCE_CMDS</key><string>$(xml "${LOOM_EVIDENCE_CMDS:-}")</string>
+    <key>LOOM_LOG_CAPTURE</key><string>$(xml "${LOOM_LOG_CAPTURE:-}")</string>
+    <key>LOOM_LOG_CAPTURE_RETENTION_HOURS</key><string>$(xml "${LOOM_LOG_CAPTURE_RETENTION_HOURS:-}")</string>
     <key>LOOM_REWRITE_CMD</key><string>$(xml "${LOOM_REWRITE_CMD:-}")</string>
     <key>LOOM_REWRITE_PRIVATE_CMD</key><string>$(xml "${LOOM_REWRITE_PRIVATE_CMD:-}")</string>
     <key>LOOM_REWRITE_CLAUDE_TOKEN_SSM</key><string>$(xml "${LOOM_REWRITE_CLAUDE_TOKEN_SSM:-}")</string>

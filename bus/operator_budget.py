@@ -5,6 +5,12 @@ A fresh binding allows sampling zero remaining after a station restart without
 calling /user, which itself needs core quota. First observation at zero, a
 rotated credential, or an expired binding remains unknown until /user succeeds.
 No credential, account name, raw response or exception text is persisted.
+
+A 401 answer is not transient: the stored login is rejected until a person
+signs it in again. The state counts 401 answers in a row ("rejected"; a good
+read clears it, any other failed read leaves it) and keeps the number of the
+ask the station filed for it ("ask"). The station files that ask
+(bus/station.py ask_operator_login); this module never publishes anything.
 """
 from __future__ import annotations
 
@@ -26,6 +32,10 @@ KEEP = 169
 LOW_DIVISOR = 10
 MAX_CORE_LIMIT = 1_000_000_000
 MAX_EPOCH = 253402300799
+# 401 answers in a row before the station asks a person to sign in again.
+REJECTED_ASK = 3
+REJECTED_STATUS = 401
+MAX_ISSUE = 2 ** 31 - 1
 
 
 def number(value):
@@ -87,6 +97,17 @@ def clean_record(record):
     return dict(core, at=record["at"], active=record.get("active") is True)
 
 
+def _counts(raw):
+    """The 401 count and the ask number a state file holds, each only when it
+    is a whole number in range."""
+    kept = {}
+    for key, most in (("rejected", KEEP), ("ask", MAX_ISSUE)):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= most:
+            kept[key] = value
+    return kept
+
+
 def load(path):
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -109,6 +130,7 @@ def load(path):
     if isinstance(failures, list):
         state["failures"] = [{"at": f["at"], "reason": "read-failed"}
                              for f in failures[-KEEP:] if isinstance(f, dict) and number(f.get("at"))]
+    state.update(_counts(raw))
     signal = clean_record(raw.get("signal"))
     if signal and signal["active"] and signal["remaining"] * LOW_DIVISOR < signal["limit"]:
         state["signal"] = signal
@@ -156,13 +178,16 @@ def sample(path, now, operator, active, reader, say):
         try:
             core, binding = reader(operator, state.get("binding", {}), now)
             record = dict(core_values(core), at=now, active=bool(active))
-        except (GitHubError, OSError, ValueError):
+        except (GitHubError, OSError, ValueError) as err:
             # Transport errors may contain secrets; only this fixed category is safe.
             state["failures"] = (state.get("failures", []) +
                                   [{"at": now, "reason": "read-failed"}])[-KEEP:]
+            if isinstance(err, GitHubError) and err.status == REJECTED_STATUS:
+                state["rejected"] = min(state.get("rejected", 0) + 1, KEEP)
             say("operator core budget read failed; identity or quota unknown; retry later")
         else:
             state["binding"] = binding
+            state.pop("rejected", None)
             state["samples"] = (state.get("samples", []) + [record])[-KEEP:]
             state["next_at"] = now + EVERY
             if record["remaining"] * LOW_DIVISOR >= record["limit"]:

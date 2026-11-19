@@ -32,7 +32,7 @@ from bus import watch as watch_module  # noqa: E402
 from bus import labels as labels_module  # noqa: E402
 from bus.github import AppToken, GitHub, GitHubError, RateLimited, TargetReached  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
-from bus import handoff  # noqa: E402
+from bus import handoff, workersai  # noqa: E402
 
 REPO = "example-owner/example-repo"
 # A goal report this old is past its next reading time and grace whatever the
@@ -6280,6 +6280,19 @@ class FixTest(Base):
     def fix_of(self, comments):
         return station.Station(GitHub("token", transport=self.fake), self.settings)._fix_for(REPO, comments)
 
+    def test_size_refusal_reuses_the_same_fix_round_on_the_same_pull(self):
+        self.fake.add(12)
+        self.comment(12, FIX_BODY + "\n<!-- loom:fix-head abc123 -->")
+        self.comment(12, "Claimed for lane workersai (body sha256 0123456789ab)")
+        self.comment(12, "Lane workersai stopped: [size] first coding request refused", author="stranger")
+        self.assertIsNone(self.fix_of(self.fake.comments[12]))
+        self.comment(12, "Lane workersai stopped: [size] first coding request refused")
+        fix, source = self.fix_of(self.fake.comments[12])
+        self.assertEqual((fix.pr, source), (99, 1))
+        self.assertEqual(station.Station._fix_round_count(self.fake.comments[12], set(AUTHORS)), 1)
+        self.comment(12, "Claimed for lane codex (body sha256 0123456789ab)")
+        self.assertIsNone(self.fix_of(self.fake.comments[12]))
+
     def test_a_fix_posted_before_the_status_comment_claim_is_not_current(self):
         self.assertIsNone(self.fix_of([self.fix_comment(), self.status_comment("2030-01-02T00:00:01Z")]))
         # The status comment keeps its place in the list and its first post
@@ -6642,6 +6655,54 @@ class RetryTest(Base):
         self.run_pass()
         self.assertIn("moved from lane anthropic-2 to lane codex.", self.bodies()[-2])
         self.assertIn("lane:codex", self.fake.names(12))
+
+    def test_workersai_size_refusal_requeues_without_spending_the_rung(self):
+        self.failed(lane="workersai", reason="[size] coding request refused")
+        self.fake.comments[12].insert(0, {"body": factory.RUNG_MARKER % 2})
+        self.fake.private = False
+        self.heartbeat("workersai")
+        self.fake.add(13, lane="workersai", body=PLAIN_WITH_CRITERIA)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        model = brain.lane_model("workersai")
+
+        def check(tokens):
+            response = {"choices": [{"message": {"content": "OK"}}], "usage": {"prompt_tokens": tokens}}
+            with mock.patch("urllib.request.urlopen", return_value=io.BytesIO(json.dumps(response).encode())):
+                return workersai.main(["check", self.home, model], io.StringIO("test\nexample\n"))
+
+        self.assertEqual(check(65536), 0)
+        usage = Path(self.home) / "state" / "usage"
+        (usage / "workersai.meter.json").write_text(json.dumps({
+            "lane": "workersai", "at": time.time(),
+            "windows": [{"window": "daily", "unit": "neurons", "used_pct": 20}]}))
+        events = usage / "events"
+        events.write_text("")
+        self.assertEqual(workersai.main(["refused", self.home, str(events), "coding"],
+                                       io.StringIO("AI_APICallError: Too Many Requests")), 0)
+        self.assertFalse(workersai.code_ready(self.home, model))
+        st.report_outcomes()
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("lane:workersai", self.fake.names(12))
+        comments = [{"body": body} for body in self.bodies()]
+        self.assertEqual(factory.tried_rungs(comments), set())
+        self.assertEqual(factory.rung_of(comments), 2)
+        self.assertTrue(any("stopped: [size]" in c["body"] for c in comments))
+        for tokens in (0, 66, 65536):
+            if tokens:
+                self.assertEqual(check(tokens) == 0, tokens == 65536)
+            st = station.Station(GitHub("token", transport=self.fake), self.settings)
+            st.claim_new()
+            self.assertEqual("loom:running" in self.fake.names(13), tokens == 65536)
+            self.assertEqual("workersai" in st._factory().down, tokens != 65536)
+
+    def test_delayed_size_report_leaves_a_new_claim_on_another_lane(self):
+        self.failed(lane="workersai", reason="[size] first coding request refused")
+        self.fake.issues[12]["labels"] = [{"name": n} for n in ("loom:ticket", "loom:running", "lane:codex")]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.report_outcomes()
+        self.assertIn("loom:running", self.fake.names(12))
+        self.assertIn("lane:codex", self.fake.names(12))
+        self.assertFalse(any("stopped: [size]" in body for body in self.bodies()))
 
     def test_a_provider_limit_from_the_runner_uses_the_bounded_retry(self):
         self.heartbeat("codex-2")
@@ -7451,10 +7512,13 @@ class SilentLaneTest(Base):
         self.assertEqual(st._factory().no_lane_since, {key: start})
         st._record_waits({key: "waits for #5 to merge (After:)"})
         self.assertEqual(st._no_lane_since(), {})
-        st._record_waits({key: "no free lane in tier medium"})
+        st._record_waits({key: "no free lane takes model claude-sonnet-5-5"})
         self.assertEqual(st._no_lane_since(), {key: st.now})
         st.now += 600
-        st._record_waits({}, settled={key})
+        with mock.patch.object(station, "_say") as say:
+            st._record_waits({}, settled={key})
+            st._record_waits({}, settled={key})
+        say.assert_called_once_with("%s model wait ended" % key)
         self.assertEqual(st._no_lane_since(), {})
         self.assertEqual(st._invariant_waits(), [])
 
@@ -9885,7 +9949,7 @@ class VerifyBeforeBuildTest(Base):
         self.run_pass()
         self.assertIn("loom:shipped", self.fake.names(12))
         self.assertNotIn("loom:queued", self.fake.names(12))
-        self.assertEqual(self.events(), [])
+        self.assertTrue(any(self.UNMET in event for event in self.events()))
 
     def test_an_unmet_answer_that_says_nothing_leaves_the_ticket_shipped(self):
         self.sent()
@@ -10222,8 +10286,36 @@ class StatusTest(Base):
         self.assertEqual(self.fake.created[0]["labels"], ["loom:lanes"])
         body = self.fake.posts[0]
         self.assertTrue(body.startswith("<!-- loom:lanes v1 -->\nUpdated "))
-        self.assertIn("| codex | yes |", body)
-        self.assertIn("| agy | no | - |", body)
+        self.assertIn("| codex | serving |", body)
+        self.assertIn("| agy | off | - |", body)
+
+    def test_a_never_paid_lane_and_a_stale_lane_explain_why_they_take_no_work(self):
+        self.settings.anthropic = spend.Budget(usd=0)
+        self.heartbeat("anthropic")
+        self.heartbeat("codex-4", age=station.HEARTBEAT_MAX_AGE + 60)
+        self.go()
+        body = self.fake.posts[0]
+        self.assertRegex(body, r"\| anthropic \| parked \| [^|]+ \| No Anthropic budget \|")
+        self.assertRegex(body, r"\| codex-4 \| off \| [^|]+ \| Heartbeat is stale \|")
+
+    def test_launchd_station_prunes_only_stale_heartbeats_without_jobs(self):
+        self.heartbeat("codex-4", age=3600)
+        self.heartbeat("codex-5", age=3600)
+        self.heartbeat("free-openrouter", age=3600)
+        self.heartbeat("muse", age=3600)
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        usage = os.path.join(self.home, "state", "usage")
+        for name in ("codex-4", "codex-5", "free-openrouter", "muse"):
+            os.utime(os.path.join(usage, name + ".json"), (st.now - 3600, st.now - 3600))
+        jobs = "PID\tStatus\tLabel\n%d\t0\tcom.loom.station\n-\t0\tcom.loom.codex-5\n" % os.getpid()
+        with mock.patch.object(station.sys, "platform", "darwin"), \
+                mock.patch.object(station.subprocess, "run", return_value=mock.Mock(stdout=jobs)), \
+                mock.patch.dict(os.environ, {"LOOM_RUNNER_SLOTS": "free-openrouter"}):
+            st._refresh_lane_jobs()
+        self.assertFalse(os.path.exists(os.path.join(usage, "codex-4.json")))
+        for name in ("codex", "codex-5", "free-openrouter", "muse"):
+            self.assertTrue(os.path.isfile(os.path.join(usage, name + ".json")))
+        self.assertEqual(st._lane_state("codex-4").reason, "No lane job")
 
     def test_existing_issue_is_reused(self):
         self.fake.lanes_issues = [{"number": 1}]
@@ -10243,7 +10335,7 @@ class StatusTest(Base):
         self.heartbeat("codex", available=False)
         self.go(30)
         self.assertEqual(len(self.fake.edits), 1)
-        self.assertIn("| codex | no |", self.fake.edits[0])
+        self.assertIn("| codex | off |", self.fake.edits[0])
 
     def test_republished_after_an_hour(self):
         self.go()
@@ -10379,7 +10471,7 @@ class SpendTest(Base):
         self.assertEqual(self.listing("anthropic-4"), [])
         self.assertIn("Under the $5.00 floor: the anthropic slots take no work.",
                       self.fake.posts[0])
-        self.assertIn("| anthropic-4 | no |", self.fake.posts[0])
+        self.assertIn("| anthropic-4 | parked |", self.fake.posts[0])
         # Above the floor, the same heartbeat takes work again.
         self.settings.anthropic.floor = 3.0
         self.station(time.time()).run_pass()
@@ -10633,10 +10725,19 @@ class AsksTest(Base):
         self.assertIn("Still open", text)
         self.assertNotIn("Waits", text)
 
-    def test_an_ask_filed_with_needs_human_is_listed(self):
+    def test_the_digest_counts_the_operator_ask_and_skips_a_legacy_verification_ask(self):
         self.fake.add_ask(5, title="New label", label="needs:human")
+        self.fake.add_ask(6, title="Legacy live check", label="needs:human",
+                          body="## Acceptance criteria\n- [ ] Live: the dashboard loads\n")
+        self.fake.asks[-1]["labels"].append({"name": "loom:shipped"})
+        self.fake.comments[6].append({
+            "body": answer.HUMAN_MARKER + "\n" + station.criteria_gate.ASK_OPENING
+                    + ", and these have none it can gather: Live: the dashboard loads.",
+            "user": {"login": self.fake.bot}, "created_at": "2030-01-01T00:00:00Z"})
         self.go(NOON)
-        self.assertIn("New label", self.sent[0][1]["content"])
+        text = self.sent[0][1]["content"]
+        self.assertIn("New label", text)
+        self.assertNotIn("Legacy live check", text)
 
     def test_an_unreadable_ask_holds_the_digest(self):
         self.fake.add_ask(5, title="Unknown")
@@ -12110,7 +12211,7 @@ class BrainTest(Base):
     def test_a_fresh_brain_is_published_and_quiet(self):
         self.tick(ok_age=60)
         self.go()
-        self.assertIn("| brain | yes |", self.fake.posts[0])
+        self.assertIn("| brain | serving |", self.fake.posts[0])
         self.assertEqual(self.sent, [])
 
     def test_a_stale_brain_is_told_once_then_its_return_once(self):
@@ -12120,7 +12221,7 @@ class BrainTest(Base):
         self.assertEqual(len(self.sent), 1)
         self.assertIn("Urgent: the Loom brain has not finished a tick since", self.sent[0])
         self.assertIn("failed (exit 124)", self.sent[0])
-        self.assertIn("| brain | no |", self.fake.posts[0])
+        self.assertIn("| brain | off |", self.fake.posts[0])
         self.tick(ok_age=0)
         self.go(120)
         self.go(180)
@@ -13192,10 +13293,9 @@ class CloseDoneTest(Base):
                       "- [ ] A test passes\n", state="shipped")
         st = station.Station(GitHub("token", transport=self.fake), self.settings)
         st.close_done_tickets()
-        # A Live line with nothing to search is still a live criterion with no
-        # evidence (bus/criteria_gate.py, 2026-10-22): it goes to the operator.
+        # A Live line with nothing to search stays shipped for verification.
         self.assertEqual(self.fake.issues[1]["state"], "open")
-        self.assertIn("needs:human", self.fake.names(1))
+        self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
         self.assertEqual(self.fake.issues[4]["state"], "closed") # no Live line, code only
@@ -13680,6 +13780,20 @@ class VerifyDispatchTest(Base):
         self.assertIn("loom:shipped", self.fake.names(2))
         self.assertEqual(self.fake.paths("PUT"), [])
 
+    def test_workersai_gets_only_a_short_verify_and_skips_a_full_meter(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        path = os.path.join(self.home, "state", "usage", "workersai.meter.json")
+        for pct in (100, 20):
+            self.write(path, json.dumps({"lane": "workersai", "at": st.now,
+                                         "windows": [{"window": "daily", "unit": "neurons",
+                                                      "used_pct": pct}]}))
+            self.fake.issues[2]["title"] = "x" * 10000
+            st._hand_verifies(["workersai"])
+            self.assertEqual(len(self.briefs("workersai")), int(pct == 20))
+        self.assertIn("Issue: %s#1" % REPO, self.text("workersai"))
+        attempts = station._read_json(os.path.join(st.state, station.VERIFY_FILE), {})
+        self.assertNotIn("%s#2" % REPO, attempts)
+
     def test_verify_brief_carries_a_proof_template_with_every_required_key(self):
         self.run_pass()
         text = self.text()
@@ -14024,10 +14138,31 @@ class VerifyDispatchTest(Base):
         st.now = time.time()
         with mock.patch.object(st, "_rewrite_goals", return_value=[]), \
              mock.patch.object(st, "_rewrite_command", return_value="agent"), \
-             mock.patch.object(station.rewrite, "run_agent", return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+             mock.patch.object(station.rewrite, "run_agent", return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}'):
             st.restate_shipped_live()
-        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+        self.assertIn("Live: `log:station` shows `the string`", self.fake.issues[2]["body"])
         self.assertEqual(self.fake.comments[2], [])
+
+    def test_the_restate_prompt_asks_for_a_read_only_check_loom_can_run(self):
+        # Owner ruling of 2026-11-19 (#3277): a restated Live line names a
+        # check Loom runs by itself, not a quoted string alone.
+        self.fake.private = False
+        self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
+            "prints `daily status ready`", "the daily line shows it")
+        self.settings.rewrite_cmd = "agent"
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.now = time.time()
+        with mock.patch.object(st, "_rewrite_goals", return_value=[]), \
+             mock.patch.object(st, "_rewrite_command", return_value="agent"), \
+             mock.patch.object(station.rewrite, "run_agent",
+                               return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}') as agent:
+            st.restate_shipped_live()
+        prompt = agent.call_args[0][1]
+        self.assertIn("a read-only check Loom can run by itself", prompt)
+        for form in ("`https://` URL", "`gh api <path>`", "`kubectl get", "`log:<source>`", "time window"):
+            self.assertIn(form, prompt)
+        self.assertIn("A quoted string alone is not a check", prompt)
+        self.assertNotIn("naming an exact string", prompt)
 
     def test_restate_runs_when_the_rewrite_step_spent_its_hourly_allowance(self):
         # Sharing one allowance, the rewrite step spent it every hour and no
@@ -14043,9 +14178,9 @@ class VerifyDispatchTest(Base):
             json.dump({station.REWRITE_STATION_KEY: [st.now - 60] * station.REWRITE_STATION_PER_HOUR}, fh)
         with mock.patch.object(st, "_rewrite_command", return_value="agent"), \
              mock.patch.object(station.rewrite, "run_agent",
-                               return_value='{"action":"restate","line":"Live: prints `the string`"}'):
+                               return_value='{"action":"restate","line":"Live: `log:station` shows `the string`"}'):
             st.restate_shipped_live()
-        self.assertIn("Live: prints `the string`", self.fake.issues[2]["body"])
+        self.assertIn("Live: `log:station` shows `the string`", self.fake.issues[2]["body"])
 
     def test_a_log_line_for_the_live_criterion_hands_the_run_and_quotes_it_once(self):
         self.fake.issues[2]["body"] = SHIPPED_BODY.replace(
@@ -15958,9 +16093,9 @@ class RunnerSlotClaimTest(Base):
         self.assertEqual(len(self.listing("free-gemma")), 1)
 
 
-class LunaReviewFake(FakeGitHub):
-    """FakeGitHub plus the pulls/<n>/comments POSTs a Luna verdict's
-    anchored findings use."""
+class ReviewPostFake(FakeGitHub):
+    """FakeGitHub plus the pulls/<n>/comments POSTs an anchored finding
+    would use, so a test sees any review thread posted."""
 
     def __init__(self):
         super().__init__()
@@ -15976,178 +16111,60 @@ class LunaReviewFake(FakeGitHub):
         return super().__call__(method, url, headers, body)
 
 
-class LunaReviewWriterTest(Base):
-    """The factory's Luna review writer (loom#2142): the station renders the
-    review brief for the pull request's current head and hands it to the
-    Luna review slot; a head that moved on is refused, so no verdict can
-    ever be posted for a commit the factory did not ask about."""
+class UnsweptReviewResultTest(Base):
+    """A finished review run the review sweep did not dispatch posts
+    nothing: review is the review bot's alone (operator decision,
+    2026-11-16), and the degraded-Elder Codex Luna fallback that once
+    posted such a run as a verdict in the check's place is gone."""
 
     SHA = "a" * 40
-
-    def station(self):
-        return station.Station(GitHub("token", transport=self.fake), self.settings,
-                               now=time.time())
-
-    def pull(self, sha):
-        self.fake.pulls = [{"number": 42,
-                            "head": {"ref": "loom/5-fix-the-thing", "sha": sha},
-                            "base": {"ref": "main"}}]
-
-    def briefs(self):
-        folder = self.inbox(factory.LUNA_REVIEW_LANE)
-        return [n for n in os.listdir(folder) if n.endswith(".md")] \
-            if os.path.isdir(folder) else []
-
-    def test_the_writer_hands_a_review_brief_to_the_luna_slot(self):
-        self.fake.add(5, lane="codex", state="pr")
-        self.pull(self.SHA)
-        st = self.station()
-        self.assertTrue(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
-        names = self.briefs()
-        self.assertEqual(len(names), 1)
-        self.assertIn("-review-", names[0])
-        with open(os.path.join(self.inbox(factory.LUNA_REVIEW_LANE), names[0])) as fh:
-            text = fh.read()
-        self.assertIn("Repo: %s\n" % REPO, text)
-        self.assertIn("Branch: loom/5-fix-the-thing\n", text)
-        self.assertIn("Review-PR: 42\n", text)
-        self.assertIn("Head-Sha: %s\n" % self.SHA, text)
-        self.assertIn("Model: gpt-6-luna\n", text)
-        self.assertIn("Deliverable: review\n", text)
-
-    def test_the_writer_refuses_a_head_that_moved(self):
-        self.fake.add(5, lane="codex", state="pr")
-        self.pull("b" * 40)
-        st = self.station()
-        self.assertFalse(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
-        self.assertEqual(self.briefs(), [])
-
-    def test_the_writer_refuses_an_unreadable_pull_request(self):
-        self.fake.add(5, lane="codex", state="pr")
-        st = self.station()
-        self.assertFalse(st._write_review_brief(REPO, 42, self.SHA, self.fake.issues[5]))
-        self.assertEqual(self.briefs(), [])
-
-
-class LunaReviewResultTest(Base):
-    """A finished Luna review run (loom#2142): the station posts the lane's
-    review.json on the pull request as a verdict in the Elder's markings
-    shape, with any blocking findings as review threads, so the factory's
-    gate and fix rounds read them exactly like the review bot's own."""
-
-    SHA = "a" * 40
+    LANE = "codex-2"
 
     def setUp(self):
         super().setUp()
-        self.fake = LunaReviewFake()
+        self.fake = ReviewPostFake()
         self.fake.add(5, lane="codex", body=BODY, state="pr")
         self.fake.comments[42] = []
         self.name = tickets.review_name(REPO, 5, 7)
         issue = {"number": 5, "title": "Fix the thing", "body": BODY}
-        brief = tickets.render_review_brief(REPO, issue, factory.LUNA_REVIEW_LANE, 7, 42,
+        brief = tickets.render_review_brief(REPO, issue, self.LANE, 7, 42,
                                             "loom/5-fix-the-thing", "main", self.SHA)
-        self.brief_path = os.path.join(self.inbox(factory.LUNA_REVIEW_LANE, "done"),
-                                       self.name + ".md")
+        self.brief_path = os.path.join(self.inbox(self.LANE, "done"), self.name + ".md")
         self.write(self.brief_path, brief)
 
-    def result(self, data, lane=None, model="gpt-6-luna"):
-        text = data if isinstance(data, str) else json.dumps(data)
-        lane = lane or factory.LUNA_REVIEW_LANE
-        self.write(os.path.join(self.home, "logs", lane,
-                                self.name + ".review.json"), text)
-        if model is not None:
-            self.write(os.path.join(self.home, "logs", lane,
-                                    self.name + ".review.model"), model + "\n")
+    def result(self, data, model="gpt-6-luna"):
+        self.write(os.path.join(self.home, "logs", self.LANE,
+                                self.name + ".review.json"), json.dumps(data))
+        self.write(os.path.join(self.home, "logs", self.LANE,
+                                self.name + ".review.model"), model + "\n")
 
-    def report(self, kind="done", lane=None):
+    def report(self, kind="done"):
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
                              now=time.time())
-        return st._report(lane or factory.LUNA_REVIEW_LANE, kind, self.brief_path, self.name)
+        return st._report(self.LANE, kind, self.brief_path, self.name)
 
-    def verdicts(self):
-        return [str(c.get("body") or "") for c in self.fake.comments[42]]
-
-    def test_a_clean_verdict_is_posted_in_the_elders_shape(self):
-        self.result({"blocking": [],
-                     "notes": [{"file": "src/app.py", "line": 3,
-                                "finding": "Name the flag for the next reader."}],
-                     "summary": "The change is sound."})
+    def test_a_clean_review_run_posts_nothing(self):
+        self.result({"blocking": [], "notes": [], "summary": "The change is sound."})
         self.assertTrue(self.report())
-        bodies = self.verdicts()
-        self.assertEqual(len(bodies), 1)
-        self.assertEqual(factory.parse_luna_verdict(bodies[0], self.SHA), (0, 1))
-        self.assertIn("The change is sound.", bodies[0])
-        self.assertIn("Name the flag for the next reader.", bodies[0])
+        self.assertEqual(self.fake.comments[42], [])
         self.assertEqual(self.fake.reviews_posted, [])
 
-    def test_a_blocking_verdict_posts_its_findings_as_review_threads(self):
-        self.result({"blocking": [
-                         {"file": "src/app.py", "line": 9,
-                          "finding": "The null check is missing."},
-                         {"file": None, "line": None,
-                          "finding": "No test covers the fallback."}],
-                     "notes": [], "summary": "Two problems."})
+    def test_a_blocking_review_run_posts_nothing(self):
+        self.result({"blocking": [{"file": "src/app.py", "line": 9,
+                                   "finding": "The null check is missing."}],
+                     "notes": [], "summary": "One problem."})
         self.assertTrue(self.report())
-        bodies = self.verdicts()
-        self.assertEqual(len(bodies), 1)
-        self.assertEqual(factory.parse_luna_verdict(bodies[0], self.SHA), (2, 2))
-        self.assertIn("The null check is missing.", bodies[0])
-        self.assertIn("No test covers the fallback.", bodies[0])
-        # Only the anchored finding becomes a review thread; both findings
-        # are in the verdict comment above.
-        self.assertEqual(len(self.fake.reviews_posted), 1)
-        number, thread = self.fake.reviews_posted[0]
-        self.assertEqual(number, 42)
-        self.assertEqual(thread, {"commit_id": self.SHA, "path": "src/app.py",
-                                  "line": 9, "side": "RIGHT",
-                                  "body": "The null check is missing."})
-
-    def test_an_anchored_finding_with_no_visible_text_posts_no_review_thread(self):
-        self.result({"blocking": [
-                         {"file": "src/app.py", "line": 9, "finding": "<!-- x -->"},
-                         {"file": "src/app.py", "line": 12,
-                          "finding": "The null check is missing."}],
-                     "notes": [], "summary": "Two problems."})
-        self.assertTrue(self.report())
-        self.assertEqual(len(self.verdicts()), 1)
-        self.assertEqual([t["line"] for _, t in self.fake.reviews_posted], [12])
-
-    def test_a_missing_review_json_posts_nothing(self):
-        self.assertTrue(self.report())
-        self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.fake.reviews_posted, [])
-
-    def test_a_malformed_review_json_posts_nothing(self):
-        self.result({"blocking": "none", "notes": [], "summary": "x"})
-        self.assertTrue(self.report())
-        self.assertEqual(self.verdicts(), [])
+        self.assertEqual(self.fake.comments[42], [])
         self.assertEqual(self.fake.reviews_posted, [])
 
     def test_a_failed_run_posts_nothing(self):
         self.result({"blocking": [], "notes": [], "summary": "Sound."})
         self.assertTrue(self.report(kind="failed"))
-        self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.fake.reviews_posted, [])
+        self.assertEqual(self.fake.comments[42], [])
 
-    def test_a_verdict_from_another_lane_posts_nothing(self):
-        # The gate trusts the posted verdict, so it counts only from the
-        # slot the factory dispatched the brief to.
-        self.result({"blocking": [], "notes": [], "summary": "Sound."}, lane="codex")
-        self.assertTrue(self.report(lane="codex"))
-        self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.fake.reviews_posted, [])
-
-    def test_a_verdict_from_a_non_luna_model_posts_nothing(self):
-        self.result({"blocking": [], "notes": [], "summary": "Sound."}, model="gpt-6-sol")
-        self.assertTrue(self.report())
-        self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.fake.reviews_posted, [])
-
-    def test_a_verdict_with_no_recorded_model_posts_nothing(self):
-        self.result({"blocking": [], "notes": [], "summary": "Sound."}, model=None)
-        self.assertTrue(self.report())
-        self.assertEqual(self.verdicts(), [])
-        self.assertEqual(self.fake.reviews_posted, [])
+    def test_the_station_has_no_luna_review_writer(self):
+        self.assertFalse(hasattr(station.Station, "_write_review_brief"))
+        self.assertFalse(hasattr(station.Station, "_post_luna_verdict"))
 
 
 class ReadyForAgentIntakeTest(Base):

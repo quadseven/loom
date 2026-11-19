@@ -29,9 +29,11 @@ MAX_ENTRY = 4000
 MAX_ROUNDS = 12
 MAX_ITEMS = 30
 MAX_DETAIL = 1500
-# The most of a failed run's log a ticket carries; the end is kept, because
-# that is where a run says why it stopped.
-MAX_TAIL = 6000
+# The longest outcome line a parked ticket carries. A ticket gets one readable
+# sentence, never lines of the run log (loom#3049 posted log tails; they put
+# test fixture tables and other tasks' output on tickets).
+MAX_OUTCOME = 300
+OUTCOME_FOOTER = "The full run log stays on the lane host."
 
 ROUND_RE = re.compile(r"^<!-- loom:round ([0-9]+) -->$", re.M)
 REPEAT_RE = re.compile(r"^(?P<headline>.*?): (?P<count>[0-9]+) times since (?P<first>\S+), "
@@ -111,17 +113,21 @@ def merge_repeat(old: Optional[str], marker: str, headline: str, items_label: st
     return "\n".join(lines) + "\n"
 
 
-def merge_tail(old: Optional[str], marker: str, headline: str, text: str, now: str) -> str:
-    """The log-tail comment: the latest tail in a code block, replacing the
-    last run's, so a ticket that fails again keeps one comment, not one per
-    failure. The old body is not read; it is a parameter so every mode has
-    the same shape. The text cannot close the block, open a marker or
-    mention anyone."""
-    fence = "`" * 3
-    text = text.replace("<!--", "<!- -").replace(fence, "'''").replace("@", "@ ").strip()
-    if len(text) > MAX_TAIL:
-        text = "... " + text[-MAX_TAIL:].lstrip()
-    return "\n".join([marker, "%s, as of %s." % (headline, now), "", fence, text, fence]) + "\n"
+def merge_outcome(old: Optional[str], marker: str, headline: str, text: str, now: str) -> str:
+    """The parked-run comment: one readable outcome line, replacing the last
+    run's, so a ticket that fails again keeps one comment, not one per
+    failure. Only the first non-blank line of the text is kept, capped at
+    MAX_OUTCOME, outside any code block. The old body is not read; it is a
+    parameter so every mode has the same shape. The text cannot open a
+    marker, mention anyone or start a code block."""
+    line = next((l.strip() for l in text.splitlines() if l.strip()), "")
+    line = line.replace("`", "'").replace("@", "@ ")
+    # The reason can carry agent text: no link, image, tag or emphasis renders.
+    line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    line = re.sub(r"([\\\[\]()!*_|#~])", r"\\\1", line)
+    if len(line) > MAX_OUTCOME:
+        line = line[:MAX_OUTCOME].rstrip() + " ..."
+    return "\n".join([marker, "%s, as of %s." % (headline, now), "", line, "", OUTCOME_FOOTER]) + "\n"
 
 
 def _read(path: Optional[str]) -> str:
@@ -137,12 +143,12 @@ def _read(path: Optional[str]) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="bus.sticky")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("rounds", "repeat", "tail"):
+    for name in ("rounds", "repeat", "outcome"):
         p = sub.add_parser(name)
         p.add_argument("--marker", required=True)
         p.add_argument("--now", required=True)
         p.add_argument("--old")
-        if name in ("repeat", "tail"):
+        if name in ("repeat", "outcome"):
             p.add_argument("--headline", required=True)
         if name == "repeat":
             p.add_argument("--items-label", required=True)
@@ -152,8 +158,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     old = _read(args.old)
     if args.command == "rounds":
         out = merge_round(old, args.marker, text, args.now)
-    elif args.command == "tail":
-        out = merge_tail(old, args.marker, args.headline, text, args.now)
+    elif args.command == "outcome":
+        out = merge_outcome(old, args.marker, args.headline, text, args.now)
     else:
         out = merge_repeat(old, args.marker, args.headline, args.items_label,
                            args.item, text, args.now)

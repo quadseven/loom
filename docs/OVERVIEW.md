@@ -17,9 +17,11 @@ Verify steps and the brain's cadence, which were corrected that day.
    `LOOM_AUTO_MERGE_TIERS` lists; deploy, security and cross-repo changes wait
    for the operator.
 7. **Ship.** The change is deployed under the project's own rules.
-8. **Verify.** The ticket closes on live evidence. One narrow exception, the
-   evidence close in `bus/evidence_close.py`, closes a low-tier ticket as
-   `closed-unproven` and lists its open box in a Proof due issue.
+8. **Verify.** The ticket closes on live evidence. One exception, the
+   evidence close in `bus/evidence_close.py`, closes a low-tier ticket whose
+   merged change still stands as `closed-unproven`, without waiting for live
+   evidence, and lists its unproven live boxes in a Proof due issue. An
+   unticked operator or decision box still keeps a ticket open.
 
 Labels on the ticket show where it is: `loom:queued`, `briefed`, `running`,
 `pr`, `merged`, `shipped`, `verified`.

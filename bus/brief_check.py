@@ -251,6 +251,67 @@ def criteria_verdict(body: str) -> Optional[Verdict]:
                    "restated as the check that proves it")
 
 
+# -- the test that proves the ticket ------------------------------------------
+# A test file by its path, in the layouts the fleet's repos use.
+_TEST_FILE_RE = re.compile(
+    r"(?<![\w.-])(?:[\w.-]+/)*(?:"
+    r"tests?/[\w./-]*\w"                             # anything under tests/ or test/
+    r"|test_[\w-]+\.(?:py|sh|bats)"                  # test_x.py
+    r"|[\w-]+_test\.(?:go|py|rb|exs?|cc|cpp)"        # x_test.go
+    r"|[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?"         # x.test.ts, x.spec.tsx
+    r"|[\w-]+Tests?\.(?:swift|kt|java|cs)"           # XTests.swift
+    r"|[\w-]+\.bats"
+    r")(?![\w-])")
+# A command that runs tests, as a brief would quote it.
+_TEST_COMMAND_RE = re.compile(
+    r"\b(?:pytest|unittest|go test|cargo test|swift test|xcodebuild test|ctest|tox|bats|"
+    r"(?:npm|pnpm|yarn|bun)(?: run)? test|make (?:test|check)|(?:gradle|gradlew|mvn) test)\b", re.I)
+# "A test fails without the fix and passes with it", "a test fails on main":
+# the box asks for a test that is red before the change, which only a real
+# test can meet.
+_RED_GREEN_RE = re.compile(
+    r"\btests?\b[^.\n]*\bfail\w*\b[^.\n]*\b(?:pass\w*|without|before|on (?:main|base|the default branch))\b", re.I)
+
+
+def names_test(text: str) -> bool:
+    """Whether an acceptance box names the test that proves it: a test file
+    path, a command that runs tests, or a test that fails without the change
+    and passes with it. A bare mention of testing ("the change is tested",
+    "CI is green") names none."""
+    text = text or ""
+    return bool(_TEST_FILE_RE.search(text) or _TEST_COMMAND_RE.search(text)
+                or _RED_GREEN_RE.search(text))
+
+
+def test_verdict(body: str) -> Optional[Verdict]:
+    """Why a new build ticket goes back for a rewrite, or None: none of its
+    acceptance boxes names the test that proves it (owner ruling of
+    2026-11-19, #3277: proof is a test that runs in CI or a throwaway
+    environment at build time, not a live observation after the fact). The
+    brief command and the rewrite refuse such a body before it is filed, so
+    tickets already on the board are not read by this rule. A body with no
+    criteria at all is criteria_verdict's; an answer ticket opens no pull
+    request and is exempt, as there. Reads nothing."""
+    body = body or ""
+    try:
+        headers, _ = tickets.parse(body)
+    except ValueError:
+        headers = {}
+    if headers.get("Deliverable"):
+        return None
+    boxes = [text for text, _ in tickets.proof_checks(body)]
+    if not boxes or any(names_test(box) for box in boxes):
+        return None
+    stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
+    return Verdict(CRITERIA, "test-" + stamp,
+                   "none of its acceptance boxes names the test that proves it: write one box "
+                   "that names a test file path, or a command that runs in CI or a throwaway "
+                   "environment")
+
+
+test_verdict.__test__ = False  # a name unittest and pytest must not collect
+
+
 # -- split --------------------------------------------------------------------
 # The platform families a brief can span. A brief whose What or acceptance
 # criteria name two or more of them is more than one ticket: lanes spent a

@@ -280,7 +280,7 @@ class RunTest(unittest.TestCase):
                 mock.patch.object(runner, "_scorecard_lines", return_value=[]), \
                 mock.patch.object(runner, "_remote_claim_count", return_value=0), \
                 mock.patch.object(runner, "_disk_status_line", return_value=""):
-            body = runner._lanes_body([("codex", "yes", "-")])
+            body = runner._lanes_body([("codex", "serving", "-", "Accepting work")])
         self.assertEqual(station_beat.lanes_stamp(body), station_beat.public_tag("alpha"))
         self.assertTrue(body.startswith(LANES))
 

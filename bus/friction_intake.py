@@ -173,6 +173,12 @@ def ticket_title(group: Group) -> str:
     return naming.generated("Friction", plain(group.text))
 
 
+
+# The one Live box a friction ticket carries. The station's own tick journals
+# prove it, so the brief's Live rule (brain._check_live_criterion) accepts it
+# as written.
+LIVE_BOX = "- [ ] Live: no tick journal names this slowdown for 24 hours after the fix ships."
+
 def ticket_body(group: Group) -> str:
     """The brief: loom writes every section; the journals' words appear
     only as quoted Friction lines."""
@@ -193,7 +199,7 @@ def ticket_body(group: Group) -> str:
         "- [ ] The pull request names the cause, with the numbers from the journals or the "
         "station log that show it.",
         "- [ ] A test fails without the fix and passes with it.",
-        "- [ ] Live: no tick journal names this slowdown for 24 hours after the fix ships.", "",
+        LIVE_BOX, "",
         "## Size", "", "M", "",
         "## Out of scope", "",
         "Other slowdowns in the same journals: each recurring one gets its own ticket. "
