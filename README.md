@@ -30,6 +30,11 @@ repository or `LOOM_LEAK_SCANNER` to a local scanner script, and configure the
 deny-list SSM parameter for your deployment. Then run `bash lanes/mac/install.sh`
 and label one issue in each project `loom:goal`.
 
+For rolling pod log evidence, set `LOOM_LOG_CAPTURE` and
+`LOOM_LOG_CAPTURE_RETENTION_HOURS` in the station environment before install.
+The station needs `kubectl` with read access to the pods and their logs.
+The optional evidence service can read the captures from the same `LOOM_HOME`.
+
 ## How to test
 
 - Required `unittest` check: `python3 -B .github/unittest_parallel.py`. CI runs it on macOS with Python 3.13, and any skip fails it.

@@ -1,4 +1,6 @@
 {
-  "logs": {},
+  "logs": {
+    "YOUR_SOURCE": {"capture": "YOUR_SOURCE"}
+  },
   "queries": {}
 }

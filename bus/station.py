@@ -50,6 +50,7 @@ from . import decision_claim
 from . import evidence_close
 from . import journal
 from . import lane_markers
+from . import log_capture
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -1027,7 +1028,7 @@ def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
     return path
 
 
-def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
+def _earliest_evidence_record(evidence_cmds: Dict[str, evidence.LogSource], repo: str,
                               log_root: str) -> Optional[datetime]:
     """Get the earliest record from the evidence source for the given repo, or None.
     
@@ -1038,7 +1039,7 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
     the configured log root.
     """
     command = evidence_cmds.get(repo)
-    if not command:
+    if not isinstance(command, str) or not command:
         return None
     log_path = _evidence_log_path(repo, command, log_root)
     if not log_path:
@@ -1149,7 +1150,7 @@ class Settings:
                  health_every: int = health.EVERY,
                  health_diagnose: Optional[Dict[str, str]] = None,
                  friction_mode: str = "",
-                 evidence_cmds: Optional[Dict[str, str]] = None,
+                 evidence_cmds: Optional[Dict[str, evidence.LogSource]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
@@ -1181,9 +1182,13 @@ class Settings:
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None,
                  disk_watch: Optional[disk_watchdog.Config] = None,
+                 log_sources: Sequence[log_capture.Source] = (),
+                 log_capture_hours: float = log_capture.DEFAULT_RETENTION_HOURS,
                  metrics_reserve: int = metrics.REQUEST_RESERVE,
                  metrics_seconds: float = metrics.STEP_SECONDS) -> None:
         self.home = home
+        self.log_sources = log_sources
+        self.log_capture_hours = log_capture_hours
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
         # loom#3187): off for a Settings built in code; from_env turns it on
         # at 25 GB.
@@ -1339,17 +1344,10 @@ class Settings:
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
         report_digest = parse_digest_times(env.get("LOOM_REPORT_DIGEST_TIMES", DIGEST_TIMES))
-        try:
-            hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
-        except ValueError:
-            hour = 9
+        hour = _int_or_default(env.get("LOOM_DIGEST_HOUR", ""), 9)
         if not 0 <= hour <= 23:
             hour = 9
-        try:
-            retry_max = int(env.get("LOOM_RETRY_MAX", "").strip() or RETRY_MAX)
-        except ValueError:
-            retry_max = RETRY_MAX
-        retry_max = max(retry_max, 0)
+        retry_max = max(_int_or_default(env.get("LOOM_RETRY_MAX", ""), RETRY_MAX), 0)
         try:
             watched = watch.components(home, env.get("LOOM_WATCH", ""))
         except ValueError as err:
@@ -1399,7 +1397,11 @@ class Settings:
                    invariant_goal=env.get("LOOM_INVARIANT_GOAL", "").strip(),
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
-                   evidence_cmds=_evidence_commands(env),
+                   evidence_cmds=_evidence_commands(env, home),
+                   log_sources=_log_capture_sources(env),
+                   log_capture_hours=_log_size(env, "LOOM_LOG_CAPTURE_RETENTION_HOURS",
+                                               log_capture.DEFAULT_RETENTION_HOURS)
+                   or log_capture.DEFAULT_RETENTION_HOURS,
                    evidence_window_hours=_hours(env.get("LOOM_EVIDENCE_WINDOW_HOURS", ""),
                                                 EVIDENCE_WINDOW_HOURS),
                    live_evidence_repos=live_adapter.opted_in(
@@ -1661,7 +1663,7 @@ def _health_diagnose(env: Dict[str, str]) -> Dict[str, str]:
     return commands
 
 
-def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
+def _evidence_commands(env: Dict[str, str], home: str) -> Dict[str, evidence.LogSource]:
     try:
         commands = json.loads(env.get("LOOM_EVIDENCE_CMDS", "{}") or "{}")
         if not isinstance(commands, dict) or not all(
@@ -1671,7 +1673,24 @@ def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
     except (ValueError, TypeError) as err:
         _say("ignoring LOOM_EVIDENCE_CMDS: %s" % err)
         return {}
-    return commands
+    sources: Dict[str, evidence.LogSource] = {}
+    for repo, command in commands.items():
+        if not command.startswith("capture:"):
+            sources[repo] = command
+            continue
+        try:
+            sources[repo] = log_capture.capture_path(home, command.removeprefix("capture:"))
+        except ValueError:
+            _say("ignoring LOOM_EVIDENCE_CMDS entry: invalid capture source")
+    return sources
+
+
+def _log_capture_sources(env: Dict[str, str]) -> List[log_capture.Source]:
+    try:
+        return log_capture.sources(env.get("LOOM_LOG_CAPTURE", "").strip())
+    except ValueError:
+        _say("ignoring LOOM_LOG_CAPTURE: invalid source configuration")
+        return []
 
 
 def _hours(raw: str, default: float) -> float:
@@ -1697,6 +1716,13 @@ def _decision_window_days(raw: str) -> int:
 def _positive_int(raw: str, default: int) -> int:
     raw = raw.strip()
     return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
+
+
+def _int_or_default(raw: str, default: int) -> int:
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -4478,7 +4504,7 @@ class Station:
                              % issue["health_proof"])
         cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
         station_data += cached if cached is not None else evidence.section(
-            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
+            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None), self.now)
         if (self._adapter_can_verify(repo, issue)
                 and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
             station_data += self._adapter_verify_section(repo)
@@ -4820,7 +4846,7 @@ class Station:
                 self._adapter_verify_section(repo)
             return False
         live = brain.live_criterion(issue.get("body"), limit=None)
-        text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live)
+        text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live, self.now)
         number = int(issue["number"])
         names = _label_names(issue)
         absence = evidence.is_absence(live)
@@ -17811,7 +17837,19 @@ class Station:
             # has a bug. Name the fault without logging private error details.
             _say("operator budget sampler failed: %s" % type(err).__name__)
 
+    def capture_pod_logs(self) -> None:
+        for source in self.s.log_sources:
+            try:
+                path = log_capture.capture_path(self.s.home, source.name)
+                first = log_capture.update(path, source, self.now, self.s.log_capture_hours)
+            except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as err:
+                _say("log capture: %s could not refresh (%s)" % (source.name, type(err).__name__))
+                continue
+            if first:
+                _say("log capture: %s holds logs from %s" % (source.name, first))
+
     def run_pass(self) -> None:
+        self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
             return

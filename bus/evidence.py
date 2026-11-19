@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 import calendar
+import math
 import os
 import re
 import signal
 import subprocess
 import time
-from typing import Optional, Tuple, Dict, Iterable, List
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Iterable, List, Union
 
-from . import text
+from . import log_capture, text
+
+LogSource = Union[str, Path]
 
 # An exact string in the Live criterion, backticked, in double quotes, or with
 # template placeholders like <name> or ...: about one in seven shipped tickets
@@ -219,7 +223,7 @@ def line_time(line: str) -> Optional[float]:
     return float(at)
 
 
-def lines_since(command: str, literal: str, since: float, now: float,
+def lines_since(command: LogSource, literal: str, since: float, now: float,
                 window_hours: float) -> Optional[List[str]]:
     """The lines the command prints for `literal` that were written at or
     after the epoch time `since` (a deploy); None when it gave no answer. The
@@ -227,7 +231,16 @@ def lines_since(command: str, literal: str, since: float, now: float,
     search. A line that starts with a time counts by that time; one that does
     not counts only when the whole log the command read (the hours it reports,
     else window_hours) starts at or after `since`, so a line from before the
-    deploy is never taken as its evidence."""
+    deploy is never taken as its evidence. A capture must cover the window
+    from since through now without a gap."""
+    if isinstance(command, Path):
+        try:
+            captured = log_capture.read(command, literal, since)
+        except (OSError, ValueError, OverflowError):
+            return None
+        if captured.covered_from <= since <= now <= captured.through:
+            return captured.lines
+        return None
     windows: List[float] = []
     lines, _ = _run(command, literal, windows,
                     {"LOOM_EVIDENCE_SINCE": "%d" % int(since)})
@@ -242,7 +255,8 @@ def lines_since(command: str, literal: str, since: float, now: float,
     return out
 
 
-def _quote(command: str, needle: str, windows: Optional[List[float]] = None
+def _quote(command: LogSource, needle: str, windows: Optional[List[float]] = None,
+           now: Optional[float] = None, since: float = -math.inf
            ) -> Tuple[str, Optional[int]]:
     """(the quoted section lines for one needle, how many safe lines named it;
     None when the command gave no answer or the needle is too general to run).
@@ -251,7 +265,21 @@ def _quote(command: str, needle: str, windows: Optional[List[float]] = None
     if not literal:
         return ("- `%s`: too general to search (its longest fixed text is under %d "
                 "characters); no lines quoted." % (needle, MIN_LITERAL)), None
-    lines, error = _run(command, literal, windows)
+    if isinstance(command, Path):
+        try:
+            captured = log_capture.read(command, literal, since)
+        except (OSError, ValueError, OverflowError):
+            return "- `%s`: capture could not be read." % needle, None
+        now = time.time() if now is None else now
+        if captured.through < now:
+            return "- `%s`: capture is behind this pass." % needle, None
+        if not captured.lines and captured.covered_from >= now:
+            return "- `%s`: capture has no covered window." % needle, None
+        if windows is not None:
+            windows.append(max(0, (now - captured.covered_from) / 3600))
+        lines, error = captured.lines, ""
+    else:
+        lines, error = _run(command, literal, windows)
     if lines is None:
         return "- `%s`: %s; no lines quoted." % (needle, error), None
     matching = [line for line in lines
@@ -268,7 +296,8 @@ def quote(command: str, needle: str) -> str:
     return _quote(command, needle)[0]
 
 
-def gather_window(commands: Dict[str, str], repo: str, live: str
+def gather_window(commands: Dict[str, LogSource], repo: str, live: str,
+                  now: Optional[float] = None
                   ) -> Tuple[str, Optional[bool], Optional[float]]:
     """(the brief's log data section, whether any line names one of the live
     criterion's strings, the hours of log the command says it read). A string
@@ -281,9 +310,15 @@ def gather_window(commands: Dict[str, str], repo: str, live: str
     requested = needles(live)
     if not command or not requested:
         return "", None, None
+    since = -math.inf
+    if isinstance(command, Path):
+        now = time.time() if now is None else now
+        span = required_span(live) if is_absence(live) else None
+        if span:
+            since = now - span * 3600
     parts, counts, windows = [], [], []
     for needle in requested:
-        text, found = _quote(command, needle, windows)
+        text, found = _quote(command, needle, windows, now, since)
         parts.append(text)
         counts.append(found)
     if any(c for c in counts if c):
@@ -297,9 +332,10 @@ def gather_window(commands: Dict[str, str], repo: str, live: str
         seen, (min(windows) if windows else None)
 
 
-def gather(commands: Dict[str, str], repo: str, live: str) -> Tuple[str, Optional[bool]]:
+def gather(commands: Dict[str, LogSource], repo: str, live: str,
+           now: Optional[float] = None) -> Tuple[str, Optional[bool]]:
     """gather_window without the window."""
-    return gather_window(commands, repo, live)[:2]
+    return gather_window(commands, repo, live, now)[:2]
 
 
 def absence_section(requested: List[str], window: float, span: Optional[float]) -> str:
@@ -318,5 +354,6 @@ def hours_text(value: float) -> str:
     return "%g" % value
 
 
-def section(commands: Dict[str, str], repo: str, live: str) -> str:
-    return gather(commands, repo, live)[0]
+def section(commands: Dict[str, LogSource], repo: str, live: str,
+            now: Optional[float] = None) -> str:
+    return gather(commands, repo, live, now)[0]

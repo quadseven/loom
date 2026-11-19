@@ -214,9 +214,10 @@ class SamplerTests(unittest.TestCase):
 
 class IntegrationTests(unittest.TestCase):
     def test_sampling_precedes_budget_and_access_early_returns(self):
-        from bus.station import Station
+        from bus.station import Settings, Station
         for exhausted in (True, False):
             station = object.__new__(Station)
+            station.s = Settings(home="", repos=[], authors=[], owners=[])
             events = []
             station.sample_operator_budget = lambda events=events: events.append("sample")
             station._budget_exhausted = lambda events=events, exhausted=exhausted: events.append("budget") or exhausted

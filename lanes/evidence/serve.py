@@ -18,7 +18,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from bus import text  # noqa: E402
+from bus import log_capture, text  # noqa: E402
 
 MAX_ITEMS = 200
 MAX_BYTES = 64 * 1024
@@ -149,11 +149,11 @@ def _safe_items(items: list[Any]) -> tuple[list[Any], int]:
     return accepted, dropped
 
 
-def _capped_payload(key: str, items: list[Any], dropped: int) -> dict[str, Any]:
+def _capped_payload(key: str, items: list[Any], dropped: int, **metadata: Any) -> dict[str, Any]:
     limited = items[:MAX_ITEMS]
     dropped += max(0, len(items) - len(limited))
     while True:
-        payload = {key: limited, "dropped": dropped}
+        payload = {key: limited, "dropped": dropped, **metadata}
         if len(json.dumps(payload, ensure_ascii=True).encode("utf-8")) <= MAX_BYTES:
             return payload
         if not limited:
@@ -183,7 +183,21 @@ def _logs_payload(config: dict[str, Any], query: dict[str, list[str]],
     hours = int(raw_hours)
     if not 0 <= hours <= MAX_SINCE_HOURS:
         raise ValueError("since is outside the allowed range")
-    safe, dropped = _safe_items(_log_lines(config["logs"][name], hours, match))
+    spec = config["logs"][name]
+    if not isinstance(spec, dict):
+        raise ValueError("invalid log source")
+    if "capture" in spec:
+        capture = spec["capture"]
+        if "command" in spec or not isinstance(capture, str):
+            raise ValueError("log source must name one capture")
+        home = os.environ.get("LOOM_HOME") or str(Path.home() / "loom")
+        cutoff = time.time() - hours * 3600
+        result = log_capture.read(log_capture.capture_path(home, capture), match, cutoff, MAX_ITEMS)
+        safe, dropped = _safe_items(result.lines)
+        return name, _capped_payload(
+            "lines", safe, dropped + result.dropped,
+            covered=result.covered_from <= cutoff <= result.through, through=result.through)
+    safe, dropped = _safe_items(_log_lines(spec, hours, match))
     return name, _capped_payload("lines", safe, dropped)
 
 

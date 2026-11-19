@@ -17,6 +17,25 @@ standalone argument, replaced with the validated `since` value. The caller's
 `match` value filters the command's output as a fixed substring. Configure
 only commands that read logs.
 
+A log entry with `"capture": "NAME"` reads the station's capture of that
+name under `$LOOM_HOME/logs/capture`. It applies the requested time window
+and literal match. The answer includes `through`, the epoch time of the
+latest successful sample, and `covered`, which says whether the capture
+continuously covers the window from the requested start through that sample.
+Treat an empty answer with `covered: false` as inconclusive.
+
+Set `LOOM_LOG_CAPTURE` on the station to a JSON list of objects with
+`source`, `namespace`, and `selector` strings. Give each capture a unique
+source name and use a selector for one workload. When more than one running
+pod matches, the station takes the newest. The station needs `kubectl` and
+read access to list pods and read their logs. Set `LOOM_STATION_PASS_ENV`
+to include `KUBECONFIG` when the station uses a non-default kubeconfig.
+`LOOM_LOG_CAPTURE_RETENTION_HOURS` defaults to 48. A missing log cursor
+or a replacement starts a new continuous window and leaves a gap marker
+between the old and new timestamps. To use the capture for a repo's station
+proofs, set that repo's value in `LOOM_EVIDENCE_CMDS` to `"capture:NAME"`.
+Use the same `LOOM_HOME` for the station and evidence service.
+
 A query entry has `database`, `sql`, and `params` fields. `sql` must be one
 SELECT statement using named SQLite parameters. Each declared parameter type
 is `str`, `int`, `float`, or `bool`; all declared values must be present in a
