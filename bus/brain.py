@@ -4671,10 +4671,10 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
-    anything with a loom: label. A ready issue (every brief section,
+    anything with a loom: label. A trusted author's ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage, and the
-    returned line names what is missing. No comment: each one emailed the
+    returned line names the reason. No comment: each one emailed the
     issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
     intake epic (intake_epic). Only labels, sub-issue links and
     an intake epic when one is needed are written, plus a Part of line at the
@@ -4701,7 +4701,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing:
+        if not missing and tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -4730,7 +4730,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         else:
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
-            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
+            reason = "missing " + ", ".join(missing) if missing else "untrusted author"
+            lines.append("#%d loom:triage, %s" % (number, reason))
         done += 1
     return lines
 

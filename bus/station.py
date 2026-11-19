@@ -1179,8 +1179,14 @@ class Settings:
                  log_sources: Sequence[log_capture.Source] = (),
                  log_capture_hours: float = log_capture.DEFAULT_RETENTION_HOURS,
                  metrics_reserve: int = metrics.REQUEST_RESERVE,
-                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
+                 metrics_seconds: float = metrics.STEP_SECONDS,
+                 host_load_gate: bool = False) -> None:
         self.home = home
+        # The host load check before a local claim (lanes/host_load.sh,
+        # loom#3303): off for a Settings built in code, so a test never
+        # depends on the load of the machine it runs on; from_env turns it on
+        # and LOOM_CHECK_LOAD_1M / LOOM_CHECK_LOAD_5M set its limits.
+        self.host_load_gate = host_load_gate
         self.log_sources = log_sources
         self.log_capture_hours = log_capture_hours
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
@@ -1433,7 +1439,8 @@ class Settings:
                    repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
                    pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
-                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")),
+                   host_load_gate=True)
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -3374,6 +3381,8 @@ class Station:
             os.remove(path)
             self._refuse(repo, issue, reason)
             return
+        if self._host_load_holds(lane):
+            return
         if not self._claim(repo, lane, issue):
             os.remove(path)
 
@@ -3867,6 +3876,22 @@ class Station:
         hold["count"] = counts[(repo, goal)]
         hold["limit"] = limit
         hold["tickets"][int(issue["number"])] = str(issue.get("title") or "")
+
+    def _host_load_holds(self, lane: str) -> bool:
+        """True while the host is too loaded for a local lane to take a
+        ticket. Only a station whose settings came from the environment
+        asks (Settings.host_load_gate); runner slots and remote lanes do
+        their work elsewhere and are never held."""
+        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
+            return False
+        script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
+        note = subprocess.check_output(["/bin/bash", script], text=True).strip()
+        if note == "unread":
+            _say("host load could not be read before claim for " + lane)
+            return False
+        if note:
+            _say("claim for %s waits for the next pass: %s" % (lane, note))
+        return bool(note)
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
@@ -5728,7 +5753,7 @@ class Station:
             _say("%s#%s: lane %s takes public repos only; back to the queue"
                  % (repo, fresh["number"], lane))
             return False
-        return self._claim(repo, lane, fresh)
+        return not self._host_load_holds(lane) and self._claim(repo, lane, fresh)
 
     def _blocked(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a briefed ticket waits on an open blocker: its brief's
@@ -6028,7 +6053,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask, unless its
+        one goes back to the queue with needs-brain, unless its
         body and labels state a non-person wait. A labelled ticket stays held
         before remote reads. A stale event wait without the label gets blocked
         once, making its hold visible without another person ask.
@@ -6064,7 +6089,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found, body)
+        return self._apply_brief_hold(repo, number, found)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6087,9 +6112,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
-                          body: str = "") -> bool:
-        """Apply the existing health, area, criteria, split or person-ask hold."""
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Send a brief that needs review back to the brain."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
@@ -6121,8 +6145,13 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
                 self._routine(repo, number, "Held for the brain: this brief %s." % found.reason)
-            else:
-                brain.human(self.gh, repo, number, brief_check.ask(found, body))
+            elif found.kind == brief_check.STALE:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                # Keep the evidence note outside the body the stale gate checks.
+                notify.post(self.gh, repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "Check what shipped and rewrite the brief around "
+                    "any remaining work."), notify.HELD)
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))

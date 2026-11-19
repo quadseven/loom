@@ -1076,11 +1076,12 @@ merged after it was filed, or when every file its criteria ask to add already
 exists on the default branch. A mention under an Out of scope, Not in scope
 or Follow-ups heading, or on a line that says the ticket was filed for later
 ("filed for", "filed as", "follow-up"), names work not built and does not
-count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
-`needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
-gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
-once: once the operator removes `needs:human`, the same evidence does not hold
-it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+count; a `Refs` or `Part of` line always counts (loom#1856). A merge predating
+a body edit is context for the new brief. A stale ticket goes back to
+`loom:queued` with `needs-brain` and a note naming the evidence so the brain
+can review what shipped and rewrite any remaining work. Explicit event waits
+keep their wait path. Existing person-ask settlements still apply.
+The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
 caller and deny-list layer had shipped weeks before; the lane read "out of
 scope" as "must be absent" and deleted the working deny-list layer, in two
 repos.

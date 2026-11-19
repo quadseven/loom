@@ -3270,6 +3270,7 @@ class TriageTest(Base):
                 if "sort=created&direction=asc" in p and "labels=ready-for-agent" not in p]
 
     def test_a_backlog_goal_is_triaged_once_an_hour(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
         self.fake.add_open_issue(100, body=READY_BODY)
         self.fake.add_open_issue(101, body="It is slow.")
@@ -3339,6 +3340,7 @@ class TriageTest(Base):
         self.assertIn("loom:triage", self.fake.names(102))
 
     def test_a_goal_without_backlog_home_is_triaged_and_rewritten(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(31, title="Ship the thing")
         self.fake.add_open_issue(102, body=READY_BODY)
         st = station.Station(GitHub("token", transport=self.fake), self.settings,
@@ -5342,6 +5344,54 @@ class ClaimTest(Base):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
 
+    def test_a_station_built_by_hand_claims_whatever_the_host_load(self):
+        """A test must not depend on the load of the machine it runs on: only a
+        station whose settings came from the environment reads it. On a busy CI
+        runner and on the lane host itself, the claim tests failed (2026-11-19)."""
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 90\n")
+        self.fake.add(12)
+        self.assertFalse(self.settings.host_load_gate)
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load),
+                             LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18"):
+            self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_settings_read_from_the_environment_turn_the_host_load_gate_on(self):
+        self.assertTrue(station.Settings.from_env({"LOOM_HOME": self.home}).host_load_gate)
+
+    def test_a_half_written_claim_is_finished_while_the_gate_holds_new_claims(self):
+        """The gate holds a new claim, never one already half made: with the gate
+        on and the host loaded, a .claiming brief of a running ticket is still
+        renamed. (test_a_claiming_file_whose_ticket_is_running_is_just_renamed
+        covers the same rename for a station with the gate off.)"""
+        self.settings.host_load_gate = True
+        self.fake.add(12, state="running")
+        name = "example-owner.example-repo-12"
+        self.write(self.inbox("codex", name + ".claiming"),
+                   tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.run_pass()
+        self.assertEqual(self.listing(), [name + ".md"])
+        self.assertEqual(self.fake.paths("PUT"), [])
+
+    def test_local_claim_waits_until_the_host_load_falls(self):
+        self.settings.host_load_gate = True
+        load = Path(self.home) / "loadavg"
+        load.write_text("2 19 1\n")
+        self.fake.add(12)
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load),
+                             LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="18"):
+            self.run_pass()
+            self.assertIn("loom:briefed", self.fake.names(12))
+            self.assertEqual(self.listing(), [])
+            load.write_text("90 18 1\n")
+            self.run_pass()
+            self.assertIn("loom:running", self.fake.names(12))
+            self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
+
     def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
         self.heartbeat("opencode-go-3")
         self.heartbeat("claude")
@@ -5912,7 +5962,10 @@ class ClaimTest(Base):
         name = "example-owner.example-repo-12"
         self.write(self.inbox("codex", name + ".claiming"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
-        self.run_pass()
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.run_pass()
         self.assertEqual(self.listing(), [name + ".md"])
         self.assertEqual(self.fake.paths("PUT"), [])
         self.assertEqual(self.fake.comments[12], [])
@@ -13274,11 +13327,9 @@ class ClaimDropTest(Base):
 
 
 class CloseDoneTest(Base):
-    """The operator's close rule (2026-10-19): a shipped ticket whose Live
-    line names nothing a log search can find closes; one that names a string
-    stays for a verify run."""
+    """The done close keeps tickets open while their criteria need evidence."""
 
-    def test_a_shipped_ticket_with_no_searchable_live_string_closes(self):
+    def test_a_shipped_ticket_with_no_searchable_live_string_stays_in_verification(self):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
@@ -13295,6 +13346,8 @@ class CloseDoneTest(Base):
         st.close_done_tickets()
         # A Live line with nothing to search stays shipped for verification.
         self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertIn("loom:shipped", self.fake.names(1))
+        self.assertNotIn("needs-brain", self.fake.names(1))
         self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain
@@ -15759,6 +15812,7 @@ class TwoLoomsTest(Base):
                       err)
 
     def test_a_goal_home_naming_our_operator_is_worked(self):
+        self.enterContext(mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         self.fake.add_goal(30, title="Backlog: every open issue in %s" % REPO)
         self.fake.goals[0]["body"] = "Operator: Alice-Example\n\n## Destination\nAll of it."
         self.fake.add_open_issue(100, body=READY_BODY)
@@ -16081,7 +16135,11 @@ class RunnerSlotClaimTest(Base):
 
     def test_a_public_ticket_labeled_for_a_runner_slot_is_claimed_there(self):
         self.fake.private = False
-        self.claim()
+        self.settings.host_load_gate = True
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 1\n")
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
+            self.claim()
         self.assertEqual(len(self.listing("free-gemma")), 1)
         self.assertIn("lane:free-gemma", self.fake.names(12))
 
