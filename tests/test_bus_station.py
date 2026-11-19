@@ -13296,11 +13296,9 @@ class ClaimDropTest(Base):
 
 
 class CloseDoneTest(Base):
-    """The operator's close rule (2026-10-19): a shipped ticket whose Live
-    line names nothing a log search can find closes; one that names a string
-    stays for a verify run."""
+    """The done close keeps tickets open while their criteria need evidence."""
 
-    def test_a_shipped_ticket_with_no_searchable_live_string_closes(self):
+    def test_a_shipped_ticket_with_no_searchable_live_string_stays_in_verification(self):
         self.fake.private = False
         no_needle = SHIPPED_BODY.replace("prints `daily status ready`", "the daily line shows it")
         self.fake.add(1, lane="codex", body=no_needle, state="shipped")
@@ -13317,6 +13315,8 @@ class CloseDoneTest(Base):
         st.close_done_tickets()
         # A Live line with nothing to search stays shipped for verification.
         self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertIn("loom:shipped", self.fake.names(1))
+        self.assertNotIn("needs-brain", self.fake.names(1))
         self.assertNotIn("needs:human", self.fake.names(1))
         self.assertEqual(self.fake.issues[2]["state"], "open")   # window still open or covered by evidence
         self.assertEqual(self.fake.issues[3]["state"], "open")   # a regression stays for the brain

@@ -6042,7 +6042,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask, unless its
+        one goes back to the queue with needs-brain, unless its
         body and labels state a non-person wait. A labelled ticket stays held
         before remote reads. A stale event wait without the label gets blocked
         once, making its hold visible without another person ask.
@@ -6078,7 +6078,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found, body)
+        return self._apply_brief_hold(repo, number, found)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6101,9 +6101,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
-                          body: str = "") -> bool:
-        """Apply the existing health, area, criteria, split or person-ask hold."""
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Send a brief that needs review back to the brain."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
@@ -6135,8 +6134,13 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
                 self._routine(repo, number, "Held for the brain: this brief %s." % found.reason)
-            else:
-                brain.human(self.gh, repo, number, brief_check.ask(found, body))
+            elif found.kind == brief_check.STALE:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                # Keep the evidence note outside the body the stale gate checks.
+                notify.post(self.gh, repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "Check what shipped and rewrite the brief around "
+                    "any remaining work."), notify.HELD)
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
