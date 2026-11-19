@@ -1,31 +1,45 @@
-"""The narrow evidence close (operator ruling of 2026-10-31, loom#2325).
+"""The evidence close (owner's rulings of 2026-10-31, loom#2325, and 2026-11-19).
 
 The 2026-10-22 hardening (#1524, #1532) keeps a ticket open while a live
-criterion has no evidence, and shadow mode holds every close. Shipped tickets
-whose only open box is a Live box then sat open with nothing left to build.
-This one close type revises that rule, for these tickets only. Every other
-close keeps it.
+criterion has no evidence, and shadow mode holds every close. The ruling of
+2026-10-31 let this one close type revise that rule for a shipped ticket
+whose one Live box was its only unticked box.
+
+The ruling of 2026-11-19 widens it. Loom keeps holding finished tickets open
+for live proof it cannot collect, and the backlog grows though the work is
+merged. From now on a shipped ticket whose merged change still stands closes
+without waiting for live evidence. Proof belongs in tests that run in CI or a
+throwaway environment at build time, not in a live observation after the
+fact. A step only a person can take still keeps a ticket open. Every other
+close keeps the 2026-10-22 rule.
 
 A ticket closes here only when all of these hold (`boxes`, `label_hold`,
 `pulls_verdict`, `tier_refusal`, `symbol_refusal`; the station reads the rest,
 bus/station.py _evidence_close):
 
-- its one Live box is the only unticked box;
+- every unticked box is a live or a code box (bus/criteria_gate.py `kind`),
+  any number of them and at least one live; an unticked operator or decision
+  box keeps the ticket open;
 - it has no regression, urgent, runaway, needs-brain or audit-failed label, no
-  ask open and no wait: label, and it never closed this way before;
+  ask open and no wait: label other than wait:live-event, which marks the wait
+  this ruling ends, and it never closed this way before;
 - every linked pull request is merged, with green CI on its merge commit, and
   the default branch carries that commit;
 - every pull request's tier is below deploy-config;
 - the symbols each one added are still defined on the default branch, and
   the ones it removed are still gone;
-- Loom has no check of its own for the box (a proof, a runnable check, a time
-  window), and the box is known to be meetable (bus/unmeetable.py).
+- Loom has no check of its own for any unticked live box (a proof, a runnable
+  check, a time window): a box with one keeps that path first, and its ticket
+  with it. The ticket's Live line, when it has one, is known to be meetable
+  (bus/unmeetable.py reads that one line; a live box beside it is not looked
+  up).
 
 A doubt refuses: a patch GitHub left out, a file that cannot be read, or a
-lookup that failed. The close carries `closed-unproven`, and the box goes into
-one rolling Proof due issue per repo, written before the close so a box is
-never closed unlisted. It is the one close that passes through shadow
-(bus/shadow.py evidence_close). Merges stay held. It makes no AI call.
+lookup that failed. The close carries `closed-unproven`, and every unticked
+live box goes into one rolling Proof due issue per repo, written before the
+close so a box is never closed unlisted. An unticked code box is not listed:
+the merged change is its evidence. It is the one close that passes through
+shadow (bus/shadow.py evidence_close). Merges stay held. It makes no AI call.
 
 The guardrail: reopens stay at or below MAX_REOPEN_RATE of the last WINDOW
 closes. A reopened ticket keeps the label, so one listing per repo finds it,
@@ -49,21 +63,25 @@ import sys
 import time
 from typing import Any, Dict, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
-from . import claimed, labels, merge_effect, merge_tier, proof, tickets, verify_data
+from . import claimed, criteria_gate, labels, merge_effect, merge_tier, proof, verify_data
 
 LABEL = "closed-unproven"
 PROOF_LABEL = "loom:proof-due"
 PROOF_TITLE = "Proof due: Live boxes of tickets closed unproven"
 STATE_FILE = "evidence-close.json"
 CONTROL_FILE = "evidence-close-control.json"
+# The one wait: label that does not hold a ticket back: it marks the wait for
+# live evidence the 2026-11-19 ruling ends (bus/brain.py WAIT_LIVE_EVENT).
+LIVE_EVENT_WAIT = "wait:live-event"
 
 # Closes a pass may make, and tickets it may read in full (about five reads
-# each, more for a pull request with many source files).
-CLOSES_PER_PASS = 3
-READS_PER_PASS = 6
-# The stock is not this close's job: at most this many a day, so a reopen has
-# time to count before the next batch.
-CLOSES_PER_DAY = 10
+# each, more for a pull request with many source files). The 2026-11-19
+# ruling raised the three bounds from 3, 6 and 10.
+CLOSES_PER_PASS = 10
+READS_PER_PASS = 20
+# At most this many a day, so a reopen has time to count before the next
+# batch.
+CLOSES_PER_DAY = 150
 DAY = 24 * 3600
 MAX_REOPEN_RATE = 0.05
 WINDOW = 100
@@ -107,20 +125,22 @@ def bound_line(run: Pass) -> str:
 
 
 def boxes(body: str) -> List[str]:
-    """The ticket's one unticked Live box, or nothing when it is not a
-    candidate: an unticked box of any other kind, no Live box, or more than
-    one (bus/unmeetable.py reads one Live line)."""
-    found = proof.criteria(body or "")
-    live = [text for _, text in found if tickets.LIVE_CRITERION_RE.match(text)]
-    unticked = [text for checked, text in found if not checked]
-    return unticked if len(live) == 1 and unticked == live else []
+    """The ticket's unticked live boxes, or nothing when it is not a
+    candidate: an unticked operator or decision box, which only a person
+    meets, or no unticked live box. An unticked code box does not hold it."""
+    kinds = [(criteria_gate.kind(text), text)
+             for checked, text in proof.criteria(body or "") if not checked]
+    if any(kind == criteria_gate.OPERATOR for kind, _ in kinds):
+        return []
+    return [text for kind, text in kinds if kind == criteria_gate.LIVE]
 
 
 def label_hold(names: Iterable[str]) -> bool:
     """Whether a ticket's labels keep it out of this close."""
     have = set(names)
     return ("loom:shipped" not in have or bool(have & set(HOLD_LABELS))
-            or labels.needs_human(have) or any(n.startswith("wait:") for n in have))
+            or labels.needs_human(have)
+            or any(n.startswith("wait:") and n != LIVE_EVENT_WAIT for n in have))
 
 
 def pulls_verdict(pulls: Sequence[Mapping[str, Any]], error: str) -> Tuple[str, str]:
@@ -204,11 +224,22 @@ def closes(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return [c for c in found if isinstance(c, dict)] if isinstance(found, list) else []
 
 
-def record(state: Dict[str, Any], repo: str, number: int, box: str, now: float) -> None:
-    """Keep one close that landed."""
+def record(state: Dict[str, Any], repo: str, number: int, unproven: Sequence[str],
+           now: float) -> None:
+    """Keep one close that landed, with the Live boxes it left unproven."""
     kept = closes(state)
-    kept.append({"repo": repo, "number": number, "box": box, "at": now, "reopened": False})
+    kept.append({"repo": repo, "number": number, "boxes": list(unproven), "at": now,
+                 "reopened": False})
     state["closes"] = kept[-CLOSES_KEPT:]
+
+
+def listed(close: Mapping[str, Any]) -> List[str]:
+    """The Live boxes one kept close left unproven. A close kept before
+    2026-11-19 holds its one box as `box`."""
+    found = close.get("boxes")
+    if isinstance(found, list):
+        return [str(box) for box in found if box]
+    return [str(close["box"])] if close.get("box") else []
 
 
 def mark_reopened(state: Dict[str, Any], repo: str, numbers: Iterable[int], now: float) -> int:
@@ -219,7 +250,7 @@ def mark_reopened(state: Dict[str, Any], repo: str, numbers: Iterable[int], now:
     for number in numbers:
         mine = [c for c in kept if c.get("repo") == repo and c.get("number") == number]
         if not mine:
-            mine = [{"repo": repo, "number": number, "box": "", "at": now, "reopened": False}]
+            mine = [{"repo": repo, "number": number, "boxes": [], "at": now, "reopened": False}]
             kept.extend(mine)
         if not mine[-1].get("reopened"):
             mine[-1]["reopened"] = True
@@ -240,7 +271,7 @@ OPERATOR_PAUSED = "the operator paused it"
 
 def stop_ask(why: str) -> str:
     """The one ask a guardrail stop raises (brain.human)."""
-    return ("Kind: decision\nThe narrow evidence close stopped: %s. Read the reopened tickets "
+    return ("Kind: decision\nThe evidence close stopped: %s. Read the reopened tickets "
             "with `python3 -m bus.evidence_close status`, then either run `python3 -m "
             "bus.evidence_close resume` or leave it stopped." % why)
 
@@ -271,15 +302,15 @@ def note_refused(state: Dict[str, Any], ticket: str, why: str, now: float) -> No
     state["refused"] = kept
 
 
-def proof_body(repo: str, state: Mapping[str, Any], extra: Sequence[Tuple[int, str]],
-               clean: Any, paused: str = "") -> str:
-    """The Proof due issue's body: the Live box of each ticket closed unproven
-    and not reopened, newest first. `extra` is a close about to be made, and
-    `clean` makes a box safe to post."""
-    rows = [(int(c.get("number") or 0), str(c.get("box") or "")) for c in closes(state)
-            if c.get("repo") == repo and not c.get("reopened") and c.get("box")]
-    rows = list(reversed(rows + list(extra)))
-    lines = ["Each ticket below closed on merged code with its Live box unproven. Prove the "
+def proof_body(repo: str, state: Mapping[str, Any],
+               extra: Sequence[Tuple[int, Sequence[str]]], clean: Any, paused: str = "") -> str:
+    """The Proof due issue's body: every unproven Live box of each ticket
+    closed unproven and not reopened, newest ticket first. `extra` is a close
+    about to be made, and `clean` makes a box safe to post."""
+    kept = [(int(c.get("number") or 0), listed(c)) for c in closes(state)
+            if c.get("repo") == repo and not c.get("reopened")]
+    rows = [(n, box) for n, found in reversed(kept + list(extra)) for box in found]
+    lines = ["Each ticket below closed on merged code with a Live box unproven. Prove the "
              "box, or reopen the ticket if it does not hold. A reopen counts against this "
              "close type: it stops above %d%%." % round(MAX_REOPEN_RATE * 100), ""]
     if paused:
