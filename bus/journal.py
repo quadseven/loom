@@ -217,6 +217,30 @@ def with_shipped_backlog(text: str, now: Optional[datetime] = None) -> str:
     return current + (marker + earlier if marker else "")
 
 
+# A handoff marker the brain wrote as a list item: GitHub hides the comment
+# and shows an empty bullet (loom#3321, seven in one wow-overseer tick).
+_MARKER_ITEM = re.compile(r"^[ \t]*[-*+][ \t]+(<!-- loom:(?:done|defer) v1 [^\n]*?-->)[ \t]*(?:\r?\n|$)", re.M)
+# A goal-home issue or pull request named in words with a bare number, which
+# GitHub does not link. "issue N of another repo" (_public_refs) stays words.
+_BARE_REF = re.compile(r"\b(issue|pull request|PR) (\d{1,7})\b(?! of another repo)")
+
+
+def tidy(text: str) -> str:
+    """One journal tick as it should read on GitHub (loom#3321): handoff
+    markers written as list items become bare lines after a blank line at
+    the end of the tick, where handoff.marks still reads them, and a bare
+    "issue N", "pull request N" or "PR N" becomes a #N link. Code spans and
+    HTML comments are never rewritten."""
+    found = _MARKER_ITEM.findall(text)
+    if found:
+        text = _MARKER_ITEM.sub("", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).rstrip("\n") + "\n\n" + "\n".join(found)
+    parts = re.split(r"(`[^`\n]*`|<!--.*?-->)", text, flags=re.S)
+    for i in range(0, len(parts), 2):
+        parts[i] = _BARE_REF.sub(r"\1 #\2", parts[i])
+    return "".join(parts)
+
+
 _STEPS_LINE = re.compile(r"^[ \t]*-[ \t]+Steps:.*(?:\r?\n|$)", re.M)
 
 
@@ -403,7 +427,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
         mine, previous = _journal_context(gh, repo, issue_number, text)
         # The tick's step timings are a log line, not a comment on the goal
         # ticket (loom#2898).
-        text = _STEPS_LINE.sub("", journal_check.annotate(text, previous))
+        text = tidy(_STEPS_LINE.sub("", journal_check.annotate(text, previous)))
         if steps:
             print("journal %s#%d %s" % (repo, int(issue_number), steps), file=sys.stderr)
         if mine is not None:
