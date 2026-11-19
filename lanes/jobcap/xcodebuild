@@ -32,8 +32,26 @@ jobs="${LOOM_BUILD_JOBS:-0}"
 [[ "$jobs" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$jobs))" -gt 0 ] || exec "$real" "$@"
 jobs="$((10#$jobs))"
 
-builds="" other_action=""
+# An option's value is never an action: "-scheme clean" names a scheme, and
+# the call still builds. The word after one of these options is skipped.
+builds="" other_action="" value=""
 for arg in "$@"; do
+  if [ -n "$value" ]; then value=""; continue; fi
+  case "$arg" in
+    -project | -target | -scheme | -workspace | -configuration | -destination | -sdk | -arch | \
+      -derivedDataPath | -resultBundlePath | -resultBundleVersion | -xcconfig | -toolchain | \
+      -testPlan | -only-testing | -skip-testing | -only-test-configuration | \
+      -skip-test-configuration | -xctestrun | -testLanguage | -testRegion | -test-iterations | \
+      -destination-timeout | -parallel-testing-enabled | -parallel-testing-worker-count | \
+      -maximum-concurrent-test-device-destinations | -maximum-parallel-testing-workers | \
+      -maximum-concurrent-test-simulator-destinations | -enableCodeCoverage | \
+      -enableAddressSanitizer | -enableThreadSanitizer | -enableUndefinedBehaviorSanitizer | \
+      -archivePath | -exportPath | -exportOptionsPlist | -localizationPath | -exportLanguage | \
+      -clonedSourcePackagesDirPath | -packageCachePath | -scmProvider | \
+      -defaultPackageRegistryURL | -authenticationKeyPath | -authenticationKeyID | \
+      -authenticationKeyIssuerID)
+      value=1; continue ;;
+  esac
   case "$arg" in
     # Its own job count: leave the call alone.
     -jobs | -IDEBuildOperationMaxNumberOfConcurrentCompileTasks=*) exec "$real" "$@" ;;

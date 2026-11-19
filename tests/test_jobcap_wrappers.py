@@ -81,6 +81,18 @@ class XcodebuildWrapperTest(JobCapWrapperTest):
         self.assertEqual(self.passed("xcodebuild", "-scheme", "App", "-configuration", "Debug"),
                          ["-jobs", "3", "-scheme", "App", "-configuration", "Debug"])
 
+    def test_an_options_value_is_never_read_as_an_action(self):
+        # A scheme, target or configuration can be named like an action or a
+        # report: the call builds all the same, so it is capped.
+        for args in (["-scheme", "clean"], ["-target", "installsrc", "-configuration", "clean"],
+                     ["-scheme", "-list"], ["-destination", "clean", "-scheme", "App"],
+                     ["-scheme", "clean", "build"], ["-derivedDataPath", "-version", "test"]):
+            with self.subTest(args=args):
+                self.assertEqual(self.passed("xcodebuild", *args), ["-jobs", "3", *args])
+        # And a real clean beside such a value still builds nothing.
+        args = ["-scheme", "build", "clean"]
+        self.assertEqual(self.passed("xcodebuild", *args), args)
+
     def test_a_call_with_its_own_job_count_is_left_alone(self):
         for args in (["-jobs", "12", "build"], ["build", "-jobs", "1"],
                      ["build", "-IDEBuildOperationMaxNumberOfConcurrentCompileTasks=6"]):
