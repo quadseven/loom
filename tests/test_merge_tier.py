@@ -12,7 +12,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -190,6 +192,12 @@ class Findings(unittest.TestCase):
         self.assertEqual(merge_tier.blocking_findings([deferred, fixed], HEAD_AT, by_bot),
                          ["medium dead-code"])
 
+    def test_a_finding_opened_the_second_of_the_newest_commit_still_blocks(self):
+        # No commit follows it, so resolving its thread proves no fix.
+        tied = thread(self.DEAD, resolved=True, created=HEAD_AT)
+        self.assertEqual(merge_tier.blocking_findings([tied], HEAD_AT, by_bot),
+                         ["medium dead-code"])
+
     def test_an_answered_high_or_bad_work_finding_blocks_even_when_held(self):
         """loom#2519 acceptance: a resolved high or bad-work finding whose
         thread is in `held` still blocks the merge with no fix commit after
@@ -262,6 +270,14 @@ class Caps(unittest.TestCase):
         why = merge_tier.cap_refusal(GitHub("t", transport=transport), REPO, {}, self.NOW)
         self.assertIn("could not count", why)
 
+    def test_a_search_answer_with_no_count_refuses(self):
+        # The cap fails closed on a 200 that carries no total_count.
+        def transport(method, url, headers, body):
+            return 200, {}, b'{"items": []}'
+        why = merge_tier.cap_refusal(GitHub("t", transport=transport), REPO, {}, self.NOW)
+        self.assertEqual(why, "could not count the last hour's merges "
+                              "(GitHub gave no count of recent merges)")
+
 
 class LastingHolds(unittest.TestCase):
     """A merge no brain can make, so no brain defers it to the next one
@@ -283,6 +299,19 @@ class LastingHolds(unittest.TestCase):
         why = merge_tier.lasting_hold([], "codex/1-review-queue", False, env={})
         self.assertIn("not a loom branch", why)
         self.assertIn("conflicts", why)
+        # The hold names the head its author must update, and says so when
+        # GitHub sent no head ref (loom#2950).
+        self.assertIn("its head codex/1-review-queue is not", why)
+        self.assertNotIn("(unknown)", why)
+        self.assertIn("its head (unknown) is not",
+                      merge_tier.lasting_hold([], "", False, env={}))
+
+    def test_the_operator_reason_names_the_tiers_loom_merges(self):
+        why = merge_tier.operator_why("deploy-config", "it changes a.yaml", env={})
+        self.assertEqual(why, "it is a deploy-config change (it changes a.yaml), and Loom "
+                              "merges only docs-tests and app-code changes on its own")
+        self.assertIn("Loom merges only no changes on its own", merge_tier.operator_why(
+            "app-code", "it changes a.py", env={"LOOM_AUTO_MERGE_TIERS": ""}))
 
     def test_a_conflicting_loom_head_or_an_unknown_mergeable_is_no_hold(self):
         # bus.brain fix sends a loom/ head back to its lane, and GitHub may
@@ -632,6 +661,164 @@ class ReviewBodies(unittest.TestCase):
         def missing(*a, **k):
             raise OSError("no ruff")
         self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=missing), None)
+
+
+class Contents:
+    """rest() only: the contents endpoint's answer for the head's file."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def rest(self, method, path):
+        return mock.Mock(data=self._data)
+
+
+class ReviewBodyEdges(unittest.TestCase):
+    """loom#2950: boundaries of the review-body gate the weekly spot
+    mutation run found no test noticed."""
+
+    AT = "2030-01-02T09:00:00Z"
+
+    def test_a_thread_opened_the_second_of_the_newest_commit_is_not_addressed(self):
+        # No commit follows a finding opened at the commit's own second, so
+        # it reads resolved, never addressed, and is no lint re-check target.
+        tied = dict(thread(S110, resolved=True, created=HEAD_AT), path="dashboard.py")
+        self.assertEqual(merge_tier.thread_states([tied], HEAD_AT, by_bot),
+                         {"s110": ("resolved", "dashboard.py")})
+        self.assertEqual(merge_tier.lint_targets([tied], HEAD_AT, by_bot), [])
+
+    def test_no_fix_commit_read_makes_no_lint_target(self):
+        # With no commit date read, no thread can read addressed.
+        resolved = dict(thread(S110, resolved=True, created=self.AT), path="dashboard.py")
+        self.assertEqual(merge_tier.lint_targets([resolved], "", by_bot), [])
+        undated = dict(thread(S110, resolved=True, created=""), path="dashboard.py")
+        self.assertEqual(merge_tier.lint_targets([undated], HEAD_AT, by_bot), [])
+
+    def test_threads_of_one_second_take_the_state_of_the_one_listed_last(self):
+        # GitHub lists threads oldest first, so of two threads for a rule
+        # with one timestamp the later-listed one is the newer duplicate.
+        resolved = thread(Findings.STYLE, resolved=True, created=self.AT)
+        opened = thread(Findings.STYLE, resolved=False, created=self.AT)
+        self.assertEqual(merge_tier.thread_states([resolved, opened], HEAD_AT, by_bot),
+                         {"naming": ("open", "")})
+
+    def test_one_rule_addressed_on_two_files_is_rechecked_on_both(self):
+        one = dict(thread(S110, resolved=True, created=self.AT), path="dashboard.py")
+        two = dict(thread(S110, resolved=True, created=self.AT), path="station.py")
+        again = dict(thread(S110, resolved=True, created=self.AT), path="dashboard.py")
+        self.assertEqual(merge_tier.lint_targets([one, two, again], HEAD_AT, by_bot),
+                         [("high", "s110", "dashboard.py"), ("high", "s110", "station.py")])
+
+    def test_a_refusal_names_each_open_finding_by_severity_and_review_time(self):
+        gh = StubGH(reviews=[review(46, Findings.STYLE, when="2030-01-02T09:30:00Z"),
+                             dict(review(47, Findings.DEAD), submitted_at=None)])
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [], HEAD_AT, by_bot)
+        self.assertEqual(
+            merge_tier.body_refusal(bodies),
+            "unanswered review bodies hold the merge: "
+            "medium naming in the review of 2030-01-02T09:30:00Z is still open; "
+            "medium dead-code in the review of an unknown time is still open")
+
+    def test_the_answer_names_each_finding_by_severity_and_the_review_by_time(self):
+        settled = dict(thread(Findings.STYLE, resolved=True, created=self.AT), path="bus/x.py")
+        gh = StubGH(reviews=[review(46, Findings.STYLE, when="2030-01-02T09:30:00Z"),
+                             dict(review(47, Findings.STYLE), submitted_at=None)])
+        bodies = merge_tier.unanswered_bodies(gh, REPO, 8, [settled], HEAD_AT, by_bot)
+        answer = merge_tier.answer_comment(bodies)
+        self.assertIn("Answering the review of 2030-01-02T09:30:00Z "
+                      "(https://example.test/pull/8#pullrequestreview-46)", answer)
+        self.assertIn("Answering the review of an unknown time "
+                      "(https://example.test/pull/8#pullrequestreview-47)", answer)
+        self.assertEqual(answer.count("- medium `naming` on `bus/x.py`: addressed"), 2)
+
+    def test_a_head_file_github_does_not_send_as_base64_cannot_be_rechecked(self):
+        # The contents endpoint sends a file over its size limit with
+        # encoding "none" and no content, and a directory as a list. Neither
+        # is the head's text, so the rule is not run on it and the addressed
+        # finding holds the merge.
+        addressed = dict(thread(S110, resolved=True, created=self.AT), path="dashboard.py")
+        ran = []
+
+        def clean(rule, path, text):
+            ran.append(text)
+            return False
+        for data in ({"encoding": "none", "content": ""}, [{"name": "dashboard.py"}], None):
+            with self.subTest(data=data):
+                self.assertEqual(
+                    merge_tier.lint_recheck_refusal(Contents(data), REPO, "abc1234", [addressed],
+                                                    HEAD_AT, by_bot, run=clean),
+                    "addressed findings could not be re-checked on the head: "
+                    "high s110 on dashboard.py")
+        self.assertEqual(ran, [])
+        sent = {"encoding": "base64", "content": base64.b64encode(b"x = 1\n").decode()}
+        self.assertEqual(merge_tier.lint_recheck_refusal(
+            Contents(sent), REPO, "abc1234", [addressed], HEAD_AT, by_bot, run=clean), "")
+        self.assertEqual(ran, ["x = 1\n"])
+
+
+class RuffRun(unittest.TestCase):
+    """loom#2950: run_ruff against a real child process, a stand-in named
+    ruff on PATH that records what it was sent."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.ruff = self.dir / "ruff"
+        patched = mock.patch.dict(os.environ, {
+            "PATH": "%s%s%s" % (self.dir, os.pathsep, os.environ.get("PATH", ""))})
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def stand_in(self, script):
+        self.ruff.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+        self.ruff.chmod(0o755)
+
+    def quietly(self, call):
+        """call(), with what the process and its children write to stdout
+        and stderr: (result, output)."""
+        sys.stdout.flush()
+        sys.stderr.flush()
+        saved = os.dup(1), os.dup(2)
+        with tempfile.TemporaryFile() as out:
+            os.dup2(out.fileno(), 1)
+            os.dup2(out.fileno(), 2)
+            try:
+                result = call()
+            finally:
+                os.dup2(saved[0], 1)
+                os.dup2(saved[1], 2)
+                os.close(saved[0])
+                os.close(saved[1])
+            out.seek(0)
+            return result, out.read().decode("utf-8", "replace")
+
+    def test_ruff_reads_the_text_on_stdin_and_its_report_is_not_printed(self):
+        # ruff reports every hit on stdout; the gate reads only its exit
+        # code, and a brain's own output must not carry the report.
+        self.stand_in('cat > "$0.stdin"\necho "$@" > "$0.args"\n'
+                      'echo "a.py:1:1: S110 hit"\necho "warning" >&2\nexit 1\n')
+        text = "try:\n    pass\nexcept Exception:\n    pass\n"
+        verdict, printed = self.quietly(lambda: merge_tier.run_ruff("s110", "bus/a.py", text))
+        self.assertIs(verdict, True)
+        self.assertEqual(printed, "")
+        self.assertEqual((self.dir / "ruff.stdin").read_text(encoding="utf-8"), text)
+        args = (self.dir / "ruff.args").read_text(encoding="utf-8").split()
+        self.assertEqual(args[:3], ["check", "--select", "S110"])
+        self.assertEqual(args[-3:], ["--stdin-filename", "bus/a.py", "-"])
+
+    def test_a_clean_file_passes_and_a_ruff_error_proves_nothing(self):
+        self.stand_in("cat > /dev/null\nexit 0\n")
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x = 1\n"), False)
+        self.stand_in("cat > /dev/null\nexit 2\n")
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x = 1\n"), None)
+
+    def test_no_ruff_or_a_ruff_that_hangs_proves_nothing(self):
+        def hangs(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        self.assertIs(merge_tier.run_ruff("s110", "a.py", "x", runner=hangs), None)
+        with mock.patch.dict(os.environ, {"PATH": str(self.dir)}):
+            self.assertIs(merge_tier.run_ruff("s110", "a.py", "x"), None)
 
 
 class ReviewBodyGate(BrainMerge):

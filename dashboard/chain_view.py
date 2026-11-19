@@ -15,12 +15,12 @@ from bus.factory import DEFAULT_REVIEW_BOT
 from . import brain_view, operators
 from .views import lane_state
 
-# The operator Claude sessions that steer and audit Loom. Fixed by the
-# operator, not read from GitHub; a login is the one their claims carry.
-MASTERMIND = (("The operator's Loom session", "quadseven",
+# The operator sessions that steer and audit Loom, with the settings that
+# supply their claim logins.
+MASTERMIND = (("The operator's Loom session", "LOOM_CHAIN_OPERATOR",
                "Steers Loom, coaches and audits the brain, lands operator pull requests."),
-              ("The second operator's session (claim:ccqw)", "ccqw",
-               "Takes Loom work after labelling it claim:ccqw."),
+              ("The second operator's session", "LOOM_CHAIN_SECOND_OPERATOR",
+               "Claims Loom work."),
               ("The infra session", None,
                "Tends the cluster, hosts and secrets Loom runs on."))
 # Ticket states the lanes layer counts, from the ticket snapshot.
@@ -70,13 +70,14 @@ def chain_snapshot(body: Any, now: float) -> Dict[str, Any]:
             "shadow_on": body["shadow_on"], "repos": kept, "received_at": now, **rows}
 
 
-def _mastermind(claims):
-    """The fixed session list, each with what /operators lists for its login."""
+def _mastermind(claims, env):
+    """The session list, each with what /operators lists for its configured login."""
     claims = claims or {}
     read = bool(claims.get("read_at"))
     groups = operators.person_groups(claims.get("items") or [], claims.get("needs") or []) if read else {}
     out = []
-    for name, login, role in MASTERMIND:
+    for name, setting, role in MASTERMIND:
+        login = str(env.get(setting) or "").strip().lower() if setting else ""
         group = groups.get(login) if login else None
         out.append({"name": name, "login": login, "role": role, "read": read,
                     "claimed": len(group["claimed"]) if group else 0,
@@ -116,7 +117,7 @@ def build_chain(payload, chain, now, env=None):
         station = {"on": chain["shadow_on"], "repos": chain["repos"],
                    "age": max(0.0, now - chain["received_at"]),
                    "acted": _newest(chain["acted"]), "held": _newest(chain["held"])}
-    return {"mastermind": _mastermind(payload.get("operator_claims")), "brain": _brain(payload),
+    return {"mastermind": _mastermind(payload.get("operator_claims"), env), "brain": _brain(payload),
             "station": station, "lanes": _lanes(payload), "bot": bot + "[bot]"}
 
 

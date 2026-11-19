@@ -29,6 +29,8 @@ TARGETS = (
     ("bus/station.py", "Station._withdraw_held_pr_wait"),
     ("bus/station.py", "Station._apply_held_wait_withdrawal"),
     ("bus/station.py", "Station._held_wait_state"),
+    ("bus/invariants.py", "_scheduled_failures"),
+    ("bus/invariants.py", "read_scheduled_workflows"),
     ("bus/log_capture.py", "update"),
 )
 

@@ -2,7 +2,7 @@
 
 Loom is a software factory that turns a goal issue into tickets, has AI coding lanes build them, reviews and merges the pull requests, ships them, and checks the result.
 
-Last checked against the code: 2026-11-01.
+Last checked against the code: 2026-12-29.
 
 ## Status
 
@@ -10,7 +10,6 @@ Last checked against the code: 2026-11-01.
 - Not paused on 2026-11-01: the station deployed the head of main that day, and the journal in issue 30 holds no pause. The code has no pause switch. A pause is the operator's word, carried out by booting out the launchd agents, so read the journal and the station log for the current state.
 - Shadow mode is on. For the 17 repos in `LOOM_SHADOW_REPOS`, Loom records merges and closes instead of taking them, except the narrow evidence close. This repo is not in that list, so Loom merges its own pull requests.
 - Some lanes run on Kubernetes through `.github/workflows/lane.yml`. The operator's dashboard also runs on Kubernetes. Its address is not in this repo.
-- Stale: outside the tests, nothing in this repo calls the scripts in `dispatch/`.
 - Unverified: a fresh install on a new machine, and the moved text in `docs/OVERVIEW.md` and `docs/ROLL_PINS.md`.
 
 ## Quick start
@@ -19,11 +18,17 @@ Tests and a local dashboard need only Python 3 and `gh`. The full factory needs 
 
 ```sh
 git clone https://github.com/quadseven/loom.git && cd loom
-python3 -B -m unittest tests.test_merge_tier
+python3 -B .github/unittest_parallel.py --allow-skips --only tests.test_merge_tier
 LOOM_REPOS=YOUR_OWNER/YOUR_REPO python3 -m dashboard
 ```
 
-To run the factory, set the keys from `.env.example` in the environment, including `LOOM_REPOS`, `LOOM_SWEEP_REPOS`, `LOOM_REPO_OWNERS`, `LOOM_STATUS_REPO` and `LOOM_BRIEF_AUTHORS`. Then run `bash lanes/mac/install.sh` and label one issue in each project `loom:goal`.
+To run the factory, export the keys you need from `.env.example`, including
+`LOOM_REPOS`, `LOOM_REPO_OWNERS`, `LOOM_STATUS_REPO` and `LOOM_BRIEF_AUTHORS`.
+Set `LOOM_SWEEP_REPOS` for repos that should receive sweep actions. Before
+starting local lanes, set `LOOM_INFRA_PUBLIC_REPO` to the scanner source
+repository or `LOOM_LEAK_SCANNER` to a local scanner script, and configure the
+deny-list SSM parameter for your deployment. Then run `bash lanes/mac/install.sh`
+and label one issue in each project `loom:goal`.
 
 For rolling pod log evidence, set `LOOM_LOG_CAPTURE` and
 `LOOM_LOG_CAPTURE_RETENTION_HOURS` in the station environment before install.
@@ -34,7 +39,7 @@ The optional evidence service can read the captures from the same `LOOM_HOME`.
 
 - Required `unittest` check: `python3 -B .github/unittest_parallel.py`. CI runs it on macOS with Python 3.13, and any skip fails it.
 - Lane pre-PR check and `unittest-linux`: `python3 -B .github/unittest_parallel.py --allow-skips`.
-- One module: `python3 -B -m unittest tests.test_merge_tier`.
+- One module: `python3 -B .github/unittest_parallel.py --allow-skips --only tests.test_merge_tier`.
 - Leak scan: `check.leak-scan.yml`, on every pull request, from the public `quadseven/infra-public` repo. Workflow hygiene: `check.workflow-hygiene.yml`, on `.github/**`.
 - `Grug - Chief` and `Grug - Elder` are the review bot's required checks. They run on GitHub only.
 
@@ -63,7 +68,9 @@ Never edit or pull the runtime clone by hand: local changes stop the deploy.
 - `bus/`: the station, brain, factory and gates. `python3 -m bus <command>` is the entry point.
 - `lanes/`: the lane runner, the agent sandbox, the Mac installer and the cluster job.
 - `dashboard/`: the live view.
-- `dispatch/`: older goal loop scripts that only the tests call.
+- `dispatch/` holds six docstring-only goal loop design notes. Only
+  `dispatcher.py` contains code, and only `tests/test_dispatcher.py` and the
+  configuration tests call it. The running loop lives in `bus/`.
 - `tests/`: unittest modules.
 - `docs/`: long reference. `GLOSSARY.md`: the terms.
 - `.loom/`: the pre-PR check and the sensitive path list.

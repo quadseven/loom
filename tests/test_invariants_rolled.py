@@ -383,6 +383,93 @@ class UnreadRepoTest(StationBase):
         self.assertEqual(own["state"], "closed", self.said)
 
 
+class ScheduledWorkflowTest(StationBase):
+    def runs(self, workflow, name, *conclusions, repo=REPO):
+        return [{"id": index, "workflow_id": workflow, "name": name, "event": "schedule",
+                 "status": "completed", "conclusion": conclusion,
+                 "repository": {"private": repo in self.gh.private}}
+                for index, conclusion in enumerate(conclusions)]
+
+    def test_three_red_runs_list_a_workflow_and_success_removes_it(self):
+        failure = self.runs(1, "Nightly build", "failure", "failure", "failure")
+        other = self.runs(2, "Daily check", "failure", "success", "failure", "failure")
+        self.gh.scheduled_runs[REPO] = failure + other
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 1)
+        (issue,) = self.breaches()
+        self.assertIn("Nightly build", issue["body"])
+        self.assertNotIn("Daily check", issue["body"])
+
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", "success") + failure + other
+        number = issue["number"]
+        self.run_at(T0 + 300)
+        self.assertEqual([i["number"] for i in self.breaches()], [number])
+        self.assertIn(invariants.ROLL_NONE, issue["body"])
+        self.assertNotIn("Nightly build", issue["body"])
+        self.assertEqual(self.gh.comments, {})
+
+    def test_an_unchanged_scheduled_workflow_list_writes_nothing(self):
+        self.gh.scheduled_runs[REPO] = self.runs(
+            1, "Nightly build", "failure", "timed_out", "failure")
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 1)
+        writes = len(self.gh.writes)
+
+        self.run_at(T0 + 300)
+        self.assertEqual(len(self.gh.writes), writes)
+        self.assertEqual(self.gh.comments, {})
+
+    def test_private_workflow_ids_stay_grouped_and_an_unread_repo_keeps_its_list(self):
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", *("failure",) * 3)
+        self.gh.scheduled_runs[OTHER] = (
+            self.runs(2, "Private name", *("failure",) * 3, repo=OTHER)
+            + self.runs(3, "Another private name", *("failure",) * 3, repo=OTHER))
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 2)
+        private = next(i for i in self.breaches() if "a private repo" in i["title"])
+        body = private["body"]
+        self.assertIn("Current violations (2):", body)
+        self.assertIn("Workflow 2", body)
+        self.assertIn("Workflow 3", body)
+        self.assertNotIn(OTHER, body)
+        self.assertNotIn("ivate name", body)
+
+        self.gh.scheduled_runs[OTHER] = GitHubError("Bad Gateway", 502)
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", "success")
+        self.run_at(T0 + 300)
+        self.assertEqual(private["body"], body)
+        self.assertIn(invariants.ROLL_NONE, next(
+            i for i in self.breaches() if i["number"] != private["number"])["body"])
+
+    def test_extra_pages_can_find_a_streak_and_a_truncated_read_keeps_it(self):
+        self.gh.scheduled_runs[REPO] = (
+            self.runs(1, "Frequent check", *("success",) * 100)
+            + self.runs(2, "Infrequent check", *("failure",) * 3))
+        self.run_at(T0)
+        (issue,) = self.breaches()
+        original = issue["body"]
+        self.assertIn("Infrequent check", original)
+        with mock.patch.object(invariants, "SCHEDULED_READ_MAX", 2):
+            self.run_at(T0 + 300)
+        self.assertEqual(issue["body"], original)
+
+    def test_the_scan_leaves_room_under_30_requests_and_rotates_deferred_repos(self):
+        self.settings.repos = ["example-owner/repo-%d" % i for i in range(31)]
+        self.gh.scheduled_runs[self.settings.repos[0]] = self.runs(
+            1, "Nightly build", *("failure",) * 3)
+        with mock.patch.object(invariants, "SCHEDULED_READ_MAX", 0):
+            self.run_at(T0 - invariants.CHECK_EVERY)
+        baseline = len(self.gh.calls)
+        self.gh.calls.clear()
+        self.run_at(T0)
+        self.assertLess(len(self.gh.calls) - baseline, 30)
+        self.assertEqual(len(self.breaches()), 1)
+        self.run_at(T0 + 300)
+        for repo in self.settings.repos:
+            self.assertTrue(any(path.startswith("/repos/%s/actions/runs?" % repo)
+                                for _, path in self.gh.calls), repo)
+
+
 class OldIssueSubjectTest(unittest.TestCase):
     """loom#2260 passed the 12-hex half of a breach key to settled(), and
     _invariant_settled reads only owner/name#N, so nothing could ever close.
