@@ -2553,10 +2553,14 @@ At most 10 closes and 20 tickets read a pass, and 150 closes a day (3, 6 and
 these bounds in one `evidence close:` line. The Proof due issue shows the
 newest 150 boxes and counts the older ones.
 
-Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+Reopens stay at or below 5% of evidence closes in the last seven days.
+If fewer than 100 tickets closed in that span, the station uses the newest
+100 closes, or all closes since the last resume if there are fewer. A resume
+always excludes earlier closes. One listing per repo finds
 reopened tickets, and a reopen stays counted after the ticket closes again.
 Above the limit this close stops, says so in the log and in each Proof due
-issue, and the usual done close takes over. A first reopen in fewer than 20
+issue, and the usual done close takes over until the operator resumes the
+evidence close. A first reopen in fewer than 20
 closes stops it too. The count is a floor: it sees only reopens someone made.
 
     python3 -m bus.evidence_close status

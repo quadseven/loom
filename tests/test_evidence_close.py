@@ -467,6 +467,38 @@ class Guardrail(Case):
         self.assertIn("1 of 1", self.control("status"))
         self.assertIn("Paused", self.proof_issues()[0]["body"])
 
+    def test_a_late_reopen_tips_a_full_week_over_the_limit_until_resume(self):
+        now = time.time()
+        # At 150 closes a day, the last seven days hold 1,050 closes.
+        history = [{"repo": REPO, "number": 1000 + n, "at": now - (1050 - n) * 576 + 300,
+                    "reopened": 1 <= n <= 52} for n in range(1049)]
+        self.write(os.path.join(self.home, "state", "station", "evidence-close.json"),
+                   json.dumps({"closes": history}))
+        self.ticket(8)
+        self.close_pass(now)
+        self.assertIn(LABEL, self.fake.names(8))
+        self.fake.add(1000, state="shipped", body=BODY)
+        self.fake.issues[1000]["labels"].append({"name": LABEL})
+        self.ticket(1)
+        said = self.close_pass(now + 1)
+        self.assertTrue(any("53 of 1050 closes reopened" in line for line in said), said)
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.assertIn("53 of 1050", self.control("status"))
+        self.close_pass(now + 8 * 86400)
+        self.assertEqual(self.fake.issues[1]["state"], "open")
+        self.control("resume")
+        said = self.close_pass(now + 8 * 86400 + 60)
+        self.assertIn(LABEL, self.fake.names(1), said)
+
+    def test_a_quiet_week_counts_the_last_100_closes(self):
+        now = time.time()
+        history = [{"repo": REPO, "number": n, "at": now - 8 * 86400 + n,
+                    "reopened": n <= 6} for n in range(1, 102)]
+        history[-1]["at"] = now - 60
+        self.write(os.path.join(self.home, "state", "station", "evidence-close.json"),
+                   json.dumps({"closes": history}))
+        self.assertIn("5 of 100 closes reopened", self.control("status"))
+
     def test_a_reopen_of_a_ticket_closed_on_several_boxes_stops_this_close(self):
         self.ticket(1, body=MANY)
         self.close_pass()

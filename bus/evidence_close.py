@@ -41,8 +41,9 @@ close so a box is never closed unlisted. An unticked code box is not listed:
 the merged change is its evidence. It is the one close that passes through
 shadow (bus/shadow.py evidence_close). Merges stay held. It makes no AI call.
 
-The guardrail: reopens stay at or below MAX_REOPEN_RATE of the last WINDOW
-closes. A reopened ticket keeps the label, so one listing per repo finds it,
+The guardrail: reopens stay at or below MAX_REOPEN_RATE of seven days of
+closes, including at least the newest 100 since resume when available.
+A reopened ticket keeps the label, so one listing per repo finds it,
 and it stays counted after it closes again. Above the limit this close type
 stops until the operator resumes it. The first reopen of a young run stops it
 too, on purpose: fewer than 20 closes cannot hold one at 5%. A stop raises one
@@ -86,7 +87,8 @@ READS_PER_PASS = 20
 CLOSES_PER_DAY = 150
 DAY = 24 * 3600
 MAX_REOPEN_RATE = 0.05
-WINDOW = 100
+MIN_CLOSES = 100
+REOPEN_SPAN = 7 * DAY
 # A refused ticket is read again after this long.
 RECHECK = 6 * 3600
 CLOSES_KEPT = 1000
@@ -168,10 +170,14 @@ class Pass(NamedTuple):
     paused: str            # why this close type is stopped, or ""
 
 
-def new_pass(state: Mapping[str, Any], control: Mapping[str, Any], now: float) -> Pass:
+def new_pass(state: Dict[str, Any], control: Mapping[str, Any], now: float) -> Pass:
     today = len([c for c in closes(state) if 0 <= now - float(c.get("at") or 0) < DAY])
+    why = paused_why(state, control, now)
+    # A stop holds until resume even after its triggering closes age out.
+    if why and why != OPERATOR_PAUSED:
+        state["rate_stop"] = {"since": control.get("at", 0), "why": why}
     return Pass([min(CLOSES_PER_PASS, max(0, CLOSES_PER_DAY - today)), READS_PER_PASS],
-                {"closed": 0, "read": 0, "waiting": 0}, paused_why(state, control))
+                {"closed": 0, "read": 0, "waiting": 0}, why)
 
 
 def bound_line(run: Pass) -> str:
@@ -282,13 +288,19 @@ def closes(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return [c for c in found if isinstance(c, dict)] if isinstance(found, list) else []
 
 
+def _window(kept: List[Dict[str, Any]], now: float, minimum: int) -> List[Dict[str, Any]]:
+    """Keep the full time span and at least the newest minimum records."""
+    cutoff = now - REOPEN_SPAN
+    return [c for c in kept[:-minimum] if float(c.get("at") or 0) >= cutoff] + kept[-minimum:]
+
+
 def record(state: Dict[str, Any], repo: str, number: int, unproven: Sequence[str],
            now: float) -> None:
     """Keep one close that landed, with the Live boxes it left unproven."""
     kept = closes(state)
     kept.append({"repo": repo, "number": number, "boxes": list(unproven), "at": now,
                  "reopened": False})
-    state["closes"] = kept[-CLOSES_KEPT:]
+    state["closes"] = _window(kept, now, CLOSES_KEPT)
 
 
 def listed(close: Mapping[str, Any]) -> List[str]:
@@ -305,22 +317,30 @@ def mark_reopened(state: Dict[str, Any], repo: str, numbers: Iterable[int], now:
     has no record of its close counts as a close too. The number newly seen."""
     kept = closes(state)
     fresh = 0
-    for number in numbers:
+    open_now = set(numbers)
+    open_by_repo = state.setdefault("open_reopens", {})
+    previously_open = set(open_by_repo.get(repo, []))
+    for number in sorted(open_now):
         mine = [c for c in kept if c.get("repo") == repo and c.get("number") == number]
         if not mine:
+            # Aging out its close record does not make a still-open ticket a new reopen.
+            if number in previously_open:
+                continue
             mine = [{"repo": repo, "number": number, "boxes": [], "at": now, "reopened": False}]
             kept.extend(mine)
         if not mine[-1].get("reopened"):
             mine[-1]["reopened"] = True
             fresh += 1
-    state["closes"] = kept[-CLOSES_KEPT:]
+    open_by_repo[repo] = sorted(open_now)
+    state["closes"] = _window(kept, now, CLOSES_KEPT)
     return fresh
 
 
-def rate(state: Mapping[str, Any], control: Mapping[str, Any]) -> Tuple[int, int]:
-    """(reopened, closes) among the last WINDOW closes since the last resume."""
+def rate(state: Mapping[str, Any], control: Mapping[str, Any], now: float) -> Tuple[int, int]:
+    """(reopened, closes) in the guardrail window since the last resume."""
     since = float(control.get("at") or 0)
-    recent = [c for c in closes(state) if float(c.get("at") or 0) >= since][-WINDOW:]
+    recent = _window([c for c in closes(state) if float(c.get("at") or 0) >= since],
+                     now, MIN_CLOSES)
     return len([c for c in recent if c.get("reopened")]), len(recent)
 
 
@@ -334,11 +354,14 @@ def stop_ask(why: str) -> str:
             "bus.evidence_close resume` or leave it stopped." % why)
 
 
-def paused_why(state: Mapping[str, Any], control: Mapping[str, Any]) -> str:
+def paused_why(state: Mapping[str, Any], control: Mapping[str, Any], now: float) -> str:
     """Why this close type is stopped, or ""."""
     if control.get("paused"):
         return OPERATOR_PAUSED
-    reopened, total = rate(state, control)
+    stop = state.get("rate_stop") or {}
+    if stop.get("since") == control.get("at", 0):
+        return stop["why"]
+    reopened, total = rate(state, control, now)
     if total and reopened / total > MAX_REOPEN_RATE:
         return "%d of %d closes reopened, above %d%%" % (
             reopened, total, round(MAX_REOPEN_RATE * 100))
@@ -416,8 +439,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             json.dump(fresh, fh)
         os.replace(control_path + ".tmp", control_path)
     state, control = read_file(os.path.join(folder, STATE_FILE)), read_file(control_path)
-    reopened, total = rate(state, control)
-    why = paused_why(state, control)
+    now = time.time()
+    reopened, total = rate(state, control, now)
+    why = paused_why(state, control, now)
     print("%d of %d closes reopened; limit %d%%; %s"
           % (reopened, total, round(MAX_REOPEN_RATE * 100),
              "paused: " + why if why else "running"))
