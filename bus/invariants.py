@@ -639,8 +639,13 @@ def marker_cadence(f: Facts) -> List[Breach]:
 
 # A brief the runner parked before its agent ran: the fix round's pull
 # request had merged or closed, or another push moved its branch
-# (lanes/run_lane.sh fix_pr_open and the branch-moved park).
-_PARKED_UNRUN = re.compile(r"(\[[a-z]+\] )?(pull request #[0-9]+ is no longer open on |branch moved: )")
+# (lanes/run_lane.sh), or a runner base stop refused dispatch (bus/runners.py).
+_PARKED_UNRUN = re.compile(
+    r"(?:\[[a-z]+\] )?(?:pull request #[0-9]+ is no longer open on |branch moved: )"
+    r"|\[transient\] (?:the base check of \S+ is red on this runner at [^;]*"
+    r"|this runner image cannot run the base check of \S+ \(a tool it needs is missing\))"
+    r"; another lane takes it$"
+)
 
 
 def _says_lane_health(r: Run) -> bool:
@@ -653,9 +658,8 @@ def _says_lane_health(r: Run) -> bool:
 
 def lane_no_success(f: Facts) -> List[Breach]:
     """A lane with RUNS_MIN or more runs in the last day and none done, runs
-    that ended at a limit, an expired key or a factory incident aside: agy's
-    34 runs at its plan's quota read as a broken lane (loom#651, 2026-10-20),
-    and a lane held at a limit is lane_held's."""
+    that ended at a limit, an expired key or a factory incident and briefs
+    parked before the agent ran aside. Lane holds are reported by lane_held."""
     if f.runs is None:
         return []
     lanes: Dict[str, List[Run]] = {}
@@ -678,8 +682,8 @@ def lane_no_success(f: Facts) -> List[Breach]:
 
 def lane_failing_streak(f: Facts) -> List[Breach]:
     """Lanes whose newest FAILING_STREAK runs in the last day all failed,
-    a limit, an expired key or a factory incident aside, after a success
-    earlier that day (a lane with none is lane_no_success). On 2026-10-19
+    after a success earlier that day (a lane with none is lane_no_success).
+    Only runs that say something about the lane count. On 2026-10-19
     zen's free model left the
     catalogue at about 12:13Z and every run after failed, while a success at
     05:00Z kept lane_no_success quiet all day. One rolling breach, a line per
@@ -688,7 +692,6 @@ def lane_failing_streak(f: Facts) -> List[Breach]:
         return []
     lanes: Dict[str, List[Run]] = {}
     for r in f.runs:
-        # Two base-check incidents counted toward zen's streak (2026-10-19).
         if 0 <= f.now - r.at <= DAY and _says_lane_health(r):
             lanes.setdefault(r.lane, []).append(r)
     lines, last = [], []

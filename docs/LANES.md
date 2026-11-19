@@ -1667,8 +1667,9 @@ Each invariant is one function returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done (one issue per lane:
   the station reads these to release a runaway a dead lane held).
-- Lanes whose newest 5 runs all failed after a success earlier in the day,
-  limits, expired keys and factory incidents aside.
+- Lanes whose newest 5 runs all failed after a success earlier in the day.
+  Both lane checks exclude limits, expired keys, factory incidents and
+  briefs parked before the agent ran, including runner base stops.
 - Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
