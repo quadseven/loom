@@ -97,6 +97,17 @@ def clean_record(record):
     return dict(core, at=record["at"], active=record.get("active") is True)
 
 
+def _counts(raw):
+    """The 401 count and the ask number a state file holds, each only when it
+    is a whole number in range."""
+    kept = {}
+    for key, most in (("rejected", KEEP), ("ask", MAX_ISSUE)):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= most:
+            kept[key] = value
+    return kept
+
+
 def load(path):
     try:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -119,11 +130,7 @@ def load(path):
     if isinstance(failures, list):
         state["failures"] = [{"at": f["at"], "reason": "read-failed"}
                              for f in failures[-KEEP:] if isinstance(f, dict) and number(f.get("at"))]
-    rejected, ask = raw.get("rejected"), raw.get("ask")
-    if isinstance(rejected, int) and not isinstance(rejected, bool) and 0 < rejected <= KEEP:
-        state["rejected"] = rejected
-    if isinstance(ask, int) and not isinstance(ask, bool) and 0 < ask <= MAX_ISSUE:
-        state["ask"] = ask
+    state.update(_counts(raw))
     signal = clean_record(raw.get("signal"))
     if signal and signal["active"] and signal["remaining"] * LOW_DIVISOR < signal["limit"]:
         state["signal"] = signal
