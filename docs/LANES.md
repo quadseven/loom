@@ -244,6 +244,36 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Before claiming a ticket for a local lane, the station checks the same
+  host load limits as lane checks. A high reading leaves the ticket for
+  the next station pass. The local runner checks before preparing a brief
+  and again before starting its agent. It polls every
+  `LOOM_CHECK_SLOT_POLL` seconds (default 5) with its keepalive running.
+  After `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) it leaves the same
+  brief in the inbox for the next pass. Heartbeats, brief handoffs and
+  cluster agent starts proceed independently of this gate.
+- `LOOM_HEAVY_REPOS` lists comma- or space-separated `owner/name` entries.
+  It defaults to empty, which disables repo locking. Each listed repo has
+  its own lock for the duration of a local agent run. Other build jobs on
+  the host can use the same protocol or call the helper directly. From
+  the shell that stays alive for the build, run
+  `python3 lanes/heavy_repo.py take "$lock"` and retry if busy. After the
+  build, run `python3 lanes/heavy_repo.py release "$lock"`.
+  Use the same `LOOM_HOME` and set `lock` to the
+  directory `$LOOM_HOME/run/heavy-repos/<owner>+<name>.lock`, with owner
+  and name in lowercase. Its `pid` file holds one positive decimal PID.
+  - Take an exclusive `flock(2)` on the persistent file
+    `$LOOM_HOME/run/heavy-repos/.guard` while reading or updating a lock.
+    Release the guard before building or waiting. Leave the guard file in place.
+  - If the PID is alive, release the guard and retry. A permission error
+    checking the PID also means busy. If the directory is absent, create
+    it. If the holder died or left an unfinished directory without a PID,
+    reclaim it. Write the new PID by renaming a temporary file to `pid`
+    before releasing the guard.
+  - On completion, take the guard, verify the PID still belongs to the
+    holder or the recorded process has exited, then remove `pid` and the
+    lock directory. The lane uses the same poll interval and wait limit as
+    for host load.
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
   hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
@@ -2391,6 +2421,11 @@ Plan:
   `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
   `-high` keeps its suffix. A model outside the catalog is refused as a
   transient lane mismatch before agy starts.
+- Every 30 minutes, even with an empty inbox, agy can recheck held models
+  in its configured ladder. It sends one small print-mode request per held
+  `gemini-3.8-flash` effort (high, medium, or low). An answer releases
+  that model on the same pass. A refusal keeps the hold and updates its
+  expiry if the provider gives a reset time.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default

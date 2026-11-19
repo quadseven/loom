@@ -2,6 +2,7 @@
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
@@ -133,7 +135,7 @@ if [ "$1" = api ]; then
       printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
-  [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
+  [ "$*" = "api repos/${FAKE_GH_REPO:-example/repo} --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
 if [ "$1 $2" = "pr list" ]; then
@@ -2821,6 +2823,84 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.run_lane(LOOM_CODEX_MODELS="gpt-test-high gpt-test-low")
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
+
+    def held_agy_lane(self, models, holds, reply):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True)
+        limits = usage / "agy.models"
+        limits.write_text("".join(f"{model} {until} account quota reached\n"
+                                  for model, until in holds.items()))
+        old = time.time() - 3600
+        os.utime(limits, (old, old))
+        lane_home = self.home / "lane-user"
+        cli = lane_home / "bin" / "agy"
+        self.write_tool(cli, '#!/bin/bash\n'
+                        '[ "$1" = -p ] && [ -n "$2" ] || exit 2\n'
+                        'while [ "$#" -gt 1 ] && [ "$1" != --model ]; do shift; done\n'
+                        '[ "$1" = --model ] || exit 2\n'
+                        'echo "$2" >> "$HOME/probes"\n' + reply)
+        self.write_tool(self.bin / "runas", FAKE_RUNAS)
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\n[ "$1" = -p ] || exit 2\nshift 2\nexec "$@"\n')
+        self.write_tool(self.bin / "codesign", '#!/bin/sh\necho "CodeDirectory flags=0x10000(runtime)"\n')
+        env = dict(LOOM_AGY_HOME=str(lane_home), LOOM_AGY_BIN=str(cli),
+                   LOOM_AGY_RUNAS=str(self.bin / "runas"), LOOM_AGY_KEY_SSM="/k/kc",
+                   FAKE_SECRET__k_kc="test", LOOM_AGY_MODELS=" ".join(models))
+        return env, lane_home / "probes"
+
+    def test_held_agy_lane_is_available_on_the_pass_its_cli_answers(self):
+        high, low = "gemini-3.8-flash-high", "gemini-3.8-flash-low"
+        until = int(time.time()) + 86400
+        env, probes = self.held_agy_lane([high, low], {high: until, low: until},
+                                         'if [[ "$2" = *-low ]]; then echo "Ready."; else echo "Starting" >&2; fi\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertTrue(beat["available"], beat)
+        self.assertEqual(beat["limited_models"], {high: until})
+        self.assertEqual(probes.read_text().splitlines(), [high, low])
+
+    def test_refused_agy_recheck_records_the_stated_reset(self):
+        model = "gemini-3.8-flash-low"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "Individual quota reached. Resets in 2h3m." >&2\nexit 1\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 7380)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 7380)
+        self.assertEqual(beat["limited_models"], {model: beat["retry_at"]})
+
+    def test_agy_rechecks_only_held_configured_flash_models_once_per_interval(self):
+        high, medium, low = ("gemini-3.8-flash-" + effort for effort in ("high", "medium", "low"))
+        other = "gemini-4-argon-high"
+        now = int(time.time())
+        env, probes = self.held_agy_lane([high, high, low, other],
+                                         {high: now + 3600, medium: now + 3600,
+                                          low: now - 1, other: now + 3600},
+                                         'echo "Individual quota reached." >&2\nexit 1\n')
+        for _ in range(2):
+            result = self.run_lane("agy", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(probes.read_text().splitlines(), [high])
+        self.assertEqual(self.beat("agy")["limited_models"][high], now + 3600)
+        limits = self.loom / "state" / "usage" / "agy.models"
+        os.utime(limits, (now - 1800, now - 1800))
+        self.run_lane("agy", **env)
+        self.assertEqual(probes.read_text().splitlines(), [high, high])
+
+    def test_agy_recheck_honors_retry_after_even_if_the_cli_exits_zero(self):
+        model = "gemini-3.8-flash-medium"
+        now = int(time.time())
+        env, _ = self.held_agy_lane([model], {model: now + 3600},
+                                    'echo "HTTP 429: Retry-After: 900" >&2\n')
+        result = self.run_lane("agy", **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat("agy")
+        self.assertFalse(beat["available"])
+        self.assertGreaterEqual(beat["retry_at"], now + 900)
+        self.assertLessEqual(beat["retry_at"], int(time.time()) + 900)
 
     def test_ticket_model_is_not_swapped_for_a_ladder_model(self):
         self.drop_brief("T042-fix-the-thing.md",
@@ -6582,7 +6662,8 @@ exit %d
 
     def test_a_pass_writes_a_fresh_available_heartbeat(self):
         before = int(time.time())
-        self.run_lane()
+        self.run_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
         self.assertEqual(beat["lane"], "codex")
@@ -7012,6 +7093,15 @@ exit %d
         self.drop_brief()
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
         self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
+
+    def test_a_retry_after_header_uses_all_duration_digits(self):
+        before = int(time.time())
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="HTTP 429: Retry-After: 740")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retry_at = self.beat()["retry_at"]
+        self.assertGreaterEqual(retry_at, before + 740)
+        self.assertLessEqual(retry_at, int(time.time()) + 740)
 
     def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
         usage = self.loom / "state" / "usage"
@@ -8529,7 +8619,7 @@ echo fixed > fix.txt
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
             ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
-            env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
+            env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
                  "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -8540,6 +8630,137 @@ echo fixed > fix.txt
         fresh.write_text(f"{one} {five} 1.00 1/100 1\n")
         fresh.replace(path)
         return path
+
+    def wait_for_run_text(self, path, text, run):
+        deadline = time.monotonic() + 30
+        while not (path.exists() and text in path.read_text()):
+            self.assertFalse(run.done(), "lane finished before " + text)
+            self.assertLess(time.monotonic(), deadline, text)
+            time.sleep(0.05)
+
+    def test_agent_starts_when_each_enabled_load_limit_clears(self):
+        for one, five, name in [(24, 0, "1-minute"), (0, 18, "5-minute")]:
+            with self.subTest(limit=name):
+                self.drop_brief()
+                log = self.loom / "logs" / "codex" / "T042-fix-the-thing.log"
+                with ThreadPoolExecutor(1) as pool:
+                    run = pool.submit(self.run_lane, LOOM_CHECK_LOAD_1M=str(one),
+                                      LOOM_CHECK_LOAD_5M=str(five), LOOM_CHECK_SLOT_POLL="0.1",
+                                      LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)))
+                    try:
+                        self.wait_for_run_text(log, name + " load", run)
+                        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                        self.assertTrue((self.loom / "state/usage/codex.alive").exists())
+                    finally:
+                        self.load_file(one or 90, five or 90)
+                    self.assertEqual(run.result().returncode, 0)
+                self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+                self.log.write_text("")
+
+    def test_agent_load_timeout_leaves_the_same_brief_for_the_next_pass(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 0)),
+                                        LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="60", timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+        self.assertFalse(list((self.inbox / "failed").iterdir()))
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("load", self.run_log())
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.run_contract_lane().returncode, 0)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agent_rechecks_load_after_preparing_the_clone(self):
+        self.drop_brief()
+        load = self.load_file(0, 0)
+        self.write_tool(self.bin / "git", '#!/bin/sh\n'
+                        'if [ "$1" = clone ]; then echo "1 20 1" > "$LOOM_CHECK_LOAD_FILE"; fi\n'
+                        f'exec {shlex.quote(shutil.which("git"))} "$@"\n')
+        result = self.run_lane(LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_5M="18",
+                               LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5-minute load", self.run_log())
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_cluster_agent_ignores_local_host_load_and_heavy_repo_lock(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(os.getpid()))
+        result = self.run_lane(LOOM_CLUSTER_RUNNER="1", LOOM_HEAVY_REPOS="example/repo",
+                               LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                               LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((lock / "pid").read_text(), str(os.getpid()))
+
+    def test_heavy_repo_agents_take_turns_while_another_repo_runs(self):
+        self.drop_brief()
+        light = self.remote.with_name("light.git")
+        git("clone", "-q", "--bare", str(self.remote), str(light))
+        for slot, repo, name in [("codex-2", "repo", "T043"), ("codex-3", "light", "T044")]:
+            folder = self.inbox.with_name(slot)
+            folder.mkdir()
+            (folder / (name + ".md")).write_text(BRIEF.replace("example/repo", "example/" + repo))
+        marks = Path(self._tmp.name) / "starts"
+        release = marks.with_name("release")
+        self.write_tool(self.bin / "codex", '#!/bin/bash\ncat >/dev/null\n'
+                        'echo "start $TAG" >> "$MARKS"\n'
+                        'while [ "$TAG" = first ] && [ ! -e "$RELEASE" ]; do sleep 0.1; done\n'
+                        'echo "end $TAG" >> "$MARKS"\nexit 3\n')
+        env = dict(LOOM_HEAVY_REPOS="example/unused,example/repo", LOOM_CHECK_SLOT_POLL="0.1",
+                   MARKS=str(marks), RELEASE=str(release))
+        with ThreadPoolExecutor(3) as pool:
+            first = pool.submit(self.run_lane, TAG="first", **env)
+            try:
+                self.wait_for_run_text(marks, "start first", first)
+                holder = (self.loom / "run/heavy-repos/example+repo.lock/pid").read_text()
+                self.assertEqual(holder, (self.loom / "run/codex.lock/pgid").read_text())
+                second = pool.submit(self.run_lane, "codex-2", TAG="second", **env)
+                third = pool.submit(self.run_lane, "codex-3", TAG="third", FAKE_GH_REPO="example/light", **env)
+                self.wait_for_run_text(self.loom / "logs/codex-2/T043.log", "heavy repo", second)
+                self.assertEqual(third.result().returncode, 0)
+                self.assertEqual(marks.read_text().splitlines(), ["start first", "start third", "end third"])
+            finally:
+                release.touch()
+            self.assertEqual(first.result().returncode, 0)
+            self.assertEqual(second.result().returncode, 0)
+        self.assertEqual(marks.read_text().splitlines()[-3:], ["end first", "start second", "end second"])
+        self.assertFalse((self.loom / "run/heavy-repos/example+repo.lock").exists())
+
+    def test_busy_heavy_repo_guard_cannot_extend_the_wait_limit(self):
+        self.drop_brief()
+        root = self.loom / "run/heavy-repos"
+        root.mkdir(parents=True)
+        with ThreadPoolExecutor(1) as pool, (root / ".guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            run = pool.submit(self.run_lane, LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+            log = self.loom / "logs/codex/T042-fix-the-thing.log"
+            self.wait_for_run_text(log, "deferred until next pass", run)
+            self.assertEqual(run.result(timeout=5).returncode, 0)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_heavy_repo_lock_respects_an_external_pid_and_reclaims_it_after_exit(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        env = dict(LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+        with subprocess.Popen(["sleep", "60"]) as other:
+            try:
+                (lock / "pid").write_text(str(other.pid) + "\n")
+                self.assertEqual(self.run_lane(**env).returncode, 0)
+                self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+                self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                self.assertEqual((lock / "pid").read_text().strip(), str(other.pid))
+            finally:
+                other.terminate()
+        self.assertEqual(self.run_lane(**env).returncode, 0)
+        self.assertTrue((self.inbox / "done/T042-fix-the-thing.md").exists())
+        self.assertFalse(lock.exists())
 
     def wait_for_slot_log(self, text, seconds=20):
         log = Path(self._tmp.name) / "slots.log"
@@ -8595,7 +8816,7 @@ echo fixed > fix.txt
         text = RUNNER.read_text()
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         out = subprocess.run(["bash", "-c", funcs + 'echo "$CHECK_LOAD_1M $CHECK_LOAD_5M"\n'],
-                             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom)},
+                             env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom)},
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(out.stdout.strip(), "24 18", out.stderr)
 
@@ -8663,7 +8884,7 @@ echo fixed > fix.txt
     def test_a_lane_whose_load_wait_runs_out_parks_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
-        self.drop_brief()
+        self.drop_brief(text=self.BASE_CHECK_BRIEF)
         load = self.load_file("31.50", "2.00")
         result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
                                         LOOM_CHECK_SLOT_POLL="0.2", LOOM_CHECK_LOAD_FILE=str(load),
