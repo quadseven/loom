@@ -11649,19 +11649,28 @@ class Station:
             try:
                 loose, tree = brain.goal_tree(self.gh, repo, int(goal["number"]))
                 children = {brain._issue_key(i, repo): i for i in brain._flatten(loose, tree, repo)}
-                for issue in brain_hold.triaged(self.gh, repo):
-                    children[brain._issue_key(issue, repo)] = issue
             except RateLimited:
                 raise
             except GitHubError as err:
                 lines.append("- **%s** could not be read (%s)" % (self._short_name(goal),
                                                                   type(err).__name__))
                 continue
+            triage_unread = False
+            try:
+                for issue in brain_hold.triaged(self.gh, repo):
+                    children[brain._issue_key(issue, repo)] = issue
+            except RateLimited:
+                raise
+            except GitHubError:
+                triage_unread = True
             groups = self._standup_ticket_groups(list(children.values()), since)
             summary = self._standup_summary(groups)
             aged = self._standup_triage_age(groups["aged_triage"])
             if aged:
                 summary = "%s. %s" % (summary, aged)
+            if triage_unread:
+                summary = "%s. Triage issues could not be read" % summary if summary \
+                    else "Triage issues could not be read"
             lines.append("- **%s** %s" % (self._short_name(goal), summary or "nothing moved"))
         return lines
 
@@ -15326,7 +15335,7 @@ class Station:
         went stuck, queued or asks the operator since `since` (loom#2898)."""
         groups = self._standup_ticket_groups(children, since)
         if any(groups[k] for k in ("merged", "verified", "sent_back", "failed", "regressed",
-                                   "aged_pr", "aged_triage", "queued", "asks", "triage_waiting")):
+                                   "aged_pr", "queued", "asks", "triage_waiting")):
             return True
         # A ticket opened or closed since the last report is news too, as in
         # bus/quiet.py.

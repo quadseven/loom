@@ -164,6 +164,12 @@ class QuietRuleTest(unittest.TestCase):
         breach = {"number": 9, "state": "closed", "labels": [{"name": "loom:invariant"}]}
         self.assertIsNotNone(self.quiet([report_comment(1, ago(7))], [closed], [breach]))
 
+    def test_an_old_stuck_triage_issue_is_reported_but_has_not_moved(self):
+        old = {"number": 8, "state": "open", "labels": [{"name": "loom:triage"}],
+               "created_at": ago(24 * 30), "updated_at": ago(24 * 30)}
+        self.assertIsNotNone(self.quiet([report_comment(1, ago(7))], [old]))
+        self.assertEqual(quiet.stuck_triage([old], NOW), ["#8 is stuck in loom:triage"])
+
     def test_the_metric_line_counts_only_when_its_numbers_change(self):
         before = journal_comment(1, ago(9), "3/9 pass as of 2030-01-08T03:00Z")
         report = report_comment(2, ago(7))

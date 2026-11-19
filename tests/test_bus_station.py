@@ -11299,6 +11299,20 @@ class ReportDigestTest(Base):
         self.assertEqual([c for c in self.fake.comments[43]
                           if str(c.get("body", "")).startswith(station.REPORT_MARKER)], [])
 
+    def test_a_failed_triage_read_leaves_the_rest_of_the_backlog_line(self):
+        self.goal(43, "Goal forty-three")
+        self.fake.issues[43]["labels"].append({"name": "loom:backlog"})
+        self.at(9, 0)
+        self.fake.sub_issues[43] = [
+            {"number": 45, "title": "Queued one", "state": "open",
+             "labels": [{"name": "loom:ticket"}, {"name": "loom:queued"}]}]
+        with mock.patch.object(station.brain_hold, "triaged",
+                               side_effect=station.GitHubError("boom", 500)):
+            self.at(10, 1)
+        text = self.sent[0]["content"]
+        self.assertIn("- **Goal forty-three** 1 queued. Triage issues could not be read", text)
+        self.assertNotIn("Goal forty-three** could not be read", text)
+
     def test_a_report_on_a_quiet_goal_is_counted_quiet_not_listed(self):
         # loom#1534: a report whose goal was quiet since the one before it
         # is not news, whatever its first line says.
@@ -11909,6 +11923,14 @@ class ReportsTest(Base):
         self.assertIn("3 in triage, 1 waiting on a person", body)
         self.assertIn("2 triage items older than 7 days (oldest #43 Oldest input)", body)
         self.assertIn("Triage waiting on a person: #44 Needs a ruling.", body)
+
+    def test_an_old_triage_issue_alone_is_not_movement_in_the_standup(self):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=time.time())
+        old = {"number": 41, "title": "Stuck input", "state": "open",
+               "created_at": self.ago(30 * 24 * 3600), "updated_at": self.ago(30 * 24 * 3600),
+               "labels": [{"name": "loom:triage"}]}
+        self.assertFalse(st._standup_moved([old], time.time() - 3600))
+        self.assertEqual(len(st._standup_ticket_groups([old], time.time() - 3600)["aged_triage"]), 1)
 
     def test_a_goal_that_moved_edits_the_stations_standup_in_place(self):
         # loom#2898: one status comment per goal; a later move edits it.
