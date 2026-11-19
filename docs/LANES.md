@@ -246,8 +246,16 @@ unset variables.
   (default 1800).
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
-  hold the runner's pid; a slot whose pid is gone is reclaimed. A lane waits
-  up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
+  hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
+  is taken only while the host has room: the 1-minute load average at or
+  under `LOOM_CHECK_LOAD_1M` (default 24) and the 5-minute one at or under
+  `LOOM_CHECK_LOAD_5M` (default 18). A value of 0 turns that limit off, and
+  a host whose load cannot be read is not gated (the log says so). The
+  reading is the first two fields of `LOOM_CHECK_LOAD_FILE` (default
+  `/proc/loadavg`), or of `sysctl -n vm.loadavg` where that file is absent.
+  A lane waits up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) for a
+  slot and for load together, with a log line that says which (`waiting for
+  a check slot` or `waiting for host load`), and
   its keepalive stamp stays fresh while it waits. A wait that runs out, or a
   base check that times out (exit 124), parks the brief `[transient]` and
   files no base-check incident: both mean host load, not a red base. A
@@ -262,6 +270,16 @@ unset variables.
   |---|---|---|
   | Loom `.github/unittest_parallel.py` | `.loom/validation.conf` | Honors `LOOM_CHECK_WORKERS`; defaults to four when unset. |
   | Other repositories | Each repo's `.loom/validation.conf` command | Repo-defined; Loom does not keep a central inventory or detect whether the command honors the variable. Confirm in that repo's runner and contract. |
+- The slot protocol is open to any other heavy job on the host (a full suite
+  before a pull request opens, say), so it queues with the lane checks
+  instead of running beside them. To take slot N, for N from 1 to
+  `LOOM_CHECK_SLOTS`: `mkdir <LOOM_HOME>/run/check-slots/slot-N` (the
+  `mkdir` is the lock: only one caller's succeeds), then write the holder's
+  pid to `slot-N/pid`. To release it, remove the directory. A slot whose
+  pid is alive is left alone by every lane; one whose pid is gone is
+  reclaimed by the next waiter; one with no `pid` file yet is treated as
+  being taken and left alone, so write the pid at once. The pid must stay
+  alive for as long as the job runs.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still

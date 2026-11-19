@@ -8319,10 +8319,18 @@ class Station:
     def _probe_lane(self, free: List[str], repo: str) -> Optional[str]:
         """A free local lane for a base-check brief: not a cluster runner
         slot, whose red check files no incident, and public-only lanes for
-        public repos only."""
+        public repos only. A base check needs no strong model, so the
+        Anthropic-credit lanes (claude and the anthropic slots) come after
+        every other eligible lane and are picked only when no other
+        eligible lane is free: claude is the only lane that serves the top
+        ladder rung, and a probe on it delays the fix rounds only it can
+        serve."""
         slots = set(runners.runner_slots())
-        return next((lane for lane in free if lane not in slots and self._inbox_empty(lane)
-                     and (not needs_public_repo(lane, "") or self._public(repo))), None)
+        eligible = [lane for lane in free if lane not in slots and self._inbox_empty(lane)
+                    and (not needs_public_repo(lane, "") or self._public(repo))]
+        credit = ("claude",) + factory.ANTHROPIC
+        return next((lane for lane in eligible if lane not in credit),
+                    eligible[0] if eligible else None)
 
     def _report_base_check(self, lane: str, kind: str, name: str, text: str) -> bool:
         """A finished base-check brief: the runner already closed or updated
@@ -12182,9 +12190,16 @@ class Station:
         evidence (_evidence_holds, bus/criteria_gate.py). A shipped ticket
         whose live criteria name a read-only proof is proved first, and closed
         on it when every criterion has evidence (_prove_live, #1608). Since
-        2026-10-31 one close revises that rule: a ticket whose one Live box is
-        its only open box, and whose merged change still stands, closes as
-        closed-unproven (_evidence_close, bus/evidence_close.py)."""
+        2026-10-31 one close revises that rule, and the owner's ruling of
+        2026-11-19 widens it: Loom keeps holding finished tickets open for
+        live proof it cannot collect, and the backlog grows though the work is
+        merged. From now on a shipped ticket whose merged change still stands
+        closes without waiting for live evidence. Proof belongs in tests that
+        run in CI or a throwaway environment at build time, not in a live
+        observation after the fact. A step only a person can take still keeps
+        a ticket open. So a ticket whose unticked boxes are all live or code
+        boxes closes as closed-unproven, each unproven live box listed as
+        proof due first (_evidence_close, bus/evidence_close.py)."""
         if self._deferred():
             return
         self._live_budget = LIVE_CHECKS_PER_PASS
@@ -12303,9 +12318,9 @@ class Station:
             _say("could not write the evidence close pause: %s" % err)
 
     def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
-        """The narrow evidence close of one ticket (bus/evidence_close.py):
-        CLOSED when it closed, WAIT when it stays for a later pass with no
-        other close path run on it, OTHER when the usual done close decides."""
+        """The evidence close of one ticket (bus/evidence_close.py): CLOSED
+        when it closed, WAIT when it stays for a later pass with no other
+        close path run on it, OTHER when the usual done close decides."""
         run = self._evidence
         boxes = evidence_close.boxes(str(issue.get("body") or ""))
         names = _label_names(issue)
@@ -12313,7 +12328,7 @@ class Station:
         state = self._evidence_state
         if (run.paused or not boxes or evidence_close.label_hold(names)
                 or evidence_close.refused_recently(state, ticket, self.now)
-                or self._live_has_own_proof(repo, issue, boxes[0])):
+                or self._live_has_own_proof(repo, issue, boxes)):
             return evidence_close.OTHER
         if min(run.left) <= 0:
             run.counts["waiting"] += 1
@@ -12330,12 +12345,14 @@ class Station:
             evidence_close.note_refused(state, ticket, why, self.now)
             _say("evidence close: not closing %s: %s" % (ticket, why))
             return evidence_close.OTHER
-        return self._close_unproven(repo, issue, boxes[0])
+        return self._close_unproven(repo, issue, boxes)
 
-    def _live_has_own_proof(self, repo: str, issue: Dict[str, Any], box: str) -> bool:
-        """Whether Loom proves this box itself, so it keeps that path: a
-        station proof, a runnable check or a time window."""
-        return (criteria_gate.check_of(box) is not None or bool(_live_time_window(box))
+    def _live_has_own_proof(self, repo: str, issue: Dict[str, Any],
+                            boxes: Sequence[str]) -> bool:
+        """Whether Loom proves one of these boxes itself, so the ticket keeps
+        that path: a station proof, a runnable check or a time window."""
+        return (any(criteria_gate.check_of(box) is not None or bool(_live_time_window(box))
+                    for box in boxes)
                 or self._provable(issue, self._proof_sources(repo)))
 
     def _symbol_refusal(self, repo: str, branch: str, pulls: List[Dict[str, Any]]) -> str:
@@ -12356,43 +12373,48 @@ class Station:
         return ""
 
     def _unmeetable_refusal(self, repo: str, issue: Dict[str, Any]) -> str:
-        """Why the Live box is not known to be meetable, or "". A lookup that
-        failed proves nothing either way, and reads as not known."""
+        """Why the ticket's Live line is not known to be meetable, or "". A
+        lookup that failed proves nothing either way, and reads as not known.
+        A ticket with no Live line has nothing to look up: bus/unmeetable.py
+        reads that one line, so a live box beside it is not looked up."""
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live == "(no Live criterion on the ticket)":
+            return ""
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         if self._unmeetable_live(repo, issue, reads):
             return "its Live box cannot be met as written"
         seen = _read_json(os.path.join(self.state, UNMEETABLE_FILE), {}, strict=False)
-        live = brain.live_criterion(issue.get("body"), limit=None)
         known = self._unmeetable_known((seen if isinstance(seen, dict) else {}).get(
             "%s#%d" % (repo, int(issue["number"]))), unmeetable.key(live))
         return "" if known is False else "its Live box could not be looked up"
 
-    def _close_unproven(self, repo: str, issue: Dict[str, Any], box: str) -> str:
-        """List the box in the repo's Proof due issue, then close the ticket.
-        Nothing closes unlisted."""
+    def _close_unproven(self, repo: str, issue: Dict[str, Any], boxes: Sequence[str]) -> str:
+        """List each unproven Live box in the repo's Proof due issue, then
+        close the ticket. Nothing closes unlisted."""
         number = int(issue["number"])
         run = self._evidence
         try:
-            where = self._write_proof_due(repo, [(number, box)], "")
+            where = self._write_proof_due(repo, [(number, boxes)], "")
         except RateLimited:
             raise
         except GitHubError as err:
             _say("evidence close: could not list %s#%d: %s" % (repo, number, err))
             return evidence_close.WAIT
         reason = "unproven, by the evidence close: its pull requests merged on green CI and " \
-                 "what they changed is still on the default branch. Its Live box is listed " \
-                 "in #%d" % where
+                 "what they changed is still on the default branch. Each unproven Live box " \
+                 "is listed in #%d" % where
         with shadow.evidence_close(repo, number):
             landed = self._close_done_ticket(repo, issue, reason, unproven=True)
         if not landed and (self._issue_state(repo, number) or ("",))[0] != "closed":
             return evidence_close.WAIT
-        evidence_close.record(self._evidence_state, repo, number, box, self.now)
+        evidence_close.record(self._evidence_state, repo, number, boxes, self.now)
         run.left[0] -= 1
         run.counts["closed"] += 1
         _say("closed unproven %s#%d: %s" % (repo, number, reason))
         return evidence_close.CLOSED
 
-    def _write_proof_due(self, repo: str, extra: List[Tuple[int, str]], paused: str) -> int:
+    def _write_proof_due(self, repo: str, extra: List[Tuple[int, Sequence[str]]],
+                         paused: str) -> int:
         """Write the repo's rolling Proof due issue and return its number."""
         number = self._proof_due_issue(repo)
         body = evidence_close.proof_body(repo, self._evidence_state, extra,
@@ -17827,6 +17849,43 @@ class Station:
             # has a bug. Name the fault without logging private error details.
             _say("operator budget sampler failed: %s" % type(err).__name__)
 
+    def ask_operator_login(self) -> None:
+        """File one ask in the status repository once GitHub has answered 401
+        to the operator login on operator_budget.REJECTED_ASK reads in a row
+        (loom#3273): 35 passes failed that way on 2026-11-18 and nothing
+        surfaced it. No ask is filed while the last one filed is open or
+        cannot be read, and none on a pass that made no read."""
+        path = os.path.join(self.state, operator_budget.FILE)
+        state = operator_budget.load(path)
+        home, login = self.s.status_repo, tickets.operator_login(self.s.authors)
+        if (state.get("rejected", 0) < operator_budget.REJECTED_ASK
+                or state.get("attempted_at") != self.now or not home or not login):
+            return
+        try:
+            asked = state.get("ask")
+            if asked and (self._issue_state(home, asked) or ("",))[0] != "closed":
+                return
+            made = self.gh.rest("POST", "/repos/%s/issues" % home, {
+                "title": "Sign the operator login %s in again on the station" % login,
+                "body": "## Ask\nGitHub answered 401 to the operator login `%s` on %d station "
+                        "reads in a row, so the token the station holds for it is rejected. "
+                        "Sign that login in again on the station host (`gh auth login`), or "
+                        "say why its token is rejected. The pin pass and the operator budget "
+                        "sample use this login and fail until then."
+                        % (login, state["rejected"]),
+                "labels": [NEEDS_HUMAN]}).data
+            if not isinstance(made, dict) or "number" not in made:
+                raise GitHubError("no operator login ask was created in %s" % home)
+            state["ask"] = int(made["number"])
+            operator_budget.save(path, state)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            # The answer may quote a request; name the fault only.
+            _say("operator login ask could not be filed: %s" % type(err).__name__)
+            return
+        _say("asked for the operator login to be signed in again: %s#%d" % (home, state["ask"]))
+
     def capture_pod_logs(self) -> None:
         for source in self.s.log_sources:
             try:
@@ -17851,6 +17910,7 @@ class Station:
         # From loom#1915 until this change every such pass skipped them, and
         # no lane tree was pruned for hours on 2026-10-26.
         try:
+            self.ask_operator_login()
             self._publish_lanes_when_old()
             self.sync_labels()
             self.finish_claims()

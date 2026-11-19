@@ -39,6 +39,11 @@ def reply(status=200, body=None):
 
 # The open epic a brief files under (decision 0003): #2, under goal #1.
 EPIC = 2
+# The Loom App's bot login and a trusted briefer, the two kinds of login whose
+# tickets this Loom builds, and the marker bus/health.py writes into a ticket.
+LOOM_APP = "loom-app[bot]"
+BRIEFER = "dana-example"
+HEALTH_MARKER = health.MARKER % ("ab" * 20)
 
 
 def epic_issue(body="Done when: done.\n\nSize: S\n\nPart of #1\n", **extra):
@@ -5639,6 +5644,34 @@ class RepairBriefTests(unittest.TestCase):
     def brief(self, fake, **kw):
         return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex", **kw)
 
+    def copied(self, fake, **kw):
+        """A rewrite whose brief carries a health marker copied from its source."""
+        return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
+                           BODY + "\n\n" + HEALTH_MARKER, "codex", **kw)
+
+    @staticmethod
+    def at_cap(**extra):
+        """A goal cap of one, with the Loom App and one trusted briefer."""
+        return {"LOOM_GOAL_CAP": "1", "LOOM_BRIEF_AUTHORS": LOOM_APP,
+                "LOOM_TRUSTED_BRIEFERS": BRIEFER, **extra}
+
+    @staticmethod
+    def issue(number, login, labels=(), body="It is slow."):
+        return item(number, body, labels, user={"login": login},
+                    html_url="https://example.com/t/%d" % number)
+
+    @classmethod
+    def marked(cls, number, login, labels=(), body="It is slow."):
+        """An open issue by `login` whose body ends with a health marker."""
+        return cls.issue(number, login, labels, body + "\n\n" + HEALTH_MARKER)
+
+    @staticmethod
+    def fill_epics(fake):
+        """Leave the goal no room to open another intake epic."""
+        for n in range(20, 20 + brain.GOAL_EPIC_CAP - 1):
+            fake.issues[n] = epic_issue(number=n, id=1000 + n, title="Epic: work %d" % n)
+            fake.subs[1].append(n)
+
     def test_a_ticket_waiting_for_a_lane_does_not_fill_the_goal(self):
         fake = GoalRepo([item(10, labels=["loom:ticket", "loom:queued"]),
                          item(11, labels=["loom:ticket", "loom:briefed", "wait:lane"])])
@@ -5662,15 +5695,15 @@ class RepairBriefTests(unittest.TestCase):
 
     def test_health_findings_use_the_reserve_even_when_intake_cannot_open_an_epic(self):
         fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"])])
-        for n in range(20, 20 + brain.GOAL_EPIC_CAP - 1):
-            fake.issues[n] = epic_issue(number=n, id=1000 + n, title="Epic: work %d" % n)
-            fake.subs[1].append(n)
+        self.fill_epics(fake)
         gh = GitHub("t", transport=fake)
 
         def file_finding(key):
+            # As health.Intake._file briefs it: `health` is what says so.
             finding = health.Finding(key, "Slow search", "search", 3, 5, 15, "Reads stall.", "")
             return brain.brief_intake(gh, REPO, 1, health.ticket_title(finding),
-                                      health.ticket_body(finding), difficulty="medium")
+                                      health.ticket_body(finding), difficulty="medium",
+                                      health=True)
 
         with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
             for key in ("first", "second"):
@@ -5684,6 +5717,132 @@ class RepairBriefTests(unittest.TestCase):
         epics = [i for i in fake.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
         self.assertEqual(len(epics), 1)
         self.assertEqual(len(fake.subs[epics[0]["number"]]), 3)
+        for number in fake.subs[epics[0]["number"]]:
+            self.assertIn("loom:health", fake.names(number))
+
+    def test_health_intake_files_labelled_tickets_through_the_reserve(self):
+        # The real intake against the real brief: its own findings pass at
+        # the cap within the reserve, and its label is why.
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"])])
+        doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [
+            {"key": "slow:%s" % area, "title": "Reads of %s stall" % area, "area": area,
+             "affected": 3, "hours": 20.0, "evidence": "3 members waited over 5 seconds",
+             "since": "2030-01-01T00:00:00Z"} for area in ("search", "login", "billing")]}
+        said = []
+        intake = health.Intake(GitHub("t", transport=fake), {}, 1_900_000_000.0,
+                               "2030-01-02T00:00:00Z", said.append, read=lambda url: doc)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            intake.run([health.Source(REPO, 1, "https://health.example.test/api/health")])
+        filed = [c[2] for c in fake.created() if c[2]["title"].startswith("Health:")]
+        self.assertEqual(len(filed), 2, said)
+        for ticket in filed:
+            self.assertIn("loom:health", ticket["labels"])
+        self.assertEqual(sum("the repair reserve is full" in line for line in said), 1, said)
+
+    def test_only_a_label_admits_an_issue_to_the_reserve(self):
+        # A collaborator sets a label. The marker is text: anyone can paste
+        # it into an issue, and a rewrite by a trusted login can copy it.
+        self.assertTrue(brain.goal_cap_repair(self.issue(11, "someone", ["loom:factory"])))
+        self.assertTrue(brain.goal_cap_repair(self.issue(11, LOOM_APP, ["loom:health"])))
+        for login in ("someone", BRIEFER, LOOM_APP):
+            self.assertFalse(brain.goal_cap_repair(self.marked(11, login)), login)
+        rewritten = self.marked(11, LOOM_APP, body="It is slow.\n\nRewritten from issue 9.")
+        self.assertFalse(brain.goal_cap_repair(rewritten))
+
+    def test_a_rewrite_of_a_strangers_marked_issue_gets_no_reserve(self):
+        # The trusted login that rewrites it copies the marker into its brief.
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"]),
+                         self.marked(11, "someone")])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            with self.assertRaisesRegex(ValueError, "ordinary briefs wait for a slot"):
+                self.copied(fake, refs=11)
+        self.assertEqual(fake.created(), [])
+        self.assertEqual(fake.comments, [])
+
+    def test_a_trusted_logins_copy_of_a_marker_gets_no_reserve(self):
+        # Author and marker text together are still no proof: the ticket a
+        # trusted briefer or the Loom App wrote from a stranger's issue
+        # carries the stranger's words.
+        for login in (BRIEFER, LOOM_APP):
+            copy = self.marked(11, login, body="It is slow.\n\nRewritten from issue 9.")
+            fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"]), copy])
+            with unittest.mock.patch.dict(os.environ, self.at_cap()):
+                with self.assertRaisesRegex(ValueError, "ordinary briefs wait for a slot"):
+                    self.copied(fake, refs=11)
+            self.assertNotIn("loom:ticket", fake.names(11), login)
+
+    def test_a_rewrite_drops_a_health_marker_copied_into_its_brief(self):
+        env = self.at_cap(LOOM_GOAL_CAP="16")
+        # Filed as a new ticket, for a stranger's issue.
+        fake = GoalRepo([self.marked(11, "someone")])
+        with unittest.mock.patch.dict(os.environ, env):
+            self.copied(fake, refs=11)
+        (made,) = fake.created()
+        self.assertNotIn("loom:health", made[2]["body"])
+        self.assertIn("Rewritten from issue 11.", made[2]["body"])
+        self.assertNotIn("loom:health", made[2]["labels"])
+        # In place, for a trusted briefer's issue: only the original text
+        # kept below the brief still has it.
+        fake = GoalRepo([self.marked(11, BRIEFER)])
+        with unittest.mock.patch.dict(os.environ, env):
+            self.copied(fake, refs=11)
+        body = fake.issues[11]["body"]
+        self.assertNotIn("loom:health", tickets.without_original(body))
+        self.assertIn(HEALTH_MARKER, body)
+        self.assertNotIn("loom:health", fake.names(11))
+
+    def test_a_health_intake_ticket_is_rewritten_through_the_reserve(self):
+        running = item(10, labels=["loom:ticket", "loom:running"])
+        # In place for a briefing login's ticket, which keeps its label.
+        fake = GoalRepo([running, self.issue(11, LOOM_APP, ["loom:health"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            self.assertEqual(self.brief(fake, refs=11), "https://example.com/t/11")
+        self.assertIn("loom:ticket", fake.names(11))
+        self.assertIn("loom:health", fake.names(11))
+        # As a new ticket otherwise, which carries the label over.
+        fake = GoalRepo([running, self.issue(11, "someone", ["loom:health"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            self.brief(fake, refs=11)
+        (made,) = fake.created()
+        self.assertIn("loom:health", made[2]["labels"])
+
+    def test_a_health_marker_does_not_reach_the_repairs_epic(self):
+        for login in ("someone", BRIEFER, LOOM_APP):
+            fake = GoalRepo([self.marked(11, login)])
+            self.fill_epics(fake)
+            gh = GitHub("t", transport=fake)
+            with unittest.mock.patch.dict(os.environ, self.at_cap(LOOM_GOAL_CAP="16")):
+                with self.assertRaises(brain.GoalEpicCapacityHeld, msg=login):
+                    brain.brief_intake(gh, REPO, 1, "Ticket", BODY + "\n\n" + HEALTH_MARKER,
+                                       refs=11)
+            self.assertEqual(fake.created(), [], login)
+            self.assertNotIn("loom:ticket", fake.names(11), login)
+
+    def test_a_health_intake_ticket_reaches_the_repairs_epic(self):
+        fake = GoalRepo([self.issue(11, LOOM_APP, ["loom:health"])])
+        self.fill_epics(fake)
+        gh = GitHub("t", transport=fake)
+        with unittest.mock.patch.dict(os.environ, self.at_cap(LOOM_GOAL_CAP="16")):
+            brain.brief_intake(gh, REPO, 1, "Ticket", BODY, refs=11)
+        (epic,) = [i for i in fake.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
+        self.assertEqual(fake.subs[epic["number"]], [11])
+
+    def test_only_a_labelled_held_ticket_uses_reserve_room(self):
+        held = ["loom:ticket", "loom:queued", "wait:lane"]
+        running = item(10, labels=["loom:ticket", "loom:running"])
+        # Marker text holds no room, whoever wrote the ticket.
+        for login in ("someone", LOOM_APP):
+            fake = GoalRepo([running, self.marked(11, login, held), self.marked(12, login, held),
+                             self.issue(13, LOOM_APP, ["loom:factory"])])
+            with unittest.mock.patch.dict(os.environ, self.at_cap()):
+                self.assertEqual(self.brief(fake, refs=13), "https://example.com/t/13", login)
+        # Two held tickets health intake filed fill the reserve.
+        fake = GoalRepo([running, *(self.issue(n, LOOM_APP, held + ["loom:health"])
+                                    for n in (11, 12)),
+                         self.issue(13, LOOM_APP, ["loom:factory"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            with self.assertRaisesRegex(ValueError, "the repair reserve is full"):
+                self.brief(fake, refs=13)
 
     def test_an_ordinary_brief_over_the_limit_is_refused(self):
         fake = self.over_limit()
