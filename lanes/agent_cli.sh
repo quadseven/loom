@@ -84,7 +84,7 @@ NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|net
 # When the provider says its limit lifts: an epoch after "limit reached|" or a
 # "reset" key, or a "retry after" / "try again in" / "resets in" duration.
 EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
-AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
+AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^0-9a-z]|$)'
 # A daily allowance with no reset time given lifts at the next midnight UTC
 # (Workers AI: "used up your daily free allocation of 10,000 neurons";
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,

@@ -6985,6 +6985,15 @@ exit %d
         self.run_lane(FAKE_AGENT="say", FAKE_OUT="status 429: retry after 120 seconds")
         self.assertTrue(before + 120 <= self.beat()["retry_at"] <= int(time.time()) + 120)
 
+    def test_a_retry_after_header_uses_all_duration_digits(self):
+        before = int(time.time())
+        self.drop_brief()
+        result = self.run_lane(FAKE_AGENT="say", FAKE_OUT="HTTP 429: Retry-After: 740")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retry_at = self.beat()["retry_at"]
+        self.assertGreaterEqual(retry_at, before + 740)
+        self.assertLessEqual(retry_at, int(time.time()) + 740)
+
     def test_a_lane_takes_work_again_once_its_retry_time_passed(self):
         usage = self.loom / "state" / "usage"
         usage.mkdir(parents=True)
