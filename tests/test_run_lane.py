@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
@@ -6660,7 +6661,8 @@ exit %d
 
     def test_a_pass_writes_a_fresh_available_heartbeat(self):
         before = int(time.time())
-        self.run_lane()
+        self.run_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
         self.assertEqual(beat["lane"], "codex")
@@ -8616,7 +8618,7 @@ echo fixed > fix.txt
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
             ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
-            env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
+            env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
                  "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -8627,6 +8629,44 @@ echo fixed > fix.txt
         fresh.write_text(f"{one} {five} 1.00 1/100 1\n")
         fresh.replace(path)
         return path
+
+    def wait_for_run_text(self, path, text, run):
+        deadline = time.monotonic() + 30
+        while not (path.exists() and text in path.read_text()):
+            self.assertFalse(run.done(), "lane finished before " + text)
+            self.assertLess(time.monotonic(), deadline, text)
+            time.sleep(0.05)
+
+    def test_agent_starts_when_each_enabled_load_limit_clears(self):
+        for one, five, name in [(24, 0, "1-minute"), (0, 18, "5-minute")]:
+            with self.subTest(limit=name):
+                self.drop_brief()
+                log = self.loom / "logs" / "codex" / "T042-fix-the-thing.log"
+                with ThreadPoolExecutor(1) as pool:
+                    run = pool.submit(self.run_lane, LOOM_CHECK_LOAD_1M=str(one),
+                                      LOOM_CHECK_LOAD_5M=str(five), LOOM_CHECK_SLOT_POLL="0.1",
+                                      LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)))
+                    try:
+                        self.wait_for_run_text(log, name + " load", run)
+                        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                        self.assertTrue((self.loom / "state/usage/codex.alive").exists())
+                    finally:
+                        self.load_file(one or 90, five or 90)
+                    self.assertEqual(run.result().returncode, 0)
+                self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+                self.log.write_text("")
+
+    def test_agent_load_timeout_leaves_the_same_brief_for_the_next_pass(self):
+        self.drop_brief()
+        result = self.run_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 0)),
+                               LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+        self.assertFalse(list((self.inbox / "failed").iterdir()))
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("load", self.run_log())
+        self.assertEqual(self.run_lane().returncode, 0)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
 
     def wait_for_slot_log(self, text, seconds=20):
         log = Path(self._tmp.name) / "slots.log"
@@ -8682,7 +8722,7 @@ echo fixed > fix.txt
         text = RUNNER.read_text()
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         out = subprocess.run(["bash", "-c", funcs + 'echo "$CHECK_LOAD_1M $CHECK_LOAD_5M"\n'],
-                             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom)},
+                             env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom)},
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(out.stdout.strip(), "24 18", out.stderr)
 
@@ -8750,7 +8790,7 @@ echo fixed > fix.txt
     def test_a_lane_whose_load_wait_runs_out_parks_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
-        self.drop_brief()
+        self.drop_brief(text=self.BASE_CHECK_BRIEF)
         load = self.load_file("31.50", "2.00")
         result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
                                         LOOM_CHECK_SLOT_POLL="0.2", LOOM_CHECK_LOAD_FILE=str(load),

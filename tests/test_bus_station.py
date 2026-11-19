@@ -618,6 +618,9 @@ class Base(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = FakeGitHub()
+        limits = mock.patch.dict(os.environ, LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="0")
+        limits.start()
+        self.addCleanup(limits.stop)
         # No free-space floor: a pass here must not depend on the host's free
         # disk (loom#2403). The disk-guard tests set their own floor.
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
@@ -5341,6 +5344,20 @@ class ClaimTest(Base):
     def setUp(self):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
+
+    def test_local_claim_waits_until_the_host_load_falls(self):
+        load = Path(self.home) / "loadavg"
+        load.write_text("2 19 1\n")
+        self.fake.add(12)
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load),
+                             LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="18"):
+            self.run_pass()
+            self.assertIn("loom:briefed", self.fake.names(12))
+            self.assertEqual(self.listing(), [])
+            load.write_text("90 18 1\n")
+            self.run_pass()
+            self.assertIn("loom:running", self.fake.names(12))
+            self.assertEqual(self.listing(), ["example-owner.example-repo-12.md"])
 
     def test_a_mismatched_model_moves_to_a_compatible_lane_before_claim(self):
         self.heartbeat("opencode-go-3")

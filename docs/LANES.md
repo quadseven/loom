@@ -244,6 +244,14 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Before claiming a ticket for a local lane, the station checks the same
+  host load limits as lane checks. A high reading leaves the ticket for
+  the next station pass. The local runner checks before preparing a brief
+  and again before starting its agent. It polls every
+  `LOOM_CHECK_SLOT_POLL` seconds (default 5) with its keepalive running.
+  After `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) it leaves the same
+  brief in the inbox for the next pass. Heartbeats, brief handoffs and
+  cluster agent starts proceed independently of this gate.
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
   hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
