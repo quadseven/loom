@@ -2405,6 +2405,7 @@ class Station:
         self.s = settings
         self._live_budget = LIVE_CHECKS_PER_PASS
         self._proof_budget = LIVE_PROOFS_PER_PASS
+        self._evidence: Optional[evidence_close.Pass] = None
         # Rewrite agent jobs this pass started, by issue (_start_rewrite).
         self._rewrite_procs: Dict[str, Any] = {}
         self.read_secret = read_secret or read_ssm
@@ -2480,6 +2481,7 @@ class Station:
         # the hand-revert scan reads the same pages as the ship checks.
         self._closed_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._closed_complete: Dict[str, bool] = {}
+        self._unmerged_refs: Dict[str, Set[int]] = {}
         # The claimed settle's re-review requests, by "repo#pull request", as
         # saved in claimed.json, and how many it has written this run.
         self._claimed_rereviews: Dict[str, Any] = {}
@@ -4758,7 +4760,8 @@ class Station:
                  % (repo, issue.get("number"), error))
         return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
 
-    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True
+    def _merged_pull_facts(self, repo: str, issue: Dict[str, Any], files: bool = True,
+                           linked: Optional[List[Dict[str, Any]]] = None
                            ) -> Tuple[str, List[Dict[str, Any]], str]:
         """(default branch, merged pull requests, error) for a ticket: its
         pull requests linked the way reconcile links them, newest first, the
@@ -4771,8 +4774,9 @@ class Station:
         read: List[Dict[str, Any]] = []
         try:
             branch = self._default_branch(repo)
-            linked = sorted((dict(pr) for pr in self._closed_pulls(repo)
-                             if _covers_pr(issue, repo, pr)),
+            if linked is None:
+                linked = [pr for pr in self._closed_pulls(repo) if _covers_pr(issue, repo, pr)]
+            linked = sorted((dict(pr) for pr in linked),
                             key=lambda pr: str(pr.get("merged_at") or ""), reverse=True)
             # Only the pull requests the section shows are read in full.
             for pr in linked[:verify_data.MAX_PULLS]:
@@ -7034,18 +7038,24 @@ class Station:
         requests survives."""
         if repo not in self._closed_cache:
             pulls: List[Dict[str, Any]] = []
+            unmerged: Set[int] = set()
             complete = True
             url: Optional[str] = ("/repos/%s/pulls?state=closed&sort=updated"
                                   "&direction=desc&per_page=100" % repo)
             for page in range(SHIP_PAGES):
                 resp = self.gh.rest("GET", url)
                 merged, known = self._closed_page(resp.data)
+                if isinstance(resp.data, list):
+                    for pr in resp.data:
+                        if isinstance(pr, dict) and not pr.get("merged_at"):
+                            unmerged.update(_refs_numbers(repo, str(pr.get("body") or "")))
                 pulls.extend(merged)
                 url, pagination_known = self._closed_next(repo, resp, page)
                 complete = complete and known and pagination_known
                 if not url:
                     break
             self._closed_complete[repo] = complete and not url
+            self._unmerged_refs[repo] = unmerged
             self._closed_cache[repo] = pulls
         return self._closed_cache[repo]
 
@@ -12202,9 +12212,8 @@ class Station:
         proof due first (_evidence_close, bus/evidence_close.py)."""
         if self._deferred():
             return
-        self._live_budget = LIVE_CHECKS_PER_PASS
-        self._proof_budget = LIVE_PROOFS_PER_PASS
-        self._evidence = self._evidence_pass()
+        if self._evidence is None:
+            self._evidence = self._evidence_pass()
         try:
             self._close_done_repos(CLOSE_DONE_PER_PASS)
         finally:
@@ -12317,7 +12326,8 @@ class Station:
         except GitHubError as err:
             _say("could not write the evidence close pause: %s" % err)
 
-    def _evidence_close(self, repo: str, issue: Dict[str, Any]) -> str:
+    def _evidence_close(self, repo: str, issue: Dict[str, Any],
+                        linked: Optional[List[Dict[str, Any]]] = None) -> str:
         """The evidence close of one ticket (bus/evidence_close.py): CLOSED
         when it closed, WAIT when it stays for a later pass with no other
         close path run on it, OTHER when the usual done close decides."""
@@ -12325,27 +12335,93 @@ class Station:
         boxes = evidence_close.boxes(str(issue.get("body") or ""))
         names = _label_names(issue)
         ticket = "%s#%d" % (repo, int(issue["number"]))
-        state = self._evidence_state
         if (run.paused or not boxes or evidence_close.label_hold(names)
-                or evidence_close.refused_recently(state, ticket, self.now)
-                or self._live_has_own_proof(repo, issue, boxes)):
+                or evidence_close.refused_recently(self._evidence_state, ticket, self.now)):
+            return evidence_close.OTHER
+        if linked is None and ("loom:shipped" not in names
+                               or self._live_has_own_proof(repo, issue, boxes)):
             return evidence_close.OTHER
         if min(run.left) <= 0:
             run.counts["waiting"] += 1
             return evidence_close.WAIT
         run.left[1] -= 1
         run.counts["read"] += 1
-        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        branch, pulls, error = self._merged_pull_facts(repo, issue, linked=linked)
         verdict, why = evidence_close.pulls_verdict(pulls, error)
         if verdict == evidence_close.WAIT:
             return verdict
         why = why or evidence_close.tier_refusal(repo, pulls, str(issue.get("body") or "")) \
-            or self._symbol_refusal(repo, branch, pulls) or self._unmeetable_refusal(repo, issue)
+            or self._symbol_refusal(repo, branch, pulls)
+        if not why and linked is not None:
+            return self._close_claimed_live(repo, issue, branch, pulls, boxes)
+        why = why or self._unmeetable_refusal(repo, issue)
         if why:
-            evidence_close.note_refused(state, ticket, why, self.now)
-            _say("evidence close: not closing %s: %s" % (ticket, why))
-            return evidence_close.OTHER
+            return self._refuse_evidence(repo, issue, why)
         return self._close_unproven(repo, issue, boxes)
+
+    def _refuse_evidence(self, repo: str, issue: Dict[str, Any], why: str) -> str:
+        ticket = "%s#%d" % (repo, int(issue["number"]))
+        evidence_close.note_refused(self._evidence_state, ticket, why, self.now)
+        _say("evidence close: not closing %s: %s" % (ticket, why))
+        return evidence_close.OTHER
+
+    def _close_claimed_live(self, repo: str, issue: Dict[str, Any], branch: str,
+                            pulls: List[Dict[str, Any]], boxes: Sequence[str]) -> str:
+        closed = self._closed_pulls(repo)
+        if any(self._reverted(repo, pr, closed, quote(branch, safe="/")) for pr in pulls):
+            return self._refuse_evidence(repo, issue, "a linked pull request was reverted")
+        remaining = self._claimed_live_checks(repo, issue, boxes, pulls)
+        if remaining is None:
+            return evidence_close.WAIT
+        if not remaining:
+            reason = "Closed after its merge and live checks passed."
+            return (evidence_close.CLOSED if self._close_done_ticket(repo, issue, reason)
+                    else evidence_close.WAIT)
+        live = brain.live_criterion(issue.get("body"), limit=None)
+        if live in (" ".join(box.split()) for box in remaining):
+            why = self._unmeetable_refusal(repo, issue)
+            if why:
+                return self._refuse_evidence(repo, issue, why)
+        return self._close_unproven(repo, issue, remaining)
+
+    def _claimed_live_checks(self, repo: str, issue: Dict[str, Any], boxes: Sequence[str],
+                             pulls: Sequence[Dict[str, Any]]) -> Optional[List[str]]:
+        """Run the claim's due read-only checks. A failed or deferred check holds the issue."""
+        sources = self._proof_sources(repo)
+        unchecked = []
+        newest = pulls[0]  # _merged_pull_facts returns the newest merge first.
+        since = metrics.stamp(newest["merged_at"])
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, issue["number"]), {})
+        for box in boxes:
+            if _live_time_window(box):
+                return None
+            if criteria_gate.check_of(box) is None and not self._station_step(box, sources):
+                unchecked.append(box)
+                continue
+            # As on the ticket path, only a trusted author can supply a check to run.
+            if not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers):
+                return None
+            step, _ = live_proof.step_of(box)
+            if step is None or (step.hours and self.now < since + step.hours * 3600):
+                return None
+            key = criteria_gate.key(box)
+            last = mine.get(key, {})
+            if last.get("revision") == newest["merge_commit_sha"]:
+                if last.get("result") == "pass":
+                    continue
+                if self.now - last["at"] < LIVE_CHECK_RETRY:
+                    return None
+            if self._live_budget <= 0:
+                return None
+            self._live_budget -= 1
+            passed, seen = live_proof.run(step, since, sources, now=self.now)
+            mine[key] = {"result": "pass" if passed else "fail", "at": self.now,
+                         "seen": seen, "revision": newest["merge_commit_sha"]}
+            _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+            if not passed:
+                return None
+        return unchecked
 
     def _live_has_own_proof(self, repo: str, issue: Dict[str, Any],
                             boxes: Sequence[str]) -> bool:
@@ -12826,9 +12902,14 @@ class Station:
             if held["new"]:
                 _say("shadow mode: would close done %s#%d (%s)" % (repo, number, reason))
             return False
-        branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
-        if error:
-            _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+        shipped = "loom:shipped" in _label_names(issue)
+        listed_claim = unproven and not shipped
+        if shipped:
+            branch, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+            if error:
+                _say("could not read the checks of done %s#%d: %s" % (repo, number, error))
+            reason = ("Closed: %s. %s Not verified live; its criteria were not ticked "
+                      "one by one." % (reason, verify_data.close_facts(branch, pulls, error)))
         try:
             # force-close is the close-completeness guard's escape hatch:
             # this close is by rule, not a claim that each box was seen to
@@ -12836,10 +12917,8 @@ class Station:
             # each with an email (2026-10-19).
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": marks})
-            closing.close(self.gh, repo, number,
-                          "Closed: %s. %s Not verified live; its criteria were not ticked "
-                          "one by one." % (reason, verify_data.close_facts(branch, pulls, error)),
-                          "completed")
+            # For a claimed evidence close, Proof due already carries the public reason.
+            closing.close(self.gh, repo, number, reason, "completed", said=listed_claim)
             kept = brain.closing_labels(_label_names(issue), self.s.authors)
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept + [m for m in marks if m not in kept]})
@@ -13014,6 +13093,8 @@ class Station:
         finally:
             self._stamp_every(state, mark)
             _write_json(path, state)
+            if self._evidence is not None and self._evidence_state is not None:
+                _write_json(self._evidence_path(), self._evidence_state)
 
     def queue_stateless_tickets(self) -> None:
         """Queue each open loom:ticket issue that carries no state label and
@@ -13653,12 +13734,23 @@ class Station:
         it was settled. One issue GitHub or the text checks refuse is logged
         and skipped; it does not stop the others."""
         number = int(issue["number"])
+        body = str(issue.get("body") or "")
+        if criteria_gate.open_operator_criteria(body) or evidence_close.label_hold(_label_names(issue)):
+            return 0
         pulls = [pr for pr in self._closed_pulls(repo)
                  if number in _refs_numbers(repo, str(pr.get("body") or ""))]
-        if not pulls or len(pulls) > claimed.MAX_PULLS:
+        if not pulls or len(pulls) > claimed.MAX_PULLS or number in self._unmerged_refs[repo]:
             return 0
-        branch = self._default_branch(repo)
         try:
+            if self.s.settle_claimed == "on" and evidence_close.boxes(body):
+                if self._evidence is None:
+                    self._evidence = self._evidence_pass()
+                verdict = self._evidence_close(repo, issue, linked=pulls)
+                if verdict != evidence_close.OTHER:
+                    return int(verdict == evidence_close.CLOSED)
+            if claimed.LIVE_LABEL in _label_names(issue):
+                return 0
+            branch = self._default_branch(repo)
             checked = self._claimed_pulls(repo, number, branch, pulls, pacer)
             if checked is None:
                 return 0
@@ -13796,7 +13888,7 @@ class Station:
         number = int(issue["number"])
         body = str(issue.get("body") or "")
         act = self.s.settle_claimed == "on"
-        live = claimed.live_boxes(body)
+        live = evidence_close.boxes(body) or claimed.live_boxes(body)
         if live:
             if act:
                 pacer.wait()
