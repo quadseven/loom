@@ -618,9 +618,6 @@ class Base(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.home = os.path.join(self._tmp.name, "loom")
         self.fake = FakeGitHub()
-        limits = mock.patch.dict(os.environ, LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="0")
-        limits.start()
-        self.addCleanup(limits.stop)
         # No free-space floor: a pass here must not depend on the host's free
         # disk (loom#2403). The disk-guard tests set their own floor.
         self.settings = station.Settings(self.home, [REPO], list(AUTHORS), list(OWNERS),
@@ -5347,7 +5344,24 @@ class ClaimTest(Base):
         super().setUp()
         self.fake.default_body = BODY_WITH_CRITERIA
 
+    def test_a_station_built_by_hand_claims_whatever_the_host_load(self):
+        """A test must not depend on the load of the machine it runs on: only a
+        station whose settings came from the environment reads it. On a busy CI
+        runner and on the lane host itself, the claim tests failed (2026-11-19)."""
+        load = Path(self.home) / "loadavg"
+        load.write_text("90 90 90\n")
+        self.fake.add(12)
+        self.assertFalse(self.settings.host_load_gate)
+        with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load),
+                             LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18"):
+            self.run_pass()
+        self.assertIn("loom:running", self.fake.names(12))
+
+    def test_settings_read_from_the_environment_turn_the_host_load_gate_on(self):
+        self.assertTrue(station.Settings.from_env({"LOOM_HOME": self.home}).host_load_gate)
+
     def test_local_claim_waits_until_the_host_load_falls(self):
+        self.settings.host_load_gate = True
         load = Path(self.home) / "loadavg"
         load.write_text("2 19 1\n")
         self.fake.add(12)
@@ -5931,6 +5945,7 @@ class ClaimTest(Base):
         name = "example-owner.example-repo-12"
         self.write(self.inbox("codex", name + ".claiming"),
                    tickets.render_brief(REPO, self.fake.issues[12], "codex", 1))
+        self.settings.host_load_gate = True
         load = Path(self.home) / "loadavg"
         load.write_text("90 90 1\n")
         with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):
@@ -16098,6 +16113,7 @@ class RunnerSlotClaimTest(Base):
 
     def test_a_public_ticket_labeled_for_a_runner_slot_is_claimed_there(self):
         self.fake.private = False
+        self.settings.host_load_gate = True
         load = Path(self.home) / "loadavg"
         load.write_text("90 90 1\n")
         with mock.patch.dict(os.environ, LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_1M="24"):

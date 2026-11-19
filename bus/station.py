@@ -1186,8 +1186,14 @@ class Settings:
                  log_sources: Sequence[log_capture.Source] = (),
                  log_capture_hours: float = log_capture.DEFAULT_RETENTION_HOURS,
                  metrics_reserve: int = metrics.REQUEST_RESERVE,
-                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
+                 metrics_seconds: float = metrics.STEP_SECONDS,
+                 host_load_gate: bool = False) -> None:
         self.home = home
+        # The host load check before a local claim (lanes/host_load.sh,
+        # loom#3303): off for a Settings built in code, so a test never
+        # depends on the load of the machine it runs on; from_env turns it on
+        # and LOOM_CHECK_LOAD_1M / LOOM_CHECK_LOAD_5M set its limits.
+        self.host_load_gate = host_load_gate
         self.log_sources = log_sources
         self.log_capture_hours = log_capture_hours
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
@@ -1440,7 +1446,8 @@ class Settings:
                    repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
                    pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
-                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")),
+                   host_load_gate=True)
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -3869,9 +3876,12 @@ class Station:
         hold["limit"] = limit
         hold["tickets"][int(issue["number"])] = str(issue.get("title") or "")
 
-    @staticmethod
-    def _host_load_holds(lane: str) -> bool:
-        if lane in runners.runner_slots() or lane in REMOTE_LANES:
+    def _host_load_holds(self, lane: str) -> bool:
+        """True while the host is too loaded for a local lane to take a
+        ticket. Only a station whose settings came from the environment
+        asks (Settings.host_load_gate); runner slots and remote lanes do
+        their work elsewhere and are never held."""
+        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
             return False
         script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
         note = subprocess.check_output(["/bin/bash", script], text=True).strip()
