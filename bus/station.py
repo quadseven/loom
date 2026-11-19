@@ -13882,8 +13882,12 @@ class Station:
         """Ask the rewrite command for a new Live line and write it."""
         prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
                   'with "action":"restate" and a "line" string: one complete Live: '
-                  "line naming an exact string the merged pull request makes the live "
-                  "system print or serve. "
+                  "line naming a read-only check Loom can run by itself on what the "
+                  "merged pull request changed: an `https://` URL, a `gh api <path>` "
+                  "read, a read-only `kubectl get ...` or `kubectl rollout status ...`, "
+                  "a `log:<source>` step for the repo's adapter, or a quoted log string "
+                  'with a time window ("within 24 hours"). A quoted string alone is not '
+                  "a check. "
                   "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
                   (issue.get("title", ""), issue.get("body", "")))
         try:
