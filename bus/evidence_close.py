@@ -13,6 +13,10 @@ throwaway environment at build time, not in a live observation after the
 fact. A step only a person can take still keeps a ticket open. Every other
 close keeps the 2026-10-22 rule.
 
+Claimed issues with live boxes use the same merge checks, Proof due issue,
+budget and reopen count as shipped tickets. The claimed sweep passes the
+pull requests whose Refs lines name the issue.
+
 A ticket closes here only when all of these hold (`boxes`, `label_hold`,
 `pulls_verdict`, `tier_refusal`, `symbol_refusal`; the station reads the rest,
 bus/station.py _evidence_close):
@@ -202,7 +206,7 @@ def boxes(body: str) -> List[str]:
 def label_hold(names: Iterable[str]) -> bool:
     """Whether a ticket's labels keep it out of this close."""
     have = set(names)
-    return ("loom:shipped" not in have or bool(have & set(HOLD_LABELS))
+    return (bool(have & set(HOLD_LABELS))
             or labels.needs_human(have)
             or any(n.startswith("wait:") and n != LIVE_EVENT_WAIT for n in have))
 

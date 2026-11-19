@@ -825,31 +825,30 @@ files or claims (a `claim:<login>` label, no `loom:` label) had nothing to
 close it once its pull request merged: about 60 stayed open in one day
 (loom#1204). Once an hour the station reads each open issue carrying a
 `claim:` label (`bus/claimed.py`). It leaves alone any issue with a `loom:`,
-`needs:`, `needs-`, `ready-for-human`, `wontfix` or `awaiting-live-check`
-label, an epic (`epic` label, an `Epic:` title or sub-issues), and one with
-no acceptance boxes. The rest settle only when every pull request whose
-`Refs` line names the issue is merged into the default branch, the review
-check (`LOOM_REVIEW_CHECK`) concluded success on its head (neutral is not a
-pass), every other check on the head concluded success, skipped or neutral
-(the review bot's other checks conclude neutral when they have nothing to say),
-and no open pull request names the issue. Then:
+`needs:`, `needs-`, `ready-for-human` or `wontfix` label, an epic (`epic`
+label, an `Epic:` title or sub-issues), and one with no acceptance boxes.
+An unticked operator or decision box also keeps the issue open. With settlement on, the station considers issues with unticked
+live boxes for the evidence close below, including issues already labeled
+`awaiting-live-check`. Ordinary claimed settlement requires every pull request
+whose `Refs` line names the issue to have merged into the default branch. The
+review check (`LOOM_REVIEW_CHECK`) must have succeeded on its head. Each other head
+check must have concluded success, skipped or neutral.
 
 - **Every box asks for merged code or tests:** one comment starting
   `<!-- loom:claimed-settle v1 -->` states each pull request, its merge
   commit, each head check's conclusion by name, and the test functions it
   added that the default branch still defines; the boxes are ticked and the
   issue is closed as completed. A comment already there is not posted again.
-- **A box asks for live, deployed or production behaviour, a time window or
+- **A box asks for live, deployed or production behavior, a time window or
   an observed event:** the issue gets the `awaiting-live-check` label once and
-  stays open for a person. The test is wide on purpose: a box wrongly read as
-  live only labels the issue.
+  stays open until a later pass can settle it.
 
 `LOOM_SETTLE_CLAIMED` picks the mode. Unset or `dry` (the default) logs
 `settle-claimed: would close OWNER/NAME#N ...` or `would label ...` and writes
 nothing, so a dry run can be read in the station log first; `on` writes; `off`
 skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
-a run, and writes are at least 3 seconds apart. Turning writes on is the
-operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
+a run. Ordinary settlement writes are at least 3 seconds apart. To turn
+on writes, the operator must set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
 
 A pull request that merged with the review check neutral (the review degraded)
 can never pass that gate, so its issue would stay open with its work merged
@@ -2508,8 +2507,16 @@ that run in CI or a throwaway environment at build time, not in a live
 observation after the fact. A step only a person can take still keeps a
 ticket open.
 
-The station closes a `loom:shipped` ticket with its live boxes unproven when
-all of these hold:
+The evidence close applies to both a `loom:shipped` ticket and a claimed
+issue with unticked live boxes. The hourly claimed sweep uses each pull
+request's `Refs` line. An open or unmerged pull request naming the issue
+keeps it open, even when another has merged. The station runs checks supplied by trusted authors first.
+A runnable check from another author keeps the issue open. A failed or deferred check holds it open.
+If some boxes still lack a runnable check, the station lists only those
+boxes in Proof due before closing the issue as `closed-unproven`. That
+entry is the close reason. The station posts no comment on the issue.
+
+Both paths apply the following checks.
 
 - every unticked box is a live or a code box (`bus/criteria_gate.py`, `kind`),
   any number of them and at least one live; an unticked operator or decision
@@ -2523,14 +2530,13 @@ all of these hold:
 - every pull request's tier is below deploy-config;
 - each symbol a pull request added is still defined on the default branch,
   and each one it removed is still gone, read from the file itself;
-- Loom has no check of its own for any unticked live box (a station proof, a
-  runnable check or a time window): a box with one keeps that path first, and
-  its ticket with it;
+- each live box listed in Proof due has no station proof, runnable check
+  or time window outstanding;
 - the ticket's Live line, when it has one, is known to be meetable
   (`bus/unmeetable.py` reads that one line; a live box beside it is not
   looked up).
 
-For each ticket within the read budget, the station reads its timeline once.
+For each shipped ticket within the read budget, the station reads its timeline once.
 It takes same-repo pull request numbers from cross-references, connected events
 and the lane's opening notice in the ticket's status comment or body. It reads
 those pull requests directly and checks that they cover the ticket. If the
@@ -2543,14 +2549,14 @@ Checks still running leave the ticket for a later pass with no ask.
 
 The close carries `closed-unproven` and `force-close`, and is the one close
 that passes through shadow. The station names the ticket in code, so no label
-or `gh` call can ask for it. Merges stay held. Every unticked live box is
+or `gh` call can ask for it. Merges stay held. Every unproven live box is
 first written into the repo's one rolling Proof due issue, edited in place, so
 nothing closes unlisted. An unticked code box is not listed: the merged change
 is its evidence. The close makes no AI call.
 
-At most 10 closes and 20 tickets read a pass, and 150 closes a day (3, 6 and
-10 before the 2026-11-19 ruling). Each pass that reads one logs its counts and
-these bounds in one `evidence close:` line. The Proof due issue shows the
+Shipped tickets and claimed issues share one budget of 10 evidence closes
+and 20 reads per pass and 150 evidence closes per day. Reopens of either
+kind count toward the same guardrail. The Proof due issue shows the
 newest 150 boxes and counts the older ones.
 
 Reopens stay at or below 5% of evidence closes in the last seven days.
@@ -2822,6 +2828,14 @@ still shows until the item itself reads as finished or closed. Within a repo, th
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.
+
+A ticket filed from here on names the test that proves it in an acceptance
+box, and carries a Live box only when the box names a read-only check Loom
+can run by itself (docs/BRIEF_FORMAT.md lists the forms). The `brief`
+command, the rewrite and a restated Live line are all held to this, so the
+"Verify due" list below stops filling with boxes nobody can prove. The
+restate prompt asks the rewrite command for such a check, never for a quoted
+string alone.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it

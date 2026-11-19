@@ -428,14 +428,21 @@ class Guardrail(Case):
         self.assertIn("at most 10 closes and 20 reads a pass, 150 closes a day", line[0])
         self.assertIn("2 waiting", line[0])
 
-    def test_the_reads_of_a_pass_are_bounded(self):
-        for number in range(1, 23):
-            self.ticket(number, conclusion="failure")
+    def test_the_timeline_reads_of_a_pass_are_bounded(self):
+        for number in range(1, 22):
+            conclusion = "success" if number in (1, 20, 21) else "failure"
+            self.ticket(number, body=MANY, conclusion=conclusion)
+            self.fake.ticket_links[number] = [{"__typename": "CrossReferencedEvent", "source": {
+                "__typename": "PullRequest", "number": 100 + number,
+                "repository": {"nameWithOwner": REPO}}}]
         said = self.close_pass()
+        self.assertEqual(self.fake.timeline_reads, list(range(1, 21)))
+        self.assertIn("/repos/%s/pulls/120" % REPO, self.fake.paths("GET"))
+        self.assertNotIn("/repos/%s/pulls/121" % REPO, self.fake.paths("GET"))
+        self.assertIn(LABEL, self.fake.names(20))
+        self.assertEqual(self.fake.issues[21]["state"], "open")
         [line] = [s for s in said if "at most" in s]
-        self.assertIn("0 closed, 20 read, 2 waiting", line)
-        self.assertEqual(len(self.fake.timeline_reads), 20)
-        self.assertEqual(len(set(self.fake.timeline_reads)), 20)
+        self.assertIn("2 closed, 20 read, 1 waiting", line)
 
     def test_the_day_is_bounded(self):
         now = time.time()
