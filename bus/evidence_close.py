@@ -149,7 +149,11 @@ def ticket_pull_numbers(gh: GitHub, repo: str, issue: Mapping[str, Any],
     for node in nodes:
         if not isinstance(node, dict):
             raise ValueError("unreadable timeline event")
-        for ref in (node.get("source") or {}, node.get("subject") or {}):
+        for ref in (node.get("source"), node.get("subject")):
+            if ref is None:
+                continue
+            if not isinstance(ref, dict):
+                raise ValueError("unreadable timeline reference")
             if (ref.get("__typename") == "PullRequest"
                     and ref["repository"]["nameWithOwner"].lower() == repo.lower()):
                 numbers.add(ref["number"])
