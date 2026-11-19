@@ -4684,6 +4684,22 @@ class VerifyDueTests(unittest.TestCase):
         self.assertEqual([8, 7, 6, 5, 4], found)
         self.assertIn("shipped 10h ago: Live: the dashboard", out)
 
+    def test_resume_hands_unclaimed_live_gaps_to_the_brain_before_a_day(self):
+        tickets = [self.issue(n, body="## Acceptance criteria\n- [ ] Tests")
+                   for n in range(1, 7)]
+        live = "Verify the deployed dashboard shows the new column."
+        tickets.append(self.issue(7, body="## Acceptance criteria\n- [ ] " + live))
+        claimed = self.issue(8, body=tickets[-1]["body"])
+        claimed["labels"].append({"name": "claim:another-brain"})
+        tickets.append(claimed)
+        now = self.NOW + timedelta(hours=12)
+        shipped = dict.fromkeys(range(1, 7), 0) | {7: 1, 8: 1}
+        out = "\n".join(brain._verify_resume_lines(self.gh(tickets, shipped), [REPO], now))
+        self.assertIn("resume verify %s#7 shipped 23h ago: %s" % (REPO, live), out)
+        self.assertNotIn("resume verify %s#8" % REPO, out)
+        self.assertIn("Read logs, the running system, or code", out)
+        self.assertIn("record what you observed", out)
+
     def test_status_prints_the_section(self):
         issues = [self.issue(5)]
         inner = self.gh(issues, {5: 6}).transport

@@ -4986,7 +4986,7 @@ class Station:
         if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
-            self._adapter_human_ask(repo, number, "no adapter_step was returned",
+            self._adapter_verify_gap(repo, number, "no adapter_step was returned",
                                     reason or "the verify answer did not contain a step")
             return True
         if result is not None and set(result) == {"adapter_step"}:
@@ -5028,34 +5028,14 @@ class Station:
                                  VERIFY_INTERVAL // 3600))
         return True
 
-    def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
-        """Ask once when an adapter verify run could not supply station proof."""
+    def _adapter_verify_gap(self, repo: str, number: int, step: str, reason: Any) -> None:
+        """Record a failed adapter proof for the verify queue."""
         issue = self._issue(repo, number)
-        names = _label_names(issue)
-        if needs_human(names):
+        if not _verify_active(issue):
             return
-        body = str(issue.get("body") or "")
-        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
-        if criteria_gate.live_wait(names, gaps, [body]):
-            # A LIVE WAIT IS NOT ON THE HUMAN LINE (loom#2872). A ticket that
-            # waits on a live event (a wait:* label, or awaiting-live-check or
-            # a stated waiting line with only live boxes open) stays shipped
-            # in the verify queue; the missing check is a status line, not a
-            # person label. Only a box that needs an operator action asks.
-            self._verify_note(repo, number, "adapter", "no read-only check named for its "
-                              "live wait (%s: %s)" % (self._note_text(step),
-                                                      self._note_text(reason)))
-            return
-        if self._asked_already(repo, number, body, gaps):
-            # Asked for these same criteria and a brain or operator took the
-            # label off: it is not added back until the criteria change.
-            return
-        ask = ("Kind: decision\nThe station could not verify the prose Live criterion. "
-               "Step tried: %s. Reason: %s. Restate the criterion with a safe "
-               "read-only check or resolve it by hand." %
-               (self._note_text(step), self._note_text(reason)))
-        brain.human(self.gh, repo, number, ask)
-        self._record_ask(repo, number, body)
+        self._note_missing_live(repo, number, "adapter proof (%s): %s" %
+                                (self._note_text(step), self._note_text(reason)))
+        self._ask_operator_criteria(repo, issue)
 
     def _apply_adapter_verify(self, repo: str, number: int, answer: Any) -> None:
         """Run a verify lane's proposed adapter step and close only on its own read."""
@@ -5075,7 +5055,7 @@ class Station:
                              live: str) -> Optional[live_proof.Step]:
         """Validate a lane's proposed adapter step without trusting its result."""
         if not isinstance(answer, dict) or set(answer) != {"criterion", "step", "strings"}:
-            self._adapter_human_ask(repo, number, "invalid adapter_step", "the answer shape is invalid")
+            self._adapter_verify_gap(repo, number, "invalid adapter_step", "the answer shape is invalid")
             return None
         strings = answer["strings"]
         if (answer["criterion"] != live or not isinstance(strings, list)
@@ -5083,13 +5063,13 @@ class Station:
                 or not all(isinstance(x, str) and x.isascii() and len(x) <= 120
                            and x.strip() and "\n" not in x and "\r" not in x
                            for x in strings)):
-            self._adapter_human_ask(repo, number, str(answer.get("step")),
+            self._adapter_verify_gap(repo, number, str(answer.get("step")),
                                     "the step needs this exact Live criterion and one to five "
                                     "short ASCII strings")
             return None
         raw = answer["step"]
         if not isinstance(raw, str) or ":" not in raw:
-            self._adapter_human_ask(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
+            self._adapter_verify_gap(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
             return None
         kind, target = raw.split(":", 1)
         strings = tuple(strings)
@@ -5098,7 +5078,7 @@ class Station:
                                    source=target)
         if kind == "sql":
             return live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
-        self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
+        self._adapter_verify_gap(repo, number, raw, "the step kind is unsupported")
         return None
 
     def _apply_adapter_step(self, repo: str, number: int, issue: Dict[str, Any],
@@ -5109,7 +5089,7 @@ class Station:
         passed, evidence_text = live_proof.run(step, self._shipped_stamp(repo, issue), sources,
                                                now=self.now)
         if not passed:
-            self._adapter_human_ask(repo, number, raw, evidence_text)
+            self._adapter_verify_gap(repo, number, raw, evidence_text)
             return
         outcome = live_proof.prove(body, self._shipped_stamp(repo, issue), sources,
                                    now=self.now, passed=self._live_passed(
@@ -5227,19 +5207,19 @@ class Station:
         verification before any build (_verify_before_build): the ticket goes
         back to loom:queued for a build, with the reason as a status event
         naming the pull request, and that pull request is not sent to a verify
-        run again (tickets.judged_pulls). Any other ticket stays shipped."""
+        run again (tickets.judged_pulls). Other tickets keep their finding in
+        the shipped verify queue."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
             _say("%s#%d is no longer shipped; its verify result is dropped" % (repo, number))
             return
-        sent = tickets.pending_verifies(self._status_texts(repo, number))
-        if not sent:
-            self._verify_note(repo, number, lane, "It said the merged change does not meet the "
-                              "criteria, but no merged pull request was sent to it before a build")
-            return
         if not isinstance(why, str) or len(why.strip()) < MISSING_MIN:
             self._verify_note(repo, number, lane, "Its unmet answer does not say what is unmet")
+            return
+        sent = tickets.pending_verifies(self._status_texts(repo, number))
+        if not sent:
+            self._routine(repo, number, "Verify finding: " + self._note_text(why))
             return
         states = {"loom:" + state for state in brain.STATES}
         labels = [n for n in names if n not in states and not n.startswith(WAIT)
@@ -11132,7 +11112,14 @@ class Station:
         """A person can act on this ask today: it is not answered in the
         ticket and waits on nothing else. The digest only reads; the label
         pass (clean_labels) takes the label off."""
-        return ask_state.state(issue, *self._ask_inputs(repo, issue)) == ask_state.OPEN
+        inputs = self._ask_inputs(repo, issue)
+        comments, _, trusted, _, _, _ = inputs
+        if "loom:shipped" in _label_names(issue) and not criteria_gate.open_operator_criteria(
+                str(issue.get("body") or "")):
+            latest = answer.latest_ask(comments, trusted)
+            if latest and criteria_gate.is_verification_ask(latest.get("body")):
+                return False
+        return ask_state.state(issue, *inputs) == ask_state.OPEN
 
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
@@ -12227,7 +12214,10 @@ class Station:
                 if verdict != evidence_close.OTHER:
                     continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
-                if not why or self._evidence_holds(repo, issue):
+                if not why:
+                    self._ask_operator_criteria(repo, issue)
+                    continue
+                if self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
@@ -12452,13 +12442,10 @@ class Station:
         return keys
 
     def _run_live_checks(self, repo: str, number: int,
-                         gaps: Sequence[Tuple[str, str]]) -> Dict[str, str]:
-        """Run the runnable checks of the ticket's unverified live criteria
-        that are due, record each result in the station's state and the
-        ticket's status, and return what each failed one saw, by key."""
+                         gaps: Sequence[Tuple[str, str]]) -> None:
+        """Run due live checks and record each result in state and on the ticket."""
         state = self._live_checks()
         mine = state.setdefault("%s#%d" % (repo, number), {})
-        failed: Dict[str, str] = {}
         for found, text in gaps:
             check = criteria_gate.check_of(text) if found == criteria_gate.LIVE else None
             k = criteria_gate.key(text)
@@ -12475,9 +12462,6 @@ class Station:
                 _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
                 self._routine(repo, number, "Live check %s: `%s` (%s) for: %s" % (
                     last["result"], check.target, seen, _clip(" ".join(text.split()), 160)))
-            if last.get("result") == "fail":
-                failed[k] = "its check failed: %s" % last.get("seen")
-        return failed
 
     def _proof_sources(self, repo: str) -> live_proof.Sources:
         """Where the live proof reads: the repo's configured evidence command
@@ -12723,15 +12707,8 @@ class Station:
         state[LIVE_ASKED_KEY] = asked
         _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
 
-    def _asked_already(self, repo: str, number: int, body: str,
-                       gaps: Sequence[Tuple[str, str]]) -> bool:
-        """Whether the verification ask must not be made now (loom#2805):
-        it was made for these same criteria, and a brain or operator has
-        since taken the person label off; or a trusted comment states a
-        `waiting:` line on a ticket whose gaps are all live. An ask the
-        station made before it kept this record counts as made for the
-        criteria it finds now: re-adding the label a brain removed sent a
-        settled live wait back to the operator."""
+    def _asked_already(self, repo: str, number: int, body: str) -> bool:
+        """Whether these operator criteria were already asked about."""
         asked = self._live_checks().get(LIVE_ASKED_KEY)
         asked = asked if isinstance(asked, dict) else {}
         made = asked.get("%s#%d" % (repo, number))
@@ -12746,22 +12723,17 @@ class Station:
         except GitHubError as err:
             _say("could not read the comments of %s#%d before asking: %s" % (repo, number, err))
             return True
-        mine = [c for c in comments if isinstance(c, dict)
-                and brain.comment_login(c).lower() in trusted]
-        if criteria_gate.live_wait([], gaps, [c.get("body") for c in mine]):
-            return True
-        if made is None and any(criteria_gate.is_verification_ask(c.get("body")) for c in mine):
+        latest = answer.latest_ask(comments, trusted)
+        if (made is None and latest
+                and criteria_gate.OPERATOR_ASK_OPENING in str(latest.get("body") or "")):
             self._record_ask(repo, number, body)
             return True
         return False
 
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
-        criterion has no evidence (bus/criteria_gate.py): a live one with a
-        check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to needs:human with one ask, once.
-        2026-10-22 audit: at least 12 tickets of the private deployment repo
-        closed shipped on green CI with live criteria never checked."""
+        criterion has no evidence. Live gaps stay in the verify queue.
+        Unticked operator criteria get one ask."""
         number = int(issue["number"])
         body = str(issue.get("body") or "")
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
@@ -12769,30 +12741,53 @@ class Station:
             return False
         if any(found == criteria_gate.LIVE and self._adapter_can_verify(repo, issue)
                for found, _ in gaps):
+            self._ask_operator_criteria(repo, issue)
             return True
-        failed = self._run_live_checks(repo, number, gaps)
+        self._run_live_checks(repo, number, gaps)
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
-        waiting = [t for k, t in gaps if k == criteria_gate.LIVE
-                   and criteria_gate.check_of(t) is not None
-                   and criteria_gate.key(t) not in failed]
+        missing = [text for kind, text in gaps if kind == criteria_gate.LIVE
+                   and criteria_gate.check_of(text) is None]
+        if missing:
+            self._note_missing_live(repo, number, "no check Loom can run for " + "; ".join(
+                _clip(self._note_text(" ".join(text.split())), criteria_gate.ASK_WIDTH)
+                for text in missing[:criteria_gate.ASK_SHOWN]))
+        self._ask_operator_criteria(repo, issue)
+        return True
+
+    def _note_missing_live(self, repo: str, number: int, reason: str) -> None:
+        """Record a live finding once while the ticket stays shipped."""
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, number), {})
+        if mine.get("_missing_note") == reason:
+            return
+        self._routine(repo, number, "Missing evidence: " + reason)
+        mine["_missing_note"] = reason
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+
+    def _ask_operator_criteria(self, repo: str, issue: Dict[str, Any]) -> None:
         names = _label_names(issue)
-        if waiting or needs_human(names) or criteria_gate.live_wait(names, gaps, [body]):
-            return True
-        if self._asked_already(repo, number, body, gaps) or not self._live_ask_room():
-            return True
+        if (not _verify_active(issue) or needs_human(names)
+                or any(n.startswith(WAIT) or n in CLOSE_DONE_HOLDS for n in names)):
+            return
+        body = str(issue.get("body") or "")
+        criteria = criteria_gate.open_operator_criteria(body)
+        if not criteria:
+            return
+        number = int(issue["number"])
+        if self._asked_already(repo, number, body) or not self._live_ask_room():
+            return
         try:
-            brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
+            brain.human(self.gh, repo, number, criteria_gate.ask(criteria))
         except RateLimited:
             raise
         except (ValueError, GitHubError) as err:
             _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
-            return True
+            return
         self._record_ask(repo, number, body)
         _say("held done %s#%d for the operator: %d criteria have no evidence"
-             % (repo, number, len(gaps)))
-        return True
+             % (repo, number, len(criteria)))
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
                            reason: str, unproven: bool = False) -> bool:
@@ -12905,7 +12900,8 @@ class Station:
             self._paginate("/repos/%s/issues/%d/comments" % (repo, number)), self.s.authors)
         bodies = [str(c.get("body") or "") for c in comments]
         ask = next((b for b in reversed(bodies) if b.startswith(HUMAN_MARKER)), "")
-        if not criteria_gate.is_verification_ask(ask):
+        operator_opening = "%s\n%s:" % (HUMAN_MARKER, criteria_gate.OPERATOR_ASK_OPENING)
+        if not (ask.startswith(operator_opening) or criteria_gate.is_verification_ask(ask)):
             return False
         note = ("Verification ask withdrawn. Ticket #%d is open and carries the work "
                 "from this source issue." % ticket)
