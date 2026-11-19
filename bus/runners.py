@@ -513,14 +513,18 @@ class Runners:
             self._refuse(ledger, entry, red_reason(repo, red))
             return
         settings = self._dispatch_settings(slot)
-        if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
-            why = "missing required runner setting %s" % OPENCODE_GO_KEY_SSM
+        required = (OPENCODE_GO_KEY_SSM,) if slot in OPENCODE_GO_SLOTS else ()
+        if slot == "workersai":
+            required = ("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")
+        missing = next((name for name in required if not settings.get(name, "").strip()), None)
+        if missing:
+            why = "missing required runner setting %s" % missing
             self._refuse(ledger, entry, why)
             # Hold the slot, or its heartbeat reads healthy and the factory
             # assigns it work it refuses again (loom#2910). The hold lifts on
             # the first pass that finds the setting (_lift_setting_holds).
             self._hold(ledger, slot, self.now + SETTING_HOLD_SECONDS, why)
-            ledger["holds"][slot]["needs"] = OPENCODE_GO_KEY_SSM
+            ledger["holds"][slot]["needs"] = missing
             return
         entry.update({"repo": repo, "base": base, "fix": bool(brief_field(brief, "Fix-PR"))})
         run_id = uuid.uuid4().hex
