@@ -8895,10 +8895,13 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     load = _lane_load(gh, repo)
     choice, skipped_load = _rung_by_load(
         left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
-    if choice is None:
-        raise ValueError("no untried rung has an available lane")
     rung, lane = choice[0] - 1, choice[1]
     model = factory.CLIMB[rung][1]
+    
+    # Check if the ticket is already on this rung (briefed with the same model and lane)
+    if (history.rung == rung and lane in _labels(issue)):
+        raise ValueError("ticket is already on rung %d %s on lane %s" % (rung + 1, model, lane))
+
     reason = "; ".join(history.reasons)
     comment_lines = [ESCALATE_MARKER]
     if skipped_load:
