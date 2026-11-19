@@ -209,7 +209,7 @@ ladder_open() {
 # to a sandboxed rung by name. An allowlist: nothing else of this
 # environment, a key or an SSM parameter name included, reaches the agent.
 BRAIN_SETTINGS=(LOOM_REPOS LOOM_SWEEP_REPOS LOOM_STATUS_REPO LOOM_BRIEF_AUTHORS LOOM_TRUSTED_BRIEFERS
-  LOOM_ASK_ANSWERERS LOOM_REPO_OWNERS LOOM_HOME
+  LOOM_ASK_ANSWERERS LOOM_REPO_OWNERS LOOM_HOME LOOM_LEGACY_HUMAN_LABELS
   LOOM_BRAIN_SCOPE LOOM_BRAIN_HOLDER LOOM_REVIEW_CHECK LOOM_REVIEW_BOT LOOM_GOAL_CAP
   LOOM_UNVERIFIED_LIMIT LOOM_REPAIR_EPICS LOOM_MERGE_SETTLE_SECONDS LOOM_GITHUB_LOGIN
   LOOM_SHADOW LOOM_SHADOW_REPOS LOOM_SHADOW_LEDGER)
@@ -300,8 +300,13 @@ while :; do
     beat skipped 0
     exit 0
   fi
-  bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$LOCK_MINUTES" --run "$RUN_ID" >> "$LOG" 2>&1 && break
+  # Keep the lock record and exit status from this attempt together.
+  lock_status=0
+  lock_line="$(bus lock "$LOCK_REPO" --holder "$HOLDER" --minutes "$LOCK_MINUTES" --run "$RUN_ID" 2>> "$LOG")" || lock_status=$?
+  [ -z "$lock_line" ] || printf '%s\n' "$lock_line" >> "$LOG"
+  [ "$lock_status" -eq 0 ] && break
   if [ "$(date +%s)" -ge "$deadline" ]; then
+    say "tick skipped: ${lock_line:-lock command returned no holder record}"
     # The stand-down leaves its yield on the peer's lock (loom#2606): the
     # station's backup-brain check counts a recent yield as alive.
     bus yielded "$LOCK_REPO" --holder "$HOLDER" >> "$LOG" 2>&1 || say "no yield recorded on the lock"

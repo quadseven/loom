@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import factory  # noqa: E402
+from bus import factory, hunt_plan  # noqa: E402
 
 # A ticket whose third box the pull request built, with the box's backticks
 # dropped, and whose first two boxes it marked not built.
@@ -67,6 +67,13 @@ def boxes(body):
 class UnbuiltCriteriaTest(unittest.TestCase):
     TICKET = ("## Acceptance criteria\n- [ ] First works; test.\n- [ ] Second works.\n"
               "- [ ] Third works.\n- [ ] Fourth works.\n")
+
+    def test_plan_filler_bullets_never_count_as_ticket_criteria(self):
+        padded = hunt_plan.pad_criteria("- [ ] First works.")
+        for criteria in (padded, padded.replace("[x]", "[ ]")):
+            with self.subTest(criteria=criteria):
+                body = "## Acceptance criteria\n" + criteria
+                self.assertEqual(factory.acceptance_criteria(body), [" First works."])
 
     def test_one_of_four_built_names_the_three_left(self):
         pull = ("## Acceptance criteria\n- [x] First works; test.\n"

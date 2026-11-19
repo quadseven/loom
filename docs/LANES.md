@@ -17,6 +17,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   list. Unpinned briefs use the first model not currently limited. A provider
   quota records a reset for that model; the lane remains available while
   another model is ready. A brief with a Model: line always keeps that model.
+  (Before a brief is written, the factory may take a default pin off a
+  queued ticket whose model had no free lane for `LOOM_PIN_FALLBACK_MINUTES`;
+  docs/BRIEF_FORMAT.md says which pins are hard.)
   Account-wide out-of-credit limits still hold the lane. The heartbeat names
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
@@ -52,9 +55,11 @@ lane runner uses infra-public's `check_private_leaks.py` on the diff and
 generated pull request body, with the shared deny-list of names and products
 (`--deny-list-ssm`, the SSM parameter `LOOM_LEAK_DENY_SSM`, default
 `/infra/leak-scan/deny-list`). Every scan goes through `leak_scan`. The lane
-machine keeps `$LOOM_HOME/infra-public` cloned, cloning it when first needed
-and fast-forwarding it at most hourly. Set `LOOM_LEAK_SCANNER` to that
-script's path when using another checkout. A scanner that is still missing
+machine clones `LOOM_INFRA_PUBLIC_REPO` into `$LOOM_HOME/infra-public` when
+first needed and fast-forwards it at most hourly. With that setting unset,
+the lane uses the existing local scanner at the default path or the path
+specified by `LOOM_LEAK_SCANNER`. The cluster workflow provides its pinned
+public scanner checkout through `LOOM_LEAK_SCANNER`. A scanner that is missing
 files a factory incident and holds the brief; a deny-list the scanner cannot
 read (it exits 2) or a hit blocks the push. A scan that could not run for
 another reason parks the brief `[transient]`. A hit parks the brief with
@@ -158,6 +163,8 @@ unset variables.
 - On a host, a base check verdict is reused by repo, base revision, check
   command and interpreter identity. Green verdicts last 24 hours; red
   verdicts last five minutes and still follow the base-check incident path.
+  Before running a Codex agent, the lane reruns green checks that populated
+  uv's scratch cache so the agent has packages for offline tests.
   Setup still runs for each brief, and the final check on the agent's commit
   is never cached. Verdicts live under the host's `state/base-verdicts/`;
   each write sweeps the ones older than a day.
@@ -344,6 +351,11 @@ pushes nothing, so the lane or the next rung fixes it. A kubectl, AWS or DNS
 that cannot be reached at all, and a lane pod (no kubeconfig, no AWS key),
 does not stop the run: the log and the pull request body (or the round's
 comment) carry `live-cluster check could not run: <reason>`.
+
+Before opening a pull request, the runner also checks each ticked live
+acceptance criterion. The criterion names its expected output lines in
+backticks or double quotes. Each line must appear in the current run's log.
+Leave the box unticked if the expected output is unspecified or missing.
 
 ## The brain tick
 
@@ -576,7 +588,39 @@ the window that are also `LOOM_LANE_DEMOTE_RATE`, default 0.1, of its pull
 requests). The same test picks every tier move,
 stall move and automatic retry, so no ticket is given a lane only to step
 straight off it again.
-It skips future `Not before:` times and tickets without a readable Difficulty.
+
+Lane load, the single source of truth for whether a lane holds work: the
+open tickets carrying the lane's `lane:<name>` label at `loom:running`, plus
+those at `loom:briefed` that the station can claim. A lane is free only with
+no load. A briefed ticket has no brief file until the station claims it (the
+claim writes the brief and moves the ticket to `loom:running`), so an empty
+inbox never means a briefed ticket is stale. Not load:
+
+- a ticket the station holds for a factory incident (`factory_held.json`);
+- a ticket the unproven-work gate refused this pass;
+- a briefed build ticket of a repo whose counted open pull requests reach its
+  cap (`LOOM_REPO_OPEN_PR_CAP`, default 8), read from the station's per-pass
+  count, not from how far the claim pass got. Its brief cannot be written, so
+  the factory puts it back to `loom:queued` with no lane label. A briefed fix
+  round is claimed over the cap, so it stays load. A queued ticket of such a repo
+  waits (`its repo is at its open pull request cap`) instead of being briefed
+  onto a lane. An unread count is no cap here.
+
+A running ticket is always load; one whose run ended is settled to
+`loom:failed` (`settle_ended_runs`). A briefed ticket no lane claims for
+`BRIEFED_STALL` (2 hours) moves to a free or shorter lane of its tier or
+rung. With no such lane it goes back to `loom:queued` with no lane label
+(a status note says why; it is not a failure and takes no rung marker), so
+it stops holding its lane and any free lane can take it from the queue. A
+ticket whose brief sits in a lane inbox is never settled this way.
+
+A pending fix round on a demoted or occupied lane keeps its brief for two
+hours from the later of the fix request and the lane assignment. It then
+takes a free lane on its rung, or a free lane on the next rung. If neither
+move is possible, it stays briefed and records one counted wait and one
+status event with its age.
+
+The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
@@ -815,6 +859,12 @@ day's slot sample may cover less than 24 hours; missing samples fail the
 spread target. Use the keys in `.env.example` as setup placeholders.
 The GitHub login used by the station must be in `LOOM_BRIEF_AUTHORS`, so
 its previous metrics comments can be trusted for the streak.
+The metrics step runs before the rotating steps, so it can resume on the
+next eligible pass. It leaves `LOOM_METRICS_RESERVE` core requests available
+(default 1500) and yields after `LOOM_METRICS_SECONDS` (default 300). It
+keeps completed API pages on disk and measures the window ending when the
+build started. Across builds, it reuses each issue's event and comment
+lists when `updated_at` matches. Changed lists use their saved ETags.
 
 Reports: by default the station sends a digest, not each report:
 `LOOM_REPORT_DIGEST_TIMES` (default `10:00,21:00`, local time) names when.
@@ -822,7 +872,12 @@ At each time it sends one message: every goal home whose latest report since
 the last digest says something moved, as its short name, the report's first
 line and a link; a count of the goal homes where nothing moved; one line
 per backlog goal home (labelled `loom:backlog`), counted from its tickets,
-since a backlog goal posts no report on GitHub; and the
+since a backlog goal posts no report on GitHub; one line counting the lane
+pull requests (head `loom/...`) merged since the last digest by actor:
+factory (the station's own App login, or `LOOM_GITHUB_LOGIN`), brain
+(another App login in `LOOM_BRIEF_AUTHORS`) and other (a person or an
+outside session), read by GraphQL newest update first until the window ends
+(at most 10 pages a repo; a repo whose read fails is named); and the
 factory's daily numbers, which then no longer go out on their own. Each time
 is sent once, and a failed send is tried again on the next pass. Switching
 the digest on sends nothing until the next digest time. Setting
@@ -876,6 +931,19 @@ only what is its own, and adding an operator is configuration:
   theirs names it, the station removes the claim label and unassigns them,
   at most 20 issues a run (`bus/stale_claims.py`). The issue is then this
   Loom's like any unowned one. A label removal sends no email.
+- A person's session may claim by assignment and a comment instead of a
+  label (`bus/human_claims.py`). `LOOM_HUMAN_CLAIMS` names each such claim as
+  `<login>:<phrase>|<phrase>`, entries split by `;`, where `*` in a phrase is
+  any short text on one line. Unset is the built-in default, which takes the
+  session's hidden claim marker or "Claimed by <anyone>'s Claude Code"; `off`
+  turns it off. An issue assigned to that login, or with a comment by that
+  login carrying one of its phrases (any case), is never taken: the
+  ready-for-agent intake, brain triage, a brief that rewrites it, a lane claim,
+  the factory's lane assignment, the hand-off pool return and conflict
+  recovery all skip it. The comments are read only for an issue about to be
+  taken that has any, once per issue state. No reaper releases such a claim:
+  the stale-claim release never unassigns that login, and the claim referee
+  leaves every claim on such an issue.
 - A Loom's own claim lapses too. The same hourly step reads each open ticket
   carrying this Loom's `claim:<login>` label and a Loom label (`loom:*`,
   `wait:*` or `needs-brain`). When it is not `loom:running`, nothing on its
@@ -1307,6 +1375,33 @@ The loom home is kept bounded by the station and the runner (loom#643).
   when the state changes, `claims resumed: ...` once when the disk has that
   much free again, and the lane status shows a `Claims paused` line
   meanwhile. The state is kept in `state/station/disk-guard.json`.
+- Before that floor, the disk watchdog (`bus/disk_watchdog.py`, loom#3187)
+  acts. Once the disk has less than `LOOM_DISK_WATCHDOG_GB` free (default 25;
+  0 turns it off), at most every 5 minutes, it frees space in this order and
+  stops as soon as the disk is back above that: on macOS, Time Machine local
+  snapshots (`com.apple.TimeMachine.<date>.local`, oldest first, through
+  `tmutil deletelocalsnapshots`; deleted files free nothing while a snapshot
+  holds them, and no other snapshot such as `com.apple.os.update-*` is
+  touched; `LOOM_THIN_SNAPSHOTS=0` keeps them); then Loom's own data: lane logs and
+  rotated service logs unchanged for 7 days (moved to
+  `LOOM_DISK_ARCHIVE_DIR` when that folder is mounted, else compressed in
+  place); idle lanes' run scratch (`-check`, `-check-default`, `-tmp`,
+  `-intent.*`, `-gh.*`) unchanged for `LOOM_DISK_RUN_DAYS` (default 2);
+  lane trees unchanged for 2 days, archived to the archive folder or to
+  `archive/trees/` in the home and removed only once the archive reads back
+  whole (local tree archives go after 14 days); then idle lanes' tool caches
+  (`.cache`, `.cargo`, `.npm`, `tmp`, `Library/Caches` and the like). It never
+  touches a brief that is waiting or running, a busy lane's folders (the
+  lane lock is read again before each removal, and a lane home changed in
+  the last 10 minutes keeps its caches), a link, or any path outside
+  `logs/`, `run/`, `archive/` and `worktrees/` in the home; a home reached
+  through a link is refused, and the agy lane's tree folder is left to the
+  tree sweep. Archive folders it makes are 0700 and archives 0600.
+  Each step says `disk watchdog: ...` with what it freed. When the disk is
+  still under the floor it logs the largest folders beside the home once an
+  hour, and the lane status shows a `Disk watchdog:` line until the disk is
+  above the floor. The state is kept in `state/station/disk-watchdog.json`.
+  The station runs it, so it runs where the station runs (the Mac lane host).
 - When a run ends the runner drops the build output git ignores from its
   tree and its default-branch check copy: `.venv`, `node_modules`,
   `__pycache__` and `.pytest_cache` folders that `git check-ignore`
@@ -1370,9 +1465,7 @@ deadline writes every thread's Python stack to `station.log` and exits, so
 launchd starts a fresh one. The next pass finds the marker and logs one line:
 `the last pass (pid ..., started ...) overran its ...s deadline`, or, when the
 marker is younger than its deadline (the pass was killed), `ended ...s into
-its ...s deadline without a clean finish`. The default sits above a daily
-metrics build (about 30 minutes on 2026-10-26) until that build is bounded on
-its own (loom#1924).
+its ...s deadline without a clean finish`.
 
 ## Station lease
 
@@ -1459,8 +1552,8 @@ with no reload. A bulk cleanup uses it so its relabels and moves draw no bot
 comments. Each paused step logs `step <name> paused (LOOM_PAUSED_STEPS)` once a
 pass and counts as done, so the rotation moves on and nothing carries over. A
 name that is not a pass step logs `unknown paused step <name>, ignored` and
-pauses nothing. Only steps in the rotation (`Station._run_steps`) can be
-paused; the work a pass does before or after it always runs.
+pauses nothing. The rotating steps and the scheduled metrics step can be
+paused through `Station._run_steps`.
 
 ## Log watch
 
@@ -1574,8 +1667,9 @@ Each invariant is one function returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done (one issue per lane:
   the station reads these to release a runaway a dead lane held).
-- Lanes whose newest 5 runs all failed after a success earlier in the day,
-  limits, expired keys and factory incidents aside.
+- Lanes whose newest 5 runs all failed after a success earlier in the day.
+  Both lane checks exclude limits, expired keys, factory incidents and
+  briefs parked before the agent ran, including runner base stops.
 - Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
@@ -2058,6 +2152,13 @@ verdict, and neither the factory nor `bus.brain merge` reads an old
 
 ## The review sweep: independent reviews by the reviewer Apps
 
+The sweep is off. Review is `grug`'s alone: the `Grug - Elder` check is the
+one reviewer on every repo (operator decision, 2026-11-16).
+`Config.from_env` leaves the sweep off unless the station environment sets
+`LOOM_REVIEW_SWEEP=on`, and the installer does not set it, so no pull
+request goes to a review lane. The code and the settings below stay for a
+later decision; they describe what the sweep does once turned on.
+
 The station's `sweep_reviews` duty (`bus/review_sweep.py`) gives open pull
 requests an independent review without waiting for a brain to ask. At most
 once per `LOOM_REVIEW_SWEEP_EVERY` seconds it lists the open, non-draft
@@ -2376,6 +2477,12 @@ What changes in a pod:
   pass because everything fails. Anything else holds the lane unavailable,
   with the reason in its heartbeat, so a policy the cluster network does not
   enforce holds the lane too.
+  While the agent runs, the runner repeats the probes every
+  `LOOM_EGRESS_RECHECK_SECONDS` seconds (default 60). If a deny probe
+  connects, the runner stops the agent, records the address in the sealed
+  lane log, and parks the brief as an `egress-opened` factory incident
+  without pushing. A failed allow probe is logged once per run and the
+  agent keeps running.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
@@ -2441,7 +2548,9 @@ image (a fingerprint of the image's packages and tools, `<ticket>.image`).
 When the last failure exited 125 to 127 (the check could not run: a tool the
 image lacks, such as `ruff`), a moved head does not lift the stop, because no
 commit on the repo can add a tool to the image; only a new image or the day
-probe below does. One run records two failures, because a red check runs twice. A failed `setup:`
+probe below does. A red check runs twice, so one run of it records two
+failures. A check that cannot start records one row, so it stops the repo on
+that slot after one run, since no retry can add the tool. A failed `setup:`
 counts too. A check that passed on its second run counts for nothing, and only
 a fix round's default-branch rows count. A day with no report from the slot
 lets one run through, because only a run can show a new image.

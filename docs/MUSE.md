@@ -514,17 +514,19 @@ when that step started and when the previous one ended, and prints the
 tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
 1. Run `python3 -m bus lock quadseven/loom --holder muse --minutes 30 --wait 5`.
-   Read its exit code and its one line, not an earlier one. Exit 0 means you
-   hold the lock: the line starts `lock acquired: yours`, or `lock acquired:
+   Run it in the foreground and wait for it to finish. Read the exit code
+   and stdout line together from that invocation. Ignore holder strings in
+   background deliveries, logs, and other lock reads. Exit 0 means you hold
+   the lock: the line starts `lock acquired: yours`, or `lock acquired:
    already yours` when you had taken it earlier this tick (a re-attempt is
    yours, never a peer's, so go on). Exit 1 means a peer holds it after the
    5-minute wait: the line starts `lock held by <holder>` and says how long
    it has held it and when it expires. Stop then, and quote that line in the
-   stand-down so it names the holder and its age. Act on the result of
-   your last lock attempt only: when you run it again (a retry, a second
-   `--wait`), the earlier attempt's `lock held by` line is superseded, so
-   never post a stand-down from it; a later `lock acquired` line means you
-   hold the lock and the tick runs. Your 30-minute lock outlives your
+   posted stand-down so it names the holder, age, and expiry from that same
+   read. Act on the result of your last lock attempt only. A retry supersedes
+   the earlier attempt's `lock held by` line, so never post a stand-down
+   from it. A later `lock acquired` line means you hold the lock and the tick
+   runs. Your 30-minute lock outlives your
    25-minute tick, so no other brain takes it mid-tick. Muse's ticks start
    at :10 and :40 past the hour; the lane machine's tick starts at :25 and
    :55 and its lock expires by your next start (loom#2469), so a lane hold
@@ -998,7 +1000,10 @@ Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
 operator, 2026-10-21). A hard ticket with no `Model:` line runs its lane's
 default; the table `HARD_MODELS` next to `TIERS` in bus/factory.py is empty,
 and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
-Anthropic lane and never goes to agy. A `Model:` line naming gpt-6-sol or a
+Anthropic lane and never goes to agy on an equivalent. A queued ticket whose
+pin is a default, not a hard pin, takes a free lane of its tier with that
+lane's own model once its model had no free lane for
+`LOOM_PIN_FALLBACK_MINUTES` (docs/BRAIN.md, Tickets no lane takes). A `Model:` line naming gpt-6-sol or a
 gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
 brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 

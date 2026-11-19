@@ -206,6 +206,15 @@ class SignatureTest(unittest.TestCase):
                 with self.subTest(line=line, prefix=prefix):
                     self.assertTrue(watch.keep(prefix + line), prefix + line)
 
+    def test_a_factory_rebrief_up_the_ladder_is_an_outcome_not_an_error(self):
+        # loom#2233: the factory moves a failed ticket to its next lane and
+        # says so; "failed" there is the state it leaves, not a fault.
+        rebrief = "factory: re-briefed failed example-owner/repo-a#1862 on lane-b"
+        for line in (rebrief, "[2026-11-05T11:00:00Z] " + rebrief):
+            self.assertFalse(watch.keep(line), line)
+        for line in (rebrief + "; move failed", "error: " + rebrief):
+            self.assertTrue(watch.keep(line), line)
+
     def test_an_audit_hold_and_a_factory_release_are_outcomes_not_errors(self):
         # loom#2774: the verify hold a failed proof audit sets, said each pass.
         # loom#2770: the re-queue after a hold whose incident filing failed.
@@ -597,6 +606,54 @@ class FilingTest(WatchBase):
         self.assertEqual(self.gh.issues, {})
         self.run_at(T0 + 3600)
         self.assertEqual(len(self.gh.issues), 1)
+
+    def test_a_late_filing_counts_the_burst_not_the_pruned_window(self):
+        # loom#2233: a burst held a pass was filed "0 times in the last 30
+        # minutes", its hits pruned before the later pass wrote the body.
+        self.append(LINE_403, LINE_403, LINE_403, LINE_403)
+        self.run_at(T0, write=False)
+        self.said.clear()
+        self.run_at(T0 + 3600)
+        body = self.gh.issues[1]["body"]
+        self.assertNotIn("0 times in the last", body)
+        self.assertIn("4 times in 30 minutes up to 2027-01-15T08:00:00Z", body)
+        self.assertIn("held 60 minutes before it was filed", body)
+        self.assertTrue(any("watch: filing a station signature held 60 minutes: "
+                            "4 hits in its burst, 0 in the window now" in s
+                            for s in self.said), self.said)
+        self.assertNotIn("burst", self.saved()["sigs"]["station: " + watch.signature(LINE_403)])
+
+    def test_a_late_filing_after_a_failed_post_keeps_its_burst(self):
+        self.append(LINE_403, LINE_403, LINE_403)
+        rest = self.gh.rest
+
+        def fail_post(method, path, body=None):
+            if method == "POST" and path == "/repos/%s/issues" % LANES_REPO:
+                raise OSError("temporary failure")
+            return rest(method, path, body)
+
+        with mock.patch.object(self.gh, "rest", side_effect=fail_post):
+            self.run_at(T0)
+        self.run_at(T0 + 1800)
+        self.assertIn("3 times in 30 minutes up to", self.gh.issues[1]["body"])
+
+    def test_merging_held_filings_keeps_the_larger_burst_in_either_order(self):
+        # A fold must not swap a held burst of ten for a later one of three.
+        def rec(burst):
+            return {"first": T0 - 600, "first_line": "a", "last": T0 - 60, "last_line": "b",
+                    "hits": [], "total": burst[1], "due": "file", "burst": list(burst)}
+
+        big, small = (T0 - 500, 10), (T0 - 400, 3)
+        watcher = watch.Watcher(self.gh, LANES_REPO, [], self.state, T0, self.said.append)
+        for target, source in ((big, small), (small, big)):
+            with self.subTest(target=target, source=source):
+                held = rec(target)
+                watcher._merge_observations(held, rec(source))
+                self.assertEqual(held["burst"], [T0 - 500, 10])
+        held = rec(small)
+        held.pop("burst")
+        watcher._merge_observations(held, rec(small))
+        self.assertEqual(held["burst"], [T0 - 400, 3])
 
     def test_a_failed_filing_does_not_skip_another_due_signature(self):
         other = "Connection refused"

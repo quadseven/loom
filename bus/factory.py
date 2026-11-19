@@ -142,6 +142,12 @@ Neither needs a model:
   easy), and says so in its note. The ticket's Difficulty: line is kept, so
   its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
+- A queued ticket pinned to a model no free lane takes, waiting for it
+  past LOOM_PIN_FALLBACK_MINUTES (default 30), takes a free lane of its tier
+  with that lane's own model and loses its Model: line (_pin_fallback,
+  loom#3151), unless the pin is hard (hard_pin: a person opened the ticket,
+  or it carries class:sensitive or tier:security). It never takes a lane it
+  ran on, and falls back at most PIN_FALLBACK_MAX times.
 - A ticket waiting with no lane that takes it (NO_LANE_RE) for
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
   climb rules allow with a free lane in its tier; with none, by
@@ -193,11 +199,11 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
-from . import no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import human_claims, no_change
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -206,6 +212,10 @@ from .tickets import FIX_MARKER, PRIORITIES, priority_of
 FACTORY_CHECK = 300
 STUCK_AGE = 6 * 3600
 BRIEFED_STALL = 2 * 3600
+PARKED_FIX_WAIT = "parked fix round on lane "
+# Why a queued ticket of a repo at its open pull request cap gets no lane. One
+# fixed text, so its wait keeps its start while the count moves (loom#3158).
+CAP_WAIT = "its repo is at its open pull request cap"
 # A ticket the factory leaves waiting with no lane that takes it (NO_LANE_RE)
 # this long is rerouted to another rung of the model ladder with a free lane
 # in its tier; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
@@ -226,8 +236,6 @@ NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
 HANDOFF_LABEL = labels.HANDOFF
 WAIT_SUPERSEDED = "wait:superseded"
 WAIT_BLOCKED = "wait:blocked"
-# What bus.brain writes on an issue it rewrote as a new ticket (_filed_rewrite).
-REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 # The states in which a lane has taken the ticket: its no-lane wait is over.
 LANED_STATES = ("running", "pr", "answered", "merged", "shipped", "verified")
 
@@ -244,6 +252,55 @@ def no_lane_reroute(env: Optional[Dict[str, str]] = None) -> float:
     if not 0 < hours < float("inf"):
         return float(NO_LANE_REROUTE)
     return min(hours * 3600, float(NO_LANE_HANDOFF))
+
+
+# A queued ticket pinned to a model with no free lane takes a free lane of its
+# tier, with that lane's own model, after this long (loom#3151). On 2026-11-17
+# one pass assigned 0 of 86 queued tickets, every one pinned to a codex or
+# anthropic model with no lane up (codex demoted, anthropic out of credit),
+# while about 30 lanes of their tiers sat idle. LOOM_PIN_FALLBACK_MINUTES sets
+# the minutes (pin_fallback_after); 0 turns the fallback off.
+PIN_FALLBACK_WAIT = 30 * 60
+# A ticket falls back at most this many times: a fallback run that fails
+# climbs the ladder and pins the ticket again, and without a bound it would
+# cycle across every free lane.
+PIN_FALLBACK_MAX = 2
+PIN_FALLBACK_MARKER = "<!-- loom:pin-fallback %s -->"
+PIN_FALLBACK_RE = re.compile(r"<!-- loom:pin-fallback \S+ -->")
+# Labels whose ticket keeps its Model: line however long it waits: its change
+# needs the reviewer-grade model it was pinned to (bus/merge_tier.py).
+HARD_PIN_LABELS = ("class:sensitive", "tier:security")
+
+
+def pin_fallback_after(env: Optional[Dict[str, str]] = None) -> Optional[float]:
+    """Seconds a queued pinned ticket waits for its model before it takes a
+    free lane of its tier: the minutes in LOOM_PIN_FALLBACK_MINUTES, None
+    when that is 0 (off), else PIN_FALLBACK_WAIT."""
+    raw = str((os.environ if env is None else env).get("LOOM_PIN_FALLBACK_MINUTES", "")).strip()
+    try:
+        minutes = float(raw)
+    except ValueError:
+        return float(PIN_FALLBACK_WAIT)
+    if minutes == 0:
+        return None
+    if not 0 < minutes < float("inf"):
+        return float(PIN_FALLBACK_WAIT)
+    return minutes * 60
+
+
+def hard_pin(issue: Dict[str, Any]) -> str:
+    """Why a ticket's Model: line binds however long it waits, or "": a
+    person opened the ticket (the operator wrote the pin), or it carries a
+    HARD_PIN_LABELS label. A pin a brain's App or the ladder wrote is a
+    default the factory may route around."""
+    found = [x for x in HARD_PIN_LABELS if x in _labels(issue)]
+    if found:
+        return "it carries %s" % found[0]
+    user = issue.get("user") or {}
+    login = str(user.get("login") or "")
+    if login and user.get("type") != "Bot" and not login.endswith("[bot]"):
+        return "a person opened it"
+    return ""
 
 
 def no_lane(reason: str) -> bool:
@@ -310,6 +367,7 @@ REVIEW_AGAIN_MARKER = "<!-- loom:review-again v1 sha=%s -->"
 # The model the codex lanes run (bus/tickets.py pins it in a review brief;
 # the review sweep, bus/review_sweep.py, checks a codex review run used it).
 LUNA_MODEL = "gpt-6-luna"
+_REVIEW_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total")
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The codex lane and its fifteen slots, all on gpt-6-luna (labels.SLOTS). Every
@@ -661,10 +719,12 @@ NO_AREA_NOTE = (
     "play, and this ticket carries no `area:` label. Add the one `area:` label that "
     "names its area; no lane takes it until then.")
 
-NO_SPLIT_NOTE = (
-    "Held for the brain (needs-brain): this brief spans more than one platform, so "
-    "it is more than one ticket. Split it into one ticket per platform, with "
-    "`After:` lines between the slices; no lane takes it until then.")
+REVIEW_FAILED_RUNG = "<!-- loom:review-failed-rung %d -->"
+REVIEW_FAILED_RUNG_RE = re.compile(r"<!-- loom:review-failed-rung (\d+) -->")
+REVIEW_SPLIT_NOTE = (
+    "Held for the brain: review findings survived fix rounds on two model rungs. "
+    "Split this ticket into smaller tickets with After: lines between dependent slices "
+    "before sending work to a lane.")
 
 # The note for a ticket whose lane run failed with its pull request open: the
 # failed run is the finding, so it is not the stock FIX_NOTES that brain.fix
@@ -828,9 +888,8 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     STUCK_AGE (age alone climbs once per window, not on every round)."""
     if age > STUCK_AGE and now - last_climb(comments) > STUCK_AGE:
         return True
-    last = next((str(c.get("body") or "") for c in reversed(comments)
-                 if str(c.get("body") or "").startswith(FIX_MARKER)), None)
-    if last is None:
+    last = _last_fix(comments)
+    if not last:
         return False
     if _finding_survived(last, open_threads, threads):
         return True
@@ -839,6 +898,11 @@ def stuck(comments: Sequence[Dict[str, Any]], open_threads: Sequence[str],
     if _unticked_left(last, unticked):
         return True
     return checks_failing and bool(FIX_CHECK_RE.search(last))
+
+
+def _last_fix(comments: Sequence[Dict[str, Any]]) -> str:
+    return next((str(c["body"]) for c in reversed(comments)
+                 if str(c.get("body") or "").startswith(FIX_MARKER)), "")
 
 
 def _unticked_left(last: str, unticked: Sequence[str]) -> bool:
@@ -854,6 +918,17 @@ def _finding_survived(last: str, open_threads: Sequence[str],
     while checks still fail."""
     return (bool(set(FIX_THREAD_RE.findall(last)) & set(open_threads))
             or bool(converge.persistent(last, (), threads)))
+
+
+def review_findings_remain(last: str, threads: Sequence[Dict[str, Any]],
+                           check: str, output: str) -> bool:
+    """Whether a fix round left a trusted thread or a blocking review check."""
+    if threads:
+        return _finding_survived(last, [str(t.get("id")) for t in threads], threads)
+    title, _, summary = output.partition("\n")
+    match = _REVIEW_MARKINGS_RE.search(title)
+    return bool(match and int(match[1]) > 0 and not degraded_review(title, summary)
+                and check in converge.asked_checks(last))
 
 
 def _end(thread: Dict[str, Any], field: str, index: int) -> Dict[str, Any]:
@@ -1370,7 +1445,7 @@ def chief_orphans(summary: str) -> Optional[List[int]]:
 
 
 def acceptance_criteria(body: str) -> List[str]:
-    """Checkbox criteria in the Acceptance criteria section."""
+    """Ticket checkboxes in the Acceptance criteria section, excluding plan filler."""
     found = []
     active = False
     for line in (body or "").splitlines():
@@ -1381,8 +1456,10 @@ def acceptance_criteria(body: str) -> List[str]:
             break
         match = CRITERION_RE.match(line)
         if active and match:
-            found.append(("x" if match.group(1).lower() == "x" else "") +
-                         " " + match.group(2).strip())
+            text = match.group(2).strip()
+            if criterion_key(text) in _FILLER_CRITERION_KEYS:
+                continue
+            found.append(("x" if match.group(1).lower() == "x" else "") + " " + text)
     return found
 
 
@@ -1396,6 +1473,11 @@ def criterion_key(text: str) -> str:
     runs of whitespace or trailing punctuation, and case (loom#2026)."""
     text = _MD_MARK_RE.sub("", _MD_LINK_RE.sub(r"\1", NOT_BUILT_RE.sub("", text)))
     return " ".join(text.split()).rstrip(".;:,").strip().casefold()
+
+
+_FILLER_CRITERION_KEYS = frozenset(
+    criterion_key(bullet.removeprefix("- [x] ")) for bullet in hunt_plan.FILLER_BULLETS
+)
 
 
 def unticked_criteria(ticket_body: str, pull_bodies: Sequence[str]) -> List[str]:
@@ -1781,6 +1863,47 @@ def _author(full: Dict[str, Any]) -> str:
     return str((full.get("user") or {}).get("login") or "")
 
 
+
+def open_blockers(gh: Any, repo: str, issue: Dict[str, Any],
+                  dependency: Callable[[str, int], Optional[Dict[str, Any]]]) -> List[str]:
+    """The issues still open that hold the ticket: those its brief's Blocked
+    on section names (bus/brief_check.py blocked_on), read through
+    `dependency`, which answers None for an issue it cannot read (that holds),
+    then those GitHub's own "blocked by" relationship names (native_blockers).
+    Each is #N (this repo) or owner/name#N. A ticket with neither costs no
+    request. The factory's queued hold and the station's claim both ask this,
+    so the two cannot disagree on what blocks a ticket (loom#3129)."""
+    number = int(issue["number"])
+    still = ["#%d" % n for n in brief_check.blocked_on(issue.get("body")) if n != number
+             and (dependency(repo, n) or {}).get("state") != "closed"]
+    return still + [ref for ref in native_blockers(gh, repo, issue) if ref not in still]
+
+
+def native_blockers(gh: Any, repo: str, issue: Dict[str, Any]) -> List[str]:
+    """The open issues GitHub's own "blocked by" relationship names for
+    the ticket, as #N (this repo) or owner/name#N. Read only when the
+    issue's dependency summary counts an open blocker, so a ticket with
+    none costs no request. A read that fails holds the ticket, naming the
+    summary's count: a lane must not take work whose blocker is unknown."""
+    summary = issue.get("issue_dependencies_summary") or {}
+    if not isinstance(summary, dict) or not summary.get("blocked_by"):
+        return []
+    number = int(issue["number"])
+    try:
+        found = list(gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by" % (repo, number)))
+    except RateLimited:
+        raise
+    except GitHubError:
+        return ["%d open issue(s) GitHub lists as blocking it" % int(summary["blocked_by"])]
+    refs = []
+    for blocker in found if isinstance(found, list) else []:
+        if not isinstance(blocker, dict) or blocker.get("state") == "closed":
+            continue
+        where = str(blocker.get("repository_url") or "").rsplit("/repos/", 1)[-1]
+        refs.append(("#%d" if where in ("", repo) else where + "#%d") % int(blocker["number"]))
+    return refs
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -1795,6 +1918,7 @@ class Factory:
                  available: Optional[Sequence[str]] = None,
                  close: Optional[Callable[..., Any]] = None,
                  held: Sequence[str] = (),
+                 capped: Sequence[str] = (),
                  model_limits: Optional[Dict[str, Dict[str, float]]] = None,
                  silent: Optional[Dict[str, float]] = None,
                  down: Sequence[str] = (),
@@ -1853,6 +1977,18 @@ class Factory:
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
         self.held = set(held)
+        # The repos at their open pull request cap by the station's count this
+        # pass: it claims none of their build tickets, so a queued one is not
+        # briefed (loom#3158). Their briefed build tickets come in `held`.
+        self.capped = set(capped)
+        # The briefed build tickets of those repos, "owner/repo#n" (a fix
+        # round is claimed over the cap, so it is not here): their brief
+        # cannot be written, so they go back to the queue with no lane.
+        self.cap_held: Set[str] = set()
+        # "owner/repo#n" of each brief in a lane inbox: the station wrote it
+        # and the run is starting, so the ticket is not stalled.
+        self.in_inbox: Set[str] = set()
+        self.pending_fix_at: Optional[Callable[[str, List[Any]], Optional[float]]] = None
         # Lane -> seconds since its last heartbeat, for each local lane
         # without a live one; silent_running is the lanes found holding a
         # running ticket past SILENT_MAX, with those tickets.
@@ -1870,6 +2006,9 @@ class Factory:
         # reroute_after it is rerouted, past NO_LANE_HANDOFF handed off.
         self.no_lane_since = dict(no_lane_since or {})
         self.reroute_after = no_lane_reroute() if reroute_after is None else reroute_after
+        # How long a queued pinned ticket waits for its model before a free
+        # lane of its tier takes it (pin_fallback_after); None never.
+        self.pin_fallback = pin_fallback_after()
         # The tickets whose no-lane wait ended this pass: a lane took them,
         # they were rerouted, or they went to the hand-off pool. The station
         # clears their no_lane_since.
@@ -1969,6 +2108,17 @@ class Factory:
         logins only."""
         data = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
         return [c for c in data if isinstance(c, dict) and self._trusted(c)]
+
+    def _human_holder(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+        """The login of a person's session that claims the issue by
+        assignment or by its claim comment (bus/human_claims.py), else None.
+        Asked only of a ticket about to get a lane; its comments are read
+        once a pass, and only when it has any."""
+        reader = getattr(self, "_human_reader", None)
+        if reader is None:
+            reader = self._human_reader = human_claims.Reader(
+                lambda r, n: self.gh.paginate("/repos/%s/issues/%d/comments" % (r, n)))
+        return reader.holder(repo, issue)
 
     def _trusted_comments(self, repo: str, number: int) -> List[Dict[str, Any]]:
         """A pull request's comments by trusted logins, in order: anyone can
@@ -2427,10 +2577,12 @@ class Factory:
     def _climb(self, repo: str, issue: Dict[str, Any], comments: Sequence[Dict[str, Any]],
                why: str, head: str = "Repeatedly stuck", failed_here: bool = True,
                skip: int = 0, footer: Optional[Tuple[str, str]] = None,
-               before_apply: Optional[Callable[[str, str], bool]] = None) -> Optional[str]:
+               before_apply: Optional[Callable[[str, str], bool]] = None,
+               only_free_rung: int = 0) -> Optional[str]:
         """Put the ticket on its next rung (climb_rungs): its Model: line and
         lane label, and a rung marker. The rung it ran on counts as tried when
-        it failed there. Returns the lane, or None when no rung it may climb
+        it failed there. only_free_rung confines the climb to a specific rung
+        with an idle lane. Returns the lane, or None when no rung it may climb
         to has a lane up: every such rung was tried (_rungs_left says which),
         or each is down or at a limit and the ticket waits."""
         number = int(issue["number"])
@@ -2442,6 +2594,8 @@ class Factory:
             return None
         tried, reached = self._tried(issue, comments, failed_here, footer)
         up = self._up_lanes(repo)
+        if only_free_rung:
+            up = {only_free_rung: tuple(x for x in up.get(only_free_rung, ()) if self._free(x))}
         rung = next_rung(tried | ({skip} - {0}), self.load, {n for n in up if up[n]}, reached,
                          lanes=up)
         if not rung:
@@ -2461,6 +2615,7 @@ class Factory:
             kept = [x for x in _labels(issue) if not x.startswith("lane:")] + ["lane:" + lane]
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept})
+            issue["body"] = body
             issue["labels"] = [{"name": x} for x in kept]
         self._status_note(repo, number, "%s\n%s (%s): the factory moved this ticket up the "
                           "model ladder to rung %d, %s on lane %s." % (
@@ -2553,10 +2708,14 @@ class Factory:
                  % (repo, number, ", ".join(sorted(held)), why))
             return
         box_budget = no_change.active(comments) and bool(unproven_criteria(str(issue.get("body") or ""), ""))
+        threads = self._trusted_open(repo, pr, open_threads)
+        if (not conflict_only and not box_budget
+                and self._review_stuck(pr, _last_fix(comments), threads)
+                and self.hold_review_split(repo, issue, comments)):
+            return
         if checks_failing and not box_budget and self._past_no_change(repo, issue, comments):
             return
         age = self.now - _ts(pr.get("created_at"))
-        threads = self._trusted_open(repo, pr, open_threads)
         # A conflict alone is mechanical (the fix brief's runner merges the
         # base), so it never climbs, waits for a rung or closes the pull
         # request past the ladder, however old the pull request is
@@ -2655,6 +2814,44 @@ class Factory:
         self._give_up(repo, issue, why, [CLIMB[n - 1][1] for n in sorted(tried)
                                          if 1 <= n <= len(CLIMB)])
         self._hand_off_failed(repo, issue)
+        return False
+
+    def _review_stuck(self, pr: Dict[str, Any], last: str,
+                      threads: Sequence[Dict[str, Any]]) -> bool:
+        sha = str((pr.get("head") or {}).get("sha") or "")
+        output = next((r.get("output") or {} for r in self._runs.get(sha, [])
+                       if r.get("name") == self.review_check and r.get("conclusion") == "failure"), {})
+        return review_findings_remain(last, threads, self.review_check,
+                                     "%s\n%s" % (output.get("title") or "", output.get("summary") or ""))
+
+    def hold_review_split(self, repo: str, issue: Dict[str, Any],
+                          comments: Sequence[Dict[str, Any]]) -> bool:
+        """Record distinct rungs that left findings open since the last restart."""
+        if (person_claim(issue) or RUNAWAY in _labels(issue)
+                or not attempts_since_brief(comments) or newest_ending_class(comments) != "work"):
+            return False
+        rung = current_rung(issue) or rung_of(comments)
+        previous = set()
+        for comment in reversed(comments):
+            body = str(comment.get("body") or "")
+            if history.rung_marker(0) in body.splitlines():
+                break
+            match = REVIEW_FAILED_RUNG_RE.fullmatch(body.partition("\n")[0])
+            if match:
+                previous.add(int(match[1]))
+        number = int(issue["number"])
+        if previous - {rung}:
+            if not any(c.get("body") == REVIEW_SPLIT_NOTE for c in comments):
+                notify.post(self.gh, repo, number, REVIEW_SPLIT_NOTE, notify.HELD)
+            names = _labels(issue) + ["needs-brain"]
+            self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": ["needs-brain"]})
+            issue["labels"] = [{"name": label} for label in names]
+            self.actions += 1
+            return True
+        if rung not in previous:
+            self._status_note(repo, number, "%s\nReview findings survived a fix round on rung %d."
+                              % (REVIEW_FAILED_RUNG % rung, rung))
         return False
 
     def _past_no_change(self, repo: str, issue: Dict[str, Any],
@@ -2801,7 +2998,7 @@ class Factory:
                  if n != number and tickets.rewritten_source(t.get("body")) == number]
         if "loom:rewritten" in _labels(ticket):
             found += [int(m.group(1)) for c in comments()
-                      for m in REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
+                      for m in brain.REWRITTEN_AS_RE.finditer(str(c.get("body") or ""))
                       if int(m.group(1)) != number]
         return max(found) if found else None
 
@@ -3580,7 +3777,7 @@ class Factory:
         conflict round once per head after 24 hours. Explicit claims,
         brain holds and running tickets always keep their work."""
         labels = _labels(issue)
-        if self._conflict_hygiene_held(labels):
+        if self._conflict_hygiene_held(labels) or self._human_holder(repo, issue):
             return
         handoff = HANDOFF_LABEL in labels
         if handoff and not self._handoff_is_aged(repo, issue):
@@ -4177,6 +4374,29 @@ class Factory:
              "was degraded and it was already asked again" % (repo, number, sha[:12]))
         return True
 
+    def _finding_blocker(self, repo: str, number: int) -> Optional[str]:
+        """The refusal an unanswered blocking comment on pull request `number`
+        puts on its merge, naming each finding's link, else None (loom#2988).
+        Read from the pull request's own comments, never its ticket's; comments
+        that cannot be read refuse, since a finding cannot be ruled out, as do
+        commits that cannot be read when an answer names its fix. With
+        no trusted login nothing is a finding, so nothing is read, as in
+        brain._finding_blocker."""
+        if not self.trusted:
+            return None
+        try:
+            comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+        except (GitHubError, OSError) as err:
+            return ("pull request comments unreadable, so a blocking comment cannot be "
+                    "ruled out (%s)" % err)
+        try:
+            found = comment_findings.open_findings(
+                [c for c in comments if isinstance(c, dict)], sorted(self.trusted),
+                brain.pr_commit_reader(self.gh, repo, number))
+        except (GitHubError, OSError) as err:
+            return brain.COMMITS_UNREADABLE % err
+        return comment_findings.blocker(found) if found else None
+
     def _behind(self, repo: str, full: Dict[str, Any]) -> int:
         base = str((full.get("base") or {}).get("ref") or "")
         head = str((full.get("head") or {}).get("sha") or "")
@@ -4198,6 +4418,10 @@ class Factory:
         held = self._lock(repo)
         if held is not None and held != number:
             blockers.append("another pull request holds the landing lock")
+        finding = self._finding_blocker(repo, number)
+        if finding:
+            _say("%s#%d waits: %s" % (repo, number, finding))
+            blockers.append(finding)
         decision = merge_verdict.decide(full, issue, blockers,
                                         ("factory",) if blockers else ())
         if not decision.ready:
@@ -4596,17 +4820,28 @@ class Factory:
     def briefed(self, repo: str, issue: Dict[str, Any]) -> None:
         if self.now < held_until(issue):
             return  # held by its Not before: line; nobody is late yet
-        if "%s#%s" % (repo, issue["number"]) in self.held:
-            # The station holds it (a factory incident, or the unproven-work
-            # gate this pass): no lane is late, so it is neither spread nor
-            # moved as stalled. Moving it rotated loom#633 through every rung
-            # with a comment each time while the gate held it (2026-10-18).
+        key = "%s#%s" % (repo, issue["number"])
+        if key in self.held:
+            # The station holds it (a factory incident, the unproven-work
+            # gate this pass, or its repo's open pull request cap): no lane is
+            # late, so it is neither spread nor moved as stalled. Moving it
+            # rotated loom#633 through every rung with a comment each time
+            # while the gate held it (2026-10-18).
+            return
+        if key in self.cap_held:
+            self._requeue(repo, issue, "its brief cannot be written while %s is at its open "
+                          "pull request cap" % repo, counted=False)
             return
         waiting = self.held_by(repo, issue)
         if waiting:
             # Waiting for another ticket is not this one's fault: it is not
             # stalled, so it climbs nothing, and only a long hold is reported.
             self._tell_held(repo, issue, waiting)
+            return
+        parked = self._parked_fix(repo, issue)
+        if self.known_waits.get(key, "").startswith(PARKED_FIX_WAIT) and key not in self.waits:
+            self.settled.add(key)
+        if parked:
             return
         if (_lane(issue) in self.limited or _lane(issue) in self.down
                 or not self._serves(_lane(issue), issue_model(issue))):
@@ -4731,6 +4966,61 @@ class Factory:
                 and (not rung or self._serves(x, CLIMB[rung - 1][1]))
                 and (x != "agy" or agy_takes_header(issue))]
 
+    def _parked_fix(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Handle a pending fix on a demoted or full lane before ordinary stalls."""
+        number, old = int(issue["number"]), _lane(issue)
+        # The briefed round itself already contributes one ticket to load.
+        if self.pending_fix_at is None or (old not in self.demoted and self.load.get(old, 0) <= 1):
+            return False
+        comments = self._comments(repo, number)
+        posted = self.pending_fix_at(repo, comments)
+        if posted is None:
+            return False
+        key = "%s#%d" % (repo, number)
+        if key in self.in_inbox or {RUNAWAY, "needs-brain", "wait:gate"} & set(_labels(issue)):
+            return True
+        since = max(posted, self._briefed_since(repo, issue, comments))
+        if since and self.now - since >= BRIEFED_STALL:
+            self._move_parked_fix(repo, issue, comments, (self.now - since) / 3600)
+        return True
+
+    def _move_parked_fix(self, repo: str, issue: Dict[str, Any],
+                         comments: List[Dict[str, Any]], hours: float) -> None:
+        number, old = int(issue["number"]), _lane(issue)
+        rung = current_rung(issue)
+        if not rung and issue_model(issue) == "unspecified":
+            model = brain.lane_model(old)
+            rungs = [n for n, (lanes, pin) in enumerate(CLIMB, 1)
+                     if old in lanes and (model is None or pin == model)]
+            rung = rungs[0] if len(rungs) == 1 else 0
+        if rung:
+            model = CLIMB[rung - 1][1]
+            lane = next((x for x in self._stall_lanes(repo, issue, rung) if self._free(x)), None)
+            if lane is not None:
+                if self._move_capped(repo, issue, comments):
+                    return
+                if issue_model(issue) == "unspecified":
+                    body = with_model(str(issue.get("body") or ""), model)
+                    self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+                    issue["body"] = body
+                self._move_stalled(repo, issue, lane, hours, rung)
+                return
+        lane = self._climb(repo, issue, comments, "briefed %.0f hours on lane %s" % (hours, old),
+                           head="Not a failure", failed_here=False, only_free_rung=rung + 1)
+        if lane is not None:
+            self.load[old] = self.load.get(old, 0) - 1
+            self.actions += 1
+            return
+        if "needs-brain" in _labels(issue):
+            return  # the move cap held the ticket
+        why = "no free lane on its rung or the next"
+        reason = PARKED_FIX_WAIT + old + ": " + why
+        if self.known_waits.get("%s#%d" % (repo, number)) != reason:
+            message = "Fix round parked for %.0f hours on lane %s: %s." % (hours, old, why)
+            self._status_note(repo, number, message)
+            _say("%s#%d: %s" % (repo, number, message))
+        self._waiting(repo, number, reason)
+
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
         least-loaded other lane of its tier (or of its rung), with no rung
@@ -4746,28 +5036,47 @@ class Factory:
             return
         if self._move_capped(repo, issue, comments):
             return
+        if "%s#%d" % (repo, number) in self.in_inbox:
+            return  # its brief is written and the run is starting
         old = _lane(issue)
         rung = current_rung(issue)
         lanes = self._stall_lanes(repo, issue, rung)
+        hours = (self.now - since) / 3600
         if not lanes:
-            kind = "rung" if rung else "tier"
-            self._wait_said(repo, number, "stalled on lane %s: no other lane of its %s is available"
-                            % (old, kind),
-                            "%s#%d stalled on lane %s: no other lane of its %s is available"
-                            % (repo, number, old, kind))
+            # Left briefed, it held its lane as load for days while 33 lanes
+            # idled with 79 tickets queued (2026-11-17, loom#3158): it waits
+            # in the queue instead, where any free lane can take it.
+            self._requeue(repo, issue, "briefed %.0f hours on lane %s with no claim, and no "
+                          "other lane of its %s is available" % (hours, old,
+                                                                 "rung" if rung else "tier"))
             return
         lane = pick_lane(lanes, self.load)
         waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
         if self._takes_work(old) and there and there >= waiting - 1:
             # A move to a lane with as long a wait only restarts the stall
             # clock: three tickets bounced codex-2 -> codex -> codex-2 for six
-            # hours unclaimed (2026-10-21). It moves to a free or shorter lane.
-            self._wait_said(repo, number, "stalled on lane %s: another lane of its %s waits as long"
-                            % (old, "rung" if rung else "tier"),
-                            "%s#%d stalled on lane %s: lane %s waits as long (%d vs %d)"
-                            % (repo, number, old, lane, there, waiting))
+            # hours unclaimed (2026-10-21). It goes back to the queue.
+            self._requeue(repo, issue, "briefed %.0f hours on lane %s with no claim, and lane "
+                          "%s waits as long" % (hours, old, lane))
             return
-        self._move_stalled(repo, issue, lane, (self.now - since) / 3600, rung)
+        self._move_stalled(repo, issue, lane, hours, rung)
+
+    def _requeue(self, repo: str, issue: Dict[str, Any], why: str, counted: bool = True) -> None:
+        """Return a briefed ticket no lane will run to loom:queued with no lane
+        label, so it stops counting as its lane's load; assign_queued gives it
+        a free lane later. Not a failure: no rung marker. `counted` says the
+        ticket was counted as load this pass."""
+        number, old = int(issue["number"]), _lane(issue)
+        kept = stale_claims.without_own_claim(
+            [x for x in _labels(issue) if x != "loom:briefed" and not x.startswith("lane:")],
+            brain.trusted_authors())
+        self._relabel(repo, issue, kept + ["loom:queued"])
+        self._status_note(repo, number, "Not a failure (%s): the factory put this ticket "
+                                        "back to the queue, with no lane." % why)
+        if counted:
+            self.load[old] = self.load.get(old, 0) - 1
+        self.actions += 1
+        _say("requeued briefed %s#%d off lane %s: %s" % (repo, number, old, why))
 
     def _move_stalled(self, repo: str, issue: Dict[str, Any], lane: str,
                       hours: float, rung: int) -> None:
@@ -4971,13 +5280,18 @@ class Factory:
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
         """Count the briefed and running tickets on each lane, reading every
-        repo's tickets unless they are given. A ticket held for a factory
-        incident is not load: counted, it kept its idle lane from every
-        queued ticket until the incident closed (2026-10-18)."""
+        repo's tickets unless they are given. A ticket the station holds is
+        not load: one held for a factory incident kept its idle lane from
+        every queued ticket until the incident closed (2026-10-18). The
+        station holds each briefed build ticket of a repo at its open pull
+        request cap (Station._load_factory): known only as far as the claim
+        pass got, 68 such tickets kept nine medium lanes idle on 2026-11-17
+        (loom#3158)."""
         if tickets is None:
             tickets = {repo: self._tickets(repo) for repo in self.repos}
         for repo, issue in ((r, i) for r, found in tickets.items() for i in found.values()):
-            if "%s#%s" % (repo, issue["number"]) in self.held:
+            key = "%s#%s" % (repo, issue["number"])
+            if key in self.held or key in self.cap_held:
                 continue
             if (_state(issue) in ("briefed", "running")
                     or (_state(issue) == "queued" and _lane(issue) in REMOTE_LANES
@@ -5060,6 +5374,11 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if brain.has_open_rewrite(self.gh, repo, issue, sorted(self.trusted)):
+            return "%s has an open rewrite ticket" % ref
+        person = self._human_holder(repo, issue)
+        if person:
+            return "%s is claimed by %s" % (ref, person)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)
@@ -5168,6 +5487,11 @@ class Factory:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
+        if repo in self.capped:
+            # Briefed, the station would hold it at the cap and its lane would
+            # take nothing else (loom#3158). Reads nothing.
+            self._waiting(repo, issue["number"], CAP_WAIT)
+            return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
                 or self._no_split(repo, issue)
                 or self._no_area(repo, issue) or self._superseded_or_blocked(repo, issue))
@@ -5219,25 +5543,21 @@ class Factory:
         return reason
 
     def _no_split(self, repo: str, issue: Dict[str, Any]) -> str:
-        """Why a queued brief that spans more than one platform gets no lane,
-        or "" (brief_check.split_verdict, the station's claim refusal). Like
-        _no_criteria it gains needs-brain and one note, once: a multi-platform
-        brief given a lane spent the whole model ladder before a person split
-        it by hand (loom#1651)."""
-        if not brief_check.split_hold(issue):
+        """Hold an oversized or multi-platform brief with one split request."""
+        split = brief_check.split_verdict(str(issue.get("body") or ""))
+        if split is None:
             return ""
         number = int(issue["number"])
         if "needs-brain" not in _labels(issue):
             self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": ["needs-brain"]})
             issue["labels"] = list(issue.get("labels") or []) + [{"name": "needs-brain"}]
-            notify.post(self.gh, repo, number, NO_SPLIT_NOTE, notify.HELD)
+            notify.post(self.gh, repo, number, "Held for the brain: this brief %s." % split.reason,
+                        notify.HELD)
             self.actions += 1
-            _say("held queued %s#%d for the brain: spans more than one platform"
-                 % (repo, number))
-        reason = "spans more than one platform"
-        self._waiting(repo, number, reason)
-        return reason
+            _say("held queued %s#%d for the brain: %s" % (repo, number, split.reason))
+        self._waiting(repo, number, split.reason)
+        return split.reason
 
     def _repo_areas(self, repo: str) -> Optional[List[str]]:
         """The repo's `area:` labels, read once a pass, or None when the read
@@ -5293,9 +5613,7 @@ class Factory:
         if newer is not None:
             reason, label = "superseded by #%d" % newer, WAIT_SUPERSEDED
         else:
-            still = ["#%d" % n for n in brief_check.blocked_on(body) if n != int(issue["number"])
-                     and (self._dependency(repo, n) or {}).get("state") != "closed"]
-            still += [ref for ref in self._native_blockers(repo, issue) if ref not in still]
+            still = open_blockers(self.gh, repo, issue, self._dependency)
             if not still:
                 return ""
             reason = "blocked on %s" % ", ".join(still)
@@ -5308,31 +5626,6 @@ class Factory:
             _say("held queued %s#%s: its brief says %s" % (repo, issue["number"], reason))
         self._waiting(repo, issue["number"], reason)
         return reason
-
-    def _native_blockers(self, repo: str, issue: Dict[str, Any]) -> List[str]:
-        """The open issues GitHub's own "blocked by" relationship names for
-        the ticket, as #N (this repo) or owner/name#N. Read only when the
-        issue's dependency summary counts an open blocker, so a ticket with
-        none costs no request. A read that fails holds the ticket, naming the
-        summary's count: a lane must not take work whose blocker is unknown."""
-        summary = issue.get("issue_dependencies_summary") or {}
-        if not isinstance(summary, dict) or not summary.get("blocked_by"):
-            return []
-        number = int(issue["number"])
-        try:
-            found = list(self.gh.paginate("/repos/%s/issues/%d/dependencies/blocked_by"
-                                          % (repo, number)))
-        except RateLimited:
-            raise
-        except GitHubError:
-            return ["%d open issue(s) GitHub lists as blocking it" % int(summary["blocked_by"])]
-        refs = []
-        for blocker in found if isinstance(found, list) else []:
-            if not isinstance(blocker, dict) or blocker.get("state") == "closed":
-                continue
-            where = str(blocker.get("repository_url") or "").rsplit("/repos/", 1)[-1]
-            refs.append(("#%d" if where in ("", repo) else where + "#%d") % int(blocker["number"]))
-        return refs
 
     def _host_only(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether every acceptance criterion of the queued ticket is a check
@@ -5375,6 +5668,9 @@ class Factory:
             # tickets before the lane's other work.
             lane = self._queued_model_lane(repo, model, busy_ok=True)
         if lane is None:
+            fell = self._pin_fallback(repo, issue, model)
+            if fell is not None:
+                return fell
             why = "%s waits: no free lane takes model %s" % (ref, model)
             reason = "no free lane takes model %s" % (
                 model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
@@ -5385,6 +5681,62 @@ class Factory:
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
             _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))
             return "%s: giving it lane %s failed" % (ref, lane)
+        return ""
+
+    def _fallback_lane(self, repo: str, issue: Dict[str, Any],
+                       skip: Sequence[str] = ()) -> Tuple[Optional[str], str]:
+        """(lane, fallback) for a pin fallback: the first free local lane of
+        the ticket's tier not in `skip`; when no lane of the tier is up, the
+        first free one of its FALLBACK tiers, with fallback saying so."""
+        private = self._is_private(repo)
+        difficulty = difficulty_of(issue)
+        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip]
+        lane = next((x for x in own if self._free(x)), None)
+        if lane is not None or any(self._takes_work(x) for x in own):
+            return lane, ""
+        for tier in FALLBACK.get(difficulty, ()):
+            lane = next((x for x in lanes_of(tier, private)
+                         if x not in REMOTE_LANES and x not in skip and self._free(x)), None)
+            if lane is not None:
+                return lane, "fallback: no %s lane is up" % difficulty
+        return None, ""
+
+    def _pin_fallback(self, repo: str, issue: Dict[str, Any], model: str) -> Optional[str]:
+        """Brief a queued ticket whose pinned `model` has had no free lane for
+        pin_fallback seconds (the station's no_lane_since clock) on a free
+        lane of its tier, with that lane's own model: its Model: line is
+        removed, so the runner's footer names the model that ran. None when
+        it keeps waiting for its model: inside the wait, a hard pin
+        (hard_pin), PIN_FALLBACK_MAX fallbacks already, or no free lane it has
+        not run on. Else "" when it got the lane, or why giving it failed."""
+        key = "%s#%s" % (repo, issue["number"])
+        waited = self.now - self.no_lane_since.get(key, self.now)
+        if self.pin_fallback is None or waited < self.pin_fallback or hard_pin(issue):
+            return None
+        if self._fallback_lane(repo, issue)[0] is None:
+            return None  # nothing to move to: no comment read, every pass
+        number = int(issue["number"])
+        comments = self._comments(repo, number)
+        if sum(bool(PIN_FALLBACK_RE.search(str(c.get("body") or "")))
+               for c in comments) >= PIN_FALLBACK_MAX:
+            return None
+        ran = {m.group(1) for c in comments for m in [CLAIMED_RE.match(str(c.get("body") or ""))] if m}
+        lane, fallback = self._fallback_lane(repo, issue, sorted(ran))
+        if lane is None:
+            return None
+        minutes = waited / 60
+        tier = "%s, pin fallback from model %s after %.0f minutes%s" % (
+            difficulty_of(issue), model, minutes, ", " + fallback if fallback else "")
+        body = without_model(str(issue.get("body") or ""))
+        self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
+        issue["body"] = body
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            return "%s: giving it lane %s failed" % (key, lane)
+        self._status_note(repo, number,
+                          "%s\nNot a failure (no free lane took model %s for %.0f minutes): the "
+                          "factory gave this ticket lane %s with that lane's own model, and took "
+                          "its Model: line off, so the pull request footer names the model that "
+                          "ran." % (PIN_FALLBACK_MARKER % model, model, minutes, lane))
         return ""
 
     def _assign_equivalent(self, repo: str, issue: Dict[str, Any], pinned: str,
@@ -5590,7 +5942,7 @@ class Factory:
                 _say("could not read the held tickets of %s: %s" % (repo, err))
                 continue
             try:
-                for issue in self._triaged(repo):
+                for issue in brain_hold.triaged(self.gh, repo):
                     by_number.setdefault(int(issue["number"]), issue)
             except GitHubError as err:
                 _say("could not read the triage issues of %s: %s" % (repo, err))
@@ -5608,9 +5960,11 @@ class Factory:
                     continue
                 counts["old"] += 1
                 counts[found.kind] += 1
+                names = _labels(issue)
+                triage = labels.in_triage(names)
+                if triage and (not found.at or labels.waiting_on_person(names)):
+                    continue
                 if found.kind == brain_hold.LOOM:
-                    triage = (brain_hold.TRIAGE_LABEL in _labels(issue)
-                              and "loom:ticket" not in _labels(issue))
                     due.append((age, repo, issue, found, triage))
         for age, repo, issue, found, triage in sorted(due, key=lambda d: -d[0]):
             if not write or limit <= 0:
@@ -5624,42 +5978,30 @@ class Factory:
                 limit -= 1
         return report
 
-    def _triaged(self, repo: str) -> List[Dict[str, Any]]:
-        """The repo's open triage issues (bus/rewrite.py candidates reads the
-        same listing): issues at loom:triage, not tickets and not pull
-        requests, whatever their other labels."""
-        data = self.gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open" % repo)
-        return [i for i in data if isinstance(i, dict) and "pull_request" not in i
-                and "number" in i and "loom:ticket" not in _labels(i)]
-
     def _lift_triage_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,
-                          age: float, done: List[bool]) -> None:
-        """Resolve one triage issue's hold Loom set (loom#1884): with no
-        retry note yet, take needs-brain off and leave the issue at
-        loom:triage with one retry note quoting why it was held (the
-        rewrite's last refusal), so the rewrite step -- whose candidates
-        leave held issues out -- tries once more. With a retry note already
-        on it, the rewrite could not turn it into a brief: put it in the
-        hand-off pool with one note, as _hold_hand_off does for a ticket."""
+                          _age: float, done: List[bool]) -> None:
+        """Send a day-old triage hold to a person, with one ask."""
         number = int(issue["number"])
-        comments = self._comments(repo, number)
-        why = brain_hold.reason(comments, found.at, "triage")
-        hours = age / 3600
-        if any(brain_hold.RETRY_MARKER in str(c.get("body") or "") for c in comments):
-            kept = list(dict.fromkeys(
-                [x for x in _labels(issue) if x != brain_hold.LABEL] + [HANDOFF_LABEL]))
-            self._relabel(repo, issue, kept)
-            self._status_note(repo, number, brain_hold.triage_handoff_note(
-                found, hours, why, HANDOFF_LABEL))
-            _say("handed off %s#%d: its triage needs-brain hold returned after its "
-                 "rewrite retry" % (repo, number))
-        else:
-            self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/%s"
-                         % (repo, number, brain_hold.LABEL), ok=(404,))
-            issue["labels"] = [{"name": x} for x in _labels(issue) if x != brain_hold.LABEL]
-            self._status_note(repo, number, brain_hold.triage_retry_note(found, hours, why))
-            _say("freed %s#%d's triage needs-brain hold for one more rewrite attempt"
-                 % (repo, number))
+        issue = self.gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+        names = _labels(issue)
+        required = {brain_hold.TRIAGE_LABEL, brain_hold.LABEL}
+        if (issue.get("state") != "open" or not required.issubset(names)
+                or "loom:ticket" in names or labels.waiting_on_person(names)
+                or any(name.startswith("blocked:") for name in names)):
+            return
+        comments = brain.trusted_comments(self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                           sorted(status.logins(self.gh, self.trusted)))
+        prior = next((c for c in comments if brain_hold.TRIAGE_ASK_MARKER
+                      in str(c.get("body") or "").splitlines()), None)
+        # If the label write failed, finish the same move. A later hold on
+        # an issue someone returned to triage does not repeat the handoff.
+        if prior is not None and _ts(prior.get("created_at")) < found.at:
+            return
+        if prior is None:
+            ask = brain_hold.triage_ask(comments, found.at)
+            brain._check_written_text(ask)
+            notify.post(self.gh, repo, number, ask, notify.ASK)
+        self._relabel(repo, issue, [name for name in names if name not in required] + [NEEDS_HUMAN])
         done.append(True)
 
     def _lift_hold(self, repo: str, issue: Dict[str, Any], found: brain_hold.Setter,

@@ -19,11 +19,13 @@ Triage issues (loom#1884): most held issues are not tickets at all but
 loom:triage issues, which the rewrite step itself held (bus/rewrite.py
 apply_answer adds needs-brain when it proposes a person) and then never
 retried, because its candidate list leaves held issues out. The same
-factory pass owns those holds: an old Loom-set hold on a triage issue is
-lifted once, with the hold's reason (the rewrite's last refusal) quoted in
-a RETRY_MARKER note, so the rewrite step tries once more; a triage issue
-whose hold comes back after that note goes to the hand-off pool instead,
-with one LIFT_MARKER note saying what the rewrite could not do.
+factory pass sends an old Loom-set triage hold to the operator once with
+the question the rewrite proposed, and removes it from triage.
+
+The rewrite's ask (loom#2936): apply_answer printed the ask of a person-only
+answer to the station log and wrote nothing on the issue, so `reason` found
+no note. It now leaves the ask as one routine event on the issue's status
+comment (ask_note, under ASK_MARKER), and `reason` returns that ask whole.
 """
 
 from __future__ import annotations
@@ -32,6 +34,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Sequence
+
+from . import labels
+from .github import GitHub
 
 LABEL = "needs-brain"
 # Equal to bus.brain.HUMAN_MARKER and bus.answer.HUMAN_MARKER.
@@ -52,11 +57,13 @@ LIFT_PER_RUN = 5
 LIFT_EVERY = 1800
 # On the ticket's status comment: the factory resolved this hold.
 LIFT_MARKER = "<!-- loom:hold-lifted -->"
-# On a triage issue's status comment: the factory freed its hold for one
-# more rewrite attempt (loom#1884). A hold that returns with this note
-# already on the issue goes to the hand-off pool instead.
-RETRY_MARKER = "<!-- loom:hold-retry -->"
+# On the operator ask for an expired triage hold.
+TRIAGE_ASK_MARKER = "<!-- loom:triage-brain-ask -->"
 TRIAGE_LABEL = "loom:triage"
+# On a triage issue's status comment: the ask of the rewrite answer that held
+# the issue (loom#2936). Only proposed: it is not an ask to a person, and it
+# carries no HUMAN_MARKER.
+ASK_MARKER = "<!-- loom:rewrite-ask -->"
 # A note this close to the label event, before or after it, names the hold.
 REASON_WINDOW = 600
 REASON_MAX = 160
@@ -102,23 +109,55 @@ def setter(events: Sequence[Any], loom: Iterable[str]) -> Setter:
     return Setter(LOOM if login in ours else PERSON, login, at)
 
 
-def _first_line(body: str) -> str:
+def _first_line(body: str, limit: int = REASON_MAX) -> str:
+    """The body's first line with words, cleaned; cut at `limit` characters
+    (0: never cut)."""
     for line in body.splitlines():
         line = re.sub(r"<!--.*?-->", "", line).strip().lstrip("#>*- ").strip()
         if line:
             line = re.sub(r"[`@]", "", re.sub(r"\s+", " ", line))
-            if len(line) > REASON_MAX:
-                line = line[:REASON_MAX].rsplit(" ", 1)[0] + "..."
+            if limit and len(line) > limit:
+                line = line[:limit].rsplit(" ", 1)[0] + "..."
             return line
     return ""
 
 
+def ask_note(kind: str, ask: str) -> str:
+    """The routine event the rewrite step leaves when it holds a triage issue
+    for the brain: the kind and the ask its answer proposed, on one line (no
+    comment marker, backtick or at-sign of the model's survives, so the ask
+    can close no marker and mention nobody)."""
+    text = re.sub(r"<!--.*?-->", "", str(ask), flags=re.S)
+    text = re.sub(r"<!--|-->|[`@]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return ("%s\nThe rewrite proposed person-only work (Kind: %s) and held the issue for "
+            "the brain. Its ask: %s" % (ASK_MARKER, kind, text))
+
+
+def ask_of(body: Any) -> str:
+    """The line of an ask_note, whole; "" for any other text."""
+    text = str(body or "")
+    if ASK_MARKER not in text:
+        return ""
+    return _first_line(text, 0)
+
+
+def _near_notes(comments: Sequence[Any], at: float) -> List[Dict[str, Any]]:
+    return sorted((c for c in comments if isinstance(c, dict) and at
+                   and abs(_ts(c.get("created_at")) - at) <= REASON_WINDOW),
+                  key=lambda c: _ts(c.get("created_at")), reverse=True)
+
+
 def reason(comments: Sequence[Any], at: float, state: str) -> str:
     """Why the ticket was held: the first line of the newest trusted note
-    within REASON_WINDOW of the label event, else what is known (its state)."""
-    near = [c for c in comments if isinstance(c, dict) and at
-            and abs(_ts(c.get("created_at")) - at) <= REASON_WINDOW]
-    for comment in sorted(near, key=lambda c: _ts(c.get("created_at")), reverse=True):
+    within REASON_WINDOW of the label event, else what is known (its state).
+    The rewrite's own ask among those notes (ask_note) is the reason, whole."""
+    near = _near_notes(comments, at)
+    for comment in near:
+        ask = ask_of(comment.get("body"))
+        if ask:
+            return ask.removesuffix(".")
+    for comment in near:
         line = _first_line(str(comment.get("body") or ""))
         if line:
             return line
@@ -140,21 +179,25 @@ def handoff_note(found: Setter, hours: float, why: str, handoff: str) -> str:
             "it to this Loom's queue." % (LIFT_MARKER, hours, found.login, why, handoff))
 
 
-def triage_retry_note(found: Setter, hours: float, why: str) -> str:
-    return ("%s\nHeld for the brain (needs-brain) for %.0f hours, set by %s: %s. The factory "
-            "took the hold off this triage issue so the rewrite step tries once more, with "
-            "that refusal reason quoted here. If the rewrite holds it for the brain again, "
-            "the factory moves it to the hand-off pool instead of freeing it a second time."
-            % (RETRY_MARKER, hours, found.login, why))
+def triaged(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
+    """The repo's open triage issues, including those outside any goal tree."""
+    data = gh.paginate("/repos/%s/issues?labels=loom%%3Atriage&state=open" % repo)
+    return [i for i in data if isinstance(i, dict) and "pull_request" not in i
+            and "number" in i and labels.in_triage(
+                [label.get("name", "") for label in i.get("labels") or []])]
 
 
-def triage_handoff_note(found: Setter, hours: float, why: str, handoff: str) -> str:
-    return ("%s\nHeld for the brain (needs-brain) for %.0f hours, set by %s: %s. This triage "
-            "issue already had its one more rewrite attempt, and the rewrite could not turn "
-            "it into a brief, for the reason quoted above. The factory took the hold off and "
-            "put the issue in the hand-off pool (%s): the second operator's session may "
-            "claim it. Taking the label off returns it to this Loom's queue."
-            % (LIFT_MARKER, hours, found.login, why, handoff))
+def triage_ask(comments: Sequence[Any], at: float) -> str:
+    """Use the recorded question, or ask for a ruling on triage itself."""
+    kind, ask = "decision", "Should Loom turn this issue into a ticket, hold it, or close it?"
+    for comment in _near_notes(comments, at):
+        proposed = re.fullmatch(r"The rewrite proposed person-only work \(Kind: ([a-z]+)\) "
+                                r"and held the issue for the brain\. Its ask: (.+)",
+                                ask_of(comment.get("body")))
+        if proposed:
+            kind, ask = proposed.groups()
+            break
+    return "%s\n%s\nKind: %s\n%s" % (HUMAN_MARKER, ask, kind, TRIAGE_ASK_MARKER)
 
 
 def repair_note(found: Setter, hours: float, why: str) -> str:

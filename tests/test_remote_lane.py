@@ -11,7 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import hunt_plan, lane, station  # noqa: E402
+from bus import brain, hunt_plan, lane, lane_markers, notify, station  # noqa: E402
 from bus.github import GitHubError  # noqa: E402
 
 # The lane's own App login, trusted as the station's LOOM_BRIEF_AUTHORS is
@@ -112,6 +112,15 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(len(gh.comments[4]), 1)
         self.assertEqual(labels(gh)[-1], "loom:running")
         self.assertIsNone(lane.claim(gh, ["example/project"], now=1001))
+
+    def test_a_queued_source_of_an_open_ticket_is_not_claimed(self):
+        gh = FakeGitHub()
+        gh.issues[4]["labels"].append({"name": "loom:rewritten"})
+        gh.issues[5] = {"state": "open", "labels": [{"name": "loom:ticket"}]}
+        gh.comments[4].append({"body": brain.TRIAGE_MARKER + "\nRewritten as ticket #5, see it.",
+                               "user": {"login": APP}})
+        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+        self.assertIn("loom:queued", labels(gh))
 
     def test_private_repo_is_never_claimed_and_expired_claim_returns_to_queue(self):
         private = FakeGitHub(private=True)
@@ -244,14 +253,40 @@ class RemoteLaneTests(unittest.TestCase):
         self.assertEqual(len(gh.comments[4]), 1)
         self.assertEqual([c[0] for c in gh.calls if "/comments" in c[1] and c[0] in ("POST", "PATCH")],
                          ["POST", "PATCH", "PATCH"])
-        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+        self.assertEqual(gh.comments[4][0]["body"], lane_markers.claim_body("muse", 4, 1200.0, 1000.0))
         gh.comments[4][0]["body"] = "<!-- loom:remote-claim v1 muse 4 1000.000 -->"
         # A comment from before the edit-in-place form is read as a claim and
         # edited into the new form on the next beat.
         self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 1000.0, 1000.0)])
         lane.heartbeat(gh, "example/project", 4, now=2000)
         self.assertEqual(len(gh.comments[4]), 1)
-        self.assertEqual(gh.comments[4][0]["body"], "<!-- loom:remote-claim v1 muse 4 2000.000 1000.000 -->")
+        self.assertEqual(gh.comments[4][0]["body"], lane_markers.claim_body("muse", 4, 2000.0, 1000.0))
+
+    def test_a_claim_comment_shows_a_visible_line_after_its_marker(self):
+        # A marker-only comment renders empty and still emails the operator.
+        gh = FakeGitHub()
+        lane.claim(gh, ["example/project"], now=1000)
+        body = gh.comments[4][0]["body"]
+        first, _, rest = body.partition("\n")
+        self.assertEqual(first, "<!-- loom:remote-claim v1 muse 4 1000.000 -->")
+        self.assertEqual(rest.strip(), "Claimed by remote lane muse.")
+        self.assertEqual(notify.visible_text(body), "Claimed by remote lane muse.")
+        lane.heartbeat(gh, "example/project", 4, now=1500)
+        self.assertEqual(notify.visible_text(gh.comments[4][0]["body"]),
+                         "Claimed by remote lane muse.")
+        self.assertEqual(lane._claims(gh.comments[4], "muse"), [(0, 1500.0, 1000.0)])
+
+    def test_claims_are_read_from_old_marker_only_and_new_bodies(self):
+        comments = [
+            {"body": "<!-- loom:remote-claim v1 muse 4 1000.000 -->"},
+            {"body": "<!-- loom:remote-claim v1 muse 4 1200.000 1100.000 -->\n"
+                     "Claimed by remote lane muse."},
+            {"body": "Quoted: <!-- loom:remote-claim v1 muse 4 1300.000 -->"},
+            {"body": "<!-- loom:remote-claim v1 codex 4 1400.000 -->\n"
+                     "Claimed by remote lane codex."},
+        ]
+        self.assertEqual(lane._claims(comments, "muse"),
+                         [(0, 1000.0, 1000.0), (1, 1200.0, 1100.0)])
 
     def test_the_lane_heartbeat_edits_one_comment(self):
         gh = FakeGitHub()
@@ -381,6 +416,18 @@ class ClaimRejectionTests(unittest.TestCase):
         self.assertIn(self.rejection_line("no acceptance criteria"), err)
         self.assertIn("loom:queued", [x["name"] for x in gh.issues[4]["labels"]])
 
+    def test_a_two_platform_ticket_is_rejected_with_the_split_reason(self):
+        # loom#2929: the split hold at the lane's own claim check.
+        gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS and on Android."))
+        got, err = self.claim_err(gh)
+        self.assertIsNone(got)
+        self.assertIn("spans more than one platform (iOS, Android)", err)
+        self.assertIn("After:", err)
+
+    def test_a_single_platform_ticket_gets_no_split_reason(self):
+        gh = FakeGitHub(body=BODY.replace("Add the feature.", "Build it on iOS."))
+        self.assertIsNone(lane._rejection_reason(gh.issues[4], "muse"))
+
     def test_a_pull_request_item_is_named_with_its_reason(self):
         gh = FakeGitHub()
         gh.issues[4]["pull_request"] = {"url": "https://example.com/pulls/4"}
@@ -470,7 +517,7 @@ class OutsiderCommentTests(unittest.TestCase):
         self.outsider(gh, 4, "<!-- loom:remote-claim v1 muse 4 999.000 -->")
         lane.heartbeat(gh, "example/project", 4, now=1000)
         self.assertFalse(any(m == "PATCH" for m, _, _ in gh.calls))
-        self.assertEqual("<!-- loom:remote-claim v1 muse 4 1000.000 -->", gh.comments[4][-1]["body"])
+        self.assertEqual(lane_markers.claim_body("muse", 4, 1000.0), gh.comments[4][-1]["body"])
 
 
 class OwnAppLoginTests(unittest.TestCase):
@@ -510,7 +557,7 @@ class OwnAppLoginTests(unittest.TestCase):
                     lane.heartbeat(gh, "example/project", 4, now=at)
                 self.assertEqual(len(gh.comments[4]), 1)
                 self.assertEqual(gh.comments[4][0]["body"],
-                                 "<!-- loom:remote-claim v1 muse 4 1200.000 1000.000 -->")
+                                 lane_markers.claim_body("muse", 4, 1200.0, 1000.0))
 
     def test_an_outsider_marker_still_does_not_count(self):
         self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})
@@ -520,6 +567,21 @@ class OwnAppLoginTests(unittest.TestCase):
         lane.lane_heartbeat(gh, "example/project", now=1000)
         self.assertEqual(gh.comments[9][0]["body"], "<!-- loom:remote-heartbeat v1 muse 1.000 -->")
         self.assertEqual(len(gh.comments[9]), 2)
+
+    def test_a_lane_heartbeat_shows_a_visible_line_and_edits_an_old_marker_only_one(self):
+        gh = FakeGitHub()
+        lane.lane_heartbeat(gh, "example/project", now=1000)
+        self.assertEqual(gh.comments[9][0]["body"],
+                         "<!-- loom:remote-heartbeat v1 muse 1000.000 -->\n"
+                         "Remote lane muse is available.")
+        gh.comments[9][0]["body"] = "<!-- loom:remote-heartbeat v1 muse 1000.000 -->"
+        lane.lane_heartbeat(gh, "example/project", now=2000)
+        self.assertEqual(len(gh.comments[9]), 1)
+        self.assertEqual(notify.visible_text(gh.comments[9][0]["body"]),
+                         "Remote lane muse is available.")
+        lane.lane_heartbeat(gh, "example/project", now=3000)
+        self.assertEqual(len(gh.comments[9]), 1)
+        self.assertIn(" 3000.000 -->", gh.comments[9][0]["body"])
 
     def test_a_client_without_an_app_login_trusts_only_the_configured_logins(self):
         self.env({"LOOM_BRIEF_AUTHORS": "operator-example"})

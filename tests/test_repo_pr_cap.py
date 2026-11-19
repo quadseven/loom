@@ -1,4 +1,5 @@
 """Repository backpressure leaves existing PR work runnable."""
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -55,6 +56,68 @@ class RepoPrCapTest(Base):
         with mock.patch.object(runner, "_heartbeat_ok", return_value=False):
             runner.claim_new()
         self.assertEqual(runner._gate_held(), [])
+
+    def try_ticket(self):
+        """One claim pass's look at ticket 12 for lane codex, with fresh
+        station memory, and the requests it sent."""
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.fake.calls.clear()
+        # As the briefed poll hands it over (Station._poll).
+        issue = dict(self.fake.issues[12], repository_url="https://api.github.com/repos/" + REPO)
+        took = runner._try_ticket(REPO, "codex", issue, ["codex"])
+        return runner, took, list(self.fake.calls)
+
+    def per_ticket_reads(self, calls):
+        """The reads a claim spends on ticket 12 itself before it can be held:
+        its trust events, its editor, its fresh issue and the closed pull
+        requests a verify-before-build check lists (loom#3119)."""
+        return [(m, p) for m, p in calls
+                if p in ("/repos/%s/issues/12" % REPO, "/graphql")
+                or p.startswith("/repos/%s/issues/12/events" % REPO)
+                or (p.startswith("/repos/%s/pulls?" % REPO) and "state=closed" in p)]
+
+    def test_cap_held_ticket_already_told_costs_no_per_ticket_read(self):
+        # loom#3119: 61 of 98 briefed tickets sat in two repos over the cap,
+        # and every pass spent the trust, issue and merged-PR reads on each
+        # one before the cap held it, so the claim share ran out first.
+        self.pulls(9)
+        self.fake.add(12)
+        _, took, _ = self.try_ticket()
+        self.assertFalse(took)
+        self.assertIn("9 open pull requests (cap 8)", str(self.fake.comments[12]))
+        runner, took, calls = self.try_ticket()
+        self.assertFalse(took)
+        self.assertEqual(self.per_ticket_reads(calls), [])
+        self.assertEqual(self.fake.paths("POST") + self.fake.paths("PATCH")
+                         + self.fake.paths("PUT"), [])
+        self.assertEqual(runner._gate_held(), ["%s#12" % REPO])
+        self.assertEqual(self.listing(), [])
+
+    def test_changed_cap_count_takes_the_full_path_and_restates_the_hold(self):
+        self.pulls(9)
+        self.fake.add(12)
+        self.try_ticket()
+        self.pulls(10)
+        _, took, _ = self.try_ticket()
+        self.assertFalse(took)
+        self.assertIn("10 open pull requests (cap 8)", str(self.fake.comments[12]))
+
+    def test_fix_round_over_cap_is_not_held_early(self):
+        self.pulls(9)
+        self.fake.add(12)
+        self.try_ticket()
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, took, _ = self.try_ticket()
+        self.assertTrue(took)
+        text = Path(self.inbox("codex", self.listing()[0])).read_text()
+        self.assertIn("Fix-PR: 99", text)
+
+    def test_under_cap_ticket_still_reads_its_trust(self):
+        self.pulls(7)
+        self.fake.add(12)
+        _, took, calls = self.try_ticket()
+        self.assertTrue(took)
+        self.assertTrue(self.per_ticket_reads(calls))
 
     def test_ticket_under_cap_still_counts_as_load(self):
         self.pulls(7)
@@ -214,6 +277,103 @@ class RepoPrCapTest(Base):
             runner._publish_initial_lanes()
         self.assertIn("Open pull requests: pending this pass", post.call_args.args[2])
         self.assertEqual(runner._repo_pr_counts, {})
+
+
+class CapLoadBeforeClaimTest(Base):
+    """The factory reads the cap from the repo count, not from how far the
+    claim pass got (loom#3158). On 2026-11-17, 68 of 97 briefed tickets sat
+    in a repo over its cap; the first assign_queued of each pass runs before
+    claim_new and a claim pass stopped at its share never reached the rest,
+    so each counted as lane load and nine medium lanes idled."""
+
+    pulls = RepoPrCapTest.pulls
+
+    def setUp(self):
+        super().setUp()
+        self.fake.default_body = BODY_WITH_CRITERIA
+
+    def factory(self):
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        return runner, runner._load_factory()
+
+    def test_briefed_ticket_over_cap_is_not_load_before_any_claim_pass(self):
+        self.pulls(9)
+        self.fake.add(12)
+        runner, counter = self.factory()
+        self.assertEqual(runner._gate_held(), [])
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 0)
+
+    def test_briefed_fix_round_over_cap_is_still_load(self):
+        # The station claims a fix round over the cap
+        # (test_fix_round_still_dispatches_over_cap), so its lane is busy.
+        self.pulls(9)
+        self.fake.add(12)
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_briefed_ticket_under_cap_is_still_load(self):
+        self.pulls(7)
+        self.fake.add(12)
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_running_ticket_over_cap_is_still_load(self):
+        self.pulls(9)
+        self.fake.add(12, state="running")
+        _, counter = self.factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_unread_count_is_not_a_cap_for_the_load(self):
+        self.fake.add(12)
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        with mock.patch.object(runner, "_read_repo_pr_count", side_effect=GitHubError("unread")):
+            counter = runner._load_factory()
+        counter.count_load({REPO: {12: self.fake.issues[12]}})
+        self.assertEqual(counter.load.get("codex", 0), 1)
+
+    def test_queued_ticket_over_cap_waits_and_stays_queued(self):
+        self.pulls(9)
+        self.fake.add(12, state="queued")
+        _, counter = self.factory()
+        reason = counter._assign_queued_ticket(REPO, self.fake.issues[12])
+        self.assertEqual(reason, "%s#12 waits: its repo is at its open pull request cap" % REPO)
+        self.assertEqual(counter.waits.get("%s#12" % REPO),
+                         "its repo is at its open pull request cap")
+        self.assertIn("loom:queued", self.fake.names(12))
+        self.assertEqual(self.fake.paths("PUT") + self.fake.paths("POST"), [])
+
+    def test_briefed_ticket_over_cap_goes_back_to_the_queue_with_no_lane(self):
+        # Its brief cannot be written while the repo is at the cap, so it
+        # waits queued (CAP_WAIT), off every lane, not briefed on one.
+        self.pulls(9)
+        self.fake.add(12)
+        _, counter = self.factory()
+        with mock.patch.object(counter, "_spread", side_effect=AssertionError("moved")), \
+                mock.patch.object(counter, "_step_aside", side_effect=AssertionError("moved")):
+            counter.briefed(REPO, self.fake.issues[12])
+        names = self.fake.names(12)
+        self.assertIn("loom:queued", names)
+        self.assertNotIn("loom:briefed", names)
+        self.assertFalse([n for n in names if n.startswith("lane:")], names)
+
+    def test_the_factory_is_told_which_tickets_have_a_brief_in_an_inbox(self):
+        os.makedirs(self.inbox("codex"), exist_ok=True)
+        Path(self.inbox("codex", "brief.md")).write_text("Issue: %s#12\n\nbody\n" % REPO)
+        Path(self.inbox("codex", "note.txt")).write_text("Issue: %s#13\n" % REPO)
+        _, counter = self.factory()
+        self.assertEqual(counter.in_inbox, {"%s#12" % REPO})
+
+    def test_briefed_fix_round_over_cap_stays_briefed(self):
+        self.pulls(9)
+        self.fake.add(12)
+        fixtures.FixTest.comment(self, 12, FIX_BODY)
+        _, counter = self.factory()
+        self.assertNotIn("%s#12" % REPO, counter.cap_held)
 
 
 if __name__ == "__main__":

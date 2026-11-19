@@ -18,15 +18,15 @@ from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
 from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
-from . import answer, ci_facts, ci_gap, decision_claim, fixrounds, history, hold_boxes, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
+from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
-from . import tick_clock
-from . import home_repo
+from . import lane_markers, tick_clock
+from . import brief_check, home_repo, state_store
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # A comment the brain posts to cancel a pending brain fix (loom#1998): the
@@ -52,6 +52,8 @@ IN_FLIGHT = ("loom:queued", "loom:briefed", "loom:running", "loom:pr", "loom:fai
 # factories can raise it through LOOM_GOAL_CAP when their goals need more
 # concurrent tickets.
 DEFAULT_GOAL_CAP = 16
+GOAL_CAP_RESERVE = 2
+LANE_WAIT_MAX_AGE = 3600
 # Merged and shipped tickets that still wait on a live check. A verified
 # ticket carries loom:verified instead of loom:shipped (or loom:merged for a
 # docs proof), so it never counts here.
@@ -853,8 +855,7 @@ def _pending_brain_fix(comments: List[Any], authors: Sequence[str],
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "")
-        remote_claim = re.fullmatch(r"<!-- loom:remote-claim v1 [^ ]+ ([0-9]+) [0-9.]+(?: [0-9.]+)? -->",
-                                    body.strip())
+        remote_claim = lane_markers.claim_match(body)
         login = tickets._login(comment.get("user")).lower()
         if login in claim_authors and (_CLAIM.fullmatch(body.strip()) or remote_claim):
             last_claim = i
@@ -967,9 +968,23 @@ def _names_sha(body: str, sha: str) -> bool:
                              for m in _SHA_WORD.finditer(body))
 
 
+def _carries_marker(body: str) -> bool:
+    """The comment carries an automated marker: an HTML comment opening
+    with the Loom marker prefix, or a review-bot marker of the same shape.
+    The factory and the brain post such comments under the same App login
+    that opens lane pull requests, so a marker comment is a machine note,
+    never the author's or a trusted login's own answer."""
+    return "<!-- loom:" in body or "<!-- grug-" in body
+
+
 def _lifts_hold(login: str, body: str, author: str, sha: str, allowed: set) -> bool:
     """A comment after a hold that lifts it: the pull request author's, or
-    a trusted one naming the head commit's sha."""
+    a trusted one naming the head commit's sha. A comment carrying a Loom
+    marker never lifts a hold, whoever posts it and whatever sha it names:
+    that is the chosen rule for this ticket, so the factory's own marker
+    comments leave a hold standing."""
+    if _carries_marker(body):
+        return False
     return (bool(author) and login == author) or (login in allowed and _names_sha(body, sha))
 
 
@@ -977,9 +992,10 @@ def fleet_hold(comments: Sequence[Any], head: Dict[str, Any], head_sha: str,
                pr_author: str, trusted: Sequence[str]) -> Optional[Dict[str, Any]]:
     """The standing hold comment on a pull request, else None (loom#2393).
     A hold is a trusted login's comment opening with "Not merging" or "Hold",
-    made after the head commit (a newer push lifts it). A later comment by
-    the pull request's author lifts it, and so does a later trusted comment
-    naming the head commit's sha. With no head commit date every hold counts."""
+    made after the head commit (a newer push lifts it). A later plain comment
+    by the pull request's author lifts it, and so does a later plain trusted
+    comment naming the head commit's sha. A comment carrying a Loom marker
+    never lifts it. With no head commit date every hold counts."""
     allowed = {a.lower() for a in trusted if a}
     if not allowed:
         return None
@@ -1033,6 +1049,55 @@ def _hold_blocker(gh: GitHub, repo: str, number: int, head: Dict[str, Any],
     if held is None:
         return None
     return "held by a fleet comment from %s: %s" % (comment_login(held), _hold_name(held))
+
+
+def _read_comments(gh: GitHub, repo: str, number: int) -> List[Dict[str, Any]]:
+    """Every comment on a pull request, read once for the comment gates (the
+    fleet hold and the blocking-comment check, loom#2988). Raises ValueError
+    when they cannot be read: a gate the comments never reached cannot be
+    passed."""
+    try:
+        return gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request comments unreadable, so a fleet hold or a "
+                         "blocking comment cannot be ruled out (%s)" % err) from err
+
+
+def _finding_blocker(gh: GitHub, repo: str, number: int, authors: Sequence[str],
+                     known: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
+    """The blocker an unanswered blocking comment from a trusted login puts on a
+    pull request, else None (bus/comment_findings.py, loom#2988). Status and
+    merge both call it, so they agree. `known` is every comment, already read;
+    else they are read from REST, and unreadable comments block. The pull
+    request's commits are read only for an answer that names a commit, and
+    unreadable commits block too."""
+    if not [a for a in authors if a]:
+        return None
+    if known is None:
+        try:
+            known = _read_comments(gh, repo, number)
+        except ValueError as err:
+            return str(err).removeprefix("blocked: ")
+    try:
+        found = comment_findings.open_findings(list(known), authors,
+                                               pr_commit_reader(gh, repo, number))
+    except GitHubError as err:
+        return COMMITS_UNREADABLE % err
+    return comment_findings.blocker(found) if found else None
+
+
+COMMITS_UNREADABLE = ("pull request commits unreadable, so a fix named in an answer "
+                      "cannot be checked (%s)")
+
+
+def pr_commit_reader(gh: GitHub, repo: str, number: int) -> comment_findings.CommitReader:
+    """Reads pull request `number`'s commit SHAs, for an answer that names its
+    fix (bus/comment_findings.py). It reads only when called."""
+    def read() -> List[str]:
+        return [str(c.get("sha") or "") for c in
+                gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+                if isinstance(c, dict)]
+    return read
 
 
 def _one_line(value: Any, limit: int = 200) -> str:
@@ -1174,6 +1239,9 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
                          hold, _node_comments(node))
     if hold:
         line = _add_blocker(line, hold)
+    finding = _finding_blocker(gh, repo, int(pr["number"]), authors, _node_comments(node))
+    if finding:
+        line = _add_blocker(line, finding)
     if operator_hold.operator_steps(str(pr.get("body") or "")):
         line = _add_blocker(line, "held for the operator: operator steps before merge")
     return _goal_rule_line(gh, repo, pr, ticket, line)
@@ -2037,14 +2105,14 @@ def _check_model(model: Optional[str]) -> None:
 
 
 def _check_laneable(body: str) -> None:
-    """Refuse a brief no lane can meet: every acceptance criterion is a check
-    on a live host or network (operator_hold.host_only). 2026-10-22: such a
-    ticket was laned; the lane replaced a README to have a diff, and it
-    merged."""
+    """Refuse host-only briefs and briefs that need to be split before filing."""
     if operator_hold.host_only(body):
         raise ValueError("every acceptance criterion is a check on a live host or network: "
                          "no lane can meet it; file it as a needs-operator ask, or add a "
                          "criterion a pull request can meet")
+    split = brief_check.split_verdict(body)
+    if split is not None:
+        raise ValueError("this brief " + split.reason)
 
 
 def _check_brief_args(title: str, body: str, lane: Optional[str],
@@ -2389,7 +2457,7 @@ def _issue_key(issue: Dict[str, Any], repo: str) -> Tuple[str, int]:
 
 
 def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
-              warnings: Optional[List[str]] = None
+              warnings: Optional[List[str]] = None, *, parallel: bool = True
               ) -> Tuple[List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]]:
     """(the goal's direct children that are not epics, [(epic, its tickets)]).
 
@@ -2425,9 +2493,11 @@ def goal_tree(gh: GitHub, repo: str, goal: int, light: bool = False,
                 found[(epic_repo, number)] = tickets
         subs = [found[(_epic_repo(e, repo), int(e.get("number") or 0))] for e in epics]
     else:
-        subs = _read_each(lambda epic: gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
-                                                   % (_epic_repo(epic, repo),
-                                                      int(epic.get("number") or 0))), epics)
+        def read_subs(epic: Dict[str, Any]) -> List[Any]:
+            return gh.paginate("/repos/%s/issues/%d/sub_issues?per_page=100"
+                               % (_epic_repo(epic, repo), int(epic.get("number") or 0)))
+
+        subs = _read_each(read_subs, epics) if parallel else [read_subs(epic) for epic in epics]
     for epic, sub in zip(epics, subs, strict=True):
         tree.append((epic, _tree_tickets(int(epic.get("number") or 0), sub, open_tickets,
                                          _epic_repo(epic, repo), repo)))
@@ -2648,11 +2718,11 @@ def _ticket_of_epic(item: Dict[str, Any], number: int, here: str) -> bool:
     return _names_goal(item.get("body"), number)
 
 
-def goal_children(gh: GitHub, repo: str, goal: int) -> List[Dict[str, Any]]:
+def goal_children(gh: GitHub, repo: str, goal: int, *, parallel: bool = True) -> List[Dict[str, Any]]:
     """Every ticket of the goal, each once: its direct children that are not
     epics, then each epic's tickets (goal_tree). The epics themselves are not
     listed: a count of tickets must not count an epic."""
-    return _flatten(*goal_tree(gh, repo, goal), repo=repo)
+    return _flatten(*goal_tree(gh, repo, goal, parallel=parallel), repo=repo)
 
 
 def _flatten(loose: List[Dict[str, Any]],
@@ -2915,6 +2985,14 @@ def _rescue_allowed(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
     return bool(_closed_epic_tickets(tree))
 
 
+class GoalCapacityHeld(ValueError):
+    """A brief can be retried when the goal has room."""
+
+
+class GoalEpicCapacityHeld(GoalCapacityHeld):
+    """The goal has no slot for a new intake epic."""
+
+
 def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any],
                      today: Optional[str] = None, rescue: bool = False,
                      area: Optional[str] = None) -> None:
@@ -2924,9 +3002,10 @@ def _check_epic_room(gh: GitHub, repo: str, goal: int, goal_issue: Dict[str, Any
     if count >= cap:
         if rescue and _rescue_allowed(tree, area=area):
             return
-        raise ValueError("goal #%d already has %d open epics (cap %d): finish one first, or "
-                         "record a one-time exception on the goal home as "
-                         "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
+        raise GoalEpicCapacityHeld(
+            "goal #%d already has %d open epics (cap %d): finish one first, or "
+            "record a one-time exception on the goal home as "
+            "\"Epic cap: N until YYYY-MM-DD\"" % (goal, count, cap))
 
 
 def file_epic(gh: GitHub, repo: str, goal: int, title: str, body: str,
@@ -3052,9 +3131,10 @@ def move_outside_tickets(gh: GitHub, repo: str, goal: int) -> Tuple[int, int]:
     line then names the new epic; the closed epic stays closed (loom#1925).
     A ticket that also sits under an open epic stays there.
 
-    An open epic that holds more than EPIC_TICKET_CAP tickets has its excess
-    open tickets moved to the goal's next intake epic (the epic retains its
-    first EPIC_TICKET_CAP tickets, loom#2085). Returns (moved, left).
+    An open epic that holds more than EPIC_TICKET_CAP open tickets has its
+    excess open tickets moved to the goal's next intake epic (the epic
+    retains its first EPIC_TICKET_CAP open tickets, loom#2085; closed tickets
+    do not count, loom#1925). Returns (moved, left).
 
     Tickets stranded under a closed epic may open further intake epics past the
     goal's open epic cap when every open intake epic is full, at most
@@ -3184,17 +3264,20 @@ def _closed_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
 def _over_capacity_epic_tickets(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]
                                ) -> List[Tuple[Dict[str, Any], int]]:
     """(ticket, its epic) for each excess open ticket of an open epic that
-    holds more than EPIC_TICKET_CAP tickets. The epic retains its first
-    EPIC_TICKET_CAP tickets, and excess open tickets move to the next epic."""
+    holds more than EPIC_TICKET_CAP open tickets. The epic retains its first
+    EPIC_TICKET_CAP open tickets, and excess open tickets move to the next
+    epic. Closed tickets do not count, as for an epic's room (_open_count):
+    counted, two intake epics full of closed tickets traded their open ones
+    back and forth on every pass (loom#1925)."""
     out: List[Tuple[Dict[str, Any], int]] = []
     seen = set()
     for epic, held in tree:
         if epic.get("state", "open") != "open" or standing_epic(epic):
             continue
-        if len(held) <= EPIC_TICKET_CAP:
+        if _open_count(held) <= EPIC_TICKET_CAP:
             continue
         number = int(epic.get("number") or 0)
-        excess = len(held) - EPIC_TICKET_CAP
+        excess = _open_count(held) - EPIC_TICKET_CAP
         movable = [t for t in held if _movable_ticket(t)]
         if not movable:
             continue
@@ -3512,18 +3595,69 @@ def goal_flying(gh: GitHub, repo: str, goal: int,
     return [i for i in _goal_children(gh, repo, goal, issue) if _in_flight(i)]
 
 
+def no_lane_waits(saved: Any, now: Optional[float] = None) -> Dict[str, float]:
+    """Read first no-lane waits, ignoring stale observations when given a time."""
+    return {key: info["no_lane_since"] for key, info in
+            (saved.items() if isinstance(saved, dict) else [])
+            if isinstance(info, dict) and type(info.get("no_lane_since")) in (int, float)
+            and (now is None or (type(info.get("seen")) in (int, float)
+                                 and 0 <= now - info["seen"] <= LANE_WAIT_MAX_AGE))}
+
+
+def _goal_lane_waits(env: Optional[Dict[str, str]] = None) -> Dict[str, float]:
+    env = os.environ if env is None else env
+    home = env.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    path = os.path.join(home, "state", "station", "ticket-waits.json")
+    return no_lane_waits(state_store.active().read_json(path, {}, strict=False), time.time())
+
+
+def _holds_goal_slot(issue: Dict[str, Any], repo: str, waiting: Container[str]) -> bool:
+    if not _in_flight(issue):
+        return False
+    names = _labels(issue)
+    if "loom:running" in names or "loom:pr" in names:
+        return True
+    return ("loom:failed" not in names and not needs_human(names)
+            and not any(name.startswith("wait:") for name in names)
+            and "%s#%s" % (repo, issue.get("number")) not in waiting
+            and not brief_check.health_hold(issue))
+
+
 def _goal_in_flight(gh: GitHub, repo: str, goal: int,
                     issue: Optional[Dict[str, Any]] = None) -> int:
-    """Tickets in flight under an open loom:goal issue; ValueError for anything else."""
-    return len(goal_flying(gh, repo, goal, issue))
+    """Tickets holding a slot under an open loom:goal issue."""
+    waiting = _goal_lane_waits()
+    return sum(_holds_goal_slot(i, repo, waiting) for i in goal_flying(gh, repo, goal, issue))
 
 
-def _check_goal_capacity(children: List[Dict[str, Any]], goal: int) -> None:
-    count = sum(1 for i in children if _in_flight(i))
+def goal_cap_repair(issue: Dict[str, Any]) -> bool:
+    """Whether a factory repair or a health intake ticket can use the reserve."""
+    return ("loom:factory" in _labels(issue)
+            or bool(brief_check.HEALTH_MARKER_RE.search(str(issue.get("body") or ""))))
+
+
+def goal_capacity_counts(children: List[Dict[str, Any]], repo: str,
+                         waiting: Container[str]) -> Tuple[int, int]:
+    """Base and reserve counts. Held repairs still use reserve room."""
+    count = held_repairs = 0
+    for issue in children:
+        if _holds_goal_slot(issue, repo, waiting):
+            count += 1
+        elif _in_flight(issue) and "loom:failed" not in _labels(issue) and goal_cap_repair(issue):
+            held_repairs += 1
+    return count, count + held_repairs
+
+
+def _check_goal_capacity(children: List[Dict[str, Any]], repo: str, repair: bool = False,
+                         env: Optional[Dict[str, str]] = None) -> None:
+    count, reserved = goal_capacity_counts(children, repo, _goal_lane_waits(env))
     cap = goal_cap()
-    if count >= cap:
-        raise ValueError("goal already has %d tickets in flight (cap %d); only a measured "
-                         "regression of a shipped ticket passes it (--regresses)" % (count, cap))
+    limit = cap + GOAL_CAP_RESERVE if repair else cap
+    if (reserved if repair else count) < limit:
+        return
+    why = "the repair reserve is full" if repair else "ordinary briefs wait for a slot"
+    raise GoalCapacityHeld("goal already has %d tickets in flight (cap %d); %s"
+                           % (count, cap, why))
 
 
 def _unproven(issue: Dict[str, Any]) -> bool:
@@ -3689,21 +3823,24 @@ def _hold_over_rebriefed(gh: GitHub, repo: str, issue: Dict[str, Any], count: in
     return why
 
 
-def _regression_slot(children: List[Dict[str, Any]], cap: int) -> Optional[str]:
+def _regression_slot(children: List[Dict[str, Any]], repo: str, cap: int) -> Optional[str]:
     """None while the goal is under its cap; past it, why a regression may still
     be admitted: through the goal's one regression slot, refused while another
     regression ticket holds it. Count-then-label is not atomic (GitHub has no
     compare-and-set on labels); one brain acts at a time under bus lock, so at
     worst a race adds one ticket to a soft cap."""
     flying = [c for c in children if _in_flight(c)]
-    if len(flying) < cap:
+    waiting = _goal_lane_waits()
+    count, _ = goal_capacity_counts(flying, repo, waiting)
+    if count < cap:
         return None
     held = [c for c in flying if REGRESSION in _labels(c)]
     if held:
+        others = count - _holds_goal_slot(held[0], repo, waiting)
         raise ValueError("the goal's regression slot is held by #%s, with %d other tickets "
-                         "in flight (cap %d)" % (held[0].get("number"), len(flying) - 1, cap))
+                         "in flight (cap %d)" % (held[0].get("number"), others, cap))
     return ("past the cap through the regression slot, with %d other tickets in flight "
-            "(cap %d)" % (len(flying), cap))
+            "(cap %d)" % (count, cap))
 
 
 def _file_ticket(gh: GitHub, repo: str, goal: int, title: str, body: str,
@@ -3832,7 +3969,7 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     if held is not None:
         return str(held.get("html_url", ""))
     issue = _regressed_ticket(gh, repo, regressed)
-    why = _regression_slot(children, goal_cap())
+    why = _regression_slot(children, repo, goal_cap())
     ours = any(int(c.get("number") or 0) == regressed for c in children)
     if issue.get("state") == "open" and ours:
         count, cap = _regression_rebriefs(issue), regression_rebrief_cap()
@@ -3897,7 +4034,9 @@ def _check_brief_difficulty(body: str, lane: Optional[str], difficulty: Optional
                          "(docs/MUSE.md, Lane choice); without it no lane ever claims the ticket")
 
 
-BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*$", re.M | re.I)
+# A body edited in the GitHub web editor ends its lines in CRLF, so the
+# line may end in a carriage return before the newline (loom#3115).
+BUILDS_ON_RE = re.compile(r"^Builds on #([1-9][0-9]*)[ \t]*\r?$", re.M | re.I)
 
 
 def _builds_on_base(gh: GitHub, repo: str, body: str,
@@ -3935,11 +4074,12 @@ def _brief_base(gh: GitHub, repo: str, body: str, goal_issue: Dict[str, Any],
 def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
                  base: Optional[str], not_before: Optional[str] = None,
                  after: Optional[str] = None, priority: Optional[str] = None,
-                 repairs_incident: Optional[int] = None) -> str:
+                 repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     headers = ["%s: %s" % (k, v) for k, v in
                (("Repairs incident", "#%d" % repairs_incident if repairs_incident is not None else None),
                 ("After", after), ("Not before", not_before),
-                ("Difficulty", difficulty), ("Priority", priority), ("Model", model),
+                ("Difficulty", difficulty), ("Priority", priority),
+                ("Foundational", "yes" if foundational else None), ("Model", model),
                 ("Base", base)) if v]
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
@@ -3974,7 +4114,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
           resolves: Optional[str] = None, intake_of: Optional[int] = None,
-          repairs_incident: Optional[int] = None) -> str:
+          repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -3986,7 +4126,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     Only a source the station could not claim as a ticket (_in_place_refusal)
     gets a new ticket whose body ends with "Rewritten from issue M." in
     words, and a comment naming the ticket and loom:rewritten in place of
-    loom:triage; it closes as completed when the ticket is verified
+    its ticket and state labels; it closes as completed when the ticket is verified
     (settle_source). The line is words, not "Refs #M": lanes copy the
     brief's sections into their pull request, and the review bot's plan
     check then demands that the original, which is in no epic, belong to one
@@ -4050,7 +4190,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
-    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority, repairs_incident)
+    full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
+                             repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
                                       "Model": model, "Base": base, "After": after,
                                       "Not before": not_before,
@@ -4059,12 +4200,13 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue, epic)
     children = _goal_children(gh, repo, goal, goal_issue)
-    _check_goal_capacity(children, goal)
+    reserve = goal_cap_repair({**(source or {}), "body": full_body})
+    _check_goal_capacity(children, repo, reserve, env)
     repair = priority == "P0" or (epic is not None and (repo, epic) in repair_epics(env))
     _check_goal_unproven(children, goal, repo if repair else None, env)
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
-        epic = intake_epic(gh, repo, goal)
+        epic = _brief_intake_epic(gh, repo, goal, reserve)
     if source is not None:
         # A rewrite's draft may carry its own Part of line naming another
         # issue (loom#2033); the ticket names the epic it is filed under.
@@ -4075,6 +4217,16 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _brief_intake_epic(gh: GitHub, repo: str, goal: int, repair: bool) -> int:
+    """Keep repair intake moving when a goal cannot open another intake epic."""
+    try:
+        return intake_epic(gh, repo, goal)
+    except GoalEpicCapacityHeld:
+        if not repair:
+            raise
+        return repairs_epic(gh, repo, goal)
 
 
 def _source_parent(source: Dict[str, Any]) -> Optional[int]:
@@ -4146,27 +4298,30 @@ def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
     (_rewrite_in_place), else a new issue (_filed_rewrite)."""
     if source is not None and elsewhere is None:
         return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
-    refs = int(source["number"]) if source is not None else None
-    return _filed_rewrite(gh, repo, epic, title, body, lane, refs, elsewhere)
+    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
-                   lane: Optional[str], refs: Optional[int],
+                   lane: Optional[str], source: Optional[Dict[str, Any]],
                    elsewhere: Optional[str]) -> Dict[str, Any]:
-    """File the brief as a new ticket. With refs (a source in-place rewriting
-    refuses, see _in_place_refusal), the source gets the rewrite comment and
-    loom:rewritten in place of loom:triage, and closes with the ticket."""
-    issue = _file_ticket(gh, repo, epic, title, body, lane)
-    if refs is not None:
+    """File the brief as a new ticket. Its source, if any, gets the rewrite
+    comment and loom:rewritten in place of its ticket and state labels."""
+    source_labels = _labels(source) if source is not None else []
+    extra = ["loom:factory"] if "loom:factory" in source_labels else []
+    issue = _file_ticket(gh, repo, epic, title, body, lane, extra)
+    if source is not None:
+        refs = int(source["number"])
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),
               file=sys.stderr)
         notify.post(gh, repo, refs,
                     "%s\nRewritten as ticket #%d, which refs this issue. This issue "
                     "closes as completed when that ticket is verified." % (
                         TRIAGE_MARKER, issue["number"]), notify.SOURCE)
-        _remove_label(gh, repo, refs, "loom:triage")
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, refs),
                 {"labels": ["loom:rewritten"]})
+        for label in source_labels:
+            if label in ticket_move.STATE_LABELS or label in ("loom:ticket", "loom:triage"):
+                _remove_label(gh, repo, refs, label)
     return issue
 
 
@@ -4224,7 +4379,19 @@ def _check_rewritable(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     names = _labels(issue)
     if "loom:ticket" in names or "loom:rewritten" in names:
         raise ValueError("#%d is already a ticket or already rewritten" % number)
+    person = _human_holder(gh, repo, issue)
+    if person:
+        raise ValueError("#%d is claimed by %s, a person's session; leave it to them"
+                         % (number, person))
     return issue
+
+
+def _human_holder(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[str]:
+    """The login of a person's session that claims the issue by assignment
+    or by its claim comment (bus/human_claims.py). The comments are read only
+    when the issue has some."""
+    return human_claims.Reader(
+        lambda r, n: gh.paginate("/repos/%s/issues/%d/comments" % (r, n))).holder(repo, issue)
 
 
 def _remove_label(gh: GitHub, repo: str, number: int, name: str) -> None:
@@ -4465,7 +4632,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
             break
         number = int(issue["number"])
         skip = _triage_skip(issue, authors, briefers, journals)
-        if skip:
+        if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
         if not missing:
@@ -5252,10 +5419,17 @@ def merge(gh: GitHub, repo: str, number: int,
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
+    logins = hold_logins(env)
+    authors = trusted_authors(env)
+    # Neither gate reads anything without a trusted login, so none is read here.
+    comments = _read_comments(gh, repo, number) if (logins or authors) else []
     hold = _hold_blocker(gh, repo, number, _head_commit(details), str(sha),
-                         str((pr.get("user") or {}).get("login") or ""), hold_logins(env))
+                         str((pr.get("user") or {}).get("login") or ""), logins, comments)
     if hold:
         raise ValueError("blocked: " + hold)
+    finding = _finding_blocker(gh, repo, number, trusted_authors(env), comments)
+    if finding:
+        raise ValueError("blocked: " + finding)
     shadow_env = _shadow_env(env)
     refusal = shadow.merge_refusal(repo, shadow_env)
     if refusal:
@@ -6115,6 +6289,7 @@ def _validate_adopt_pr(gh: GitHub, repo: str, pr: Dict[str, Any],
 
 def reply_to_review(gh: GitHub, repo: str, number: int, comment_id: int,
                     body: str, resolve: bool = False) -> None:
+    notify.check_visible(body, "a review reply on %s#%d" % (repo, number))
     _check_written_text(body)
     _check_decision_claim(gh, repo, number, body)
     gh.rest("POST", "/repos/%s/pulls/%d/comments/%d/replies" % (repo, number, comment_id), {"body": body})
@@ -6370,6 +6545,7 @@ FORCE_CLOSE_LABEL = "force-close"
 _REWRITTEN_FROM = tickets.REWRITTEN_FROM_RE
 # Rewrites before loom#462 ended the ticket with this line instead.
 _REFS_LINE = re.compile(r"^Refs #(\d+)[ \t]*$", re.M)
+REWRITTEN_AS_RE = re.compile(r"Rewritten as ticket #(\d+),")
 
 
 def rewritten_from(body: Any) -> Optional[int]:
@@ -6379,6 +6555,30 @@ def rewritten_from(body: Any) -> Optional[int]:
     text_ = tickets.without_original(str(body or ""))
     found = _REWRITTEN_FROM.search(text_) or _REFS_LINE.search(text_)
     return int(found.group(1)) if found else None
+
+
+def rewritten_as(comments: Any, authors: Optional[Sequence[str]] = None) -> int:
+    """The ticket named by the newest trusted rewrite comment, or 0."""
+    for comment in reversed(trusted_comments(comments, authors)):
+        body = str(comment.get("body") or "")
+        match = REWRITTEN_AS_RE.search(body)
+        if TRIAGE_MARKER in body and match:
+            return int(match.group(1))
+    return 0
+
+
+def has_open_rewrite(gh: GitHub, repo: str, issue: Dict[str, Any],
+                     authors: Optional[Sequence[str]] = None) -> bool:
+    """Whether a rewritten source's work is on a replacement still open."""
+    if "loom:rewritten" not in _labels(issue):
+        return False
+    number = int(issue["number"])
+    ticket = rewritten_as(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), authors)
+    if not ticket or ticket == number:
+        return False
+    replacement = gh.rest("GET", "/repos/%s/issues/%d" % (repo, ticket), ok=(404,)).data
+    return (isinstance(replacement, dict) and replacement.get("state") == "open"
+            and "pull_request" not in replacement and "loom:ticket" in _labels(replacement))
 
 
 def _source_marker(ticket: int, outcome: str) -> str:
@@ -8413,7 +8613,10 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
         globals()["scorecard"] = scorecard
     # A lane the scorecard has demoted takes no build ticket, the same set
     # the factory reads (bus/scorecard.py): leave it out even where lane
-    # status still prints it as available.
+    # status still prints it as available. The scorecard keys a demotion
+    # by base lane, so expand it to every slot of that lane the way the
+    # factory does (scorecard.demoted_slots): a demoted base lane leaves
+    # out its numbered slots too.
     demoted = {row["lane"] for row in scorecard.parse_rows(body)
                if row.get("demoted")}
     # The station also keeps the demoted set in its scorecard file; read it
@@ -8430,7 +8633,8 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
                     demoted |= set(card.demoted())
             except (OSError, ValueError):
                 pass
-    return [lane for lane in rows if lane not in demoted]
+    blocked = scorecard.demoted_slots({lane: "" for lane in demoted}, rows)
+    return [lane for lane in rows if lane not in blocked]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,
@@ -8724,6 +8928,8 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("repos", nargs="+"); s.add_argument("--lanes-repo", default=lanes_repo_default()); s.add_argument("--repo-budget", type=float, metavar="SECONDS", help="per-repo read budget (default LOOM_REPO_BUDGET, else %g)" % per_repo.DEFAULT_BUDGET); s.add_argument("--deadline", type=float, metavar="MINUTES", help="stop reading after MINUTES (default %g), name the repos not reached and exit %d" % (STATUS_DEADLINE_MINUTES, STATUS_PARTIAL_EXIT))
     b = sub.add_parser("brief"); b.add_argument("repo"); b.add_argument("--epic", type=int); b.add_argument("--goal", type=int, help=argparse.SUPPRESS); b.add_argument("--title", required=True); b.add_argument("--file", required=True); b.add_argument("--lane"); b.add_argument("--difficulty", choices=DIFFICULTIES); b.add_argument("--model"); b.add_argument("--base"); b.add_argument("--not-before"); b.add_argument("--after", metavar="'#5' or 'owner/name#7, #8'"); b.add_argument("--refs", type=int); b.add_argument("--regresses", type=int); b.add_argument("--priority", choices=tickets.PRIORITIES); b.add_argument("--holder"); b.add_argument("--resolves", help="brief defer key this brief finishes")  # leak-guard-allow: the --after help above shows the cross-repo ref shape
     b.add_argument("--repairs-incident", type=int, help="open factory incident repaired, for example 7")
+    b.add_argument("--foundational", action="store_true",
+                   help="an epic child its siblings build on: writes Foundational: yes")
     ce = sub.add_parser("close-epic"); ce.add_argument("epic"); ce.add_argument("--note", required=True)
     ep = sub.add_parser("epic"); ep.add_argument("repo"); ep.add_argument("--goal", type=int, required=True); ep.add_argument("--title", required=True); ep.add_argument("--file", required=True)
     tr = sub.add_parser("triage"); tr.add_argument("repo"); tr.add_argument("--goal", type=int, required=True); tr.add_argument("--limit", type=int, default=TRIAGE_LIMIT)
@@ -8795,7 +9001,8 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,
-                resolves=args.resolves, repairs_incident=args.repairs_incident))
+                resolves=args.resolves, repairs_incident=args.repairs_incident,
+                foundational=args.foundational))
 
 
 def _cmd_epic(gh: GitHub, args: argparse.Namespace) -> None:

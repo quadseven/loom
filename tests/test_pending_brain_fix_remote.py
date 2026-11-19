@@ -28,6 +28,16 @@ class PendingBrainFixRemoteTests(unittest.TestCase):
 
         self.assertFalse(brain._pending_brain_fix(comments, [AUTHOR, LANE]))
 
+    def test_a_claim_with_a_visible_line_after_the_marker_clears_pending_fix(self):
+        comments = [fix_comment(), {
+            "user": {"login": LANE},
+            "created_at": "2030-01-01T00:01:00Z",
+            "body": "<!-- loom:remote-claim v1 muse 9 1893456060.000 -->\n"
+                    "Claimed by remote lane muse.",
+        }]
+
+        self.assertFalse(brain._pending_brain_fix(comments, [AUTHOR, LANE]))
+
     def test_merged_fix_pr_does_not_block_other_pr(self):
         comments = [fix_comment(41)]
 

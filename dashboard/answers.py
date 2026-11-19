@@ -226,15 +226,17 @@ def _waits(issue: Mapping[str, Any], login: str) -> List[str]:
 def review_target(gh: Any, entry: Dict[str, Any], comments: List[Dict[str, Any]],
                   expected_pr: Any = None, expected_head: Any = None, expected_ask: Any = None) -> str:
     """Re-read a review card's target before posting, binding the decision to its head and complete ask."""
-    number = answer.held_pr(needs_you.full_ask(entry))
-    if number is None:
-        if any(value is not None for value in (expected_pr, expected_head, expected_ask)):
-            raise Refused(409, "the current ask is not a held pull request")
-        return ""
     explicit = any(value is not None for value in (expected_pr, expected_head, expected_ask))
     if explicit:
         _require_review_fields(expected_pr, expected_head, expected_ask)
-    key = _check_review_ask(comments, number, expected_pr, expected_ask, needs_you.full_ask(entry))
+    displayed = needs_you.full_ask(entry)
+    number = expected_pr if explicit else answer.held_pr(displayed)
+    current = answer.latest_ask(comments, brain.trusted_authors())
+    if number is None:
+        if current and answer.held_pr(current.get('body')) is not None:
+            raise Refused(409, "this pull request needs a decision from the review queue")
+        return ""
+    key = _check_review_ask(current, number, expected_ask, displayed)
     repo = quote(str(entry['repo']), safe='/')
     pr = gh.rest('GET', '/repos/%s/pulls/%d' % (repo, number)).data or {}
     head = _review_head(pr, expected_head)
@@ -248,13 +250,10 @@ def _require_review_fields(number: Any, head: Any, ask: Any) -> None:
         raise Refused(409, "the reviewed PR, head and ask are required; reload the review queue")
 
 
-def _check_review_ask(comments: List[Dict[str, Any]], number: int, expected_pr: Any,
+def _check_review_ask(current: Mapping[str, Any] | None, number: int,
                       expected_ask: Any, displayed: str) -> str:
-    current = answer.latest_ask(comments, brain.trusted_authors())
     if current is None or answer.held_pr(str(current.get('body') or '')) != number:
         raise Refused(409, "the ask changed; reload before answering")
-    if expected_pr is not None and expected_pr != number:
-        raise Refused(409, "the held pull request changed; reload before answering")
     try:
         key = answer.review_ask_key(current)
     except ValueError as error:
@@ -286,12 +285,6 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
     if getattr(gh, "auth", "") != "app":
         raise Refused(503, "answers post as the Loom GitHub App; set LOOM_GITHUB_APP_ID, "
                            "LOOM_GITHUB_APP_INSTALLATION_ID and LOOM_GITHUB_APP_KEY_FILE")
-    try:
-        choice, note = answer.accept(needs_you.answer_options(entry), choice_in, note_in)
-        body = answer.comment_body(login, choice, note)
-        text.check(body)
-    except ValueError as err:
-        raise Refused(400, str(err)) from err
     repo, number = str(entry["repo"]), int(entry["number"])
     key = str(entry["key"])
     board = desk(state)
@@ -303,6 +296,16 @@ def post(state: Any, entry: Dict[str, Any], login: str, choice_in: Any, note_in:
             raise Refused(409, "%s#%d is not open" % (repo, number))
         comments = _comments(gh, repo, number, int(issue.get("comments") or 0))
         target = review_target(gh, entry, comments, expected_pr, expected_head, expected_ask)
+        opts = needs_you.answer_options(entry)
+        if target:
+            current = answer.latest_ask(comments, brain.trusted_authors())
+            opts = answer.options(str(current['body']).removeprefix(answer.HUMAN_MARKER))
+        try:
+            choice, note = answer.accept(opts, choice_in, note_in)
+            body = answer.comment_body(login, choice, note)
+            text.check(body)
+        except ValueError as err:
+            raise Refused(400, str(err)) from err
         if target:
             body += "\n\n" + target
         same = _existing_answer(comments, choice, target)

@@ -11,15 +11,13 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
-from . import brain, brief_check, change_class, hunt_plan, notify, pr_repair, risk_line, tickets
+from . import (brain, brief_check, change_class, hunt_plan, lane_markers, notify, pr_repair,
+               risk_line, tickets)
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
-# One claim comment per ticket claim: the first time is the claim, and each
-# heartbeat edits the same comment to add the newest beat as the third field
-# and keep the claim time as the fourth. A comment from before that has the
-# one time and no fourth field.
-CLAIM_RE = re.compile(r"^<!-- loom:remote-claim v1 ([^ ]+) ([0-9]+) ([0-9.]+)(?: ([0-9.]+))? -->$")
+# Written and read in bus/lane_markers.py.
+CLAIM_RE = lane_markers.CLAIM_RE
 CLAIM_AGE = 2 * 3600
 PR_AGE = 3 * 3600
 # push_branch's ref read: the sentinel a 404 leaves behind, so an empty or
@@ -76,7 +74,7 @@ def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, fl
     """(index, newest beat, first claim time) for each claim comment of the lane."""
     out = []
     for index, comment in enumerate(comments):
-        match = CLAIM_RE.fullmatch(str(comment.get("body") or "").strip())
+        match = lane_markers.claim_match(comment.get("body"))
         if match and match.group(1) == lane:
             try:
                 beat = float(match.group(3))
@@ -88,8 +86,7 @@ def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, fl
 
 
 def _claim_body(lane: str, number: int, beat: float, first: Optional[float] = None) -> str:
-    tail = "" if first is None or first == beat else " %.3f" % first
-    return "<!-- loom:remote-claim v1 %s %d %.3f%s -->" % (lane, number, beat, tail)
+    return lane_markers.claim_body(lane, number, beat, first)
 
 
 def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
@@ -212,6 +209,8 @@ def _candidates(gh: GitHub, repos: Sequence[str], lane: str) -> List[Tuple[str, 
         for item in gh.paginate("/repos/%s/issues?state=open&labels=loom:queued,lane:%s"
                                 % (repo, quote(lane, safe=""))):
             reason = _rejection_reason(item, lane)
+            if reason is None and brain.has_open_rewrite(gh, repo, item):
+                reason = "has an open rewrite ticket"
             if reason is None:
                 found.append((str(item.get("created_at") or ""), repo, item))
             elif isinstance(item, dict) and isinstance(item.get("number"), int):
@@ -244,8 +243,9 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     # unrun by the runner (loom#2249).
     if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
         return "no acceptance criteria"
-    if brief_check.split_hold(item):
-        return "spans more than one platform"
+    split = brief_check.split_verdict(str(item.get("body") or ""))
+    if split is not None:
+        return split.reason
     # The factory's reading (its default tier for a ticket with no
     # Difficulty: line), so a ticket it reserved for this lane is one the
     # lane takes (a reserved ticket sat unclaimed under four Muse lanes).
@@ -390,12 +390,12 @@ def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
             "body": "The station keeps lane status current here."}).data
     if not isinstance(issue, dict) or "number" not in issue:
         raise ValueError("could not locate the lane status issue")
-    body = "<!-- loom:remote-heartbeat v1 %s %.3f -->" % (lane, now)
+    body = lane_markers.heartbeat_body(lane, now)
     # One comment per lane, edited in place: a heartbeat every tick must not
     # grow the status issue by a comment each time.
-    mine = re.compile(r"^<!-- loom:remote-heartbeat v1 %s [0-9.]+ -->$" % re.escape(lane))
     for comment in _comments(gh, repo, int(issue["number"])):
-        if mine.fullmatch(str(comment.get("body") or "").strip()) and comment.get("id"):
+        match = lane_markers.heartbeat_match(comment.get("body"))
+        if match and match.group(1) == lane and comment.get("id"):
             gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, int(comment["id"])),
                     {"body": body})
             return

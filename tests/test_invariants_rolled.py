@@ -6,6 +6,7 @@ import re
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -13,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import invariants, station  # noqa: E402
 from bus.invariants import Facts, Ref  # noqa: E402
+from dashboard import results  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401 - shadow off: these tests close
 from bus.github import GitHubError  # noqa: E402
 from test_invariants import (  # noqa: E402
@@ -96,6 +98,19 @@ class RolledKindTest(unittest.TestCase):
 
     def test_a_cleared_kind_says_none_then_closes_after_the_clear_wait_and_reopens(self):
         self.clear_and_return()
+
+    def test_close_counts_skip_trackers_and_include_rewritten_work(self):
+        self.file(self.stalled([self.pull(201)]))
+        (tracker,) = self.gh.issues.values()
+        closed_at = stamp(T0)
+        rows = [dict(tracker, closed_at=closed_at, state_reason="not_planned"),
+                {"closed_at": closed_at, "state_reason": "not_planned"},
+                {"closed_at": closed_at, "state_reason": "completed",
+                 "body": self.legacy(99)["body"] + "\n\n## What\nRepair the issue."}]
+        data = results.build_results({"tickets": {REPO: rows}}, datetime.fromtimestamp(T0, timezone.utc))
+        counts = {row["name"]: row["values"] for row in data["rows"]}
+        self.assertEqual(counts["Tickets closed as not planned"], {"day": 1, "week": 1, "month": 1})
+        self.assertEqual(counts["Tickets closed as done"], {"day": 1, "week": 1, "month": 1})
 
     def clear_and_return(self):
         """Clear, wait, close, return: the tracking issue's number and when."""
@@ -281,6 +296,34 @@ class RolledKindTest(unittest.TestCase):
         self.assertIn("- Open epics with one title: #40, #41 (since %s)" % stamp(T0),
                       issue["body"])
 
+    def test_closed_epics_holding_open_tickets_are_one_tracking_issue_with_a_line_each(self):
+        # loom#2099: closed-epic-open-tickets filed one issue per closed epic.
+        t = lambda n: Ref("%s#%d" % (REPO, n), "#%d" % n)  # noqa: E731
+        shape = invariants.GoalShape(Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL), 6, (
+            invariants.EpicShape(Ref("%s#40" % REPO, "#40"), False, 3, (t(70), t(71))),
+            invariants.EpicShape(Ref("%s#41" % REPO, "#41"), False, 2, (t(72),)),
+            invariants.EpicShape(Ref("%s#42" % REPO, "#42"), True, 2, (t(73),))), ())
+        self.file(invariants.closed_epic_open_tickets(Facts(T0, shapes=[shape])))
+        (issue,) = self.gh.issues.values()
+        self.assertEqual(issue["title"], "Invariant: closed-epic-open-tickets in %s" % REPO)
+        self.assertIn("- Closed epic #40 of goal home #%d: 2 open tickets, #70, #71 (since %s)"
+                      % (GOAL, stamp(T0)), issue["body"])
+        self.assertIn("- Closed epic #41 of goal home #%d: 1 open tickets, #72" % GOAL,
+                      issue["body"])
+        self.assertNotIn("#42", issue["body"])
+
+    def test_goals_over_their_epic_cap_are_one_tracking_issue_with_a_line_each(self):
+        def goal(number, epics):
+            return invariants.GoalShape(Ref("%s#%d" % (REPO, number), "#%d" % number), 1, tuple(
+                invariants.EpicShape(Ref("%s#%d" % (REPO, e), "#%d" % e), True, 1, ())
+                for e in epics), ())
+        shapes = [goal(GOAL, (40, 41)), goal(GOAL + 1, (50, 51, 52))]
+        self.file(invariants.goal_epics_over_cap(Facts(T0, shapes=shapes)))
+        (issue,) = self.gh.issues.values()
+        self.assertEqual(issue["title"], "Invariant: goal-epics-over-cap in %s" % REPO)
+        self.assertIn("- Goal home #%d: 2 open epics (cap 1), #40, #41" % GOAL, issue["body"])
+        self.assertIn("- Goal home #%d: 3 open epics (cap 1)" % (GOAL + 1), issue["body"])
+
     def test_a_pull_request_stalls_past_a_day_not_past_six_hours(self):
         self.assertEqual(invariants.PR_STALLED, 24 * 3600)
         self.assertEqual(self.stalled([self.pull(201, opened=T0 - 23 * 3600)]), [])
@@ -338,6 +381,93 @@ class UnreadRepoTest(StationBase):
         self.assertNotIn((REPO, hidden["number"]), self.gh.comments)
         self.assertIn(invariants.ROLL_NONE, own["body"])
         self.assertEqual(own["state"], "closed", self.said)
+
+
+class ScheduledWorkflowTest(StationBase):
+    def runs(self, workflow, name, *conclusions, repo=REPO):
+        return [{"id": index, "workflow_id": workflow, "name": name, "event": "schedule",
+                 "status": "completed", "conclusion": conclusion,
+                 "repository": {"private": repo in self.gh.private}}
+                for index, conclusion in enumerate(conclusions)]
+
+    def test_three_red_runs_list_a_workflow_and_success_removes_it(self):
+        failure = self.runs(1, "Nightly build", "failure", "failure", "failure")
+        other = self.runs(2, "Daily check", "failure", "success", "failure", "failure")
+        self.gh.scheduled_runs[REPO] = failure + other
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 1)
+        (issue,) = self.breaches()
+        self.assertIn("Nightly build", issue["body"])
+        self.assertNotIn("Daily check", issue["body"])
+
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", "success") + failure + other
+        number = issue["number"]
+        self.run_at(T0 + 300)
+        self.assertEqual([i["number"] for i in self.breaches()], [number])
+        self.assertIn(invariants.ROLL_NONE, issue["body"])
+        self.assertNotIn("Nightly build", issue["body"])
+        self.assertEqual(self.gh.comments, {})
+
+    def test_an_unchanged_scheduled_workflow_list_writes_nothing(self):
+        self.gh.scheduled_runs[REPO] = self.runs(
+            1, "Nightly build", "failure", "timed_out", "failure")
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 1)
+        writes = len(self.gh.writes)
+
+        self.run_at(T0 + 300)
+        self.assertEqual(len(self.gh.writes), writes)
+        self.assertEqual(self.gh.comments, {})
+
+    def test_private_workflow_ids_stay_grouped_and_an_unread_repo_keeps_its_list(self):
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", *("failure",) * 3)
+        self.gh.scheduled_runs[OTHER] = (
+            self.runs(2, "Private name", *("failure",) * 3, repo=OTHER)
+            + self.runs(3, "Another private name", *("failure",) * 3, repo=OTHER))
+        self.run_at(T0)
+        self.assertEqual(len(self.breaches()), 2)
+        private = next(i for i in self.breaches() if "a private repo" in i["title"])
+        body = private["body"]
+        self.assertIn("Current violations (2):", body)
+        self.assertIn("Workflow 2", body)
+        self.assertIn("Workflow 3", body)
+        self.assertNotIn(OTHER, body)
+        self.assertNotIn("ivate name", body)
+
+        self.gh.scheduled_runs[OTHER] = GitHubError("Bad Gateway", 502)
+        self.gh.scheduled_runs[REPO] = self.runs(1, "Nightly build", "success")
+        self.run_at(T0 + 300)
+        self.assertEqual(private["body"], body)
+        self.assertIn(invariants.ROLL_NONE, next(
+            i for i in self.breaches() if i["number"] != private["number"])["body"])
+
+    def test_extra_pages_can_find_a_streak_and_a_truncated_read_keeps_it(self):
+        self.gh.scheduled_runs[REPO] = (
+            self.runs(1, "Frequent check", *("success",) * 100)
+            + self.runs(2, "Infrequent check", *("failure",) * 3))
+        self.run_at(T0)
+        (issue,) = self.breaches()
+        original = issue["body"]
+        self.assertIn("Infrequent check", original)
+        with mock.patch.object(invariants, "SCHEDULED_READ_MAX", 2):
+            self.run_at(T0 + 300)
+        self.assertEqual(issue["body"], original)
+
+    def test_the_scan_leaves_room_under_30_requests_and_rotates_deferred_repos(self):
+        self.settings.repos = ["example-owner/repo-%d" % i for i in range(31)]
+        self.gh.scheduled_runs[self.settings.repos[0]] = self.runs(
+            1, "Nightly build", *("failure",) * 3)
+        with mock.patch.object(invariants, "SCHEDULED_READ_MAX", 0):
+            self.run_at(T0 - invariants.CHECK_EVERY)
+        baseline = len(self.gh.calls)
+        self.gh.calls.clear()
+        self.run_at(T0)
+        self.assertLess(len(self.gh.calls) - baseline, 30)
+        self.assertEqual(len(self.breaches()), 1)
+        self.run_at(T0 + 300)
+        for repo in self.settings.repos:
+            self.assertTrue(any(path.startswith("/repos/%s/actions/runs?" % repo)
+                                for _, path in self.gh.calls), repo)
 
 
 class OldIssueSubjectTest(unittest.TestCase):

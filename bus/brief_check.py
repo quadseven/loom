@@ -23,7 +23,10 @@ Before the station hands a ticket to a lane (`check`), it reads:
   the ticket to a verify run. A stale ticket goes back to the queue with
   `needs:human` and one ask naming the evidence, once per piece of evidence:
   when the operator gives it back to the factory, the same evidence does not
-  hold it again. A recorded decision by a configured person beside blocked
+  hold it again. New asks fingerprint the body: a later verified person
+  removal of the ask label settles all stale evidence for that same body,
+  until its text changes. Legacy asks keep their evidence-only behavior.
+  A recorded decision by a configured person beside blocked
   or awaiting-live-check, or a non-person Blocked on section beside those
   labels, keeps waiting work held before stale-evidence reads. A stale event
   wait without the label gets blocked once. This neither approves a build
@@ -48,10 +51,9 @@ Before the station hands a ticket to a lane (`check`), it reads:
   goes back the same way a health ticket does. An answer ticket opens no
   pull request and is exempt, as at the runner.
 - split: a brief whose What or acceptance criteria name more than one
-  platform gets no lane (`split_verdict`): it is more than one ticket,
-  and lanes spent a whole model ladder on one such brief before a person
-  split it by hand. Splitting it into one slice per platform, with
-  After: lines between the slices, is the brain's intake work, so the
+  platform, or whose estimated diff exceeds 800 lines, gets no lane
+  (`split_verdict`). Splitting the work into smaller tickets, with After:
+  lines between dependent slices, is the brain's intake work, so the
   ticket goes back the same way a health ticket does.
 
 A read that fails holds the ticket for the next pass: a gate that cannot
@@ -80,6 +82,9 @@ AREA_PREFIX = "area:"
 
 ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
+BODY_MARKER = "<!-- loom:stale-body %s -->"
+BODY_MARKER_RE = re.compile(r"<!-- loom:stale-body ([0-9a-f]{64}) -->")
+PERSON_ASK_LABELS = {"loom:human", "needs:human", "needs-operator"}
 # An evidence key the marker carries as it is: a word and a number or hex
 # stamp, which holds no repository reference. Any other key (a pull
 # request key names its repo) is written as a hash of itself, because the
@@ -275,6 +280,11 @@ PLATFORM_PATTERNS = (
 
 # `Split: no` lifts the hold only with a reason on the same line.
 SPLIT_NO_RE = re.compile(r"^[ \t]*Split:[ \t]*no\b[ \t:,.(-]*[^\s:,.(-]", re.I | re.M)
+DIFF_ESTIMATE_RE = re.compile(
+    r"^[ \t]*Estimated diff:[ \t]*~?[ \t]*"
+    r"([0-9]{1,3}(?:,[0-9]{3}){1,2}|[0-9]{1,9})[ \t]+lines?\b",
+    re.I | re.M)
+SPLIT_DIFF_LIMIT = 800
 
 
 def platforms_named(body: str) -> List[str]:
@@ -289,27 +299,23 @@ def platforms_named(body: str) -> List[str]:
 
 
 def split_verdict(body: str) -> Optional[Verdict]:
-    """Why a brief naming more than one platform gets no lane, or None: it
-    is refused at queue time with a split request, and the brain files one
-    slice per platform with After: lines between them. Splitting is the
-    brain's intake work, so the ticket goes back the same way a health
-    ticket does. Reads nothing."""
-    found = platforms_named(body)
-    if len(found) < 2:
-        return None
-    if SPLIT_NO_RE.search(brief_text(body or "")):
-        return None    # the author says why this is one ticket
-    stamp = hashlib.sha256((body or "").encode("utf-8")).hexdigest()[:12]
+    """Give the brain a split request for a multi-platform or oversized brief."""
+    text = brief_text(body)
+    estimated = DIFF_ESTIMATE_RE.search(text)
+    lines = int(estimated[1].replace(",", "")) if estimated else 0
+    if lines > SPLIT_DIFF_LIMIT:
+        reason = "has an estimated diff of %d lines (limit %d)" % (lines, SPLIT_DIFF_LIMIT)
+        slices = "smaller tickets"
+    else:
+        found = platforms_named(body)
+        if len(found) < 2 or SPLIT_NO_RE.search(text):
+            return None
+        reason = "spans more than one platform (%s)" % ", ".join(found)
+        slices = "one ticket per platform"
+    stamp = hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]
     return Verdict(SPLIT, "split-" + stamp,
-                   "its What or acceptance criteria name more than one platform "
-                   "(%s): split it into one slice per platform, with After: lines "
-                   "between the slices, before it can be queued" % ", ".join(found))
-
-
-def split_hold(issue: Mapping[str, Any]) -> bool:
-    """Whether the factory gives the queued ticket no lane: a brief that
-    spans more than one platform. Reads nothing."""
-    return split_verdict(str(issue.get("body") or "")) is not None
+                   "%s: split it into %s with After: lines between dependent slices "
+                   "before it can be queued" % (reason, slices))
 
 
 # -- area ---------------------------------------------------------------------
@@ -450,6 +456,59 @@ def asked(comments: Iterable[Mapping[str, Any]], trusted: Iterable[str]) -> set:
             for key in ASK_MARKER_RE.findall(str(c.get("body") or ""))}
 
 
+def _matching_ask_stamp(issue: Mapping[str, Any],
+                        comments: Sequence[Mapping[str, Any]],
+                        trusted: Sequence[str]) -> float:
+    """Return the latest ask timestamp only when its body fingerprint matches."""
+    allowed = {x.lower() for x in trusted}
+    asks = [c for c in comments if _login(c).lower() in allowed
+            and ASK_MARKER_RE.search(str(c.get("body") or ""))]
+    if not asks:
+        return 0.0
+    latest = max(asks, key=lambda c: (_ts(c.get("created_at")), int(c.get("id") or 0)))
+    stamp = max(_ts(latest.get("created_at")), _ts(latest.get("updated_at")))
+    digest = hashlib.sha256(str(issue.get("body") or "").encode("utf-8")).hexdigest()
+    if stamp <= 0 or digest not in BODY_MARKER_RE.findall(str(latest.get("body") or "")):
+        return 0.0
+    return stamp
+
+
+def _latest_ask_label_change(gh: Any, repo: str,
+                             issue: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read the last ask-label transition without reusing an older removal."""
+    events = gh.paginate("/repos/%s/issues/%d/events" % (repo, int(issue["number"])))
+    changes = [e for e in events if isinstance(e, dict)
+               and e.get("event") in {"labeled", "unlabeled"}
+               and (e.get("label") or {}).get("name") in PERSON_ASK_LABELS]
+    if not changes:
+        return {}
+    last = max(changes, key=lambda e: (_ts(e.get("created_at")), int(e.get("id") or 0)))
+    return last
+
+
+def settled_body(gh: Any, repo: str, issue: Mapping[str, Any],
+                 comments: Sequence[Mapping[str, Any]], trusted: Sequence[str]) -> bool:
+    """A verified person removed the latest ask for exactly this body.
+
+    Legacy asks have no fingerprint and cannot establish a body-wide waiver.
+    This suppresses stale evidence only, never another kind of build hold.
+    """
+    names = {x.get("name") if isinstance(x, dict) else x
+             for x in issue.get("labels", [])}
+    if names & PERSON_ASK_LABELS:
+        return False
+    stamp = _matching_ask_stamp(issue, comments, trusted)
+    if stamp <= 0:
+        return False
+    last = _latest_ask_label_change(gh, repo, issue)
+    actor = last.get("actor") or {}
+    if (last.get("event") != "unlabeled" or _ts(last.get("created_at")) <= stamp
+            or decision_claim.is_bot(actor)
+            or str(actor.get("login") or "").lower() not in decision_claim.person_logins(trusted)):
+        return False
+    return str(actor.get("login") or "").lower() != decision_claim.client_login(gh).lower()
+
+
 def operator_done(comments: Sequence[Mapping[str, Any]], operator: str) -> Optional[Verdict]:
     """The operator's newest comment, when it says the work is done or
     superseded."""
@@ -482,8 +541,40 @@ def source_shipped(gh: Any, repo: str, body: str) -> Optional[Verdict]:
     return None
 
 
+# Where a pull request or a ticket names work it does not build: a section
+# headed Out of scope, Not in scope or Follow-ups (any heading level or a bold
+# line), and a line that says a ticket was filed for the rest. 2026-10-26: a
+# merged pull request named a ticket only in its Out of scope list, and the
+# stale check held that ticket on a person (loom#1856).
+UNBUILT_HEAD_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+|\*\*)[ \t]*(?:out of scope|not in scope|follow[- ]?ups?)\b", re.I)
+FILED_NOTE_RE = re.compile(r"\bfiled (?:for|as)\b|\bfollow[- ]up\b", re.I)
+REFS_LINE_RE = re.compile(r"^[ \t]*(?:refs|part of)\b", re.I)
+
+
+def without_unbuilt_mentions(text: str) -> str:
+    """The text without its Out of scope, Not in scope and Follow-ups
+    sections and without lines that say a ticket was filed for later: a
+    reference there names work the text does not build. Reads nothing."""
+    kept: List[str] = []
+    inside = False
+    for line in (text or "").replace("\r", "").split("\n"):
+        if UNBUILT_HEAD_RE.match(line):
+            inside = True
+            continue
+        if inside and NEXT_HEAD_RE.match(line):
+            inside = False
+        if inside:
+            continue
+        # A Refs or Part of line names the work the text does, whatever
+        # else it says.
+        if REFS_LINE_RE.match(line) or not FILED_NOTE_RE.search(line):
+            kept.append(line)
+    return "\n".join(kept)
+
+
 def _names_ticket(text: str, repo: str, number: int) -> bool:
-    lowered = (text or "").lower()
+    lowered = without_unbuilt_mentions(text or "").lower()
     return ("%s#%d" % (repo.lower(), number) in re.sub(r"\s+", "", lowered)
             or "github.com/%s/issues/%d" % (repo.lower(), number) in lowered)
 
@@ -563,7 +654,8 @@ def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
     the ticket was filed. A link to work merged before it is context."""
     owner = repo.partition("/")[0].lower()
     filed = _ts(issue.get("created_at"))
-    links = [(r, n) for r, n in _links(_person_texts(issue, comments, trusted))
+    texts = [without_unbuilt_mentions(t) for t in _person_texts(issue, comments, trusted)]
+    links = [(r, n) for r, n in _links(texts)
              if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
     for where, num in links[:LINKS_READ]:
         merged = _merged_at(gh, where, num)
@@ -706,6 +798,8 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
              lambda: merged_linked(gh, repo, issue, comments, trusted),
              lambda: already_built(gh, repo, body, branch))
     try:
+        if settled_body(gh, repo, issue, comments, trusted):
+            return split if split is not None else criteria
         for read in reads:
             found = read()
             if found is not None and not was_asked(found.key, done):
@@ -715,10 +809,13 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     return split if split is not None else criteria
 
 
-def ask(verdict: Verdict) -> str:
+def ask(verdict: Verdict, body: Optional[str] = None) -> str:
     """The one ask for a stale ticket."""
+    marker = ASK_MARKER % marker_key(verdict.key)
+    if body is not None:
+        marker += "\n" + BODY_MARKER % hashlib.sha256(body.encode("utf-8")).hexdigest()
     return ("Kind: decision\n%s\nThis ticket did not go to a build lane: %s. A lane that "
             "builds a stale ticket rewrites working code to match it. Close the ticket if "
             "its work is done, or rewrite it to what is still missing and remove "
             "`needs:human`; this evidence will not hold it again."
-            % (ASK_MARKER % marker_key(verdict.key), verdict.reason))
+            % (marker, verdict.reason))

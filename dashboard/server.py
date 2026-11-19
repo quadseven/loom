@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
 from bus import brain as bus_brain
 from bus import bench as bench_lib
+from bus import labels as bus_labels
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus import scorecard
@@ -273,6 +274,13 @@ def _floor(state):
     else:
         standup = '<p class="standup-line">No standup yet.</p><p class="standup-meta machine-fact">not looked: %s</p>' % esc(
             str(context.get("report_reason") or "no goal report found"))
+    open_issues = getattr(state, "open_issues", {}) or {}
+    if open_issues and all(issues is not None for issues in open_issues.values()):
+        label_sets = [bus_brain._labels(issue) for issues in open_issues.values() for issue in issues]
+        triage = [names for names in label_sets if bus_labels.in_triage(names)]
+        waiting = sum(bus_labels.waiting_on_person(names) for names in triage)
+        standup += '<p class="standup-meta machine-fact">Triage: %d untriaged, %d waiting on a person</p>' % (
+            len(triage) - waiting, waiting)
     head = '<div class="section-head"><span class="label">Conveyor - count and median wait</span>%s</div>' % (
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
     parts = ['<section class="standup">%s</section>' % standup,
@@ -868,7 +876,7 @@ def _needs_you(document, state, *, source_missing=False, who=""):
 
 
 def _review_queue(state):
-    document = _backlog_document(_backlog_bytes() or b"{}")
+    document = _backlog_document(_backlog_raw(state) or b"{}")
     asks, claims, repos = _needs_sources(document, state)
     mode = answers_view.mode(state)
     entries, _ = needs_you_view.render(asks, claims, "", repos, answers_view.posted(state), mode)
@@ -879,13 +887,13 @@ def _review_queue(state):
     details = {}
     below_floor = getattr(state, "_below_floor", lambda: False)()
     if reader is not None and not below_floor:
-        for entry in review_queue.held(entries):
+        for entry in review_queue.candidates(entries):
             details["%s#%d" % (entry["repo"], entry["number"])] = reader.get(entry)
     content = ('<p class="page-lede">Review held changes, read their evidence, and choose the next step. '
                'Approval still runs every merge check.</p>' + _answer_bar(mode))
     if below_floor:
         content += '<p role="status">GitHub reads are waiting for the request budget to recover.</p>'
-    unknown = sum(1 for entry in entries if entry.get("comment_ask") is None)
+    unknown = sum(1 for result in details.values() if result.get("errors") and "review_ask" not in result)
     if unknown:
         content += ('<p role="status">%d asks are not classified yet. '
                     '<a href="/needs-you">Read their asks in Needs you</a>.</p>') % unknown
