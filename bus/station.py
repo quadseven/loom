@@ -1344,17 +1344,10 @@ class Settings:
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
         report_digest = parse_digest_times(env.get("LOOM_REPORT_DIGEST_TIMES", DIGEST_TIMES))
-        try:
-            hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
-        except ValueError:
-            hour = 9
+        hour = _int_or_default(env.get("LOOM_DIGEST_HOUR", ""), 9)
         if not 0 <= hour <= 23:
             hour = 9
-        try:
-            retry_max = int(env.get("LOOM_RETRY_MAX", "").strip() or RETRY_MAX)
-        except ValueError:
-            retry_max = RETRY_MAX
-        retry_max = max(retry_max, 0)
+        retry_max = max(_int_or_default(env.get("LOOM_RETRY_MAX", ""), RETRY_MAX), 0)
         try:
             watched = watch.components(home, env.get("LOOM_WATCH", ""))
         except ValueError as err:
@@ -1723,6 +1716,13 @@ def _decision_window_days(raw: str) -> int:
 def _positive_int(raw: str, default: int) -> int:
     raw = raw.strip()
     return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
+
+
+def _int_or_default(raw: str, default: int) -> int:
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600

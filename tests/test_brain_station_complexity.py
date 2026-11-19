@@ -32,6 +32,9 @@ TARGETS = (
     ("bus/invariants.py", "_scheduled_failures"),
     ("bus/invariants.py", "read_scheduled_workflows"),
     ("bus/log_capture.py", "update"),
+    # AI-REVIEW 2026-11-18 [automated review summary] station complexity (PR #3237):
+    # Keep environment parsing below the cap as new settings are added.
+    ("bus/station.py", "Settings.from_env"),
 )
 
 
