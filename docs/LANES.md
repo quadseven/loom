@@ -246,8 +246,16 @@ unset variables.
   (default 1800).
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
-  hold the runner's pid; a slot whose pid is gone is reclaimed. A lane waits
-  up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) with a log line, and
+  hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
+  is taken only while the host has room: the 1-minute load average at or
+  under `LOOM_CHECK_LOAD_1M` (default 24) and the 5-minute one at or under
+  `LOOM_CHECK_LOAD_5M` (default 18). A value of 0 turns that limit off, and
+  a host whose load cannot be read is not gated (the log says so). The
+  reading is the first two fields of `LOOM_CHECK_LOAD_FILE` (default
+  `/proc/loadavg`), or of `sysctl -n vm.loadavg` where that file is absent.
+  A lane waits up to `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) for a
+  slot and for load together, with a log line that says which (`waiting for
+  a check slot` or `waiting for host load`), and
   its keepalive stamp stays fresh while it waits. A wait that runs out, or a
   base check that times out (exit 124), parks the brief `[transient]` and
   files no base-check incident: both mean host load, not a red base. A
@@ -262,6 +270,16 @@ unset variables.
   |---|---|---|
   | Loom `.github/unittest_parallel.py` | `.loom/validation.conf` | Honors `LOOM_CHECK_WORKERS`; defaults to four when unset. |
   | Other repositories | Each repo's `.loom/validation.conf` command | Repo-defined; Loom does not keep a central inventory or detect whether the command honors the variable. Confirm in that repo's runner and contract. |
+- The slot protocol is open to any other heavy job on the host (a full suite
+  before a pull request opens, say), so it queues with the lane checks
+  instead of running beside them. To take slot N, for N from 1 to
+  `LOOM_CHECK_SLOTS`: `mkdir <LOOM_HOME>/run/check-slots/slot-N` (the
+  `mkdir` is the lock: only one caller's succeeds), then write the holder's
+  pid to `slot-N/pid`. To release it, remove the directory. A slot whose
+  pid is alive is left alone by every lane; one whose pid is gone is
+  reclaimed by the next waiter; one with no `pid` file yet is treated as
+  being taken and left alone, so write the pid at once. The pid must stay
+  alive for as long as the job runs.
 - Every step sees `LOOM_CHECK_SANDBOX=1`. The sandbox denies localhost, so a
   repo's test that needs a loopback connection may skip when that variable
   is `1`, and only then; CI and local runs never set it, so the test still
@@ -1432,27 +1450,30 @@ The loom home is kept bounded by the station and the runner (loom#643).
   however old, and a link is never followed. The station logs
   `removed N stale rewrite scratch folder(s), X GB, from ...`.
 
-## Failed-run log tail
+## Parked-run outcome note
 
 A run that ends parked leaves its detail in the lane host's log, which a
 reader of the ticket often cannot reach. When a lane parks a brief after its
-repo passed the owner check, `post_log_tail` in `lanes/run_lane.sh` posts the
-last `LOOM_LOG_TAIL_LINES` lines (default 40) of this run's log as one comment
-on the ticket, found by `<!-- loom:lane-log-tail v1 -->` and replaced by the
-next failure (`bus/sticky.py tail`), so a ticket that keeps failing has one
-comment, not one per run.
+repo passed the owner check, `post_park_note` in `lanes/run_lane.sh` posts one
+readable line on the ticket: the lane, the failure class and the first line of
+the park reason, then "The full run log stays on the lane host." It is found
+by `<!-- loom:lane-log-tail v1 -->` and replaced by the next park
+(`bus/sticky.py outcome`), so a ticket that keeps failing has one comment, not
+one per run.
 
-- Local paths and control characters are removed, then the text goes through
-  the leak scan: the full scan for a repo not known to be private, the
-  personal data scan for a private one. A refused or unavailable scan posts a
-  note that the tail was withheld, never the text.
+- The run log is never posted. Its tail (posted until 2026-11-18) carried the
+  agent's whole session: test fixture tables, other tasks' API replies,
+  commands to run. The marker is unchanged so a ticket's next park replaces
+  an old tail.
+- Local paths and control characters are removed, then the reason line goes
+  through the leak scan: the full scan for a repo not known to be private,
+  the personal data scan for a private one. A refused or unavailable scan
+  posts the outcome without the reason.
 - Limit and auth parks post nothing (the station re-briefs them with the
   reason). A brief refused before its owner check posts nothing, and neither
   does a lane with App settings whose token could not be minted.
 - A failed post is logged and never fails the park. `LOOM_LOG_TAIL=off` turns
   the comment off.
-- Not done here: uploading the whole log to object storage. That needs a
-  bucket and a credential, which the operator supplies.
 
 ## Pass deadline
 
@@ -1669,8 +1690,9 @@ Each invariant is one function returning breaches with evidence:
   `loom:report` comments within 90 minutes, on one goal home.
 - A lane with 5 or more runs in 24 hours and none done (one issue per lane:
   the station reads these to release a runaway a dead lane held).
-- Lanes whose newest 5 runs all failed after a success earlier in the day,
-  limits, expired keys and factory incidents aside.
+- Lanes whose newest 5 runs all failed after a success earlier in the day.
+  Both lane checks exclude limits, expired keys, factory incidents and
+  briefs parked before the agent ran, including runner base stops.
 - Lanes held by a limit for over 2 hours while tickets of their tier are
   queued. Only truly queued tickets count: `loom:queued` is their only state
   label, and no other operator has claimed them. `LOOM_NO_TOPUP` names the
@@ -2136,25 +2158,20 @@ lookup leaves the brief for the next pass. The rule covers:
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
-## Elder fallback reviews: the codex-2 slot on Luna
+## A degraded Elder check: held, with no fallback reviewer
 
-When the review bot's model route is exhausted, its check on a lane pull
-request concludes as a degraded review - not a verdict - and the re-ask
-degrades the same way (loom#2142). The factory then dispatches one review
-brief to the `codex-2` slot instead of another fix round: a
-`Deliverable: review` brief in the verify brief's shape, whose tree is the
-pull request's own branch, pinned `Model: gpt-6-luna` (the only model the
-codex lanes run), through `codex exec` on the operator's Codex login, on
-the same lane machine as the other codex slots. The lane changes no code;
-it writes `review.json` (blocking findings, notes, a summary). The station
-posts the verdict on the pull request in the Elder's markings shape
-(`Elder markings - N blocking, M total`, under a
-`<!-- loom:luna-review v1 sha=... -->` marker), with blocking findings
-also posted as review threads, and the factory's merge gate reads the
-verdict for that head in the degraded check's place: a clean verdict lets
-the pull request land, a blocking one sends it back through the ordinary
-fix rounds. A dispatched review that produces no verdict is dispatched
-again after an hour.
+Review is `grug`'s alone (operator decision, 2026-11-16). When the review
+bot's model route is exhausted, its check on a lane pull request concludes
+as a degraded review, which is not a verdict. The factory asks the bot to
+review the head again once (`/grug improve`, docs/BRAIN.md). When the re-run
+degrades too, the pull request is held at `loom:pr` until the check reruns
+with a verdict. It is not sent to a fix round, since no lane can fix a
+degraded review by editing code.
+
+The codex-2 Luna fallback that once reviewed such a head (loom#2142) is
+gone. The factory dispatches no review brief, the station posts no Luna
+verdict, and neither the factory nor `bus.brain merge` reads an old
+`<!-- loom:luna-review v1 sha=... -->` comment in the check's place.
 
 ## The review sweep: independent reviews by the reviewer Apps
 
@@ -2195,8 +2212,8 @@ that is not held after transient failures, has a fresh heartbeat, and
 whose reviewer App did not write the pull request. A scorecard demotion
 does not stop a review: it judges the lane's builds, and a review is not
 one; a stale block goes first to the lane of the App that blocked,
-since only that App's new review replaces its block. The brief is the Luna
-review brief with `Review-Mode: sweep`; a codex slot is pinned to
+since only that App's new review replaces its block. The brief is a review
+brief with `Review-Mode: sweep`; a codex slot is pinned to
 `gpt-6-luna`, and agy runs its own model. The station records each
 dispatch (brief name, lane, pull request, head) in its state, and that
 record, not the brief's text, makes a finished run a sweep run: a pull
@@ -2204,9 +2221,8 @@ request body copied into the brief cannot choose the posting mode, and
 the pull request and head are read from the brief's header block only and
 must match the record. A sweep verdict counts only from the lane the
 record names, running that lane's model: `gpt-6-luna` on a codex slot,
-and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run is
-a degraded-Elder Luna run and counts only from the `codex-2` slot on
-`gpt-6-luna`.
+and `LOOM_AGY_MODEL` or a `gemini-` model on agy. Any other review run
+posts nothing.
 
 The verdict is posted as one formal review on the head commit by the
 lane's reviewer App (`LOOM_REVIEW_APPS`), never by the station: `APPROVE`
@@ -2484,6 +2500,12 @@ What changes in a pod:
   pass because everything fails. Anything else holds the lane unavailable,
   with the reason in its heartbeat, so a policy the cluster network does not
   enforce holds the lane too.
+  While the agent runs, the runner repeats the probes every
+  `LOOM_EGRESS_RECHECK_SECONDS` seconds (default 60). If a deny probe
+  connects, the runner stops the agent, records the address in the sealed
+  lane log, and parks the brief as an `egress-opened` factory incident
+  without pushing. A failed allow probe is logged once per run and the
+  agent keeps running.
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.

@@ -39,6 +39,11 @@ def reply(status=200, body=None):
 
 # The open epic a brief files under (decision 0003): #2, under goal #1.
 EPIC = 2
+# The Loom App's bot login and a trusted briefer, the two kinds of login whose
+# tickets this Loom builds, and the marker bus/health.py writes into a ticket.
+LOOM_APP = "loom-app[bot]"
+BRIEFER = "dana-example"
+HEALTH_MARKER = health.MARKER % ("ab" * 20)
 
 
 def epic_issue(body="Done when: done.\n\nSize: S\n\nPart of #1\n", **extra):
@@ -1560,11 +1565,46 @@ class SensitiveResumeTests(unittest.TestCase):
         with unittest.mock.patch.object(brain, "_read", return_value=BODY), \
                 unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
                 unittest.mock.patch.object(brain, "_check_live_criterion"), \
+                unittest.mock.patch.object(brain, "_check_test_named"), \
                 unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
                 contextlib.redirect_stdout(io.StringIO()):
             code = brain.main(argv)
         self.assertEqual(code, 0)
         self.assertEqual(make.call_args.kwargs["repairs_incident"], 7)
+
+    def brief_from_the_command_line(self, body):
+        err = io.StringIO()
+        with unittest.mock.patch.object(brain, "_read", return_value=body), \
+                unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                unittest.mock.patch.object(brain, "brief", return_value="filed") as make, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = brain.main(["brief", REPO, "--epic", "2", "--title", "Ticket", "--file", "unused",
+                               "--lane", "codex"])
+        return code, err.getvalue(), make
+
+    def test_the_brief_command_refuses_a_body_whose_boxes_name_no_test(self):
+        # Owner ruling of 2026-11-19 (#3277): a new ticket names the test
+        # that proves it; the body goes back to its writer before it is filed.
+        code, err, make = self.brief_from_the_command_line(BODY)
+        self.assertEqual(code, 1)
+        self.assertIn("names the test that proves it", err)
+        self.assertIn("a test file path", err)
+        make.assert_not_called()
+
+    def test_the_brief_command_files_a_body_that_names_its_test(self):
+        code, err, make = self.brief_from_the_command_line(
+            BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers the slow query"))
+        self.assertEqual(code, 0, err)
+        make.assert_called_once()
+
+    def test_the_brief_command_refuses_a_live_line_with_no_runnable_check_and_lists_the_forms(self):
+        code, err, make = self.brief_from_the_command_line(
+            BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers the slow query")
+                .replace("- [ ] live", "- [ ] Live: the page log shows `cache hit`"))
+        self.assertEqual(code, 1)
+        for form in ("https://", "gh api", "log:<source>"):
+            self.assertIn(form, err)
+        make.assert_not_called()
 
     def test_brief_refuses_invalid_repair_incident_before_writing(self):
         for number in (0, -1, True, "#7"):
@@ -1606,7 +1646,7 @@ class SensitiveResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             path = os.path.join(home, "brief.md")
             with open(path, "w") as fh:
-                fh.write(BODY)
+                fh.write(BODY.replace("- [ ] tested", "- [ ] tests/test_page.py covers it"))
             err = io.StringIO()
             with unittest.mock.patch("bus.brain.auth_from_env", return_value="t"), \
                     unittest.mock.patch("bus.brain.GitHub") as client, \
@@ -2831,16 +2871,21 @@ def fix_ticket(*states):
     return {"state": "open", "labels": [{"name": n} for n in names]}
 
 
-class LunaMergeTests(unittest.TestCase):
-    """A clean Luna verdict in the real brain.merge (loom#2575): the factory
-    clears the fault on a clean Luna verdict for a degraded review check and
-    calls brain.merge, which used to refuse the head on every pass because
-    the rollup is still FAILURE. These tests run the real merge, risk tier
-    included; nothing on the merge path is stood in for."""
+# The comment the removed Codex Luna fallback posted for head "checked".
+OLD_LUNA_VERDICT = ("<!-- loom:luna-review v1 sha=checked -->\n"
+                    "Elder markings - 0 blocking, 2 total\n\nThe change is sound.")
+
+
+class DegradedReviewMergeTests(unittest.TestCase):
+    """A degraded review check in the real brain.merge: review is the review
+    bot's alone (operator decision, 2026-11-16), so a degraded check keeps
+    the merge refused until the check reruns, and the comment the removed
+    Codex Luna fallback posted no longer stands in for it. These tests run
+    the real merge, risk tier included; nothing on the merge path is stood
+    in for."""
 
     # The merging client writes as example-station (LOOM_GITHUB_LOGIN on a
-    # personal-token client): the station posts the Luna verdict and calls
-    # brain.merge with the same client, so only that login's verdict counts.
+    # personal-token client), the login that once posted the Luna verdict.
     ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane example-station",
            "LOOM_GITHUB_LOGIN": "example-station", "LOOM_MERGE_SETTLE_SECONDS": "0"}
     DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
@@ -2857,8 +2902,7 @@ class LunaMergeTests(unittest.TestCase):
 
     def setUp(self):
         self.runs = [dict(self.GREEN), dict(self.DEGRADED)]
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
-                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        self.verdict = OLD_LUNA_VERDICT
         self.verdict_user = "example-station"
         self.pr_comments = None
         self.combined = {"state": "success", "total_count": 0, "statuses": []}
@@ -2943,96 +2987,20 @@ class LunaMergeTests(unittest.TestCase):
         return brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
                            env=dict(self.ENV, **env))
 
-    def test_a_clean_luna_verdict_merges_through_the_real_merge(self):
-        result = self.merge()
-        self.assertTrue(result["merged"])
-        self.assertEqual(self.merges, [{"merge_method": "squash", "sha": "checked"}])
-        self.assertEqual(self.labels[-1], ["loom:ticket", "loom:merged"])
-
-    def test_a_blocking_luna_verdict_still_refuses(self):
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
-                        "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
+    def test_an_old_luna_verdict_does_not_stand_in_for_a_degraded_check(self):
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
 
-    def test_a_clean_luna_verdict_does_not_excuse_a_real_review_failure(self):
-        self.runs = [dict(self.GREEN), dict(self.FINDINGS)]
+    def test_a_degraded_check_alone_refuses_the_merge(self):
+        self.pr_comments = []
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
 
-    def test_a_clean_luna_verdict_does_not_excuse_another_failing_check(self):
-        self.runs = [dict(self.GREEN, conclusion="failure"), dict(self.DEGRADED)]
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_an_untrusted_luna_verdict_still_refuses(self):
-        self.verdict_user = "mallory-example"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_trusted_comment_without_a_verdict_still_refuses(self):
-        # Ordinary trusted text is not a verdict: no marker and no markings
-        # line, so nothing stands in for the degraded check.
-        self.verdict = "Looked at this head myself; it reads fine to me."
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_verdict_from_the_pull_requests_own_author_still_refuses(self):
-        # The verdict is the station's word: a clean verdict the change's own
-        # author posted for its own head never stands in, trusted or not.
-        self.verdict_user = "example-lane"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_newer_blocking_verdict_replaces_an_older_clean_one(self):
-        self.pr_comments = [
-            {"body": self.verdict, "user": {"login": "example-station"}},
-            {"body": factory.LUNA_REVIEW_MARKER % "checked" +
-                     "\nElder markings - 1 blocking, 2 total\n\nOne finding blocks.",
-             "user": {"login": "example-station"}}]
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_clean_verdict_from_another_trusted_login_still_refuses(self):
-        # Only the station that ran the Luna slot posts its verdict: a clean
-        # marker from any other trusted login (the brain App, another fleet
-        # agent) is not that verdict and never stands in.
-        self.verdict_user = "example-brain"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_no_known_writer_login_refuses_every_verdict(self):
-        # A client whose own login is unknown cannot tell the station's
-        # verdict from anyone else's, so the Luna path fails closed.
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge(LOOM_GITHUB_LOGIN="")
-        self.assertEqual(self.merges, [])
-
-    def test_a_clean_verdict_for_an_older_head_still_refuses(self):
-        # The verdict is bound to the head it reviewed: a clean verdict for
-        # an earlier head says nothing about the commits pushed since.
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "older" +
-                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_failing_commit_status_beside_the_degraded_check_still_refuses(self):
-        # The rollup reads commit statuses too: a red status beside the
-        # degraded review check is not the review check's to excuse.
-        self.combined = {"state": "failure", "total_count": 1,
-                         "statuses": [{"context": "legacy-ci", "state": "failure"}]}
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
+    def test_the_merge_no_longer_reads_a_stand_in(self):
+        self.assertFalse(hasattr(brain, "_luna_stands_in"))
+        self.assertFalse(hasattr(brain, "_clean_luna_verdict"))
 
 
 class FixTests(unittest.TestCase):
@@ -4758,6 +4726,22 @@ class VerifyDueTests(unittest.TestCase):
         self.assertEqual([8, 7, 6, 5, 4], found)
         self.assertIn("shipped 10h ago: Live: the dashboard", out)
 
+    def test_resume_hands_unclaimed_live_gaps_to_the_brain_before_a_day(self):
+        tickets = [self.issue(n, body="## Acceptance criteria\n- [ ] Tests")
+                   for n in range(1, 7)]
+        live = "Verify the deployed dashboard shows the new column."
+        tickets.append(self.issue(7, body="## Acceptance criteria\n- [ ] " + live))
+        claimed = self.issue(8, body=tickets[-1]["body"])
+        claimed["labels"].append({"name": "claim:another-brain"})
+        tickets.append(claimed)
+        now = self.NOW + timedelta(hours=12)
+        shipped = dict.fromkeys(range(1, 7), 0) | {7: 1, 8: 1}
+        out = "\n".join(brain._verify_resume_lines(self.gh(tickets, shipped), [REPO], now))
+        self.assertIn("resume verify %s#7 shipped 23h ago: %s" % (REPO, live), out)
+        self.assertNotIn("resume verify %s#8" % REPO, out)
+        self.assertIn("Read logs, the running system, or code", out)
+        self.assertIn("record what you observed", out)
+
     def test_status_prints_the_section(self):
         issues = [self.issue(5)]
         inner = self.gh(issues, {5: 6}).transport
@@ -5697,6 +5681,34 @@ class RepairBriefTests(unittest.TestCase):
     def brief(self, fake, **kw):
         return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket", BODY, "codex", **kw)
 
+    def copied(self, fake, **kw):
+        """A rewrite whose brief carries a health marker copied from its source."""
+        return brain.brief(GitHub("t", transport=fake), REPO, EPIC, "Ticket",
+                           BODY + "\n\n" + HEALTH_MARKER, "codex", **kw)
+
+    @staticmethod
+    def at_cap(**extra):
+        """A goal cap of one, with the Loom App and one trusted briefer."""
+        return {"LOOM_GOAL_CAP": "1", "LOOM_BRIEF_AUTHORS": LOOM_APP,
+                "LOOM_TRUSTED_BRIEFERS": BRIEFER, **extra}
+
+    @staticmethod
+    def issue(number, login, labels=(), body="It is slow."):
+        return item(number, body, labels, user={"login": login},
+                    html_url="https://example.com/t/%d" % number)
+
+    @classmethod
+    def marked(cls, number, login, labels=(), body="It is slow."):
+        """An open issue by `login` whose body ends with a health marker."""
+        return cls.issue(number, login, labels, body + "\n\n" + HEALTH_MARKER)
+
+    @staticmethod
+    def fill_epics(fake):
+        """Leave the goal no room to open another intake epic."""
+        for n in range(20, 20 + brain.GOAL_EPIC_CAP - 1):
+            fake.issues[n] = epic_issue(number=n, id=1000 + n, title="Epic: work %d" % n)
+            fake.subs[1].append(n)
+
     def test_a_ticket_waiting_for_a_lane_does_not_fill_the_goal(self):
         fake = GoalRepo([item(10, labels=["loom:ticket", "loom:queued"]),
                          item(11, labels=["loom:ticket", "loom:briefed", "wait:lane"])])
@@ -5720,15 +5732,15 @@ class RepairBriefTests(unittest.TestCase):
 
     def test_health_findings_use_the_reserve_even_when_intake_cannot_open_an_epic(self):
         fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"])])
-        for n in range(20, 20 + brain.GOAL_EPIC_CAP - 1):
-            fake.issues[n] = epic_issue(number=n, id=1000 + n, title="Epic: work %d" % n)
-            fake.subs[1].append(n)
+        self.fill_epics(fake)
         gh = GitHub("t", transport=fake)
 
         def file_finding(key):
+            # As health.Intake._file briefs it: `health` is what says so.
             finding = health.Finding(key, "Slow search", "search", 3, 5, 15, "Reads stall.", "")
             return brain.brief_intake(gh, REPO, 1, health.ticket_title(finding),
-                                      health.ticket_body(finding), difficulty="medium")
+                                      health.ticket_body(finding), difficulty="medium",
+                                      health=True)
 
         with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
             for key in ("first", "second"):
@@ -5742,6 +5754,132 @@ class RepairBriefTests(unittest.TestCase):
         epics = [i for i in fake.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
         self.assertEqual(len(epics), 1)
         self.assertEqual(len(fake.subs[epics[0]["number"]]), 3)
+        for number in fake.subs[epics[0]["number"]]:
+            self.assertIn("loom:health", fake.names(number))
+
+    def test_health_intake_files_labelled_tickets_through_the_reserve(self):
+        # The real intake against the real brief: its own findings pass at
+        # the cap within the reserve, and its label is why.
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"])])
+        doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [
+            {"key": "slow:%s" % area, "title": "Reads of %s stall" % area, "area": area,
+             "affected": 3, "hours": 20.0, "evidence": "3 members waited over 5 seconds",
+             "since": "2030-01-01T00:00:00Z"} for area in ("search", "login", "billing")]}
+        said = []
+        intake = health.Intake(GitHub("t", transport=fake), {}, 1_900_000_000.0,
+                               "2030-01-02T00:00:00Z", said.append, read=lambda url: doc)
+        with unittest.mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            intake.run([health.Source(REPO, 1, "https://health.example.test/api/health")])
+        filed = [c[2] for c in fake.created() if c[2]["title"].startswith("Health:")]
+        self.assertEqual(len(filed), 2, said)
+        for ticket in filed:
+            self.assertIn("loom:health", ticket["labels"])
+        self.assertEqual(sum("the repair reserve is full" in line for line in said), 1, said)
+
+    def test_only_a_label_admits_an_issue_to_the_reserve(self):
+        # A collaborator sets a label. The marker is text: anyone can paste
+        # it into an issue, and a rewrite by a trusted login can copy it.
+        self.assertTrue(brain.goal_cap_repair(self.issue(11, "someone", ["loom:factory"])))
+        self.assertTrue(brain.goal_cap_repair(self.issue(11, LOOM_APP, ["loom:health"])))
+        for login in ("someone", BRIEFER, LOOM_APP):
+            self.assertFalse(brain.goal_cap_repair(self.marked(11, login)), login)
+        rewritten = self.marked(11, LOOM_APP, body="It is slow.\n\nRewritten from issue 9.")
+        self.assertFalse(brain.goal_cap_repair(rewritten))
+
+    def test_a_rewrite_of_a_strangers_marked_issue_gets_no_reserve(self):
+        # The trusted login that rewrites it copies the marker into its brief.
+        fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"]),
+                         self.marked(11, "someone")])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            with self.assertRaisesRegex(ValueError, "ordinary briefs wait for a slot"):
+                self.copied(fake, refs=11)
+        self.assertEqual(fake.created(), [])
+        self.assertEqual(fake.comments, [])
+
+    def test_a_trusted_logins_copy_of_a_marker_gets_no_reserve(self):
+        # Author and marker text together are still no proof: the ticket a
+        # trusted briefer or the Loom App wrote from a stranger's issue
+        # carries the stranger's words.
+        for login in (BRIEFER, LOOM_APP):
+            copy = self.marked(11, login, body="It is slow.\n\nRewritten from issue 9.")
+            fake = GoalRepo([item(10, labels=["loom:ticket", "loom:running"]), copy])
+            with unittest.mock.patch.dict(os.environ, self.at_cap()):
+                with self.assertRaisesRegex(ValueError, "ordinary briefs wait for a slot"):
+                    self.copied(fake, refs=11)
+            self.assertNotIn("loom:ticket", fake.names(11), login)
+
+    def test_a_rewrite_drops_a_health_marker_copied_into_its_brief(self):
+        env = self.at_cap(LOOM_GOAL_CAP="16")
+        # Filed as a new ticket, for a stranger's issue.
+        fake = GoalRepo([self.marked(11, "someone")])
+        with unittest.mock.patch.dict(os.environ, env):
+            self.copied(fake, refs=11)
+        (made,) = fake.created()
+        self.assertNotIn("loom:health", made[2]["body"])
+        self.assertIn("Rewritten from issue 11.", made[2]["body"])
+        self.assertNotIn("loom:health", made[2]["labels"])
+        # In place, for a trusted briefer's issue: only the original text
+        # kept below the brief still has it.
+        fake = GoalRepo([self.marked(11, BRIEFER)])
+        with unittest.mock.patch.dict(os.environ, env):
+            self.copied(fake, refs=11)
+        body = fake.issues[11]["body"]
+        self.assertNotIn("loom:health", tickets.without_original(body))
+        self.assertIn(HEALTH_MARKER, body)
+        self.assertNotIn("loom:health", fake.names(11))
+
+    def test_a_health_intake_ticket_is_rewritten_through_the_reserve(self):
+        running = item(10, labels=["loom:ticket", "loom:running"])
+        # In place for a briefing login's ticket, which keeps its label.
+        fake = GoalRepo([running, self.issue(11, LOOM_APP, ["loom:health"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            self.assertEqual(self.brief(fake, refs=11), "https://example.com/t/11")
+        self.assertIn("loom:ticket", fake.names(11))
+        self.assertIn("loom:health", fake.names(11))
+        # As a new ticket otherwise, which carries the label over.
+        fake = GoalRepo([running, self.issue(11, "someone", ["loom:health"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            self.brief(fake, refs=11)
+        (made,) = fake.created()
+        self.assertIn("loom:health", made[2]["labels"])
+
+    def test_a_health_marker_does_not_reach_the_repairs_epic(self):
+        for login in ("someone", BRIEFER, LOOM_APP):
+            fake = GoalRepo([self.marked(11, login)])
+            self.fill_epics(fake)
+            gh = GitHub("t", transport=fake)
+            with unittest.mock.patch.dict(os.environ, self.at_cap(LOOM_GOAL_CAP="16")):
+                with self.assertRaises(brain.GoalEpicCapacityHeld, msg=login):
+                    brain.brief_intake(gh, REPO, 1, "Ticket", BODY + "\n\n" + HEALTH_MARKER,
+                                       refs=11)
+            self.assertEqual(fake.created(), [], login)
+            self.assertNotIn("loom:ticket", fake.names(11), login)
+
+    def test_a_health_intake_ticket_reaches_the_repairs_epic(self):
+        fake = GoalRepo([self.issue(11, LOOM_APP, ["loom:health"])])
+        self.fill_epics(fake)
+        gh = GitHub("t", transport=fake)
+        with unittest.mock.patch.dict(os.environ, self.at_cap(LOOM_GOAL_CAP="16")):
+            brain.brief_intake(gh, REPO, 1, "Ticket", BODY, refs=11)
+        (epic,) = [i for i in fake.issues.values() if i.get("title") == brain.REPAIRS_TITLE]
+        self.assertEqual(fake.subs[epic["number"]], [11])
+
+    def test_only_a_labelled_held_ticket_uses_reserve_room(self):
+        held = ["loom:ticket", "loom:queued", "wait:lane"]
+        running = item(10, labels=["loom:ticket", "loom:running"])
+        # Marker text holds no room, whoever wrote the ticket.
+        for login in ("someone", LOOM_APP):
+            fake = GoalRepo([running, self.marked(11, login, held), self.marked(12, login, held),
+                             self.issue(13, LOOM_APP, ["loom:factory"])])
+            with unittest.mock.patch.dict(os.environ, self.at_cap()):
+                self.assertEqual(self.brief(fake, refs=13), "https://example.com/t/13", login)
+        # Two held tickets health intake filed fill the reserve.
+        fake = GoalRepo([running, *(self.issue(n, LOOM_APP, held + ["loom:health"])
+                                    for n in (11, 12)),
+                         self.issue(13, LOOM_APP, ["loom:factory"])])
+        with unittest.mock.patch.dict(os.environ, self.at_cap()):
+            with self.assertRaisesRegex(ValueError, "the repair reserve is full"):
+                self.brief(fake, refs=13)
 
     def test_an_ordinary_brief_over_the_limit_is_refused(self):
         fake = self.over_limit()
@@ -6119,14 +6257,43 @@ class LiveCriterionTest(unittest.TestCase):
                 "- [ ] %s\n\n## Size\nS\n\n## Out of scope\nz\n" % live)
 
     def test_a_prose_live_criterion_is_refused(self):
-        with self.assertRaisesRegex(ValueError, "names no exact string"):
+        with self.assertRaisesRegex(ValueError, "names no check Loom can run by itself"):
             brain._check_live_criterion(self.body(
                 "Live: the station log for the 24 hours after deploy shows it working"))
 
-    def test_a_live_criterion_naming_a_string_passes(self):
-        brain._check_live_criterion(self.body(
-            "Live: the station log shows `deployed` within a pass of the merge"))
-        brain._check_live_criterion(self.body('Live: "/api/v2/health" reports no finding'))
+    def test_a_quoted_string_with_no_window_is_refused_and_the_message_lists_the_forms(self):
+        # Owner ruling of 2026-11-19 (#3277): a Live box is written only when
+        # Loom can run its check. A string alone names no time to read the
+        # log for, so 18 such boxes sat on shipped tickets and none was ever
+        # proven.
+        for live in ("Live: the station log shows `deployed`",
+                     'Live: "/api/v2/health" reports no finding'):
+            with self.subTest(live=live):
+                with self.assertRaises(ValueError) as caught:
+                    brain._check_live_criterion(self.body(live))
+                message = str(caught.exception)
+                for form in ("https://", "gh api", "kubectl get", "log:<source>", "time window"):
+                    self.assertIn(form, message)
+                self.assertIn("names the test", message)
+
+    def test_a_live_criterion_naming_a_check_loom_can_run_passes(self):
+        for live in ("Live: https://example.invalid/api/v2/health answers `ok`",
+                     "Live: `gh api repos/example/thing/issues/3` shows `closed`",
+                     "Live: `kubectl get deploy web -n shop` shows `2/2`",
+                     "Live: `log:station` shows `claimed 3`",
+                     "Live: the station log shows `deployed` within 24 hours of the merge",
+                     "Live: no `Traceback` line appears in the station log for 24 hours"):
+            with self.subTest(live=live):
+                brain._check_live_criterion(self.body(live))
+
+    def test_the_intake_templates_keep_their_one_live_box(self):
+        # The station's own absence tracking proves these two boxes
+        # (bus/health.py, bus/friction_intake.py), so they stay as written.
+        from bus import friction_intake, health
+        for box in (health.LIVE_BOX, friction_intake.LIVE_BOX):
+            with self.subTest(box=box):
+                self.assertTrue(box.startswith("- [ ] Live:"), box)
+                brain._check_live_criterion(self.body(box[len("- [ ] "):]))
 
     def test_a_body_with_no_live_criterion_is_left_alone(self):
         brain._check_live_criterion(self.body("A test fails without the change"))
@@ -6146,19 +6313,19 @@ class RestateLiveTest(unittest.TestCase):
     def test_a_shipped_ticket_gets_its_live_line_replaced_in_place(self):
         fake = Fake(reply(200, self.issue()), reply(200, {}))
         brain.restate_live(GitHub("t", transport=fake), REPO, 8,
-                           "Live: the station log shows `deployed` within a pass", env=self.ENV)
+                           "Live: the station log shows `deployed` within 24 hours of the merge", env=self.ENV)
         self.assertEqual(fake.calls[1][0], "PATCH")
         self.assertEqual(fake.calls[1][2]["body"], self.BODY.replace(
             "Live: the logs show it working after deploy",
-            "Live: the station log shows `deployed` within a pass"))
+            "Live: the station log shows `deployed` within 24 hours of the merge"))
 
     def test_refusals_make_no_writes(self):
         cases = [
             (self.issue(), "Live: the logs show it"),                       # names no string
             (self.issue(), "live: the station log shows `deployed`"),        # not read as Live
             (self.issue(), "The station log shows `deployed`"),             # not a Live line
-            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows"),
-            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows"),
+            (self.issue(labels=("loom:ticket", "loom:merged")), "Live: `deployed` shows within 24 hours"),
+            (self.issue(body="## Acceptance criteria\n- [ ] a\n"), "Live: `deployed` shows within 24 hours"),
         ]
         for issue, text in cases:
             with self.subTest(text=text):

@@ -35,7 +35,7 @@
 # A base-check brief (Deliverable: base-check, from the station, loom#3084)
 # runs only the base check on the default branch: a pass closes the repo's
 # base-check incident, a fail updates it. No agent and no pull request.
-# A review brief (Deliverable: review, from the station, loom#2142) also
+# A review brief (Deliverable: review, from the station's review sweep) also
 # changes no code: its tree is the reviewed pull request's own branch (a
 # Review-PR: <number> line names it, cloned like a fix brief's), the agent
 # leaves review.json in its tree, and the runner copies it to the lane's log
@@ -56,6 +56,9 @@
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_CHECK_SLOTS (check runs at once across all lanes on the host, default 3),
 # LOOM_CHECK_SLOT_WAIT (seconds a check waits for a slot, default 5400),
+# LOOM_CHECK_LOAD_1M and LOOM_CHECK_LOAD_5M (a check takes a slot only while
+# the host's 1-minute and 5-minute load averages are at or under these,
+# defaults 24 and 18; 0 turns that limit off),
 # LOOM_<SLOT>_OPENCODE (the opencode binary one slot runs, default opencode
 # from PATH; a 2.x binary uses a private server inside its sandbox),
 # LOOM_<SLOT>_PROBE_URL and _PROBE_HEADER (API lanes: the provider's chat
@@ -64,7 +67,8 @@
 # LOOM_SANDBOX (seatbelt, the default, or bwrap in a lane pod, which also
 # needs LOOM_EGRESS_DENY_PROBES, IPv4:port addresses the pod's egress policy
 # blocks, and LOOM_EGRESS_ALLOW_PROBE, a host:port it must reach; see
-# egress_denied),
+# egress_denied), LOOM_EGRESS_RECHECK_SECONDS (seconds between checks during
+# a bwrap agent run, default 60),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
 # pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
@@ -228,6 +232,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   # The agent's watchdog and its tail reader run in a group of their own; a
   # lock from before loom#2401 has no watchdog_pgid, and that is skipped.
   stop_orphaned_agent "$(cat "$LOCK/watchdog_pgid" 2>/dev/null || true)"
+  stop_orphaned_agent "$(cat "$LOCK/egress_pgid" 2>/dev/null || true)"
   rm -rf "$LOCK"; mkdir "$LOCK" || exit 0
 fi
 echo $$ > "$LOCK/pid"
@@ -1277,52 +1282,53 @@ agent_gh_calls() {
 }
 APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); nothing was posted"
 
-# The last lines of a failed run's log, as one comment on its ticket, so a
-# reader who cannot reach the lane host sees why it failed (loom#3049). The
-# lines lose local paths and control characters, go through the leak scan
-# (the full scan for a repo not known to be private, the personal data scan
-# for a private one) and are posted only when it passes: a refused or
-# unavailable scan posts a note that the tail was withheld, never the text.
-# One comment, found by its marker and replaced by the next failure. A limit
-# or auth park is skipped (the station re-briefs those with the reason in
-# hand). A failed post is logged and never fails the park. LOOM_LOG_TAIL=off
-# turns it off; LOOM_LOG_TAIL_LINES sets the line count (default 40).
+# One readable outcome on a parked ticket, so a reader who cannot reach the
+# lane host sees that the run stopped and why: the lane, the failure class
+# and the first line of the park reason. The run log itself is never posted:
+# it holds the agent's whole session (test fixture tables, other tasks' API
+# replies), which loom#3049's log tails put on tickets as if it were news.
+# The line loses local paths and control characters and goes through the
+# leak scan (the full scan for a repo not known to be private, the personal
+# data scan for a private one); a refused or unavailable scan posts the
+# outcome without the reason. One comment, found by its marker (the old
+# log-tail marker, so a ticket's next park replaces an old tail) and
+# replaced by the next park. A limit or auth park is skipped (the station
+# re-briefs those with the reason in hand). A failed post is logged and
+# never fails the park. LOOM_LOG_TAIL=off turns it off.
 # Only a brief whose repo passed the owner check and whose privacy is known
 # (LOG_TAIL_OK, set in the brief loop) gets one: a brief is input, and a
 # refused one must not make the lane write to a repo it names. A lane with
 # App settings and no minted token posts nothing, as nothing else does.
 LOG_TAIL_MARKER="<!-- loom:lane-log-tail v1 -->"
 LOG_TAIL_OK=0
-post_log_tail() {  # failure class
+post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
   [ -z "${LOOM_GITHUB_APP_ID:-}" ] || [ -n "${GH_TOKEN:-}" ] || return 0
-  case "${1:-work}" in limit|auth) return 0 ;; esac
-  [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] && [ -s "${LOG:-}" ] || return 0
-  local lines="${LOOM_LOG_TAIL_LINES:-40}" file scan=() rc=0 text
-  { [[ "$lines" =~ ^[0-9]+$ ]] && [ "$lines" -gt 0 ]; } || lines=40
-  file="$(mktemp "${TMPDIR:-/tmp}/loom-log-tail.XXXXXX")" || return 0
-  tail -c +"$((${LOG_START:-0} + 1))" "$LOG" 2>/dev/null | tr -d '\r' |
-    LC_ALL=C tr -d '\000-\010\013\014\016-\037' | tail -n "$lines" | cut -c1-300 |
+  local class="${1:-work}" reason file scan=() rc=0 text
+  case "$class" in limit|auth) return 0 ;; esac
+  [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
+  file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
+  printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
+    grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
     sed -E "s#(^|[[:space:]\"'(=])(~|\\\$HOME)?/[^[:space:]\"'():,]*#\\1<path>#g" > "$file"
   if [ "${REPO_PRIVATE:-}" = true ]; then
     scan=(--personal-data)
   else
     scan=(--allow-repo-ref "$REPO" --allow-repo-ref "$FACTORY_REPO")
   fi
-  # The scanner's words stay out of the log: a shape hit echoes the text it
-  # matched, and the log is where the next tail is cut from.
+  # The scanner's words stay out of the log: a shape hit echoes the text it matched.
   leak_scan --text-file "$file" "${scan[@]}" > /dev/null 2>&1 || rc=$?
-  [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the log tail or could not run (exit $rc)" >> "$LOG"
-  if [ "$rc" -eq 0 ]; then
-    text="$(cat "$file")"
+  [ "$rc" -eq 0 ] || echo "[$(date -u +%FT%TZ)] $TICKET: the leak scan refused the park reason or could not run (exit $rc)" >> "$LOG"
+  reason="$(cat "$file")"; rm -f "$file"
+  if [ "$rc" -eq 0 ] && [ -n "$reason" ]; then
+    text="The $LANE lane parked this ticket after a $class failure: $reason"
   else
-    text="The log tail was withheld: the leak scan refused it or could not run. The full log is on the lane host."
+    text="The $LANE lane parked this ticket after a $class failure; the reason was withheld by the leak scan."
   fi
-  rm -f "$file"
   printf '%s\n' "$text" |
-    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" tail \
-      --headline "Last lines of the $LANE lane log for $TICKET" ||
-    echo "[$(date -u +%FT%TZ)] $TICKET: could not post the log tail" >> "$LOG"
+    upsert_sticky_comment "$REPO" "$ISSUE_NUMBER" "$LOG_TAIL_MARKER" outcome \
+      --headline "Outcome of the $LANE lane run for $TICKET" ||
+    echo "[$(date -u +%FT%TZ)] $TICKET: could not post the park note" >> "$LOG"
   return 0
 }
 
@@ -1334,7 +1340,7 @@ park() {
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET failed: [${3:-work}] $reason" | tee -a "$LOG" >&2
   [ -z "${AGENT_GH_CALLS:-}" ] || printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
-  post_log_tail "${3:-work}"
+  post_park_note "${3:-work}" "$reason"
   mv "$1" "$INBOX/failed/"
 }
 
@@ -2800,6 +2806,14 @@ note_base_check_failure() {  # kind, detail, reason_var_name, revision [, log_of
 # (default 5400) polling every LOOM_CHECK_SLOT_POLL (default 5); waiting is
 # no failure and the lane's keepalive stamp keeps the station reading it as
 # alive. A wait that runs out returns 75, which callers class as transient.
+# A free slot is not room on the host: three checks alone took a 12-core
+# host to a 1-minute load of 31.5 (#3279). So a slot is taken only while the
+# 1-minute load average is at or under LOOM_CHECK_LOAD_1M (default 24) and
+# the 5-minute one at or under LOOM_CHECK_LOAD_5M (default 18); 0 turns that
+# limit off. A load wait counts toward LOOM_CHECK_SLOT_WAIT like a slot wait.
+# The reading is the first two fields of LOOM_CHECK_LOAD_FILE (default
+# /proc/loadavg), or of `sysctl -n vm.loadavg` where that file is absent
+# (macOS). A host whose load cannot be read is not gated, and the log says so.
 CHECK_SLOTS="${LOOM_CHECK_SLOTS:-3}"
 CHECK_SLOT_WAIT="${LOOM_CHECK_SLOT_WAIT:-5400}"
 CHECK_SLOT_POLL="${LOOM_CHECK_SLOT_POLL:-5}"
@@ -2808,6 +2822,45 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
+CHECK_LOAD_1M="${LOOM_CHECK_LOAD_1M:-24}"
+CHECK_LOAD_5M="${LOOM_CHECK_LOAD_5M:-18}"
+CHECK_LOAD_FILE="${LOOM_CHECK_LOAD_FILE:-/proc/loadavg}"
+CHECK_LOAD_NOTE=""
+[[ "$CHECK_LOAD_1M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_1M=24
+[[ "$CHECK_LOAD_5M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_5M=18
+
+# Print the host's 1-minute and 5-minute load averages as "<1m> <5m>";
+# return 1 when there is no reading.
+check_load_reading() {
+  local line="" one="" five="" rest=""
+  if [ -r "$CHECK_LOAD_FILE" ]; then
+    IFS= read -r line < "$CHECK_LOAD_FILE" || [ -n "$line" ] || return 1
+  else
+    line="$(sysctl -n vm.loadavg 2>/dev/null || /usr/sbin/sysctl -n vm.loadavg 2>/dev/null)" || return 1
+  fi
+  # macOS prints "{ 2.92 3.15 3.21 }", and a comma for the point in some locales.
+  line="${line//[\{\}]/ }"
+  line="${line//,/.}"
+  read -r one five rest <<< "$line"
+  [[ "$one" =~ ^[0-9]+(\.[0-9]+)?$ && "$five" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s %s\n' "$one" "$five"
+}
+
+# Return 0 when the host load is above a limit, with CHECK_LOAD_NOTE saying
+# which reading and limit; 1 when there is room, both limits are 0, or the
+# load cannot be read (CHECK_LOAD_NOTE is then "unread").
+check_load_high() {
+  local reading one five
+  CHECK_LOAD_NOTE=""
+  [[ "$CHECK_LOAD_1M" =~ ^0+(\.0+)?$ && "$CHECK_LOAD_5M" =~ ^0+(\.0+)?$ ]] && return 1
+  reading="$(check_load_reading)" || { CHECK_LOAD_NOTE=unread; return 1; }
+  read -r one five <<< "$reading"
+  CHECK_LOAD_NOTE="$(awk -v a="$one" -v b="$five" -v la="$CHECK_LOAD_1M" -v lb="$CHECK_LOAD_5M" 'BEGIN {
+    if (la + 0 > 0 && a + 0 > la + 0) printf "1-minute load %s is above %s", a, la
+    else if (lb + 0 > 0 && b + 0 > lb + 0) printf "5-minute load %s is above %s", b, lb
+  }')"
+  [ -n "$CHECK_LOAD_NOTE" ]
+}
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
@@ -2840,21 +2893,45 @@ try_check_slot() {
 }
 
 acquire_check_slot() {
-  local waited=0 next_note=0 start
+  local waited=0 next_note=0 start why="" noted="" for_slot="" for_load="" unread="" what
   start="$(date +%s)"
-  while ! try_check_slot; do
-    if [ "$waited" -ge "$next_note" ]; then
-      echo "[$(date -u +%FT%TZ)] waiting for a check slot: all $CHECK_SLOTS in use; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+  while :; do
+    if check_load_high; then
+      why=load; for_load=1
+    else
+      if [ "$CHECK_LOAD_NOTE" = unread ] && [ -z "$unread" ]; then
+        unread=1
+        echo "[$(date -u +%FT%TZ)] host load could not be read; check slots are taken without the load limit" >> "$LOG"
+      fi
+      try_check_slot && break
+      why=slot; for_slot=1
+    fi
+    if [ "$waited" -ge "$next_note" ] || [ "$why" != "$noted" ]; then
+      if [ "$why" = load ]; then
+        echo "[$(date -u +%FT%TZ)] waiting for host load before taking a check slot: $CHECK_LOAD_NOTE; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+      else
+        echo "[$(date -u +%FT%TZ)] waiting for a check slot: all $CHECK_SLOTS in use; waited ${waited}s of ${CHECK_SLOT_WAIT}s" >> "$LOG"
+      fi
+      noted="$why"
       next_note=$((waited + 300))
     fi
     if [ "$waited" -ge "$CHECK_SLOT_WAIT" ]; then
-      echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s; the check did not run (transient)" >> "$LOG"
+      if [ "$why" = load ]; then
+        echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s: host load stayed high ($CHECK_LOAD_NOTE); the check did not run (transient)" >> "$LOG"
+      else
+        echo "[$(date -u +%FT%TZ)] no check slot after ${waited}s; the check did not run (transient)" >> "$LOG"
+      fi
       return 1
     fi
     sleep "$CHECK_SLOT_POLL"
     waited=$(( $(date +%s) - start ))
   done
-  [ "$waited" -eq 0 ] || echo "[$(date -u +%FT%TZ)] got check slot ${CHECK_SLOT_HELD##*-} after ${waited}s" >> "$LOG"
+  if [ -n "$for_slot$for_load" ]; then
+    what="a slot"
+    [ -z "$for_load" ] || what="host load"
+    [ -z "$for_slot" ] || [ -z "$for_load" ] || what="a slot and host load"
+    echo "[$(date -u +%FT%TZ)] got check slot ${CHECK_SLOT_HELD##*-} after ${waited}s (waited for $what)" >> "$LOG"
+  fi
   return 0
 }
 
@@ -4164,6 +4241,34 @@ agent_watchdog() {
   rm -f "$fifo"
 }
 
+# Run outside bwrap, with a process group the runner can stop along with
+# any in-flight probe. The marker takes priority over the agent's exit code.
+agent_egress_watchdog() {
+  local agent="$1" interval="${LOOM_EGRESS_RECHECK_SECONDS:-60}" warned="" group groups
+  [[ "$interval" =~ ^[1-9][0-9]{0,8}$ ]] || interval=60
+  set +m
+  while sleep "$interval" && kill -0 "$agent" 2>/dev/null; do
+    if egress_denied; then
+      continue
+    fi
+    if [ -n "$EGRESS_CONNECTED" ]; then
+      printf '%s\n' "$EGRESS_CONNECTED" > "$LOCK/egress-opened"
+      # Kill the timeout and sandbox groups before their parent wrapper.
+      groups="$(agent_groups "$agent" | sort -u)"
+      for group in $groups; do
+        case "$group" in "$agent"|0|1) continue ;; esac
+        kill -KILL -- "-$group" 2>/dev/null || true
+      done
+      kill -KILL -- "-$agent" 2>/dev/null || true
+      return
+    fi
+    if [ -z "$warned" ]; then
+      echo "[$(date -u +%FT%TZ)] $TICKET: egress allow probe failed during the run" >> "$LOG"
+      warned=1
+    fi
+  done
+}
+
 spend() { PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.spend "$@"; }
 
 # The anthropic lanes spend API credits. The CLI's JSON result carries the
@@ -4696,7 +4801,7 @@ for BRIEF in "$INBOX"/*.md; do
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
   if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
-  rm -f "$LOCK/watchdog-limit"
+  rm -f "$LOCK/watchdog-limit" "$LOCK/egress-opened"
   # The job's proof that an agent started: without it a cluster run fails in
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
@@ -4709,17 +4814,33 @@ for BRIEF in "$INBOX"/*.md; do
     ( agent_watchdog "$agent_pid" "$LOG_START" "$LOG" ) &
     watchdog_pid=$!
     echo $watchdog_pid > "$LOCK/watchdog_pgid"
+    egress_pid=""
+    if [ "${LOOM_SANDBOX:-}" = bwrap ] && [ -n "${LOOM_EGRESS_DENY_PROBES:-}" ]; then
+      ( agent_egress_watchdog "$agent_pid" ) &
+      egress_pid=$!
+      echo "$egress_pid" > "$LOCK/egress_pgid"
+    fi
     wait $agent_pid
     agent_status=$?
+    if [ -n "$egress_pid" ]; then
+      # Once the watchdog records an open probe, let it finish the kill.
+      [ -s "$LOCK/egress-opened" ] || kill -TERM -- "-$egress_pid" 2>/dev/null || true
+      wait "$egress_pid" 2>/dev/null || true
+      rm -f "$LOCK/egress_pgid"
+    fi
     kill -TERM -- "-$watchdog_pid" 2>/dev/null || kill -TERM "$watchdog_pid" 2>/dev/null || true
     wait $watchdog_pid 2>/dev/null || true
     exit $agent_status ) &
   wait $!
   STATUS=$?
-  AGENT_GH_CALLS="$(agent_gh_calls)"
+  [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
+  GH_CLEANUP_FAILURE=""
   if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
-    park "$BRIEF" "could not remove the agent's gh credential store" transient; continue
+    GH_CLEANUP_FAILURE="could not remove the agent's gh credential store"
+    if [ ! -s "$LOCK/egress-opened" ]; then
+      park "$BRIEF" "$GH_CLEANUP_FAILURE" transient; continue
+    fi
   fi
   is_api_lane && archive_transcripts
   if [ "$MODEL_KIND" = paid ] && [ -f "$WORKDIR/$TICKET.opencode-events" ]; then
@@ -4729,7 +4850,20 @@ for BRIEF in "$INBOX"/*.md; do
       echo "[$(date -u +%FT%TZ)] $TICKET could not settle $MODEL: paid models stop for an hour" | tee -a "$LOG" >&2
     fi
   fi
-  if ! lane_app_token; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
+  TOKEN_READY=1
+  lane_app_token || TOKEN_READY=0
+  if [ -s "$LOCK/egress-opened" ]; then
+    # The address belongs in the lane log and the sealed runner report.
+    echo "[$(date -u +%FT%TZ)] $TICKET egress probe connected: $(cat "$LOCK/egress-opened")" >> "$LOG"
+    INCIDENT="factory incident filing failed ($APP_TOKEN_WHY)"
+    if [ "$TOKEN_READY" = 1 ]; then
+      INCIDENT="$(file_factory_incident egress-opened "A deny probe connected during the agent run. See the sealed lane log for the address.")"
+    fi
+    LOOM_LOG_TAIL=off park "$BRIEF" \
+      "egress probe connected; nothing pushed; $INCIDENT${GH_CLEANUP_FAILURE:+; $GH_CLEANUP_FAILURE}" egress-opened
+    break
+  fi
+  if [ "$TOKEN_READY" = 0 ]; then park "$BRIEF" "$APP_TOKEN_WHY" transient; continue; fi
   # A spark run that ended because the box went hot is a limit, not a failure.
   if [ "$STATUS" -ne 0 ] && { [ "$LANE" = spark ] || [ "$LANE" = free ]; } && { spark_probe; [ $? -eq 1 ]; }; then
     mark_limit

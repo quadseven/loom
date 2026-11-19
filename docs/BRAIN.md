@@ -92,7 +92,7 @@ decides who acts:
 | `loom:merged` | The brain merged the pull request; nothing is deployed yet. |
 | `loom:closed-unmerged` | The linked pull request closed without merging. |
 | `loom:shipped` | Deployed. Loom's own tickets are shipped by the station when it deploys the revision that carries their pull request (see Shipping Loom itself); other repos keep their goal home's ship rules, under whoever owns shipping there (which may not be the brain). |
-| `closed-unproven` | The station closed the ticket on merged code with its Live box unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
+| `closed-unproven` | The station closed the ticket on merged code with its live boxes unproven (see The evidence close). It stays on a reopened ticket, and such a ticket never closes this way again. |
 | `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
 | `loom:mutation` | The one rolling report of the weekly spot mutation run (`bus/mutation_run.py`). Never a ticket; a survivor to fix gets its own. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
@@ -109,6 +109,7 @@ decides who acts:
 | `loom:digest` | The issue holding the full daily digest of asks, in each repo with asks. |
 | `loom:regression` | A ticket admitted for a measured regression of a shipped ticket (`brief --regresses`). Claimed and landed before other tickets. |
 | `loom:revert` | A ticket the station filed to revert the merge that turned a default branch red (see Red default branch). Claimed and landed before every other ticket. |
+| `loom:health` | A ticket health intake filed for a live finding (docs/HEALTH.md). With `loom:factory`, one of the two labels that admit a ticket to the reserve above the goal cap. |
 | `class:logic` | A change to behavior; every revert ticket carries it. |
 | `tier:<name>` | The pull request's `bus/merge_tier.py` tier when it opened. It reports and decides nothing. |
 
@@ -303,9 +304,10 @@ string in backticks or double quotes; health and friction intake tickets are
 verified by the station's own absence tracking and are exempt. The string is
 the log line, field or endpoint the proof will show, for example
 `overseer: summoned` or `/api/v2/health`. The station searches its log
-command for that string before it spends a verify run (bus/evidence.py), so
-a criterion written as prose can never be verified. Triage counts the same checks as missing sections. The size may
-be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
+command for that string before it spends a log-based verify lane run
+(`bus/evidence.py`). A shipped ticket with a prose criterion can reach the
+brain's verify hand-out. Triage counts the same checks as missing sections.
+The size may be a `## Size` section or one line of its own, `Size: XS|S|M|L` (any case,
 optionally bold); triage, `brief`, the rewrite check, the runner and PR
 repair all read it through `hunt_plan.stated_size`. The runner
 writes the Size as the letter whatever the brief says, and logs any plan
@@ -654,13 +656,12 @@ It applies the same skips as triage (`brain.not_work_reason`: a `wayfinder:*`
 label, `awaiting-live-check`, a factory incident, an epic), so an issue
 labelled `loom:triage` before a skip existed is not rewritten into a ticket.
 It only briefs or skips: when its model answers that only a person can do the
-work, the issue keeps `loom:triage`, gains `needs-brain`, and the station
-leaves it alone from then on; the brain decides whether it becomes a ticket
-or `needs:human`. The proposed ask is no comment to a person: it is one
-routine event on the issue's status comment (`<!-- loom:rewrite-ask -->`),
-which the factory's hold notes quote as the reason for the hold and the
-prompt of a later rewrite attempt repeats. Free rewrite models labelled factory work as
-person-only, and every `needs:human` reaches the operator's digest.
+work, the issue keeps `loom:triage`, gains `needs-brain`, and records the
+proposed ask as a status event (`<!-- loom:rewrite-ask -->`). The brain can
+rule on it before the station escalates the hold. Issues with a
+`needs:<login>` label wait on that person and are skipped by the rewriter.
+The standup and dashboard count those issues as waiting on a person. The
+standup also counts triage issues older than seven days and names the oldest.
 Set `LOOM_REWRITE_CMD` (public repos) and `LOOM_REWRITE_PRIVATE_CMD` (private
 repos) to command lines that read a prompt on stdin and print one JSON object.
 `lanes/rewrite_agent.sh <key-ssm|-> <provider/model[,provider/model...]>`
@@ -876,7 +877,10 @@ still runs the log command on every verify cooldown and costs no verify run
 until a line appears. When one does, the hand-out removes `wait:live-event` and
 the verify runs and closes the ticket on proof as for any shipped ticket; a run
 that finds the evidence missing again lands on `loom:awaiting-evidence` and is
-held again once the log shows no matching line.
+held again once the log shows no matching line. Since the ruling of 2026-11-19
+this label no longer holds a ticket back from the evidence close (see The
+evidence close): a held ticket that meets its other conditions closes as
+`closed-unproven`.
 
 This waiting applies to a Live box that needs a line to appear. A box that needs its
 strings to be absent ("no `X` line appears") is the other way round: an empty
@@ -1148,8 +1152,13 @@ title carries a partial-review form such as `WARN Elder review low
 confidence`) is not sent back: a lane cannot fix it. The station leaves the
 ticket at `loom:pr` with no fix comment, no round counted and no
 `loom:ready`, and the factory asks the review bot to review the head again
-(`/grug improve`, once per head commit). Real failures beside it are sent
-back without it. The same request goes to any open lane pull request whose
+(`/grug improve`, once per head commit). When the re-run is degraded or
+partial too, the pull request stays held at `loom:pr` until the review
+check reruns on the head with a verdict: review is the review bot's alone
+(operator decision, 2026-11-16), so no lane reviews it and nothing stands
+in for the check, in the factory or in `bus.brain merge`. A person or brain
+can comment `/grug improve` again once the review route recovers. Real
+failures beside it are sent back without it. The same request goes to any open lane pull request whose
 review check failed degraded, whatever state its ticket is in or whatever else
 fails on the head, once per head commit and at most `claimed.REREVIEW_PER_RUN`
 requests a factory pass; the log names each request against that bound and the
@@ -1711,7 +1720,12 @@ impact and brief lanes up to `LOOM_GOAL_CAP` (default 16) tickets in flight
 per goal. Running tickets and tickets at a pull request
 hold slots, as do queued or briefed tickets eligible for a lane. Factory
 repairs and health findings share two extra slots above the cap. Held repairs
-and health findings still use room in that reserve. Measured regressions
+and health findings still use room in that reserve. A label is the only
+evidence for it: `loom:factory` for a repair, `loom:health` for a finding
+health intake filed. Only a collaborator sets a label. The health marker in
+a body grants nothing, whoever wrote the issue, since anyone can paste it and
+a rewrite can copy it. A rewrite is judged by the labels of the issue it
+rewrites, and a marker in its brief is dropped. Measured regressions
 have their own slot (see Regression slot). Write the journal, report when
 due, and release the lock. A failed step goes in the journal and waits for
 the next tick.
@@ -1786,6 +1800,10 @@ factory's `brain_holds`) resolves a hold older than 24 hours that Loom set:
   running, pr or failed to `loom:failed`, out of the goal's in-flight count.
   Either way one event on the status comment, edited in place, names who held
   it, for how long and why (the note beside the label event, else its state).
+- A triage issue that has waited 24 hours goes to `needs:human` and loses
+  `loom:triage` and `needs-brain`. The station posts the recorded ask once.
+  When the hold has no recorded ask, it asks the operator to decide how to
+  triage the issue. An existing person hold is left in place.
 - At most 5 a run, oldest first, and a run at most every 30 minutes, stamped
   however it ends. The run sends each repo's count of holds older than a day
   that it left (`POST /api/brain-holds`), and the dashboard's Needs-you page
@@ -2386,11 +2404,17 @@ Only a 2xx passes a URL check: a redirect is not followed, so a 3xx (a login
 or error page behind it) fails as "redirect not followed", unless every
 expected string names that exact status or Location.
 Each result is kept in the station's `live-checks.json` and written to the
-ticket's status; the answer itself is never written. A criterion with no
-runnable check, a failed check, or an operator criterion sends the ticket to
-`needs:human` with one ask (`Kind: decision`), once, and at most 4 such asks
-an hour. A verify lane's proof that passes a live or operator criterion
-without station evidence is refused.
+ticket's status. A live criterion with no runnable check or a failed check
+stays shipped in the verify queue with a missing-evidence note or the
+observed failure. Once unclaimed live work has waited 23 hours, the next
+scheduled `resume` hands it to the brain holding the lock ahead of the
+ordinary verify slots. The brain reads the logs, running system, or code and
+records the evidence, the missing evidence, or the finding if the box is false.
+Only unticked operator criteria raise a `needs:human` ask (`Kind: decision`),
+once per set of criteria and at most 4 asks an hour. The digest omits legacy
+station verification asks that have no open operator criterion. A verify
+lane's proof that passes a live or operator criterion without station evidence
+is refused.
 
 The proof a shipped ticket names is read by `bus/live_proof.py`, read-only.
 Each live criterion names at most one step: its log strings searched from the
@@ -2465,33 +2489,46 @@ default branch, drops its `sql` command, and counts the pair only while the
 lender is in `LOOM_LIVE_EVIDENCE_REPOS`. A repo not paired gets no adapter.
 
 When an opted-in repo has a prose Live box with no runnable check, the
-station hands a shipped ticket to a verify lane before asking a person. The
-brief lists that adapter's log sources and whether its SQL route is available.
+station can hand the shipped ticket to a verify lane. The brief lists that
+adapter's log sources and whether its SQL route is available.
 The lane may return one `adapter_step`: `log:<source>` with required strings,
 or `sql:<SELECT ...>` with strings that must occur in the rows. The station
 validates and runs the step through the repo adapter itself; lane prose never
-counts as evidence. A missing step or a failed station read raises one
-`loom:human` ask naming the attempted step and reason. Repos without an opted-in
-adapter keep the existing ask path.
+counts as evidence. A missing step or a failed station read stays in the
+verify queue with a status note naming the attempted step and reason.
 
 ### The evidence close
 
 By the operator's ruling of 2026-10-31 (loom#2325), one close revises the
-rule above, for one kind of ticket. The station closes a `loom:shipped`
-ticket with its one Live box unproven when all of these hold:
+rule above. The owner's ruling of 2026-11-19 widens it: Loom keeps holding
+finished tickets open for live proof it cannot collect, and the backlog grows
+though the work is merged. From now on a shipped ticket whose merged change
+still stands closes without waiting for live evidence. Proof belongs in tests
+that run in CI or a throwaway environment at build time, not in a live
+observation after the fact. A step only a person can take still keeps a
+ticket open.
 
-- that Live box is the ticket's only unticked box;
+The station closes a `loom:shipped` ticket with its live boxes unproven when
+all of these hold:
+
+- every unticked box is a live or a code box (`bus/criteria_gate.py`, `kind`),
+  any number of them and at least one live; an unticked operator or decision
+  box keeps the ticket open;
 - it has no regression, urgent, runaway, `needs-brain` or `loom:audit-failed`
-  label, no open ask, no `wait:` label, and never closed this way before;
+  label, no open ask, no `wait:` label other than `wait:live-event` (the wait
+  this ruling ends), and never closed this way before;
 - every linked pull request is merged, green on its merge commit (a neutral
   review check counts, and at least one check succeeded), and on the default
   branch;
 - every pull request's tier is below deploy-config;
 - each symbol a pull request added is still defined on the default branch,
   and each one it removed is still gone, read from the file itself;
-- Loom has no check of its own for the box (a station proof, a runnable check
-  or a time window), and the box is known to be meetable
-  (`bus/unmeetable.py`).
+- Loom has no check of its own for any unticked live box (a station proof, a
+  runnable check or a time window): a box with one keeps that path first, and
+  its ticket with it;
+- the ticket's Live line, when it has one, is known to be meetable
+  (`bus/unmeetable.py` reads that one line; a live box beside it is not
+  looked up).
 
 A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
 refused ticket goes to the usual done close and is read again after 6 hours.
@@ -2499,13 +2536,15 @@ Checks still running leave the ticket for a later pass with no ask.
 
 The close carries `closed-unproven` and `force-close`, and is the one close
 that passes through shadow. The station names the ticket in code, so no label
-or `gh` call can ask for it. Merges stay held. The box is first written into
-the repo's one rolling Proof due issue, edited in place, so nothing closes
-unlisted. The close makes no AI call.
+or `gh` call can ask for it. Merges stay held. Every unticked live box is
+first written into the repo's one rolling Proof due issue, edited in place, so
+nothing closes unlisted. An unticked code box is not listed: the merged change
+is its evidence. The close makes no AI call.
 
-At most 3 closes and 6 tickets read a pass, and 10 closes a day. Each pass
-that reads one logs its counts and these bounds in one `evidence close:` line.
-Clearing a stock in bulk is not this close's job.
+At most 10 closes and 20 tickets read a pass, and 150 closes a day (3, 6 and
+10 before the 2026-11-19 ruling). Each pass that reads one logs its counts and
+these bounds in one `evidence close:` line. The Proof due issue shows the
+newest 150 boxes and counts the older ones.
 
 Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
 reopened tickets, and a reopen stays counted after the ticket closes again.
@@ -2772,6 +2811,14 @@ still shows until the item itself reads as finished or closed. Within a repo, th
 reads per pull request, per stuck ticket and per epic run side by side, so
 one repo's status takes about a third of the time it did when they ran one
 after another.
+
+A ticket filed from here on names the test that proves it in an acceptance
+box, and carries a Live box only when the box names a read-only check Loom
+can run by itself (docs/BRIEF_FORMAT.md lists the forms). The `brief`
+command, the rewrite and a restated Live line are all held to this, so the
+"Verify due" list below stops filling with boxes nobody can prove. The
+restate prompt asks the rewrite command for such a check, never for a quoted
+string alone.
 
 `resume` also ends with a "Verify due" section: up to 5 open `loom:shipped`
 tickets across the repos, oldest ship first, each with how long ago it

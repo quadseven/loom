@@ -17,13 +17,18 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import brain, brain_hold, rewrite, station, status  # noqa: E402
+from bus import brain, brain_hold, health, rewrite, station, status  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 
 REPO = "example-owner/example-repo"
 GOAL = 30
 # The goal's intake epic, where rewrites file their tickets (decision 0003).
 INTAKE = 31
+# The Loom App's bot login and a trusted briefer, and the marker
+# bus/health.py writes into a ticket.
+LOOM_APP = "loom-app[bot]"
+BRIEFER = "dana-example"
+HEALTH_MARKER = health.MARKER % ("ab" * 20)
 BODY = ("## Why\nThe page is slow for every visitor.\n\n## What\nCache the query.\n\n"
         "## Acceptance criteria\n- [ ] The page loads in under a second.\n"
         "- [ ] A test fails without the cache.\n- [ ] The query runs once a minute.\n\n"
@@ -158,6 +163,21 @@ class TwoIntakeGitHub(FakeGitHub):
         return super()._issue_request(method, path, rest, data)
 
 
+class InPlaceGitHub(FakeGitHub):
+    """Also takes the edit that makes a trusted author's issue the ticket."""
+
+    def __init__(self):
+        super().__init__()
+        self.edited = {}
+
+    def _issue_request(self, method, path, rest, data):
+        m = re.fullmatch(r"issues/(\d+)", rest)
+        if m and method == "PATCH":
+            self.edited[int(m.group(1))] = data
+            return reply(200, self.triage[int(m.group(1))])
+        return super()._issue_request(method, path, rest, data)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -288,6 +308,11 @@ class RewriteIssueTest(Base):
         self.fake.triage[7]["labels"] = [{"name": "loom:triage"}, {"name": "needs-brain"}]
         self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
 
+    def test_a_triage_issue_waiting_on_a_person_is_not_rewritten(self):
+        self.fake.add_triage(7)
+        self.fake.triage[7]["labels"].append({"name": "needs:release-owner"})
+        self.assertEqual(rewrite.candidates(self.gh(), REPO), [])
+
     def test_a_handed_off_triage_issue_is_not_a_candidate(self):
         # loom#1884: the factory's hold pass puts a triage issue whose hold
         # returned after its retry into the hand-off pool (handoff:claude,
@@ -376,6 +401,36 @@ class RewriteIssueTest(Base):
         prompt = rewrite.build_prompt({"title": "t", "body": "b", "labels": []}, [], "FORMAT")
         self.assertIn("Never use human for work a coding agent or the factory can do", prompt)
         self.assertIn('"kind": "money|hardware|account|credential|physical|decision"', prompt)
+
+    def test_the_prompt_asks_for_a_test_as_proof_and_a_live_box_only_with_a_runnable_check(self):
+        # Owner ruling of 2026-11-19 (#3277): proof is a test that runs in CI
+        # or a throwaway environment, and a Live box is written only when
+        # Loom can run its check by itself.
+        prompt = rewrite.build_prompt({"title": "t", "body": "b", "labels": []}, [], "FORMAT")
+        self.assertIn("names the test that proves the ticket: a test file path, or a command "
+                      "that runs in CI or a throwaway environment", prompt)
+        self.assertIn("Write a Live checkbox only when it names a read-only check Loom can run "
+                      "by itself", prompt)
+        for form in ("`https://` URL", "`gh api <path>`", "`kubectl get", "`log:<source>`", "time window"):
+            self.assertIn(form, prompt)
+        self.assertIn("write no Live checkbox", prompt)
+        self.assertNotIn("A Live criterion, if you write one", prompt)
+
+    def test_a_rewrite_whose_live_line_names_no_runnable_check_is_refused_with_the_forms(self):
+        quoted = BODY.replace("- [ ] ", "- [ ] Live: the station log shows `deployed`\n- [ ] ", 1)
+        with self.assertRaises(rewrite.Invalid) as caught:
+            self.rewrite(dict(BRIEF, body=quoted))
+        for form in ("https://", "gh api", "log:<source>"):
+            self.assertIn(form, str(caught.exception))
+        self.assertEqual(self.fake.writes_to(7), [])
+
+    def test_a_rewrite_whose_live_line_names_a_runnable_check_is_accepted(self):
+        for live in ("Live: https://example.invalid/health answers `ok`",
+                     "Live: `gh api repos/example/thing/issues/3` shows `closed`",
+                     "Live: `log:station` shows `claimed 3`"):
+            with self.subTest(live=live):
+                body = BODY.replace("- [ ] ", "- [ ] %s\n- [ ] " % live, 1)
+                rewrite.validate(dict(BRIEF, body=body))
 
     def test_a_skip_answer_writes_nothing(self):
         self.assertEqual(self.rewrite({"action": "skip", "reason": "unclear"}), "skip")
@@ -506,6 +561,75 @@ class StationRewriteTest(Base):
         (ticket,) = self.fake.created
         self.assertIn("Rewritten from issue 8.", ticket["body"])
         self.assertIn("loom:factory", ticket["labels"])
+
+    def marked(self, number, login, labels=(), body="It is slow."):
+        """A loom:triage issue by `login` whose body ends with a health marker."""
+        self.fake.add_triage(number)
+        issue = self.fake.triage[number]
+        issue.update(id=9000 + number, user={"login": login},
+                     body=body + "\n\n" + HEALTH_MARKER)
+        issue["labels"] += [{"name": name} for name in labels]
+
+    def test_a_strangers_health_marker_runs_no_agent_at_the_goal_cap(self):
+        # Anyone can paste the marker into an issue on a public repo, and the
+        # rewrite model may copy it into its brief.
+        self.marked(8, "someone")
+        self.fake.goal_tickets = [self.ticket(50)]
+        copied = dict(BRIEF, body=BODY + "\n" + HEALTH_MARKER)
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            self.run_station(self.station(cmd=self.agent(copied)))
+        self.assertFalse(os.path.exists(self.prompt_file))
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(self.fake.writes_to(8), [])
+
+    def test_a_trusted_logins_copy_of_a_marker_runs_no_agent_at_the_goal_cap(self):
+        # A stranger's marked issue, rewritten by a login this Loom trusts:
+        # the author is trusted and the marker is there, and that is still
+        # no proof that health intake filed it.
+        self.marked(8, "a", body="It is slow.\n\nRewritten from issue 6.")
+        self.marked(9, BRIEFER, body="It is slow.\n\nRewritten from issue 6.")
+        self.marked(10, LOOM_APP)
+        self.fake.goal_tickets = [self.ticket(50)]
+        st = self.station(cmd=self.agent(dict(BRIEF, body=BODY + "\n" + HEALTH_MARKER)))
+        st.s.authors.append(LOOM_APP)
+        st.s.briefers = [BRIEFER]
+        env = {"LOOM_GOAL_CAP": "1", "LOOM_BRIEF_AUTHORS": "a " + LOOM_APP,
+               "LOOM_TRUSTED_BRIEFERS": BRIEFER}
+        with mock.patch.dict(os.environ, env):
+            self.run_station(st)
+        self.assertFalse(os.path.exists(self.prompt_file))
+        self.assertEqual(self.fake.created, [])
+        for number in (8, 9, 10):
+            self.assertEqual(self.fake.writes_to(number), [], number)
+
+    def test_a_health_intake_ticket_is_rewritten_at_the_goal_cap(self):
+        # Health intake's label is the proof, as loom:factory is for a repair.
+        self.fake = InPlaceGitHub()
+        self.fake.add_triage(7)
+        self.marked(8, LOOM_APP, ["loom:health"])
+        self.fake.goal_tickets = [self.ticket(50)]
+        st = self.station(cmd=self.agent(BRIEF))
+        # The station trusts its own App login on every pass (_trust_app_login).
+        st.s.authors.append(LOOM_APP)
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1", "LOOM_BRIEF_AUTHORS": LOOM_APP}):
+            self.run_station(st)
+        self.assertEqual(self.fake.created, [])
+        self.assertEqual(list(self.fake.edited), [8])
+        self.assertIn((8, ["loom:ticket", "loom:queued"]), self.fake.labels)
+        self.assertEqual(self.fake.writes_to(7), [])
+
+    def test_a_held_ticket_with_only_a_marker_leaves_the_reserve_to_repairs(self):
+        self.fake.add_triage(8)
+        self.fake.triage[8]["labels"].append({"name": "loom:factory"})
+        held = [dict(self.ticket(n, "queued"), body=HEALTH_MARKER, user={"login": login})
+                for n, login in ((51, "someone"), (52, LOOM_APP))]
+        for ticket in held:
+            ticket["labels"].append({"name": "wait:lane"})
+        self.fake.goal_tickets = [self.ticket(50), *held]
+        with mock.patch.dict(os.environ, {"LOOM_GOAL_CAP": "1"}):
+            self.run_station(self.station(cmd=self.agent(BRIEF)))
+        (ticket,) = self.fake.created
+        self.assertIn("Rewritten from issue 8.", ticket["body"])
 
     def test_a_recorded_no_lane_wait_opens_a_slot_for_rewrites(self):
         self.fake.add_triage(7)

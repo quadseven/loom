@@ -1559,6 +1559,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
 
 VERIFY_DUE_HEADING = "### Verify due"
 VERIFY_RESUME_MAX = 5
+VERIFY_DUTY_AFTER = timedelta(hours=23)
 SENSITIVE_RESUME_MAX = 5
 _LIVE_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]*)?(?:\[[ xX]\][ \t]*)?(Live\b.*?)[ \t]*$", re.M)
 
@@ -2140,19 +2141,44 @@ def _check_brief_args(title: str, body: str, lane: Optional[str],
 
 
 def _check_live_criterion(body: str) -> None:
-    """A Live criterion names at least one exact string the station can look
-    for: a log line, field or endpoint in backticks or double quotes. Without
-    one, no verify brief carries log data and the ticket can only stay
-    shipped (2026-10-18: 3 of 72 merged tickets verified, most refused for
-    missing evidence on criteria written as prose)."""
+    """A Live criterion names a check Loom can run by itself, or the brief
+    writes no Live box at all.
+
+    Owner ruling of 2026-11-19 (#3277): proof belongs in a test that runs in
+    CI or a throwaway environment at build time, not in a live observation
+    after the fact. Until then a Live line passed when it quoted one string,
+    and the box then waited for an observation nobody could collect: 16 of
+    the 21 shipped tickets read that day carried one, and none of their 18
+    boxes named a check Loom could run. The accepted forms are the ones
+    bus/live_proof.py runnable_form reads. The one templated box of a health
+    or friction intake ticket passes as written: the station's own absence
+    tracking proves it."""
     found = _LIVE_LINE.search(body or "")
     if not found:
         return
-    from .evidence import needles
-    if not needles(found.group(1)):
-        raise ValueError("the Live criterion names no exact string the station can look "
-                         "for: put the log line, field or endpoint it means in backticks, "
-                         "for example `overseer: summoned` or `/api/v2/health`")
+    from . import friction_intake, health, live_proof
+    line = " ".join(found.group(1).split())
+    templated = {" ".join(box.split("Live:", 1)[1].split())
+                 for box in (health.LIVE_BOX, friction_intake.LIVE_BOX)}
+    if " ".join(line.split(":", 1)[-1].split()) in templated:
+        return
+    if not live_proof.runnable_form(line):
+        raise ValueError(
+            "the Live criterion names no check Loom can run by itself. Write a Live box only "
+            "with one of: %s. Otherwise leave the Live box out and write a box that names the "
+            "test that proves the ticket: a test file path, or a command that runs in CI or a "
+            "throwaway environment" % "; ".join(live_proof.RUNNABLE_FORMS))
+
+
+def _check_test_named(body: str) -> None:
+    """A new build ticket names the test that proves it in an acceptance box
+    (bus/brief_check.py test_verdict, owner ruling of 2026-11-19, #3277).
+    Checked where a ticket is filed, the brief command and the rewrite, so
+    a body that names none goes back to its writer and no ticket already on
+    the board is read by this rule."""
+    found = brief_check.test_verdict(body)
+    if found is not None:
+        raise ValueError(found.reason)
 
 
 def plan_problems(body: str) -> List[str]:
@@ -3630,10 +3656,22 @@ def _goal_in_flight(gh: GitHub, repo: str, goal: int,
     return sum(_holds_goal_slot(i, repo, waiting) for i in goal_flying(gh, repo, goal, issue))
 
 
+# brief puts it on each ticket health intake files (`health`). Only a
+# collaborator sets a label, so it says a ticket is a health finding where the
+# marker in a body cannot: anyone can paste that marker into an issue, and a
+# rewrite can copy it (loom#3275).
+HEALTH_LABEL = "loom:health"
+# The labels that admit a ticket to the reserve above the goal cap: a factory
+# repair, and a finding health intake filed.
+RESERVE_LABELS = ("loom:factory", HEALTH_LABEL)
+
+
 def goal_cap_repair(issue: Dict[str, Any]) -> bool:
-    """Whether a factory repair or a health intake ticket can use the reserve."""
-    return ("loom:factory" in _labels(issue)
-            or bool(brief_check.HEALTH_MARKER_RE.search(str(issue.get("body") or ""))))
+    """Whether a factory repair or a health intake ticket can use the reserve:
+    it carries one of RESERVE_LABELS. The health marker in a body proves
+    nothing, whoever wrote the issue: anyone can paste it into an issue on a
+    public repo, and a rewrite by a trusted login can copy it (loom#3275)."""
+    return any(name in RESERVE_LABELS for name in _labels(issue))
 
 
 def goal_capacity_counts(children: List[Dict[str, Any]], repo: str,
@@ -4114,7 +4152,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
           resolves: Optional[str] = None, intake_of: Optional[int] = None,
-          repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
+          repairs_incident: Optional[int] = None, foundational: bool = False,
+          health: bool = False) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -4153,7 +4192,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     from handoff.done_marker, so resume stops listing the finished brief.
 
     When the goal home names a Trunk branch and no explicit --base is given,
-    the ticket uses that branch as its base."""
+    the ticket uses that branch as its base.
+
+    With health, the brief is a finding health intake files (bus/health.py):
+    its ticket carries the loom:health label, which admits it to the reserve
+    above the goal cap (goal_cap_repair). Only health intake passes it."""
     if repairs_incident is not None and (type(repairs_incident) is not int or repairs_incident < 1):
         raise ValueError("repairs-incident must be a positive issue number")
     if model:
@@ -4170,8 +4213,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if refs is not None and regresses is not None:
         raise ValueError("a brief is a rewrite or a regression, not both")
     source, elsewhere = _rewrite_source(gh, repo, refs, env)
-    if elsewhere is not None:
-        body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    if source is not None:
+        body = _rewrite_text(body, int(source["number"]), elsewhere)
     refusal = acceptance_refusal(body, source)
     if refusal:
         raise ValueError(refusal)
@@ -4200,23 +4243,45 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue, epic)
     children = _goal_children(gh, repo, goal, goal_issue)
-    reserve = goal_cap_repair({**(source or {}), "body": full_body})
-    _check_goal_capacity(children, repo, reserve, env)
+    reserve = _reserve_labels(source, health)
+    _check_goal_capacity(children, repo, bool(reserve), env)
     repair = priority == "P0" or (epic is not None and (repo, epic) in repair_epics(env))
     _check_goal_unproven(children, goal, repo if repair else None, env)
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
-        epic = _brief_intake_epic(gh, repo, goal, reserve)
+        epic = _brief_intake_epic(gh, repo, goal, bool(reserve))
     if source is not None:
         # A rewrite's draft may carry its own Part of line naming another
         # issue (loom#2033); the ticket names the epic it is filed under.
         full_body = _without_other_part_of(full_body, epic)
     issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
-                         source, elsewhere, goal)
+                         source, elsewhere, goal, reserve)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _rewrite_text(body: str, refs: int, elsewhere: Optional[str]) -> str:
+    """The brief text of a rewrite, as it is filed. A health marker in it is
+    dropped: the text is a model's or a briefer's copy of the source's words,
+    and only health intake writes that marker (loom#3275). A rewrite filed as
+    a new ticket ends with the line naming its source."""
+    body = brief_check.HEALTH_MARKER_RE.sub("", body)
+    if elsewhere is not None:
+        body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    return body
+
+
+def _reserve_labels(source: Optional[Dict[str, Any]], health: bool) -> List[str]:
+    """The RESERVE_LABELS a brief's ticket carries; any admits the brief to
+    the reserve above the goal cap (goal_cap_repair). A rewrite has the ones
+    the issue it rewrites carries: that issue's text and the brief's grant
+    nothing. A brief that rewrites nothing has loom:health when health intake
+    files it (`health`), and none otherwise."""
+    if source is None:
+        return [HEALTH_LABEL] if health else []
+    return [name for name in RESERVE_LABELS if name in _labels(source)]
 
 
 def _brief_intake_epic(gh: GitHub, repo: str, goal: int, repair: bool) -> int:
@@ -4293,22 +4358,23 @@ def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],
 
 def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
                  lane: Optional[str], source: Optional[Dict[str, Any]],
-                 elsewhere: Optional[str], goal: Optional[int] = None) -> Dict[str, Any]:
+                 elsewhere: Optional[str], goal: Optional[int] = None,
+                 reserve: Sequence[str] = ()) -> Dict[str, Any]:
     """The ticket a brief makes: the rewritten source itself when it can be
-    (_rewrite_in_place), else a new issue (_filed_rewrite)."""
+    (_rewrite_in_place), else a new issue (_filed_rewrite) that carries the
+    `reserve` labels (_reserve_labels)."""
     if source is not None and elsewhere is None:
         return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
-    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere)
+    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere, reserve)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
                    lane: Optional[str], source: Optional[Dict[str, Any]],
-                   elsewhere: Optional[str]) -> Dict[str, Any]:
+                   elsewhere: Optional[str], reserve: Sequence[str] = ()) -> Dict[str, Any]:
     """File the brief as a new ticket. Its source, if any, gets the rewrite
     comment and loom:rewritten in place of its ticket and state labels."""
     source_labels = _labels(source) if source is not None else []
-    extra = ["loom:factory"] if "loom:factory" in source_labels else []
-    issue = _file_ticket(gh, repo, epic, title, body, lane, extra)
+    issue = _file_ticket(gh, repo, epic, title, body, lane, reserve)
     if source is not None:
         refs = int(source["number"])
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),
@@ -5386,10 +5452,7 @@ def merge(gh: GitHub, repo: str, number: int,
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
-        # _luna_stands_in reads more only on a FAILURE rollup, the one shape
-        # a degraded review check leaves; every other refusal reads no more.
-        luna = _luna_stands_in(gh, repo, number, details, env, _pr_author(pr))
-        _validate_merge_pr(repo, pr, details, env, luna=luna)
+        _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
@@ -5418,7 +5481,7 @@ def merge(gh: GitHub, repo: str, number: int,
             raise ValueError(reason)
         _refuse_merge_constraints(gh, repo, number, association, issue)
         tier = _refuse_risk_tier(gh, repo, number, pr, details, association, issue, env, verdict,
-                                 held, lint_run, luna=luna)
+                                 held, lint_run)
     sha = details.get("headRefOid") or (pr.get("head") or {}).get("sha")
     if not sha:
         raise ValueError("pull request has no head SHA")
@@ -5759,8 +5822,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
                       issue: Dict[str, Any], env: Optional[Dict[str, str]],
                       verdict: Optional[Callable[[], Optional[answer.Answer]]] = None,
                       held: Container[str] = (),
-                      lint_run: Optional[Callable[..., Optional[bool]]] = None,
-                      luna: bool = False) -> str:
+                      lint_run: Optional[Callable[..., Optional[bool]]] = None) -> str:
     """Refuse a lane pull request Loom may not merge on its own
     (bus/merge_tier.py): a tier outside LOOM_AUTO_MERGE_TIERS (deploy-config,
     security and cross-repo by default) goes to the operator with one ask on
@@ -5790,10 +5852,7 @@ def _refuse_risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
         raise ValueError("held for the operator: %s%s" % (reason, asked))
     sha = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
     check = review_check_name(env)
-    # A clean Luna verdict for this head stands in for the review check's
-    # success here too (_luna_stands_in, loom#2575); the blocking-findings
-    # and cap rules below still apply as they are.
-    if not sha or (not luna and not _review_check_passed(gh, repo, sha, check)):
+    if not sha or not _review_check_passed(gh, repo, sha, check):
         raise ValueError("a %s change merges on its own only when the review check %s "
                          "succeeded on its head commit" % (tier, check))
     from . import factory
@@ -5977,117 +6036,6 @@ def _checks_green(details: Dict[str, Any]) -> bool:
     return _rollup_state(details) == "SUCCESS"
 
 
-def _head_check_runs(gh: GitHub, repo: str, sha: str) -> Optional[List[Dict[str, Any]]]:
-    """Every check run on this head, all pages, or None when the read is
-    unreadable or too long to prove complete: a Luna verdict may stand in
-    only on a complete read (loom#2575)."""
-    runs: List[Dict[str, Any]] = []
-    try:
-        for page in range(1, 11):
-            data = gh.rest("GET", "/repos/%s/commits/%s/check-runs?filter=all&per_page=100&page=%d"
-                           % (repo, sha, page)).data or {}
-            batch = data.get("check_runs") if isinstance(data, dict) else None
-            if not isinstance(batch, list):
-                return None
-            runs += [run for run in batch if isinstance(run, dict)]
-            if len(batch) < 100:
-                return runs
-    except GitHubError:
-        return None
-    return None
-
-
-def _luna_degraded_only(runs: Sequence[Dict[str, Any]], check: str) -> bool:
-    """Whether the only non-green newest run on a head is the review check,
-    completed with failure, and its output is a degraded review rather than
-    a verdict: the factory's own test (factory._review_degraded), read from
-    the head's check runs instead of the factory's cache."""
-    from . import factory  # factory imports this module
-    failed = []
-    for run in newest_check_runs(runs):
-        if run.get("status") != "completed":
-            return False
-        if run.get("conclusion") not in factory.GREEN:
-            failed.append(run)
-    if len(failed) != 1 or failed[0].get("name") != check:
-        return False
-    output = failed[0].get("output")
-    if not isinstance(output, dict):
-        return False
-    return factory.degraded_review(str(output.get("title") or ""),
-                                   str(output.get("summary") or ""))
-
-
-def _clean_luna_verdict(gh: GitHub, repo: str, number: int, sha: str,
-                        env: Optional[Dict[str, str]], author: str = "") -> bool:
-    """Whether the newest Luna verdict the station posted for this exact head
-    on this pull request is clean (factory.parse_luna_verdict). The verdict
-    is the station's word, posted by its review reporter after the Luna
-    slot's run with the same client that calls this merge, so only a
-    verdict by writer_login(gh, env) counts; any other trusted login's
-    marker is not that verdict. A client with no known login reads no
-    verdict at all. A verdict the pull request's own author posted never
-    counts, and a newer verdict for the head replaces an older one, clean
-    or blocking."""
-    from . import factory  # factory imports this module
-    station = writer_login(gh, env).lower()
-    if not station:
-        return False  # no known writer: no verdict can be the station's
-    try:
-        comments = gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-    except GitHubError:
-        return False  # an unreadable verdict proves nothing: the gate stands
-    newest: Optional[Tuple[int, int]] = None
-    for comment in trusted_comments(comments, trusted_authors(env)):
-        login = comment_login(comment).lower()
-        if login != station or (author and login == author.lower()):
-            continue  # only the station's verdict counts, never the author's
-        verdict = factory.parse_luna_verdict(comment.get("body"), sha)
-        if verdict is not None:
-            newest = verdict
-    return newest is not None and newest[0] == 0
-
-
-def _head_status_clear(gh: GitHub, repo: str, sha: str) -> bool:
-    """Whether this head's combined commit status is clear: its state is
-    success, or it carries no statuses at all. A FAILURE rollup can come
-    from a failing commit status beside the check runs, and a Luna verdict
-    stands in for the review check only, never for a red status. An
-    unreadable read is not clear."""
-    try:
-        data = gh.rest("GET", "/repos/%s/commits/%s/status" % (repo, sha)).data
-    except GitHubError:
-        return False
-    if not isinstance(data, dict):
-        return False
-    return data.get("state") == "success" or data.get("total_count") == 0
-
-
-def _luna_stands_in(gh: GitHub, repo: str, number: int, details: Dict[str, Any],
-                    env: Optional[Dict[str, str]] = None, author: str = "") -> bool:
-    """Whether a clean Luna verdict stands in for this head's review check
-    in the merge gate (loom#2575, the factory's loom#2142 fallback): the
-    rollup is FAILURE, the review check is the head's only non-green run and
-    failed degraded, the head's combined commit status is clear, and the
-    newest trusted Luna verdict for this head, not the pull request author's
-    own, is clean. The
-    factory already clears its fault on that verdict and calls merge; without
-    this the real merge refused the head on every pass, because the degraded
-    check keeps the rollup FAILURE. Any doubt (an unreadable run, another
-    failing or running
-    check, a non-degraded failure, a blocking, untrusted or other-head
-    verdict) leaves the gate as it was."""
-    sha = str(details.get("headRefOid") or "")
-    if not sha or _rollup_state(details) != "FAILURE":
-        return False
-    runs = _head_check_runs(gh, repo, sha)
-    if runs is None or not _luna_degraded_only(runs, review_check_name(env)):
-        return False
-    if not _head_status_clear(gh, repo, sha):
-        return False
-    return _clean_luna_verdict(gh, repo, number, sha, env, author)
-
-
 def _threads_resolved(details: Dict[str, Any]) -> bool:
     review_threads = details.get("reviewThreads") or {}
     threads = review_threads.get("nodes") or []
@@ -6136,7 +6084,7 @@ def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
 
 
 def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
-                       env: Optional[Dict[str, str]] = None, luna: bool = False) -> None:
+                       env: Optional[Dict[str, str]] = None) -> None:
     head_ref = str((pr.get("head") or {}).get("ref") or details.get("headRefName") or "")
     trusted_lane_head = (
         _ticket_association(repo, pr) is not None
@@ -6149,9 +6097,7 @@ def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
         (_mergeable(pr),
          "pull request is not mergeable (GitHub may still be computing it)"),
-        # A clean Luna verdict stands in for the degraded review check that
-        # keeps the rollup red (_luna_stands_in, loom#2575).
-        (_checks_green(details) or luna, "pull request checks are not successful"),
+        (_checks_green(details), "pull request checks are not successful"),
         (_threads_resolved(details), "pull request has unresolved review threads"),
     ]
     decision = merge_verdict.decide(pr, None,
@@ -7964,18 +7910,34 @@ def _verify_due_in(gh: GitHub, repo: str, now: datetime
 def _verify_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
                          due: Optional[List[Tuple[datetime, str, Dict[str, Any]]]] = None
                          ) -> List[str]:
-    """Up to VERIFY_RESUME_MAX shipped tickets across `repos` (or the `due`
-    already read for them), oldest ship first: after stage work, before new
-    briefs."""
+    """Hand unclaimed live gaps to the acting brain before a day passes,
+    then fill the ordinary verify slots oldest ship first."""
     if due is None:
         due = [item for repo in repos for item in _verify_due_in(gh, repo, now)]
     due = list(due)
     due.sort(key=lambda x: (x[0], x[1], int(x[2]["number"])))
-    out = ["", "## Verify due (up to %d, oldest ship first)" % VERIFY_RESUME_MAX]
-    for shipped, repo, issue in due[:VERIFY_RESUME_MAX]:
+    urgent, ordinary = [], []
+    for shipped, repo, issue in due:
+        labels = _labels(issue)
+        if issue.get("assignees") or any(n.lower().startswith(stale_claims.CLAIM_PREFIX) for n in labels):
+            continue
+        criteria = str(issue.get("body") or "")
+        live = [text for kind, text in criteria_gate.needing_evidence(criteria)
+                if kind == criteria_gate.LIVE]
+        if (live and now - shipped >= VERIFY_DUTY_AFTER
+                and not criteria_gate.open_operator_criteria(criteria)):
+            urgent.append((shipped, repo, issue, " ".join(live)))
+        else:
+            ordinary.append((shipped, repo, issue, live_criterion(criteria)))
+    out = ["", "## Verify due"]
+    if urgent:
+        out.append("The brain holding the lock owns the live evidence hand-out. "
+                   "Read logs, the running system, or code and record what you observed "
+                   "or what evidence is missing on each ticket.")
+    for shipped, repo, issue, criterion in urgent + ordinary[:VERIFY_RESUME_MAX]:
         out.append("- resume verify %s#%s shipped %s ago: %s" % (
-            repo, issue["number"], _since(shipped, now), live_criterion(issue.get("body"))))
-    return out if due else out + ["- none"]
+            repo, issue["number"], _since(shipped, now), _one_line(criterion, 240)))
+    return out if urgent or ordinary else out + ["- none"]
 
 
 def _audit_resume_lines(gh: GitHub, repos: Sequence[str], now: datetime,
@@ -8733,7 +8695,10 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
         globals()["scorecard"] = scorecard
     # A lane the scorecard has demoted takes no build ticket, the same set
     # the factory reads (bus/scorecard.py): leave it out even where lane
-    # status still prints it as available.
+    # status still prints it as available. The scorecard keys a demotion
+    # by base lane, so expand it to every slot of that lane the way the
+    # factory does (scorecard.demoted_slots): a demoted base lane leaves
+    # out its numbered slots too.
     demoted = {row["lane"] for row in scorecard.parse_rows(body)
                if row.get("demoted")}
     # The station also keeps the demoted set in its scorecard file; read it
@@ -8750,7 +8715,8 @@ def _available_lanes(gh: GitHub, lanes_repo: str,
                     demoted |= set(card.demoted())
             except (OSError, ValueError):
                 pass
-    return [lane for lane in rows if lane not in demoted]
+    blocked = scorecard.demoted_slots({lane: "" for lane in demoted}, rows)
+    return [lane for lane in rows if lane not in blocked]
 
 
 def _open_pr(gh: GitHub, repo: str, number: int,
@@ -9114,6 +9080,7 @@ def _cmd_brief(gh: GitHub, args: argparse.Namespace) -> None:
     # Hand-written briefs only: health and friction intake are verified by
     # the station's own absence tracking, not by a log string.
     _check_live_criterion(body)
+    _check_test_named(body)
     print(brief(gh, _repo(args.repo), args.epic, args.title, body,
                 args.lane, args.difficulty, args.model, args.base, args.not_before, args.refs,
                 args.regresses, args.after, args.priority, args.holder,

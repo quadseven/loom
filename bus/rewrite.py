@@ -139,8 +139,14 @@ def build_prompt(issue: Dict[str, Any], comments: List[Dict[str, Any]], fmt: str
         "sentence. Acceptance criteria has at least three checkboxes. Size is one of XS, "
         "S, M or L. Out of scope names at least one thing. Do not write header lines "
         "such as Priority, Difficulty, After or Not before; the station adds those.",
-        "A Live criterion, if you write one, names the exact log line, field or endpoint "
-        "its proof will show, in backticks.",
+        "At least one acceptance checkbox names the test that proves the ticket: a test file "
+        "path, or a command that runs in CI or a throwaway environment at build time. Proof "
+        "is that test, not an observation of the live system after the fact.",
+        "Write a Live checkbox only when it names a read-only check Loom can run by itself: "
+        "an `https://` URL, a `gh api <path>` read, a read-only `kubectl get ...` or `kubectl "
+        "rollout status ...`, a `log:<source>` step for the repo's adapter, or a quoted log "
+        "string with a time window (\"within 24 hours\"). When no such check exists, write no "
+        "Live checkbox.",
         "Use human only when the work needs money, hardware, an account, a credential, "
         "someone physically present or an operator decision nobody has made, and name that "
         "reason as kind. A credential is a secret only the owner holds, not repository or "
@@ -382,6 +388,7 @@ def validate(answer: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
             raise Invalid("body lacks: %s" % ", ".join(missing))
         brain._check_written_text(title + "\n" + body)
         brain._check_live_criterion(body)
+        brain._check_test_named(body)
     except ValueError as err:
         raise Invalid(str(err)) from None
     return "brief", {"title": title, "difficulty": difficulty, "body": body}
@@ -401,6 +408,7 @@ def candidates(gh: GitHub, repo: str) -> List[Dict[str, Any]]:
                         "&sort=created&direction=asc&per_page=100" % repo)
     pool = [i for i in found if isinstance(i, dict) and "pull_request" not in i
             and not brain.owned_elsewhere(i) and NEEDS_BRAIN not in _names(i)
+            and not labels.waiting_on_person(_names(i))
             and labels.HANDOFF not in _names(i)
             and not brain.not_work_reason(i)]
     if not pool:
@@ -449,8 +457,8 @@ def apply_answer(gh: GitHub, repo: str, goal: int, number: int, output: str,
         gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": [NEEDS_BRAIN]})
         # The ask goes on the issue too, as a routine event on its one status
         # comment (an edit, no email), timed beside the label event: it was
-        # only printed here, so brain_hold.reason found no note and the
-        # factory's retry and hand-off notes quoted no cause (loom#2936).
+        # only printed here. The factory reads this event if it sends the
+        # unanswered hold to the operator.
         status.add(gh, repo, number,
                    brain_hold.ask_note(fields["kind"], fields["ask"].split("\n", 1)[1]),
                    time.time() if now is None else now, brain.trusted_authors())

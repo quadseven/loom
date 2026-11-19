@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
 
 from bus import brain as bus_brain
 from bus import bench as bench_lib
+from bus import labels as bus_labels
 from bus import tickets as bus_tickets
 from bus import metrics as bus_metrics
 from bus import scorecard
@@ -273,6 +274,13 @@ def _floor(state):
     else:
         standup = '<p class="standup-line">No standup yet.</p><p class="standup-meta machine-fact">not looked: %s</p>' % esc(
             str(context.get("report_reason") or "no goal report found"))
+    open_issues = getattr(state, "open_issues", {}) or {}
+    if open_issues and all(issues is not None for issues in open_issues.values()):
+        label_sets = [bus_brain._labels(issue) for issues in open_issues.values() for issue in issues]
+        triage = [names for names in label_sets if bus_labels.in_triage(names)]
+        waiting = sum(bus_labels.waiting_on_person(names) for names in triage)
+        standup += '<p class="standup-meta machine-fact">Triage: %d untriaged, %d waiting on a person</p>' % (
+            len(triage) - waiting, waiting)
     head = '<div class="section-head"><span class="label">Conveyor - count and median wait</span>%s</div>' % (
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
     parts = ['<section class="standup">%s</section>' % standup,

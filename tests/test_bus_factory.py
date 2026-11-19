@@ -323,7 +323,7 @@ class Base(unittest.TestCase):
 
     def go(self, limited=(), no_test_repos=(), available=None, model_limits=None, held=(), silent=None,
            down=(), limit_until=None, scope=None, known_waits=None, demoted=None,
-           no_lane_since=None, review_brief=None, lint_run=None, now=NOW,
+           no_lane_since=None, lint_run=None, now=NOW,
            fix_accept=True, in_inbox=()):
         def merge(gh, repo, number, ticket):
             # As GitHub does: a standing change request blocks the merge.
@@ -372,7 +372,7 @@ class Base(unittest.TestCase):
                             available=available, model_limits=model_limits, held=held,
                             silent=silent, down=down, limit_until=limit_until, scope=scope,
                             known_waits=known_waits, demoted=demoted,
-                            no_lane_since=no_lane_since, review_brief=review_brief,
+                            no_lane_since=no_lane_since,
                             lint_run=lint_run or merge_tier.run_ruff)
         f.in_inbox = set(in_inbox)
         f.run()
@@ -1847,7 +1847,7 @@ class PullRequests(Base):
         self.assertTrue(factory.degraded_review("WARN Elder review coverage partial", ""))
         self.assertFalse(factory.degraded_review("FAIL Elder found 2 problems", "Fix the null check."))
 
-    def test_a_second_partial_review_on_the_same_head_is_sent_back(self):
+    def test_a_second_partial_review_on_the_same_head_is_held(self):
         self.gh.ticket(5, "pr")
         self.gh.pull(50, 5, green=False)
         self.gh.runs["sha50"] = [
@@ -1859,9 +1859,11 @@ class PullRequests(Base):
         improve = [c for c in self.gh.comments[50]
                    if "/grug improve" in str(c.get("body") or "")]
         self.assertEqual(len(improve), 1)
-        # The same head, still partial: back to the usual fix round.
+        # The same head, still partial: no lane can fix a partial review by
+        # editing code, so the pull request waits for the check to rerun.
         self.go()
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
         self.assertEqual(len([c for c in self.gh.comments[50]
                               if "/grug improve" in str(c.get("body") or "")]), 1)
 
@@ -5033,12 +5035,6 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(scope({"LOOM_SCOPE_CHECK_URL": "http://gw.invalid/v1"}))
         self.assertTrue(callable(scope({"LOOM_SCOPE_CHECK_URL": "https://gw.invalid/free-public/gemini/v1"})))
 
-    def test_the_station_wires_the_luna_review_writer_into_the_factory(self):
-        with tempfile.TemporaryDirectory() as home:
-            settings = station.Settings(home, [REPO], ["alice-example"], [], factory_on=True)
-            st = station.Station(FakeGitHub(), settings, now=NOW)
-            self.assertEqual(st._factory().review_brief, st._write_review_brief)
-
 
     def test_the_station_tells_the_factory_which_tickets_it_holds(self):
         with tempfile.TemporaryDirectory() as home:
@@ -5065,7 +5061,7 @@ class Helpers(unittest.TestCase):
                          no_test_repos=(), available=None, briefers=(), held=(),
                          model_limits=None, silent=None, down=(), limit_until=None,
                          benched=(), known_waits=None, plan_check=None, demoted=None,
-                         no_lane_since=None, review_brief=None):
+                         no_lane_since=None):
                 self.silent_running, self.silent, self.waits = {}, silent, {}
                 self.settled = set()
                 calls.append((tuple(repos), tuple(trusted), review_check, tuple(limited),
@@ -5915,12 +5911,12 @@ class BranchHygiene(Base):
         self.assertEqual(self.merged, [])
 
 
-class LunaReview(Base):
-    """The Codex Luna review fallback (loom#2142): when the review check is
-    degraded (its model route is exhausted) and the review bot's re-ask has
-    already failed on the same head, the factory dispatches one review brief
-    to the Luna lane slot instead of a fix round no lane can close, and the
-    gate reads the lane's verdict for that head like the review bot's own."""
+class DegradedReviewHold(Base):
+    """A degraded review check is not a verdict, and review is the review
+    bot's alone (operator decision, 2026-11-16): the factory asks the bot
+    to review the head again once (/grug improve) and then holds the pull
+    request until the check reruns. No lane reviews it, and no comment
+    stands in for the check."""
 
     DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
                 "conclusion": "failure",
@@ -5928,143 +5924,46 @@ class LunaReview(Base):
                            "summary": "Degraded review (all_failed): not a verdict. "
                                       "Comment /grug improve to re-run once the backend recovers."},
                 "details_url": "https://github.com/%s/actions/runs/80/job/1" % REPO}
+    # The comment the removed Codex Luna fallback posted in the check's place.
+    OLD_VERDICT = ("<!-- loom:luna-review v1 sha=sha50 -->\n"
+                   "Elder markings - 0 blocking, 2 total\n\nThe change is sound.")
 
-    def degraded_pr(self):
+    def degraded_pr(self, green=False):
         self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5, green=False)
+        self.gh.pull(50, 5, green=green)
         self.gh.runs["sha50"] = [dict(self.DEGRADED)]
 
-    def writer(self):
-        calls = []
+    def bodies(self):
+        return [str(c.get("body") or "") for c in self.gh.comments.get(50, [])]
 
-        def write(repo, pr_number, sha, issue):
-            calls.append((repo, pr_number, sha, int(issue["number"])))
-            return True
-        return calls, write
+    def test_the_factory_takes_no_review_brief_writer(self):
+        import inspect
+        self.assertNotIn("review_brief", inspect.signature(factory.Factory).parameters)
 
-    def seed(self, body, ago=0, user=None):
+    def test_a_degraded_review_asks_the_review_bot_again_once(self):
+        self.degraded_pr()
+        self.go()
+        self.go()
+        asks = [b for b in self.bodies() if factory.REVIEW_AGAIN_MARKER % "sha50" in b]
+        self.assertEqual(len(asks), 1)
+        self.assertIn(factory.REVIEW_AGAIN, asks[0])
+
+    def test_a_review_still_degraded_after_the_reask_holds_the_pull_request(self):
+        self.degraded_pr()
+        for _ in range(3):
+            self.go()
+        self.assertEqual(self.fixed, [])
+        self.assertEqual(self.merged, [])
+        self.assertEqual(self.gh.filed, [])
+        self.assertFalse(any("luna" in b.lower() for b in self.bodies()))
+
+    def test_an_old_luna_verdict_does_not_stand_in_for_the_check(self):
+        self.degraded_pr(green=True)
         self.gh.comments.setdefault(50, []).append(
-            {"body": body, "user": user or ME, "created_at": iso(ago)})
-
-    def test_parse_luna_verdict_reads_the_markings_line(self):
-        body = (factory.LUNA_REVIEW_MARKER % "sha50" +
-                "\nElder markings - 2 blocking, 5 total\n\nFindings follow.")
-        self.assertEqual(factory.parse_luna_verdict(body, "sha50"), (2, 5))
-        self.assertIsNone(factory.parse_luna_verdict(body, "sha99"))
-        self.assertIsNone(factory.parse_luna_verdict(
-            "Elder markings - 0 blocking, 0 total", "sha50"))
-        self.assertIsNone(factory.parse_luna_verdict(
-            factory.LUNA_REVIEW_MARKER % "sha50" + "\nno markings here", "sha50"))
-
-    def test_a_degraded_review_still_degraded_after_the_reask_dispatches_a_luna_review(self):
-        self.degraded_pr()
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.assertEqual(calls, [])  # the first pass only re-asks the review bot
-        self.go(review_brief=write)
-        self.assertEqual(calls, [(REPO, 50, "sha50", 5)])
-        bodies = [str(c.get("body") or "") for c in self.gh.comments[50]]
-        self.assertTrue(any(factory.LUNA_REQUEST_MARKER % "sha50" in body for body in bodies))
-        self.assertEqual(self.fixed, [])
-        self.assertEqual(self.merged, [])
-
-    def test_without_a_review_writer_a_second_degraded_review_is_sent_back_as_before(self):
-        self.degraded_pr()
+            {"body": self.OLD_VERDICT, "user": ME, "created_at": iso(0)})
         self.go()
         self.go()
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
-
-    def test_a_luna_request_already_in_flight_is_not_dispatched_again(self):
-        self.degraded_pr()
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.go(review_brief=write)
-        self.go(review_brief=write)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(self.fixed, [])
-
-    def test_a_luna_request_older_than_the_retry_window_is_dispatched_again(self):
-        self.degraded_pr()
-        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
-        self.seed(factory.LUNA_REQUEST_MARKER % "sha50", ago=2 * factory.LUNA_RETRY_AFTER)
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.assertEqual(len(calls), 1)
-
-    def test_a_clean_luna_verdict_lets_the_pull_request_land(self):
-        self.gh.ticket(5, "pr")
-        self.gh.pull(50, 5)
-        self.gh.runs["sha50"] = [dict(self.DEGRADED)]
-        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
-                  "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
-        self.go()
-        self.assertEqual(self.merged, [(50, (REPO, 5))])
-        self.assertEqual(self.fixed, [])
-
-    def test_a_blocking_luna_verdict_does_not_excuse_the_check(self):
-        self.degraded_pr()
-        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
-        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
-                  "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.assertEqual(calls, [])  # a verdict exists: nothing new to dispatch
         self.assertEqual(self.merged, [])
-        self.assertEqual([f[:2] for f in self.fixed], [(50, (REPO, 5))])
-
-    def test_an_untrusted_luna_verdict_is_ignored(self):
-        self.degraded_pr()
-        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
-        self.seed(factory.LUNA_REVIEW_MARKER % "sha50" +
-                  "\nElder markings - 0 blocking, 0 total",
-                  user={"login": "mallory-example"})
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.assertEqual(len(calls), 1)  # no trusted verdict: the lane is asked
-        self.assertEqual(self.merged, [])
-
-    def test_a_luna_verdict_for_another_head_is_ignored(self):
-        self.degraded_pr()
-        self.seed(factory.REVIEW_AGAIN_MARKER % "sha50" + "\n/grug improve")
-        self.seed(factory.LUNA_REVIEW_MARKER % "shaOTHER" +
-                  "\nElder markings - 0 blocking, 1 total")
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(self.merged, [])
-
-    def requests(self):
-        return [c for c in self.gh.comments.get(50, [])
-                if factory.LUNA_REQUEST_MARKER % "sha50" in str(c.get("body") or "")]
-
-    def dispatches(self, count):
-        """Run the factory once to re-ask, then `count` passes a retry window
-        apart; returns the writer's calls."""
-        self.degraded_pr()
-        calls, write = self.writer()
-        self.go(review_brief=write)
-        for n in range(count):
-            self.go(review_brief=write, now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
-        return calls
-
-    def test_two_dispatches_for_one_head_leave_one_comment_edited(self):
-        calls = self.dispatches(2)
-        self.assertEqual(len(calls), 2)
-        found = self.requests()
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["body"].count("Dispatch "), 2)
-
-    def test_three_dispatches_without_a_verdict_file_one_factory_ticket_and_stop(self):
-        calls = self.dispatches(3)
-        self.assertEqual(len(calls), 3)
-        later = self.writer()
-        for n in (4, 6):
-            self.go(review_brief=later[1], now=NOW + n * (factory.LUNA_RETRY_AFTER + 1))
-        self.assertEqual(later[0], [])
-        self.assertEqual(len(self.requests()), 1)
-        self.assertEqual(len(self.gh.filed), 1)
-        self.assertIn("loom:factory", self.gh.filed[0]["labels"])
-        self.assertIn("sha50", self.gh.filed[0]["title"])
         self.assertEqual(self.fixed, [])
 
 

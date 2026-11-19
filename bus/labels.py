@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from typing import Dict, Iterable, List
+from typing import Collection, Dict, Iterable, List
 from urllib.parse import quote
 
 from .github import GitHub
@@ -104,6 +104,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:runaway": {"color": "b60205", "description": "Held for brain review after repeated or regressive attempts"},
     "loom:recurring": {"color": "fbca04", "description": "Invariant breached repeatedly; keep open for a fix"},
     "loom:factory": {"color": "b60205", "description": "A factory validation incident"},
+    "loom:health": {"color": "d93f0b", "description": "Filed by health intake for a live finding of the goal's health endpoint"},
     "loom:validation-gap": {"color": "fbca04", "description": "A CI job the repo's .loom/validation.conf does not run"},
     "needs:human": {"color": "b60205", "description": "One exact ask for a person; see the comment. Comes off when the answer is in the ticket"},
     "needs-operator": {"color": "b60205", "description": "Old name of needs:human"},
@@ -153,11 +154,22 @@ OLD_HUMAN_LABELS = tuple(dict.fromkeys(
             if name != NEEDS_HUMAN)
 ))
 HUMAN_LABELS = (NEEDS_HUMAN,) + OLD_HUMAN_LABELS
+NEEDS_LOGIN_RE = re.compile(r"needs:[a-z0-9][a-z0-9-]{0,38}(?:\[bot\])?", re.I)
 
 
 def needs_human(names: Iterable[str]) -> bool:
     """A person is asked: `names` hold needs:human or an old name of it."""
     return any(name in HUMAN_LABELS for name in names)
+
+
+def waiting_on_person(names: Iterable[str]) -> bool:
+    """The issue has a human ask or names a login that needs to act."""
+    return any(name in HUMAN_LABELS or NEEDS_LOGIN_RE.fullmatch(name) for name in names)
+
+
+def in_triage(names: Collection[str]) -> bool:
+    """The issue is still labeled for triage and has yet to become a ticket."""
+    return "loom:triage" in names and "loom:ticket" not in names
 
 
 def ensure_labels(gh: GitHub, repo: str) -> List[str]:
