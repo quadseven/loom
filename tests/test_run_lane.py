@@ -4468,6 +4468,33 @@ exec /bin/rm "$@"
         self.assertIn("small=cloudflare-workers-ai/@cf/vendor/model", agent[0])
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
+    def test_workersai_first_request_refusal_with_room_is_size(self):
+        self.write_tool(self.bin / "sandbox-exec", self.FAKE_SANDBOX)
+        self.write_tool(self.bin / "opencode", """#!/bin/sh
+case "$1" in
+    --version) echo 1.18.4 ;;
+    models) echo cloudflare-workers-ai/@cf/example/model ;;
+    run) echo 'AI_APICallError: Too Many Requests' >&2
+         echo 'AI_RetryError: retries exhausted' >&2
+         sleep 30 ;;
+esac
+""")
+        inbox = self.loom / "briefs" / "workersai"
+        inbox.mkdir()
+        name = "T042-fix-the-thing"
+        (inbox / (name + ".md")).write_text(BRIEF.replace("Lane: codex", "Lane: workersai"))
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / "workersai.meter.json").write_text(json.dumps({
+            "lane": "workersai", "at": time.time(), "windows": [
+                {"window": "daily", "unit": "neurons", "used_pct": 12}]}))
+        self.run_lane("workersai", LOOM_WORKERSAI_KEY_SSM="/example/key",
+                      FAKE_SECRET__example_key="test", LOOM_WORKERSAI_ACCOUNT_SSM="/example/account",
+                      FAKE_SECRET__example_account="example", LOOM_WORKERSAI_MODEL="cloudflare-workers-ai/@cf/example/model")
+        self.assertIn("failed: [size]", (self.loom / "logs" / "workersai" / (name + ".log")).read_text())
+        self.assertTrue(self.beat("workersai")["available"])
+        self.assertFalse((usage / "workersai.limit").exists())
+
     def meter_server(self, body):
         """A fake provider meter on loopback: answers every request with BODY
         and records the request's method, path, headers and body."""

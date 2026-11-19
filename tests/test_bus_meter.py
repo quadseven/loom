@@ -163,6 +163,15 @@ class MeterMainTests(unittest.TestCase):
                    now=NOW, fetch=fetch)
         self.assertEqual(fetch.requests[0].full_url, "http://127.0.0.1:1/api/v1/key")
 
+    def test_completed_runner_refresh_includes_work_since_the_preflight_meter(self):
+        args = ["workersai", self.out]
+        empty = {"data": {"viewer": {"accounts": [{"aiInferenceAdaptiveGroups": []}]}}}
+        meter.main(args, stdin=io.StringIO("test\nexample"), now=NOW, fetch=FakeFetch(empty))
+        fetch = FakeFetch(NEURONS)
+        rc = meter.main(args + ["--refresh"], stdin=io.StringIO("test\nexample"), now=NOW + 5, fetch=fetch)
+        self.assertEqual(rc, 0)
+        self.assertGreater(json.loads(Path(self.out).read_text())["windows"][0]["used"], 0)
+
     def test_a_fresh_reading_is_not_read_again(self):
         meter.main(["openrouter", self.out], stdin=io.StringIO("k\n"), now=NOW, fetch=FakeFetch(OPENROUTER_KEY))
         again = FakeFetch(OPENROUTER_KEY)

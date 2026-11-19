@@ -107,6 +107,7 @@ from . import live_adapter, live_proof
 from . import deploy_watch
 from . import scorecard
 from . import watch
+from . import workersai
 from . import weakened
 from . import labels
 from . import lock
@@ -581,7 +582,7 @@ REMOTE_RE = re.compile(r"[:/]([A-Za-z0-9._-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?$")
 # keeps its rung, and the brain re-queues it when the incident closes.
 # An [auth] one is the operator's key, which no lane can renew: it is not a
 # failure, not an attempt spent and never a runaway.
-CLASS_RE = re.compile(r"^\[(limit|transient|work|factory|auth|egress-opened)\] ")
+CLASS_RE = re.compile(r"^\[(size|limit|transient|work|factory|auth|egress-opened)\] ")
 RETRY_CLASSES = ("limit", "transient")
 RETRY_MAX = 2
 # Whether this process has said the send-back comparison is off (unset target).
@@ -2073,7 +2074,7 @@ def provider(lane: str) -> str:
 
 
 # Failure classes that did no work on the ticket (loom#572).
-NOT_WORK = ("factory", "transient", "limit", "auth")
+NOT_WORK = ("size", "factory", "transient", "limit", "auth")
 
 
 def failure_class(reason: str) -> str:
@@ -2897,6 +2898,7 @@ class Station:
         allowed = {a.lower() for a in self.s.authors}
         comments = status.expand(comments, self.s.authors)
         last_end, newest_fix = -1, None
+        before_workersai = None
         for i, c in enumerate(comments):
             if not isinstance(c, dict):
                 continue
@@ -2904,7 +2906,11 @@ class Station:
             trusted = tickets._login(c.get("user")) in allowed
             # A stranger's claim or rung marker must not hide a trusted fix.
             if trusted and (CLAIM_RE.fullmatch(body.strip()) or _restarts_ladder(body)):
+                before_workersai = last_end if body.startswith("Claimed for lane workersai ") else None
                 last_end = i
+            elif trusted and body.startswith(history.WORKERSAI_SIZE_STOP) and before_workersai is not None:
+                # The next lane must resume the open pull on this same fix round.
+                last_end, before_workersai = before_workersai, None
             if trusted and body.startswith(tickets.FIX_MARKER):
                 newest_fix = (i, c, body)
         if newest_fix is None or newest_fix[0] < last_end:
@@ -2945,7 +2951,7 @@ class Station:
         its fix comment cannot be used (refused, as an untrusted ticket is),
         or when its newest claim's brief is still waiting or running in a
         lane inbox (left for the next pass)."""
-        if not self._can_claim(lane):
+        if not self._can_claim(lane, issue):
             return False
         number = int(issue["number"])
         comments = self._claim_comments(repo, issue, number)
@@ -3584,19 +3590,20 @@ class Station:
             self._claim_candidates([])
             self._record_slot_sample(False)
             return
-        cands = self._claim_candidates(free)
-        before = {lane: len(cands[lane]) for lane in free}
+        builders = [lane for lane in free if self._code_ready(lane)]
+        cands = self._claim_candidates(builders)
+        before = {lane: len(cands[lane]) for lane in builders}
         by_lane = self._apply_unproven_gate(cands)
         # The lanes that had briefed tickets and the gate left with nothing:
         # they sit idle while the gate holds the work (loom#564).
-        idle = [lane for lane in free if before[lane] and not by_lane[lane]]
+        idle = [lane for lane in builders if before[lane] and not by_lane[lane]]
         for hold in self._gate_holds.values():
             hold["idle"] = len(idle)
-        for lane in free:
-            self._claim_for_lane(lane, by_lane[lane], free)
+        for lane in builders:
+            self._claim_for_lane(lane, by_lane[lane], builders)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
-                                     for lane in free))
-        self._hand_verifies([lane for lane in free if not by_lane[lane]])
+                                     for lane in builders))
+        self._hand_verifies([lane for lane in free if not by_lane.get(lane)])
 
     # -- dead-lane runaway release (loom#565) ------------------------------
     def _open_lane_no_success(self) -> Dict[str, Tuple[int, str]]:
@@ -3945,6 +3952,8 @@ class Station:
                 lanes.update(model_lanes(model.group(1)))
             else:
                 lanes.update(factory.lanes_of(factory.difficulty_of(issue), not self._public(repo)))
+        if not self._code_ready("workersai"):
+            lanes.discard("workersai")
         return lanes
 
     def _proven(self, repo: str, number: int) -> bool:
@@ -4471,25 +4480,30 @@ class Station:
         for lane in lanes:
             if limit and handed >= limit:
                 return
+            if lane == "workersai" and workersai.daily_pct(self.s.home, self.now) == 100:
+                continue
             if lane in held or self._verify_lane_held(lane):
                 continue
             for repo, issue in list(pool):
                 if needs_public_repo(lane, "") and not self._public(repo):
                     continue
+                missing = self._no_live_evidence(repo, issue)
+                text = None
+                if lane == "workersai" and not missing:
+                    text = self._verify_brief_text(repo, lane, issue)
+                    if not workersai.short_verify(text):
+                        continue
                 pool.remove((repo, issue))
                 attempts["%s#%s" % (repo, issue["number"])] = self.now
                 _write_json(path, attempts)
-                if self._no_live_evidence(repo, issue):
+                if missing:
                     continue
-                self._write_verify_brief(repo, lane, issue)
+                self._write_verify_brief(repo, lane, issue, text)
                 handed += 1
                 break
 
-    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any]) -> None:
+    def _verify_brief_text(self, repo: str, lane: str, issue: Dict[str, Any]) -> str:
         number = int(issue["number"])
-        self._clear_awaiting(repo, number)
-        if brain.WAIT_LIVE_EVENT in _label_names(issue):
-            self._clear_live_event(repo, number)
         stamp = int(self.now)
         adapter_live = (_adapter_live_criterion(str(issue.get("body") or ""))
                         if self._adapter_can_verify(repo, issue) else None)
@@ -4510,7 +4524,17 @@ class Station:
         if (self._adapter_can_verify(repo, issue)
                 and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
             station_data += self._adapter_verify_section(repo)
-        text = text.replace("\n## Verify\n", "\n" + station_data + "\n## Verify\n", 1)
+        return text.replace("\n## Verify\n", "\n" + station_data + "\n## Verify\n", 1)
+
+    def _write_verify_brief(self, repo: str, lane: str, issue: Dict[str, Any],
+                            text: Optional[str] = None) -> None:
+        number = int(issue["number"])
+        stamp = int(self.now)
+        if text is None:
+            text = self._verify_brief_text(repo, lane, issue)
+        self._clear_awaiting(repo, number)
+        if brain.WAIT_LIVE_EVENT in _label_names(issue):
+            self._clear_live_event(repo, number)
         claiming = self._write_brief(lane, tickets.verify_name(repo, number, stamp), text)
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
@@ -4646,7 +4670,7 @@ class Station:
             slug = config.app(lane)
             if not slug or author == review_sweep_mod.bot(slug):
                 continue
-            if self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
+            if not self._code_ready(lane) or self._verify_lane_held(lane) or not self._heartbeat_ok(lane):
                 continue
             return lane
         return None
@@ -5010,12 +5034,12 @@ class Station:
 
     def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
         klass = failure_class(self._failure_reason(lane, name))
-        if klass in ("transient", "limit"):
+        if klass in ("transient", "size", "limit"):
             # The run never looked at the ticket: it costs the ticket no
             # cooldown, and a lane failing this way twice sits out an hour
             # (loom#714).
             self._forget_verify_attempt(repo, number)
-            held = klass == "transient" and self._verify_strike(lane)
+            held = klass in ("transient", "size") and self._verify_strike(lane)
             _say("verify run %s failed [%s]; %s#%d is due again now%s"
                  % (name, klass, repo, number,
                     "; lane %s takes no verify run for an hour after %d transient "
@@ -9228,6 +9252,15 @@ class Station:
         reason = self._failure_reason(lane, name)
         fix_pr = self._field(text, "Fix-PR")
         klass, bare = failure_class(reason), CLASS_RE.sub("", reason)
+        if lane == "workersai" and klass == "size":
+            names = _label_names(self._issue(repo, number))
+            if RUNNING in names and "lane:workersai" in names:
+                self._stopped(repo, number, lane, klass, reason)
+                queued = ticket_move.next_labels(names, "queued", lane="", wait="lane",
+                                                 own_logins=self.s.authors, clear_needs_brain=False)
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": queued})
+                _say("requeued %s#%d after a coding-size refusal on workersai" % (repo, number))
+            return True
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
@@ -9525,7 +9558,8 @@ class Station:
         demoted, not the failed lane's provider, whose runner takes the model
         and, for a public-only lane, a public repo. public caches the repo
         lookup across candidates."""
-        if cand not in LANES or cand in demoted or not self._heartbeat_ok(cand):
+        if (cand not in LANES or cand in demoted or not self._code_ready(cand, model)
+                or not self._heartbeat_ok(cand)):
             return False
         if provider(cand) == provider(failed):
             return False
@@ -16487,9 +16521,17 @@ class Station:
                      merges if isinstance(merges, dict) else {})
         card.save()
 
-    def _can_claim(self, lane: str) -> bool:
+    def _code_ready(self, lane: str, model: str = "") -> bool:
+        return lane != "workersai" or workersai.code_ready(
+            self.s.home, model or brain.lane_model(lane))
+
+    def _can_claim(self, lane: str, issue: Optional[Dict[str, Any]] = None) -> bool:
         """Whether a lane may claim a brief: not demoted, or a zero-done
         demoted lane whose probe gate is open."""
+        if lane == "workersai" and issue is not None:
+            model = brief_model(lane, tickets.parse(issue.get("body"))[0])
+            if not self._code_ready(lane, model):
+                return False
         return lane not in self.demoted_lanes() or scorecard.Scorecard(self.state, self.now).can_probe(lane)
 
     def _not_demoted(self, free: List[str]) -> List[str]:
@@ -16541,7 +16583,8 @@ class Station:
                                available=[x for x in LANES if self._heartbeat_ok(x)],
                                held=list(self._held_tickets()) + self._gate_held(),
                                silent=self._silent_lanes(),
-                               down=self.down_lanes() + self.benched_lanes(pairs),
+                               down=self.down_lanes() + self.benched_lanes(pairs)
+                               + ([] if self._code_ready("workersai") else ["workersai"]),
                                demoted=self.demoted_lanes(),
                                benched=pairs,
                                limit_until=self.limit_until(),

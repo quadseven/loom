@@ -2007,7 +2007,7 @@ cannot query the viewer or any other local service.
   group of its own. An expired key still holds all four.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
-  read-only meter with the key they already hold, at most every five minutes,
+  read-only meter with the key they already hold, at most every five minutes on heartbeat,
   through `bus/meter.py` (key and account id on stdin, never argv or a log),
   into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
   `GET /api/v1/key`, the key's free-model requests in the current UTC day and
@@ -2282,6 +2282,22 @@ App wrote.
   newer models (glm-5.3-flash) are paid-plan only.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
+
+The station holds coding tickets by default. To test coding capacity on demand,
+run `python3 -B -m bus.workersai check "$LOOM_HOME" "$LOOM_WORKERSAI_MODEL"`
+with the lane's token and account ID piped on standard input, one per line.
+The check sends a synthetic prompt. It enables the checked model only when the
+provider returns an answer and reports at least 65,536 input tokens. A first
+coding request refused with HTTP 429 while a fresh daily meter is below 50
+percent clears that check. The station requeues the ticket on its current rung.
+
+Workers AI can still verify shipped tickets using the evidence in the brief.
+The lane sends one request with an 8,192-token budget. It counts one input
+token per UTF-8 byte, reserves 128 tokens for the chat template and caps the
+reply at 1,024 tokens. The runner checks the daily neuron meter before sending
+the request. Larger verify briefs stay eligible for other lanes. Cluster
+dispatch requires both provider parameter settings, and a successful cluster
+run refreshes the meter for its report.
 
 ## free provider slots on the spark-gateway
 
