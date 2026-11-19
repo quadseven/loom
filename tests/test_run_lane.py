@@ -786,6 +786,9 @@ print('leak guard: clean (shape patterns only)')
             # loopback port, never the real provider, unless a test serves one.
             "LOOM_OPENROUTER_METER_URL": "http://127.0.0.1:9/meter",
             "LOOM_WORKERSAI_METER_URL": "http://127.0.0.1:9/meter",
+            # A check slot is taken whatever the load of the machine running
+            # this suite; the load limits have their own tests, which set them.
+            "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
             **env,
@@ -8412,15 +8415,188 @@ echo fixed > fix.txt
 
     def slot_script(self, body, **env):
         """Run the runner's check-slot functions, as written in run_lane.sh,
-        in a bash of their own with LOG and LOOM_HOME set."""
+        in a bash of their own with LOG and LOOM_HOME set. The load limits
+        are off unless a test sets them, so the load of the machine running
+        the suite never holds a slot."""
         text = RUNNER.read_text()
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
             ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
-                 **env},
+                 "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def load_file(self, one, five):
+        """A fake load reading, in the /proc/loadavg shape, that a test rewrites."""
+        path = Path(self._tmp.name) / "loadavg"
+        fresh = path.with_name("loadavg.new")
+        fresh.write_text(f"{one} {five} 1.00 1/100 1\n")
+        fresh.replace(path)
+        return path
+
+    def wait_for_slot_log(self, text, seconds=20):
+        log = Path(self._tmp.name) / "slots.log"
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if log.exists() and text in log.read_text():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def check_waits_for_load_then_takes_the_slot(self, high, name, **limits):
+        """One free slot and a load reading above a limit: the check waits,
+        takes nothing, and takes the slot once the reading falls."""
+        tmp = Path(self._tmp.name)
+        marks = tmp / "marks"
+        load = self.load_file(*high)
+        proc = self.slot_script('acquire_check_slot || exit 3\necho got >> "$MARKS"\n'
+                                'cat "$CHECK_SLOT_HELD/pid" > /dev/null || exit 4\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_SLOT_WAIT="60",
+                                LOOM_CHECK_LOAD_FILE=str(load), MARKS=str(marks), **limits)
+        try:
+            self.assertTrue(self.wait_for_slot_log("waiting for host load"),
+                            "the check never waited for load")
+            time.sleep(0.5)
+            self.assertIsNone(proc.poll(), "the check ended while the load was high")
+            self.assertFalse(marks.exists())
+            self.assertFalse((self.loom / "run" / "check-slots" / "slot-1").exists())
+            self.load_file("2.00", "2.00")
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(marks.read_text().split(), ["got"])
+        log = (tmp / "slots.log").read_text()
+        self.assertIn(f"{name} load", log)
+        self.assertNotIn("waiting for a check slot", log)
+        self.assertIn("got check slot 1", log)
+        self.assertIn("(waited for host load)", log)
+
+    def test_a_check_waits_with_a_free_slot_while_the_one_minute_load_is_high(self):
+        # Three lane checks alone took a 12-core host to a 1-minute load of
+        # 31.5 with every slot granted the moment it was free (#3279).
+        self.check_waits_for_load_then_takes_the_slot(("31.50", "2.00"), "1-minute",
+                                                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+
+    def test_a_check_waits_with_a_free_slot_while_the_five_minute_load_is_high(self):
+        self.check_waits_for_load_then_takes_the_slot(("2.00", "19.50"), "5-minute",
+                                                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+
+    def test_the_load_limits_default_to_24_and_18(self):
+        text = RUNNER.read_text()
+        funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        out = subprocess.run(["bash", "-c", funcs + 'echo "$CHECK_LOAD_1M $CHECK_LOAD_5M"\n'],
+                             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom)},
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), "24 18", out.stderr)
+
+    def test_a_load_limit_of_zero_turns_that_limit_off(self):
+        tmp = Path(self._tmp.name)
+        load = self.load_file("99.00", "99.00")
+        body = 'acquire_check_slot || exit 3\nrelease_check_slot\n'
+        both_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                    LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                    LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="0")
+        out, err = both_off.communicate(timeout=30)
+        self.assertEqual(both_off.returncode, 0, err)
+        # Each limit is off alone: the other one still reads its own average.
+        self.load_file("99.00", "2.00")
+        one_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                   LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                   LOOM_CHECK_LOAD_1M="0", LOOM_CHECK_LOAD_5M="18")
+        out, err = one_off.communicate(timeout=30)
+        self.assertEqual(one_off.returncode, 0, err)
+        self.load_file("2.00", "99.00")
+        five_off = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                    LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                    LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="0")
+        out, err = five_off.communicate(timeout=30)
+        self.assertEqual(five_off.returncode, 0, err)
+        log = tmp / "slots.log"
+        self.assertNotIn("waiting", log.read_text() if log.exists() else "")
+        # The same reading holds the slot once the limit is back on.
+        held = self.slot_script(body, LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                LOOM_CHECK_SLOT_POLL="0.1", LOOM_CHECK_LOAD_FILE=str(load),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = held.communicate(timeout=30)
+        self.assertEqual(held.returncode, 3, err)
+
+    def test_a_host_whose_load_cannot_be_read_takes_the_slot_and_says_so(self):
+        tmp = Path(self._tmp.name)
+        unreadable = tmp / "loadavg"
+        unreadable.write_text("not a load reading\n")
+        proc = self.slot_script('acquire_check_slot || exit 3\nrelease_check_slot\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.1",
+                                LOOM_CHECK_LOAD_FILE=str(unreadable),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("host load could not be read", (tmp / "slots.log").read_text())
+
+    def test_a_load_wait_that_runs_out_is_exit_75_with_a_log_line_naming_load(self):
+        tmp = Path(self._tmp.name)
+        load = self.load_file("31.50", "2.00")
+        text = RUNNER.read_text()
+        contract_run = re.search(r"^contract_run\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
+        proc = self.slot_script(contract_run + 'contract_run_sandboxed() { echo ran; }\n'
+                                'contract_run "true"\necho "rc $?"\n',
+                                LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.2",
+                                LOOM_CHECK_LOAD_FILE=str(load),
+                                LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.split("\n")[:-1], ["rc 75"], err)
+        log = (tmp / "slots.log").read_text()
+        self.assertIn("waiting for host load", log)
+        self.assertIn("1-minute load 31.50 is above 24", log)
+        self.assertIn("host load stayed high", log)
+        self.assertFalse((self.loom / "run" / "check-slots" / "slot-1").exists())
+
+    def test_a_lane_whose_load_wait_runs_out_parks_transient_without_an_incident(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        load = self.load_file("31.50", "2.00")
+        result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="0.2", LOOM_CHECK_LOAD_FILE=str(load),
+                                        LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "failed" / "T042-fix-the-thing.md").exists())
+        log = self.lane_log()
+        self.assertIn("waiting for host load", log)
+        self.assertIn("host load stayed high (1-minute load 31.50 is above 24)", log)
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("failed: [factory]", log)
+        self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
+        self.assertFalse(any(c.startswith("codex") for c in self.calls()))
+        slots = self.loom / "run" / "check-slots"
+        self.assertEqual(list(slots.iterdir()) if slots.exists() else [], [])
+
+    def test_a_slot_another_job_holds_is_respected_while_its_pid_lives_and_reclaimed_after(self):
+        # The protocol docs/LANES.md states for any job on the host: a
+        # directory slot-N under run/check-slots holding the holder's pid.
+        slots = self.loom / "run" / "check-slots"
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        (slots / "slot-1").mkdir(parents=True)
+        (slots / "slot-1" / "pid").write_text(f"{other.pid}\n")
+        body = 'acquire_check_slot\necho "rc $? ${CHECK_SLOT_HELD##*/}"\n'
+        env = {"LOOM_CHECK_SLOTS": "1", "LOOM_CHECK_SLOT_WAIT": "1", "LOOM_CHECK_SLOT_POLL": "0.2"}
+        proc = self.slot_script(body, **env)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.strip(), "rc 1", err)
+        self.assertEqual((slots / "slot-1" / "pid").read_text().strip(), str(other.pid))
+        other.kill()
+        other.wait()
+        proc = self.slot_script(body + 'cat "$CHECK_SLOT_HELD/pid"\n', **env)
+        out, err = proc.communicate(timeout=30)
+        self.assertEqual(out.split()[:3], ["rc", "0", "slot-1"], err)
+        self.assertNotEqual(out.split()[3], str(other.pid))
+        self.assertIn(f"held by pid {other.pid}, which is gone; reclaimed",
+                      (Path(self._tmp.name) / "slots.log").read_text())
 
     def test_two_checks_at_once_run_one_at_a_time_with_one_slot(self):
         # Fifteen lanes each started a full suite at once and drove the host
