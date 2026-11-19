@@ -1417,9 +1417,11 @@ class Intake:
             return False
         body = ticket_body(f, diagnosis(source.diagnose, f.key, self.clock))
         try:
+            # health: the ticket gets the loom:health label, the proof that
+            # this intake filed it (a marker in a body is only text).
             url = self.brief(self.gh, source.repo, source.goal, ticket_title(f),
                              rolling_evidence(body, [f], checked),
-                             difficulty="medium", priority=f.priority)
+                             difficulty="medium", priority=f.priority, health=True)
         except ValueError as err:
             if rec.get("brief_error") != str(err):
                 self.say("health %s: could not brief finding %s: %s"

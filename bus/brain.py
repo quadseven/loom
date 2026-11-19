@@ -3631,10 +3631,22 @@ def _goal_in_flight(gh: GitHub, repo: str, goal: int,
     return sum(_holds_goal_slot(i, repo, waiting) for i in goal_flying(gh, repo, goal, issue))
 
 
+# brief puts it on each ticket health intake files (`health`). Only a
+# collaborator sets a label, so it says a ticket is a health finding where the
+# marker in a body cannot: anyone can paste that marker into an issue, and a
+# rewrite can copy it (loom#3275).
+HEALTH_LABEL = "loom:health"
+# The labels that admit a ticket to the reserve above the goal cap: a factory
+# repair, and a finding health intake filed.
+RESERVE_LABELS = ("loom:factory", HEALTH_LABEL)
+
+
 def goal_cap_repair(issue: Dict[str, Any]) -> bool:
-    """Whether a factory repair or a health intake ticket can use the reserve."""
-    return ("loom:factory" in _labels(issue)
-            or bool(brief_check.HEALTH_MARKER_RE.search(str(issue.get("body") or ""))))
+    """Whether a factory repair or a health intake ticket can use the reserve:
+    it carries one of RESERVE_LABELS. The health marker in a body proves
+    nothing, whoever wrote the issue: anyone can paste it into an issue on a
+    public repo, and a rewrite by a trusted login can copy it (loom#3275)."""
+    return any(name in RESERVE_LABELS for name in _labels(issue))
 
 
 def goal_capacity_counts(children: List[Dict[str, Any]], repo: str,
@@ -4115,7 +4127,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
           priority: Optional[str] = None, holder: Optional[str] = None,
           env: Optional[Dict[str, str]] = None,
           resolves: Optional[str] = None, intake_of: Optional[int] = None,
-          repairs_incident: Optional[int] = None, foundational: bool = False) -> str:
+          repairs_incident: Optional[int] = None, foundational: bool = False,
+          health: bool = False) -> str:
     """File a ticket under an open epic (decision 0003): it becomes the epic's
     sub-issue and its Part of line names the epic. The epic must be open,
     labelled epic, under an open loom:goal, and hold fewer than
@@ -4154,7 +4167,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     from handoff.done_marker, so resume stops listing the finished brief.
 
     When the goal home names a Trunk branch and no explicit --base is given,
-    the ticket uses that branch as its base."""
+    the ticket uses that branch as its base.
+
+    With health, the brief is a finding health intake files (bus/health.py):
+    its ticket carries the loom:health label, which admits it to the reserve
+    above the goal cap (goal_cap_repair). Only health intake passes it."""
     if repairs_incident is not None and (type(repairs_incident) is not int or repairs_incident < 1):
         raise ValueError("repairs-incident must be a positive issue number")
     if model:
@@ -4171,8 +4188,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if refs is not None and regresses is not None:
         raise ValueError("a brief is a rewrite or a regression, not both")
     source, elsewhere = _rewrite_source(gh, repo, refs, env)
-    if elsewhere is not None:
-        body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    if source is not None:
+        body = _rewrite_text(body, int(source["number"]), elsewhere)
     refusal = acceptance_refusal(body, source)
     if refusal:
         raise ValueError(refusal)
@@ -4201,23 +4218,45 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         return _brief_regression(gh, repo, goal, title, body, lane, model, full_body,
                                  regresses, goal_issue, epic)
     children = _goal_children(gh, repo, goal, goal_issue)
-    reserve = goal_cap_repair({**(source or {}), "body": full_body})
-    _check_goal_capacity(children, repo, reserve, env)
+    reserve = _reserve_labels(source, health)
+    _check_goal_capacity(children, repo, bool(reserve), env)
     repair = priority == "P0" or (epic is not None and (repo, epic) in repair_epics(env))
     _check_goal_unproven(children, goal, repo if repair else None, env)
     done = _brief_done_due(gh, repo, goal, holder, env, resolves)
     if epic is None:
-        epic = _brief_intake_epic(gh, repo, goal, reserve)
+        epic = _brief_intake_epic(gh, repo, goal, bool(reserve))
     if source is not None:
         # A rewrite's draft may carry its own Part of line naming another
         # issue (loom#2033); the ticket names the epic it is filed under.
         full_body = _without_other_part_of(full_body, epic)
     issue = _brief_issue(gh, repo, epic, title, _with_part_of(full_body, epic), lane,
-                         source, elsewhere, goal)
+                         source, elsewhere, goal, reserve)
     url = str(issue.get("html_url", ""))
     if done:
         _journal_brief_done(gh, repo, goal, str(holder), done, url)
     return url
+
+
+def _rewrite_text(body: str, refs: int, elsewhere: Optional[str]) -> str:
+    """The brief text of a rewrite, as it is filed. A health marker in it is
+    dropped: the text is a model's or a briefer's copy of the source's words,
+    and only health intake writes that marker (loom#3275). A rewrite filed as
+    a new ticket ends with the line naming its source."""
+    body = brief_check.HEALTH_MARKER_RE.sub("", body)
+    if elsewhere is not None:
+        body = body.rstrip("\n") + "\n\nRewritten from issue %d.\n" % refs
+    return body
+
+
+def _reserve_labels(source: Optional[Dict[str, Any]], health: bool) -> List[str]:
+    """The RESERVE_LABELS a brief's ticket carries; any admits the brief to
+    the reserve above the goal cap (goal_cap_repair). A rewrite has the ones
+    the issue it rewrites carries: that issue's text and the brief's grant
+    nothing. A brief that rewrites nothing has loom:health when health intake
+    files it (`health`), and none otherwise."""
+    if source is None:
+        return [HEALTH_LABEL] if health else []
+    return [name for name in RESERVE_LABELS if name in _labels(source)]
 
 
 def _brief_intake_epic(gh: GitHub, repo: str, goal: int, repair: bool) -> int:
@@ -4294,22 +4333,23 @@ def _rewrite_source(gh: GitHub, repo: str, refs: Optional[int],
 
 def _brief_issue(gh: GitHub, repo: str, epic: int, title: str, body: str,
                  lane: Optional[str], source: Optional[Dict[str, Any]],
-                 elsewhere: Optional[str], goal: Optional[int] = None) -> Dict[str, Any]:
+                 elsewhere: Optional[str], goal: Optional[int] = None,
+                 reserve: Sequence[str] = ()) -> Dict[str, Any]:
     """The ticket a brief makes: the rewritten source itself when it can be
-    (_rewrite_in_place), else a new issue (_filed_rewrite)."""
+    (_rewrite_in_place), else a new issue (_filed_rewrite) that carries the
+    `reserve` labels (_reserve_labels)."""
     if source is not None and elsewhere is None:
         return _rewrite_in_place(gh, repo, source, epic, title, body, lane, goal)
-    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere)
+    return _filed_rewrite(gh, repo, epic, title, body, lane, source, elsewhere, reserve)
 
 
 def _filed_rewrite(gh: GitHub, repo: str, epic: int, title: str, body: str,
                    lane: Optional[str], source: Optional[Dict[str, Any]],
-                   elsewhere: Optional[str]) -> Dict[str, Any]:
+                   elsewhere: Optional[str], reserve: Sequence[str] = ()) -> Dict[str, Any]:
     """File the brief as a new ticket. Its source, if any, gets the rewrite
     comment and loom:rewritten in place of its ticket and state labels."""
     source_labels = _labels(source) if source is not None else []
-    extra = ["loom:factory"] if "loom:factory" in source_labels else []
-    issue = _file_ticket(gh, repo, epic, title, body, lane, extra)
+    issue = _file_ticket(gh, repo, epic, title, body, lane, reserve)
     if source is not None:
         refs = int(source["number"])
         print("#%d is rewritten as a new ticket #%s: %s" % (refs, issue.get("number"), elsewhere),

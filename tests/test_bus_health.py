@@ -72,11 +72,11 @@ class Base(unittest.TestCase):
         self.doc = {"checked_at": "2030-01-02T00:00:00Z", "findings": [finding()]}
 
     def brief(self, gh, repo, goal, title, body, difficulty=None, priority=None,
-              regresses=None):
+              regresses=None, health=False):
         number = regresses or 100 + len(self.briefs)
         self.briefs.append({"repo": repo, "goal": goal, "title": title, "body": body,
                             "difficulty": difficulty, "priority": priority,
-                            "regresses": regresses})
+                            "regresses": regresses, "health": health})
         if regresses is None:
             self.gh.open.append({"number": number, "body": body,
                                  "labels": [{"name": "loom:ticket"}]})
@@ -151,6 +151,8 @@ class Intake(Base):
         made = self.briefs[0]
         self.assertEqual((made["goal"], made["title"], made["difficulty"], made["priority"]),
                          (1, "Health: Ana waits on slow search", "medium", "P1"))
+        # Briefed as a health finding, so the ticket gets the loom:health label.
+        self.assertIs(made["health"], True)
         digest = sha()
         self.assertIn(health.MARKER % digest, made["body"])
         self.assertIn("Live: the finding is absent from the health endpoint for 24 hours",
