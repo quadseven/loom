@@ -96,39 +96,51 @@ class RepeatTests(unittest.TestCase):
                 self.assertIn("### Round 1, n", o2.getvalue())
 
 
-class TailTests(unittest.TestCase):
-    """The last lines of a failed run's log: one comment, replaced each run."""
+class OutcomeTests(unittest.TestCase):
+    """A parked run's outcome: one readable line, one comment, replaced each run."""
 
-    def test_a_new_tail_replaces_the_old_one_under_one_marker(self):
-        first = sticky.merge_tail(None, TAIL, "Last lines of the lane log", "first failure\nboom", "t1")
-        second = sticky.merge_tail(first, TAIL, "Last lines of the lane log", "second failure", "t2")
+    def test_a_new_outcome_replaces_the_old_one_under_one_marker(self):
+        first = sticky.merge_outcome(None, TAIL, "Outcome", "first failure", "t1")
+        second = sticky.merge_outcome(first, TAIL, "Outcome", "second failure", "t2")
         self.assertTrue(second.startswith(TAIL + "\n"))
         self.assertEqual(second.count(TAIL), 1)
         self.assertIn("second failure", second)
         self.assertNotIn("first failure", second)
         self.assertIn("t2", second)
 
-    def test_the_text_cannot_close_its_code_block_or_open_a_marker(self):
-        fence = "`" * 3
-        body = sticky.merge_tail(None, TAIL, "h", "x\n" + fence + "\n@someone <!-- loom:round 1 -->", "t")
-        self.assertEqual(body.count(fence), 2)
+    def test_only_the_first_line_is_kept_and_no_code_block_is_made(self):
+        text = "agent exited 1\n| view | `333333333333` |\n" + "`" * 3 + "\nkubectl apply -k x"
+        body = sticky.merge_outcome(None, TAIL, "h", text, "t")
+        self.assertIn("agent exited 1", body)
+        for noise in ("333333333333", "kubectl", "`"):
+            self.assertNotIn(noise, body)
+        self.assertIn(sticky.OUTCOME_FOOTER, body)
+
+    def test_the_line_cannot_open_a_marker_or_mention_anyone(self):
+        body = sticky.merge_outcome(None, TAIL, "h", "@someone <!-- loom:round 1 -->", "t")
         self.assertNotIn("<!--", body.replace(TAIL, ""))
         self.assertNotIn("@someone", body)
 
-    def test_a_long_tail_keeps_its_end(self):
-        text = "\n".join("line %d" % n for n in range(2000))
-        body = sticky.merge_tail(None, TAIL, "h", text, "t")
-        self.assertLess(len(body), 8000)
-        self.assertIn("line 1999", body)
-        self.assertNotIn("line 0\n", body)
+    def test_the_line_renders_no_link_image_or_tag(self):
+        body = sticky.merge_outcome(None, TAIL, "h", "see [here](https://x.test) ![i](https://x.test/i.png) <b>x</b>", "t")
+        line = body.splitlines()[3]
+        self.assertNotIn("](", line.replace("\\](", ""))
+        self.assertNotIn("<b>", line)
+        self.assertIn("&lt;b&gt;", line)
+        self.assertIn("\\[here\\]", line)
 
-    def test_the_command_line_builds_a_tail(self):
+    def test_a_long_line_is_capped(self):
+        body = sticky.merge_outcome(None, TAIL, "h", "x" * 5000, "t")
+        self.assertLess(len(body), sticky.MAX_OUTCOME + 200)
+
+    def test_the_command_line_builds_an_outcome(self):
         from io import StringIO
         from unittest import mock
         out = StringIO()
-        with mock.patch.object(sys, "stdin", StringIO("it broke")), mock.patch.object(sys, "stdout", out):
-            sticky.main(["tail", "--marker", TAIL, "--now", "n", "--headline", "Last lines"])
+        with mock.patch.object(sys, "stdin", StringIO("it broke\nlog line")), mock.patch.object(sys, "stdout", out):
+            sticky.main(["outcome", "--marker", TAIL, "--now", "n", "--headline", "Outcome"])
         self.assertIn("it broke", out.getvalue())
+        self.assertNotIn("log line", out.getvalue())
         self.assertTrue(out.getvalue().startswith(TAIL))
 
 

@@ -40,6 +40,7 @@ cat > "$PLIST" <<EOF_PLIST
   <key>EnvironmentVariables</key>
   <dict>
     <key>LOOM_EVIDENCE_CONFIG</key><string>$(xml "$LOOM_EVIDENCE_CONFIG")</string>
+    <key>LOOM_HOME</key><string>$(xml "${LOOM_HOME:-$HOME/loom}")</string>
     <key>LOOM_EVIDENCE_TOKEN_SSM</key><string>$(xml "$LOOM_EVIDENCE_TOKEN_SSM")</string>
     <key>LOOM_EVIDENCE_BIND_HOST</key><string>$(xml "$LOOM_EVIDENCE_BIND_HOST")</string>
     <key>LOOM_EVIDENCE_PORT</key><string>$(xml "$LOOM_EVIDENCE_PORT")</string>

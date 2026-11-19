@@ -510,8 +510,13 @@ def status_line(outcome: Outcome) -> str:
     text, why = outcome.missing[0]
     more = " and %d more" % (len(outcome.missing) - 1) if len(outcome.missing) > 1 else ""
     first_line = why.splitlines()[0] if why else why
-    after = ("next check %s" % _when(outcome.next_at) if outcome.next_at is not None
-             else "no further check: a person decides")
+    if outcome.next_at is not None:
+        after = "next check %s" % _when(outcome.next_at)
+    elif all(criteria_gate.kind(criterion) == criteria_gate.OPERATOR
+             for criterion, _ in outcome.missing):
+        after = "no further check: a person decides"
+    else:
+        after = "no further automated check, stays in the verify queue"
     return "Live proof missing: %s (%s)%s; %s." % (
         " ".join(text.split())[:STATUS_WIDTH], first_line, more, after)
 

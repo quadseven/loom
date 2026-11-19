@@ -28,6 +28,7 @@ STATION = "loom-station[bot]"
 TRUSTED = [OP, BRAIN, STATION]
 ASKED = "2030-01-02T00:00:00Z"
 ASK = "Ask for the operator: approve the retention rule, (a) or (b)?"
+LEGACY_ASK = criteria_gate.ASK_OPENING + ", and these have none it can gather: Live: prints it."
 API = "https://api.github.com"
 
 
@@ -186,22 +187,18 @@ class EachCause(unittest.TestCase):
         self.assertEqual(needs_you.NEEDS_YOU, found.section)
 
     def test_a_station_verification_tag_is_not_a_person_ask(self):
-        text = criteria_gate.ask([(criteria_gate.LIVE, "Live: prints it")], {})
-        found = judge([ask(text.replace("Kind: decision\n", ""), by=STATION)])
+        found = judge([ask(LEGACY_ASK, by=STATION)])
         self.assertEqual(needs_you.VERIFICATION, found.section)
 
     def test_a_station_tag_on_a_waiting_ticket_stays_a_tag(self):
-        text = criteria_gate.ask([(criteria_gate.LIVE, "Live: prints it")], {})
-        found = judge([ask(text, by=STATION)], issue(labels=("needs:human", "wait:blocked")))
+        found = judge([ask(LEGACY_ASK, by=STATION)], issue(labels=("needs:human", "wait:blocked")))
         self.assertEqual(needs_you.VERIFICATION, found.section)
 
     def test_the_same_words_from_an_untrusted_author_are_an_ask(self):
-        text = criteria_gate.ask([(criteria_gate.LIVE, "Live: prints it")], {})
-        self.assertEqual(needs_you.NEEDS_YOU, judge([ask(text, by="drive-by")]).section)
+        self.assertEqual(needs_you.NEEDS_YOU, judge([ask(LEGACY_ASK, by="drive-by")]).section)
 
     def test_a_person_ask_after_the_tag_is_an_ask(self):
-        text = criteria_gate.ask([(criteria_gate.LIVE, "Live: prints it")], {})
-        found = judge([ask(text, by=STATION), ask(at="2030-01-05T00:00:00Z")])
+        found = judge([ask(LEGACY_ASK, by=STATION), ask(at="2030-01-05T00:00:00Z")])
         self.assertEqual(needs_you.NEEDS_YOU, found.section)
 
     def test_a_label_with_no_written_ask_is_not_a_question(self):

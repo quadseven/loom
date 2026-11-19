@@ -185,84 +185,46 @@ class StationAdapterProofTest(tbs.Base):
                                  for item in template["criteria"]}
         self.assertIn("UTC time you saw it", evidence_by_criterion[criterion])
 
-    def test_prose_live_box_without_adapter_still_asks_for_a_person(self):
-        body = HEAD + "- [ ] Live: the production levels and cleared runs remain correct\n"
-        self.ship(body, hours_ago=2)
-        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
-        with mock.patch.object(station.brain, "human") as human:
-            self.assertTrue(st._evidence_holds(REPO, self.fake.issues[self.NUMBER]))
-        human.assert_called_once()
-        self.assertIn("no check Loom can run", human.call_args.args[3])
-
-    def test_report_verify_dispatches_missing_adapter_step_to_one_human_ask(self):
+    def test_report_verify_records_a_missing_adapter_step_once(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
-        self.ship(body, hours_ago=2)
         self.settings.live_evidence_repos = [REPO]
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
-        def add_human_label(*args):
-            self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
-        with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
-              mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
-              mock.patch.object(station.brain, "human", side_effect=add_human_label) as ask):
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-        ask.assert_called_once()
-        self.assertIn("no adapter_step was returned", ask.call_args.args[3])
-
-    def _failed_verify_twice(self, st, labels_after_first=()):
-        """A verify answer that names no adapter step, twice; a brain takes the
-        person label off in between. Returns the human-ask mock."""
-        def add_human_label(*args):
-            self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
-        with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
-              mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
-              mock.patch.object(station.brain, "human", side_effect=add_human_label) as ask):
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-            labels = self.fake.issues[self.NUMBER]["labels"]
-            labels[:] = [x for x in labels if x["name"] != "loom:human"]
-            self.assertTrue(st._report_verify("codex", "done", REPO, self.NUMBER, "run"))
-        return ask
-
-    def test_a_live_wait_ticket_is_not_sent_to_a_person_when_no_step_is_named(self):
-        """loom#2872: awaiting-live-check or wait:live-event is not on the
-        human line; the missing check is a status line and the ticket stays
-        in the verify queue."""
-        for label in ("awaiting-live-check", "wait:live-event"):
-            with self.subTest(label=label):
-                self.fake.issues.clear()
-                body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
-                self.ship(body, hours_ago=2)
-                self.fake.issues[self.NUMBER]["labels"].append({"name": label})
-                self.settings.live_evidence_repos = [REPO]
-                st = station.Station(GitHub("token", transport=self.fake), self.settings,
-                                     now=self.now)
-                ask = self._failed_verify_twice(st)
+        for number, wait in enumerate((None, "awaiting-live-check", "wait:live-event"), 1):
+            with self.subTest(wait=wait):
+                self.fake.add(number, body=body, state="shipped")
+                if wait:
+                    self.fake.issues[number]["labels"].append({"name": wait})
+                with (mock.patch.object(st, "_read_verify", return_value=({"missing": "no step"}, "")),
+                      mock.patch.object(st, "_adapter_can_verify", return_value=True),
+                      mock.patch.object(station.brain, "human") as ask):
+                    self.assertTrue(st._report_verify("codex", "done", REPO, number, "run"))
+                    self.assertTrue(st._report_verify("codex", "done", REPO, number, "run"))
                 ask.assert_not_called()
-                names = self.fake.names(self.NUMBER)
+                names = self.fake.names(number)
+                self.assertIn("loom:shipped", names)
                 self.assertNotIn("loom:human", names)
                 self.assertNotIn("needs:human", names)
-                self.assertEqual("loom:shipped" in names, True)
+                notes = "\n".join(c["body"] for c in self.fake.comments[number])
+                self.assertEqual(notes.count(
+                    "Missing evidence: adapter proof (no adapter_step was returned)"), 1)
 
-    def test_an_operator_box_with_no_wait_still_asks_the_operator(self):
-        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
+    def test_an_adapter_ticket_with_an_operator_box_still_asks_the_operator(self):
+        operator = "Operator decides whether to approve the retention policy."
+        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n- [ ] " + operator
         self.ship(body, hours_ago=2)
         self.settings.live_evidence_repos = [REPO]
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
         with (mock.patch.object(station.Station, "_read_verify", return_value=({"missing": "no step"}, "")),
               mock.patch.object(station.Station, "_adapter_can_verify", return_value=True),
-              mock.patch.object(station.brain, "human") as ask):
+              mock.patch.object(station.brain, "human", wraps=station.brain.human) as ask):
+            st._report_verify("codex", "done", REPO, self.NUMBER, "run")
+            self.assertIn("needs:human", self.fake.names(self.NUMBER))
+            st.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs%%3Ahuman" % (REPO, self.NUMBER))
             st._report_verify("codex", "done", REPO, self.NUMBER, "run")
         ask.assert_called_once()
-        self.assertIn("no adapter_step was returned", ask.call_args.args[3])
-
-    def test_a_label_a_brain_removed_is_not_added_back_for_the_same_criteria(self):
-        body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
-        self.ship(body, hours_ago=2)
-        self.settings.live_evidence_repos = [REPO]
-        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
-        ask = self._failed_verify_twice(st)
-        ask.assert_called_once()
-        self.assertNotIn("loom:human", self.fake.names(self.NUMBER))
+        self.assertNotIn("needs:human", self.fake.names(self.NUMBER))
+        self.assertIn(operator, ask.call_args.args[3])
+        self.assertNotIn("adapter_step", ask.call_args.args[3])
 
     def test_report_verify_passes_adapter_step_to_station_reader(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
@@ -301,32 +263,20 @@ class StationAdapterProofTest(tbs.Base):
             ("log", "worker", "levels stable"),
             ("log", "worker", "cleared runs complete")])
 
-    def test_missing_step_and_failed_adapter_read_raise_one_human_ask(self):
+    def test_failed_adapter_read_stays_shipped_with_the_finding(self):
         body = HEAD + "- [ ] Live: current levels and cleared runs are correct\n"
         self.ship(body, hours_ago=2)
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=self.now)
-        def add_human_label(*args):
-            self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
-
-        with (mock.patch.object(station.Station, "_issue",
-                                return_value=self.fake.issues[self.NUMBER]),
-              mock.patch.object(station.brain, "human", side_effect=add_human_label) as human):
-            st._adapter_human_ask(REPO, self.NUMBER, "no step was returned", "no safe read was named")
-            st._adapter_human_ask(REPO, self.NUMBER, "no step was returned", "no safe read was named")
-        human.assert_called_once()
-        self.assertIn("no step was returned", human.call_args.args[3])
-
-        self.fake.issues[self.NUMBER]["labels"].append({"name": "loom:human"})
         fake = FakeAdapter(error="adapter exited 2")
         sources = live_proof.Sources(source_log=fake.log, sql=fake.sql)
         with (mock.patch.object(station.Station, "_proof_sources", return_value=sources),
-              mock.patch.object(station.Station, "_shipped_stamp", return_value=self.shipped_at),
-              mock.patch.object(station.Station, "_adapter_human_ask") as ask):
+              mock.patch.object(station.Station, "_shipped_stamp", return_value=self.shipped_at)):
             st._apply_adapter_verify(REPO, self.NUMBER, {
                 "criterion": "Live: current levels and cleared runs are correct",
                 "step": "log:worker", "strings": ["levels stable"]})
-        ask.assert_called_once()
-        self.assertIn("adapter exited 2", ask.call_args.args[3])
+        self.assertIn("adapter exited 2", self.status_text())
+        self.assertIn("loom:shipped", self.fake.names(self.NUMBER))
+        self.assertNotIn("needs:human", self.fake.names(self.NUMBER))
 
     def test_a_write_query_is_refused_and_never_reaches_the_adapter(self):
         self.ship(WRITE_SQL_BODY, hours_ago=2)

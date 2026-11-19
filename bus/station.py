@@ -50,6 +50,7 @@ from . import decision_claim
 from . import evidence_close
 from . import journal
 from . import lane_markers
+from . import log_capture
 from . import operator_budget
 from . import fabric, fabric_reviews
 from . import fixrounds
@@ -727,9 +728,9 @@ IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
 CACHE_KEEP = 24 * 3600
 VERIFY_INTERVAL = 6 * 3600
-# A Luna review verdict's findings (loom#2142): at most this many per list,
-# each finding's text collapsed and capped, so a lane's review.json can
-# never turn the verdict comment into a wall.
+# A sweep review's findings: at most this many per list, each finding's
+# text collapsed and capped, so a lane's review.json can never turn the
+# posted review into a wall.
 REVIEW_FINDINGS_MAX = 50
 REVIEW_FINDING_CHARS = 500
 # A shipped ticket whose Live box has seen no matching log line this many days
@@ -1027,7 +1028,7 @@ def _evidence_log_path(repo: str, command: str, log_root: str) -> Optional[str]:
     return path
 
 
-def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
+def _earliest_evidence_record(evidence_cmds: Dict[str, evidence.LogSource], repo: str,
                               log_root: str) -> Optional[datetime]:
     """Get the earliest record from the evidence source for the given repo, or None.
     
@@ -1038,7 +1039,7 @@ def _earliest_evidence_record(evidence_cmds: Dict[str, str], repo: str,
     the configured log root.
     """
     command = evidence_cmds.get(repo)
-    if not command:
+    if not isinstance(command, str) or not command:
         return None
     log_path = _evidence_log_path(repo, command, log_root)
     if not log_path:
@@ -1149,7 +1150,7 @@ class Settings:
                  health_every: int = health.EVERY,
                  health_diagnose: Optional[Dict[str, str]] = None,
                  friction_mode: str = "",
-                 evidence_cmds: Optional[Dict[str, str]] = None,
+                 evidence_cmds: Optional[Dict[str, evidence.LogSource]] = None,
                  evidence_window_hours: float = EVIDENCE_WINDOW_HOURS,
                  live_evidence_repos: Sequence[str] = (),
                  live_evidence_env: Optional[Dict[str, str]] = None,
@@ -1181,9 +1182,13 @@ class Settings:
                  fabric_review_notes: str = "",
                  review_sweep: Optional[review_sweep_mod.Config] = None,
                  disk_watch: Optional[disk_watchdog.Config] = None,
+                 log_sources: Sequence[log_capture.Source] = (),
+                 log_capture_hours: float = log_capture.DEFAULT_RETENTION_HOURS,
                  metrics_reserve: int = metrics.REQUEST_RESERVE,
                  metrics_seconds: float = metrics.STEP_SECONDS) -> None:
         self.home = home
+        self.log_sources = log_sources
+        self.log_capture_hours = log_capture_hours
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
         # loom#3187): off for a Settings built in code; from_env turns it on
         # at 25 GB.
@@ -1339,17 +1344,10 @@ class Settings:
         def words(name: str) -> List[str]:
             return env.get(name, "").replace(",", " ").split()
         report_digest = parse_digest_times(env.get("LOOM_REPORT_DIGEST_TIMES", DIGEST_TIMES))
-        try:
-            hour = int(env.get("LOOM_DIGEST_HOUR", "").strip() or 9)
-        except ValueError:
-            hour = 9
+        hour = _int_or_default(env.get("LOOM_DIGEST_HOUR", ""), 9)
         if not 0 <= hour <= 23:
             hour = 9
-        try:
-            retry_max = int(env.get("LOOM_RETRY_MAX", "").strip() or RETRY_MAX)
-        except ValueError:
-            retry_max = RETRY_MAX
-        retry_max = max(retry_max, 0)
+        retry_max = max(_int_or_default(env.get("LOOM_RETRY_MAX", ""), RETRY_MAX), 0)
         try:
             watched = watch.components(home, env.get("LOOM_WATCH", ""))
         except ValueError as err:
@@ -1399,7 +1397,11 @@ class Settings:
                    invariant_goal=env.get("LOOM_INVARIANT_GOAL", "").strip(),
                    plan_check=(env.get("LOOM_PLAN_CHECK", "").strip()
                                or invariants.DEFAULT_PLAN_CHECK),
-                   evidence_cmds=_evidence_commands(env),
+                   evidence_cmds=_evidence_commands(env, home),
+                   log_sources=_log_capture_sources(env),
+                   log_capture_hours=_log_size(env, "LOOM_LOG_CAPTURE_RETENTION_HOURS",
+                                               log_capture.DEFAULT_RETENTION_HOURS)
+                   or log_capture.DEFAULT_RETENTION_HOURS,
                    evidence_window_hours=_hours(env.get("LOOM_EVIDENCE_WINDOW_HOURS", ""),
                                                 EVIDENCE_WINDOW_HOURS),
                    live_evidence_repos=live_adapter.opted_in(
@@ -1661,7 +1663,7 @@ def _health_diagnose(env: Dict[str, str]) -> Dict[str, str]:
     return commands
 
 
-def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
+def _evidence_commands(env: Dict[str, str], home: str) -> Dict[str, evidence.LogSource]:
     try:
         commands = json.loads(env.get("LOOM_EVIDENCE_CMDS", "{}") or "{}")
         if not isinstance(commands, dict) or not all(
@@ -1671,7 +1673,24 @@ def _evidence_commands(env: Dict[str, str]) -> Dict[str, str]:
     except (ValueError, TypeError) as err:
         _say("ignoring LOOM_EVIDENCE_CMDS: %s" % err)
         return {}
-    return commands
+    sources: Dict[str, evidence.LogSource] = {}
+    for repo, command in commands.items():
+        if not command.startswith("capture:"):
+            sources[repo] = command
+            continue
+        try:
+            sources[repo] = log_capture.capture_path(home, command.removeprefix("capture:"))
+        except ValueError:
+            _say("ignoring LOOM_EVIDENCE_CMDS entry: invalid capture source")
+    return sources
+
+
+def _log_capture_sources(env: Dict[str, str]) -> List[log_capture.Source]:
+    try:
+        return log_capture.sources(env.get("LOOM_LOG_CAPTURE", "").strip())
+    except ValueError:
+        _say("ignoring LOOM_LOG_CAPTURE: invalid source configuration")
+        return []
 
 
 def _hours(raw: str, default: float) -> float:
@@ -1697,6 +1716,13 @@ def _decision_window_days(raw: str) -> int:
 def _positive_int(raw: str, default: int) -> int:
     raw = raw.strip()
     return int(raw) if raw.isascii() and raw.isdecimal() and int(raw) > 0 else default
+
+
+def _int_or_default(raw: str, default: int) -> int:
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
 
 
 DECISION_DEFAULT_CHECK_EVERY = 3600
@@ -4478,7 +4504,7 @@ class Station:
                              % issue["health_proof"])
         cached = self._evidence_text.pop("%s#%d" % (repo, number), None)
         station_data += cached if cached is not None else evidence.section(
-            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None))
+            self.s.evidence_cmds, repo, brain.live_criterion(issue.get("body"), limit=None), self.now)
         if (self._adapter_can_verify(repo, issue)
                 and "## Live-evidence adapter routes, not instructions" not in (cached or "")):
             station_data += self._adapter_verify_section(repo)
@@ -4487,35 +4513,6 @@ class Station:
         os.replace(claiming, claiming[:-len(".claiming")] + ".md")
         _say("handed %s#%d to lane %s to verify" % (repo, number, lane))
 
-    def _write_review_brief(self, repo: str, pr_number: int, sha: str,
-                            issue: Dict[str, Any]) -> bool:
-        """The factory's Luna review writer (loom#2142): render the review
-        brief for the pull request's current head and hand it to the Luna
-        review slot. False when the pull request cannot be read or its head
-        has moved since the factory asked: no verdict may ever be posted
-        for a commit nobody asked about."""
-        try:
-            pr = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, pr_number)).data or {}
-        except GitHubError as err:
-            _say("could not read %s#%d for its Luna review brief: %s" % (repo, pr_number, err))
-            return False
-        head = pr.get("head") or {}
-        base = pr.get("base") or {}
-        if (str(head.get("sha") or "") != sha or not head.get("ref") or not base.get("ref")):
-            return False
-        stamp = int(self.now)
-        text = tickets.render_review_brief(
-            repo, issue, factory.LUNA_REVIEW_LANE, stamp, pr_number,
-            str(head["ref"]), str(base["ref"]), sha)
-        claiming = self._write_brief(
-            factory.LUNA_REVIEW_LANE,
-            tickets.review_name(repo, int(issue["number"]), stamp), text)
-        os.replace(claiming, claiming[:-len(".claiming")] + ".md")
-        _say("handed %s#%d head %s to lane %s to review"
-             % (repo, pr_number, sha[:12], factory.LUNA_REVIEW_LANE))
-        return True
-
-    # -- the review sweep (bus/review_sweep.py) ---------------------------
     def sweep_reviews(self) -> None:
         """At most once per LOOM_REVIEW_SWEEP_EVERY seconds, hand each open
         pull request with no independent verdict on its head to a review
@@ -4820,7 +4817,7 @@ class Station:
                 self._adapter_verify_section(repo)
             return False
         live = brain.live_criterion(issue.get("body"), limit=None)
-        text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live)
+        text, seen, reported = evidence.gather_window(self.s.evidence_cmds, repo, live, self.now)
         number = int(issue["number"])
         names = _label_names(issue)
         absence = evidence.is_absence(live)
@@ -4989,7 +4986,7 @@ class Station:
         if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
-            self._adapter_human_ask(repo, number, "no adapter_step was returned",
+            self._adapter_verify_gap(repo, number, "no adapter_step was returned",
                                     reason or "the verify answer did not contain a step")
             return True
         if result is not None and set(result) == {"adapter_step"}:
@@ -5031,34 +5028,14 @@ class Station:
                                  VERIFY_INTERVAL // 3600))
         return True
 
-    def _adapter_human_ask(self, repo: str, number: int, step: str, reason: Any) -> None:
-        """Ask once when an adapter verify run could not supply station proof."""
+    def _adapter_verify_gap(self, repo: str, number: int, step: str, reason: Any) -> None:
+        """Record a failed adapter proof for the verify queue."""
         issue = self._issue(repo, number)
-        names = _label_names(issue)
-        if needs_human(names):
+        if not _verify_active(issue):
             return
-        body = str(issue.get("body") or "")
-        gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
-        if criteria_gate.live_wait(names, gaps, [body]):
-            # A LIVE WAIT IS NOT ON THE HUMAN LINE (loom#2872). A ticket that
-            # waits on a live event (a wait:* label, or awaiting-live-check or
-            # a stated waiting line with only live boxes open) stays shipped
-            # in the verify queue; the missing check is a status line, not a
-            # person label. Only a box that needs an operator action asks.
-            self._verify_note(repo, number, "adapter", "no read-only check named for its "
-                              "live wait (%s: %s)" % (self._note_text(step),
-                                                      self._note_text(reason)))
-            return
-        if self._asked_already(repo, number, body, gaps):
-            # Asked for these same criteria and a brain or operator took the
-            # label off: it is not added back until the criteria change.
-            return
-        ask = ("Kind: decision\nThe station could not verify the prose Live criterion. "
-               "Step tried: %s. Reason: %s. Restate the criterion with a safe "
-               "read-only check or resolve it by hand." %
-               (self._note_text(step), self._note_text(reason)))
-        brain.human(self.gh, repo, number, ask)
-        self._record_ask(repo, number, body)
+        self._note_missing_live(repo, number, "adapter proof (%s): %s" %
+                                (self._note_text(step), self._note_text(reason)))
+        self._ask_operator_criteria(repo, issue)
 
     def _apply_adapter_verify(self, repo: str, number: int, answer: Any) -> None:
         """Run a verify lane's proposed adapter step and close only on its own read."""
@@ -5078,7 +5055,7 @@ class Station:
                              live: str) -> Optional[live_proof.Step]:
         """Validate a lane's proposed adapter step without trusting its result."""
         if not isinstance(answer, dict) or set(answer) != {"criterion", "step", "strings"}:
-            self._adapter_human_ask(repo, number, "invalid adapter_step", "the answer shape is invalid")
+            self._adapter_verify_gap(repo, number, "invalid adapter_step", "the answer shape is invalid")
             return None
         strings = answer["strings"]
         if (answer["criterion"] != live or not isinstance(strings, list)
@@ -5086,13 +5063,13 @@ class Station:
                 or not all(isinstance(x, str) and x.isascii() and len(x) <= 120
                            and x.strip() and "\n" not in x and "\r" not in x
                            for x in strings)):
-            self._adapter_human_ask(repo, number, str(answer.get("step")),
+            self._adapter_verify_gap(repo, number, str(answer.get("step")),
                                     "the step needs this exact Live criterion and one to five "
                                     "short ASCII strings")
             return None
         raw = answer["step"]
         if not isinstance(raw, str) or ":" not in raw:
-            self._adapter_human_ask(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
+            self._adapter_verify_gap(repo, number, str(raw), "the step is not log:<source> or sql:<SELECT>")
             return None
         kind, target = raw.split(":", 1)
         strings = tuple(strings)
@@ -5101,7 +5078,7 @@ class Station:
                                    source=target)
         if kind == "sql":
             return live_proof.Step(live_proof.QUERY, target, strings, 0, source="adapter")
-        self._adapter_human_ask(repo, number, raw, "the step kind is unsupported")
+        self._adapter_verify_gap(repo, number, raw, "the step kind is unsupported")
         return None
 
     def _apply_adapter_step(self, repo: str, number: int, issue: Dict[str, Any],
@@ -5112,7 +5089,7 @@ class Station:
         passed, evidence_text = live_proof.run(step, self._shipped_stamp(repo, issue), sources,
                                                now=self.now)
         if not passed:
-            self._adapter_human_ask(repo, number, raw, evidence_text)
+            self._adapter_verify_gap(repo, number, raw, evidence_text)
             return
         outcome = live_proof.prove(body, self._shipped_stamp(repo, issue), sources,
                                    now=self.now, passed=self._live_passed(
@@ -5149,73 +5126,56 @@ class Station:
             out.append(item)
         return out
 
-    @staticmethod
-    def _finding_line(finding: Dict[str, Any]) -> str:
-        where = ""
-        if "file" in finding:
-            where = "`%s`%s: " % (finding["file"],
-                                  " (line %d)" % finding["line"] if "line" in finding else "")
-        return where + finding["finding"]
-
     def _report_review(self, lane: str, kind: str, repo: str, number: int,
                        name: str, text: str) -> bool:
-        """Apply a finished Luna review run (loom#2142): post the lane's
-        review.json on the pull request as a verdict in the Elder's markings
-        shape, with its blocking findings as review threads when they name a
-        file and a line, so the factory's gate and fix rounds read them
-        exactly like the review bot's own. A failed run, an unreadable
-        result or a result in the wrong shape posts nothing: the factory
-        dispatches again after its retry window. A result also posts
-        nothing when it did not come from the review slot's own Luna run:
-        the gate trusts the posted verdict, so no other lane or model may
-        speak it.
-
-        Two kinds of review run report here. A sweep run (one the station's
+        """Apply a finished review run. Only a sweep run (one the station's
         review sweep dispatched, by its own record of the brief: never a
-        line of the brief's text, which carries a pull request body) is
-        posted by the lane's reviewer App as a formal review
+        line of the brief's text, which carries a pull request body) posts:
+        the lane's reviewer App posts it as a formal review
         (_post_sweep_review), and only from the lane the record names,
         running that lane's model (review_sweep.model_ok). Any other review
-        run is a degraded-Elder Luna run: posted as the station's Luna
-        verdict only from the Luna slot on gpt-6-luna. The pull request and
-        head come from the brief's header block only."""
+        run posts nothing: review is the review bot's alone (2026-11-16),
+        and the degraded-Elder Luna fallback that once posted such runs is
+        gone. A failed run, an unreadable result or a result in the wrong
+        shape posts nothing either. The pull request and head come from the
+        brief's header block only."""
         if kind == "failed":
             _say("review run %s on lane %s failed; %s#%d keeps waiting for "
                  "a verdict" % (name, lane, repo, number))
             return True
         header = text.split("\n## ", 1)[0]
         record = self._sweep_record(name)
-        if not self._review_run_trusted(lane, name, header, record):
+        if record is None:
+            self._say_unswept(name, header)
+            return True
+        if not self._review_run_trusted(lane, name, record):
             return True
         found = self._review_result(lane, name, header)
         if found is None:
             return True
         pr_number, sha, blocking, notes, summary = found
-        if record is not None:
-            if (record.get("sha"), record.get("number")) != (sha, pr_number):
-                _say("review run %s names %s#%d head %s, not what the sweep sent; "
-                     "nothing posted" % (name, repo, pr_number, sha[:12]))
-                return True
-            self._post_sweep_review(lane, repo, pr_number, sha, (blocking, notes, summary))
+        if (record.get("sha"), record.get("number")) != (sha, pr_number):
+            _say("review run %s names %s#%d head %s, not what the sweep sent; "
+                 "nothing posted" % (name, repo, pr_number, sha[:12]))
             return True
-        self._post_luna_verdict(lane, repo, pr_number, sha, blocking, notes, summary)
+        self._post_sweep_review(lane, repo, pr_number, sha, (blocking, notes, summary))
         return True
 
-    def _review_run_trusted(self, lane: str, name: str, header: str,
-                            record: Optional[Dict[str, Any]]) -> bool:
-        """Whether a review run may speak: a sweep run from the lane the
-        sweep sent it to, on that lane's model; any other run from the Luna
-        slot on gpt-6-luna. Says why not."""
-        model = self._review_model(lane, name)
-        if record is None and self._field(header, "Review-Mode") == "sweep":
+    def _say_unswept(self, name: str, header: str) -> None:
+        """Say why a review run the sweep has no record of posts nothing."""
+        if self._field(header, "Review-Mode") == "sweep":
             _say("review run %s is marked as a sweep review the sweep has no record "
                  "of; its verdict is not posted" % name)
-            return False
-        if record is not None:
-            trusted = (record.get("lane") == lane and lane in self.s.review_sweep.lanes
-                       and review_sweep_mod.model_ok(lane, model, self.s.review_sweep))
         else:
-            trusted = lane == factory.LUNA_REVIEW_LANE and model == factory.LUNA_MODEL
+            _say("review run %s was not dispatched by the review sweep; review is "
+                 "the review bot's alone, so nothing is posted" % name)
+
+    def _review_run_trusted(self, lane: str, name: str, record: Dict[str, Any]) -> bool:
+        """Whether a sweep run may speak: from the lane the sweep sent it
+        to, on that lane's model. Says why not."""
+        model = self._review_model(lane, name)
+        trusted = (record.get("lane") == lane and lane in self.s.review_sweep.lanes
+                   and review_sweep_mod.model_ok(lane, model, self.s.review_sweep))
         if not trusted:
             _say("review run %s on lane %s (model %s) is not from the lane and model "
                  "its brief went to; its verdict is not posted" % (name, lane, model or "none"))
@@ -5241,68 +5201,25 @@ class Station:
             return None
         return int(pr_field), sha, blocking, notes, summary
 
-    def _post_luna_verdict(self, lane: str, repo: str, pr_number: int, sha: str,
-                           blocking: List[Dict[str, Any]], notes: List[Dict[str, Any]],
-                           summary: str) -> None:
-        """The degraded-Elder Luna verdict: a station comment in the Elder's
-        markings shape, read by the factory's gate for this head only."""
-        # Each anchored blocking finding becomes a review thread of its own
-        # (one pulls/comments post per finding), so the factory's fix rounds
-        # and rebuttal reads meet them exactly like the review bot's threads.
-        for finding in [f for f in blocking if "file" in f and "line" in f]:
-            if not notify.visible_text(finding.get("finding")):
-                _say("a Luna finding on %s#%d has no visible text; no review thread "
-                     "posted for it" % (repo, pr_number))
-                continue
-            try:
-                self.gh.rest("POST", "/repos/%s/pulls/%d/comments" % (repo, pr_number), {
-                    "commit_id": sha, "path": finding["file"],
-                    "line": finding["line"], "side": "RIGHT",
-                    "body": finding["finding"]})
-            except GitHubError as err:
-                _say("could not post a Luna review thread on %s#%d (%s); the "
-                     "finding still lands in the verdict comment" % (repo, pr_number, err))
-        lines = [factory.LUNA_REVIEW_MARKER % sha,
-                 "Elder markings - %d blocking, %d total"
-                 % (len(blocking), len(blocking) + len(notes)),
-                 "", " ".join(summary.split())[:1000] or "The lane gave no summary.",
-                 "",
-                 "This verdict comes from a Codex Luna review (lane %s, gpt-6-luna "
-                 "through `codex exec`) while the Elder review route is degraded. "
-                 "The merge gate reads it for this head in the degraded check's "
-                 "place." % lane]
-        if blocking:
-            lines += ["", "Blocking findings:"] + \
-                     ["- " + self._finding_line(f) for f in blocking]
-        if notes:
-            lines += ["", "Notes:"] + ["- " + self._finding_line(f) for f in notes]
-        try:
-            notify.post(self.gh, repo, pr_number, "\n".join(lines), notify.RECORD)
-        except GitHubError as err:
-            _say("could not post the Luna verdict on %s#%d (%s)" % (repo, pr_number, err))
-            return
-        _say("posted the Luna verdict on %s#%d: %d blocking, %d total"
-             % (repo, pr_number, len(blocking), len(blocking) + len(notes)))
-
     def _refute_merged(self, lane: str, repo: str, number: int, why: Any) -> None:
         """A verify run's answer that the merged change does not meet the
         criteria (loom#1385). It counts only for a ticket the station sent to
         verification before any build (_verify_before_build): the ticket goes
         back to loom:queued for a build, with the reason as a status event
         naming the pull request, and that pull request is not sent to a verify
-        run again (tickets.judged_pulls). Any other ticket stays shipped."""
+        run again (tickets.judged_pulls). Other tickets keep their finding in
+        the shipped verify queue."""
         issue = self._issue(repo, number)
         names = _label_names(issue)
         if issue.get("state") != "open" or "loom:shipped" not in names or "loom:verified" in names:
             _say("%s#%d is no longer shipped; its verify result is dropped" % (repo, number))
             return
-        sent = tickets.pending_verifies(self._status_texts(repo, number))
-        if not sent:
-            self._verify_note(repo, number, lane, "It said the merged change does not meet the "
-                              "criteria, but no merged pull request was sent to it before a build")
-            return
         if not isinstance(why, str) or len(why.strip()) < MISSING_MIN:
             self._verify_note(repo, number, lane, "Its unmet answer does not say what is unmet")
+            return
+        sent = tickets.pending_verifies(self._status_texts(repo, number))
+        if not sent:
+            self._routine(repo, number, "Verify finding: " + self._note_text(why))
             return
         states = {"loom:" + state for state in brain.STATES}
         labels = [n for n in names if n not in states and not n.startswith(WAIT)
@@ -11195,7 +11112,14 @@ class Station:
         """A person can act on this ask today: it is not answered in the
         ticket and waits on nothing else. The digest only reads; the label
         pass (clean_labels) takes the label off."""
-        return ask_state.state(issue, *self._ask_inputs(repo, issue)) == ask_state.OPEN
+        inputs = self._ask_inputs(repo, issue)
+        comments, _, trusted, _, _, _ = inputs
+        if "loom:shipped" in _label_names(issue) and not criteria_gate.open_operator_criteria(
+                str(issue.get("body") or "")):
+            latest = answer.latest_ask(comments, trusted)
+            if latest and criteria_gate.is_verification_ask(latest.get("body")):
+                return False
+        return ask_state.state(issue, *inputs) == ask_state.OPEN
 
     def _new_digest_plan(self, keyed: List[Tuple[str, str, Dict[str, Any]]],
                          covered: Any, today: str) -> Optional[Dict[str, Any]]:
@@ -12290,7 +12214,10 @@ class Station:
                 if verdict != evidence_close.OTHER:
                     continue
                 why = self._done_reason(issue, self._earliest_record(repo, issue, log_root))
-                if not why or self._evidence_holds(repo, issue):
+                if not why:
+                    self._ask_operator_criteria(repo, issue)
+                    continue
+                if self._evidence_holds(repo, issue):
                     continue
                 if self._close_done_ticket(repo, issue, why):
                     left -= 1
@@ -12515,13 +12442,10 @@ class Station:
         return keys
 
     def _run_live_checks(self, repo: str, number: int,
-                         gaps: Sequence[Tuple[str, str]]) -> Dict[str, str]:
-        """Run the runnable checks of the ticket's unverified live criteria
-        that are due, record each result in the station's state and the
-        ticket's status, and return what each failed one saw, by key."""
+                         gaps: Sequence[Tuple[str, str]]) -> None:
+        """Run due live checks and record each result in state and on the ticket."""
         state = self._live_checks()
         mine = state.setdefault("%s#%d" % (repo, number), {})
-        failed: Dict[str, str] = {}
         for found, text in gaps:
             check = criteria_gate.check_of(text) if found == criteria_gate.LIVE else None
             k = criteria_gate.key(text)
@@ -12538,9 +12462,6 @@ class Station:
                 _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
                 self._routine(repo, number, "Live check %s: `%s` (%s) for: %s" % (
                     last["result"], check.target, seen, _clip(" ".join(text.split()), 160)))
-            if last.get("result") == "fail":
-                failed[k] = "its check failed: %s" % last.get("seen")
-        return failed
 
     def _proof_sources(self, repo: str) -> live_proof.Sources:
         """Where the live proof reads: the repo's configured evidence command
@@ -12786,15 +12707,8 @@ class Station:
         state[LIVE_ASKED_KEY] = asked
         _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
 
-    def _asked_already(self, repo: str, number: int, body: str,
-                       gaps: Sequence[Tuple[str, str]]) -> bool:
-        """Whether the verification ask must not be made now (loom#2805):
-        it was made for these same criteria, and a brain or operator has
-        since taken the person label off; or a trusted comment states a
-        `waiting:` line on a ticket whose gaps are all live. An ask the
-        station made before it kept this record counts as made for the
-        criteria it finds now: re-adding the label a brain removed sent a
-        settled live wait back to the operator."""
+    def _asked_already(self, repo: str, number: int, body: str) -> bool:
+        """Whether these operator criteria were already asked about."""
         asked = self._live_checks().get(LIVE_ASKED_KEY)
         asked = asked if isinstance(asked, dict) else {}
         made = asked.get("%s#%d" % (repo, number))
@@ -12809,22 +12723,17 @@ class Station:
         except GitHubError as err:
             _say("could not read the comments of %s#%d before asking: %s" % (repo, number, err))
             return True
-        mine = [c for c in comments if isinstance(c, dict)
-                and brain.comment_login(c).lower() in trusted]
-        if criteria_gate.live_wait([], gaps, [c.get("body") for c in mine]):
-            return True
-        if made is None and any(criteria_gate.is_verification_ask(c.get("body")) for c in mine):
+        latest = answer.latest_ask(comments, trusted)
+        if (made is None and latest
+                and criteria_gate.OPERATOR_ASK_OPENING in str(latest.get("body") or "")):
             self._record_ask(repo, number, body)
             return True
         return False
 
     def _evidence_holds(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a done ticket stays open because a live or operator
-        criterion has no evidence (bus/criteria_gate.py): a live one with a
-        check Loom can run gets the check; one with none, a failed check, or
-        an operator action sends the ticket to needs:human with one ask, once.
-        2026-10-22 audit: at least 12 tickets of the private deployment repo
-        closed shipped on green CI with live criteria never checked."""
+        criterion has no evidence. Live gaps stay in the verify queue.
+        Unticked operator criteria get one ask."""
         number = int(issue["number"])
         body = str(issue.get("body") or "")
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
@@ -12832,30 +12741,53 @@ class Station:
             return False
         if any(found == criteria_gate.LIVE and self._adapter_can_verify(repo, issue)
                for found, _ in gaps):
+            self._ask_operator_criteria(repo, issue)
             return True
-        failed = self._run_live_checks(repo, number, gaps)
+        self._run_live_checks(repo, number, gaps)
         gaps = criteria_gate.unverified(body, self._live_passed(repo, number, body))
         if not gaps:
             return False
-        waiting = [t for k, t in gaps if k == criteria_gate.LIVE
-                   and criteria_gate.check_of(t) is not None
-                   and criteria_gate.key(t) not in failed]
+        missing = [text for kind, text in gaps if kind == criteria_gate.LIVE
+                   and criteria_gate.check_of(text) is None]
+        if missing:
+            self._note_missing_live(repo, number, "no check Loom can run for " + "; ".join(
+                _clip(self._note_text(" ".join(text.split())), criteria_gate.ASK_WIDTH)
+                for text in missing[:criteria_gate.ASK_SHOWN]))
+        self._ask_operator_criteria(repo, issue)
+        return True
+
+    def _note_missing_live(self, repo: str, number: int, reason: str) -> None:
+        """Record a live finding once while the ticket stays shipped."""
+        state = self._live_checks()
+        mine = state.setdefault("%s#%d" % (repo, number), {})
+        if mine.get("_missing_note") == reason:
+            return
+        self._routine(repo, number, "Missing evidence: " + reason)
+        mine["_missing_note"] = reason
+        _write_json(os.path.join(self.state, LIVE_CHECKS_FILE), state)
+
+    def _ask_operator_criteria(self, repo: str, issue: Dict[str, Any]) -> None:
         names = _label_names(issue)
-        if waiting or needs_human(names) or criteria_gate.live_wait(names, gaps, [body]):
-            return True
-        if self._asked_already(repo, number, body, gaps) or not self._live_ask_room():
-            return True
+        if (not _verify_active(issue) or needs_human(names)
+                or any(n.startswith(WAIT) or n in CLOSE_DONE_HOLDS for n in names)):
+            return
+        body = str(issue.get("body") or "")
+        criteria = criteria_gate.open_operator_criteria(body)
+        if not criteria:
+            return
+        number = int(issue["number"])
+        if self._asked_already(repo, number, body) or not self._live_ask_room():
+            return
         try:
-            brain.human(self.gh, repo, number, criteria_gate.ask(gaps, failed))
+            brain.human(self.gh, repo, number, criteria_gate.ask(criteria))
         except RateLimited:
             raise
         except (ValueError, GitHubError) as err:
             _say("could not ask about the unverified criteria of %s#%d: %s" % (repo, number, err))
-            return True
+            return
         self._record_ask(repo, number, body)
         _say("held done %s#%d for the operator: %d criteria have no evidence"
-             % (repo, number, len(gaps)))
-        return True
+             % (repo, number, len(criteria)))
 
     def _close_done_ticket(self, repo: str, issue: Dict[str, Any],
                            reason: str, unproven: bool = False) -> bool:
@@ -12968,7 +12900,8 @@ class Station:
             self._paginate("/repos/%s/issues/%d/comments" % (repo, number)), self.s.authors)
         bodies = [str(c.get("body") or "") for c in comments]
         ask = next((b for b in reversed(bodies) if b.startswith(HUMAN_MARKER)), "")
-        if not criteria_gate.is_verification_ask(ask):
+        operator_opening = "%s\n%s:" % (HUMAN_MARKER, criteria_gate.OPERATOR_ASK_OPENING)
+        if not (ask.startswith(operator_opening) or criteria_gate.is_verification_ask(ask)):
             return False
         note = ("Verification ask withdrawn. Ticket #%d is open and carries the work "
                 "from this source issue." % ticket)
@@ -16495,8 +16428,7 @@ class Station:
                                benched=pairs,
                                limit_until=self.limit_until(),
                                known_waits=self._saved_waits(),
-                               no_lane_since=self._no_lane_since(),
-                               review_brief=self._write_review_brief, **extra)
+                               no_lane_since=self._no_lane_since(), **extra)
 
     def _load_factory(self) -> factory.Factory:
         """The factory for the steps that count lane load (run and
@@ -17811,7 +17743,19 @@ class Station:
             # has a bug. Name the fault without logging private error details.
             _say("operator budget sampler failed: %s" % type(err).__name__)
 
+    def capture_pod_logs(self) -> None:
+        for source in self.s.log_sources:
+            try:
+                path = log_capture.capture_path(self.s.home, source.name)
+                first = log_capture.update(path, source, self.now, self.s.log_capture_hours)
+            except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as err:
+                _say("log capture: %s could not refresh (%s)" % (source.name, type(err).__name__))
+                continue
+            if first:
+                _say("log capture: %s holds logs from %s" % (source.name, first))
+
     def run_pass(self) -> None:
+        self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
             return

@@ -1,8 +1,7 @@
 """The review sweep: independent reviews for open pull requests.
 
-Open pull requests waited days for a review from a fleet reviewer App,
-since the factory's own review slot (the Luna review, bus/factory.py) runs
-only while the Elder review check is degraded. The station's sweep_reviews
+Open pull requests waited days for a review from a fleet reviewer App. The
+station's sweep_reviews
 duty lists the open, non-draft pull requests of each LOOM_REPOS repo once
 per LOOM_REVIEW_SWEEP_EVERY seconds and hands each one with no independent
 verdict on its head to a review lane (LOOM_REVIEW_LANES). The lane writes

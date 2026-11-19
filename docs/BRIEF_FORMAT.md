@@ -59,10 +59,11 @@ and writes `verify.json`; the runner copies it to the lane's log folder, moves
 the brief to `done/`, and opens no pull request (docs/LANES.md, "Verify runs").
 
 `Deliverable: review` is written only by the station (a ticket cannot ask for
-it) and hands a lane one pull request to review when the normal review route
-is degraded. The agent changes no code and writes `review.json`; the runner
-copies it to the lane's log folder, moves the brief to `done/`, and opens no
-pull request (docs/LANES.md, "Elder fallback reviews").
+it) and hands a lane one pull request to review for the station's review
+sweep. The agent changes no code and writes
+`review.json`; the runner copies it to the lane's log folder, moves the
+brief to `done/`, and opens no pull request (docs/LANES.md, "The review
+sweep").
 
 `Deliverable: base-check` is written only by the station (a ticket cannot ask
 for it) for a repo an open base-check incident holds. The runner runs setup

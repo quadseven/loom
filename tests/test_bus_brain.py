@@ -2829,16 +2829,21 @@ def fix_ticket(*states):
     return {"state": "open", "labels": [{"name": n} for n in names]}
 
 
-class LunaMergeTests(unittest.TestCase):
-    """A clean Luna verdict in the real brain.merge (loom#2575): the factory
-    clears the fault on a clean Luna verdict for a degraded review check and
-    calls brain.merge, which used to refuse the head on every pass because
-    the rollup is still FAILURE. These tests run the real merge, risk tier
-    included; nothing on the merge path is stood in for."""
+# The comment the removed Codex Luna fallback posted for head "checked".
+OLD_LUNA_VERDICT = ("<!-- loom:luna-review v1 sha=checked -->\n"
+                    "Elder markings - 0 blocking, 2 total\n\nThe change is sound.")
+
+
+class DegradedReviewMergeTests(unittest.TestCase):
+    """A degraded review check in the real brain.merge: review is the review
+    bot's alone (operator decision, 2026-11-16), so a degraded check keeps
+    the merge refused until the check reruns, and the comment the removed
+    Codex Luna fallback posted no longer stands in for it. These tests run
+    the real merge, risk tier included; nothing on the merge path is stood
+    in for."""
 
     # The merging client writes as example-station (LOOM_GITHUB_LOGIN on a
-    # personal-token client): the station posts the Luna verdict and calls
-    # brain.merge with the same client, so only that login's verdict counts.
+    # personal-token client), the login that once posted the Luna verdict.
     ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane example-station",
            "LOOM_GITHUB_LOGIN": "example-station", "LOOM_MERGE_SETTLE_SECONDS": "0"}
     DEGRADED = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
@@ -2855,8 +2860,7 @@ class LunaMergeTests(unittest.TestCase):
 
     def setUp(self):
         self.runs = [dict(self.GREEN), dict(self.DEGRADED)]
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
-                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
+        self.verdict = OLD_LUNA_VERDICT
         self.verdict_user = "example-station"
         self.pr_comments = None
         self.combined = {"state": "success", "total_count": 0, "statuses": []}
@@ -2941,96 +2945,20 @@ class LunaMergeTests(unittest.TestCase):
         return brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
                            env=dict(self.ENV, **env))
 
-    def test_a_clean_luna_verdict_merges_through_the_real_merge(self):
-        result = self.merge()
-        self.assertTrue(result["merged"])
-        self.assertEqual(self.merges, [{"merge_method": "squash", "sha": "checked"}])
-        self.assertEqual(self.labels[-1], ["loom:ticket", "loom:merged"])
-
-    def test_a_blocking_luna_verdict_still_refuses(self):
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "checked" +
-                        "\nElder markings - 2 blocking, 3 total\n\nTwo findings block.")
+    def test_an_old_luna_verdict_does_not_stand_in_for_a_degraded_check(self):
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
 
-    def test_a_clean_luna_verdict_does_not_excuse_a_real_review_failure(self):
-        self.runs = [dict(self.GREEN), dict(self.FINDINGS)]
+    def test_a_degraded_check_alone_refuses_the_merge(self):
+        self.pr_comments = []
         with self.assertRaisesRegex(ValueError, "checks are not successful"):
             self.merge()
         self.assertEqual(self.merges, [])
 
-    def test_a_clean_luna_verdict_does_not_excuse_another_failing_check(self):
-        self.runs = [dict(self.GREEN, conclusion="failure"), dict(self.DEGRADED)]
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_an_untrusted_luna_verdict_still_refuses(self):
-        self.verdict_user = "mallory-example"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_trusted_comment_without_a_verdict_still_refuses(self):
-        # Ordinary trusted text is not a verdict: no marker and no markings
-        # line, so nothing stands in for the degraded check.
-        self.verdict = "Looked at this head myself; it reads fine to me."
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_verdict_from_the_pull_requests_own_author_still_refuses(self):
-        # The verdict is the station's word: a clean verdict the change's own
-        # author posted for its own head never stands in, trusted or not.
-        self.verdict_user = "example-lane"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_newer_blocking_verdict_replaces_an_older_clean_one(self):
-        self.pr_comments = [
-            {"body": self.verdict, "user": {"login": "example-station"}},
-            {"body": factory.LUNA_REVIEW_MARKER % "checked" +
-                     "\nElder markings - 1 blocking, 2 total\n\nOne finding blocks.",
-             "user": {"login": "example-station"}}]
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_clean_verdict_from_another_trusted_login_still_refuses(self):
-        # Only the station that ran the Luna slot posts its verdict: a clean
-        # marker from any other trusted login (the brain App, another fleet
-        # agent) is not that verdict and never stands in.
-        self.verdict_user = "example-brain"
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_no_known_writer_login_refuses_every_verdict(self):
-        # A client whose own login is unknown cannot tell the station's
-        # verdict from anyone else's, so the Luna path fails closed.
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge(LOOM_GITHUB_LOGIN="")
-        self.assertEqual(self.merges, [])
-
-    def test_a_clean_verdict_for_an_older_head_still_refuses(self):
-        # The verdict is bound to the head it reviewed: a clean verdict for
-        # an earlier head says nothing about the commits pushed since.
-        self.verdict = (factory.LUNA_REVIEW_MARKER % "older" +
-                        "\nElder markings - 0 blocking, 2 total\n\nThe change is sound.")
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
-
-    def test_a_failing_commit_status_beside_the_degraded_check_still_refuses(self):
-        # The rollup reads commit statuses too: a red status beside the
-        # degraded review check is not the review check's to excuse.
-        self.combined = {"state": "failure", "total_count": 1,
-                         "statuses": [{"context": "legacy-ci", "state": "failure"}]}
-        with self.assertRaisesRegex(ValueError, "checks are not successful"):
-            self.merge()
-        self.assertEqual(self.merges, [])
+    def test_the_merge_no_longer_reads_a_stand_in(self):
+        self.assertFalse(hasattr(brain, "_luna_stands_in"))
+        self.assertFalse(hasattr(brain, "_clean_luna_verdict"))
 
 
 class FixTests(unittest.TestCase):
@@ -4755,6 +4683,22 @@ class VerifyDueTests(unittest.TestCase):
         found = [int(x.split("#")[1].split()[0]) for x in out.splitlines() if x.startswith("- resume verify")]
         self.assertEqual([8, 7, 6, 5, 4], found)
         self.assertIn("shipped 10h ago: Live: the dashboard", out)
+
+    def test_resume_hands_unclaimed_live_gaps_to_the_brain_before_a_day(self):
+        tickets = [self.issue(n, body="## Acceptance criteria\n- [ ] Tests")
+                   for n in range(1, 7)]
+        live = "Verify the deployed dashboard shows the new column."
+        tickets.append(self.issue(7, body="## Acceptance criteria\n- [ ] " + live))
+        claimed = self.issue(8, body=tickets[-1]["body"])
+        claimed["labels"].append({"name": "claim:another-brain"})
+        tickets.append(claimed)
+        now = self.NOW + timedelta(hours=12)
+        shipped = dict.fromkeys(range(1, 7), 0) | {7: 1, 8: 1}
+        out = "\n".join(brain._verify_resume_lines(self.gh(tickets, shipped), [REPO], now))
+        self.assertIn("resume verify %s#7 shipped 23h ago: %s" % (REPO, live), out)
+        self.assertNotIn("resume verify %s#8" % REPO, out)
+        self.assertIn("Read logs, the running system, or code", out)
+        self.assertIn("record what you observed", out)
 
     def test_status_prints_the_section(self):
         issues = [self.issue(5)]
