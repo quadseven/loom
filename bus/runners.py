@@ -66,6 +66,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
 from .github import RateLimited
+from .github import GitHubError
 from .labels import LANES
 
 WORKFLOW = "lane.yml"
@@ -785,12 +786,8 @@ class Runners:
 
     # -- a lost cluster runner ----------------------------------------------
     def _runner_lost(self, entry: Dict[str, Any]) -> bool:
-        """Whether a job annotation of the entry's run says the self-hosted
-        runner lost communication with the server, read as the brief names
-        it: the run's jobs (GET .../actions/runs/RUN/jobs), then each job's
-        annotations (GET .../check-runs/JOB/annotations). A read that fails
-        says not lost: the run then parks with the bare no-report reason,
-        as before, and dispatch reads the same APIs either way."""
+        """Check the run's jobs for runner-loss annotations. An ordinary
+        GitHub read failure leaves the run to park with the no-report reason."""
         run = entry.get("run")
         if not isinstance(run, int) or isinstance(run, bool):
             return False
@@ -800,29 +797,31 @@ class Runners:
             jobs = data.get("jobs") if isinstance(data, dict) else None
             if not isinstance(jobs, list):
                 return False
-            for job in jobs:
-                if not isinstance(job, dict):
-                    continue
-                check = str(job.get("check_run_url") or "").rsplit("/", 1)[-1] \
-                    or str(job.get("id") or "")
-                if not check.isdigit():
-                    continue
-                path = "/repos/%s/check-runs/%s/annotations?per_page=100" % (self.repo, check)
-                paginate = getattr(self.gh, "paginate", None)
-                if callable(paginate):
-                    notes = paginate(path)
-                else:
-                    notes = self.gh.rest("GET", path).data
-                for note in notes or []:
-                    if not isinstance(note, dict):
-                        continue
-                    text = "%s %s" % (note.get("title") or "", note.get("message") or "")
-                    if LOST_TEXT in text:
-                        return True
+            return any(self._job_reports_runner_loss(job) for job in jobs
+                       if isinstance(job, dict))
         except RateLimited:
             raise
-        except Exception:  # noqa: BLE001 - an unreadable annotation read is not a loss
+        except GitHubError:
             return False
+
+    def _job_reports_runner_loss(self, job: Dict[str, Any]) -> bool:
+        """Read a job's check-run annotations and look for the runner-loss text."""
+        check = (str(job.get("check_run_url") or "").rsplit("/", 1)[-1]
+                 or str(job.get("id") or ""))
+        if not check.isdigit():
+            return False
+        path = "/repos/%s/check-runs/%s/annotations?per_page=100" % (self.repo, check)
+        paginate = getattr(self.gh, "paginate", None)
+        if callable(paginate):
+            notes = paginate(path)
+        else:
+            notes = self.gh.rest("GET", path).data
+        for note in notes or []:
+            if not isinstance(note, dict):
+                continue
+            text = "%s %s" % (note.get("title") or "", note.get("message") or "")
+            if LOST_TEXT in text:
+                return True
         return False
 
     def _note_lost(self, ledger: Dict[str, Any]) -> None:

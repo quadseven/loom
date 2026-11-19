@@ -11,12 +11,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bus import runners  # noqa: E402
-from bus.github import Response  # noqa: E402
+from bus.github import GitHubError, RateLimited, Response  # noqa: E402
 from tests.test_runners import APP, BRIEF, REPO, TICKET, FakeGitHub  # noqa: E402
 
 LOST = "The self-hosted runner lost communication with the server."
@@ -115,6 +116,23 @@ class RunnerLostTest(unittest.TestCase):
         self.collect_lost(TICKET, run=903)
         self.assertIn("the runner run ended failure with no report", self.failure_line())
         self.assertNotIn("cluster dispatch paused", " ".join(self.said))
+
+    def test_an_annotation_read_failure_keeps_the_no_report_reason(self):
+        with mock.patch.object(self.gh, "paginate", side_effect=GitHubError("unavailable", 503)):
+            self.collect_lost(TICKET, run=903)
+        self.assertIn("the runner run ended failure with no report", self.failure_line())
+
+    def test_unexpected_annotation_errors_surface(self):
+        with mock.patch.object(self.gh, "paginate", side_effect=AttributeError("bad response")):
+            with self.assertRaisesRegex(AttributeError, "bad response"):
+                self.collect_lost(TICKET, run=903)
+        self.assertTrue((self.inbox / (TICKET + ".md")).exists())
+
+    def test_an_annotation_rate_limit_surfaces(self):
+        limited = RateLimited("budget", 429, "", int(self.now + 60))
+        with mock.patch.object(self.gh, "paginate", side_effect=limited):
+            with self.assertRaises(RateLimited):
+                self.collect_lost(TICKET, run=903)
 
 
 if __name__ == "__main__":
