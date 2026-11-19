@@ -18,7 +18,10 @@ Rules:
 - A run that ends with no report, a run no runner takes within QUEUE_MAX, a
   dispatch with no answer or no run id, a run from elsewhere and a report
   that cannot be read or verified each park the brief [transient], so the
-  station re-briefs the ticket elsewhere.
+  station re-briefs the ticket elsewhere. A no-report run whose job
+  annotations say the runner lost communication parks with that loss and
+  its minutes named instead; two such losses in a row pause cluster
+  dispatch for an hour (CLUSTER_PAUSE_SECONDS).
 - A brief whose inputs exceed GitHub's INPUT_LIMIT, or that names a repo
   that is not public, is not dispatched: it is parked [transient] and the
   ticket goes to a local lane. Runner slots take public repos only, because
@@ -129,6 +132,12 @@ CANNOT_RUN = (125, 126, 127)
 CANNOT_RUN_MAX = 1
 # With no report from a slot for this long, a stopped repo gets one more run.
 IMAGE_PROBE = 86400
+# A job annotation carrying these words says the run's runner was lost.
+LOST_TEXT = "lost communication with the server"
+# Runner losses in a row, across every cluster slot, that pause dispatch.
+LOST_STREAK_MAX = 2
+# How long cluster dispatch stays paused after LOST_STREAK_MAX losses.
+CLUSTER_PAUSE_SECONDS = 3600
 # Ledger entries whose brief has left the inbox are dropped after this long.
 KEEP_SECONDS = 7 * 86400
 
@@ -352,7 +361,8 @@ class Runners:
             with open(self.ledger_path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return {"runs": {}, "holds": {}, "base_red": {}, "images": {}}
+            return {"runs": {}, "holds": {}, "base_red": {}, "images": {},
+                    "runner_lost_streak": 0, "cluster_paused_until": 0}
         except (OSError, ValueError) as err:
             raise ReportError("cannot read %s: %s" % (self.ledger_path, err)) from None
         if not isinstance(data, dict) or not isinstance(data.get("runs"), dict):
@@ -360,6 +370,8 @@ class Runners:
         data.setdefault("holds", {})
         data.setdefault("base_red", {})
         data.setdefault("images", {})
+        data.setdefault("runner_lost_streak", 0)
+        data.setdefault("cluster_paused_until", 0)
         return data
 
     def save(self, ledger: Dict[str, Any]) -> None:
@@ -387,8 +399,9 @@ class Runners:
                 self._follow(ledger, entry)
                 self.save(ledger)
         self._lift_setting_holds(ledger)
-        for slot in self.slots:
-            self._dispatch_slot(ledger, slot)
+        if not self._cluster_paused(ledger):
+            for slot in self.slots:
+                self._dispatch_slot(ledger, slot)
         for slot in self.slots:
             self._beat(ledger, slot)
         self._prune(ledger)
@@ -766,14 +779,95 @@ class Runners:
                       if name.endswith("_MODEL") and name.startswith(_prefix(slot))), "")
         return model.startswith("opencode-go/") and model.endswith("-free")
 
+    # -- a lost cluster runner ----------------------------------------------
+    def _runner_lost(self, entry: Dict[str, Any]) -> bool:
+        """Whether a job annotation of the entry's run says the self-hosted
+        runner lost communication with the server, read as the brief names
+        it: the run's jobs (GET .../actions/runs/RUN/jobs), then each job's
+        annotations (GET .../check-runs/JOB/annotations). A read that fails
+        says not lost: the run then parks with the bare no-report reason,
+        as before, and dispatch reads the same APIs either way."""
+        run = entry.get("run")
+        if not isinstance(run, int) or isinstance(run, bool):
+            return False
+        try:
+            data = self.gh.rest("GET", "/repos/%s/actions/runs/%d/jobs?per_page=100"
+                                % (self.repo, run)).data
+            jobs = data.get("jobs") if isinstance(data, dict) else None
+            if not isinstance(jobs, list):
+                return False
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                check = str(job.get("check_run_url") or "").rsplit("/", 1)[-1] \
+                    or str(job.get("id") or "")
+                if not check.isdigit():
+                    continue
+                path = "/repos/%s/check-runs/%s/annotations?per_page=100" % (self.repo, check)
+                paginate = getattr(self.gh, "paginate", None)
+                if callable(paginate):
+                    notes = paginate(path)
+                else:
+                    notes = self.gh.rest("GET", path).data
+                for note in notes or []:
+                    if not isinstance(note, dict):
+                        continue
+                    text = "%s %s" % (note.get("title") or "", note.get("message") or "")
+                    if LOST_TEXT in text:
+                        return True
+        except RateLimited:
+            raise
+        except Exception:  # noqa: BLE001 - an unreadable annotation read is not a loss
+            return False
+        return False
+
+    def _note_lost(self, ledger: Dict[str, Any]) -> None:
+        """Count one runner loss in the ledger's streak, across slots.
+        At LOST_STREAK_MAX in a row, pause cluster dispatch for
+        CLUSTER_PAUSE_SECONDS and say so once: a loss that lands while a
+        pause already runs neither extends it nor says it again. Saved
+        here, not only by tend's save, so a direct collect keeps it."""
+        streak = int(ledger.get("runner_lost_streak") or 0) + 1
+        ledger["runner_lost_streak"] = streak
+        if streak >= LOST_STREAK_MAX and not self._cluster_paused(ledger):
+            ledger["cluster_paused_until"] = self.now + CLUSTER_PAUSE_SECONDS
+            self.say("cluster dispatch paused: %d runner losses in a row" % LOST_STREAK_MAX)
+        self.save(ledger)
+
+    @staticmethod
+    def _note_not_lost(ledger: Dict[str, Any]) -> None:
+        """Any collected run that was not a runner loss breaks the streak."""
+        ledger["runner_lost_streak"] = 0
+
+    def _cluster_paused(self, ledger: Dict[str, Any]) -> bool:
+        """Whether the ledger's runner-loss pause still runs. An expired
+        pause clears, with its streak, so dispatch and counting restart."""
+        until = float(ledger.get("cluster_paused_until") or 0)
+        if until > self.now:
+            return True
+        if until:
+            ledger["cluster_paused_until"] = 0
+            ledger["runner_lost_streak"] = 0
+        return False
+
     def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
         conclusion = entry.get("conclusion") or "unknown"
         artifact = self._report_artifact(entry)
         if artifact is None:
+            if self._runner_lost(entry):
+                minutes = int((self.now - float(entry.get("at") or self.now)) // 60)
+                self._note_lost(ledger)
+                self._park(slot, ticket,
+                           "the cluster runner was lost after %d minutes "
+                           "(runner lost communication)" % max(minutes, 0),
+                           "transient")
+                return
+            self._note_not_lost(ledger)
             self._park(slot, ticket, "the runner run ended %s with no report" % conclusion,
                        "transient")
             return
+        self._note_not_lost(ledger)
         try:
             files = self._read_report(entry, artifact)
             beat = self.apply(slot, ticket, files)
