@@ -1,0 +1,50 @@
+#!/bin/bash
+# swift under the lane job cap (lanes/build_jobs.sh): this file sits first on
+# a lane run's PATH and runs the real swift, the next one on PATH, with
+# "--jobs $LOOM_BUILD_JOBS" added to swift build, swift test and swift run.
+# The package manager takes a job count only as a flag, and without one it
+# uses every core. Every argument is passed on unchanged and in order; the
+# flag goes straight after the subcommand, ahead of the name of a program
+# swift run starts, so it is never handed to that program. The call is passed
+# through as it came when LOOM_BUILD_JOBS is unset, 0 or not a number, when it
+# names its own job count (-j or --jobs), or when it is any other swift call.
+
+# Shell builtins only up to the exec: PATH here is whatever the run has.
+self="${BASH_SOURCE[0]}"
+name="${self##*/}"
+case "$self" in */*) self_dir="${self%/*}" ;; *) self_dir=. ;; esac
+self_dir="$(cd "${self_dir:-/}" && pwd -P)"
+
+# The real tool: the first one on PATH outside this directory, so the wrapper
+# never runs itself, whatever name or link PATH reaches it by.
+real=""
+IFS=: read -r -a path_dirs <<< "${PATH:-}"
+for dir in ${path_dirs[@]+"${path_dirs[@]}"}; do
+  [ -n "$dir" ] || continue
+  [ -x "$dir/$name" ] && [ ! -d "$dir/$name" ] || continue
+  [ "$(cd "$dir" 2>/dev/null && pwd -P)" != "$self_dir" ] || continue
+  [ ! "$dir/$name" -ef "$self_dir/$name" ] || continue
+  real="$dir/$name"
+  break
+done
+[ -n "$real" ] || { echo "$name: command not found" >&2; exit 127; }
+
+jobs="${LOOM_BUILD_JOBS:-0}"
+[[ "$jobs" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$jobs))" -gt 0 ] || exec "$real" "$@"
+jobs="$((10#$jobs))"
+
+case "${1:-}" in
+  build | test | run) ;;
+  *) exec "$real" "$@" ;;
+esac
+for arg in "$@"; do
+  case "$arg" in
+    # Its own job count: leave the call alone.
+    -j | -j[0-9]* | --jobs | --jobs=*) exec "$real" "$@" ;;
+    # What follows belongs to the program swift run starts.
+    --) break ;;
+  esac
+done
+subcommand="$1"
+shift
+exec "$real" "$subcommand" --jobs "$jobs" "$@"
