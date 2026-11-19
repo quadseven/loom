@@ -5961,6 +5961,85 @@ printf '%s\\n%s' "$FAKE_BODY" "$FAKE_STATUS"
         beat = json.loads((self.loom / "state/usage/opencode-go.json").read_text())
         self.assertFalse(beat["available"])
 
+    def write_limit_file(self, until, why="pacing: fleet_fuel daily quota", lane="codex"):
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / (lane + ".limit")).write_text("%d %s\n" % (until, why))
+        return usage / (lane + ".limit")
+
+    def test_a_hold_read_from_the_limit_file_ends_on_the_first_pass_after_the_file_is_removed(self):
+        # 2026-11-19 (#3270): the fleet pacer lifted its pacing hold on lane
+        # openrouter by deleting the limit file, and the lane kept the hold for
+        # 22 more hours: the heartbeat still carried the retry time, and only a
+        # provider probe could end a recorded hold. The lane has no probe URL.
+        until = int(time.time()) + 20 * 3600
+        limit = self.write_limit_file(until)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        held = self.beat()
+        self.assertFalse(held["available"], held)
+        self.assertEqual(held["retry_at"], until)
+        self.assertIn("pacing: fleet_fuel daily quota", held["reason"])
+        self.assertIs(held.get("from_limit_file"), True, held)
+        limit.unlink()
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertTrue(beat["available"], beat)
+        self.assertEqual(beat["reason"], "")
+        self.assertNotIn("retry_at", beat)
+        self.assertNotIn("from_limit_file", beat)
+
+    def test_a_hold_from_a_provider_refusal_stays_when_no_limit_file_was_ever_written(self):
+        # A hold the provider's own refusal set is not a file hold: with no
+        # limit file ever written it stands until its time, or until a
+        # provider re-check passes, exactly as before (#3270).
+        until = int(time.time()) + 20 * 3600
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        reason = "limit: provider limit reached; lane waits until later"
+        (usage / "codex.json").write_text(json.dumps({
+            "lane": "codex", "at": int(time.time()) - 60, "available": False,
+            "reason": reason, "retry_at": until, "limited_models": {}}) + "\n")
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertFalse(beat["available"], beat)
+        self.assertEqual(beat["retry_at"], until)
+        self.assertEqual(beat["reason"], reason)
+        self.assertNotIn("from_limit_file", beat)
+
+    def test_a_limit_file_rewritten_with_a_new_time_moves_the_heartbeat_to_that_time(self):
+        first = int(time.time()) + 2 * 3600
+        self.write_limit_file(first)
+        self.run_lane()
+        self.assertEqual(self.beat()["retry_at"], first)
+        second = int(time.time()) + 5 * 3600
+        self.write_limit_file(second)
+        result = self.run_lane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        beat = self.beat()
+        self.assertFalse(beat["available"], beat)
+        self.assertEqual(beat["retry_at"], second)
+        self.assertIs(beat.get("from_limit_file"), True, beat)
+
+    def test_the_cluster_free_openrouter_slot_keeps_a_hold_whose_limit_file_a_restart_lost(self):
+        # Its limit file does not survive a pod restart, so a missing file
+        # there is not a withdrawn hold (#3270 leaves this slot as it was).
+        script = self.source_functions("beat_hold_from_file") + (
+            'BEAT="$LOOM_HOME/state/usage/free-openrouter.json"\n'
+            'beat_hold_from_file; echo "rc=$?"')
+        usage = self.loom / "state" / "usage"
+        usage.mkdir(parents=True, exist_ok=True)
+        (usage / "free-openrouter.json").write_text(json.dumps({
+            "lane": "free-openrouter", "at": 1, "available": False, "reason": "limit: x",
+            "retry_at": int(time.time()) + 3600, "from_limit_file": True, "limited_models": {}}) + "\n")
+        result = subprocess.run(["bash", "-c", script], env={**self.lane_env(), "LOOM_HOME": str(self.loom)},
+                                capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "rc=0", result.stderr)
+        runner = RUNNER.read_text()
+        self.assertIn('[ "$SLOT" != free-openrouter ] && beat_hold_from_file', runner)
+
     def test_a_hold_the_agent_cli_recorded_is_not_lifted_by_the_probe(self):
         # The agent CLI's own hold (a model it no longer offers) carries no
         # provider limit: no probe says otherwise, so it stands.

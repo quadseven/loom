@@ -417,12 +417,19 @@ lane_setting() {
 # to that model is not claimed for this lane again before the reset: a pinned
 # model's limit parked the same ticket here every pass, 24 claims in 90
 # minutes, while the beat said available.
+# A hold the lane read from its limit file is marked "from_limit_file", so the
+# next pass can tell it from a hold the provider's own refusal set: the first
+# ends when the file is removed, the second only at its time or on a passing
+# provider re-check (HOLD_FROM_FILE, set by limit_held and mark_limit).
 BEAT="$LOOM_HOME/state/usage/$SLOT.json"
+HOLD_FROM_FILE=""
 write_beat() {
   local slot="$1" reason retry="" models
   # shellcheck disable=SC1003 # a literal backslash is one of the deleted characters
   reason="$(printf '%s' "$3" | tr -d '"\\' | tr '[:cntrl:]' ' ')"
   [[ "${4:-}" =~ ^[0-9]+$ ]] && retry=", \"retry_at\": $4"
+  [ "$2" = false ] && [ -n "$retry" ] && [ -n "$HOLD_FROM_FILE" ] && [ "$slot" = "$SLOT" ] &&
+    retry="$retry, \"from_limit_file\": true"
   models="$(limited_models_json "$slot")"
   mkdir -p "$LOOM_HOME/state/usage"
   printf '{"lane": "%s", "at": %s, "available": %s, "reason": "%s"%s, "limited_models": {%s}}\n' \
@@ -1552,7 +1559,7 @@ mark_limit() {
   LIMIT_UNTIL=$(( $(date +%s) + hold ))
   mkdir -p "$LOOM_HOME/state/usage"
   printf '%s %s\n' "$LIMIT_UNTIL" "$LIMIT_WHY" > "$LIMIT_FILE"
-  LIMITED=1
+  LIMITED=1 HOLD_FROM_FILE=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
   heartbeat false "$READY_REASON" "$LIMIT_UNTIL"
 }
@@ -1565,8 +1572,13 @@ limit_held() {
   read -r ends why < "$LIMIT_FILE" || return 1
   now="$(date +%s)"
   [[ "$ends" =~ ^[0-9]+$ ]] && [ "$ends" -gt "$now" ] && [ "$ends" -le $(( now + LIMIT_MAX_HOLD )) ] || return 1
-  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1
+  LIMIT_UNTIL="$ends" LIMIT_WHY="$why" LIMITED=1 HOLD_FROM_FILE=1
   READY_REASON="limit: $LIMIT_WHY; unavailable until $(utc "$LIMIT_UNTIL")"
+}
+
+# Whether the hold in the heartbeat was read from the limit file.
+beat_hold_from_file() {
+  grep -q '"from_limit_file": true' "$BEAT" 2> /dev/null
 }
 
 spark_ready() {
@@ -4346,6 +4358,19 @@ if [ "$LANE" = opencode-go ] && [ -n "$LIMIT_UNTIL" ] && free_model "$(slot_mode
   grep -q "$GO_LIMIT_ERROR" "$BEAT" 2>/dev/null; then
   echo "[$(date -u +%FT%TZ)] lane $SLOT runs free model $(slot_model "$SLOT"), outside the Go allowance: dropping its Go limit hold" >&2
   rm -f "$LOOM_HOME/state/usage/$SLOT.provider-limit.json"
+  LIMIT_UNTIL=""
+fi
+# A hold the lane read from its limit file ends when that file is removed: its
+# writer withdrew it (the fleet pacer lifts a pacing hold by deleting the
+# file). 2026-11-19: lane openrouter sat idle for 22 hours on a pacing hold
+# whose file was gone, with 887 of its 1000 free requests unused, because only
+# a provider probe could end a recorded hold and the lane has no probe URL.
+# The cluster free-openrouter slot is left out: its limit file does not
+# survive a pod restart, so a missing file there says nothing (see below).
+if [ -n "$LIMIT_UNTIL" ] && [ "$LIMIT_UNTIL" -gt "$(date +%s)" ] && [ ! -f "$LIMIT_FILE" ] &&
+   [ "$SLOT" != free-openrouter ] && beat_hold_from_file; then
+  echo "[$(date -u +%FT%TZ)] lane $SLOT: its limit file is gone, so the hold it recorded ends" >&2
+  heartbeat true ""
   LIMIT_UNTIL=""
 fi
 if [ -z "$CONFIGURED_MODELS" ] && [ -n "$LIMIT_UNTIL" ] &&
