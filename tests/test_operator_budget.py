@@ -211,6 +211,39 @@ class SamplerTests(unittest.TestCase):
         self.reader.assert_not_called()
         self.assertNotIn("private", repr(self.say.call_args_list))
 
+    def test_consecutive_401_answers_are_counted_and_a_good_answer_resets(self):
+        self.reader.side_effect = GitHubError("PRIVATE", 401, "PRIVATE BODY")
+        for index in range(3):
+            self.run_sample(NOW + index * budget.RETRY)
+            self.assertEqual(self.saved()["rejected"], index + 1)
+        self.assertEqual(budget.load(self.path)["rejected"], budget.REJECTED_ASK)
+        self.assertNotIn("PRIVATE", json.dumps(self.saved()))
+        self.reader.side_effect = None
+        self.run_sample(NOW + 3 * budget.RETRY)
+        self.assertNotIn("rejected", self.saved())
+
+    def test_other_failed_reads_are_not_counted_as_rejected(self):
+        errors = (GitHubError("down", 500), GitHubError("refused", 403), GitHubError("no answer"),
+                  OSError("network"), ValueError("unverified"), RateLimited("slow", 429, "", NOW + 60))
+        for index, error in enumerate(errors):
+            self.reader.side_effect = error
+            self.run_sample(NOW + index * budget.RETRY)
+            self.assertNotIn("rejected", self.saved())
+        self.assertEqual(len(self.saved()["failures"]), len(errors))
+
+    def test_another_failure_between_401_answers_keeps_the_count(self):
+        for index, status in enumerate((401, 500, 401)):
+            self.reader.side_effect = GitHubError("failed", status)
+            self.run_sample(NOW + index * budget.RETRY)
+        self.assertEqual(self.saved()["rejected"], 2)
+
+    def test_corrupt_rejected_count_and_ask_number_are_discarded(self):
+        for value in (True, -1, 0, 1.5, "3", 10 ** 1000, [3]):
+            self.path.write_text(json.dumps({"rejected": value, "ask": value}))
+            state = budget.load(self.path)
+            self.assertNotIn("rejected", state)
+            self.assertNotIn("ask", state)
+
 
 class IntegrationTests(unittest.TestCase):
     def test_sampling_precedes_budget_and_access_early_returns(self):
@@ -374,3 +407,159 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(station._operator_lane_active(), expected)
                 if not assigned or pid in (None, -1, 0, True, 10 ** 1000):
                     station._pid_alive.assert_not_called()
+
+
+class AskGitHub:
+    """A station client stand-in: records every call and answers the ask's two."""
+
+    def __init__(self):
+        self.calls = []
+        self.issues = {}
+
+    def rest(self, method, path, body=None):
+        self.calls.append((method, path, body))
+        if method == "POST":
+            number = 40 + len(self.issues)
+            self.issues[number] = "open"
+            return SimpleNamespace(data={"number": number})
+        return SimpleNamespace(data={"state": self.issues[int(path.rsplit("/", 1)[1])]})
+
+    def posts(self):
+        return [call for call in self.calls if call[0] == "POST"]
+
+
+class RejectedLoginAskTests(unittest.TestCase):
+    """loom#3273: three 401 answers in a row on the operator token file one ask."""
+    HOME = "example-owner/status"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.gh = AskGitHub()
+        self.reader = mock.Mock(side_effect=GitHubError("PRIVATE", 401, "PRIVATE BODY"))
+        self.passes = 0
+
+    def station_pass(self, status_repo=HOME, retry=True):
+        """One station pass: the sample, then the ask step."""
+        from bus.station import Station
+        station = object.__new__(Station)
+        station.gh = self.gh
+        station.state = self.tmp.name
+        station.now = NOW + self.passes * (budget.RETRY if retry else 60)
+        self.passes += 1
+        station.s = SimpleNamespace(authors=["app[bot]", "operator-login"], repos=[],
+                                    status_repo=status_repo)
+        station.operator_reader = self.reader
+        station._operator_lane_active = lambda: False
+        station.sample_operator_budget()
+        station.ask_operator_login()
+
+    def test_three_consecutive_401_answers_file_exactly_one_ask(self):
+        from bus.labels import NEEDS_HUMAN
+        self.station_pass()
+        self.station_pass()
+        self.assertEqual(self.gh.calls, [])
+        self.station_pass()
+        (_, path, sent), = self.gh.posts()
+        self.assertEqual(path, "/repos/%s/issues" % self.HOME)
+        self.assertEqual(sent["labels"], [NEEDS_HUMAN])
+        self.assertIn("operator-login", sent["title"] + sent["body"])
+        self.assertNotIn("PRIVATE", repr(sent))
+        self.assertEqual(budget.load(Path(self.tmp.name) / budget.FILE)["ask"], 40)
+
+    def test_no_second_ask_while_the_first_is_open(self):
+        for _ in range(8):
+            self.station_pass()
+        self.assertEqual(len(self.gh.posts()), 1)
+        self.assertEqual(self.reader.call_count, 8)
+
+    def test_passes_between_reads_make_no_request(self):
+        for _ in range(3):
+            self.station_pass()
+        before = list(self.gh.calls)
+        self.passes = 2 * budget.RETRY // 60 + 1  # the same clock, now in 60 second passes
+        self.station_pass(retry=False)
+        self.station_pass(retry=False)
+        self.assertEqual(self.reader.call_count, 3)
+        self.assertEqual(self.gh.calls, before)
+
+    def test_a_good_answer_resets_the_count(self):
+        self.station_pass()
+        self.station_pass()
+        self.reader.side_effect = None
+        self.reader.return_value = (CORE, {"key": "a" * 64, "at": NOW})
+        self.station_pass()
+        self.reader.side_effect = GitHubError("rejected", 401)
+        self.passes = 20  # past the hourly wait a good sample sets
+        self.station_pass()
+        self.station_pass()
+        self.assertEqual(self.gh.posts(), [])
+        self.station_pass()
+        self.assertEqual(len(self.gh.posts()), 1)
+
+    def test_other_failures_file_no_ask(self):
+        for error in (GitHubError("down", 500), GitHubError("refused", 403), OSError("net"),
+                      ValueError("unverified"), GitHubError("no answer")):
+            self.reader.side_effect = error
+            self.station_pass()
+        self.assertEqual(self.gh.calls, [])
+
+    def test_a_closed_ask_is_followed_by_one_new_ask_while_still_rejected(self):
+        for _ in range(4):
+            self.station_pass()
+        self.gh.issues[40] = "closed"
+        for _ in range(3):
+            self.station_pass()
+        self.assertEqual(len(self.gh.posts()), 2)
+
+    def test_an_unreadable_ask_is_not_asked_again(self):
+        for _ in range(3):
+            self.station_pass()
+        self.gh.issues.clear()  # the read of the ask now fails
+        real = self.gh.rest
+
+        def rest(method, path, body=None):
+            if method == "GET":
+                self.gh.calls.append((method, path, body))
+                raise GitHubError("GET -> 502", 502)
+            return real(method, path, body)
+        self.gh.rest = rest
+        self.station_pass()
+        self.assertEqual(len(self.gh.posts()), 1)
+
+    def test_no_status_repo_files_nothing_and_a_failed_post_is_retried(self):
+        for _ in range(4):
+            self.station_pass(status_repo="")
+        self.assertEqual(self.gh.calls, [])
+        real = self.gh.rest
+        self.gh.rest = mock.Mock(side_effect=GitHubError("POST -> 502 PRIVATE", 502))
+        with mock.patch("bus.station._say") as say:
+            self.station_pass()
+        self.assertNotIn("PRIVATE", repr(say.call_args_list))
+        self.assertNotIn("ask", budget.load(Path(self.tmp.name) / budget.FILE))
+        self.gh.rest = real
+        self.station_pass()
+        self.assertEqual(len(self.gh.posts()), 1)
+
+    def test_run_pass_reaches_the_ask_step_after_the_access_check(self):
+        from bus.station import Settings, Station
+        station = object.__new__(Station)
+        station.s = Settings(home="", repos=[], authors=[], owners=[])
+        events = []
+        station.capture_pod_logs = lambda: None
+        station.sample_operator_budget = lambda: events.append("sample")
+        station._budget_exhausted = lambda: False
+        station.check_repo_access = lambda: events.append("access") or True
+
+        def ask():
+            events.append("ask")
+            raise RateLimited("stop here", 429, "", NOW + 60)
+        station.ask_operator_login = ask
+        station._publish_lanes_when_old = lambda: events.append("later")
+        station._end_pass_locally = lambda: None
+        try:
+            station.run_pass()
+        except RateLimited:
+            pass
+        self.assertEqual(events[:3], ["sample", "access", "ask"])
+        self.assertNotIn("later", events)
