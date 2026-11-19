@@ -402,6 +402,36 @@ class RewriteIssueTest(Base):
         self.assertIn("Never use human for work a coding agent or the factory can do", prompt)
         self.assertIn('"kind": "money|hardware|account|credential|physical|decision"', prompt)
 
+    def test_the_prompt_asks_for_a_test_as_proof_and_a_live_box_only_with_a_runnable_check(self):
+        # Owner ruling of 2026-11-19 (#3277): proof is a test that runs in CI
+        # or a throwaway environment, and a Live box is written only when
+        # Loom can run its check by itself.
+        prompt = rewrite.build_prompt({"title": "t", "body": "b", "labels": []}, [], "FORMAT")
+        self.assertIn("names the test that proves the ticket: a test file path, or a command "
+                      "that runs in CI or a throwaway environment", prompt)
+        self.assertIn("Write a Live checkbox only when it names a read-only check Loom can run "
+                      "by itself", prompt)
+        for form in ("`https://` URL", "`gh api <path>`", "`kubectl get", "`log:<source>`", "time window"):
+            self.assertIn(form, prompt)
+        self.assertIn("write no Live checkbox", prompt)
+        self.assertNotIn("A Live criterion, if you write one", prompt)
+
+    def test_a_rewrite_whose_live_line_names_no_runnable_check_is_refused_with_the_forms(self):
+        quoted = BODY.replace("- [ ] ", "- [ ] Live: the station log shows `deployed`\n- [ ] ", 1)
+        with self.assertRaises(rewrite.Invalid) as caught:
+            self.rewrite(dict(BRIEF, body=quoted))
+        for form in ("https://", "gh api", "log:<source>"):
+            self.assertIn(form, str(caught.exception))
+        self.assertEqual(self.fake.writes_to(7), [])
+
+    def test_a_rewrite_whose_live_line_names_a_runnable_check_is_accepted(self):
+        for live in ("Live: https://example.invalid/health answers `ok`",
+                     "Live: `gh api repos/example/thing/issues/3` shows `closed`",
+                     "Live: `log:station` shows `claimed 3`"):
+            with self.subTest(live=live):
+                body = BODY.replace("- [ ] ", "- [ ] %s\n- [ ] " % live, 1)
+                rewrite.validate(dict(BRIEF, body=body))
+
     def test_a_skip_answer_writes_nothing(self):
         self.assertEqual(self.rewrite({"action": "skip", "reason": "unclear"}), "skip")
         self.assertEqual(self.fake.writes_to(7), [])

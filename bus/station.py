@@ -8319,10 +8319,18 @@ class Station:
     def _probe_lane(self, free: List[str], repo: str) -> Optional[str]:
         """A free local lane for a base-check brief: not a cluster runner
         slot, whose red check files no incident, and public-only lanes for
-        public repos only."""
+        public repos only. A base check needs no strong model, so the
+        Anthropic-credit lanes (claude and the anthropic slots) come after
+        every other eligible lane and are picked only when no other
+        eligible lane is free: claude is the only lane that serves the top
+        ladder rung, and a probe on it delays the fix rounds only it can
+        serve."""
         slots = set(runners.runner_slots())
-        return next((lane for lane in free if lane not in slots and self._inbox_empty(lane)
-                     and (not needs_public_repo(lane, "") or self._public(repo))), None)
+        eligible = [lane for lane in free if lane not in slots and self._inbox_empty(lane)
+                    and (not needs_public_repo(lane, "") or self._public(repo))]
+        credit = ("claude",) + factory.ANTHROPIC
+        return next((lane for lane in eligible if lane not in credit),
+                    eligible[0] if eligible else None)
 
     def _report_base_check(self, lane: str, kind: str, name: str, text: str) -> bool:
         """A finished base-check brief: the runner already closed or updated
@@ -13874,8 +13882,12 @@ class Station:
         """Ask the rewrite command for a new Live line and write it."""
         prompt = ("Rewrite the shipped ticket's Live criterion. Return one JSON object "
                   'with "action":"restate" and a "line" string: one complete Live: '
-                  "line naming an exact string the merged pull request makes the live "
-                  "system print or serve. "
+                  "line naming a read-only check Loom can run by itself on what the "
+                  "merged pull request changed: an `https://` URL, a `gh api <path>` "
+                  "read, a read-only `kubectl get ...` or `kubectl rollout status ...`, "
+                  "a `log:<source>` step for the repo's adapter, or a quoted log string "
+                  'with a time window ("within 24 hours"). A quoted string alone is not '
+                  "a check. "
                   "Do not include markdown or explanation.\n\nTitle: %s\nBody:\n%s" %
                   (issue.get("title", ""), issue.get("body", "")))
         try:

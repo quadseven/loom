@@ -81,6 +81,25 @@ stay on the ticket and are not written into the brief.
 other value is refused. At the same priority, a ticket that blocks more open issues
 goes first, then a `Foundational: yes` ticket, then the oldest.
 
+A new build ticket names the test that proves it. At least one acceptance box
+names a test file path (`tests/test_totals.py`), a command that runs tests in
+CI or a throwaway environment (`go test ./internal/ledger/...`), or a test
+that fails without the change. Proof is that test, run at build time, not an
+observation of the live system after the fact (owner ruling of 2026-11-19).
+`bus.brain brief` and the rewrite refuse a body whose boxes name none, so it
+goes back to its writer before it is filed; an answer ticket is exempt, and
+tickets already on the board are not read by this rule.
+
+A `Live:` box is written only when it names a read-only check Loom can run by
+itself: an `https://` URL, a `gh api <path>` read, a read-only `kubectl get
+...` or `kubectl rollout status ...`, a `log:<source>` or `sql:` step for the
+repo's adapter, a `SELECT`, or a quoted log string with a time window
+("within 24 hours"). A quoted string alone is not a check: nothing says when
+to read the log for it, and such a box could only wait. When no such check
+exists, the ticket carries no Live box. The one templated Live box of a
+health or friction intake ticket stays as written, because the station's own
+absence tracking proves it.
+
 Right after the ticket body, a build brief carries a `## Proof checks`
 section: each acceptance criterion restated as the check that proves it
 (the lane's pull request ticking it, the station's verify run observing it
