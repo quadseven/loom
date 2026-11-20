@@ -209,8 +209,13 @@ class Closes(Case):
 
 class Refuses(Case):
     def test_malformed_timeline_references_hold_only_their_tickets(self):
-        for number in (1, 2, 3):
+        for number in (1, 2, 3, 4, 5):
             self.ticket(number)
+        self.fake.ticket_links[4] = [{"__typename": "ConnectedEvent", "source": None,
+                                      "subject": {"__typename": "PullRequest", "number": 104}}]
+        self.fake.ticket_links[5] = [{"__typename": "ConnectedEvent", "source": None,
+                                      "subject": {"__typename": "PullRequest", "number": 105,
+                                                  "repository": None}}]
         self.fake.ticket_links[1] = [{"__typename": "CrossReferencedEvent", "source": "bad"}]
         self.fake.ticket_links[2] = [{"__typename": "ConnectedEvent", "subject": []}]
         self.fake.ticket_links[3] = [{"__typename": "ConnectedEvent", "source": None,
@@ -221,6 +226,8 @@ class Refuses(Case):
 
         self.assertEqual(self.fake.issues[1]["state"], "open")
         self.assertEqual(self.fake.issues[2]["state"], "open")
+        self.assertEqual(self.fake.issues[4]["state"], "open")
+        self.assertEqual(self.fake.issues[5]["state"], "open")
         self.assertIn(LABEL, self.fake.names(3))
 
     def test_no_merged_pull_request(self):

@@ -154,8 +154,11 @@ def ticket_pull_numbers(gh: GitHub, repo: str, issue: Mapping[str, Any],
                 continue
             if not isinstance(ref, dict):
                 raise ValueError("unreadable timeline reference")
-            if (ref.get("__typename") == "PullRequest"
-                    and ref["repository"]["nameWithOwner"].lower() == repo.lower()):
+            if ref.get("__typename") != "PullRequest":
+                continue
+            if not isinstance(ref.get("repository"), dict):
+                raise ValueError("unreadable timeline reference")
+            if str(ref["repository"].get("nameWithOwner") or "").lower() == repo.lower():
                 numbers.add(ref["number"])
         if (node.get("__typename") == "IssueComment" and status.is_status(node.get("body"))
                 and rest_login(node.get("author")).lower() in allowed):
