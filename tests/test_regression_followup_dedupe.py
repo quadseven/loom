@@ -12,6 +12,8 @@ from bus import brain  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
 REPO = "example-owner/example-repo"
+SHORT = REPO.split("/")[-1]
+OTHER = "other-" + SHORT
 
 
 def _ticket(number, state, why, state_open=True):
@@ -30,14 +32,14 @@ class RegressionFollowupDedupeTests(unittest.TestCase):
                 None, None, "## What\nx\n", 7)
 
     def test_in_flight_followup_that_names_the_ticket_is_refused(self):
-        followup = _ticket(9, "loom:briefed", "The fix from example-repo#7 is missing.")
+        followup = _ticket(9, "loom:briefed", f"The fix from {SHORT}#7 is missing.")
         with self.assertRaisesRegex(ValueError, "already in flight as #9"):
             self._brief([followup])
         # Kept rules, asserted after the new case: a closed or shipped ticket,
         # or one that names another ticket or another repo, does not block.
         others = [_ticket(10, "loom:briefed", "from #7", state_open=False),
                   _ticket(11, "loom:shipped", "from #7"),
-                  _ticket(12, "loom:queued", "from #70 and other-repo#7")]
+                  _ticket(12, "loom:queued", f"from #70 and {OTHER}#7")]
         with self.assertRaisesRegex(RuntimeError, "reached"):
             self._brief(others)
 
