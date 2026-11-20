@@ -3,7 +3,7 @@ ticked moves the ticket to loom:merged and drops its lane, not an operator ask."
 from unittest import mock
 
 from bus import brief_check, station
-from bus.github import GitHub
+from bus.github import GitHub, GitHubError
 from test_bus_station import Base, REPO
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
 
@@ -51,3 +51,16 @@ class TickedMerged(Base):
         ask.assert_called_once()
         self.assertIn("lane:claude", self.fake.names(12))
         self.assertNotIn("loom:merged", self.fake.names(12))
+
+    def test_a_failed_move_leaves_the_existing_hold_to_run(self):
+        real = GitHub.rest
+
+        def rest(self, method, path, *args, **kw):
+            if method == "PUT":
+                raise GitHubError("boom", 500)
+            return real(self, method, path, *args, **kw)
+
+        with mock.patch.object(GitHub, "rest", rest):
+            held, notes, ask = self.run_hold(TICKED)
+        self.assertTrue(held)
+        ask.assert_called_once()

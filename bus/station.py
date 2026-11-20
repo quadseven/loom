@@ -6153,8 +6153,9 @@ class Station:
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": labels})
         except GitHubError as err:
-            _say("%s#%d waits: moving it to merged failed (%s)" % (repo, number, err))
-            return True
+            _say("%s#%d: moving it to merged failed (%s); the hold runs"
+                 % (repo, number, err))
+            return False
         issue["labels"] = [{"name": n} for n in labels]
         self._routine(repo, number, "Every box is ticked and %s, so the ticket moves "
                       "to loom:merged without its lane." % found.reason)
