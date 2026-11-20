@@ -695,18 +695,30 @@ def _person_texts(issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]
         if _login(c).lower() in people and (c.get("user") or {}).get("type") != "Bot"]
 
 
-def _merged_at(gh: Any, where: str, number: int) -> str:
-    """When the pull request merged, "" when it did not, is a revert, or is
-    no pull request."""
+def _merged_pull(gh: Any, where: str, number: int) -> Mapping[str, Any]:
+    """The pull request, or an empty mapping when it is a revert or is no
+    pull request (an issue, or gone)."""
     try:
         pr = gh.rest("GET", "/repos/%s/pulls/%d" % (where, number)).data or {}
     except GitHubError as err:
         if err.status == 404:
-            return ""  # an issue, not a pull request, or gone
+            return {}  # an issue, not a pull request, or gone
         raise
-    if not isinstance(pr, dict) or _is_revert(pr):
-        return ""
-    return str(pr.get("merged_at") or "")
+    return {} if not isinstance(pr, dict) or _is_revert(pr) else pr
+
+
+def _already_judged(repo: str, issue: Mapping[str, Any], where: str, pr: Mapping[str, Any],
+                    num: int) -> bool:
+    """A pull request of this repo the station judged when it requeued the
+    ticket for the rest, or one opened from the ticket's own branch: the
+    requeue already settled it, so the ticket goes on to a build lane."""
+    if where.lower() != repo.lower():
+        return False
+    notes = [text for _, text in status.body_events(issue.get("body"))]
+    if num in tickets.judged_pulls(notes):
+        return True
+    ref = str((pr.get("head") or {}).get("ref") or "")
+    return ref.startswith("loom/%s-" % issue["number"])
 
 
 def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
@@ -721,8 +733,10 @@ def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
     links = [(r, n) for r, n in _links(texts)
              if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
     for where, num in links[:LINKS_READ]:
-        merged = _merged_at(gh, where, num)
-        if merged and _ts(merged) > filed and not edited_after(merged):
+        pr = _merged_pull(gh, where, num)
+        merged = str(pr.get("merged_at") or "")
+        if (merged and _ts(merged) > filed and not edited_after(merged)
+                and not _already_judged(repo, issue, where, pr, num)):
             return Verdict(STALE, "pr-%s#%d" % (where, num),
                            "pull request %s#%d, linked on this ticket, merged at %s, after "
                            "the ticket was filed" % (where, num, merged))
