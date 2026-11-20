@@ -136,14 +136,14 @@ except ImportError:  # not on a POSIX host
 
 @unittest.skipIf(fcntl is None, "needs fcntl")
 class BusyTest(unittest.TestCase):
-    def test_a_held_station_lock_stops_a_real_import(self):
+    def test_a_held_station_lock_is_reported_as_not_acquired(self):
         with tempfile.TemporaryDirectory() as home:
             os.makedirs(os.path.join(home, "state"))
-            self.assertFalse(state_import.station_busy(home))
             fd = os.open(os.path.join(home, "state", "station.lock"), os.O_RDWR | os.O_CREAT)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
-                self.assertTrue(state_import.station_busy(home))
+                with state_import.hold_station_lock(home) as acquired:
+                    self.assertFalse(acquired)
             finally:
                 os.close(fd)
 
@@ -152,10 +152,10 @@ class BusyTest(unittest.TestCase):
             os.makedirs(os.path.join(home, "state"))
             with state_import.hold_station_lock(home) as acquired:
                 self.assertTrue(acquired)
-                self.assertTrue(state_import.station_busy(home))
                 with state_import.hold_station_lock(home) as second:
                     self.assertFalse(second)
-            self.assertFalse(state_import.station_busy(home))
+            with state_import.hold_station_lock(home) as again:
+                self.assertTrue(again)
 
 
 if __name__ == "__main__":

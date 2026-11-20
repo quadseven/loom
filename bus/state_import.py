@@ -55,30 +55,12 @@ def _entries(value: Any) -> int:
     return len(value) if isinstance(value, (list, dict)) else 1
 
 
-def station_busy(home: str) -> bool:
-    """True while a pass on this host holds the station lock."""
-    import fcntl
-    path = os.path.join(home, "state", "station.lock")
-    if not os.path.exists(path):
-        return False
-    fd = os.open(path, os.O_RDWR)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
-    finally:
-        os.close(fd)
-
-
 @contextlib.contextmanager
 def hold_station_lock(home: str):
     """Hold the station lock for the whole block; yield False if a pass holds it.
 
-    station_busy only probes and lets go, so a pass could start between the
-    probe and the copy. A real import holds the lock until it is done.
+    Probing and letting go would leave a gap in which a pass could start
+    before the copy. A real import holds the lock until it is done.
     """
     import fcntl
     path = os.path.join(home, "state", "station.lock")
