@@ -5235,7 +5235,7 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
     if not after or " ".join(after.group(1).split()) != text:
         raise ValueError("the restated body does not read back with the new Live line")
     _check_live_criterion(new)
-    _check_written_text(new)
+    _check_written_text(text)
     if new != body:
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
@@ -5246,7 +5246,9 @@ def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
     the station never claims the ticket with the old model."""
     body = str(issue.get("body") or "")
     new = _with_model(body, model)
-    _check_written_text(new)
+    # Only the line the brain adds is checked: text already on the ticket
+    # (a quoted device path, say) is not the brain's to refuse.
+    _check_written_text("Model: " + tickets.allowed_model(model))
     if new != body:
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
