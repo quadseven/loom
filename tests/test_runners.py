@@ -71,6 +71,8 @@ class FakeGitHub:
             return Response(200, {"artifacts": self.artifacts.get(int(parts[-2]), [])})
         if path.endswith("/zip"):
             return Response(302, None, headers={"location": "https://blob.example.com/%s" % parts[-2]})
+        if method == "GET" and path.endswith("/jobs?per_page=100"):
+            return Response(200, {"jobs": []})
         if "/actions/runs/" in path:
             return Response(200, self.runs[int(parts[-1])])
         if "/commits/" in path:
