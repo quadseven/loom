@@ -1132,13 +1132,11 @@ class Intake:
             if umbrella is None or not owned or any(
                     MARKER % d not in str(umbrella.get("body") or "") for d in owned):
                 continue
-            self._comment(repo, issue, "Folded into #%d, the one rolling ticket of the %s area, "
+            closing.close(self.gh, repo, int(issue["number"]),
+                          "Folded into #%d, the one rolling ticket of the %s area, "
                           "which now holds this ticket's findings and their evidence. Closing "
                           "this one as a duplicate." % (int(umbrella["number"]), area.group(1)),
-                          notify.EVIDENCE)
-            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, int(issue["number"])),
-                         {"state": "closed", "state_reason": "duplicate"})
-            issue["state"] = "closed"
+                          "duplicate")
             self.say("health %s: closed #%d as a duplicate of #%d"
                      % (repo, int(issue["number"]), int(umbrella["number"])))
 
