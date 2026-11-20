@@ -8067,7 +8067,9 @@ class FactoryIncidentTest(Base):
         for reason in ("[factory] setup failed: base check exited 1 on the unmodified repo; "
                        "factory incident %s#99" % REPO,
                        "[factory] setup failed: base check exited 2 on the default branch; "
-                       "factory incident %s#99" % REPO):
+                       "factory incident %s#99" % REPO,
+                       "[factory] setup failed: base check exited 1 on the base at 0123abc; "
+                       "no incident filed on a cluster runner: another lane runs the base check"):
             with self.subTest(reason=reason):
                 self.setUp()
                 self.heartbeat("anthropic")
