@@ -238,7 +238,10 @@ def scratch_files(tree: str, base: str, head: str, brief_text: str,
                                   fnmatch.fnmatchcase(path, "verify*.py") or
                                   fnmatch.fnmatchcase(path, "check_*.py") or
                                   fnmatch.fnmatchcase(path, "scratch*.py") or
-                                  fnmatch.fnmatchcase(path, "tmp*.py")):
+                                  fnmatch.fnmatchcase(path, "tmp*.py") or
+                                  fnmatch.fnmatchcase(path.lower(), "*summary*.md") or
+                                  fnmatch.fnmatchcase(path.lower(), "*summary*.txt") or
+                                  fnmatch.fnmatchcase(path.lower(), ".loom-summary*")):
             if not referenced_by_tracked_file(tree, head, path):
                 scratch.append(path)
     return scratch

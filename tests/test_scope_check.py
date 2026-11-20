@@ -143,7 +143,8 @@ class ScopeCheckTest(unittest.TestCase):
         self.write("redistribute_epics.py", "pass\n")
         self.commit("work")
         found = scope_check.scratch_files(str(self.tree), self.base, "HEAD", "")
-        self.assertEqual(sorted(found), [".gradle/daemon/8.13/daemon-1.out.log", "T762.patch",
+        self.assertEqual(sorted(found), [".gradle/daemon/8.13/daemon-1.out.log",
+                                         "IMPLEMENTATION_SUMMARY.md", "T762.patch",
                                          "build/WindowContaminationTest", "sh-thd-3211296841"])
 
     def test_a_build_folder_the_base_tracks_is_not_scratch(self):
