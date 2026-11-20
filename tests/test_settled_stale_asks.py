@@ -44,11 +44,11 @@ class SettledStaleAsks(unittest.TestCase):
             "## Decision (%s, 2026-10-26)\nKeep the ticket open for the live result.\n"
             % OPERATOR, labels=("loom:ticket", "awaiting-live-check"))
 
-    def test_a_decision_to_build_with_later_stale_evidence_still_asks(self):
+    def test_later_stale_evidence_goes_to_the_brain_after_a_build_decision(self):
         held, fake = self.check("## Decision (%s, 2026-10-26)\nBuild option B.\n" % OPERATOR)
         self.assertTrue(held)
         self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO,
-                       {"labels": ["needs:human"]}), fake.writes)
+                       {"labels": ["needs-brain"]}), fake.writes)
 
     def test_a_stated_wait_uses_no_remote_reads_or_repeated_run_logs(self):
         issue = ticket(body=STALE_REWRITE + "\n## Blocked on\nThe next scheduled event.\n",
@@ -91,23 +91,23 @@ class SettledStaleAsks(unittest.TestCase):
         for heading in ("### Blocked on", "# Blocked by", "**Blocked on**", "Blocked on:"):
             with self.subTest(heading=heading):
                 _, fake = self.check(decision + heading + "\nneeds:the-operator to prepare it.\n")
-                self.assertTrue(any(body == {"labels": ["needs:human"]}
+                self.assertTrue(any(body == {"labels": ["needs-brain"]}
                                     for _, _, body in fake.writes))
 
-    def test_a_named_person_blocker_still_raises_an_ask(self):
+    def test_a_named_person_blocker_goes_to_the_brain_for_review(self):
         for blocker in ("needs:the-operator to prepare the move", "@the-operator to prepare it"):
             with self.subTest(blocker=blocker):
                 held, fake = self.check("## Blocked on\n%s\n" % blocker)
                 self.assertTrue(held)
                 self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO,
-                               {"labels": ["needs:human"]}), fake.writes)
+                               {"labels": ["needs-brain"]}), fake.writes)
 
     def test_empty_or_untrusted_decisions_do_not_settle_an_ask(self):
         for extra in ("## Blocked on\n", "## Decision (upstream, 2026-10-26)\nKeep it.\n",
                       "## Decision (operator %s, 2026-10-26)\n" % OPERATOR):
             with self.subTest(extra=extra):
                 _, fake = self.check(extra, labels=("loom:ticket", "blocked"))
-                self.assertTrue(any(body == {"labels": ["needs:human"]}
+                self.assertTrue(any(body == {"labels": ["needs-brain"]}
                                     for _, _, body in fake.writes))
 
     def test_examples_and_original_issue_text_do_not_settle_the_current_ask(self):
@@ -120,7 +120,7 @@ class SettledStaleAsks(unittest.TestCase):
                       "> ## Blocked on\n> The next scheduled event.\n"):
             with self.subTest(extra=extra):
                 _, fake = self.check(extra, labels=("loom:ticket", "blocked"))
-                self.assertTrue(any(body == {"labels": ["needs:human"]}
+                self.assertTrue(any(body == {"labels": ["needs-brain"]}
                                     for _, _, body in fake.writes))
 
     def test_the_health_diagnosis_gate_still_holds(self):
@@ -178,4 +178,4 @@ class SettledStaleAsks(unittest.TestCase):
                 self.assertNotIn(("POST", "/repos/%s/issues/206/labels" % REPO,
                                   {"labels": ["blocked"]}), fake.writes)
                 self.assertIn(("POST", "/repos/%s/issues/206/labels" % REPO,
-                               {"labels": ["needs:human"]}), fake.writes)
+                               {"labels": ["needs-brain"]}), fake.writes)

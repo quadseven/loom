@@ -216,13 +216,6 @@ UNLINKED_STATES = ("loom:queued", "loom:briefed", "loom:running", "loom:answered
 # A lane's run scratch (run/<slot>-home, -check, -check-default) younger than
 # this is never removed: a runner may have just made it.
 RUN_SCRATCH_SETTLE = 600
-# How long a loom:running ticket's newest brief must have sat in its lane's
-# done or failed folder, with none in the inbox and no runner on the lane,
-# before the station calls the run ended (settle_ended_runs). The run's own
-# report moves the ticket within a pass or two; this is the backstop.
-ENDED_RUN_SETTLE = 2 * 3600
-# At most this many ended runs are settled a pass: each is a read and two writes.
-ENDED_RUN_MAX = 10
 # The folders an idle lane's run home drops each pass: package caches and
 # temp files a run rebuilds.
 RUN_HOME_CACHES = (".cache", ".cargo", "tmp")
@@ -1186,8 +1179,14 @@ class Settings:
                  log_sources: Sequence[log_capture.Source] = (),
                  log_capture_hours: float = log_capture.DEFAULT_RETENTION_HOURS,
                  metrics_reserve: int = metrics.REQUEST_RESERVE,
-                 metrics_seconds: float = metrics.STEP_SECONDS) -> None:
+                 metrics_seconds: float = metrics.STEP_SECONDS,
+                 host_load_gate: bool = False) -> None:
         self.home = home
+        # The host load check before a local claim (lanes/host_load.sh,
+        # loom#3303): off for a Settings built in code, so a test never
+        # depends on the load of the machine it runs on; from_env turns it on
+        # and LOOM_CHECK_LOAD_1M / LOOM_CHECK_LOAD_5M set its limits.
+        self.host_load_gate = host_load_gate
         self.log_sources = log_sources
         self.log_capture_hours = log_capture_hours
         # LOOM_DISK_WATCHDOG_GB and its settings (bus/disk_watchdog.py,
@@ -1440,7 +1439,8 @@ class Settings:
                    repo_pr_caps=repo_open_pr_caps(env.get("LOOM_REPO_OPEN_PR_CAP", "")),
                    urgency_config=urgency.Config.from_env(env),
                    pass_deadline=_pass_deadline(env.get("LOOM_PASS_DEADLINE", "")),
-                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")))
+                   decision_window_days=_decision_window_days(env.get("LOOM_DECISION_WINDOW_DAYS", "")),
+                   host_load_gate=True)
 
 
 def _agy_workdir(env: Dict[str, str]) -> str:
@@ -2601,14 +2601,18 @@ class Station:
         """Repos named by a brief waiting or running in a lane inbox."""
         return {key.split("#", 1)[0] for key in self._inbox_tickets()}
 
-    def _inbox_tickets(self) -> Set[str]:
+    def _inbox_tickets(self, *, strict: bool = False) -> Set[str]:
         """The ticket, as owner/repo#n, of each brief waiting or running in a
         lane inbox."""
         found: Set[str] = set()
         for lane in LANES:
             try:
                 entries = os.listdir(self.inbox(lane))
+            except FileNotFoundError:
+                continue
             except OSError:
+                if strict:
+                    raise
                 continue
             for entry in entries:
                 if not entry.endswith((".md", ".claiming")):
@@ -2616,7 +2620,11 @@ class Station:
                 try:
                     with open(os.path.join(self.inbox(lane), entry), encoding="utf-8") as fh:
                         m = ISSUE_LINE_RE.search(fh.read())
+                except FileNotFoundError:
+                    continue
                 except (OSError, ValueError):
+                    if strict:
+                        raise
                     continue
                 if m:
                     found.add("%s#%s" % (m.group(1), m.group(2)))
@@ -3373,6 +3381,8 @@ class Station:
             os.remove(path)
             self._refuse(repo, issue, reason)
             return
+        if self._host_load_holds(lane):
+            return
         if not self._claim(repo, lane, issue):
             os.remove(path)
 
@@ -3866,6 +3876,22 @@ class Station:
         hold["count"] = counts[(repo, goal)]
         hold["limit"] = limit
         hold["tickets"][int(issue["number"])] = str(issue.get("title") or "")
+
+    def _host_load_holds(self, lane: str) -> bool:
+        """True while the host is too loaded for a local lane to take a
+        ticket. Only a station whose settings came from the environment
+        asks (Settings.host_load_gate); runner slots and remote lanes do
+        their work elsewhere and are never held."""
+        if not self.s.host_load_gate or lane in runners.runner_slots() or lane in REMOTE_LANES:
+            return False
+        script = os.path.join(os.path.dirname(__file__), "..", "lanes", "host_load.sh")
+        note = subprocess.check_output(["/bin/bash", script], text=True).strip()
+        if note == "unread":
+            _say("host load could not be read before claim for " + lane)
+            return False
+        if note:
+            _say("claim for %s waits for the next pass: %s" % (lane, note))
+        return bool(note)
 
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
@@ -5727,7 +5753,7 @@ class Station:
             _say("%s#%s: lane %s takes public repos only; back to the queue"
                  % (repo, fresh["number"], lane))
             return False
-        return self._claim(repo, lane, fresh)
+        return not self._host_load_holds(lane) and self._claim(repo, lane, fresh)
 
     def _blocked(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Whether a briefed ticket waits on an open blocker: its brief's
@@ -6027,7 +6053,7 @@ class Station:
         """Whether the ticket goes to no build lane (bus/brief_check.py): a
         health ticket whose cause is missing or names only the measurement
         goes back to the queue with needs-brain; a stale or already-shipped
-        one goes back to the queue with needs:human and one ask, unless its
+        one goes back to the queue with needs-brain, unless its
         body and labels state a non-person wait. A labelled ticket stays held
         before remote reads. A stale event wait without the label gets blocked
         once, making its hold visible without another person ask.
@@ -6063,7 +6089,7 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
-        return self._apply_brief_hold(repo, number, found, body)
+        return self._apply_brief_hold(repo, number, found)
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -6086,9 +6112,8 @@ class Station:
              % (repo, number))
         return True
 
-    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict,
-                          body: str = "") -> bool:
-        """Apply the existing health, area, criteria, split or person-ask hold."""
+    def _apply_brief_hold(self, repo: str, number: int, found: brief_check.Verdict) -> bool:
+        """Send a brief that needs review back to the brain."""
         try:
             brain.move(self.gh, repo, number, "queued")
             if found.kind == brief_check.HEALTH:
@@ -6120,8 +6145,13 @@ class Station:
                 self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                              {"labels": ["needs-brain"]})
                 self._routine(repo, number, "Held for the brain: this brief %s." % found.reason)
-            else:
-                brain.human(self.gh, repo, number, brief_check.ask(found, body))
+            elif found.kind == brief_check.STALE:
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
+                             {"labels": ["needs-brain"]})
+                # Keep the evidence note outside the body the stale gate checks.
+                notify.post(self.gh, repo, number, brief_check.HEALTH_NOTE % (
+                    found.reason, "Check what shipped and rewrite the brief around "
+                    "any remaining work."), notify.HELD)
         except ValueError as err:
             _say("%s#%d gets no lane (%s), but holding it failed: %s"
                  % (repo, number, found.reason, err))
@@ -6427,14 +6457,15 @@ class Station:
                 if "pull_request" in ticket or "loom:ticket" not in _label_names(ticket):
                     continue
                 tickets_by_number[number] = ticket
-            labels = _label_names(ticket)
-            if not set(labels).intersection(("loom:queued", "loom:briefed")):
+            names = _label_names(ticket)
+            if (not set(names).intersection(("loom:queued", "loom:briefed"))
+                    or labels.RUN_OUTCOME_HOLDS.intersection(names)):
                 continue
             if self._owned_elsewhere(repo, ticket):
                 continue
             if not _linked_pr(ticket, repo, pr):
                 continue
-            if "loom:briefed" in labels and self._fix_round_for(repo, ticket, int(pr["number"])):
+            if "loom:briefed" in names and self._fix_round_for(repo, ticket, int(pr["number"])):
                 # A brain fix round moved it back to briefed for a lane to fix
                 # this very pull request: not a new link. Relabelling it pr
                 # undid the round every pass, and the brain re-briefed it
@@ -6444,7 +6475,7 @@ class Station:
             if not trusted:
                 continue
             number = int(ticket["number"])
-            kept = [name for name in labels if name not in ("loom:queued", "loom:briefed")]
+            kept = [name for name in names if name not in ("loom:queued", "loom:briefed")]
             kept.append("loom:pr")
             self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                          {"labels": kept})
@@ -8128,7 +8159,7 @@ class Station:
         except GitHubError as err:
             _say("factory release: could not read %s#%d: %s" % (repo, number, err))
             return
-        if not isinstance(issue, dict) or RUNNING not in _label_names(issue):
+        if not isinstance(issue, dict) or not self._incident_held(issue):
             self._forget_held(key)
             return
         if ref is None:
@@ -8226,15 +8257,17 @@ class Station:
 
     def _release_one(self, key: str, repo: str, number: int, issue: Dict[str, Any],
                      cleared: bool, text: str) -> None:
-        """Move a held running ticket to loom:queued, clear its runaway hold
-        when the release cleared one, post the status event, and forget it."""
-        self._relabel(repo, number, "loom:queued")
-        if cleared:
-            kept = [n for n in _label_names(self._issue(repo, number)) if n != RUNAWAY]
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
-                         {"labels": kept})
+        """Release a factory hold and clear its runaway hold if requested."""
+        names = [n for n in _label_names(issue) if not (cleared and n == RUNAWAY)]
+        self._end_run(repo, number, names, "loom:queued")
         self._routine(repo, number, text)
         self._forget_held(key)
+
+    @staticmethod
+    def _incident_held(issue: Dict[str, Any]) -> bool:
+        names = _label_names(issue)
+        return issue.get("state") == "open" and (
+            RUNNING in names or {WAIT + "incident", "loom:queued"} <= set(names))
 
     def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
         """A lane claim in a comment or the issue body is newer than close."""
@@ -8340,7 +8373,7 @@ class Station:
         repo, _, raw = key.rpartition("#")
         try:
             issue = self._issue(repo, int(raw))
-            if RUNNING not in _label_names(issue) or not incident_probe.is_fix(
+            if not self._incident_held(issue) or not incident_probe.is_fix(
                     ref, key, issue.get("body"), comments):
                 return
             incident_repo, _, incident = ref.rpartition("#")
@@ -9105,6 +9138,9 @@ class Station:
     def _report_done(self, repo: str, number: int, lane: str, text: str,
                      path: str, name: str) -> bool:
         if self._field(text, "Deliverable") == "answer":
+            names = _label_names(self._issue(repo, number))
+            if "lane:" + lane in names and (RUNNING in names or "loom:answered" in names):
+                self._end_run(repo, number, self._drop_claim(names), "loom:answered")
             _say("reported %s#%d answer posted by lane %s" % (repo, number, lane))
             return True
         if not self._field(text, "Fix-PR") and self._answered(lane, name):
@@ -9186,19 +9222,20 @@ class Station:
         return True
 
     def settle_ended_runs(self) -> None:
-        """Move each loom:running ticket whose run has ended to loom:failed,
-        through _never_left_running, so it stops holding its lane. Ended
-        means the newest brief of the ticket in its lane's folders sits in
-        done or failed for ENDED_RUN_SETTLE, none waits in the inbox, and no
-        runner holds the lane. Remote lanes, factory incident holds and a
-        ticket with no brief on record are left alone. The factory counts a
-        running ticket as lane load: on 2026-11-16 six such tickets, ended
-        4 hours to 14 days before, kept three live lanes from 49 queued
-        tickets. One open-issues list a repo, a 304 when unchanged."""
-        run = os.path.join(self.s.home, "run")
-        left = ENDED_RUN_MAX
+        """Requeue local running tickets without a brief in any lane inbox.
+
+        Give a recent, unreported outcome time to settle first. Remote lanes
+        report their own claims and have no local inbox record.
+        """
+        live = self._inbox_tickets(strict=True)
+        reported = _read_json(os.path.join(self.state, "reported.json"), {})
+        pending = set()
+        for lane, _, path, name in self._finished_briefs():
+            if ("%s/%s" % (lane, name) not in reported
+                    and self.now - _landed_at(path, self.now) < DONE_NO_PR_WAIT):
+                pending.add(re.sub(r"-r[0-9]+$", "", name))
         for repo in self.scan_repos():
-            if left <= 0 or self._deferred():
+            if self._deferred():
                 return
             try:
                 found = self._paginate("/repos/%s/issues?labels=loom:running&state=open"
@@ -9209,48 +9246,43 @@ class Station:
                 _say("could not list running tickets in %s: %s" % (repo, err))
                 continue
             for issue in found:
-                if left <= 0:
-                    return
-                lane = _lane_of(issue) if isinstance(issue, dict) else ""
-                if (not lane or lane in REMOTE_LANES or "pull_request" in issue
-                        or WAIT + "incident" in _label_names(issue)
-                        or self._lane_locked(run, lane)
-                        or not self._run_ended(repo, int(issue["number"]), lane)):
-                    continue
-                self._never_left_running(repo, int(issue["number"]), lane)
-                left -= 1
-
-    def _run_ended(self, repo: str, number: int, lane: str) -> bool:
-        """The ticket's newest build brief on the lane is in done or failed,
-        at least ENDED_RUN_SETTLE old, and no brief of it is in the inbox."""
-        stem = re.compile(r"%s(?:-r[0-9]+)?\.(?:md|claiming)$"
-                          % re.escape(tickets.ticket_name(repo, number)))
-        newest = None
-        for folder in ("", "done", "failed"):
-            path = os.path.join(self.inbox(lane), folder)
-            try:
-                entries = [e for e in os.listdir(path) if stem.fullmatch(e)]
-            except OSError:
-                continue
-            if entries and not folder:
-                return False
-            for entry in entries:
                 try:
-                    stamp = os.path.getmtime(os.path.join(path, entry))
-                except OSError:
-                    continue
-                newest = stamp if newest is None else max(newest, stamp)
-        return newest is not None and self.now - newest >= ENDED_RUN_SETTLE
+                    self._requeue_ended_run(repo, issue, live, pending)
+                except RateLimited:
+                    raise
+                except GitHubError as err:
+                    _say("could not clear a stale run in %s: %s" % (repo, err))
+
+    def _requeue_ended_run(self, repo: str, issue: Any, live: set, pending: set) -> None:
+        if not isinstance(issue, dict) or "pull_request" in issue:
+            return
+        number = int(issue["number"])
+        if "%s#%d" % (repo, number) in live:
+            return
+        stem = tickets.ticket_name(repo, number)
+        if stem in pending:
+            return
+        if _lane_of(issue) in REMOTE_LANES or self._owned_elsewhere(repo, issue):
+            return
+        fresh = self._issue(repo, number)
+        names = _label_names(fresh)
+        if (fresh.get("state") != "open" or RUNNING not in names or _lane_of(fresh) != _lane_of(issue)
+                or self._owned_elsewhere(repo, fresh)):
+            return
+        kept = self._drop_claim(n for n in names if n != RUNNING and not n.startswith("lane:"))
+        if not ticket_move.STATE_LABELS.intersection(kept):
+            kept.append("loom:queued")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": kept})
+        _say("cleared stale running labels on %s#%d" % (repo, number))
 
     def _never_left_running(self, repo: str, number: int, lane: str) -> None:
         """A reported failure ends the run, so a ticket still loom:running on
         that lane goes to loom:failed, where the factory acts on it. A path
         that reported and forgot to move it left the ticket running with no
         brief: a runaway hold did, and four tickets sat 8 to 48 hours
-        (2026-10-20). A factory hold (wait:incident) stays running by design."""
+        (2026-10-20)."""
         names = _label_names(self._issue(repo, number))
-        if (RUNNING not in names or "lane:" + lane not in names
-                or WAIT + "incident" in names):
+        if RUNNING not in names or "lane:" + lane not in names:
             return
         self._relabel(repo, number, "loom:failed")
         self._routine(repo, number, "Lane %s's run ended and nothing moved the ticket, so it "
@@ -9290,6 +9322,16 @@ class Station:
             # resolves", and the ticket sat 8 hours with nothing running
             # (2026-10-20).
             self._relabel(repo, number, "loom:failed")
+            return True
+        # A pick_held stop (no model of the slot can run at all) is not a
+        # briefed wait on the same slot: kept briefed with its lane, the
+        # ticket was claimed by that slot again and again and ended failed
+        # (loom#3226). It goes back to the queue with no lane, as a
+        # transient requeue does, and the slot's own heartbeat hold keeps
+        # the station from claiming for it until the hold ends.
+        if (bare.startswith("limit: no model can run") or bare.startswith("no model can run")) \
+                and not fix_pr.isdigit():
+            self._requeue_no_model(repo, number, lane, reason)
             return True
         # Thermal-limit briefs carry "limit:" with or without a class and
         # return to the factory. Provider limits have a class but no marker,
@@ -9377,7 +9419,7 @@ class Station:
         match = HELD_FOR_RE.search(bare)
         incident_ref = "%s#%s" % (match.group(1), match.group(2)) if match else None
         self._note_held(repo, number, incident_ref)
-        self._set_wait(repo, self._issue(repo, number), "incident")
+        self._relabel(repo, number, "loom:queued", wait="incident")
         if incident_ref is None:
             self._routine(repo, number,
                           "Lane %s held: incident filing failed. %s. The ticket keeps its rung and "
@@ -9622,6 +9664,24 @@ class Station:
             return event.startswith(prefix)
         return False
 
+    def _requeue_no_model(self, repo: str, number: int, lane: str, reason: str) -> None:
+        """A run that stopped because no model of its slot can run
+        (pick_held in lanes/run_lane.sh): the slot did no work, so it is no
+        failure and costs no rung, and the ticket must not wait briefed on
+        that slot, which claimed it again on every pass (loom#3226). It
+        goes back to loom:queued with its lane label removed and
+        wait:model-limit; the factory gives it a lane that can run, or it
+        waits for the slot's hold to end. A status event, not a comment,
+        ends the claim as [limit]."""
+        names = _label_names(self._issue(repo, number))
+        if RUNNING not in names:
+            return
+        labels = ticket_move.next_labels(names, "queued", lane="", wait="model-limit",
+                                         own_logins=self.s.authors, clear_needs_brain=False)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+        self._stopped(repo, number, lane, "limit", reason)
+        _say("requeued %s#%d after a no model can run stop on lane %s" % (repo, number, lane))
+
     def _requeue_transient(self, repo: str, number: int, lane: str, reason: str,
                            why_not: str) -> None:
         """A transient ending with no retry left (every automatic retry used,
@@ -9837,10 +9897,7 @@ class Station:
             return
         if merged:
             pr = merged[0]
-            states = {"loom:" + s for s in brain.STATES}
-            labels = [n for n in names if n not in states and not n.startswith(WAIT)]
-            labels.append("loom:merged")
-            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
+            self._end_run(repo, number, names, "loom:merged")
             note = ("Pull request #%d (merged %s, merge commit %s) already carries this "
                     "ticket's work, so the ticket moved to loom:merged: it ships and is verified "
                     "against its acceptance criteria like any merged ticket."
@@ -9985,12 +10042,14 @@ class Station:
         if step["action"] == "promote" and "plan" not in step:
             plan = self._no_change_plan(repo, planning)
             if plan is None:
-                self._set_wait(repo, issue, "no-change")
                 # Reported once; retry_waiting_no_change drives the retry.
                 step.update(waiting=True, fix=fix, tried_at=self.now)
                 if model:
                     step["model"] = model
                 self._save_no_change(data)
+                names = _label_names(issue)
+                if RUNNING in names:
+                    self._end_run(repo, number, names, "loom:queued", "no-change")
                 return True
             step["plan"] = plan
             self._save_no_change(data)
@@ -10034,6 +10093,10 @@ class Station:
         names = set(_label_names(issue))
         allowed = {RUNNING, "wait:no-change"}
         if prior:
+            if prior.get("waiting") and {"loom:queued", "wait:no-change"} <= names:
+                if any(name.startswith("lane:") for name in names):
+                    return True
+                allowed.add("loom:queued")
             held = prior["action"] == "hold" or prior.get("plan") == {}
             target = "answered" if held else ("pr" if fix else "queued")
             if prior.get("plan") and not fix:
@@ -10124,7 +10187,7 @@ class Station:
     def _no_change_labels(self, repo: str, number: int, issue: Dict[str, Any], target: str,
                           plan: Optional[Dict[str, Any]], held: bool) -> None:
         labels = ticket_move.next_labels(
-            _label_names(issue), target, lane=plan["lane"] if plan else None,
+            _label_names(issue), target, lane=plan["lane"] if plan else ("" if target == "queued" else None),
             own_logins=self.s.authors, clear_needs_brain=False)
         if held and "needs-brain" not in labels:
             labels.append("needs-brain")
@@ -10413,7 +10476,16 @@ class Station:
         names = _label_names(self._issue(repo, number))
         if RUNNING not in names:
             return
-        labels = ticket_move.next_labels(names, new, wait=wait,
+        self._end_run(repo, number, names, new, wait)
+
+    def _end_run(self, repo: str, number: int, names: List[str], new: str, wait: str = "") -> None:
+        """Write the labels of a run that ended in `new`. Only a ticket going
+        back to the queue loses its lane label, so any lane can take it. At
+        every other state the label stays: the factory reads it to send a fix
+        round to the lane that built the pull request (Factory._open_round)
+        and to count the rung a failed run was on (factory.current_rung)."""
+        lane = "" if new == "loom:queued" else None
+        labels = ticket_move.next_labels(names, new, lane=lane, wait=wait,
                                          own_logins=self.s.authors,
                                          clear_needs_brain=False)
         self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
@@ -11620,19 +11692,28 @@ class Station:
             try:
                 loose, tree = brain.goal_tree(self.gh, repo, int(goal["number"]))
                 children = {brain._issue_key(i, repo): i for i in brain._flatten(loose, tree, repo)}
-                for issue in brain_hold.triaged(self.gh, repo):
-                    children[brain._issue_key(issue, repo)] = issue
             except RateLimited:
                 raise
             except GitHubError as err:
                 lines.append("- **%s** could not be read (%s)" % (self._short_name(goal),
                                                                   type(err).__name__))
                 continue
+            triage_unread = False
+            try:
+                for issue in brain_hold.triaged(self.gh, repo):
+                    children[brain._issue_key(issue, repo)] = issue
+            except RateLimited:
+                raise
+            except GitHubError:
+                triage_unread = True
             groups = self._standup_ticket_groups(list(children.values()), since)
             summary = self._standup_summary(groups)
             aged = self._standup_triage_age(groups["aged_triage"])
             if aged:
                 summary = "%s. %s" % (summary, aged)
+            if triage_unread:
+                summary = "%s. Triage issues could not be read" % summary if summary \
+                    else "Triage issues could not be read"
             lines.append("- **%s** %s" % (self._short_name(goal), summary or "nothing moved"))
         return lines
 
@@ -15297,7 +15378,7 @@ class Station:
         went stuck, queued or asks the operator since `since` (loom#2898)."""
         groups = self._standup_ticket_groups(children, since)
         if any(groups[k] for k in ("merged", "verified", "sent_back", "failed", "regressed",
-                                   "aged_pr", "aged_triage", "queued", "asks", "triage_waiting")):
+                                   "aged_pr", "queued", "asks", "triage_waiting")):
             return True
         # A ticket opened or closed since the last report is news too, as in
         # bus/quiet.py.
@@ -18012,7 +18093,7 @@ class Station:
                     self._timed(self.settle_ended_runs)
                 except RateLimited:
                     raise
-                except (GitHubError, OSError) as err:
+                except (GitHubError, OSError, ValueError) as err:
                     _say("settle_ended_runs failed: %s" % err)
             # Briefing a queued ticket onto a free lane comes before the heavy
             # reads: reconcile_pull_requests and claim_new spend the pass's

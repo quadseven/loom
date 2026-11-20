@@ -317,12 +317,25 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+HEAVY_LOCK=""
+heavy_lock() {
+  python3 -IB "$LOOM_ROOT/lanes/heavy_repo.py" "$@"
+}
+release_heavy_repo() {
+  [ -z "$HEAVY_LOCK" ] || heavy_lock release "$HEAVY_LOCK"
+  HEAVY_LOCK=""
+}
+trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
+# The job cap an agent run and each check step start under (LOOM_BUILD_JOBS,
+# default 4, 0 for none): BUILD_JOBS_ENV, BUILD_JOBS_CHECK_ENV, BUILD_JOBS_BIN
+# and build_jobs_export.
+# shellcheck source=lanes/build_jobs.sh
+. "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
@@ -1474,7 +1487,7 @@ agy_agent() {
   settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
-    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+    LANG="${LANG:-en_US.UTF-8}" ${BUILD_JOBS_ENV[@]+"${BUILD_JOBS_ENV[@]}"} timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$@" --disable-slash-commands --model "$MODEL" < /dev/null | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
   # A failed restore must fail the run, even if agy itself succeeded. Only the
@@ -2868,45 +2881,7 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
-CHECK_LOAD_1M="${LOOM_CHECK_LOAD_1M:-24}"
-CHECK_LOAD_5M="${LOOM_CHECK_LOAD_5M:-18}"
-CHECK_LOAD_FILE="${LOOM_CHECK_LOAD_FILE:-/proc/loadavg}"
-CHECK_LOAD_NOTE=""
-[[ "$CHECK_LOAD_1M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_1M=24
-[[ "$CHECK_LOAD_5M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_5M=18
-
-# Print the host's 1-minute and 5-minute load averages as "<1m> <5m>";
-# return 1 when there is no reading.
-check_load_reading() {
-  local line="" one="" five="" rest=""
-  if [ -r "$CHECK_LOAD_FILE" ]; then
-    IFS= read -r line < "$CHECK_LOAD_FILE" || [ -n "$line" ] || return 1
-  else
-    line="$(sysctl -n vm.loadavg 2>/dev/null || /usr/sbin/sysctl -n vm.loadavg 2>/dev/null)" || return 1
-  fi
-  # macOS prints "{ 2.92 3.15 3.21 }", and a comma for the point in some locales.
-  line="${line//[\{\}]/ }"
-  line="${line//,/.}"
-  read -r one five rest <<< "$line"
-  [[ "$one" =~ ^[0-9]+(\.[0-9]+)?$ && "$five" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
-  printf '%s %s\n' "$one" "$five"
-}
-
-# Return 0 when the host load is above a limit, with CHECK_LOAD_NOTE saying
-# which reading and limit; 1 when there is room, both limits are 0, or the
-# load cannot be read (CHECK_LOAD_NOTE is then "unread").
-check_load_high() {
-  local reading one five
-  CHECK_LOAD_NOTE=""
-  [[ "$CHECK_LOAD_1M" =~ ^0+(\.0+)?$ && "$CHECK_LOAD_5M" =~ ^0+(\.0+)?$ ]] && return 1
-  reading="$(check_load_reading)" || { CHECK_LOAD_NOTE=unread; return 1; }
-  read -r one five <<< "$reading"
-  CHECK_LOAD_NOTE="$(awk -v a="$one" -v b="$five" -v la="$CHECK_LOAD_1M" -v lb="$CHECK_LOAD_5M" 'BEGIN {
-    if (la + 0 > 0 && a + 0 > la + 0) printf "1-minute load %s is above %s", a, la
-    else if (lb + 0 > 0 && b + 0 > lb + 0) printf "5-minute load %s is above %s", b, lb
-  }')"
-  [ -n "$CHECK_LOAD_NOTE" ]
-}
+. "$LOOM_ROOT/lanes/host_load.sh" || exit 1
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
@@ -2984,6 +2959,35 @@ acquire_check_slot() {
 release_check_slot() {
   [ -z "$CHECK_SLOT_HELD" ] || rm -rf "$CHECK_SLOT_HELD"
   CHECK_SLOT_HELD=""
+}
+
+wait_for_agent() {
+  [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || return 0
+  local requested="${1:-}" start=$SECONDS noted="" why left poll="$CHECK_SLOT_POLL"
+  while :; do
+    if check_load_high; then
+      why="$CHECK_LOAD_NOTE"
+    elif [ -n "$requested" ] && ! heavy_lock take "$requested"; then
+      why="heavy repo lock for $REPO"
+    else
+      HEAVY_LOCK="$requested"
+      if [ "$CHECK_LOAD_NOTE" = unread ]; then
+        echo "host load could not be read before agent start" >> "$LOG"
+      fi
+      return 0
+    fi
+    if [ -z "$noted" ]; then
+      echo "waiting to start agent: $why" >> "$LOG"
+      noted=1
+    fi
+    left=$((10#$CHECK_SLOT_WAIT - (SECONDS - start)))
+    if [ "$left" -le 0 ]; then
+      echo "agent deferred until next pass: $why" >> "$LOG"
+      return 1
+    fi
+    if [ "${poll%%.*}" -ge "$left" ]; then poll="$left"; fi
+    sleep "$poll"
+  done
 }
 
 # A check that never ran for want of a slot (75) or that the timeout killed
@@ -3091,13 +3095,18 @@ contract_run_sandboxed() {
     # (2026-10-16).
     # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
     # the scratch home, where agent_uv_cache copies them for a codex agent.
-    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${BUILD_JOBS_BIN:+$BUILD_JOBS_BIN:}${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
     export LOOM_CHECK_WORKERS="$CHECK_WORKERS"
+    # The job cap (lanes/build_jobs.sh). This environment was emptied above,
+    # so the cap is set here, not inherited; it lowers LOOM_CHECK_WORKERS
+    # when that is the larger of the two. The wrapper directory is first on
+    # PATH above. With LOOM_BUILD_JOBS=0 the list is empty.
+    for kv in ${BUILD_JOBS_CHECK_ENV[@]+"${BUILD_JOBS_CHECK_ENV[@]}"}; do export "${kv?}"; done
     # Host-red tests to set aside (host_red_deselected_passes): node ids
     # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
     # names them for a check that reads them itself.
@@ -4810,6 +4819,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
   fi
 
+  [ "$DELIVERABLE" = base-check ] || wait_for_agent || exit 0
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events" "$WORKDIR/$TICKET.last-message"
@@ -4864,6 +4874,15 @@ for BRIEF in "$INBOX"/*.md; do
     continue
   fi
   resume_earlier_attempt
+  repo_lock=""
+  if [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && [ -n "${LOOM_HEAVY_REPOS:-}" ]; then
+    repo_key="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+    heavy_repos="$(printf '%s' "$LOOM_HEAVY_REPOS" | tr '[:upper:]' '[:lower:]' | tr ',[:space:]' ' ')"
+    case " $heavy_repos " in
+      *" $repo_key "*) repo_lock="$LOOM_HOME/run/heavy-repos/${repo_key/\//+}.lock" ;;
+    esac
+  fi
+  wait_for_agent "$repo_lock" || exit 0
   [ "$LANE" = opencode-go ] && { catalogue_cmd record-call "$MODEL" >> "$LOG" 2>&1 || true; }
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -4871,13 +4890,23 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
-  if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
+  if ! agent_gh_config; then
+    release_heavy_repo
+    park "$BRIEF" "$AGENT_GH_WHY" transient; continue
+  fi
   rm -f "$LOCK/watchdog-limit" "$LOCK/egress-opened"
   # The job's proof that an agent started: without it a cluster run fails in
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    (if [ -n "$HEAVY_LOCK" ]; then
+       # This process group can outlive the runner. Keep its own PID in the lock.
+       heavy_lock adopt "$HEAVY_LOCK" "$$" || exit 1
+       trap 'release_heavy_repo' EXIT
+     fi
+     # The job cap, in this subshell only (lanes/build_jobs.sh).
+     build_jobs_export &&
+     cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
@@ -4904,6 +4933,7 @@ for BRIEF in "$INBOX"/*.md; do
     exit $agent_status ) &
   wait $!
   STATUS=$?
+  release_heavy_repo
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   GH_CLEANUP_FAILURE=""

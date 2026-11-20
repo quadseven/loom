@@ -5417,6 +5417,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if labels.RUN_OUTCOME_HOLDS.intersection(_labels(issue)):
+            return "%s is held" % ref
         if brain.has_open_rewrite(self.gh, repo, issue, sorted(self.trusted)):
             return "%s has an open rewrite ticket" % ref
         person = self._human_holder(repo, issue)
@@ -6005,7 +6007,7 @@ class Factory:
                 counts[found.kind] += 1
                 names = _labels(issue)
                 triage = labels.in_triage(names)
-                if triage and (not found.at or labels.waiting_on_person(names)):
+                if triage and labels.waiting_on_person(names):
                     continue
                 if found.kind == brain_hold.LOOM:
                     due.append((age, repo, issue, found, triage))

@@ -65,7 +65,8 @@ def _waiting(lines: List[str]) -> Tuple[str, ...]:
             values.append(line[4:])
         elif line.strip():
             active = False
-    values = [" ".join(value.split()) for value in values]
+    # A posted tick links "issue 7" as "issue #7" (journal.tidy); compare both alike.
+    values = [" ".join(re.sub(r"#(\d)", r"\1", value).split()) for value in values]
     return tuple(sorted(value for value in values if value.lower() not in _EMPTY))
 
 

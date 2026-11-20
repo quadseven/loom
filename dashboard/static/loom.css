@@ -873,3 +873,9 @@ footer { margin-top: 18px; color: var(--muted); font: 12px var(--font-mono); }
   .review-item .answer-choices button { flex: 1 1 7rem; }
   .review-item .answer-note { width: 100%; min-width: 0; }
 }
+
+.needs-board { margin: 0 0 20px; padding: 14px 16px; border: 2px solid var(--accent, #c2410c); border-radius: 12px; }
+.needs-board > h2 { margin: 0 0 8px; font-size: 18px; }
+.needs-board table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.needs-board th, .needs-board td { padding: 6px 8px; text-align: left; vertical-align: top; border-top: 1px solid var(--border, #8884); }
+.needs-board .ask-missing { font-style: italic; color: var(--muted); }

@@ -2,6 +2,7 @@
 the remote, and fake agent and gh commands on PATH that record their calls."""
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import unittest
 from http.server import BaseHTTPRequestHandler
@@ -133,7 +135,7 @@ if [ "$1" = api ]; then
       printf '{"number":%s,"state":"%s","labels":[{"name":"%s"}]}\\n' "${2##*/}" "${FAKE_GH_ISSUE_STATE:-open}" "${FAKE_GH_ISSUE_LABEL:-loom:factory}"
       exit 0 ;;
   esac
-  [ "$*" = "api repos/example/repo --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
+  [ "$*" = "api repos/${FAKE_GH_REPO:-example/repo} --jq .private" ] && printf '%s\\n' "${FAKE_GH_PRIVATE:-false}"
   exit 0
 fi
 if [ "$1 $2" = "pr list" ]; then
@@ -4462,7 +4464,7 @@ exec /bin/rm "$@"
                          [("deny", "*"), ("allow", "443")])
         writes = [line for line in profile.splitlines() if "file-write*" in line]
         scratch = home.resolve()
-        self.assertEqual(len(writes), 5)
+        self.assertEqual(len(writes), 6)
         self.assertEqual(writes[0], '(deny file-write* (subpath "/"))')
         self.assertTrue(writes[1].startswith('(allow file-write* (literal "/dev/null")'), writes[1])
         self.assertNotIn("subpath", writes[1])
@@ -4476,6 +4478,8 @@ exec /bin/rm "$@"
         self.assertTrue(tree.endswith("/worktrees/T042-fix-the-thing"), tree)
         self.assertEqual(profile_scratch, str(scratch))
         self.assertEqual(writes[4], f'(deny file-write* (subpath "{tree}/.git"))')
+        # The job cap's wrapper directory: readable, and no write allowed.
+        self.assertEqual(writes[5], f'(deny file-write* (subpath "{(RUNNER.parent / "jobcap").resolve()}"))')
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -6660,7 +6664,8 @@ exit %d
 
     def test_a_pass_writes_a_fresh_available_heartbeat(self):
         before = int(time.time())
-        self.run_lane()
+        self.run_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                      LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_LOAD_5M="18")
         beat = json.loads((self.loom / "state" / "usage" / "codex.json").read_text())
         self.assertTrue(beat["available"])
         self.assertEqual(beat["lane"], "codex")
@@ -8616,7 +8621,7 @@ echo fixed > fix.txt
         tmp = Path(self._tmp.name)
         return subprocess.Popen(
             ["bash", "-c", "LOG=\"$SLOT_LOG\"\n" + funcs + body],
-            env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
+            env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom), "SLOT_LOG": str(tmp / "slots.log"),
                  "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0", **env},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -8627,6 +8632,137 @@ echo fixed > fix.txt
         fresh.write_text(f"{one} {five} 1.00 1/100 1\n")
         fresh.replace(path)
         return path
+
+    def wait_for_run_text(self, path, text, run):
+        deadline = time.monotonic() + 30
+        while not (path.exists() and text in path.read_text()):
+            self.assertFalse(run.done(), "lane finished before " + text)
+            self.assertLess(time.monotonic(), deadline, text)
+            time.sleep(0.05)
+
+    def test_agent_starts_when_each_enabled_load_limit_clears(self):
+        for one, five, name in [(24, 0, "1-minute"), (0, 18, "5-minute")]:
+            with self.subTest(limit=name):
+                self.drop_brief()
+                log = self.loom / "logs" / "codex" / "T042-fix-the-thing.log"
+                with ThreadPoolExecutor(1) as pool:
+                    run = pool.submit(self.run_lane, LOOM_CHECK_LOAD_1M=str(one),
+                                      LOOM_CHECK_LOAD_5M=str(five), LOOM_CHECK_SLOT_POLL="0.1",
+                                      LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)))
+                    try:
+                        self.wait_for_run_text(log, name + " load", run)
+                        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                        self.assertTrue((self.loom / "state/usage/codex.alive").exists())
+                    finally:
+                        self.load_file(one or 90, five or 90)
+                    self.assertEqual(run.result().returncode, 0)
+                self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+                self.log.write_text("")
+
+    def test_agent_load_timeout_leaves_the_same_brief_for_the_next_pass(self):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo()
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 0)),
+                                        LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="1",
+                                        LOOM_CHECK_SLOT_POLL="60", timeout=12)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+        self.assertFalse(list((self.inbox / "failed").iterdir()))
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertIn("load", self.run_log())
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.run_contract_lane().returncode, 0)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    def test_agent_rechecks_load_after_preparing_the_clone(self):
+        self.drop_brief()
+        load = self.load_file(0, 0)
+        self.write_tool(self.bin / "git", '#!/bin/sh\n'
+                        'if [ "$1" = clone ]; then echo "1 20 1" > "$LOOM_CHECK_LOAD_FILE"; fi\n'
+                        f'exec {shlex.quote(shutil.which("git"))} "$@"\n')
+        result = self.run_lane(LOOM_CHECK_LOAD_FILE=str(load), LOOM_CHECK_LOAD_5M="18",
+                               LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5-minute load", self.run_log())
+        self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_cluster_agent_ignores_local_host_load_and_heavy_repo_lock(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        (lock / "pid").write_text(str(os.getpid()))
+        result = self.run_lane(LOOM_CLUSTER_RUNNER="1", LOOM_HEAVY_REPOS="example/repo",
+                               LOOM_CHECK_LOAD_FILE=str(self.load_file(90, 90)),
+                               LOOM_CHECK_LOAD_1M="24", LOOM_CHECK_SLOT_WAIT="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(c.startswith("codex ") for c in self.calls()))
+        self.assertEqual((lock / "pid").read_text(), str(os.getpid()))
+
+    def test_heavy_repo_agents_take_turns_while_another_repo_runs(self):
+        self.drop_brief()
+        light = self.remote.with_name("light.git")
+        git("clone", "-q", "--bare", str(self.remote), str(light))
+        for slot, repo, name in [("codex-2", "repo", "T043"), ("codex-3", "light", "T044")]:
+            folder = self.inbox.with_name(slot)
+            folder.mkdir()
+            (folder / (name + ".md")).write_text(BRIEF.replace("example/repo", "example/" + repo))
+        marks = Path(self._tmp.name) / "starts"
+        release = marks.with_name("release")
+        self.write_tool(self.bin / "codex", '#!/bin/bash\ncat >/dev/null\n'
+                        'echo "start $TAG" >> "$MARKS"\n'
+                        'while [ "$TAG" = first ] && [ ! -e "$RELEASE" ]; do sleep 0.1; done\n'
+                        'echo "end $TAG" >> "$MARKS"\nexit 3\n')
+        env = dict(LOOM_HEAVY_REPOS="example/unused,example/repo", LOOM_CHECK_SLOT_POLL="0.1",
+                   MARKS=str(marks), RELEASE=str(release))
+        with ThreadPoolExecutor(3) as pool:
+            first = pool.submit(self.run_lane, TAG="first", **env)
+            try:
+                self.wait_for_run_text(marks, "start first", first)
+                holder = (self.loom / "run/heavy-repos/example+repo.lock/pid").read_text()
+                self.assertEqual(holder, (self.loom / "run/codex.lock/pgid").read_text())
+                second = pool.submit(self.run_lane, "codex-2", TAG="second", **env)
+                third = pool.submit(self.run_lane, "codex-3", TAG="third", FAKE_GH_REPO="example/light", **env)
+                self.wait_for_run_text(self.loom / "logs/codex-2/T043.log", "heavy repo", second)
+                self.assertEqual(third.result().returncode, 0)
+                self.assertEqual(marks.read_text().splitlines(), ["start first", "start third", "end third"])
+            finally:
+                release.touch()
+            self.assertEqual(first.result().returncode, 0)
+            self.assertEqual(second.result().returncode, 0)
+        self.assertEqual(marks.read_text().splitlines()[-3:], ["end first", "start second", "end second"])
+        self.assertFalse((self.loom / "run/heavy-repos/example+repo.lock").exists())
+
+    def test_busy_heavy_repo_guard_cannot_extend_the_wait_limit(self):
+        self.drop_brief()
+        root = self.loom / "run/heavy-repos"
+        root.mkdir(parents=True)
+        with ThreadPoolExecutor(1) as pool, (root / ".guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            run = pool.submit(self.run_lane, LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+            log = self.loom / "logs/codex/T042-fix-the-thing.log"
+            self.wait_for_run_text(log, "deferred until next pass", run)
+            self.assertEqual(run.result(timeout=5).returncode, 0)
+        self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+
+    def test_heavy_repo_lock_respects_an_external_pid_and_reclaims_it_after_exit(self):
+        self.drop_brief()
+        lock = self.loom / "run/heavy-repos/example+repo.lock"
+        lock.mkdir(parents=True)
+        env = dict(LOOM_HEAVY_REPOS="example/repo", LOOM_CHECK_SLOT_WAIT="0")
+        with subprocess.Popen(["sleep", "60"]) as other:
+            try:
+                (lock / "pid").write_text(str(other.pid) + "\n")
+                self.assertEqual(self.run_lane(**env).returncode, 0)
+                self.assertEqual((self.inbox / "T042-fix-the-thing.md").read_text(), BRIEF)
+                self.assertFalse(any(c.startswith("codex ") for c in self.calls()))
+                self.assertEqual((lock / "pid").read_text().strip(), str(other.pid))
+            finally:
+                other.terminate()
+        self.assertEqual(self.run_lane(**env).returncode, 0)
+        self.assertTrue((self.inbox / "done/T042-fix-the-thing.md").exists())
+        self.assertFalse(lock.exists())
 
     def wait_for_slot_log(self, text, seconds=20):
         log = Path(self._tmp.name) / "slots.log"
@@ -8682,7 +8818,7 @@ echo fixed > fix.txt
         text = RUNNER.read_text()
         funcs = re.search(r"^CHECK_SLOTS=.*?^release_check_slot\(\) \{\n.*?^\}\n", text, re.S | re.M).group(0)
         out = subprocess.run(["bash", "-c", funcs + 'echo "$CHECK_LOAD_1M $CHECK_LOAD_5M"\n'],
-                             env={"PATH": "/usr/bin:/bin", "LOOM_HOME": str(self.loom)},
+                             env={"PATH": "/usr/bin:/bin", "LOOM_ROOT": str(RUNNER.parent.parent), "LOOM_HOME": str(self.loom)},
                              capture_output=True, text=True, timeout=30)
         self.assertEqual(out.stdout.strip(), "24 18", out.stderr)
 
@@ -8750,7 +8886,7 @@ echo fixed > fix.txt
     def test_a_lane_whose_load_wait_runs_out_parks_transient_without_an_incident(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         self.contract_repo()
-        self.drop_brief()
+        self.drop_brief(text=self.BASE_CHECK_BRIEF)
         load = self.load_file("31.50", "2.00")
         result = self.run_contract_lane(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1",
                                         LOOM_CHECK_SLOT_POLL="0.2", LOOM_CHECK_LOAD_FILE=str(load),
@@ -9620,6 +9756,305 @@ echo fixed > fix.txt
                                 env=env, cwd=str(tree), capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(str(resolved_localbin), result.stdout)
+
+    # The job cap (lanes/build_jobs.sh): LOOM_BUILD_JOBS, default 4, 0 for none.
+
+    JOBCAP_BIN = RUNNER.parent / "jobcap"
+    JOB_CAP_NAMES = ("LOOM_BUILD_JOBS", "MAKEFLAGS", "CMAKE_BUILD_PARALLEL_LEVEL",
+                     "PYTEST_XDIST_AUTO_NUM_WORKERS", "CARGO_BUILD_JOBS", "GOMAXPROCS",
+                     "GRADLE_OPTS", "UV_CONCURRENT_BUILDS", "RAYON_NUM_THREADS",
+                     "OMP_NUM_THREADS", "npm_config_jobs")
+    # A stand-in for the real build tool, later on PATH than the wrapper: it
+    # records the arguments it was started with, one call a line.
+    FAKE_BUILD_TOOL = ('#!/bin/bash\nprintf \'%s\' "$(basename "$0")" >> "$TOOL_CALLS"\n'
+                       'for a in "$@"; do printf \' [%s]\' "$a" >> "$TOOL_CALLS"; done\n'
+                       'echo >> "$TOOL_CALLS"\n')
+
+    def job_cap(self, jobs, tests=None):
+        """The environment a cap of `jobs` sets; `tests` is the test runner's
+        share when a check's worker count is the smaller."""
+        return {
+            "LOOM_BUILD_JOBS": str(jobs), "MAKEFLAGS": f"-j{jobs}",
+            "CMAKE_BUILD_PARALLEL_LEVEL": str(jobs),
+            "PYTEST_XDIST_AUTO_NUM_WORKERS": str(jobs if tests is None else tests),
+            "CARGO_BUILD_JOBS": str(jobs), "GOMAXPROCS": str(jobs),
+            "GRADLE_OPTS": f"-Dorg.gradle.workers.max={jobs}", "UV_CONCURRENT_BUILDS": "1",
+            "RAYON_NUM_THREADS": str(jobs), "OMP_NUM_THREADS": str(jobs),
+            "npm_config_jobs": str(jobs),
+        }
+
+    @staticmethod
+    def env_of(text):
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+    def assert_capped(self, env, jobs, tests=None):
+        for name, value in self.job_cap(jobs, tests).items():
+            self.assertEqual(env.get(name), value, name)
+        self.assertEqual(env["PATH"].split(":")[0], str(self.JOBCAP_BIN))
+        self.assertEqual(env["PATH"].split(":").count(str(self.JOBCAP_BIN)), 1)
+
+    def assert_uncapped(self, env, inherited=False):
+        """No cap is set. A subscription lane's agent inherits the runner's
+        environment, the operator's LOOM_BUILD_JOBS=0 included: that is the
+        setting saying off, which the wrappers read as off too."""
+        for name in self.JOB_CAP_NAMES:
+            if inherited and name == "LOOM_BUILD_JOBS":
+                self.assertEqual(env.get(name), "0")
+            else:
+                self.assertNotIn(name, env)
+        self.assertNotIn("jobcap", env["PATH"])
+
+    def codex_env_run(self, **env):
+        """A codex pass whose agent writes down its environment, then starts
+        the two build tools the cap wraps. Returns the agent's environment
+        and the calls the real tools got."""
+        root = Path(self._tmp.name)
+        seen, tool_calls = root / "agent-env", root / "tool-calls"
+        tool_calls.touch()
+        for name in ("xcodebuild", "swift"):
+            self.write_tool(self.bin / name, self.FAKE_BUILD_TOOL)
+        self.write_tool(self.bin / "codex", FAKE_AGENT.replace("cat > /dev/null\n", (
+            "cat > /dev/null\n"
+            'env > "$AGENT_ENV_OUT"\n'
+            'xcodebuild -scheme "My App" build\nswift test --filter "a b"\n'), 1))
+        self.drop_brief()
+        result = self.run_lane(AGENT_ENV_OUT=str(seen), TOOL_CALLS=str(tool_calls), **env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+        return self.env_of(seen.read_text()), tool_calls.read_text().splitlines()
+
+    def test_an_agent_run_starts_under_the_job_cap(self):
+        # A lane run in flight took every core: nothing told its build tools
+        # how many jobs to use, and the load gates only stop a run starting.
+        env, tools = self.codex_env_run(LOOM_BUILD_JOBS="3")
+        self.assert_capped(env, 3)
+        # The wrappers are first on PATH, so the two tools that take a job
+        # count only as a flag got one, with every argument as it was given.
+        self.assertEqual(tools, ["xcodebuild [-jobs] [3] [-scheme] [My App] [build]",
+                                 "swift [test] [--jobs] [3] [--filter] [a b]"])
+
+    def test_the_job_cap_is_four_when_nothing_sets_it(self):
+        env, tools = self.codex_env_run()
+        self.assert_capped(env, 4)
+        self.assertEqual(tools[0], "xcodebuild [-jobs] [4] [-scheme] [My App] [build]")
+
+    def test_an_agent_run_keeps_the_hosts_own_make_and_gradle_flags(self):
+        env, _ = self.codex_env_run(LOOM_BUILD_JOBS="3", MAKEFLAGS="-k",
+                                    GRADLE_OPTS="-Xmx2g")
+        self.assertEqual(env["MAKEFLAGS"], "-k -j3")
+        self.assertEqual(env["GRADLE_OPTS"], "-Xmx2g -Dorg.gradle.workers.max=3")
+
+    def test_a_job_cap_of_zero_sets_no_cap_and_leaves_path_alone(self):
+        env, tools = self.codex_env_run(LOOM_BUILD_JOBS="0")
+        self.assert_uncapped(env, inherited=True)
+        # PATH is what the runner makes of the one it was started with, and
+        # nothing was put in front of it.
+        self.assertTrue(env["PATH"].startswith(self.lane_env()["PATH"]), env["PATH"])
+        self.assertEqual(tools, ["xcodebuild [-scheme] [My App] [build]",
+                                 "swift [test] [--filter] [a b]"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_emptied_agent_environment_carries_the_job_cap(self):
+        # An API lane's agent starts with an emptied environment, so the cap
+        # is set where that environment is built, and its sandbox must let
+        # the agent run the wrappers.
+        self.write_tool(self.bin / "swift", self.FAKE_BUILD_TOOL.replace("$TOOL_CALLS", "$TMPDIR/tool-calls"))
+        self.write_tool(self.bin / "opencode", FAKE_OPENCODE.replace(
+            'args="$*"; args=', 'env > "$TMPDIR/agent-env"\nswift build -c release\nargs="$*"; args=', 1))
+        scratch = self.loom / "run" / "openrouter-home" / "tmp"
+        inbox, result = self.api_lane(
+            "openrouter", LOOM_OPENROUTER_KEY_SSM="/k/or", FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free", LOOM_BUILD_JOBS="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists(), result.stderr)
+        self.assert_capped(self.env_of((scratch / "agent-env").read_text()), 3)
+        self.assertEqual((scratch / "tool-calls").read_text().splitlines(),
+                         ["swift [build] [--jobs] [3] [-c] [release]"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_an_emptied_agent_environment_has_no_cap_at_zero(self):
+        self.write_tool(self.bin / "opencode", FAKE_OPENCODE.replace(
+            'args="$*"; args=', 'env > "$TMPDIR/agent-env"\nargs="$*"; args=', 1))
+        inbox, result = self.api_lane(
+            "openrouter", LOOM_OPENROUTER_KEY_SSM="/k/or", FAKE_SECRET__k_or="fake-or-key",
+            LOOM_OPENROUTER_MODEL="openrouter/vendor/model:free", LOOM_BUILD_JOBS="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_uncapped(self.env_of(
+            (self.loom / "run" / "openrouter-home" / "tmp" / "agent-env").read_text()))
+
+    def check_step_env(self, **settings):
+        """The environment one check step runs in, with the runner's settings
+        `settings`: contract_run_sandboxed alone, behind a sandbox-exec that
+        only runs its command. Returns the step's environment and the PATH
+        the runner had."""
+        text = RUNNER.read_text()
+        funcs = "".join(re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+                        for name in ("contract_command_ok", "contract_run_sandboxed"))
+        # As the runner sets them up: the worker count, then the cap.
+        setup = "".join(line + "\n" for line in text.splitlines()
+                        if line.startswith('CHECK_WORKERS="${LOOM_CHECK_WORKERS')
+                        or "lanes/build_jobs.sh\" ||" in line)
+        self.assertIn("CHECK_WORKERS=", setup)
+        tmp = Path(self._tmp.name)
+        fakes = tmp / "fakebin"
+        fakes.mkdir(exist_ok=True)
+        self.write_tool(fakes / "sandbox-exec", '#!/bin/bash\nshift 2\nexec "$@"\n')
+        self.write_tool(fakes / "timeout", '#!/bin/bash\nshift\nexec "$@"\n')
+        script = (setup + funcs + SANDBOX_HELPERS
+                  + 'sandbox_profile() { echo "(version 1)"; }\ncontract_run_sandboxed "$1"\n')
+        log = tmp / "check-step.log"
+        log.write_text("")
+        path = f"{fakes}:/usr/bin:/bin"
+        env = {"PATH": path, "LOG": str(log), "TREE": str(tmp), "CHECK_HOME": str(tmp),
+               "CHECK_CLI": "bash", "CHECK_TIMEOUT": "30", "LOOM_ROOT": str(RUNNER.parent.parent),
+               "RUNNER_SECRET": "x", **settings}
+        # No stdin: a bash started on a socket reads the user's own startup
+        # file, which would change the PATH this compares.
+        result = subprocess.run(["bash", "-c", script, "test", "env"], env=env, capture_output=True,
+                                stdin=subprocess.DEVNULL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.env_of(log.read_text()), path
+
+    def test_a_check_steps_emptied_environment_carries_the_job_cap(self):
+        # One lane check compiled a dependency from source with 28 compiler
+        # processes: a check step's environment is emptied, so it inherited
+        # no cap from anywhere.
+        env, _ = self.check_step_env(LOOM_BUILD_JOBS="3", LOOM_CHECK_WORKERS="3")
+        self.assert_capped(env, 3)
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "3")
+        self.assertNotIn("RUNNER_SECRET", env)
+
+    def test_a_check_step_with_nothing_set_is_capped_at_four(self):
+        # The default check worker count is 2, the smaller of the two, so the
+        # test runner keeps it.
+        env, _ = self.check_step_env()
+        self.assert_capped(env, 4, tests=2)
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "2")
+
+    def test_the_smaller_of_the_job_cap_and_the_check_workers_wins(self):
+        env, _ = self.check_step_env(LOOM_BUILD_JOBS="3", LOOM_CHECK_WORKERS="8")
+        self.assert_capped(env, 3)
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "3")
+        env, _ = self.check_step_env(LOOM_BUILD_JOBS="6", LOOM_CHECK_WORKERS="2")
+        self.assert_capped(env, 6, tests=2)
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "2")
+
+    def test_a_check_step_has_no_cap_at_zero_and_its_path_is_untouched(self):
+        env, path = self.check_step_env(LOOM_BUILD_JOBS="0", LOOM_CHECK_WORKERS="8")
+        self.assert_uncapped(env)
+        self.assertEqual(env["PATH"], path)
+        # LOOM_CHECK_WORKERS keeps its meaning with no cap beside it.
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "8")
+
+    def test_a_job_cap_that_is_no_number_is_the_default_not_off(self):
+        for bad in ("many", "-1", "4x", "", " "):
+            with self.subTest(bad=bad):
+                env, _ = self.check_step_env(LOOM_BUILD_JOBS=bad)
+                self.assert_capped(env, 4, tests=2)
+        # A leading zero is still the number, never read as octal.
+        env, _ = self.check_step_env(LOOM_BUILD_JOBS="08", LOOM_CHECK_WORKERS="09")
+        self.assert_capped(env, 8)
+        self.assertEqual(env["LOOM_CHECK_WORKERS"], "8")
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
+    def test_a_lane_checks_steps_run_under_the_job_cap(self):
+        # The whole pass: every step of the check (setup, base, final) prints
+        # the cap it was started under into the run log.
+        self.contract_repo(CONTRACT.replace(
+            "setup: ", "setup: echo setup-jobs=$CMAKE_BUILD_PARALLEL_LEVEL:$MAKEFLAGS:${PATH%%:*} && ").replace(
+            "check: ", "check: echo check-jobs=$CMAKE_BUILD_PARALLEL_LEVEL:$MAKEFLAGS:${PATH%%:*} && "))
+        self.drop_brief()
+        result = self.run_contract_lane(LOOM_BUILD_JOBS="3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
+        log = self.lane_log()
+        self.assertIn(f"setup-jobs=3:-j3:{self.JOBCAP_BIN}", log)
+        self.assertGreaterEqual(log.count(f"check-jobs=3:-j3:{self.JOBCAP_BIN}"), 2, log)
+
+    def job_cap_profile(self, mode, jobs_bin, **env):
+        """sandbox_profile's output for a run whose wrapper directory is
+        `jobs_bin` (None: the cap is off), with HOME a temp home."""
+        text = (RUNNER.parent / "agent_sandbox.sh").read_text()
+        funcs = SANDBOX_HELPERS + "".join(
+            re.search(r"^%s\(\) \{\n.*?^\}\n" % name, text, re.S | re.M).group(0)
+            for name in ("api_rules", "provider_ports", "bwrap_profile", "sandbox_profile"))
+        tmp = Path(self._tmp.name)
+        tree = tmp / "tree"
+        tree.mkdir(exist_ok=True)
+        (tmp / "agent").mkdir(exist_ok=True)
+        self.home.mkdir(exist_ok=True)
+        script = funcs + ('BUILD_JOBS_BIN="$1"\n' if jobs_bin else "") + 'sandbox_profile "$PWD" bash %s\n' % mode
+        result = subprocess.run(
+            ["bash", "-c", script, "test", str(jobs_bin or "")],
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "AGENT_HOME": str(tmp / "agent"),
+                 "LANE": "openrouter", "SKILLS": str(tmp / "no-skills"), **env},
+            cwd=str(tree), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def home_jobcap(self):
+        """A copy of the wrapper directory inside the temp home, as on a
+        host whose loom checkout sits under the runner's HOME."""
+        target = self.home / "checkout" / "lanes" / "jobcap"
+        shutil.copytree(self.JOBCAP_BIN, target)
+        return target
+
+    def test_the_sandbox_profile_lets_a_run_read_the_wrapper_directory_and_nothing_beside_it(self):
+        # The profile hides the runner's HOME, where the loom checkout may
+        # sit: without a rule for it the wrappers first on PATH could not be
+        # read, and the cap would silently miss xcodebuild and swift.
+        jobs_bin = self.home_jobcap()
+        (jobs_bin.parent / "secret.sh").write_text("not for the agent\n")
+        resolved = jobs_bin.resolve()
+        for mode in ("api", "check"):
+            with self.subTest(mode=mode):
+                profile = self.job_cap_profile(mode, jobs_bin)
+                self.assertIn('(allow file-read* (subpath "%s"))' % resolved, profile)
+                self.assertIn('(deny file-write* (subpath "%s"))' % resolved, profile)
+                # Later rules win: the allowance comes after HOME is denied.
+                self.assertLess(profile.index('(deny file-read* file-write* (subpath "%s"))' % self.home.resolve()),
+                                profile.index('(allow file-read* (subpath "%s"))' % resolved))
+                self.assertNotIn('(subpath "%s")' % resolved.parent, profile)
+                self.assertNotIn("secret.sh", profile)
+                # With the cap off the profile names nothing of the checkout.
+                self.assertNotIn(str(resolved.parent.parent), self.job_cap_profile(mode, None))
+
+    def test_a_lane_pods_sandbox_binds_the_wrapper_directory_read_only(self):
+        jobs_bin = self.home_jobcap()
+        lines = self.job_cap_profile("api", jobs_bin, LOOM_SANDBOX="bwrap").splitlines()
+        resolved = str(jobs_bin.resolve())
+        at = lines.index(resolved)
+        self.assertEqual(lines[at - 1:at + 2], ["--ro-bind", resolved, resolved])
+        self.assertNotIn(resolved, self.job_cap_profile("api", None, LOOM_SANDBOX="bwrap").splitlines())
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_a_sandboxed_run_reaches_the_wrappers_under_the_runners_home(self):
+        # Under the real sandbox: a wrapper inside the hidden HOME runs, adds
+        # the flag and reaches the real tool; nothing else there can be read,
+        # and the wrapper cannot be rewritten.
+        jobs_bin = self.home_jobcap()
+        secret = jobs_bin.parent / "secret.sh"
+        secret.write_text("not for the agent\n")
+        tmp = Path(self._tmp.name)
+        calls = tmp / "tree" / "tool-calls"
+        self.write_tool(self.bin / "swift", self.FAKE_BUILD_TOOL)
+        for mode in ("api", "check"):
+            with self.subTest(mode=mode):
+                profile = self.job_cap_profile(mode, jobs_bin)
+                calls.write_text("")
+                result = subprocess.run(
+                    ["sandbox-exec", "-p", profile, "/bin/bash", "-c",
+                     'swift build; echo "rc=$?"; cat "$1" 2>/dev/null && echo read-secret; '
+                     'echo x >> "$2" 2>/dev/null && echo wrote-wrapper; true',
+                     "test", str(secret), str(jobs_bin / "swift")],
+                    env={"PATH": f"{jobs_bin}:{self.bin}:/usr/bin:/bin", "HOME": str(tmp / "agent"),
+                         "LOOM_BUILD_JOBS": "3", "TOOL_CALLS": str(calls)},
+                    cwd=str(tmp / "tree"), capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("rc=0", result.stdout, result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), ["swift [build] [--jobs] [3]"])
+                self.assertNotIn("read-secret", result.stdout)
+                self.assertNotIn("wrote-wrapper", result.stdout)
 
 
 if __name__ == "__main__":
