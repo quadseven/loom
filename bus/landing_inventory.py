@@ -1,4 +1,8 @@
-"""Find direct pull request merge writes in the repository's Python and shell."""
+"""Find direct pull request merge writes in the repository's Python and shell.
+
+merge_callers is the library entry point: the inventory test calls it to compare
+the code with the documented list of automated merges.
+"""
 import ast
 from pathlib import Path
 import re
@@ -6,6 +10,7 @@ import re
 _PULL_MERGE = re.compile(r"/pulls/[^/\s]+/merge(?:-async)?(?:$|[?\"'\s])")
 _MUTATION = re.compile(r"\b(?:mergePullRequest|enablePullRequestAutoMerge)\s*\(")
 _COMMAND = re.compile(r"(?:^|[;&|(])\s*(?:(?:if|elif|then|while|until|do|exec|command|!)\s+)*(?:gh|curl)\s+")
+_CLI_CALLS = ("run", "call", "check_call", "check_output", "Popen", "system")
 _FUNCTION = re.compile(r"^(?:function\s+([\w-]+)(?:\s*\(\))?|([\w-]+)\s*\(\))\s*\{?")
 
 
@@ -39,6 +44,24 @@ def _literal(node, names):
     return ""
 
 
+def _call_merges(node, names):
+    """True when this call writes a pull request merge."""
+    values = [*node.args, *(kw.value for kw in node.keywords)]
+    args = [_literal(arg, names) for arg in values]
+    func = getattr(node.func, "attr", "") or getattr(node.func, "id", "")
+    put = "PUT" in args or func == "put"
+    rest = put and any(_PULL_MERGE.search(arg) for arg in args)
+    graphql = func == "graphql" and any(_MUTATION.search(arg) for arg in args)
+    cli = func in _CLI_CALLS and any(_merge_command(arg) for arg in args)
+    return bool(rest or graphql or cli)
+
+
+def _remember_assignment(node, names):
+    for target in node.targets:
+        if isinstance(target, ast.Name):
+            names[target.id] = _literal(node.value, names)
+
+
 def _python_callers(source):
     found = set()
 
@@ -47,19 +70,9 @@ def _python_callers(source):
             scope = (*scope, node.name)
             names = names.copy()
         if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    names[target.id] = _literal(node.value, names)
-        if isinstance(node, ast.Call):
-            values = [*node.args, *(kw.value for kw in node.keywords)]
-            args = [_literal(arg, names) for arg in values]
-            func = getattr(node.func, "attr", "") or getattr(node.func, "id", "")
-            put = "PUT" in args or func == "put"
-            rest = put and any(_PULL_MERGE.search(arg) for arg in args)
-            graphql = func == "graphql" and any(_MUTATION.search(arg) for arg in args)
-            cli = func in ("run", "call", "check_call", "check_output", "Popen", "system")
-            if rest or graphql or (cli and any(_merge_command(arg) for arg in args)):
-                found.add(".".join(scope) or "<module>")
+            _remember_assignment(node, names)
+        if isinstance(node, ast.Call) and _call_merges(node, names):
+            found.add(".".join(scope) or "<module>")
         for child in ast.iter_child_nodes(node):
             visit(child, scope, names)
 
