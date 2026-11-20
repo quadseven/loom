@@ -1082,7 +1082,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         self.assertIn(note, self.run_log())
         self.assertNotIn("connection refused", self.body.read_text())
 
-    def test_a_ticked_live_criterion_needs_output_from_this_run(self):
+    def test_a_ticked_live_criterion_without_output_from_this_run_is_unticked(self):
         criterion = 'A canary passes and prints "canary: healthy".'
         log = self.loom / "logs" / "codex" / "T042-fix-the-thing.log"
         log.parent.mkdir(parents=True)
@@ -1093,10 +1093,9 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         result = self.run_lane(FAKE_SUMMARY=summary, FAKE_AGENT_SAYS="- [x] " + criterion)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
-        heads = subprocess.check_output(["git", "ls-remote", "--heads", str(self.remote)], text=True)
-        self.assertNotIn("loom/T042-fix-the-thing", heads)
-        self.assertTrue(self.failure_line().startswith("[work] live acceptance criterion 1"))
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("[ ] " + criterion, self.body.read_text())
+        self.assertIn("criterion 1 unticked", self.body.read_text())
 
     def test_current_run_output_allows_the_live_tick_in_the_pull_request(self):
         criterion = ('A pod runs on a node and `curl https://status.example.com/healthz` '
