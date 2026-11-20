@@ -8208,6 +8208,14 @@ class Station:
         if not isinstance(issue, dict) or not self._incident_held(issue):
             self._forget_held(key)
             return
+        if self._session_claimed_since_hold(repo, number, issue, at):
+            self._routine(repo, number,
+                          "held: an operator session claimed this ticket after the hold "
+                          "began, so it is not re-queued for a lane")
+            self._forget_held(key)
+            _say("factory release: %s#%d kept: an operator session holds it"
+                 % (repo, number))
+            return
         if ref is None:
             # The incident filing failed: nothing names an incident that can
             # close this hold, so release it once it has outlived
@@ -8240,7 +8248,7 @@ class Station:
         if not any(ref in str(c.get("body") or "") for c in event_comments
                    if isinstance(c, dict)):
             return
-        if self._claimed_since(event_comments, incident):
+        if self._claimed_since(event_comments, incident, at):
             return
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
@@ -8248,6 +8256,26 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _session_claimed_since_hold(self, repo: str, number: int, issue: Dict[str, Any],
+                                    at: Optional[float]) -> bool:
+        """Whether a claim:<login> label of this Loom's own operator logins was
+        added after the hold began (loom#2975). A lane never claims a held
+        ticket, so such a claim is an operator session working it by hand."""
+        mine = {a.lower() for a in self.s.authors}
+        if at is None or not (set(tickets.claimed_by(issue)) & mine):
+            return False
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        for event in events:
+            if not isinstance(event, dict) or event.get("event") != "labeled":
+                continue
+            name = str((event.get("label") or {}).get("name") or "").lower()
+            login = name[len(tickets.CLAIM_LABEL_PREFIX):].strip()
+            when = self._epoch(str(event.get("created_at") or ""))
+            if (name.startswith(tickets.CLAIM_LABEL_PREFIX) and login in mine
+                    and when is not None and when > at):
+                return True
+        return False
 
     def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
         """Read one named incident once per pass; return it only when closed."""
@@ -8315,10 +8343,15 @@ class Station:
         return issue.get("state") == "open" and (
             RUNNING in names or {WAIT + "incident", "loom:queued"} <= set(names))
 
-    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
-        """A lane claim in a comment or the issue body is newer than close."""
+    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any],
+                       held_at: Optional[float] = None) -> bool:
+        """A lane claim in a comment or the issue body is newer than the
+        incident's close and than the hold. A hold recorded after the close
+        is the claim's own outcome, so an earlier claim is not a new one."""
         from . import factory as _factory
         closed = self._epoch(str(incident.get("closed_at") or ""))
+        if closed is not None and held_at is not None:
+            closed = max(closed, held_at)
         return closed is not None and any(
             isinstance(c, dict)
             and _factory.CLAIMED_RE.fullmatch(str(c.get("body") or "").strip())
@@ -8372,18 +8405,37 @@ class Station:
             at = entry.get("at")
             if not entry.get("open") or (self._num(at) and 0 <= self.now - at < every):
                 continue
-            lane = self._probe_lane(free, keys[0].rpartition("#")[0])
+            repo = keys[0].rpartition("#")[0]
+            # A probe on the head the last one failed on can only fail again.
+            head = self._default_head(repo)
+            if head and head == entry.get("base"):
+                continue
+            lane = self._probe_lane(free, repo)
             if lane is None:
                 continue
             name, text = incident_probe.brief(keys[0].rpartition("#")[0], lane, ref, int(self.now))
             claiming = self._write_brief(lane, name, text)
             os.replace(claiming, claiming[:-len(".claiming")] + ".md")
             entry["at"] = self.now
+            entry["base"] = head
             free = [x for x in free if x != lane]
             _say("handed lane %s a base check of %s for factory incident %s"
                  % (lane, keys[0].rpartition("#")[0], ref))
         _write_json(path, ledger)
         return free
+
+    def _default_head(self, repo: str) -> str:
+        """The head of the repo's default branch, or "" when it cannot be read."""
+        try:
+            branch = self._default_branch(repo)
+            commit = self.gh.rest(
+                "GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data \
+                if branch else None
+        except RateLimited:
+            raise
+        except GitHubError:
+            return ""
+        return str(commit.get("sha") or "") if isinstance(commit, dict) else ""
 
     def _read_probed_incident(self, ref: str, entry: Dict[str, Any], keys: List[str]) -> bool:
         """Read one held incident into its ledger entry and release its fix
@@ -9478,6 +9530,13 @@ class Station:
     def _retry_factory_check(self, repo: str, number: int, lane: str, reason: str) -> None:
         note = self._retry(repo, number, lane, "transient", reason)
         if note:
+            bare = CLASS_RE.sub("", reason)
+            if HELD_FOR_RE.search(bare):
+                # No other lane can run the check, and the reason names the
+                # open incident: hold the ticket for it, so it returns to its
+                # rung when the incident closes and is not left failed.
+                self._report_factory_hold(repo, number, lane, bare, reason)
+                return
             self._requeue_transient(repo, number, lane, reason, note)
 
     def _report_box_no_change(self, repo: str, number: int, lane: str, text: str,

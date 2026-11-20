@@ -26,7 +26,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import lane_markers, lane_state, tick_clock
-from . import brief_check, home_repo, state_store
+from . import brief_check, home_repo, incident_probe, state_store
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # A comment the brain posts to cancel a pending brain fix (loom#1998): the
@@ -1243,8 +1243,7 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _status_pr_line(gh, repo, pr, node, bot, check)
     ticket = _safe_ticket_association(repo, pr)
     line = _docs_criterion_override(gh, repo, ticket, line)
-    stacked = _stacked_base_blocker(gh, repo, pr,
-                                    str(data.get("trunk") or ""))
+    stacked = _stacked_base_blocker(gh, repo, pr, str(data.get("trunk") or ""), ticket)
     if stacked:
         line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
@@ -1376,9 +1375,14 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                       + _mid_round_note(at, "pr"))
         if reason:
             found.append(reason)
+    if not _loom_head_ok(repo, pr, {}):
+        found.append("pull request head is not a loom branch")
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
     if held:
         found.append(held.removeprefix("blocked: "))
+    left = _body_unticked_code_boxes(str(pr.get("body") or ""), issue)
+    if left:
+        found.append("criteria not ticked: " + "; ".join(left))
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
@@ -1405,9 +1409,42 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                                      ("operator",) if found else ()).blockers)
 
 
+def _body_unticked_code_boxes(pr_body: str, issue: Dict[str, Any]) -> List[str]:
+    """The ticket code boxes the pull request body itself lists as `- [ ]`
+    (loom#2955): merging it would requeue the ticket as unbuilt, so status
+    must not read it READY. A body with no such checkbox, or a ticket that
+    cannot be read, blocks nothing."""
+    from . import factory
+    ticket_body = str(issue.get("body") or "")
+    if not ticket_body or not pr_body:
+        return []
+    listed = set()
+    for criterion in factory.acceptance_criteria(pr_body):
+        checked, _, text = criterion.partition(" ")
+        if checked != "x":
+            listed.add(factory.criterion_key(text))
+    return [text for text in factory.unbuilt_criteria(ticket_body, [pr_body])
+            if factory.criterion_key(text) in listed]
+
+
+def _pr_goal_trunk(gh: GitHub, repo: str, ticket: Optional[Tuple[str, int]]) -> str:
+    """The Trunk: branch of the goal home the pull request's ticket belongs
+    to, or "" when the ticket, its goal or a trunk line cannot be read."""
+    if ticket is None or ticket[0] != repo:
+        return ""
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        home = _goal_home_for_ticket(gh, repo, issue)
+    except GitHubError:
+        return ""
+    return goal_trunk(home) or "" if home else ""
+
+
 def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
-                          default_branch: str) -> str:
-    """Name an open stacked base pull request or its non-default branch."""
+                          default_branch: str,
+                          ticket: Optional[Tuple[str, int]] = None) -> str:
+    """Name an open stacked base pull request or its non-default branch. A
+    base equal to the Trunk: branch of the `ticket`'s goal is not stacked."""
     declared = re.search(r"\bstacked\s+on\s+(?:pull\s+request\s+)?#?(\d+)\b",
                          str(pr.get("body") or ""), re.I)
     if declared:
@@ -1425,7 +1462,10 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
         return ""
     # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-stack:
     # Keep declared-parent handling separate from branch-parent lookup.
-    return _branch_stack_blocker(gh, repo, pr, base)
+    blocker = _branch_stack_blocker(gh, repo, pr, base)
+    if blocker == "stacked on branch %s" % base and base == _pr_goal_trunk(gh, repo, ticket):
+        return ""
+    return blocker
 
 
 def _branch_stack_blocker(gh: GitHub, repo: str, pr: Dict[str, Any], base: str) -> str:
@@ -4196,6 +4236,7 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
 
 
 _REPO_REF = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+")
+_REPO_NUMBER = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
 
 def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
@@ -4215,6 +4256,51 @@ def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
     if not private:
         raise ValueError("this repo is public: name another repo's issue in words "
                          "(for example \"issue 12 of another repo\"), not as owner/name#N")
+
+
+def _incident_subjects(repo: str, env: Optional[Dict[str, str]]) -> List[str]:
+    """How a factory incident names `repo` on its Repo: line: the repo itself,
+    or "private repo <alias>" with the alias the lane host keeps for it."""
+    subjects = [repo]
+    home = (env if env is not None else os.environ).get("LOOM_HOME") or ""
+    path = os.path.join(home, "state", "incidents", repo.replace("/", "_") + ".alias")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            alias = "".join(c for c in handle.read() if c in "0123456789abcdef")
+    except OSError:
+        alias = ""
+    if len(alias) == 8:
+        subjects.append("private repo %s" % alias)
+    return subjects
+
+
+def _repairs_header_for(gh: GitHub, repo: str, body: str, given: Optional[int],
+                        env: Optional[Dict[str, str]]) -> Optional[int]:
+    """The open base-check incident of `repo` the brief's body names, so the
+    ticket carries the Repairs incident header the lane needs to run past the
+    red base (incident_probe.is_fix). `given` is the --repairs-incident number:
+    kept when it is one of the named incidents, refused when the body names
+    another. Only owner/name#N of the factory repo counts; a body that names
+    none leaves `given` as it is."""
+    factory = home_repo.home_repo(env)
+    if not factory:
+        return given
+    numbers = sorted({int(m.group(2)) for m in _REPO_NUMBER.finditer(body)
+                      if m.group(1).lower() == factory.lower()})
+    subjects = _incident_subjects(repo, env)
+    named = []
+    for number in numbers:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (factory, number), ok=(404,)).data
+        if incident_probe.open_base_check(issue) and any(
+                "Repo: %s" % x in str(issue.get("body") or "").splitlines() for x in subjects):
+            named.append(number)
+    if not named or given in named:
+        return given
+    if given is not None or len(named) > 1:
+        raise ValueError("the brief names open base-check incident(s) %s of this repo: "
+                         "pass --repairs-incident with one of them"
+                         % ", ".join("#%d" % n for n in named))
+    return named[0]
 
 
 def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
@@ -4307,6 +4393,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
+    repairs_incident = _repairs_header_for(gh, repo, body, repairs_incident, env)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
                              repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
@@ -5235,7 +5322,7 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
     if not after or " ".join(after.group(1).split()) != text:
         raise ValueError("the restated body does not read back with the new Live line")
     _check_live_criterion(new)
-    _check_written_text(new)
+    _check_written_text(text)
     if new != body:
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
@@ -5246,7 +5333,9 @@ def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
     the station never claims the ticket with the old model."""
     body = str(issue.get("body") or "")
     new = _with_model(body, model)
-    _check_written_text(new)
+    # Only the line the brain adds is checked: text already on the ticket
+    # (a quoted device path, say) is not the brain's to refuse.
+    _check_written_text("Model: " + tickets.allowed_model(model))
     if new != body:
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
@@ -5262,13 +5351,25 @@ def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
         raise ValueError("proof revision %s is not on %s" % (revision, branch))
 
 
+def _verifiable(issue: Dict[str, Any]) -> bool:
+    """A loom:ticket, or a loom:factory issue by a trusted login whose code is
+    built and only a Live box is left. A factory incident never is one."""
+    names = _labels(issue)
+    if "loom:ticket" in names:
+        return True
+    return ("loom:factory" in names
+            and FACTORY_INCIDENT_MARKER not in str(issue.get("body") or "")
+            and tickets.brief_author_trusted(issue, trusted_authors(), trusted_briefers(),
+                                             as_ticket=True))
+
+
 def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
                    record: Dict[str, Any], facts: Sequence[str] = ()) -> str:
     """Check a proof record against the ticket and return the comment for it,
     with the facts the station checked when it gives any. Runtime work is
     verified once shipped; documentation once merged."""
     names = _labels(issue)
-    if "loom:ticket" not in names:
+    if not _verifiable(issue):
         raise ValueError("only a loom:ticket is verified")
     body = str(issue.get("body") or "")
     proof.check(record, body)
@@ -5541,8 +5642,9 @@ def merge(gh: GitHub, repo: str, number: int,
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     base_repo = (pr.get("base") or {}).get("repo") or {}
-    stacked = _stacked_base_blocker(gh, repo, pr,
-                                    str(base_repo.get("default_branch") or ""))
+    stacked = _stacked_base_blocker(
+        gh, repo, pr, str(base_repo.get("default_branch") or ""),
+        ticket or _safe_ticket_association(repo, pr))
     if stacked:
         raise ValueError("blocked: " + stacked)
     details = _pr_graphql(gh, repo, number)
@@ -6120,7 +6222,30 @@ def _refuse_pending_fix(gh: GitHub, repo: str, number: int,
     note = _fix_cancellation(gh, repo, number, comments, details, env, authors)
     if note is not None:
         return note
+    if _fix_answered_by_head(comments, authors, details):
+        return None
     raise ValueError("a brain fix is pending on the ticket; merge after it runs")
+
+
+def _fix_answered_by_head(comments: List[Any], authors: Sequence[str],
+                          details: Dict[str, Any]) -> bool:
+    """The pending brain fix was answered by the brain's own push: a trusted
+    comment (not another fix ask) after the marker, and a pull request head
+    that is not the head the round named and was committed after the marker.
+    False on any missing time or head, which leaves the fix pending."""
+    fix = _pending_fix_comment(comments, authors)
+    found = _fix_round(str(fix.get("body") or "")) if fix else None
+    if fix is None or found is None:
+        return False
+    asked = str(fix.get("created_at") or "")
+    head = str(details.get("headRefOid") or "")
+    pushed = str(_head_commit(details).get("committedDate") or "")
+    if not (asked and head and pushed > asked) or head.startswith(found[1]):
+        return False
+    allowed = {a.lower() for a in authors}
+    return any(isinstance(c, dict) and str(c.get("created_at") or "") > asked
+               and tickets._login(c.get("user")).lower() in allowed
+               and not _is_brain_fix(c, allowed) for c in comments)
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
@@ -6193,16 +6318,23 @@ def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     return pr, details
 
 
-def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
-                       env: Optional[Dict[str, str]] = None) -> None:
+def _loom_head_ok(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
+                  env: Optional[Dict[str, str]] = None) -> bool:
+    """A loom/ head, or a linked pull request by a trusted lane author: the one
+    rule merge and status share for the head branch."""
     head_ref = str((pr.get("head") or {}).get("ref") or details.get("headRefName") or "")
     trusted_lane_head = (
         _ticket_association(repo, pr) is not None
         and _pr_author(pr).lower() in {a.lower() for a in trusted_authors(env)})
+    return head_ref.startswith("loom/") or trusted_lane_head
+
+
+def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
+                       env: Optional[Dict[str, str]] = None) -> None:
     rules = [
         (pr.get("state") == "open", "pull request is not open"),
         (not (details.get("isDraft") or pr.get("draft")), "pull request is a draft"),
-        (head_ref.startswith("loom/") or trusted_lane_head,
+        (_loom_head_ok(repo, pr, details, env),
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
         (_mergeable(pr),

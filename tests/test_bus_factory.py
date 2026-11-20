@@ -5718,6 +5718,17 @@ class BranchHygiene(Base):
         self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
         self.assertEqual((self.merged, self.fixed), ([], []))
 
+    def test_a_ticket_with_an_unticked_hold_box_gets_no_branch_refresh(self):
+        held = "## Acceptance criteria\n- [ ] Hold: do not merge until the service returns\n"
+        self.gh.ticket(5, "pr", body=held)
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.gh.ticket(6, "pr", body="## Acceptance criteria\n- [ ] A real box\n")
+        self.gh.pull(60, 6, created=7200, runs=self.WAITING)
+        self.gh.behind[60] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/60/update-branch" % REPO])
+
     def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
         self.gh.ticket(5, "briefed")
         self.gh.pull(50, 5, created=7200, runs=self.WAITING)

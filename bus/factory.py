@@ -203,7 +203,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import human_claims, no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hold_boxes, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -1381,6 +1381,10 @@ def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
     return history.needs_other_repo(comments)
 
 
+def base_pass_tests(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    return history.base_pass_tests(comments)
+
+
 def current_rung(issue: Dict[str, Any]) -> int:
     """The rung whose model and lane the ticket runs on now, 0 when none: a
     brief can start on a ladder model, and failing there tries that rung."""
@@ -1929,6 +1933,9 @@ def lane_state(lane: str) -> str:
 
 
 class Factory:
+    # How the base run of a remote-lane pull request gets a tree; None clones.
+    base_clone: Optional[Callable[[str, str], str]] = None
+
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -2263,8 +2270,17 @@ class Factory:
                           full: Dict[str, Any], issue: Dict[str, Any]) -> List[str]:
         """Check changed Python sources for vacuous lookup and fixture edits."""
         sha = str((full.get("head") or {}).get("sha") or "")
-        return vacuous.pull_findings(self.gh, repo, number, sha,
-                                     str(issue.get("body") or ""))
+        found = vacuous.pull_findings(self.gh, repo, number, sha,
+                                      str(issue.get("body") or ""))
+        if _lane(issue) not in REMOTE_LANES:
+            # A local lane's run already reported its own base pass.
+            return found
+        base = str((full.get("base") or {}).get("sha") or "")
+        if not base:
+            return found
+        modules = vacuous.added_test_modules(self.gh, repo, number)
+        return found + vacuous.base_run_findings(repo, base, sha, modules,
+                                                 self.base_clone)
 
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
@@ -4022,6 +4038,8 @@ class Factory:
             return
         if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
             return  # brought up to date less than the cooldown ago
+        if hold_boxes.hold_box_reason(str(issue.get("body") or "")):
+            return  # an unticked hold box: the ticket's pull request is not touched
         if self._hold_stands(repo, number, sha, _author(full)):
             return
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
@@ -4745,6 +4763,10 @@ class Factory:
         if other:
             self._hold_other_repo(repo, issue, other)
             return
+        passing = base_pass_tests(comments)
+        if passing is not None:
+            self._hold_done_check(repo, issue, passing)
+            return
         pr = prs.get(number)
         if self._not_work(repo, issue, comments, pr):
             return
@@ -4845,6 +4867,27 @@ class Factory:
                      {"labels": names + ["needs-brain"]})
         self.actions += 1
         _say("%s#%d failed again with no commit and no reason; left for the brain"
+             % (repo, number))
+
+    def _hold_done_check(self, repo: str, issue: Dict[str, Any], tests: str) -> None:
+        """Leave a ticket failed for the brain to done-check, once (needs-brain
+        says it was asked), when every test its run changed already passes on
+        the default branch: no rung is spent, as a stronger model cannot make
+        a test fail on code that already works (loom#3005)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        notify.post(self.gh, repo, number,
+                    "Not climbing the model ladder: every test lane %s changed already passes "
+                    "on the default branch%s, so the behaviour may already hold and a stronger "
+                    "model cannot make those tests fail. The brain checks whether the ticket "
+                    "is done, then closes it or rewrites the brief around what is missing."
+                    % (_lane(issue), " (" + tests + ")" if tests else ""), notify.HELD)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d failed with every changed test passing on base; left for a done-check"
              % (repo, number))
 
     def _hold_other_repo(self, repo: str, issue: Dict[str, Any], submodule: str) -> None:

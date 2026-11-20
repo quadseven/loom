@@ -551,12 +551,45 @@ def _effects(outcome: str, n: int, runs: int) -> List[str]:
     return effects
 
 
-def keep(line: str) -> bool:
+_DOC_BULLET_RE = re.compile(r"^(?:[-*+>]|[0-9]+[.)])\s+")
+
+
+def _doc_norm(line: str) -> str:
+    """A line with its leading stamps, list marker and outer whitespace off."""
+    return _DOC_BULLET_RE.sub("", _LEAD_RE.sub("", line).strip())
+
+
+def doc_lines(root: str) -> frozenset:
+    """The whole lines of the tracked docs under root/docs, normalized as
+    _doc_norm does. A brain tick that reads a doc echoes its lines into the
+    brain log, and none of them is an error."""
+    found = set()
+    docs = os.path.join(root, "docs")
+    try:
+        names = sorted(os.listdir(docs))
+    except OSError:
+        return frozenset()
+    for name in names:
+        if not name.endswith(".md"):
+            continue
+        try:
+            with open(os.path.join(docs, name), encoding="utf-8") as fh:
+                found.update(_doc_norm(row) for row in fh)
+        except (OSError, ValueError):
+            continue
+    found.discard("")
+    return frozenset(found)
+
+
+def keep(line: str, docs: Iterable[str] = ()) -> bool:
     """A line worth a signature: it names an error or an HTTP 4xx/5xx. The
     station's hold line is status, whatever state word it names, so is the
     brain's own status output (brain_status), the station's note of a failed
     verify run (VERIFY_RUN_RE) and a designed station outcome (EXPECTED_RES).
-    A relayed CI log line is the run's output (CI_LOG_RE)."""
+    A relayed CI log line is the run's output (CI_LOG_RE). A whole line of a
+    doc in docs (see doc_lines) is the brain reading its instructions."""
+    if docs and _doc_norm(line) in docs:
+        return False
     bare = _LEAD_RE.sub("", line).rstrip("\r\n")
     # An escaped run-log tail (a literal backslash-n and what follows) does
     # not turn a designed outcome into an error.
@@ -634,12 +667,16 @@ def quiet_reason(issue: Dict[str, Any]) -> Optional[str]:
 
 class Watcher:
     def __init__(self, gh: Any, repo: str, logs: List[Tuple[str, str]], path: str,
-                 now: float, say: Say, write: bool = True, private: Iterable[str] = ()) -> None:
+                 now: float, say: Say, write: bool = True, private: Iterable[str] = (),
+                 root: Optional[str] = None) -> None:
         """gh files issues in repo (the lanes repo); path is the state file;
         write False (the GitHub budget is low) scans only, and a signature
         that comes due is filed on a later pass. private names repositories
-        whose names a denied path must not show."""
+        whose names a denied path must not show. root is the checkout whose
+        docs/ the log lines are compared with (default: the running code's)."""
         self.gh = gh
+        self.root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self._docs: Optional[frozenset] = None
         self.repo = repo
         self.logs = logs
         self.path = path
@@ -704,6 +741,12 @@ class Watcher:
         return [clean(line) for line in
                 data[:end + 1].decode("utf-8", errors="replace").splitlines()]
 
+    def _doc_lines(self) -> frozenset:
+        """The doc lines, read once per watcher (one watcher a pass)."""
+        if self._docs is None:
+            self._docs = doc_lines(self.root)
+        return self._docs
+
     def _hits(self, rec: Dict[str, Any], lines: List[str], name: str = "") -> List[str]:
         """The lines that count. A Python traceback counts once, as its
         exception line (the first unindented line after the header). A run's
@@ -740,7 +783,7 @@ class Watcher:
         prev, prev_hit = before
         found = refusal(line, prev, self.private)
         if found is None:
-            if not keep(line):
+            if not keep(line, self._doc_lines()):
                 return False
             out.append(line)
             return True

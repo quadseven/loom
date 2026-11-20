@@ -3528,7 +3528,7 @@ prepare_validation() {
 # Run changed Python tests on the base code in the check sandbox. This separate
 # pass has its own timeout because it archives the base tree and runs tests.
 final_base_tests() {
-  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names default_rev=""
+  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names all_names default_rev=""
   cp "$LOOM_ROOT/bus/vacuous.py" "$helper" || {
     VALIDATION_REASON="validation environment unavailable: could not stage the base-test gate"
     return 125
@@ -3549,6 +3549,7 @@ final_base_tests() {
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
+  all_names="$(tail -c +$((log_offset + 1)) "$LOG" | grep -E '^base-(pass|timeout|unrunnable): ')"
   names="$(tail -c +$((log_offset + 1)) "$LOG" \
     | sed -n -e 's/^base-pass: /passes on base: /p' \
              -e 's/^base-timeout: /timed out on base: /p' \
@@ -3560,7 +3561,16 @@ final_base_tests() {
     124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free for the base-test gate" ;;
     125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
-    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
+    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed"
+       # Only base-pass names, outside a fix round: the ticket's behaviour may
+       # already hold on the default branch, which no stronger model changes
+       # (loom#3005). The station holds it for a done-check, not a rung.
+       if [ -z "${FIX_PR:-}" ] && [ -n "$names" ]; then
+         case "$all_names" in
+           *base-timeout:*|*base-unrunnable:*) ;;
+           *) VALIDATION_REASON="validation failed: every changed test passes on base; the ticket may already hold on the default branch" ;;
+         esac
+       fi ;;
   esac
   [ -z "$names" ] || VALIDATION_REASON="$VALIDATION_REASON: ${names%;}"
   return "$rc"
@@ -3594,6 +3604,24 @@ format_changed_files() {
   return 0
 }
 
+# One more agent turn in the same run, after the base-test gate refused: the
+# brief names each test that passed on base and asks for a change that makes it
+# fail there. Whatever the turn changed is committed on the lane branch.
+base_retry_turn() {
+  local named="$1" brief="$WORKDIR/$TICKET.base-retry-brief"
+  { cat "$RUN_BRIEF"
+    printf '\n\n## Tests that pass on the base commit\n\n'
+    printf 'The base-test gate refused this branch: each test below passes on the base commit, so it proves nothing about your change.\n'
+    printf 'Change each one so it fails on the base commit and passes with your change. You have one turn.\n\n'
+    printf '%s\n' "$named" | grep -o 'passes on base: [^;]*' | sed 's/^passes on base: /- /'
+  } > "$brief" || return 1
+  ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
+  fi
+}
+
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
@@ -3612,6 +3640,17 @@ final_validation() {
   contract_run "$C_CHECK"; rc=$?
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
+    # The agent answers a refusal once: one more turn, then the whole check
+    # again. A second refusal ends the run as before.
+    if [ "$gate_rc" -ne 0 ] && [ -z "${BASE_RETRY_USED:-}" ] &&
+       [[ "$VALIDATION_REASON" == *"passes on base: "* ]]; then
+      BASE_RETRY_USED=1
+      echo "base-test gate refused; giving the agent one more turn" >> "$LOG"
+      if base_retry_turn "$VALIDATION_REASON"; then
+        final_validation
+        return $?
+      fi
+    fi
     if [ "$gate_rc" -ne 0 ]; then
       [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 75 ] || [ "$gate_rc" -eq 126 ] ||
         [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
@@ -4886,6 +4925,7 @@ for BRIEF in "$INBOX"/*.md; do
     esac
   fi
 
+  BASE_RETRY_USED=""
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
   OPERATOR_REVIEW="$(field Operator-Review "$BRIEF" || true)"
   REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
