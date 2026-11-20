@@ -8628,8 +8628,11 @@ class History:
 
     def __init__(self, failed: int, fixes: int, tried: List[str],
                  reasons: List[str], rung: Optional[int], rungs: Optional[set] = None,
-                 held: Sequence[tickets.After] = ()) -> None:
+                 held: Sequence[tickets.After] = (), waiting: bool = False) -> None:
         self.failed = failed
+        # The ticket's Model: line and lane label already name its next
+        # rung, and no lane has claimed it there yet (loom#3238).
+        self.waiting = waiting
         self.fixes = fixes
         self.tried = tried
         self.reasons = reasons
@@ -8761,6 +8764,14 @@ def _trusted_rungs(comments: List[Any], authors: Sequence[str]) -> set:
     return history.read_history(comments, authors).tried_rungs
 
 
+def _on_rung(issue: Dict[str, Any], rung: int, lanes: Sequence[str]) -> bool:
+    """Whether the ticket already sits on rung (0-based in factory.CLIMB): its
+    Model: line is the rung's model and it carries a lane label of lanes."""
+    from . import factory  # factory imports this module
+    return (factory.issue_model(issue) == factory.CLIMB[rung][1]
+            and any("lane:" + lane in _labels(issue) for lane in lanes))
+
+
 def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
              authors: Sequence[str] = (),
              held: Sequence[tickets.After] = (),
@@ -8778,8 +8789,10 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
     rungs = read.tried_rungs
-    return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
-                   rungs, held)
+    nxt = _lowest_untried(tried, rungs)
+    from . import factory  # factory imports this module
+    waiting = nxt is not None and _on_rung(issue, nxt, factory.CLIMB[nxt][0])
+    return History(failed, fixes, tried, reasons, nxt, rungs, held, waiting)
 
 
 def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
@@ -8837,7 +8850,7 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
-        if history.reasons:
+        if history.reasons and not history.waiting:
             marks[number] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
                 ", ".join(history.reasons), history.attempts,
                 ", ".join(history.tried) or "none", history.next_text())
@@ -9123,6 +9136,10 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice[0] - 1, choice[1]
     model = factory.CLIMB[rung][1]
+    if _on_rung(issue, rung, (lane,)):
+        raise ValueError("ticket already waits on rung %d (%s on lane %s); no lane has "
+                         "claimed it there, so escalating would write the same rung again"
+                         % (rung + 1, model, lane))
     reason = "; ".join(history.reasons)
     comment_lines = [ESCALATE_MARKER]
     if skipped_load:
