@@ -3441,7 +3441,8 @@ class Station:
         credit = self._anthropic_spend() if labels.base_lane(lane) == "anthropic" else None
         beat = self._local_beat(lane)
         return lane_state.evaluate(beat, self.now, credit=credit, parked=parked,
-                                   has_job=lane not in self._missing_lane_jobs)
+                                   has_job=lane not in self._missing_lane_jobs,
+                                   running=self._keepalive_fresh(lane))
 
     def _heartbeat_ok(self, lane: str) -> bool:
         return self._lane_state(lane).available
