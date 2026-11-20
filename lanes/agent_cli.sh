@@ -21,8 +21,54 @@
 # A codex lane run writes its final message to AGENT_LAST_MESSAGE when the
 # runner names one: the reason a run that committed nothing quotes
 # (loom#1799), instead of whatever the agent printed last.
+#
+# A lane-only Codex home for a codex lane run, under the run's scratch home
+# (AGENT_HOME): the operator's model and provider config (config.toml) and
+# sign-in (auth.json, or the cluster sign-in file LOOM_CODEX_AUTH_FILE
+# names) are copied in, and nothing else. The user-level AGENTS.md in the
+# operator's Codex home is never copied, and one an earlier run left in the
+# lane home is removed before the run: that file told a lane run to read a
+# personal startup file and do a chat duty at task start, so the run
+# stopped with no commit and its ticket was parked as work (loom#3227).
+# Session rollouts stay where the station reads them: the lane home's
+# sessions folder links to the operator's, so usage readings that read
+# session logs keep seeing lane runs. Prints the lane home; a run that
+# cannot prepare one does not run at all, rather than run under the
+# operator's personal instructions.
+codex_lane_home() {
+  local src="${CODEX_HOME:-$HOME/.codex}" dest="${AGENT_HOME:-}/.codex"
+  [ -n "${AGENT_HOME:-}" ] || { echo "no AGENT_HOME for a codex lane run" >&2; return 2; }
+  mkdir -p "$dest" || return 2
+  rm -f "$dest/AGENTS.md" || return 2
+  if [ "$src" != "$dest" ]; then
+    if [ -f "$src/config.toml" ]; then
+      cp "$src/config.toml" "$dest/config.toml" || return 2
+    else
+      rm -f "$dest/config.toml" || return 2
+    fi
+    if [ -n "${LOOM_CODEX_AUTH_FILE:-}" ] && [ -f "$LOOM_CODEX_AUTH_FILE" ]; then
+      cp "$LOOM_CODEX_AUTH_FILE" "$dest/auth.json" || return 2
+      chmod 600 "$dest/auth.json" || return 2
+    elif [ -f "$src/auth.json" ]; then
+      cp "$src/auth.json" "$dest/auth.json" || return 2
+      chmod 600 "$dest/auth.json" || return 2
+    else
+      rm -f "$dest/auth.json" || return 2
+    fi
+    if [ -d "$src/sessions" ]; then
+      if [ -L "$dest/sessions" ]; then
+        rm -f "$dest/sessions" || return 2
+        ln -s "$src/sessions" "$dest/sessions" || return 2
+      elif [ ! -e "$dest/sessions" ]; then
+        ln -s "$src/sessions" "$dest/sessions" || return 2
+      fi
+    fi
+  fi
+  printf '%s\n' "$dest"
+}
+
 agent_cli() {
-  local uv_env=() uv_dir=() last=()
+  local uv_env=() uv_dir=() last=() codex_home=""
   [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
   if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
     uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
@@ -39,7 +85,8 @@ agent_cli() {
       fi ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
-    codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
+    codex:lane) codex_home="$(codex_lane_home)" || return 2
+      CODEX_HOME="$codex_home" timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
       ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" ${last[@]+"${last[@]}"} "$3" < /dev/null ;;
     codex:brain) timeout "$AGENT_TIMEOUT" codex exec --sandbox danger-full-access \
       --skip-git-repo-check --model "$MODEL" "$3" < /dev/null ;;
@@ -84,7 +131,7 @@ NET_RE='econnreset|econnrefused|etimedout|enotfound|eai_again|socket hang up|net
 # When the provider says its limit lifts: an epoch after "limit reached|" or a
 # "reset" key, or a "retry after" / "try again in" / "resets in" duration.
 EPOCH_RE='(limit reached\||reset[a-z_-]*["'"'"': =]+)([0-9]{10})([^0-9]|$)'
-AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^a-z]|$)'
+AFTER_RE='(retry[ -]after|try again in|resets? in)[^0-9]{0,3}([0-9]+) ?(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)?([^0-9a-z]|$)'
 # A daily allowance with no reset time given lifts at the next midnight UTC
 # (Workers AI: "used up your daily free allocation of 10,000 neurons";
 # OpenRouter: "free-models-per-day"). The fixed hour retried it, and failed,
@@ -179,7 +226,8 @@ if not done:
 # the tree. $2 is the run's whole output (from LOG_START in the lane runner,
 # log_start in the brain) and $4 is the short tail (its last five non-blank
 # lines); the limit and credit patterns match $2 while auth and transient
-# match $4. On limit also sets RETRY_AT. A key the provider will not take is
+# match $4. On limit also sets RETRY_AT, and STATED_RETRY_AT when the provider
+# gives a reset time or duration. A key the provider will not take is
 # auth: no retry and no attempt can fix it, so the runner takes its lanes
 # offline until the operator renews it. A crash before any edit, a timeout,
 # a signal, a network fault or a provider fault on one request is transient;
@@ -210,7 +258,7 @@ classify_failure() {
   # lanes until midnight, 2026-10-25), so only what its CLI said last counts.
   seen="$whole"
   [ "$status" -eq 0 ] && seen="$tail"
-  FAIL_CLASS=work RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON=""
+  FAIL_CLASS=work RETRY_AT="" STATED_RETRY_AT="" OUT_OF_CREDIT="" FAIL_REASON=""
   now="$(date +%s)"
   shopt -s nocasematch
   if [[ "$tail" =~ $AUTH_RE ]]; then
@@ -236,11 +284,11 @@ classify_failure() {
     elif [[ "$whole" =~ $OUT_OF_CREDIT_RE ]] || [[ "$tail" =~ $CREDIT_CODE_RE ]]; then
       OUT_OF_CREDIT=1 RETRY_AT=$((now + LIMIT_WAIT_MAX))
     elif [[ "$whole" =~ $EPOCH_RE ]]; then
-      RETRY_AT="${BASH_REMATCH[2]}"
+      RETRY_AT="${BASH_REMATCH[2]}" stated="${BASH_REMATCH[2]}"
     elif [[ "$whole" =~ $AFTER_RE ]]; then
       n="${BASH_REMATCH[2]}"
       case "${BASH_REMATCH[3]}" in h*) n=$((n * 3600)) ;; m*) n=$((n * 60)) ;; esac
-      RETRY_AT=$((now + n))
+      RETRY_AT=$((now + n)) stated=$((now + n))
     elif [[ "$whole" =~ $DAILY_RE ]]; then
       RETRY_AT=$((now - now % 86400 + 86400))
     elif [[ "$whole" =~ $MONTHLY_RE ]]; then
@@ -251,6 +299,7 @@ classify_failure() {
     if [ "$monthly" -eq 0 ] && [ "$RETRY_AT" -gt $((now + cap)) ]; then
       RETRY_AT=$((now + cap))
     fi
+    [ -z "$stated" ] || STATED_RETRY_AT="$RETRY_AT"
   elif [ "$status" -ne 0 ]; then
     if [ "$status" -eq 124 ] || [ "$status" -gt 128 ] || [ "$edited" != edited ] ||
        [[ "$tail" =~ $NET_RE ]]; then

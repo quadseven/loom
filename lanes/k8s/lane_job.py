@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -485,6 +486,26 @@ def report_files(home: str, slot: str, ticket: str) -> List[str]:
     return found
 
 
+def _pack(tar: tarfile.TarFile, full: str, rel: str) -> None:
+    """Add one file. A log past runners.REPORT_FILE_MAX goes in as its last
+    REPORT_FILE_MAX bytes under a first line naming its original size, so the
+    station still reads how the run ended."""
+    cap = runners.REPORT_FILE_MAX
+    size = os.path.getsize(full)
+    if size <= cap or not rel.startswith("logs/"):
+        tar.add(full, arcname=rel, recursive=False)
+        return
+    head = ("[loom] this log was %d bytes; only the last %d bytes follow\n" % (size, cap)).encode("ascii")
+    with tempfile.TemporaryFile() as tmp, open(full, "rb") as src:
+        tmp.write(head)
+        src.seek(size - cap)
+        shutil.copyfileobj(src, tmp)
+        tmp.seek(0)
+        info = tar.gettarinfo(full, arcname=rel)
+        info.size = len(head) + cap
+        tar.addfile(info, tmp)
+
+
 def report() -> None:
     """report/key.enc, report/report.enc and report/report.mac: the run's
     files as a tar.gz, AES-256-CBC (PBKDF2) with a random key, that key
@@ -500,7 +521,7 @@ def report() -> None:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for rel in report_files(home, job["slot"], job["ticket"]):
-            tar.add(os.path.join(home, rel), arcname=rel, recursive=False)
+            _pack(tar, os.path.join(home, rel), rel)
     secret = os.path.join(d, "report-secret")
     fd = os.open(secret, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as fh:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import re
 import hmac
@@ -10,6 +11,7 @@ import ssl
 import statistics
 import socket
 import socketserver
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -50,6 +52,8 @@ from bus.github import GitHubError
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
 from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
+LOG = logging.getLogger(__name__)
+
 
 def _all_tickets(state):
     payload = state.response()
@@ -283,7 +287,9 @@ def _floor(state):
             len(triage) - waiting, waiting)
     head = '<div class="section-head"><span class="label">Conveyor - count and median wait</span>%s</div>' % (
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
-    parts = ['<section class="standup">%s</section>' % standup,
+    board_asks, board_claims, board_repos = _needs_sources(_backlog_document(_backlog_raw(state) or b"{}"), state)
+    board_found = needs_you_view.render(board_asks, board_claims, "", board_repos, answers_view.posted(state))[0]
+    parts = [needs_you_view.board(board_found), '<section class="standup">%s</section>' % standup,
              '<section class="section">%s<div class="conveyor">%s</div></section>' % (head, conveyor)]
     runaway_rows = "".join(_ticket_row(row) for row in runaway)
     parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
@@ -859,7 +865,8 @@ def _needs_you(document, state, *, source_missing=False, who=""):
     asks, claims, repos = _needs_sources(document, state)
     mode = answers_view.mode(state)
     found, cards = needs_you_view.render(asks, claims, who, repos, answers_view.posted(state), mode)
-    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
+    out = [needs_you_view.board(found),
+           '<p class="page-lede">Only what only a person can do: each item names who it waits on. '
            'Everything else the brain does itself.</p>', _answer_bar(mode)]
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')
@@ -1403,10 +1410,32 @@ def _ticket_detail_data(state, repo, number):
     return details.get(repo, number, prs, views.footer)
 
 
+NOT_READY_LOG_SECONDS = 60
+_not_ready_logged = [0.0]
+_not_ready_lock = threading.Lock()
+
+
+def _log_not_ready(state, now=None):
+    """Log why /readyz answers 503, at most once a NOT_READY_LOG_SECONDS: the
+    probe asks every few seconds, and the answer used to say nothing."""
+    now = time.monotonic() if now is None else now
+    # The server is threaded: check and set under one lock, so two probes
+    # arriving together cannot both log.
+    with _not_ready_lock:
+        if _not_ready_logged[0] and now - _not_ready_logged[0] < NOT_READY_LOG_SECONDS:
+            return False
+        _not_ready_logged[0] = now
+    reason = getattr(state, "not_ready_reason", None)
+    LOG.warning("readyz answered 503: %s", reason() if reason else "the first snapshot is not ready")
+    return True
+
+
 def _dispatch_basic(handler, state, path):
     if path == "/livez":
         return handler.send_text(200, "live")
     if path == "/readyz":
+        if not state.ready:
+            _log_not_ready(state)
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, _api_tickets(state.response()))
@@ -1440,7 +1469,8 @@ def _dispatch_usage(handler, state):
     payload = state.response() if hasattr(state, "response") else {}
     lanes = {lane for row in rows for lane in (row.get("lanes") or []) if isinstance(lane, str)}
     models = {lane: model for lane in lanes for model in [bus_brain.lane_model(lane)] if model}
-    data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models)
+    data = usage_store.build(rows, now, prs=payload.get("pull_requests") or [], models=models,
+                             lane_rows=_merge_lane_rows(payload.get("lanes", [])))
     return handler.send_page(page("Usage", "usage", usage_store.render(data),
                                   status="stale" if payload.get("stale") else "live"))
 
@@ -1629,7 +1659,7 @@ def _merge_lane_rows(comments):
         if lane_name not in by_lane:
             lane_rows.append(remote)
             by_lane[lane_name] = remote
-        elif remote.get("available"):
+        elif "state" not in by_lane[lane_name] and remote.get("available"):
             by_lane[lane_name]["available"] = True
     return lane_rows
 
@@ -1706,7 +1736,7 @@ def _lane_card(item, tickets, newest_pr_for_lane, usage_records):
         age_str = views.format_age(model_info["time"])
         model_display = ("%s (last PR %s)" % (model_info["model"], age_str)
                          if age_str else model_info["model"])
-    reason = _hold_reason(lane_name, usage_records)
+    reason = item.get("reason") if "state" in item else _hold_reason(lane_name, usage_records)
     if item["available"] and reason == "no reason":
         reason = "available"
     item.update({

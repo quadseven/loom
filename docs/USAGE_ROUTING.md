@@ -9,13 +9,22 @@ Every lane writes `state/usage/<lane>.json` on every runner pass (including when
  "lane": "codex",
  "at": 1731234567,
  "available": true,
- "reason": ""
+ "reason": "",
+ "state": "serving",
+ "state_reason": "Accepting work",
+ "limited_models": {}
 }
 ```
 
-`lane` is the lane name, `at` is a Unix timestamp from the runner's current time, `available` is true when the lane can take new work, and `reason` explains unavailability. The dispatcher reads this file and routes only to lanes with fresh heartbeats (`within 600 seconds`) that report `available: true`.
+`at` is the runner's Unix timestamp. `available` and `reason` record runner
+readiness. The station evaluates the heartbeat again when it reads it so
+freshness and policy apply even when the runner has not reported recently.
+The factory routes to serving lanes, subject to ticket and model rules.
 
-Quota fields (models, budget, burn_rate_per_hour, rate_limited) are not written yet and are a planned addition.
+The station publishes each lane's state, reason, and heartbeat time in the
+table shared by `bus.brain status` and the dashboard. A ready lane is
+`serving`, a runner at a limit is `limited`, a lane held by policy is
+`parked`, and a lane without a usable heartbeat is `off`.
 
 ## Sources (ToS-clean)
 

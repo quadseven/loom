@@ -229,7 +229,8 @@ NO_LANE_HANDOFF = 24 * 3600
 # queued ticket no free lane of its model or tier takes, a briefed one stalled
 # with no other lane of its rung or tier, or one on a lane at a limit or down
 # with no free lane in its rung or tier.
-NO_LANE_RE = re.compile(r"(no free lane takes model |no free lane in tier "
+MODEL_WAIT = "no free lane takes model "
+NO_LANE_RE = re.compile(r"(" + MODEL_WAIT + r"|no free lane in tier "
                         r"|stalled on lane \S+: no other lane of its "
                         r"|on lane \S+, .*: no free lane in its |remote lane \S+ has not pulled it)")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
@@ -306,6 +307,11 @@ def hard_pin(issue: Dict[str, Any]) -> str:
 def no_lane(reason: str) -> bool:
     """Whether a wait reason (Factory.waits) says no lane takes the ticket."""
     return bool(NO_LANE_RE.match(str(reason or "")))
+
+
+def model_wait_reason(model: str) -> str:
+    return MODEL_WAIT + (model if len(model) <= 64 and tickets.MODEL_RE.fullmatch(model)
+                         else "(its Model: line names no model id)")
 # A ticket held by its After: line this long, with none of the tickets it
 # waits for merged, is reported to the brain once like a stuck ticket.
 HOLD_STUCK = 48 * 3600
@@ -1804,6 +1810,16 @@ def difficulty_of(issue: Dict[str, Any]) -> str:
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
 
 
+def base_of(issue: Dict[str, Any]) -> str:
+    """The ticket's Base: line, "" (the default branch) when it has none
+    readable: the base a runner brief for the ticket names, as the
+    dispatch stop reads it (bus/runners.py _base_red)."""
+    try:
+        return str(tickets.parse(issue.get("body"))[0].get("Base") or "")
+    except ValueError:
+        return ""
+
+
 def public_only(lane: str) -> bool:
     """Whether the lane takes public repos only, by the station's claim rule
     (station.needs_public_repo): PUBLIC_ONLY, a slot sent to cluster runners
@@ -1933,7 +1949,8 @@ class Factory:
                  operators: Optional[Sequence[str]] = None,
                  no_lane_since: Optional[Dict[str, float]] = None,
                  reroute_after: Optional[float] = None,
-                 lint_run: Callable[..., Optional[bool]] = merge_tier.run_ruff) -> None:
+                 lint_run: Callable[..., Optional[bool]] = merge_tier.run_ruff,
+                 runner_stops: Optional[Callable[[str, str, str], bool]] = None) -> None:
         self.gh = gh
         self.repos = list(repos)
         self.now = now
@@ -2056,6 +2073,13 @@ class Factory:
         self._overlap_health: Dict[Tuple[str, int, str], bool] = {}
         # Each repo's `area:` labels, read once a pass by _repo_areas.
         self._areas: Dict[str, Optional[List[str]]] = {}
+        # Whether a runner slot's live base-red record stops a repo on a
+        # base (bus/runners.py Runners.stops, the dispatch read), or None
+        # when no reader was wired (a factory built away from the station):
+        # a lane pick skips a stopped slot (loom#3211). Read once per
+        # (lane, repo, base) a pass.
+        self.runner_stops = runner_stops
+        self._stops_cache: Dict[Tuple[str, str, str], bool] = {}
 
     # -- reads -----------------------------------------------------------
     def _trusted(self, item: Dict[str, Any]) -> bool:
@@ -2157,6 +2181,20 @@ class Factory:
         running ticket."""
         return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
+    def _runner_stops(self, lane: str, repo: str, base: str) -> bool:
+        """Whether the runner ledger stops `repo` on `lane`'s slot for
+        `base`, through the station's runner_stops (bus/runners.py
+        Runners.stops, the read dispatch itself makes): a slot it stops is
+        skipped like a busy one, a normal skip with no note or park, so the
+        next lane of the tier takes the ticket (loom#3211). No reader wired
+        stops nothing."""
+        if self.runner_stops is None:
+            return False
+        key = (lane, repo, base)
+        if key not in self._stops_cache:
+            self._stops_cache[key] = bool(self.runner_stops(lane, repo, base))
+        return self._stops_cache[key]
+
     def _tier_move(self, repo: str, issue: Dict[str, Any],
                    old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
         """(lane, fallback) for a tier move off lane `old`: the first free lane
@@ -2165,10 +2203,11 @@ class Factory:
         fallback saying so. (None, "") when it should wait."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
+        base = base_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
         own = [x for x in lanes_of(difficulty, private)
                if x != old and (allow_remote or x not in REMOTE_LANES)
-               and (x != "agy" or agy_ok)]
+               and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
@@ -2180,7 +2219,8 @@ class Factory:
         for tier in FALLBACK.get(difficulty, ()):
             fallback_lanes = [x for x in lanes_of(tier, private)
                               if x != old and (allow_remote or x not in REMOTE_LANES)
-                              and (x != "agy" or agy_ok)]
+                              and (x != "agy" or agy_ok)
+                              and not self._runner_stops(x, repo, base)]
             lane = next((x for x in fallback_lanes if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
@@ -4897,7 +4937,7 @@ class Factory:
         for this reason, not on each pass it repeats it: 716 identical stall
         lines in two days hid the ones that mattered (loom#1280)."""
         key = "%s#%s" % (repo, number)
-        if self.known_waits.get(key) != reason:
+        if self.waits.get(key, self.known_waits.get(key)) != reason:
             _say(message)
         self._waiting(repo, number, reason)
 
@@ -5325,8 +5365,8 @@ class Factory:
     def assign_queued(self) -> None:
         """Give queued tickets free tier lanes (or FALLBACK lanes when none of
         the tier is up) across repos in tickets.work_order: FIRST labels,
-        then priority, then the oldest. A pass that gives none a lane says
-        how many wait and why the first does."""
+        then priority, then the oldest. A pass that gives none a lane can
+        summarize the first wait. Pinned model waits log their transitions."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
         self.count_load(found_by_repo)
         before = _placements(found_by_repo)
@@ -5335,10 +5375,13 @@ class Factory:
                   if _state(issue) == "queued" and HANDOFF_LABEL not in _labels(issue)]
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
-        if waits and all(waits):
+        if waits and all(waits) and MODEL_WAIT not in waits[0]:
             _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
         self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
+        self.settled.update(ref for ref, reason in self.known_waits.items()
+                            if reason.startswith(MODEL_WAIT) and ref not in self.waits
+                            and ref.rpartition("#")[0] in found_by_repo)
 
     def _return_hand_offs(self, found_by_repo: Dict[str, Dict[int, Dict[str, Any]]]) -> None:
         """Give a lane left free after every other queued ticket had its turn
@@ -5374,6 +5417,8 @@ class Factory:
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
         ref = "%s#%s" % (repo, issue["number"])
+        if labels.RUN_OUTCOME_HOLDS.intersection(_labels(issue)):
+            return "%s is held" % ref
         if brain.has_open_rewrite(self.gh, repo, issue, sorted(self.trusted)):
             return "%s has an open rewrite ticket" % ref
         person = self._human_holder(repo, issue)
@@ -5671,12 +5716,9 @@ class Factory:
             fell = self._pin_fallback(repo, issue, model)
             if fell is not None:
                 return fell
-            why = "%s waits: no free lane takes model %s" % (ref, model)
-            reason = "no free lane takes model %s" % (
-                model if tickets.MODEL_RE.fullmatch(model) and len(model) <= 64
-                else "(its Model: line names no model id)")
-            self._waiting(repo, issue["number"], reason)
-            _say("%s (known lanes checked for availability, limits and model support)" % why)
+            reason = model_wait_reason(model)
+            why = "%s waits: %s" % (ref, reason)
+            self._wait_said(repo, issue["number"], reason, why)
             return why
         if not self._guarded(self._assign_queued_one, repo, issue, lane, "model %s" % model):
             _say("%s: assignment to lane %s failed for model %s" % (ref, lane, model))
@@ -5690,13 +5732,16 @@ class Factory:
         first free one of its FALLBACK tiers, with fallback saying so."""
         private = self._is_private(repo)
         difficulty = difficulty_of(issue)
-        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip]
+        base = base_of(issue)
+        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip
+               and not self._runner_stops(x, repo, base)]
         lane = next((x for x in own if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
             lane = next((x for x in lanes_of(tier, private)
-                         if x not in REMOTE_LANES and x not in skip and self._free(x)), None)
+                         if x not in REMOTE_LANES and x not in skip and self._free(x)
+                         and not self._runner_stops(x, repo, base)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
         return None, ""
@@ -5962,7 +6007,7 @@ class Factory:
                 counts[found.kind] += 1
                 names = _labels(issue)
                 triage = labels.in_triage(names)
-                if triage and (not found.at or labels.waiting_on_person(names)):
+                if triage and labels.waiting_on_person(names):
                     continue
                 if found.kind == brain_hold.LOOM:
                     due.append((age, repo, issue, found, triage))

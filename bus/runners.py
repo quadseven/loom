@@ -18,7 +18,10 @@ Rules:
 - A run that ends with no report, a run no runner takes within QUEUE_MAX, a
   dispatch with no answer or no run id, a run from elsewhere and a report
   that cannot be read or verified each park the brief [transient], so the
-  station re-briefs the ticket elsewhere.
+  station re-briefs the ticket elsewhere. A no-report run whose job
+  annotations say the runner lost communication parks with that loss and
+  its minutes named instead; two such losses in a row pause cluster
+  dispatch for an hour (CLUSTER_PAUSE_SECONDS).
 - A brief whose inputs exceed GitHub's INPUT_LIMIT, or that names a repo
   that is not public, is not dispatched: it is parked [transient] and the
   ticket goes to a local lane. Runner slots take public repos only, because
@@ -33,7 +36,9 @@ Rules:
 - After BASE_RED_MAX base check failures of one repo at one revision on a
   slot (one, for a check that could not start), the slot takes no more of
   that repo: its briefs park [transient] so another lane takes them, until
-  the repo's head or the runner image changes.
+  the repo's head or the runner image changes. That stop is shared: it
+  holds the repo on every slot for the same base and revision, and clears
+  by the recording slot's rules.
 
 Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
 docs/LANES.md, "Lanes on cluster runners".
@@ -62,7 +67,9 @@ import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
+from . import lane_state
 from .github import RateLimited
+from .github import GitHubError
 from .labels import LANES
 
 WORKFLOW = "lane.yml"
@@ -109,6 +116,9 @@ ARTIFACT_MAX = 64 * 1024 * 1024
 KEY_MAX = 4096
 MAC_MAX = 128
 UNPACKED_MAX = 128 * 1024 * 1024
+# The most of one run log the job packs; a larger one is cut to its tail, so
+# one runaway log cannot push the whole report past UNPACKED_MAX.
+REPORT_FILE_MAX = UNPACKED_MAX // 2
 MEMBERS_MAX = 20000
 CHUNK = 1024 * 1024
 # What the job's MAC covers comes after this label (lanes/k8s/lane_job.py).
@@ -129,6 +139,12 @@ CANNOT_RUN = (125, 126, 127)
 CANNOT_RUN_MAX = 1
 # With no report from a slot for this long, a stopped repo gets one more run.
 IMAGE_PROBE = 86400
+# A job annotation carrying these words says the run's runner was lost.
+LOST_TEXT = "lost communication with the server"
+# Runner losses in a row, across every cluster slot, that pause dispatch.
+LOST_STREAK_MAX = 2
+# How long cluster dispatch stays paused after LOST_STREAK_MAX losses.
+CLUSTER_PAUSE_SECONDS = 3600
 # Ledger entries whose brief has left the inbox are dropped after this long.
 KEEP_SECONDS = 7 * 86400
 
@@ -352,7 +368,8 @@ class Runners:
             with open(self.ledger_path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except FileNotFoundError:
-            return {"runs": {}, "holds": {}, "base_red": {}, "images": {}}
+            return {"runs": {}, "holds": {}, "base_red": {}, "images": {},
+                    "runner_lost_streak": 0, "cluster_paused_until": 0}
         except (OSError, ValueError) as err:
             raise ReportError("cannot read %s: %s" % (self.ledger_path, err)) from None
         if not isinstance(data, dict) or not isinstance(data.get("runs"), dict):
@@ -360,6 +377,8 @@ class Runners:
         data.setdefault("holds", {})
         data.setdefault("base_red", {})
         data.setdefault("images", {})
+        data.setdefault("runner_lost_streak", 0)
+        data.setdefault("cluster_paused_until", 0)
         return data
 
     def save(self, ledger: Dict[str, Any]) -> None:
@@ -387,8 +406,9 @@ class Runners:
                 self._follow(ledger, entry)
                 self.save(ledger)
         self._lift_setting_holds(ledger)
-        for slot in self.slots:
-            self._dispatch_slot(ledger, slot)
+        if not self._cluster_paused(ledger):
+            for slot in self.slots:
+                self._dispatch_slot(ledger, slot)
         for slot in self.slots:
             self._beat(ledger, slot)
         self._prune(ledger)
@@ -582,7 +602,28 @@ class Runners:
         slot: only a run can show a new runner image, and a sole red repo
         lets none run. A head that cannot be read keeps it. A check the
         runner cannot run (CANNOT_RUN) is the image's fault, not the
-        revision's, so one run stops it and a moved head does not clear it."""
+        revision's, so one run stops it and a moved head does not clear it.
+        The runner image is shared, so a record that stops the repo on one
+        slot stops it on every slot for the same repo, base and revision:
+        the other slots do not each spend BASE_RED_MAX runs learning a stop
+        the image already taught one of them. A shared stop clears by the
+        recording slot's rules, as below."""
+        own = self._record_stops(ledger, slot, repo, base)
+        if own is not None:
+            return own
+        for other in sorted(ledger["base_red"]):
+            if other == slot:
+                continue
+            shared = self._record_stops(ledger, other, repo, base)
+            if shared is not None:
+                return shared
+        return None
+
+    def _record_stops(self, ledger: Dict[str, Any], slot: str, repo: str,
+                      base: str) -> Optional[Dict[str, Any]]:
+        """The record in `slot`'s own ledger row that stops `repo` on
+        `base`, or None, clearing that row first when its day probe or a
+        moved head lifts it."""
         red = (ledger["base_red"].get(slot) or {}).get(repo)
         if (not red or int(red.get("failures") or 0) < _stop_after(red)
                 or red.get("base", "") != base):
@@ -610,6 +651,27 @@ class Runners:
             del ledger["base_red"][slot][repo]
             return None
         return red
+
+    def stops(self, slot: str, repo: str, base: str) -> bool:
+        """Whether the slot's live base-red record stops `repo` on `base`,
+        read exactly as dispatch reads it (_base_red), for a caller choosing
+        work for the slot before dispatch (the factory's lane pick,
+        loom#3211): a stop the pick cannot see is a ticket claimed for a
+        slot whose runner only parks it. A record _base_red clears (a moved
+        head, the day probe) is saved back, as a dispatch pass leaves it.
+        An unreadable ledger blocks assignment to cluster slots because
+        dispatch requires the same ledger. Local lanes can still take work."""
+        if slot not in self.slots:
+            return False
+        try:
+            ledger = self.load()
+        except ReportError:
+            return True
+        before = json.dumps(ledger["base_red"], sort_keys=True)
+        red = self._base_red(ledger, slot, repo, base)
+        if json.dumps(ledger["base_red"], sort_keys=True) != before:
+            self.save(ledger)
+        return red is not None
 
     def _note_image(self, ledger: Dict[str, Any], slot: str, files: Dict[str, bytes],
                     ticket: str) -> None:
@@ -770,14 +832,93 @@ class Runners:
                       if name.endswith("_MODEL") and name.startswith(_prefix(slot))), "")
         return model.startswith("opencode-go/") and model.endswith("-free")
 
+    # -- a lost cluster runner ----------------------------------------------
+    def _runner_lost(self, entry: Dict[str, Any]) -> bool:
+        """Check the run's jobs for runner-loss annotations. An ordinary
+        GitHub read failure leaves the run to park with the no-report reason."""
+        run = entry.get("run")
+        if not isinstance(run, int) or isinstance(run, bool):
+            return False
+        try:
+            data = self.gh.rest("GET", "/repos/%s/actions/runs/%d/jobs?per_page=100"
+                                % (self.repo, run)).data
+            jobs = data.get("jobs") if isinstance(data, dict) else None
+            if not isinstance(jobs, list):
+                return False
+            return any(self._job_reports_runner_loss(job) for job in jobs
+                       if isinstance(job, dict))
+        except RateLimited:
+            raise
+        except GitHubError:
+            return False
+
+    def _job_reports_runner_loss(self, job: Dict[str, Any]) -> bool:
+        """Read a job's check-run annotations and look for the runner-loss text."""
+        check = (str(job.get("check_run_url") or "").rsplit("/", 1)[-1]
+                 or str(job.get("id") or ""))
+        if not check.isdigit():
+            return False
+        path = "/repos/%s/check-runs/%s/annotations?per_page=100" % (self.repo, check)
+        paginate = getattr(self.gh, "paginate", None)
+        if callable(paginate):
+            notes = paginate(path)
+        else:
+            notes = self.gh.rest("GET", path).data
+        for note in notes or []:
+            if not isinstance(note, dict):
+                continue
+            text = "%s %s" % (note.get("title") or "", note.get("message") or "")
+            if LOST_TEXT in text:
+                return True
+        return False
+
+    def _note_lost(self, ledger: Dict[str, Any]) -> None:
+        """Count one runner loss in the ledger's streak, across slots.
+        At LOST_STREAK_MAX in a row, pause cluster dispatch for
+        CLUSTER_PAUSE_SECONDS and say so once: a loss that lands while a
+        pause already runs neither extends it nor says it again. Saved
+        here, not only by tend's save, so a direct collect keeps it."""
+        streak = int(ledger.get("runner_lost_streak") or 0) + 1
+        ledger["runner_lost_streak"] = streak
+        if streak >= LOST_STREAK_MAX and not self._cluster_paused(ledger):
+            ledger["cluster_paused_until"] = self.now + CLUSTER_PAUSE_SECONDS
+            self.say("cluster dispatch paused: %d runner losses in a row" % LOST_STREAK_MAX)
+        self.save(ledger)
+
+    @staticmethod
+    def _note_not_lost(ledger: Dict[str, Any]) -> None:
+        """Any collected run that was not a runner loss breaks the streak."""
+        ledger["runner_lost_streak"] = 0
+
+    def _cluster_paused(self, ledger: Dict[str, Any]) -> bool:
+        """Whether the ledger's runner-loss pause still runs. An expired
+        pause clears, with its streak, so dispatch and counting restart."""
+        until = float(ledger.get("cluster_paused_until") or 0)
+        if until > self.now:
+            return True
+        if until:
+            ledger["cluster_paused_until"] = 0
+            ledger["runner_lost_streak"] = 0
+        return False
+
     def _collect(self, ledger: Dict[str, Any], entry: Dict[str, Any]) -> None:
         slot, ticket = entry["slot"], entry["ticket"]
         conclusion = entry.get("conclusion") or "unknown"
         artifact = self._report_artifact(entry)
         if artifact is None:
+            if self._runner_lost(entry):
+                minutes = int((self.now - float(entry.get("at") or self.now)) // 60)
+                self._note_lost(ledger)
+                self._park(slot, ticket,
+                           "the cluster runner was lost after %d minutes "
+                           "(runner lost communication)" % max(minutes, 0),
+                           "transient")
+                return
+            self._note_not_lost(ledger)
             self._park(slot, ticket, "the runner run ended %s with no report" % conclusion,
                        "transient")
             return
+        self._note_not_lost(ledger)
         try:
             files = self._read_report(entry, artifact)
             beat = self.apply(slot, ticket, files)
@@ -917,6 +1058,20 @@ class Runners:
                 raise ReportError("the decrypted report is larger than %d bytes" % ARTIFACT_MAX)
             return self._untar(plain)
 
+    @staticmethod
+    def _largest(path: str, current: "tarfile.TarInfo") -> str:
+        """Text naming the biggest file in the archive, for the refusal. The
+        headers only are read; a failure here just leaves the name out."""
+        best = current
+        try:
+            with tarfile.open(path, mode="r|gz") as tar:
+                for member in tar:
+                    if member.isfile() and member.size > best.size:
+                        best = member
+        except (tarfile.TarError, OSError, EOFError, zlib.error, ValueError):
+            pass
+        return " (largest file: %s, %d bytes)" % (best.name[:80], best.size)
+
     def _untar(self, path: str) -> Dict[str, bytes]:
         files: Dict[str, bytes] = {}
         total = 0
@@ -930,7 +1085,8 @@ class Runners:
                     if not member.isfile():
                         raise ReportError("the report holds a link or device: %s" % member.name[:80])
                     if member.size < 0 or total + member.size > UNPACKED_MAX:
-                        raise ReportError("the report unpacks past %d bytes" % UNPACKED_MAX)
+                        raise ReportError("the report unpacks past %d bytes%s"
+                                          % (UNPACKED_MAX, self._largest(path, member)))
                     buf = io.BytesIO()
                     fh = tar.extractfile(member)
                     if fh is not None:
@@ -1054,6 +1210,7 @@ class Runners:
             if not models:
                 ledger["holds"].pop(slot, None)
         beat["limited_models"] = models
+        beat = lane_state.heartbeat_fields(slot, beat, self.home)
         _write(self._usage(slot, ".json"), (json.dumps(beat) + "\n").encode("utf-8"))
 
     def _prune(self, ledger: Dict[str, Any]) -> None:

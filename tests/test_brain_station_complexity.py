@@ -31,6 +31,13 @@ TARGETS = (
     ("bus/station.py", "Station._held_wait_state"),
     ("bus/invariants.py", "_scheduled_failures"),
     ("bus/invariants.py", "read_scheduled_workflows"),
+    # AI-REVIEW 2026-11-18 [gpt-6-luna/subscription] 1-5 (PR #3252):
+    # Keep lane classification, wait tracking and rendering under the cap.
+    ("bus/lane_state.py", "evaluate"),
+    ("bus/station.py", "Station._record_waits"),
+    ("dashboard/brain_view.py", "_render_lane_cards"),
+    ("dashboard/usage.py", "build"),
+    ("dashboard/views.py", "_lane_summary"),
     ("bus/log_capture.py", "update"),
     # AI-REVIEW 2026-11-18 [automated review summary] station complexity (PR #3237):
     # Keep environment parsing below the cap as new settings are added.
