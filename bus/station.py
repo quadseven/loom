@@ -603,7 +603,7 @@ NO_CHANGE_UNPROVEN_NOTE = ("The answer does not prove every acceptance box, so t
 # holds the ticket behind an incident if the base is red there too.
 CHECK_CANNOT_RUN_RE = re.compile(r"the check exited 12[5-7] on the unmodified base"
                                  r"|base check exited [0-9]+ on the (?:unmodified repo"
-                                 r"|default branch)")
+                                 r"|default branch|base at [0-9a-f]+)")
 HELD_FOR_RE = re.compile(r"factory incident ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)")
 # A [factory] hold whose reason names no incident (the incident filing failed)
 # has nothing that can close it, so the station releases it after this long:
