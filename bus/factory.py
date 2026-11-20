@@ -1920,6 +1920,11 @@ def native_blockers(gh: Any, repo: str, issue: Dict[str, Any]) -> List[str]:
     return refs
 
 
+def lane_state(lane: str) -> str:
+    """The state a ticket takes on `lane`: remote pull lanes claim queued."""
+    return "queued" if lane in REMOTE_LANES else "briefed"
+
+
 class Factory:
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
@@ -4768,7 +4773,7 @@ class Factory:
             self._give_up(repo, issue, "it failed on lane %s" % _lane(issue))
             return
         if pr is None:
-            self.move(self.gh, repo, number, "briefed", lane=lane)
+            self.brief_on(repo, number, lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
 
@@ -4921,7 +4926,7 @@ class Factory:
             self._status_note(repo, number, said + "the factory moved this ticket to lane "
                               "%s, %s." % (lane, "in its difficulty tier"
                                            if model == "unspecified" else "which takes its model"))
-            kept = brain._moved_labels(_labels(issue), "briefed", lane)
+            kept = brain._moved_labels(_labels(issue), lane_state(lane), lane)
             self._relabel(repo, issue, kept)
             self.load[lane] = self.load.get(lane, 0) + 1
             _say("moved running %s#%d off silent lane %s to %s" % (repo, number, old, lane))
@@ -5784,13 +5789,21 @@ class Factory:
                           "ran." % (PIN_FALLBACK_MARKER % model, model, minutes, lane))
         return ""
 
+    def brief_on(self, repo: str, number: int, lane: str, **kw: Any) -> None:
+        """Move a ticket onto `lane`: briefed for a local lane, queued for a
+        remote pull lane, which claims only queued tickets (as brain.move)."""
+        if lane in REMOTE_LANES:
+            self.move(self.gh, repo, number, "queued", lane=lane)
+        else:
+            self.move(self.gh, repo, number, "briefed", lane=lane, **kw)
+
     def _assign_equivalent(self, repo: str, issue: Dict[str, Any], pinned: str,
                            lane: str, model: str, why: str) -> None:
         """Brief a queued ticket on `lane` with the equivalent `model` written
         to its Model: line, so its claim records the model that ran. The note
         carries EQUIVALENT_MARKER, which leaves the pinned rung untried."""
         number = int(issue["number"])
-        self.move(self.gh, repo, number, "briefed", lane=lane, model=model)
+        self.brief_on(repo, number, lane, model=model)
         self._status_note(repo, number,
                           "%s\nThe station gave this queued ticket lane %s with model %s in "
                           "place of %s (equivalent: %s)." % (
