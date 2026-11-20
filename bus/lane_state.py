@@ -53,19 +53,7 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
     if at is None:
         return State("off", "No heartbeat", at)
     if not fresh(at, now, window):
-        # A stated limit hold outlives the beat's freshness window: its end
-        # is the beat's retry_at, not its stamp. A pick_held hold (a paid
-        # pace stop, a model the CLI no longer offers) can last days, and
-        # reading it as merely stale dropped it from the station's limited
-        # lanes and limit_until, so the slot claimed again at once
-        # (loom#3226). A stale beat with no such hold, or one that has
-        # ended, is stale as before.
-        if beat.get("available") is False:
-            reason = str(beat.get("reason") or "")
-            until = epoch(beat.get("retry_at"))
-            if reason.startswith(LIMIT) and until is not None and until > now:
-                return _limit_state(reason, at, until, now)
-        return State("off", "Heartbeat is stale", at)
+        return _stale_state(beat, at, now)
     if parked:
         return State("parked", parked, at)
     if beat.get("available") is True:
@@ -76,6 +64,16 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
     if reason.startswith(LIMIT):
         return _limit_state(reason, at, epoch(beat.get("retry_at")), now)
     return State("off", RUNNER_UNAVAILABLE, at)
+
+
+def _stale_state(beat: dict[str, Any], at: float, now: float) -> State:
+    """Keep a timed limit active until its retry time (loom#3226)."""
+    if beat.get("available") is False:
+        reason = str(beat.get("reason") or "")
+        until = epoch(beat.get("retry_at"))
+        if reason.startswith(LIMIT) and until is not None and until > now:
+            return _limit_state(reason, at, until, now)
+    return State("off", "Heartbeat is stale", at)
 
 
 def _limit_state(reason: str, at: float, until: Optional[float], now: float) -> State:
