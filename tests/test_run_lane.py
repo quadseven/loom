@@ -5201,10 +5201,10 @@ echo fixed > fix.txt
     def test_a_runner_without_the_scorecard_skips_models_named_in_the_brief(self):
         (self.loom / "briefs" / "opencode-go").mkdir(parents=True, exist_ok=True)
         inbox, result = self.api_lane("opencode-go", extra="", difficulty="medium",
-                                      brief_header="Demoted-Models: opencode-go/gpt-6-luna",
-                                      **self.pick_env(go=self.STRONG_LISTED + ("claude-haiku-5-5",)))
+                                      brief_header="Demoted-Models: opencode-go/claude-haiku-5-5",
+                                      **self.pick_env(go=self.STRONG_LISTED))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("-m opencode-go/claude-haiku-5-5", self.runs()[-1])
+        self.assertIn("-m opencode-go/iceman-contributor-free", self.runs()[-1])
 
     def pause_models(self, *keys):
         (self.loom / "state" / "usage").mkdir(parents=True, exist_ok=True)
@@ -5255,14 +5255,14 @@ echo fixed > fix.txt
         ledger = (self.loom / "state" / "usage" / "go-budget.jsonl").read_text().splitlines()
         self.assertEqual(sum(json.loads(line)["requests"] for line in ledger), 1)
 
-    STRONG_LISTED = ("beam-free", "iceman-contributor-free", "gpt-6-luna", "mimo-v2.6-flash")
+    STRONG_LISTED = ("beam-free", "iceman-contributor-free", "claude-haiku-5-5", "mimo-v2.6-flash")
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_a_medium_ticket_runs_the_strong_tier(self):
         inbox, result = self.api_lane("opencode-go",
                                       **self.pick_env(go=self.STRONG_LISTED))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("-m opencode-go/gpt-6-luna", self.runs()[-1])
+        self.assertIn("-m opencode-go/claude-haiku-5-5", self.runs()[-1])
         log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
         self.assertIn("(paid)", log)
         self.assertIn("strong tier", log)
