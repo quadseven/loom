@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
+from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, live_check_due, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
 from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
@@ -584,15 +584,27 @@ def _split_owned_runaways(rows: List[Tuple[Any, Dict[str, Any]]]
     return own, held
 
 
+def _split_operator_ask(rows: List[Tuple[Any, Dict[str, Any]]]
+                        ) -> Tuple[List[Tuple[Any, Dict[str, Any]]],
+                                   List[Tuple[Any, Dict[str, Any]]]]:
+    """Runaway rows that need review, and those whose way forward is an open
+    operator ask (needs:human)."""
+    ask = [r for r in rows if needs_human(_labels(r[1]))]
+    return [r for r in rows if r not in ask], ask
+
+
 def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
     rows = [(None, i) for i in issues if RUNAWAY in _labels(i)
             and tickets.ticket_state(i) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(rows)
+    own, ask = _split_operator_ask(own)
     lines = ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
                                         for _, i in own] or ["- none"])
     lines += ["- owned by %s: #%s %s" % (owner, issue["number"], issue.get("title", ""))
               for _, issue, owner in held]
+    lines += ["- waiting on the operator: #%s %s" % (i["number"], i.get("title", ""))
+              for _, i in ask]
     return lines
 
 
@@ -1550,6 +1562,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
               for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
+    lines += [""] + live_check_due.section_lines(_live_check_rows(gh, repo, tickets), now)
     lines += ["", INVARIANTS_HEADING]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
@@ -1665,6 +1678,24 @@ def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[dateti
               if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "loom:shipped"]
     stamps = [x for x in stamps if x]
     return max(stamps) if stamps else _stamp(issue.get("updated_at"))
+
+
+def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
+                     ) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """(due date, ticket) for each open awaiting-live-check ticket; the label
+    time is read from the events, the ticket's update time when they do not say."""
+    waiting = [i for i in tickets if LIVE_CHECK_LABEL in _labels(i)]
+
+    def read(issue: Dict[str, Any]) -> datetime:
+        events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+        stamps = [_stamp(e.get("created_at")) for e in events
+                  if e.get("event") == "labeled"
+                  and (e.get("label") or {}).get("name") == LIVE_CHECK_LABEL]
+        stamps = [x for x in stamps if x]
+        at = max(stamps) if stamps else _stamp(issue.get("updated_at"))
+        return live_check_due.due_date(issue.get("body"), at or datetime.now(timezone.utc))
+
+    return list(zip(_read_each(read, waiting), waiting, strict=True))
 
 
 def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
@@ -1908,10 +1939,14 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(runaway)
+    own, ask = _split_operator_ask(own)
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in own] or ["- none"])
     tail += ["- owned by %s: %s#%s %s" % (owner, repo, issue["number"], issue.get("title", ""))
              for repo, issue, owner in held]
+    tail += ["- waiting on the operator: %s#%s %s" % (repo, issue["number"],
+                                                     issue.get("title", ""))
+             for repo, issue in ask]
     tail += [""] + priority_lines(found, now)
     tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)

@@ -152,6 +152,8 @@ EXPECTED_RES = (
                r"(?:the edits are on branch [A-Za-z0-9_./-]+|the push of [A-Za-z0-9_./-]+ failed; the edits are committed in the lane tree|the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree|the edits are committed in the lane tree)(?:; no pull request opened)?[ \t]*"),
     re.compile(r"station: factory release: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ re-queued: "
                r"incident filing failed[ \t]*"),
+    re.compile(r"station: close audit: [0-9]+ closes read, [0-9]+ refused, "
+               r"[0-9]+ waiting; at most [0-9]+ reads a pass[ \t]*"),
     re.compile(r"factory: re-briefed failed [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ "
                r"on [A-Za-z0-9_.-]+[ \t]*"),
 )
@@ -551,6 +553,9 @@ def keep(line: str) -> bool:
     verify run (VERIFY_RUN_RE) and a designed station outcome (EXPECTED_RES).
     A relayed CI log line is the run's output (CI_LOG_RE)."""
     bare = _LEAD_RE.sub("", line).rstrip("\r\n")
+    # An escaped run-log tail (a literal backslash-n and what follows) does
+    # not turn a designed outcome into an error.
+    bare = bare.split("\\n", 1)[0]
     if HOLD_RE.fullmatch(bare) or any(r.fullmatch(bare) for r in EXPECTED_RES):
         return False
     if brain_status(line):

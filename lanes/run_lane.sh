@@ -602,21 +602,23 @@ live_cluster_check() {
   LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
 }
 
-# Check the composed pull request checklist against only this run's log.
+# Untick each checked live box of the composed pull request checklist whose
+# expected output is not in this run's log, and go on: the finished work is
+# pushed with the box open. A check that cannot run parks the run.
 live_acceptance_check() {
-  local gap
-  if ! gap="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+  local body
+  if ! body="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
 import sys
-from bus.live_proof import lane_output_gap
+from bus.live_proof import untick_unproven_live
 with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
     log.seek(int(sys.argv[2]))
-    print(lane_output_gap(sys.stdin.read(), log))
+    print(untick_unproven_live(sys.stdin.read().rstrip("\n"), log))
 ' "$LOG" "$LOG_START" 2>&1)"; then
-    printf '%s\n' "$gap" >> "$LOG"
+    printf '%s\n' "$body" >> "$LOG"
     park "$BRIEF" "could not check live acceptance criteria; nothing pushed" transient
     return 1
   fi
-  [ -z "$gap" ] || { park "$BRIEF" "$gap; nothing pushed"; return 1; }
+  PR_BODY="$body"
 }
 
 # STRAY_FILES as one comma-separated line, at most ten names.
@@ -917,10 +919,10 @@ upsert_sticky_comment() {
   fi
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   else
     timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   fi
   rm -f "$old_file" "$input_file" "$new_file"
   return "$ok"

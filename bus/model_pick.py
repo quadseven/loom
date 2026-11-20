@@ -65,7 +65,6 @@ GROUP_ZEN = "zen-free"
 # other model is refused, whatever the live list offers. DeepSeek V4.1 Flash
 # is left out: its hidden reasoning spent 8,192 tokens on one empty answer.
 GO_PAID: Dict[str, Tuple[int, int, int]] = {
-    "opencode-go/gpt-6-luna": (5_640, 14_080, 28_170),
     "opencode-go/claude-haiku-5-5": (5_133, 12_830, 25_640),
     "opencode-go/mimo-v2.6-flash": (32_608, 81_470, 162_930),
     "opencode-go/muse-spark-1.3-contributor": (49_075, 122_740, 245_480),
@@ -75,7 +74,7 @@ GO_PAID: Dict[str, Tuple[int, int, int]] = {
 # with its tests green, and Claude Haiku 5.5 finished with 6 tests failing.
 # Kimi K3.1 Pro leads the Artificial Analysis index but cost five times as much
 # and had not finished at 28 steps. MiMo-V2.6-Pro edited nothing in 33 steps.
-GO_STRONG = ("opencode-go/gpt-6-luna", "opencode-go/claude-haiku-5-5")
+GO_STRONG = ("opencode-go/claude-haiku-5-5",)
 # Models that take easy tickets only: Beam Free's scorecard is 4 merged of 11.
 EASY_ONLY = ("beam-free",)
 WINDOWS = (5 * 3600, 7 * 86400, 30 * 86400)

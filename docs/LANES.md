@@ -1613,6 +1613,20 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Moving file ledgers into the shared backend
+
+A station switched to `postgres` starts with empty ledgers, so it would send
+its reports, asks and notices again and forget its watches and holds.
+`python3 -m bus state-import` copies the file ledgers once: every `*.json`
+below `state/` except the host-local ones (`state_store.host_local`, which
+includes the ETag cache). `--dry-run` prints a count per ledger and writes
+nothing; it works without the database settings. A real run needs
+`LOOM_STATE_BACKEND=postgres` and its settings, refuses while a pass on this
+host holds the station lock, reads each copy back and compares it, and leaves
+ledgers the store already holds alone unless `--overwrite` is given, so a
+second run changes nothing. `--skip LEDGER` leaves one out. Stop the old
+station first; a station on another host cannot be seen from here.
+
 ### Standing by for another station
 
 The lease cannot stop a station that does not use it: one started by launchd
