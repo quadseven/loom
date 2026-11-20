@@ -1289,6 +1289,23 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
+  APP_TOKEN_AT="$(date +%s)"
+}
+
+# A run can outlive its installation token (one hour), so each GitHub write
+# that can come late in a run mints again once the token is older than
+# LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
+# the log and keeps the old token, which may still work (loom#3231).
+fresh_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
+  now="$(date +%s)"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=2700
+  [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
+  lane_app_token && return 0
+  [ -z "$old" ] || export GH_TOKEN="$old"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  return 1
 }
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
@@ -1353,6 +1370,7 @@ post_park_note() {  # failure class, reason
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
+  fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
     grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
@@ -3828,6 +3846,10 @@ push_side() {
   range="$BASE..$from"
   [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
   [ "${REPO_PRIVATE:-}" = true ] && scan=(--personal-data)
+  if ! fresh_app_token; then
+    printf 'the GitHub App token could not be refreshed; the edits are committed in the lane tree'
+    return 1
+  fi
   if ! (cd "$TREE" && leak_scan --diff "$range" "${scan[@]}") >> "$LOG" 2>&1; then
     printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
     return 1
@@ -5500,6 +5522,7 @@ for BRIEF in "$INBOX"/*.md; do
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
+    fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
       if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then
