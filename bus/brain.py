@@ -6169,7 +6169,30 @@ def _refuse_pending_fix(gh: GitHub, repo: str, number: int,
     note = _fix_cancellation(gh, repo, number, comments, details, env, authors)
     if note is not None:
         return note
+    if _fix_answered_by_head(comments, authors, details):
+        return None
     raise ValueError("a brain fix is pending on the ticket; merge after it runs")
+
+
+def _fix_answered_by_head(comments: List[Any], authors: Sequence[str],
+                          details: Dict[str, Any]) -> bool:
+    """The pending brain fix was answered by the brain's own push: a trusted
+    comment (not another fix ask) after the marker, and a pull request head
+    that is not the head the round named and was committed after the marker.
+    False on any missing time or head, which leaves the fix pending."""
+    fix = _pending_fix_comment(comments, authors)
+    found = _fix_round(str(fix.get("body") or "")) if fix else None
+    if fix is None or found is None:
+        return False
+    asked = str(fix.get("created_at") or "")
+    head = str(details.get("headRefOid") or "")
+    pushed = str(_head_commit(details).get("committedDate") or "")
+    if not (asked and head and pushed > asked) or head.startswith(found[1]):
+        return False
+    allowed = {a.lower() for a in authors}
+    return any(isinstance(c, dict) and str(c.get("created_at") or "") > asked
+               and tickets._login(c.get("user")).lower() in allowed
+               and not _is_brain_fix(c, allowed) for c in comments)
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
