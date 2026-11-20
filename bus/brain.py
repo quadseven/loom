@@ -5222,13 +5222,25 @@ def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
         raise ValueError("proof revision %s is not on %s" % (revision, branch))
 
 
+def _verifiable(issue: Dict[str, Any]) -> bool:
+    """A loom:ticket, or a loom:factory issue by a trusted login whose code is
+    built and only a Live box is left. A factory incident never is one."""
+    names = _labels(issue)
+    if "loom:ticket" in names:
+        return True
+    return ("loom:factory" in names
+            and FACTORY_INCIDENT_MARKER not in str(issue.get("body") or "")
+            and tickets.brief_author_trusted(issue, trusted_authors(), trusted_briefers(),
+                                             as_ticket=True))
+
+
 def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
                    record: Dict[str, Any], facts: Sequence[str] = ()) -> str:
     """Check a proof record against the ticket and return the comment for it,
     with the facts the station checked when it gives any. Runtime work is
     verified once shipped; documentation once merged."""
     names = _labels(issue)
-    if "loom:ticket" not in names:
+    if not _verifiable(issue):
         raise ValueError("only a loom:ticket is verified")
     body = str(issue.get("body") or "")
     proof.check(record, body)
