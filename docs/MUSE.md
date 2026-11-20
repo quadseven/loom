@@ -721,7 +721,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs:human` issue in `LOOM_REPOS`. Do yourself
+6. First run `python3 -m bus.brain step asks --holder muse`. Run `python3 -m bus.needs_you` and review only the items in its `## Brain review this tick` section (at most 5, oldest ask first, `--brain-batch N` sets the count; an item whose newest comment is from a `LOOM_BRIEF_AUTHORS` login is left out until someone else writes on it, so the batch rotates). A tick that acted on each of those items records no degraded asks step. For each of them, do yourself
    whatever does not need the operator's own hands, money, accounts or a
    decision the goal home reserves for the operator: fix it, ticket it, or
    record the decision the evidence supports. Then comment what was done and
