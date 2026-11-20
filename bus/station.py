@@ -6128,7 +6128,38 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
+        if self._move_ticked_merged(repo, issue, found):
+            return True
         return self._apply_brief_hold(repo, number, found)
+
+    def _move_ticked_merged(self, repo: str, issue: Dict[str, Any],
+                            found: brief_check.Verdict) -> bool:
+        """A stale verdict that names a merged pull request, on a ticket with
+        every acceptance box ticked, moves the ticket to loom:merged without its
+        lane label and with a note naming the pull request, instead of asking
+        the operator. Any unticked box keeps the existing hold. Other labels,
+        awaiting-live-check among them, stay."""
+        if found.kind != brief_check.STALE or not found.key.startswith("pr-"):
+            return False
+        boxes = proof.criteria(str(issue.get("body") or ""))
+        if not boxes or not all(checked for checked, _ in boxes):
+            return False
+        number = int(issue["number"])
+        states = {"loom:" + state for state in brain.STATES}
+        labels = [n for n in _label_names(issue)
+                  if n not in states and not n.startswith(("lane:", WAIT))]
+        labels.append("loom:merged")
+        try:
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+        except GitHubError as err:
+            _say("%s#%d waits: moving it to merged failed (%s)" % (repo, number, err))
+            return True
+        issue["labels"] = [{"name": n} for n in labels]
+        self._routine(repo, number, "Every box is ticked and %s, so the ticket moves "
+                      "to loom:merged without its lane." % found.reason)
+        _say("%s#%d moves to merged: %s" % (repo, number, found.reason))
+        return True
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
