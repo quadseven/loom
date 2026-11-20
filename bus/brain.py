@@ -4552,6 +4552,9 @@ def missing_sections(body: Optional[str]) -> List[str]:
     return missing
 
 
+_TEST_PATH = re.compile(r"\btests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py\b")
+
+
 def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = None
                        ) -> Optional[str]:
     """Why a body cannot be filed or briefed as a ticket for want of acceptance
@@ -4566,17 +4569,25 @@ def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = No
         return None
     criteria = _body_sections(body).get("acceptance criteria", [])
     if any(_CHECKBOX.match(line) for line in criteria):
-        for line in criteria:
-            criterion = _CHECKBOX.sub("", line, count=1)
+        texts = [_CHECKBOX.sub("", line, count=1) for line in criteria]
+        for at, criterion in enumerate(texts):
             kept = re.search(r"\b(?:still|keeps?|unchanged|continues?|no longer regresses)\b",
                              criterion, re.I)
             requests_test = re.search(r"\b(?:test|tests)\b", criterion, re.I)
-            names_test = re.search(r"\btests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py\b",
-                                   criterion)
-            if kept and requests_test and not names_test:
+            paths = _TEST_PATH.findall(criterion)
+            if kept and requests_test and not paths:
                 return ("kept behaviour criteria that ask for a test must name the existing "
                         "test path under tests/; otherwise reword the criterion as a "
                         "behaviour change whose test fails on main")
+            # Kept behaviour passes on main, so a test for it cannot sit in a
+            # module that this brief's other criteria make new (loom#3385).
+            fresh = {path for other, text in enumerate(texts) if other != at
+                     for path in _TEST_PATH.findall(text)
+                     if re.search(r"\bnew\b|fails on main", text, re.I)}
+            if kept and (re.search(r"\bnew (?:test )?module\b", criterion, re.I)
+                         or fresh.intersection(paths)):
+                return ("kept behaviour belongs in an existing test module: a new module's "
+                        "tests must fail on main, and kept behaviour passes there")
         return None
     return ("the body has no acceptance criteria: add an ## Acceptance criteria section "
             "with at least one - [ ] checkbox, so a lane has something to prove. The draft "
