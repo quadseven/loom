@@ -4262,7 +4262,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # goal's intake epic (loom#2033).
         epic = _source_epic(gh, repo, source, elsewhere is None)
     if epic is not None:
-        _, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic_issue, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic = _repairs_rollover(gh, repo, epic, epic_issue, goal)
     elif intake_of is not None:
         goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
     else:
@@ -4340,6 +4341,23 @@ def _source_parent(source: Dict[str, Any]) -> Optional[int]:
         return parent
     match = _PART_OF_ANY.search(strip_status_body(source.get("body")))
     return int(match.group(1)) if match else None
+
+
+def _repairs_rollover(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any],
+                      goal: int) -> int:
+    """The epic a brief files under: the one named, except that a repairs epic
+    (standing or batch) at GitHub's SUB_ISSUE_LIMIT sends it to the batch
+    repairs_epic picks with room, and one stderr line names both (loom#3206:
+    a brief under a full standing epic got a Part of line and no sub-issue
+    link)."""
+    if not (standing_epic(issue) or repairs_batch(issue)):
+        return epic
+    if sub_issue_count(gh, repo, issue) < SUB_ISSUE_LIMIT:
+        return epic
+    used = repairs_epic(gh, repo, goal, full=(epic,))
+    print("brief: epic #%d holds %d sub-issues; filing under #%d" % (epic, SUB_ISSUE_LIMIT, used),
+          file=sys.stderr)
+    return used
 
 
 def _open_epic_for(gh: GitHub, repo: str, epic: int, source: Optional[Dict[str, Any]],
