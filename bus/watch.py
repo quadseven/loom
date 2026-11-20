@@ -156,6 +156,11 @@ EXPECTED_RES = (
                r"[0-9]+ waiting; at most [0-9]+ reads a pass[ \t]*"),
     re.compile(r"factory: re-briefed failed [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ "
                r"on [A-Za-z0-9_.-]+[ \t]*"),
+    # The backstop Station._never_left_running is: a reported failure ended
+    # the run, so a ticket still running on that lane goes to loom:failed
+    # for the factory to act on. It is the recovery, not the error.
+    re.compile(r"station: moved [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+ to loom:failed: "
+               r"its reported run left it running[ \t]*"),
 )
 # The brain's own status output, read back into its log: it names stages,
 # states and outcomes ("failed"), so the error words match, but none of it is
