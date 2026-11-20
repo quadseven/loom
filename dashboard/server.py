@@ -287,7 +287,9 @@ def _floor(state):
             len(triage) - waiting, waiting)
     head = '<div class="section-head"><span class="label">Conveyor - count and median wait</span>%s</div>' % (
         '<span class="bottleneck-note">%s is the bottleneck</span>' % esc(bottleneck) if bottleneck else "")
-    parts = ['<section class="standup">%s</section>' % standup,
+    board_asks, board_claims, board_repos = _needs_sources(_backlog_document(_backlog_raw(state) or b"{}"), state)
+    board_found = needs_you_view.render(board_asks, board_claims, "", board_repos, answers_view.posted(state))[0]
+    parts = [needs_you_view.board(board_found), '<section class="standup">%s</section>' % standup,
              '<section class="section">%s<div class="conveyor">%s</div></section>' % (head, conveyor)]
     runaway_rows = "".join(_ticket_row(row) for row in runaway)
     parts.append('<section class="section runaway-tickets"><div class="section-head"><span class="label">Runaway tickets</span></div>%s</section>' % (
@@ -863,7 +865,8 @@ def _needs_you(document, state, *, source_missing=False, who=""):
     asks, claims, repos = _needs_sources(document, state)
     mode = answers_view.mode(state)
     found, cards = needs_you_view.render(asks, claims, who, repos, answers_view.posted(state), mode)
-    out = ['<p class="page-lede">Only what only a person can do: each item names who it waits on. '
+    out = [needs_you_view.board(found),
+           '<p class="page-lede">Only what only a person can do: each item names who it waits on. '
            'Everything else the brain does itself.</p>', _answer_bar(mode)]
     if source_missing:
         out.append('<p class="card">Backlog source unavailable: Hunt\'s items are not shown.</p>')

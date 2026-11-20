@@ -2234,6 +2234,12 @@ lookup leaves the brief for the next pass. The rule covers:
  When the base check left a uv cache, the agent gets a copy of it and runs uv
  offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
  without network (loom#1665).
+- A lane run points `CODEX_HOME` at a lane-only home under the run's scratch
+ home: the operator's `config.toml` (model and provider config) and sign-in
+ are copied in, and the user-level `AGENTS.md` is not, so a personal startup
+ duty in that file never reaches a lane run (loom#3227). Session rollouts
+ still link to the operator's sessions folder, where the station reads them.
+ A brain run keeps the operator's Codex home as before.
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
