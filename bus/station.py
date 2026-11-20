@@ -150,6 +150,9 @@ ISSUE_LINE_RE = re.compile(r"^Issue: ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)#([0-9]+)[
 # planned and stopped holding it.
 AFTER_RELEASE_RE = re.compile(r"^<!-- loom:after-release ([0-9]+) -->")
 FAILED_RE = re.compile(r"\bfailed: (.*)$")
+# The line lanes/run_lane.sh park writes: "[time] <ticket> failed: [class] reason".
+# _failure_reason prefers it to any other line that merely holds "failed: ".
+LANE_FAILED_RE = re.compile(r"^\[[^\]]*\] \S+ failed: (\[[A-Za-z-]+\] .*)$")
 # The runner's reason when a lane run ends with nothing committed.
 NO_COMMIT = "agent made no commit"
 # Elder review check output parsing: individual markings like "removed-guarded-path"
@@ -1150,6 +1153,7 @@ class Settings:
                  live_evidence_env: Optional[Dict[str, str]] = None,
                  live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
+                 roll_pin_exempt: Sequence[str] = (),
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
@@ -1276,6 +1280,7 @@ class Settings:
         # reads the lender's LOG adapter only (live_adapter.lends).
         self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
+        self.roll_pin_exempt = tuple(roll_pin_exempt)
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -1416,6 +1421,7 @@ class Settings:
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
+                   roll_pin_exempt=words("LOOM_ROLL_PIN_EXEMPT"),
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ask_answerers=ask_state.answerers(env),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
@@ -10475,12 +10481,17 @@ class Station:
     def _failure_reason(self, lane: str, name: str) -> str:
         log = os.path.join(self.s.home, "logs", lane, name + ".log")
         reason = ""
+        own = ""
         try:
             with open(log, encoding="utf-8", errors="replace") as fh:
                 for line in fh:
+                    m = LANE_FAILED_RE.match(line.rstrip("\r\n"))
+                    if m:
+                        own = m.group(1)
                     m = FAILED_RE.search(line)
                     if m:
                         reason = m.group(1)
+            reason = own or reason
         except OSError:
             pass
         # The agent's own output is in the log too, so the line is scrubbed
@@ -14698,6 +14709,7 @@ class Station:
             _say("invariants: could not read the goal tickets: %s" % err)
         facts.roll_goals = self._roll_goals(homes)
         facts.roll_docs = len(self.s.roll_ship_docs)
+        facts.roll_exempt = self.s.roll_pin_exempt
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except RateLimited:

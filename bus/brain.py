@@ -529,7 +529,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                 lines.append("  - %d more are held for a rare live event (%s): counted apart "
                              "from open work" % (apart, WAIT_LIVE_EVENT))
             if tree:
-                lines += epic_lines(tree)
+                lines += epic_lines(tree, repo)
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
@@ -2807,14 +2807,21 @@ def _flatten(loose: List[Dict[str, Any]],
     return children
 
 
-def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[str]:
+def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+               repo: str = "") -> List[str]:
     """bus.brain status lines for a goal's epics: the open epics against
-    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP."""
+    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP.
+    An epic of a repository other than the goal's prints as OWNER/NAME#N, so
+    a brain never reads it as an epic of the goal's own repository."""
     open_epics = [(e, t) for e, t in tree if e.get("state", "open") == "open"]
     lines = ["  - open epics %d/%d" % (len(open_epics), GOAL_EPIC_CAP)]
     for epic, found in open_epics:
-        lines.append("  - epic #%s %s - tickets %d/%d" % (
-            epic.get("number"), epic.get("title", ""), len(found), EPIC_TICKET_CAP))
+        home = _epic_repo(epic, repo)
+        ref = "#%s" % epic.get("number")
+        if repo and home.lower() != repo.lower():
+            ref = "%s#%s" % (home, epic.get("number"))
+        lines.append("  - epic %s %s - tickets %d/%d" % (
+            ref, epic.get("title", ""), len(found), EPIC_TICKET_CAP))
     return lines
 
 
@@ -4262,7 +4269,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # goal's intake epic (loom#2033).
         epic = _source_epic(gh, repo, source, elsewhere is None)
     if epic is not None:
-        _, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic_issue, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic = _repairs_rollover(gh, repo, epic, epic_issue, goal)
     elif intake_of is not None:
         goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
     else:
@@ -4340,6 +4348,23 @@ def _source_parent(source: Dict[str, Any]) -> Optional[int]:
         return parent
     match = _PART_OF_ANY.search(strip_status_body(source.get("body")))
     return int(match.group(1)) if match else None
+
+
+def _repairs_rollover(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any],
+                      goal: int) -> int:
+    """The epic a brief files under: the one named, except that a repairs epic
+    (standing or batch) at GitHub's SUB_ISSUE_LIMIT sends it to the batch
+    repairs_epic picks with room, and one stderr line names both (loom#3206:
+    a brief under a full standing epic got a Part of line and no sub-issue
+    link)."""
+    if not (standing_epic(issue) or repairs_batch(issue)):
+        return epic
+    if sub_issue_count(gh, repo, issue) < SUB_ISSUE_LIMIT:
+        return epic
+    used = repairs_epic(gh, repo, goal, full=(epic,))
+    print("brief: epic #%d holds %d sub-issues; filing under #%d" % (epic, SUB_ISSUE_LIMIT, used),
+          file=sys.stderr)
+    return used
 
 
 def _open_epic_for(gh: GitHub, repo: str, epic: int, source: Optional[Dict[str, Any]],

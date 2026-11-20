@@ -47,7 +47,7 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from . import brain
@@ -482,6 +482,9 @@ class Facts:
     incidents: Optional[List[Incident]] = None
     # (repo, public name or private placeholder, failing workflow labels)
     scheduled_workflows: Optional[List[Tuple[str, str, Tuple[str, ...]]]] = None
+    # Goal homes (OWNER/NAME#N) the operator exempted from the roll source-pin
+    # pass: roll-pin-off leaves them out (LOOM_ROLL_PIN_EXEMPT).
+    roll_exempt: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1080,8 +1083,10 @@ def gate_hold(f: Facts) -> List[Breach]:
 def roll_pin_off(f: Facts) -> List[Breach]:
     """Goal homes that ship by roll with no roll ship document: the station
     opens no source-pin pull request when their module changes merge."""
-    if not f.roll_goals:
+    goals = [g for g in f.roll_goals or [] if g.key not in f.roll_exempt]
+    if not goals:
         return []
+    f = replace(f, roll_goals=goals)
     why = ("No LOOM_ROLL_SHIP_DOCS entry names them" if f.roll_docs else
            "LOOM_ROLL_SHIP_DOCS is empty, so the station's roll source-pin pass is off")
     return [Breach("roll-pin-off", ROLL_SUBJECT,
