@@ -13704,7 +13704,11 @@ class Station:
             self._add_labels(repo, number, found.add)
             for removal in found.remove:
                 self._unlabel(repo, number, removal)
-            changed += 1
+            # A shadow repo's removals are ledger lines that are never sent,
+            # so the same issues come first on every pass: they must not use
+            # up the budget of the repos after it.
+            if not shadow.active(repo):
+                changed += 1
         return changed
 
     def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:
