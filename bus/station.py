@@ -980,6 +980,14 @@ def verify_note_text(shipped_at: float, now: float) -> str:
             % (time.strftime("%Y-%m-%d", time.gmtime(now)), waited))
 
 
+def _only_live_boxes_open(body: Optional[str]) -> bool:
+    """Whether the ticket has an open box and none of them is one a lane can
+    build: every unticked box is a Live or operator box."""
+    open_kinds = [criteria_gate.kind(text) for checked, text in proof.criteria(body or "")
+                  if not checked]
+    return bool(open_kinds) and criteria_gate.CODE not in open_kinds
+
+
 def live_needles(body: Optional[str]) -> Optional[List[str]]:
     """Needles for a Live criterion, or None when the ticket has no Live line."""
     live = brain.live_criterion(body, limit=None)
@@ -5828,7 +5836,10 @@ class Station:
         already judged for it: one it sent back for unbuilt criteria, or one
         a verify run found wanting (tickets.judged_pulls)."""
         names = _label_names(issue)
-        if set(names) & {REGRESSION, factory.REVERT_LABEL} or live_needles(issue.get("body")) == []:
+        if set(names) & {REGRESSION, factory.REVERT_LABEL}:
+            return False
+        blank = live_needles(issue.get("body")) == []
+        if blank and not _only_live_boxes_open(issue.get("body")):
             return False
         number = int(issue["number"])
         merged = self._merged_linked(repo, issue) or self._merged_cited(repo, issue)
@@ -5850,6 +5861,9 @@ class Station:
         issue["labels"] = [{"name": n} for n in labels]
         self._routine(repo, number, tickets.MERGED_FIRST_NOTE % (
             int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
+        if blank:
+            self._routine(repo, number, tickets.LIVE_RESTATE_NOTE)
+            self._add_label(repo, number, "needs-brain")
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
         return True
