@@ -9956,8 +9956,12 @@ echo fixed > fix.txt
         self.assert_capped(env, 8)
         self.assertEqual(env["LOOM_CHECK_WORKERS"], "8")
 
-    @unittest.skipUnless(shutil.which("sandbox-exec"), "validation runs under macOS sandbox-exec")
     def test_a_lane_checks_steps_run_under_the_job_cap(self):
+        # A pass-through sandbox-exec: the assertions below are about the
+        # job cap the check steps are started under, not the seatbelt, and
+        # a nested sandbox-exec fails inside a lane's own check sandbox,
+        # where it red-checked loom's base on a green main.
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
         # The whole pass: every step of the check (setup, base, final) prints
         # the cap it was started under into the run log.
         self.contract_repo(CONTRACT.replace(
