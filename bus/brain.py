@@ -5889,6 +5889,11 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
             return merge_tier.REVERT, ""
         print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
               file=sys.stderr)
+    named = merge_verdict.named_test_blocker(
+        change_class.class_of(pr), [text for _, text in proof.criteria(str(issue.get("body") or ""))],
+        [str(f.get("filename") or "") for f in entries])
+    if named:
+        raise ValueError(named)
     return merge_tier.classify(repo, entries, str(issue.get("body") or ""),
                                change_class.class_of(pr) == "sensitive")
 
