@@ -1378,6 +1378,9 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
     if held:
         found.append(held.removeprefix("blocked: "))
+    left = _body_unticked_code_boxes(str(pr.get("body") or ""), issue)
+    if left:
+        found.append("criteria not ticked: " + "; ".join(left))
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
@@ -1402,6 +1405,24 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         found.append("held by the hourly merge cap: %s" % refusal)
     return list(merge_verdict.decide(pr, issue, found,
                                      ("operator",) if found else ()).blockers)
+
+
+def _body_unticked_code_boxes(pr_body: str, issue: Dict[str, Any]) -> List[str]:
+    """The ticket code boxes the pull request body itself lists as `- [ ]`
+    (loom#2955): merging it would requeue the ticket as unbuilt, so status
+    must not read it READY. A body with no such checkbox, or a ticket that
+    cannot be read, blocks nothing."""
+    from . import factory
+    ticket_body = str(issue.get("body") or "")
+    if not ticket_body or not pr_body:
+        return []
+    listed = set()
+    for criterion in factory.acceptance_criteria(pr_body):
+        checked, _, text = criterion.partition(" ")
+        if checked != "x":
+            listed.add(factory.criterion_key(text))
+    return [text for text in factory.unbuilt_criteria(ticket_body, [pr_body])
+            if factory.criterion_key(text) in listed]
 
 
 def _pr_goal_trunk(gh: GitHub, repo: str, ticket: Optional[Tuple[str, int]]) -> str:
