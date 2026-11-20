@@ -644,6 +644,9 @@ class FactoryHold(Base):
         removed = {"filename": "k/app.yaml", "status": "removed", "patch": None}
         found = operator_hold.placement_files(GH({"content": deployment}), "o/r", pr, [removed])
         self.assertEqual(found, ["k/app.yaml"])
+        empty = GH({"content": "", "encoding": "none"})
+        self.assertEqual(operator_hold.placement_files(empty, "o/r", pr, [removed]),
+                         ["k/app.yaml"])
         broken = GH(operator_hold.GitHubError("boom"))
         broken.answer = operator_hold.GitHubError("boom")
         self.assertEqual(operator_hold.placement_files(broken, "o/r", pr, [removed]),

@@ -201,6 +201,8 @@ def _deploy_manifest(gh: Any, repo: str, pr: Dict[str, Any], entry: Dict[str, An
         text = base64.b64decode(content).decode("utf-8", "replace")
     except (GitHubError, TypeError, ValueError):
         return True
+    if not text.strip():
+        return True  # an empty read (a file too large for contents) is no proof
     return "apiVersion" in text and "kind" in text
 
 
