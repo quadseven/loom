@@ -1290,3 +1290,98 @@ class CompareMemo(unittest.TestCase):
         self.assertFalse(self.carries())
         self.assertTrue(self.carries())
         self.assertEqual(len(self.asked), 2)
+
+
+class FoldAreas(Base):
+    """LOOM_HEALTH_FOLD_AREAS: one rolling ticket per fold area."""
+
+    def setUp(self):
+        super().setUp()
+        patch = unittest.mock.patch.dict(os.environ, {"LOOM_HEALTH_FOLD_AREAS": "search"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.ana = finding()
+        self.bo = finding(key="search:Bo", title="Bo waits on slow search in room two",
+                          hours=100.0)
+
+    def umbrella(self):
+        return [i for i in self.gh.open if health.FOLD_MARKER % "search" in i["body"]]
+
+    def per_place(self, number, item, title):
+        issue = self.open_ticket(number, sha(item))
+        issue["title"] = title
+        issue["body"] = issue["body"].replace(
+            "## Why\nx", "## Why\nthe endpoint reports a live problem in the search area")
+        return issue
+
+    def closes(self):
+        return [w for w in self.gh.writes if w[0] == "PATCH"
+                and (w[2] or {}).get("state") == "closed"]
+
+    def test_two_places_in_a_fold_area_make_one_ticket_with_both_markers_and_lines(self):
+        self.doc["findings"] = [self.ana, self.bo]
+        self.run_once()
+        self.run_once(NOW + 900)
+        self.assertEqual(len(self.briefs), 1)
+        self.assertEqual(self.briefs[0]["title"], "Health: Recurring findings in the search area")
+        self.assertEqual(self.briefs[0]["priority"], "P0")
+        body = self.umbrella()[0]["body"]
+        self.assertIn(health.MARKER % sha(self.ana), body)
+        self.assertIn(health.MARKER % sha(self.bo), body)
+        self.assertIn("title: Ana waits on slow search", body)
+        self.assertIn("title: Bo waits on slow search in room two", body)
+
+    def test_the_folded_ticket_goes_absent_only_when_every_finding_is_absent(self):
+        self.doc["findings"] = [self.ana, self.bo]
+        self.run_once()
+        self.run_once(NOW + 900)
+        self.doc["findings"] = [self.bo]
+        self.run_once(NOW + 1800)
+        self.assertFalse([w for w in self.gh.writes
+                          if health.ABSENT_MARKER in (w[2] or {}).get("body", "")])
+        self.doc["findings"] = []
+        self.run_once(NOW + 2700)
+        self.assertEqual(len([w for w in self.gh.writes
+                              if health.ABSENT_MARKER in (w[2] or {}).get("body", "")]), 1)
+
+    def test_a_per_place_ticket_is_closed_only_after_the_folded_ticket_holds_its_marker(self):
+        old = self.per_place(50, self.ana, "Health: Ana waits on slow search")
+        self.doc["findings"] = [self.ana]
+        self.run_once()
+        # Filed this pass, so the umbrella is not in the open list yet.
+        self.assertEqual(len(self.briefs), 1)
+        self.assertEqual(self.closes(), [])
+        self.run_once(NOW + 900)
+        closed = self.closes()
+        self.assertEqual([w[1] for w in closed], ["/repos/%s/issues/50" % REPO])
+        self.assertEqual(closed[0][2]["state_reason"], "duplicate")
+        self.assertIn("Folded into #100", self.comments_on(50)[0])
+        self.assertEqual(len(self.briefs), 1)
+        self.assertIn(health.MARKER % sha(self.ana), old["body"])
+
+    def test_an_existing_per_place_finding_moves_to_the_folded_ticket(self):
+        self.per_place(50, self.ana, "Health: Ana waits on slow search")
+        self.doc["findings"] = [self.ana, self.bo]
+        self.run_once()
+        self.run_once(NOW + 900)
+        self.assertEqual(len(self.briefs), 1)
+        self.assertEqual(len(self.closes()), 1)
+
+    def test_a_finding_outside_the_fold_areas_still_files_its_own_ticket(self):
+        self.doc["findings"] = [self.ana, finding(key="pay:1", title="Pay is slow",
+                                                  area="checkout")]
+        self.run_once()
+        self.assertEqual(sorted(b["title"] for b in self.briefs),
+                         ["Health: Pay is slow",
+                          "Health: Recurring findings in the search area"])
+
+    def test_with_the_setting_unset_each_place_keeps_its_own_ticket(self):
+        with unittest.mock.patch.dict(os.environ, {"LOOM_HEALTH_FOLD_AREAS": ""}):
+            self.doc["findings"] = [self.ana, self.bo]
+            self.run_once()
+        self.assertEqual(len(self.briefs), 2)
+        self.assertEqual(self.umbrella(), [])
+
+    def comments_on(self, number):
+        return [w[2]["body"] for w in self.gh.writes
+                if w[0] == "POST" and w[1] == "/repos/%s/issues/%d/comments" % (REPO, number)]

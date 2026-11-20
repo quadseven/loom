@@ -207,6 +207,14 @@ In the station's environment, never in this repo:
 - `LOOM_HEALTH_DIAGNOSE_CMDS`: optional JSON object from goal home
   (`owner/name#goal`) to one read-only shell command (see Diagnosis below).
   A value that is not such an object sets no command, with a log line.
+- `LOOM_HEALTH_FOLD_AREAS`: optional space separated area names, empty by
+  default. Every finding in a named area joins one rolling ticket per goal
+  home and area, titled for the area with no place in it. The ticket keeps one
+  evidence line per finding and takes its priority from the highest impact. It
+  counts as absent only when all of its findings are. An open per-place ticket
+  in a fold area is closed as a duplicate, with one comment linking the folded
+  ticket, once that ticket holds all of its markers. Areas outside the setting
+  are unchanged.
 
 The endpoint's address stays in that private setting. Tickets, comments and
 logs name the goal home, never the URL.
