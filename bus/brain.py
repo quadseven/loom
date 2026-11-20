@@ -1378,6 +1378,9 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
     if held:
         found.append(held.removeprefix("blocked: "))
+    left = _body_unticked_code_boxes(str(pr.get("body") or ""), issue)
+    if left:
+        found.append("criteria not ticked: " + "; ".join(left))
     rest = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     # A null mergeable is GitHub still computing it, which merge waits out.
     if rest.get("mergeable") is not None and not _mergeable(rest):
@@ -1402,6 +1405,24 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         found.append("held by the hourly merge cap: %s" % refusal)
     return list(merge_verdict.decide(pr, issue, found,
                                      ("operator",) if found else ()).blockers)
+
+
+def _body_unticked_code_boxes(pr_body: str, issue: Dict[str, Any]) -> List[str]:
+    """The ticket code boxes the pull request body itself lists as `- [ ]`
+    (loom#2955): merging it would requeue the ticket as unbuilt, so status
+    must not read it READY. A body with no such checkbox, or a ticket that
+    cannot be read, blocks nothing."""
+    from . import factory
+    ticket_body = str(issue.get("body") or "")
+    if not ticket_body or not pr_body:
+        return []
+    listed = set()
+    for criterion in factory.acceptance_criteria(pr_body):
+        checked, _, text = criterion.partition(" ")
+        if checked != "x":
+            listed.add(factory.criterion_key(text))
+    return [text for text in factory.unbuilt_criteria(ticket_body, [pr_body])
+            if factory.criterion_key(text) in listed]
 
 
 def _pr_goal_trunk(gh: GitHub, repo: str, ticket: Optional[Tuple[str, int]]) -> str:
@@ -5328,13 +5349,25 @@ def _check_revision(gh: GitHub, repo: str, revision: str) -> None:
         raise ValueError("proof revision %s is not on %s" % (revision, branch))
 
 
+def _verifiable(issue: Dict[str, Any]) -> bool:
+    """A loom:ticket, or a loom:factory issue by a trusted login whose code is
+    built and only a Live box is left. A factory incident never is one."""
+    names = _labels(issue)
+    if "loom:ticket" in names:
+        return True
+    return ("loom:factory" in names
+            and FACTORY_INCIDENT_MARKER not in str(issue.get("body") or "")
+            and tickets.brief_author_trusted(issue, trusted_authors(), trusted_briefers(),
+                                             as_ticket=True))
+
+
 def _proof_comment(gh: GitHub, repo: str, issue: Dict[str, Any],
                    record: Dict[str, Any], facts: Sequence[str] = ()) -> str:
     """Check a proof record against the ticket and return the comment for it,
     with the facts the station checked when it gives any. Runtime work is
     verified once shipped; documentation once merged."""
     names = _labels(issue)
-    if "loom:ticket" not in names:
+    if not _verifiable(issue):
         raise ValueError("only a loom:ticket is verified")
     body = str(issue.get("body") or "")
     proof.check(record, body)
@@ -6187,7 +6220,30 @@ def _refuse_pending_fix(gh: GitHub, repo: str, number: int,
     note = _fix_cancellation(gh, repo, number, comments, details, env, authors)
     if note is not None:
         return note
+    if _fix_answered_by_head(comments, authors, details):
+        return None
     raise ValueError("a brain fix is pending on the ticket; merge after it runs")
+
+
+def _fix_answered_by_head(comments: List[Any], authors: Sequence[str],
+                          details: Dict[str, Any]) -> bool:
+    """The pending brain fix was answered by the brain's own push: a trusted
+    comment (not another fix ask) after the marker, and a pull request head
+    that is not the head the round named and was committed after the marker.
+    False on any missing time or head, which leaves the fix pending."""
+    fix = _pending_fix_comment(comments, authors)
+    found = _fix_round(str(fix.get("body") or "")) if fix else None
+    if fix is None or found is None:
+        return False
+    asked = str(fix.get("created_at") or "")
+    head = str(details.get("headRefOid") or "")
+    pushed = str(_head_commit(details).get("committedDate") or "")
+    if not (asked and head and pushed > asked) or head.startswith(found[1]):
+        return False
+    allowed = {a.lower() for a in authors}
+    return any(isinstance(c, dict) and str(c.get("created_at") or "") > asked
+               and tickets._login(c.get("user")).lower() in allowed
+               and not _is_brain_fix(c, allowed) for c in comments)
 
 
 def _same_repo(repo: str, pr: Dict[str, Any], details: Dict[str, Any]) -> bool:
