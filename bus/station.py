@@ -8974,8 +8974,15 @@ class Station:
         last = converge.last_fix_body(comments, authors, (repo, pr_number))
         persisted = converge.persistent(
             last, failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
+        timed_out = self._timed_out_round(comments, last, sha) if persisted or failed else None
+        if timed_out:
+            # The round pushed nothing, so the same failures prove nothing
+            # about the model; the next round merges the kept branch.
+            _say("%s#%d: its fix round timed out before it pushed (kept branch %s); not "
+                 "counted as persisted" % (repo, number, timed_out))
+            persisted = []
         review_output = next((tail for name, tail in failed if name == self.s.review_check), "")
-        review_failed = factory.review_findings_remain(
+        review_failed = not timed_out and factory.review_findings_remain(
             last or "", threads, self.s.review_check, review_output)
         if persisted or review_failed:
             reasons = persisted or ["check " + self.s.review_check]
@@ -8991,6 +8998,28 @@ class Station:
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
+
+    def _timed_out_round(self, comments: List[Any], last: Optional[str],
+                         sha: str) -> Optional[str]:
+        """The kept branch of a newest fix round that ended `[transient]` on a
+        timeout and pushed nothing: the head is still the one its fix brief
+        named and a later trusted comment names the branch. None otherwise."""
+        head = brain.FIX_HEAD_RE.search(last or "")
+        if not head or not sha or not sha.startswith(head.group(1)):
+            return None
+        allowed = {a.lower() for a in self.s.authors}
+        expanded = status.expand(comments, self.s.authors)
+        if not isinstance(expanded, list):
+            return None
+        sent = [factory.ts_of(c.get("created_at")) for c in expanded
+                if isinstance(c, dict) and str(c.get("body") or "") == last]
+        if not sent:
+            return None
+        return tickets.timedout_branch(
+            [str(c.get("body") or "") for c in expanded
+             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed
+             and "[transient]" in str(c.get("body") or "")
+             and factory.ts_of(c.get("created_at")) > max(sent)])
 
     @staticmethod
     def _rung_round_count(comments: List[Any], authors: set) -> int:
