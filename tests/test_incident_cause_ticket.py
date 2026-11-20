@@ -59,3 +59,36 @@ class CauseTicket(tbs.Base):
             self.incident(kind=kind, count=count, body_extra=extra)
             self.read()
             self.assertEqual(self.filed.call_count, 0, (kind, count, extra))
+
+
+class CauseWriteFails(tbs.Base):
+    open_incident = tbs.IncidentProbeTest.open_incident
+    hold = tbs.IncidentProbeTest.hold
+    station = tbs.IncidentProbeTest.station
+
+    def test_a_failed_cause_line_write_retries_the_write_not_the_ticket(self):
+        author = {"login": tbs.AUTHORS[0]}
+        comments = [{"id": 1, "user": author, "body": REPEAT % 3,
+                     "created_at": "2030-01-01T00:00:00Z"}]
+        self.open_incident(comments=comments)
+        self.fake.issues[99]["user"] = author
+        self.hold(12)
+        filed = mock.Mock(return_value="https://github.com/%s/issues/501" % tbs.REPO)
+        runner = self.station()
+        runner._goals = [(tbs.REPO, {"number": 7})]
+        real = runner.gh.rest
+        failing = [True]
+
+        def rest(method, path, *args, **kw):
+            if method == "PATCH" and path.endswith("/issues/99") and failing[0]:
+                failing[0] = False
+                raise station.GitHubError(500)
+            return real(method, path, *args, **kw)
+
+        with mock.patch.object(station, "FACTORY_REPO", tbs.REPO), \
+                mock.patch.object(station.brain, "brief_intake", filed), \
+                mock.patch.object(runner.gh, "rest", rest):
+            for _ in range(2):
+                runner._read_probed_incident("%s#99" % tbs.REPO, {}, ["%s#12" % tbs.REPO])
+        self.assertEqual(filed.call_count, 1)
+        self.assertIn("Cause: %s#501\n" % tbs.REPO, self.fake.issues[99]["body"])

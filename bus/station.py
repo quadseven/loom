@@ -2433,6 +2433,7 @@ class Station:
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
+        self._causes_filed: Dict[str, str] = {}
         self._pass_started = time.monotonic()
         self.state = os.path.join(settings.home, "state", "station")
         self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
@@ -8453,17 +8454,21 @@ class Station:
             return
         try:
             goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
-            line = "none filed, %s has no goal home" % repo
-            if goal is not None:
+            line = self._causes_filed.get(ref) or "none filed, %s has no goal home" % repo
+            if goal is not None and ref not in self._causes_filed:
                 title, text = incident_probe.cause_ticket(ref, body)
                 try:
                     url = brain.brief_intake(self.gh, repo, goal, title, text,
                                              difficulty="medium")
                     line = "%s#%s" % (repo, str(url).rstrip("/").rpartition("/")[2])
+                    # Kept so a failed write of the line below retries only
+                    # the write, not a second ticket.
+                    self._causes_filed[ref] = line
                 except ValueError as err:
                     line = "none filed, no intake epic could take it (%s)" % err
             self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw),
                          {"body": incident_probe.with_cause(body, line)})
+            self._causes_filed.pop(ref, None)
         except RateLimited:
             raise
         except GitHubError as err:
