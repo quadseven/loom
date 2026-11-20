@@ -267,6 +267,9 @@ PIN_FALLBACK_WAIT = 30 * 60
 # cycle across every free lane.
 PIN_FALLBACK_MAX = 2
 PIN_FALLBACK_MARKER = "<!-- loom:pin-fallback %s -->"
+# A ticket the model ladder escalated carries one of these, in a comment or in
+# its status body: its model is the ladder's rung, not a default (loom#3191).
+LADDER_RE = re.compile(r"<!-- loom:(?:rung \d+|escalate v1) -->")
 PIN_FALLBACK_RE = re.compile(r"<!-- loom:pin-fallback \S+ -->")
 # Labels whose ticket keeps its Model: line however long it waits: its change
 # needs the reviewer-grade model it was pinned to (bus/merge_tier.py).
@@ -5752,16 +5755,21 @@ class Factory:
         lane of its tier, with that lane's own model: its Model: line is
         removed, so the runner's footer names the model that ran. None when
         it keeps waiting for its model: inside the wait, a hard pin
-        (hard_pin), PIN_FALLBACK_MAX fallbacks already, or no free lane it has
-        not run on. Else "" when it got the lane, or why giving it failed."""
+        (hard_pin), a ladder marker (the rung's model is not a default),
+        PIN_FALLBACK_MAX fallbacks already, or no free lane it has not run
+        on. Else "" when it got the lane, or why giving it failed."""
         key = "%s#%s" % (repo, issue["number"])
         waited = self.now - self.no_lane_since.get(key, self.now)
         if self.pin_fallback is None or waited < self.pin_fallback or hard_pin(issue):
+            return None
+        if LADDER_RE.search(str(issue.get("body") or "")):
             return None
         if self._fallback_lane(repo, issue)[0] is None:
             return None  # nothing to move to: no comment read, every pass
         number = int(issue["number"])
         comments = self._comments(repo, number)
+        if any(LADDER_RE.search(str(c.get("body") or "")) for c in comments):
+            return None
         if sum(bool(PIN_FALLBACK_RE.search(str(c.get("body") or "")))
                for c in comments) >= PIN_FALLBACK_MAX:
             return None
