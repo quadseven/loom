@@ -519,10 +519,12 @@ class SensitiveResumeTests(unittest.TestCase):
         # (loom#2078), then the pull requests, then the lane comments.
         gh = GitHub("t", transport=Fake(
             reply(200, [lanes_issue]), reply(200, []),
-            reply(200, [{"body": "<!-- loom:lanes v1 -->\n| codex | yes |", "created_at": "2030-01-01T00:00:00Z",
+            reply(200, [{"body": "<!-- loom:lanes v1 -->\n"
+                         "| codex | off | 2030-01-01 00:00:00Z | Heartbeat is stale |",
+                         "created_at": "2030-01-01T00:00:00Z",
                          "user": {"login": "example-brain"}}])))
         report = brain.status(gh, [REPO], REPO, env=TRUSTED)
-        self.assertIn("| codex | yes |", report)
+        self.assertIn("| codex | off | 2030-01-01 00:00:00Z | Heartbeat is stale |", report)
         self.assertEqual(gh.requests, 3)
 
     def test_status_lists_a_sensitive_pull_request(self):
@@ -4827,6 +4829,7 @@ class TriageTests(unittest.TestCase):
     def run_triage(self, routes, limit=25):
         # The goal's intake epic is #3 (intake_epic has its own tests).
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
+                unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
             return brain.triage(GitHub("t", transport=routes), REPO, 1, limit)
 
@@ -6844,6 +6847,7 @@ class MoveFromGoalTests(unittest.TestCase):
         return [c for c in calls if c[0] == "POST" and c[1].endswith("/sub_issues")]
 
     def test_triage_moves_a_direct_child_of_the_goal_under_the_intake_epic(self):
+        self.enterContext(unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         routes = Routes([item(5, parent_issue_url=self.GOAL_URL)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
                 unittest.mock.patch.object(brain, "_epic_tickets", return_value=[]):
@@ -6852,6 +6856,7 @@ class MoveFromGoalTests(unittest.TestCase):
                          [{"sub_issue_id": 1005, "replace_parent": True}])
 
     def test_triage_files_a_ready_area_issue_under_its_area_epic(self):
+        self.enterContext(unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         routes = Routes([item(5, labels=["area:stability"]), item(6, labels=["area:stability"])])
         areas = {"stability": {"name": "area:stability", "description": "Service stability"}}
         with unittest.mock.patch.object(brain, "_area_labels", return_value=areas) as read, \
@@ -6864,6 +6869,7 @@ class MoveFromGoalTests(unittest.TestCase):
                          ["/repos/%s/issues/70/sub_issues" % REPO] * 2)
 
     def test_triage_does_not_take_an_issue_out_of_another_parent(self):
+        self.enterContext(unittest.mock.patch.object(brain.tickets, "brief_author_trusted", return_value=True))
         other = "https://api.github.com/repos/%s/issues/77" % REPO
         routes = Routes([item(5, parent_issue_url=other), item(6)])
         with unittest.mock.patch.object(brain, "intake_epic", return_value=INTAKE), \
