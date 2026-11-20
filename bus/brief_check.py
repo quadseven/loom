@@ -123,9 +123,11 @@ DONE_RE = re.compile(
 NEGATED_RE = re.compile(
     r"\b(?:not|never|isn't|wasn't|hasn't|is not|was not|has not)\s+(?:\w+\s+){0,2}"
     r"(?:done|shipped|fixed|superseded|obsolete|in place)\b", re.I)
-# A criterion asking for a file to be added.
+# A criterion asking for a file to be added. A path after "in", "to" or
+# "inside" is a file that gets a test or function, not a file that is new.
 CREATE_RE = re.compile(
-    r"\b(?:adds?|added|creates?|created|new|introduces?|introduced|ships?)\b[^`\n]{0,60}"
+    r"\b(?:adds?|added|creates?|created|new|introduces?|introduced|ships?)\b"
+    r"(?:(?!\b(?:in|to|into|inside|within)\b)[^`\n]){0,60}"
     r"`([A-Za-z0-9_.][A-Za-z0-9_./-]*\.[A-Za-z0-9]+)`", re.I)
 REF_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)#(\d+)\b")
 PULL_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)"
