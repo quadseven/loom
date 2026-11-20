@@ -21,8 +21,54 @@
 # A codex lane run writes its final message to AGENT_LAST_MESSAGE when the
 # runner names one: the reason a run that committed nothing quotes
 # (loom#1799), instead of whatever the agent printed last.
+#
+# A lane-only Codex home for a codex lane run, under the run's scratch home
+# (AGENT_HOME): the operator's model and provider config (config.toml) and
+# sign-in (auth.json, or the cluster sign-in file LOOM_CODEX_AUTH_FILE
+# names) are copied in, and nothing else. The user-level AGENTS.md in the
+# operator's Codex home is never copied, and one an earlier run left in the
+# lane home is removed before the run: that file told a lane run to read a
+# personal startup file and do a chat duty at task start, so the run
+# stopped with no commit and its ticket was parked as work (loom#3227).
+# Session rollouts stay where the station reads them: the lane home's
+# sessions folder links to the operator's, so usage readings that read
+# session logs keep seeing lane runs. Prints the lane home; a run that
+# cannot prepare one does not run at all, rather than run under the
+# operator's personal instructions.
+codex_lane_home() {
+  local src="${CODEX_HOME:-$HOME/.codex}" dest="${AGENT_HOME:-}/.codex"
+  [ -n "${AGENT_HOME:-}" ] || { echo "no AGENT_HOME for a codex lane run" >&2; return 2; }
+  mkdir -p "$dest" || return 2
+  rm -f "$dest/AGENTS.md" || return 2
+  if [ "$src" != "$dest" ]; then
+    if [ -f "$src/config.toml" ]; then
+      cp "$src/config.toml" "$dest/config.toml" || return 2
+    else
+      rm -f "$dest/config.toml" || return 2
+    fi
+    if [ -n "${LOOM_CODEX_AUTH_FILE:-}" ] && [ -f "$LOOM_CODEX_AUTH_FILE" ]; then
+      cp "$LOOM_CODEX_AUTH_FILE" "$dest/auth.json" || return 2
+      chmod 600 "$dest/auth.json" || return 2
+    elif [ -f "$src/auth.json" ]; then
+      cp "$src/auth.json" "$dest/auth.json" || return 2
+      chmod 600 "$dest/auth.json" || return 2
+    else
+      rm -f "$dest/auth.json" || return 2
+    fi
+    if [ -d "$src/sessions" ]; then
+      if [ -L "$dest/sessions" ]; then
+        rm -f "$dest/sessions" || return 2
+        ln -s "$src/sessions" "$dest/sessions" || return 2
+      elif [ ! -e "$dest/sessions" ]; then
+        ln -s "$src/sessions" "$dest/sessions" || return 2
+      fi
+    fi
+  fi
+  printf '%s\n' "$dest"
+}
+
 agent_cli() {
-  local uv_env=() uv_dir=() last=()
+  local uv_env=() uv_dir=() last=() codex_home=""
   [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
   if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
     uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
@@ -39,7 +85,8 @@ agent_cli() {
       fi ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
-    codex:lane) timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
+    codex:lane) codex_home="$(codex_lane_home)" || return 2
+      CODEX_HOME="$codex_home" timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
       ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" ${last[@]+"${last[@]}"} "$3" < /dev/null ;;
     codex:brain) timeout "$AGENT_TIMEOUT" codex exec --sandbox danger-full-access \
       --skip-git-repo-check --model "$MODEL" "$3" < /dev/null ;;
