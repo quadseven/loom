@@ -228,6 +228,46 @@ def pull_findings(gh: object, repo: str, number: int, head: str,
                          {path: patches[path] for path in code}, added_tests)
 
 
+def added_test_modules(gh: object, repo: str, number: int) -> List[str]:
+    """Test modules a pull request adds, as repository paths."""
+    return sorted(_filename(item) for item in _pull_files(gh, repo, number)
+                  if item.get("status") == "added" and is_test_path(_filename(item))
+                  and _filename(item).endswith(".py"))
+
+
+def clone_tree(repo: str, scratch: str) -> str:
+    """A full clone of a public repository, for the base run of a pull request
+    that no local lane built."""
+    tree = os.path.join(scratch, "tree")
+    subprocess.run(["git", "clone", "--quiet", "https://github.com/%s.git" % repo, tree],
+                   check=True, capture_output=True, timeout=600)
+    return tree
+
+
+def base_run_findings(repo: str, base: str, head: str, modules: Sequence[str],
+                      clone: Optional[object] = None, timeout: int = 120) -> List[str]:
+    """One finding per added test module whose tests all pass on the base.
+
+    A remote lane runs no base pass of its own, so the factory runs the added
+    modules on the base the way final_base_tests does on a local lane.
+    """
+    if not modules:
+        return []
+    with tempfile.TemporaryDirectory(prefix="loom-remote-base-") as scratch:
+        tree = (clone or clone_tree)(repo, scratch)
+        result = git_base_test_results(tree, base, head, timeout)
+    findings = []
+    for path in modules:
+        module = _module_name(path)
+        mine = [name for name in (result.passed_on_base + result.failed_on_base
+                                  + result.timed_out + result.not_run)
+                if module and name.startswith(module + ".")]
+        passed = [name for name in result.passed_on_base if name in mine]
+        if passed and len(passed) == len(mine):
+            findings.append("passes on base: " + path)
+    return findings
+
+
 def _read_sources(gh: object, repo: str, paths: Sequence[str], head: str) -> Dict[str, str]:
     found = {}
     for path in paths:

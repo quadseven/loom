@@ -1929,6 +1929,9 @@ def lane_state(lane: str) -> str:
 
 
 class Factory:
+    # How the base run of a remote-lane pull request gets a tree; None clones.
+    base_clone: Optional[Callable[[str, str], str]] = None
+
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -2263,8 +2266,17 @@ class Factory:
                           full: Dict[str, Any], issue: Dict[str, Any]) -> List[str]:
         """Check changed Python sources for vacuous lookup and fixture edits."""
         sha = str((full.get("head") or {}).get("sha") or "")
-        return vacuous.pull_findings(self.gh, repo, number, sha,
-                                     str(issue.get("body") or ""))
+        found = vacuous.pull_findings(self.gh, repo, number, sha,
+                                      str(issue.get("body") or ""))
+        if _lane(issue) not in REMOTE_LANES:
+            # A local lane's run already reported its own base pass.
+            return found
+        base = str((full.get("base") or {}).get("sha") or "")
+        if not base:
+            return found
+        modules = vacuous.added_test_modules(self.gh, repo, number)
+        return found + vacuous.base_run_findings(repo, base, sha, modules,
+                                                 self.base_clone)
 
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
