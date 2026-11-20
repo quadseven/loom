@@ -3566,6 +3566,24 @@ final_base_tests() {
   return "$rc"
 }
 
+# One more agent turn in the same run, after the base-test gate refused: the
+# brief names each test that passed on base and asks for a change that makes it
+# fail there. Whatever the turn changed is committed on the lane branch.
+base_retry_turn() {
+  local named="$1" brief="$WORKDIR/$TICKET.base-retry-brief"
+  { cat "$RUN_BRIEF"
+    printf '\n\n## Tests that pass on the base commit\n\n'
+    printf 'The base-test gate refused this branch: each test below passes on the base commit, so it proves nothing about your change.\n'
+    printf 'Change each one so it fails on the base commit and passes with your change. You have one turn.\n\n'
+    printf '%s\n' "$named" | grep -o 'passes on base: [^;]*' | sed 's/^passes on base: /- /'
+  } > "$brief" || return 1
+  ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
+  fi
+}
+
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
@@ -3584,6 +3602,17 @@ final_validation() {
   contract_run "$C_CHECK"; rc=$?
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
+    # The agent answers a refusal once: one more turn, then the whole check
+    # again. A second refusal ends the run as before.
+    if [ "$gate_rc" -ne 0 ] && [ -z "${BASE_RETRY_USED:-}" ] &&
+       [[ "$VALIDATION_REASON" == *"passes on base: "* ]]; then
+      BASE_RETRY_USED=1
+      echo "base-test gate refused; giving the agent one more turn" >> "$LOG"
+      if base_retry_turn "$VALIDATION_REASON"; then
+        final_validation
+        return $?
+      fi
+    fi
     if [ "$gate_rc" -ne 0 ]; then
       [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 75 ] || [ "$gate_rc" -eq 126 ] ||
         [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
@@ -4856,6 +4885,7 @@ for BRIEF in "$INBOX"/*.md; do
     esac
   fi
 
+  BASE_RETRY_USED=""
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
   OPERATOR_REVIEW="$(field Operator-Review "$BRIEF" || true)"
   REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
