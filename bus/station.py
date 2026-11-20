@@ -17492,7 +17492,7 @@ class Station:
         goal = self._get_goal_home()
         if goal is None:
             return
-        repo, number = goal
+        repo, goal_number = goal
 
         ask_state = self._read_ask_state()
         ask_state_path = os.path.join(self.state, "disk-guard-ask.json")
@@ -17502,9 +17502,9 @@ class Station:
             folders = self._read_loom_home_folders()
             ask_body = self._build_ask_body(guard["free"] if free is None else free,
                                             guard["floor"], folders)
-            self._handle_disk_low(repo, number, guard, ask_body, ask_state, ask_state_path)
+            self._handle_disk_low(repo, goal_number, guard, ask_body, ask_state, ask_state_path)
         else:
-            self._handle_disk_recovered(repo, number, ask_state, ask_state_path)
+            self._handle_disk_recovered(repo, goal_number, ask_state, ask_state_path)
 
     def _read_disk_guard_state(self) -> Optional[Dict[str, Any]]:
         """Read and validate the disk guard state file. Returns None if invalid."""
@@ -17563,7 +17563,7 @@ class Station:
     def _handle_disk_low(
         self,
         repo: str,
-        number: int,
+        goal_number: int,
         guard: Dict[str, Any],
         ask_body: str,
         ask_state: Dict[str, Any],
@@ -17574,55 +17574,59 @@ class Station:
             # Under 60 minutes: do nothing
             return
 
-        if ask_state.get("number") == number and ask_state.get("repo") == repo:
-            # Ask exists - edit it in place
-            self._edit_ask_comment(repo, number, ask_body)
-            _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
-            _say("disk guard: updated needs:human ask on %s#%d" % (repo, number))
+        ask_number = ask_state.get("number")
+        ask_repo = ask_state.get("repo")
+
+        if ask_number is not None and ask_repo == repo:
+            # Ask exists - edit the issue body in place
+            self._edit_ask_issue(repo, ask_number, ask_body)
+            _write_json(ask_state_path, {"number": ask_number, "repo": repo, "at": self.now})
+            _say("disk guard: updated needs:human ask on %s#%d" % (repo, ask_number))
         else:
-            # Create new ask
+            # Create new ask issue
             try:
-                brain_human(self.gh, repo, number, ask_body)
-                _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
-                _say("disk guard: opened needs:human ask on %s#%d" % (repo, number))
-            except ValueError as err:
-                if "already needs:human" in str(err):
-                    # Ask already exists, record it and edit
-                    self._edit_ask_comment(repo, number, ask_body)
-                    _write_json(ask_state_path, {"number": number, "repo": repo, "at": self.now})
-                else:
-                    _say("disk guard: failed to open ask: %s" % err)
+                title = "Disk guard: free space below floor for 60+ minutes"
+                data = {"title": title, "body": ask_body}
+                resp = self.gh.rest("POST", "/repos/%s/issues" % repo, data)
+                ask_number = resp.data.get("number")
+                if ask_number is None:
+                    raise GitHubError("no issue number returned")
+                # Add needs:human label
+                self.gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, ask_number),
+                             {"labels": ["needs:human"]})
+                _write_json(ask_state_path, {"number": ask_number, "repo": repo, "at": self.now})
+                _say("disk guard: opened needs:human ask on %s#%d" % (repo, ask_number))
+            except (GitHubError, OSError) as err:
+                _say("disk guard: failed to open ask: %s" % err)
 
     def _handle_disk_recovered(
         self,
         repo: str,
-        number: int,
+        goal_number: int,
         ask_state: Dict[str, Any],
         ask_state_path: str,
     ) -> None:
         """Handle the case when disk has recovered."""
-        if ask_state.get("number") == number and ask_state.get("repo") == repo:
+        ask_number = ask_state.get("number")
+        ask_repo = ask_state.get("repo")
+
+        if ask_number is not None and ask_repo == repo:
             try:
-                # Remove the needs:human label
-                self.gh.rest("DELETE", "/repos/%s/issues/%d/labels/needs:human" % (repo, number))
+                # Close the ask issue
+                self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, ask_number),
+                             {"state": "closed"})
                 _write_json(ask_state_path, {})
-                _say("disk guard: closed needs:human ask on %s#%d" % (repo, number))
+                _say("disk guard: closed needs:human ask on %s#%d" % (repo, ask_number))
             except (GitHubError, OSError) as err:
                 _say("disk guard: failed to close ask: %s" % err)
 
-    def _edit_ask_comment(self, repo: str, number: int, ask_body: str) -> None:
-        """Edit the existing needs:human comment with updated body."""
-        comments = self.gh.paginate("/repos/%s/issues/%d/comments" % (repo, number))
-        for comment in comments:
-            if isinstance(comment, dict):
-                body = str(comment.get("body") or "")
-                if body.startswith(HUMAN_MARKER):
-                    comment_id = comment.get("id")
-                    if comment_id is not None:
-                        new_body = "%s\n%s\nKind: hardware" % (HUMAN_MARKER, ask_body)
-                        self.gh.rest("PATCH", "/repos/%s/issues/comments/%d" % (repo, comment_id),
-                                     {"body": new_body})
-                    break
+    def _edit_ask_issue(self, repo: str, number: int, ask_body: str) -> None:
+        """Edit the existing ask issue body with updated body."""
+        try:
+            self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number),
+                         {"body": ask_body})
+        except (GitHubError, OSError) as err:
+            _say("disk guard: failed to edit ask issue: %s" % err)
 
     def tend_watchdog(self) -> None:
         """Below LOOM_DISK_WATCHDOG_GB free, clear Loom's own data before

@@ -23,15 +23,20 @@ NOW = 1_800_000_000.0
 HOME = "/srv/loom"
 GOAL_REPO = "quadseven/loom"
 GOAL_NUMBER = 123
+DISK_ASK_NUMBER = 456
 
 
 class FakeGH:
     def __init__(self):
-        self.posted = []  # (repo, number, body)
+        self.posted_issues = []  # (repo, title, body) -> returns issue number
+        self.posted_comments = []  # (repo, number, body)
         self.labels_added = []  # (repo, number, labels)
         self.labels_removed = []  # (repo, number, labels)
         self.comments = {}  # (repo, number) -> [comment]
         self.patched_comments = []  # (repo, comment_id, body)
+        self.closed_issues = []  # (repo, number)
+        self.issue_counter = DISK_ASK_NUMBER
+        self.created_issues = {}  # (repo, number) -> {"title": ..., "body": ..., "state": "open"}
 
     def rest(self, method, path, data=None):
         if method == "GET" and path.startswith("/repos/") and "/issues/" in path and not path.endswith("/labels") and not "/comments" in path:
@@ -41,6 +46,9 @@ class FakeGH:
             number = int(parts[5])
             if number == GOAL_NUMBER:
                 return type("Resp", (), {"data": {"number": GOAL_NUMBER, "state": "open", "labels": [{"name": "loom:goal"}]}})()
+            if (repo, number) in self.created_issues:
+                issue = self.created_issues[(repo, number)]
+                return type("Resp", (), {"data": {"number": number, "state": issue["state"], "labels": [{"name": l} for l in issue.get("labels", [])]}})()
             return type("Resp", (), {"data": {}})()
         if method == "POST" and path.endswith("/labels"):
             parts = path.split("/")
@@ -55,119 +63,65 @@ class FakeGH:
             body = data.get("body", "")
             comment = {"id": comment_id, "body": body}
             self.comments.setdefault((repo, number), []).append(comment)
-            self.posted.append((repo, number, body))
+            self.posted_comments.append((repo, number, body))
         if method == "PATCH" and "/issues/comments/" in path:
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
             comment_id = int(parts[6])
             body = data.get("body", "")
-            # Find and update the comment
             for comments_list in self.comments.values():
                 for c in comments_list:
                     if c.get("id") == comment_id:
                         c["body"] = body
                         break
             self.patched_comments.append((repo, comment_id, body))
+        if method == "PATCH" and "/issues/" in path and not "/comments" in path and not "/labels" in path:
+            # PATCH /repos/{owner}/{repo}/issues/{number} - update issue body/state
+            parts = path.split("/")
+            repo = parts[2] + "/" + parts[3]
+            number = int(parts[5])
+            if (repo, number) in self.created_issues:
+                if "body" in data:
+                    self.created_issues[(repo, number)]["body"] = data["body"]
+                if "state" in data:
+                    self.created_issues[(repo, number)]["state"] = data["state"]
+                if data.get("state") == "closed":
+                    self.closed_issues.append((repo, number))
         if method == "DELETE" and path.endswith("/labels/needs:human"):
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
             number = int(parts[5])
             self.labels_removed.append((repo, number, ["needs:human"]))
+        if method == "POST" and path == "/repos/%s/issues" % GOAL_REPO:
+            # Create new issue
+            self.issue_counter += 1
+            title = data.get("title", "")
+            body = data.get("body", "")
+            issue_num = self.issue_counter
+            self.created_issues[(GOAL_REPO, issue_num)] = {"title": title, "body": body, "state": "open", "labels": []}
+            self.posted_issues.append((GOAL_REPO, title, body, issue_num))
+            return type("Resp", (), {"data": {"number": issue_num}})()
         return type("Resp", (), {"data": {}})()
 
     def paginate(self, path):
         if "/comments" in path:
             parts = path.split("/")
             repo = parts[2] + "/" + parts[3]
-            # Path format: /repos/{owner}/{repo}/issues/{number}/comments
-            # or /repos/{owner}/{repo}/issues/comments/{comment_id}
             if "issues/comments" in path:
-                # PATCH path - not used for paginate
                 return []
             number = int(parts[5])
             return self.comments.get((repo, number), [])
         if "/issues?" in path:
-            return [{"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}],
-                      "pull_request": None, "html_url": "https://github.com/" + GOAL_REPO + "/issues/" + str(GOAL_NUMBER)}]
+            issues = []
+            for (repo, num), data in self.created_issues.items():
+                issues.append({"number": num, "labels": [{"name": l} for l in data.get("labels", [])], "pull_request": None})
+            # Also include the goal home
+            issues.append({"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}], "pull_request": None, "html_url": "https://github.com/" + GOAL_REPO + "/issues/" + str(GOAL_NUMBER)})
+            return issues
         return []
 
     def graphql(self, query, variables):
         return {"repository": {"issue": {"editor": {"login": "loom-app[bot]", "__typename": "Bot"}, "lastEditedAt": None}}}
-
-
-class FakeStation:
-    def __init__(self, home=HOME, now=NOW):
-        self.s = type("Settings", (), {
-            "home": home,
-            "repos": [GOAL_REPO],
-            "authors": ["loom-app[bot]"],
-            "disk_free_min_gb": FLOOR_GB,
-            "thin_snapshots": False,
-        })()
-        self.gh = FakeGH()
-        self.state = os.path.join(home, "state", "station")
-        self.now = now
-        self._free_read = False
-        self._free = None
-        os.makedirs(self.state, exist_ok=True)
-        os.makedirs(os.path.join(home, "logs"), exist_ok=True)
-        os.makedirs(os.path.join(home, "worktrees"), exist_ok=True)
-        os.makedirs(os.path.join(home, "run"), exist_ok=True)
-
-    def _disk_free(self):
-        if not self._free_read:
-            self._free_read = True
-            try:
-                self._free = int(2 * self.s.disk_free_min_gb * GB)  # Above floor initially
-            except OSError:
-                self._free = None
-        return self._free
-
-    def disk_low(self):
-        from bus.station import DISK_GUARD_FILE, _read_json, _write_json, _gb
-        path = os.path.join(self.state, DISK_GUARD_FILE)
-        saved = _read_json(path, {}, strict=False)
-        was = bool(saved.get("low")) if isinstance(saved, dict) else False
-        free = self._disk_free()
-        floor = self.s.disk_free_min_gb * GB
-        low = was if free is None else free < floor
-        if free is not None and low != was:
-            if low:
-                print("claims paused: only %s free on the loom home's disk (under %s)" % (_gb(free), _gb(floor)))
-            else:
-                print("claims resumed: %s free on the loom home's disk (at least %s)" % (_gb(free), _gb(floor)))
-            _write_json(path, {"low": low, "free": free, "floor": floor, "at": self.now})
-        return low
-
-    def tend_disk(self):
-        from bus.station import DISK_EVERY, _read_json, _write_json, _gb, _tree_stat
-        free = self._disk_free()
-        path = os.path.join(self.state, "disk.json")
-        saved = _read_json(path, {}, strict=False)
-        last = saved.get("at") if isinstance(saved, dict) else None
-        if self._num(last) and 0 <= self.now - last < DISK_EVERY:
-            return
-        sizes = {}
-        for name in os.listdir(self.s.home):
-            try:
-                full = os.path.join(self.s.home, name)
-                is_dir = os.path.isdir(full)
-                key = name if is_dir else "files"
-                sizes[key] = sizes.get(key, 0) + _tree_stat(full)[1]
-            except OSError:
-                continue
-        total = sum(sizes.values())
-        parts = ", ".join("%s %s" % (k, _gb(v)) for k, v in
-                          sorted(sizes.items(), key=lambda kv: (-kv[1], kv[0])))
-        print("loom home holds %s (%s); %s free on its disk"
-              % (_gb(total), parts or "empty", "unknown" if free is None else _gb(free)))
-        _write_json(path, {"at": self.now, "bytes": total, "free": free, "folders": sizes})
-
-    def _num(self, v):
-        return isinstance(v, (int, float)) and not isinstance(v, bool)
-
-    def _goal_homes(self):
-        return [(GOAL_REPO, {"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}]})]
 
 
 class DiskGuardAskTest(unittest.TestCase):
@@ -197,8 +151,7 @@ class DiskGuardAskTest(unittest.TestCase):
         path = os.path.join(self.home, "state", "station", DISK_GUARD_FILE)
         _write_json(path, {"low": low, "free": free, "floor": FLOOR, "at": at})
 
-    def test_disk_low_under_60_minutes_files_nothing(self):
-        """When disk_low has held for less than 60 minutes, no ask is filed."""
+    def _make_station(self, free_space=None):
         from bus.station import Station
         st = Station.__new__(Station)
         st.s = type("Settings", (), {
@@ -212,11 +165,16 @@ class DiskGuardAskTest(unittest.TestCase):
         st.state = os.path.join(self.home, "state", "station")
         st.now = NOW
         st._free_read = False
-        st._free = int(0.5 * FLOOR)  # Below floor
+        st._free = free_space if free_space is not None else int(0.5 * FLOOR)
         st._disk_free = lambda: st._free
         st._goal_homes = lambda: [(GOAL_REPO, {"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}]})]
         st._num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-        st._goals = {}  # Required by _goal_homes
+        st._goals = {}
+        return st
+
+    def test_disk_low_under_60_minutes_files_nothing(self):
+        """When disk_low has held for less than 60 minutes, no ask is filed."""
+        st = self._make_station()
 
         # Disk has been low for 30 minutes (1800 seconds)
         self._write_disk_guard(True, int(0.5 * FLOOR), NOW - 1800)
@@ -225,28 +183,11 @@ class DiskGuardAskTest(unittest.TestCase):
         st._check_disk_guard_ask()
 
         # No ask should be filed
-        self.assertEqual(len(st.gh.posted), 0, "No ask should be filed under 60 minutes")
+        self.assertEqual(len(st.gh.posted_issues), 0, "No ask should be filed under 60 minutes")
 
     def test_disk_low_over_60_minutes_creates_ask(self):
-        """When disk_low has held for 60+ minutes, one needs:human ask is created."""
-        from bus.station import Station
-        st = Station.__new__(Station)
-        st.s = type("Settings", (), {
-            "home": self.home,
-            "repos": [GOAL_REPO],
-            "authors": ["loom-app[bot]"],
-            "disk_free_min_gb": FLOOR_GB,
-            "thin_snapshots": False,
-        })()
-        st.gh = FakeGH()
-        st.state = os.path.join(self.home, "state", "station")
-        st.now = NOW
-        st._free_read = False
-        st._free = int(0.5 * FLOOR)  # Below floor
-        st._disk_free = lambda: st._free
-        st._goal_homes = lambda: [(GOAL_REPO, {"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}]})]
-        st._num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-        st._goals = {}  # Required by _goal_homes
+        """When disk_low has held for 60+ minutes, one needs:human ask issue is created."""
+        st = self._make_station()
 
         # Disk has been low for 61 minutes (3660 seconds)
         self._write_disk_guard(True, int(0.5 * FLOOR), NOW - 3660)
@@ -254,102 +195,122 @@ class DiskGuardAskTest(unittest.TestCase):
         # Call the disk guard ask check
         st._check_disk_guard_ask()
 
-        # One ask should be filed
-        self.assertEqual(len(st.gh.posted), 1, "One ask should be filed after 60+ minutes")
-        repo, number, body = st.gh.posted[0]
+        # One ask issue should be created
+        self.assertEqual(len(st.gh.posted_issues), 1, "One ask issue should be created after 60+ minutes")
+        repo, title, body, issue_num = st.gh.posted_issues[0]
         self.assertEqual(repo, GOAL_REPO)
-        self.assertEqual(number, GOAL_NUMBER)
+        self.assertIn("Disk guard", title)
         self.assertIn("Kind: hardware", body)
-        self.assertIn("Free space: 7.5 GB\n", body)
-        self.assertIn("Floor: 15.0 GB\n", body)
+        self.assertIn("Free space: 7.5 GB", body)
+        self.assertIn("Floor: 15.0 GB", body)
         self.assertIn("Free disk space on the lane machine.", body)
+        # The ask state should track the new issue number
+        self.assertEqual(issue_num, DISK_ASK_NUMBER + 1)
 
     def test_ask_edited_in_place_while_paused(self):
-        """The ask comment is edited in place (not a new comment) while disk stays low."""
-        from bus.station import Station
-        st = Station.__new__(Station)
-        st.s = type("Settings", (), {
-            "home": self.home,
-            "repos": [GOAL_REPO],
-            "authors": ["loom-app[bot]"],
-            "disk_free_min_gb": FLOOR_GB,
-            "thin_snapshots": False,
-        })()
-        st.gh = FakeGH()
-        st.state = os.path.join(self.home, "state", "station")
-        st.now = NOW
-        st._free_read = False
-        st._free = int(0.5 * FLOOR)
-        st._disk_free = lambda: st._free
-        st._goal_homes = lambda: [(GOAL_REPO, {"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}]})]
-        st._num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-        st._goals = {}  # Required by _goal_homes
+        """The ask issue body is edited in place (not a new issue) while disk stays low."""
+        st = self._make_station()
 
         # Disk has been low for 61 minutes
         self._write_disk_guard(True, int(0.5 * FLOOR), NOW - 3660)
 
-        # First check creates the ask
+        # First check creates the ask issue
         st._check_disk_guard_ask()
-        first_posted = len(st.gh.posted)
+        first_issue_count = len(st.gh.posted_issues)
+        first_issue_num = st.gh.posted_issues[0][3]
 
-        # Second check (later pass) should edit in place, not create new
+        # Second check (later pass) should edit in place, not create new issue
         st.now = NOW + 3600  # One hour later
         st._free = 9 * GB
         station._write_json(os.path.join(st.state, "disk.json"), {"folders": {"logs": 2 * GB}})
         st._check_disk_guard_ask()
 
-        # Should still have only one ask (edited in place)
-        self.assertEqual(len(st.gh.posted), first_posted, "Ask should be edited in place, not duplicated")
-        # Verify the comment was actually patched
-        self.assertEqual(len(st.gh.patched_comments), 1, "Comment should be patched once")
-        repo, comment_id, body = st.gh.patched_comments[0]
-        self.assertEqual(repo, GOAL_REPO)
-        self.assertEqual(comment_id, st.gh.comments[(GOAL_REPO, GOAL_NUMBER)][0]["id"])
+        # Should still have only one ask issue (edited in place)
+        self.assertEqual(len(st.gh.posted_issues), first_issue_count, "Ask issue should be edited in place, not duplicated")
+        # Verify the issue body was patched
+        self.assertIn((GOAL_REPO, first_issue_num), st.gh.created_issues)
+        body = st.gh.created_issues[(GOAL_REPO, first_issue_num)]["body"]
         self.assertIn("Kind: hardware", body)
-        self.assertIn("Free space: 9.0 GB\n", body)
-        self.assertIn("Floor: 15.0 GB\n", body)
+        self.assertIn("Free space: 9.0 GB", body)
+        self.assertIn("Floor: 15.0 GB", body)
         self.assertIn("Loom home holds 2.0 GB (logs 2.0 GB)", body)
 
     def test_ask_closed_when_disk_recovers(self):
-        """When disk recovers (free space above floor), the ask is closed."""
-        from bus.station import Station
-        st = Station.__new__(Station)
-        st.s = type("Settings", (), {
-            "home": self.home,
-            "repos": [GOAL_REPO],
-            "authors": ["loom-app[bot]"],
-            "disk_free_min_gb": FLOOR_GB,
-            "thin_snapshots": False,
-        })()
-        st.gh = FakeGH()
-        st.state = os.path.join(self.home, "state", "station")
-        st.now = NOW
-        st._free_read = False
-        st._free = int(0.5 * FLOOR)
-        st._disk_free = lambda: st._free
-        st._goal_homes = lambda: [(GOAL_REPO, {"number": GOAL_NUMBER, "labels": [{"name": "loom:goal"}]})]
-        st._num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-        st._goals = {}  # Required by _goal_homes
+        """When disk recovers (free space above floor), the ask issue is closed."""
+        st = self._make_station()
 
         # Disk has been low for 61 minutes - ask created
         self._write_disk_guard(True, int(0.5 * FLOOR), NOW - 3660)
         st._check_disk_guard_ask()
+        issue_num = st.gh.posted_issues[0][3]
 
         # Now disk recovers
         st._free = int(2 * FLOOR)  # Above floor
         st._free_read = False  # Force re-read
         self._write_disk_guard(False, int(2 * FLOOR), NOW)
 
-        with mock.patch.object(st.gh, "rest", side_effect=TypeError("invalid close call")):
-            with self.assertRaisesRegex(TypeError, "invalid close call"):
-                st._check_disk_guard_ask()
-
-        # Next check should close the ask
         st._check_disk_guard_ask()
 
-        # The needs:human label should be removed
-        removed = [l for r, n, l in st.gh.labels_removed if "needs:human" in l]
-        self.assertTrue(len(removed) > 0, "needs:human label should be removed when disk recovers")
+        # The ask issue should be closed
+        self.assertIn((GOAL_REPO, issue_num), st.gh.created_issues)
+        self.assertEqual(st.gh.created_issues[(GOAL_REPO, issue_num)]["state"], "closed")
+        self.assertIn((GOAL_REPO, issue_num), st.gh.closed_issues)
+
+    def test_goal_home_with_existing_needs_human_untouched(self):
+        """A goal home that already carries needs:human keeps its label and comment untouched."""
+        st = self._make_station()
+        gh = st.gh
+
+        # Pre-populate goal home with needs:human label and comment
+        gh.created_issues[(GOAL_REPO, GOAL_NUMBER)] = {
+            "title": "Goal: Loom",
+            "body": "Goal home body",
+            "state": "open",
+            "labels": ["loom:goal", "needs:human"]
+        }
+        goal_comment_id = 1
+        gh.comments[(GOAL_REPO, GOAL_NUMBER)] = [{
+            "id": goal_comment_id,
+            "body": "<!-- loom:human v1 -->\nKind: hardware\nExisting ask on goal home"
+        }]
+
+        # Disk has been low for 61 minutes
+        self._write_disk_guard(True, int(0.5 * FLOOR), NOW - 3660)
+        st._check_disk_guard_ask()
+
+        # A new ask issue should be created (not on the goal home)
+        self.assertEqual(len(gh.posted_issues), 1, "One ask issue should be created")
+        issue_num = gh.posted_issues[0][3]
+        self.assertNotEqual(issue_num, GOAL_NUMBER, "Ask should be a new issue, not the goal home")
+
+        # Goal home should still have needs:human label
+        goal_labels = gh.created_issues[(GOAL_REPO, GOAL_NUMBER)]["labels"]
+        self.assertIn("needs:human", goal_labels, "Goal home should keep its needs:human label")
+
+        # Goal home comment should be unchanged
+        goal_comments = gh.comments.get((GOAL_REPO, GOAL_NUMBER), [])
+        self.assertEqual(len(goal_comments), 1, "Goal home should have one comment")
+        self.assertEqual(goal_comments[0]["body"], "<!-- loom:human v1 -->\nKind: hardware\nExisting ask on goal home",
+                         "Goal home comment should be untouched")
+
+        # Now disk recovers
+        st._free = int(2 * FLOOR)
+        st._free_read = False
+        self._write_disk_guard(False, int(2 * FLOOR), NOW)
+        st._check_disk_guard_ask()
+
+        # Goal home should still have needs:human label (not removed)
+        goal_labels = gh.created_issues[(GOAL_REPO, GOAL_NUMBER)]["labels"]
+        self.assertIn("needs:human", goal_labels, "Goal home should still keep its needs:human label after resume")
+
+        # Goal home comment should still be unchanged
+        goal_comments = gh.comments.get((GOAL_REPO, GOAL_NUMBER), [])
+        self.assertEqual(goal_comments[0]["body"], "<!-- loom:human v1 -->\nKind: hardware\nExisting ask on goal home",
+                         "Goal home comment should still be untouched after resume")
+
+        # The disk ask issue should be closed
+        self.assertEqual(gh.created_issues[(GOAL_REPO, issue_num)]["state"], "closed",
+                         "Disk ask issue should be closed on resume")
 
 
 if __name__ == "__main__":
