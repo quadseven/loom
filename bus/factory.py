@@ -5554,9 +5554,10 @@ class Factory:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
-        if repo in self.capped:
+        if repo in self.capped and priority_of(issue) != "P0":
             # Briefed, the station would hold it at the cap and its lane would
-            # take nothing else (loom#3158). Reads nothing.
+            # take nothing else (loom#3158). Reads nothing. A P0 ticket is
+            # claimed over the cap, so it is not held here.
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)

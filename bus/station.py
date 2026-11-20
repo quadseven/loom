@@ -6019,6 +6019,8 @@ class Station:
         return pr["number"]
 
     def _repo_pr_held(self, repo: str, issue: Dict[str, Any]) -> bool:
+        if tickets.priority_of(issue) == "P0":
+            return False
         count = self._repo_pr_count(repo)
         cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
         if count is not None and count < cap:
@@ -6041,6 +6043,8 @@ class Station:
         On 2026-11-16, 61 of 98 briefed tickets sat in two repos over the
         cap, and the trust, issue and merged-PR reads each one cost spent the
         claim share before free lanes reached a ticket they could run."""
+        if tickets.priority_of(issue) == "P0":
+            return False
         count = self._repo_pr_count(repo)
         cap = self.s.repo_open_pr_caps.get(repo, self.s.repo_open_pr_caps["*"])
         if count is None or count < cap:
