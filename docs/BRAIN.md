@@ -2537,6 +2537,13 @@ Both paths apply the following checks.
   (`bus/unmeetable.py` reads that one line; a live box beside it is not
   looked up).
 
+For each shipped ticket within the read budget, the station reads its timeline once.
+It takes same-repo pull request numbers from cross-references, connected events
+and the lane's opening notice in the ticket's status comment or body. It reads
+those pull requests directly and checks that they cover the ticket. If the
+ticket names none, it searches the newest 500 closed pull requests. An
+incomplete timeline holds the evidence close for that ticket.
+
 A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
 refused ticket goes to the usual done close and is read again after 6 hours.
 Checks still running leave the ticket for a later pass with no ask.
@@ -2553,10 +2560,14 @@ and 20 reads per pass and 150 evidence closes per day. Reopens of either
 kind count toward the same guardrail. The Proof due issue shows the
 newest 150 boxes and counts the older ones.
 
-Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+Reopens stay at or below 5% of evidence closes in the last seven days.
+If fewer than 100 tickets closed in that span, the station uses the newest
+100 closes, or all closes since the last resume if there are fewer. A resume
+always excludes earlier closes. One listing per repo finds
 reopened tickets, and a reopen stays counted after the ticket closes again.
 Above the limit this close stops, says so in the log and in each Proof due
-issue, and the usual done close takes over. A first reopen in fewer than 20
+issue, and the usual done close takes over until the operator resumes the
+evidence close. A first reopen in fewer than 20
 closes stops it too. The count is a floor: it sees only reopens someone made.
 
     python3 -m bus.evidence_close status

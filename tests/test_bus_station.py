@@ -75,6 +75,8 @@ class FakeGitHub:
         self.comments = {}
         self.editors = {}
         self.pulls = []
+        self.timeline_reads = []
+        self.ticket_links = {}
         self.search_items = []
         # Pull requests read as issues: number -> the live issue object.
         self.pull_issues = {}
@@ -500,6 +502,12 @@ class FakeGitHub:
 
     def _graphql(self, data):
         query, variables = data["query"], data.get("variables") or {}
+        if "timelineItems" in query:
+            number = variables["number"]
+            self.timeline_reads.append(number)
+            page = {"nodes": self.ticket_links.get(number, []),
+                    "pageInfo": {"hasNextPage": False}}
+            return reply(200, {"data": {"repository": {"issue": {"timelineItems": page}}}})
         if "addPullRequestReviewThreadReply" in query:
             if variables["id"] in self.reply_fails:
                 return reply(502, {"message": "bad gateway"})
