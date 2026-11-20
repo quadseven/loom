@@ -44,6 +44,12 @@ class RestorePlan(unittest.TestCase):
         self.assertEqual(out["lanes"][0]["outcome"], rp.FRESH)
         self.assertEqual(out["exit"], 1)
 
+    def test_an_unknown_policy_fails_and_is_never_started_fresh(self):
+        manifest = {"lanes": [{"name": "e", "kind": "codex", "restore_policy": "resuem"}]}
+        out = rp.plan(manifest, SNAP, [])
+        self.assertEqual(out["lanes"][0]["outcome"], rp.FAILED)
+        self.assertIsNone(out["lanes"][0]["command"])
+
     def test_an_unknown_kind_fails(self):
         manifest = {"lanes": [{"name": "d", "kind": "other", "restore_policy": "resume"}]}
         self.assertEqual(rp.plan(manifest, SNAP, [])["lanes"][0]["outcome"], rp.FAILED)

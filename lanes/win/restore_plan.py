@@ -37,6 +37,9 @@ def _lane(lane: Dict[str, Any], snap: Dict[str, Any],
     if kind not in RESUME_ARGS:
         out["outcome"] = FAILED
         return out
+    if policy not in ("resume", "ask", "fresh"):
+        out["outcome"] = FAILED
+        return out
     if policy == "resume" and not sid:
         policy = "ask"
     if policy == "ask":
