@@ -295,22 +295,44 @@ def runnable_form(text: str) -> str:
     return ""
 
 
-def lane_output_gap(body: str, log: Iterable[str]) -> str:
-    """The first checked live box missing its stated output in this lane run."""
-    checked_live = [(index, text) for index, (checked, text) in enumerate(proof.criteria(body), 1)
-                    if checked and criteria_gate.kind(text) == criteria_gate.LIVE]
-    if not checked_live:
-        return ""
+def _unproven_boxes(body: str, log: Iterable[str]) -> List[int]:
+    """The 1-based numbers of checked live boxes missing their stated output in
+    this lane run's log."""
     lines = {line.strip() for line in log}
-    for index, text in checked_live:
+    gaps = []
+    for index, (checked, text) in enumerate(proof.criteria(body), 1):
+        if not checked or criteria_gate.kind(text) != criteria_gate.LIVE:
+            continue
         expected = [line for line in evidence.needles(text)
                     if not _command_like(line) and not criteria_gate.URL_RE.fullmatch(line)]
         if (expected and not evidence.absent_needles(text) and not evidence.required_span(text)
                 and all(line in lines for line in expected)):
             continue
-        return ("live acceptance criterion %d needs its expected output in this run log; "
-                "leave it unticked until verified" % index)
-    return ""
+        gaps.append(index)
+    return gaps
+
+
+def untick_unproven_live(body: str, log: Iterable[str]) -> str:
+    """The body with each checked live box whose stated output is missing from
+    this lane run's log unticked, and one note line naming those boxes. A body
+    with no such box comes back unchanged."""
+    gaps = _unproven_boxes(body, log)
+    if not gaps:
+        return body
+    out: List[str] = []
+    inside, index = False, 0
+    for line in body.split("\n"):
+        if line.startswith("## "):
+            inside = line.strip() == proof._CRITERIA_HEADING
+        elif inside and proof._BOX.match(line.rstrip("\r")):
+            index += 1
+            if index in gaps:
+                line = re.sub(r"\[[xX]\]", "[ ]", line, count=1)
+        out.append(line)
+    names = ", ".join(str(i) for i in gaps)
+    note = ("Live acceptance criterion %s unticked: its expected output is not in "
+            "this run log; verify it, then tick it." % names)
+    return "\n".join(out).rstrip("\n") + "\n\n" + note
 
 
 def _step_refusal(step: Step) -> str:
