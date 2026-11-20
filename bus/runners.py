@@ -33,7 +33,9 @@ Rules:
 - After BASE_RED_MAX base check failures of one repo at one revision on a
   slot (one, for a check that could not start), the slot takes no more of
   that repo: its briefs park [transient] so another lane takes them, until
-  the repo's head or the runner image changes.
+  the repo's head or the runner image changes. That stop is shared: it
+  holds the repo on every slot for the same base and revision, and clears
+  by the recording slot's rules.
 
 Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
 docs/LANES.md, "Lanes on cluster runners".
@@ -583,7 +585,28 @@ class Runners:
         slot: only a run can show a new runner image, and a sole red repo
         lets none run. A head that cannot be read keeps it. A check the
         runner cannot run (CANNOT_RUN) is the image's fault, not the
-        revision's, so one run stops it and a moved head does not clear it."""
+        revision's, so one run stops it and a moved head does not clear it.
+        The runner image is shared, so a record that stops the repo on one
+        slot stops it on every slot for the same repo, base and revision:
+        the other slots do not each spend BASE_RED_MAX runs learning a stop
+        the image already taught one of them. A shared stop clears by the
+        recording slot's rules, as below."""
+        own = self._record_stops(ledger, slot, repo, base)
+        if own is not None:
+            return own
+        for other in sorted(ledger["base_red"]):
+            if other == slot:
+                continue
+            shared = self._record_stops(ledger, other, repo, base)
+            if shared is not None:
+                return shared
+        return None
+
+    def _record_stops(self, ledger: Dict[str, Any], slot: str, repo: str,
+                      base: str) -> Optional[Dict[str, Any]]:
+        """The record in `slot`'s own ledger row that stops `repo` on
+        `base`, or None, clearing that row first when its day probe or a
+        moved head lifts it."""
         red = (ledger["base_red"].get(slot) or {}).get(repo)
         if (not red or int(red.get("failures") or 0) < _stop_after(red)
                 or red.get("base", "") != base):
