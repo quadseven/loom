@@ -3854,6 +3854,28 @@ def _regression_attempt(children: List[Dict[str, Any]],
     return None
 
 
+def _names_ticket(why: str, repo: str, number: int) -> bool:
+    """True when the text names ticket number of this repo: bare #N, name#N or
+    owner/name#N. A ref to another repo's #N does not count."""
+    for prefix, found in re.findall(r"([\w.-]+/[\w.-]+|[\w.-]+)?#(\d+)(?!\w)", why):
+        if int(found) == number and prefix in ("", repo, repo.split("/")[-1]):
+            return True
+    return False
+
+
+def _followup_in_flight(children: List[Dict[str, Any]], repo: str,
+                        regressed: int) -> Optional[Dict[str, Any]]:
+    """The goal's open in-flight ticket whose Why names the regressed ticket,
+    though it carries no loom:regression label and no Regresses line."""
+    for child in children:
+        if int(child.get("number") or 0) == regressed or not _in_flight(child):
+            continue
+        why = "\n".join(_body_sections(str(child.get("body") or "")).get("why", []))
+        if _names_ticket(why, repo, regressed):
+            return child
+    return None
+
+
 def _regressed_ticket(gh: GitHub, repo: str, number: int) -> Dict[str, Any]:
     """The ticket that regressed: shipped or verified, or closed as completed."""
     found = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number), ok=(404,))
@@ -4050,6 +4072,10 @@ def _brief_regression(gh: GitHub, repo: str, goal: int, title: str, body: str,
     held = _regression_attempt(children, regressed)
     if held is not None:
         return str(held.get("html_url", ""))
+    follow = _followup_in_flight(children, repo, regressed)
+    if follow is not None:
+        raise ValueError("regression of #%d is already in flight as #%s; add the "
+                         "evidence there" % (regressed, follow.get("number")))
     issue = _regressed_ticket(gh, repo, regressed)
     why = _regression_slot(children, repo, goal_cap())
     ours = any(int(c.get("number") or 0) == regressed for c in children)
