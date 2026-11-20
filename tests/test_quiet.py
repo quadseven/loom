@@ -214,6 +214,16 @@ class StatusTest(unittest.TestCase):
         self.assertIn("  - quiet since %s: no report owed; heartbeat from %s"
                       % (ago(13), ago(13 - 24 * 7)), report)
 
+    def test_status_reports_stuck_triage_without_owing_a_report(self):
+        issue = {"number": 41, "state": "open", "labels": [{"name": "loom:triage"}],
+                 "created_at": ago(24 * 30)}
+        home = GoalHome([report_comment(1, ago(13))],
+                        [issue])
+        report, owed = self.status(home)
+        goals = report.split("### Goals\n")[1].split("### Reports owed before unlock")[0]
+        self.assertIn("  - #41 is stuck in loom:triage\n", goals)
+        self.assertEqual(owed.strip(), "- none")
+
     def test_status_still_owes_a_report_for_a_goal_that_moved(self):
         # The ticket's merge is what makes the report owed: without it the
         # same goal is quiet.
