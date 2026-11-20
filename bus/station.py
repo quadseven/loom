@@ -2103,6 +2103,13 @@ def fix_pr_merged(fix_pr: str, reason: str) -> bool:
     return bool(m) and m.group(1) == fix_pr and m.group(2) == "MERGED"
 
 
+def fix_pr_closed(fix_pr: str, reason: str) -> bool:
+    """Whether a fix brief was parked unrun because its own pull request,
+    fix_pr, was closed without a merge (PR_GONE_RE)."""
+    m = PR_GONE_RE.match(CLASS_RE.sub("", reason))
+    return bool(m) and m.group(1) == fix_pr and m.group(2) == "CLOSED"
+
+
 def lane_takes_model(lane: str, model: str) -> bool:
     """Whether the lane's runner accepts the model (lanes/run_lane.sh)."""
     lane = provider(lane)
@@ -9330,6 +9337,9 @@ class Station:
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
             return True
+        if fix_pr_closed(fix_pr, reason):
+            self._fix_pr_closed(repo, number, lane, int(fix_pr))
+            return True
         no_change_result = self._report_box_no_change(repo, number, lane, text, name, bare)
         if no_change_result is not None:
             return no_change_result
@@ -9813,6 +9823,19 @@ class Station:
                       "pull request #%d merged before lane %s ran its fix round; nothing "
                       "ran, which is not a failure" % (pr, lane))
         _say("reported %s#%d: pull request #%d merged before lane %s's fix round"
+             % (repo, number, pr, lane))
+
+    def _fix_pr_closed(self, repo: str, number: int, lane: str, pr: int) -> None:
+        """A fix brief the runner parked unrun because its pull request was
+        closed without a merge. Nothing ran, so no rung is spent. The claim
+        that sent the run is newer than the ticket's loom:fix comment, so the
+        stale fix is retired (_fix_with_source) and the ticket, back at
+        loom:queued, gets a fresh build brief on its current rung."""
+        self._relabel(repo, number, "loom:queued")
+        self._stopped(repo, number, lane, "transient",
+                      "pull request #%d was closed unmerged before lane %s ran its fix round; "
+                      "nothing ran, which is not a failure" % (pr, lane))
+        _say("reported %s#%d: pull request #%d closed before lane %s's fix round"
              % (repo, number, pr, lane))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
