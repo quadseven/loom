@@ -1289,6 +1289,23 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
+  APP_TOKEN_AT="$(date +%s)"
+}
+
+# A run can outlive its installation token (one hour), so each GitHub write
+# that can come late in a run mints again once the token is older than
+# LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
+# the log and keeps the old token, which may still work (loom#3231).
+fresh_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
+  now="$(date +%s)"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=2700
+  [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
+  lane_app_token && return 0
+  [ -z "$old" ] || export GH_TOKEN="$old"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  return 1
 }
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
@@ -1353,6 +1370,7 @@ post_park_note() {  # failure class, reason
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
+  fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
     grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
@@ -3622,6 +3640,14 @@ final_validation() {
     PARK_CLASS=transient
     VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
   fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ "${BASELINE_EXIT:-}" = 0 ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_refusal; then
+    # Every failure is the sandbox refusing an operation, in a check the base
+    # run may never have executed: the environment, not the agent's work.
+    PARK_CLASS=factory
+    VALIDATION_REASON="validation environment unavailable: sandbox refusal (Operation not permitted) in the final check"
+  fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124)
@@ -3850,6 +3876,10 @@ push_side() {
   range="$BASE..$from"
   [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
   [ "${REPO_PRIVATE:-}" = true ] && scan=(--personal-data)
+  if ! fresh_app_token; then
+    printf 'the GitHub App token could not be refreshed; the edits are committed in the lane tree'
+    return 1
+  fi
   if ! (cd "$TREE" && leak_scan --diff "$range" "${scan[@]}") >> "$LOG" 2>&1; then
     printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
     return 1
@@ -4115,8 +4145,21 @@ update_fix_branch() {
   fi
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge-base HEAD "origin/$default" > /dev/null 2>&1; then
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+    # Two fetches on one shallow tree can race ("shallow file has changed since
+    # we read it"), so the deepening is tried a second time after a pause, as
+    # fetch_base_for_contract does.
+    local try
+    for try in 1 2; do
+      timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        fetch -q --unshallow origin >> "$LOG" 2>&1 && break
+      [ "$try" -eq 2 ] || sleep 3
+    done
+    # Still no common commit: a merge would only say "unrelated histories" and
+    # be read as the agent's failure, so name the shallow tree instead.
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+         merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+      UPDATE_REASON="could not deepen the shallow tree to merge $default"; return 1
+    fi
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
@@ -5522,6 +5565,7 @@ for BRIEF in "$INBOX"/*.md; do
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
+    fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
       if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then

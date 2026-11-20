@@ -7369,14 +7369,14 @@ class RetryTest(Base):
                          "lane codex ran its fix round; nothing ran, which is not a failure")
         self.assertEqual(self.listing("codex-2"), [])
 
-    def test_a_fix_round_whose_pull_request_closed_unmerged_still_fails_its_work(self):
+    def test_a_fix_round_whose_pull_request_closed_unmerged_requeues_the_ticket(self):
         self.heartbeat("codex-2")
         fix = tickets.parse_fix(REPO, FIX_BODY)
         self.failed(reason="[work] pull request #99 is no longer open on "
                            "loom/12-fix-the-thing (CLOSED loom/12-fix-the-thing)",
                     attempt=1, fix=fix)
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued"])
 
     def test_a_merged_ticket_is_never_held_as_a_runaway(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[work] agent made no commit on loom/12-fix-the-thing")
