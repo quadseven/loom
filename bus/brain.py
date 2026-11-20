@@ -584,15 +584,27 @@ def _split_owned_runaways(rows: List[Tuple[Any, Dict[str, Any]]]
     return own, held
 
 
+def _split_operator_ask(rows: List[Tuple[Any, Dict[str, Any]]]
+                        ) -> Tuple[List[Tuple[Any, Dict[str, Any]]],
+                                   List[Tuple[Any, Dict[str, Any]]]]:
+    """Runaway rows that need review, and those whose way forward is an open
+    operator ask (needs:human)."""
+    ask = [r for r in rows if needs_human(_labels(r[1]))]
+    return [r for r in rows if r not in ask], ask
+
+
 def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
     rows = [(None, i) for i in issues if RUNAWAY in _labels(i)
             and tickets.ticket_state(i) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(rows)
+    own, ask = _split_operator_ask(own)
     lines = ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
                                         for _, i in own] or ["- none"])
     lines += ["- owned by %s: #%s %s" % (owner, issue["number"], issue.get("title", ""))
               for _, issue, owner in held]
+    lines += ["- waiting on the operator: #%s %s" % (i["number"], i.get("title", ""))
+              for _, i in ask]
     return lines
 
 
@@ -1908,10 +1920,14 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(runaway)
+    own, ask = _split_operator_ask(own)
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in own] or ["- none"])
     tail += ["- owned by %s: %s#%s %s" % (owner, repo, issue["number"], issue.get("title", ""))
              for repo, issue, owner in held]
+    tail += ["- waiting on the operator: %s#%s %s" % (repo, issue["number"],
+                                                     issue.get("title", ""))
+             for repo, issue in ask]
     tail += [""] + priority_lines(found, now)
     tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)
