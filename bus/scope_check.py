@@ -32,7 +32,8 @@ paths. As a script it prints one stray path per line, made printable::
     python3 -m bus.scope_check <tree> <base> <head> <brief> [<rev>...]
 
 With ``--scratch``, it prints only stray files safe to drop: unreferenced
-top-level test/debug files, object files and build output (BUILD_OUTPUT_DIRS),
+top-level test/debug files and agent summaries, object files and build output
+(BUILD_OUTPUT_DIRS),
 top-level shell here-document temp files (``sh-thd-*``) and ``*.patch`` files,
 and .loom metadata other than the validation contract. New .github files are
 never dropped.
@@ -226,19 +227,20 @@ def scratch_files(tree: str, base: str, head: str, brief_text: str,
     for path in stray_files(tree, base, head, brief_text, also):
         if path.startswith(".github/"):
             continue
-        if path.startswith(".loom/") and path != ".loom/validation.conf":
+        folded = path.casefold()
+        if "/" not in path and any(fnmatch.fnmatchcase(folded, pattern) for pattern in
+                                   ("*summary*.md", "*summary*.txt", ".loom-summary*")):
+            if not referenced_by_tracked_file(tree, head, path):
+                scratch.append(path)
+        elif path.startswith(".loom/") and path != ".loom/validation.conf":
             scratch.append(path)
         elif path.startswith(BUILD_OUTPUT_DIRS) or path.endswith(".o"):
             scratch.append(path)
         elif "/" not in path and (path.startswith("sh-thd-") or path.endswith(".patch")):
             scratch.append(path)
-        elif "/" not in path and (fnmatch.fnmatchcase(path, "test_*") or
-                                  fnmatch.fnmatchcase(path, "*_debug*") or
-                                  fnmatch.fnmatchcase(path, "test.py") or
-                                  fnmatch.fnmatchcase(path, "verify*.py") or
-                                  fnmatch.fnmatchcase(path, "check_*.py") or
-                                  fnmatch.fnmatchcase(path, "scratch*.py") or
-                                  fnmatch.fnmatchcase(path, "tmp*.py")):
+        elif "/" not in path and any(fnmatch.fnmatchcase(path, pattern) for pattern in
+                                     ("test_*", "*_debug*", "test.py", "verify*.py",
+                                      "check_*.py", "scratch*.py", "tmp*.py")):
             if not referenced_by_tracked_file(tree, head, path):
                 scratch.append(path)
     return scratch
