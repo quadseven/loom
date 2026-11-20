@@ -4123,8 +4123,21 @@ update_fix_branch() {
   fi
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge-base HEAD "origin/$default" > /dev/null 2>&1; then
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+    # Two fetches on one shallow tree can race ("shallow file has changed since
+    # we read it"), so the deepening is tried a second time after a pause, as
+    # fetch_base_for_contract does.
+    local try
+    for try in 1 2; do
+      timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        fetch -q --unshallow origin >> "$LOG" 2>&1 && break
+      [ "$try" -eq 2 ] || sleep 3
+    done
+    # Still no common commit: a merge would only say "unrelated histories" and
+    # be read as the agent's failure, so name the shallow tree instead.
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+         merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+      UPDATE_REASON="could not deepen the shallow tree to merge $default"; return 1
+    fi
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
