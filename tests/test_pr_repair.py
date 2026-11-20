@@ -607,12 +607,28 @@ class PlanRepairTest(unittest.TestCase):
                 self.assertEqual(pr_repair.main(argv), 1)
             self.assertEqual(printed.getvalue(), "## Size (XS, S, M or L)\n")
 
+    def test_refused_repair_does_not_name_ticket_gaps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            brief, body, out = (os.path.join(tmp, name) for name in ("brief", "body", "out"))
+            with open(brief, "w") as fh:
+                fh.write(SWEEP_TICKET["body"])
+            with open(body, "w") as fh:
+                fh.write(SWEEP_BODY)
+            printed = io.StringIO()
+            log = io.StringIO()
+            with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(log):
+                rc = pr_repair.main(["plan", brief, body, "invalid lane", "model",
+                                     "ticket", "--out", out])
+            self.assertNotEqual(rc, 0)
+            self.assertIn("repair refused", log.getvalue())
+            self.assertEqual(printed.getvalue(), "")
+
     def test_gaps_name_the_ticket_sections(self):
         self.assertEqual(pr_repair.ticket_gaps([
             "## Acceptance criteria has 0 non-empty bullets; need >=3",
             "no Size: XS/S/M/L/XL in body", "## Why has 2 words; need >=5"]),
             ["## Acceptance criteria (three or more \"- [ ]\" lines)",
-             "## Size (XS, S, M or L)", "## Why (five or more words)"])
+             "## Size (XS, S, M or L)", "## Why has 2 words; need >=5"])
 
 
 # Another repo's issue in the owner-qualified form, built here: the literal in
