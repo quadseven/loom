@@ -4016,6 +4016,8 @@ class Factory:
             return  # brought up to date less than the cooldown ago
         if self._hold_stands(repo, number, sha, _author(full)):
             return
+        if self._ticket_hold_stands(repo, number, issue):
+            return
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
                             {"expected_head_sha": sha}, ok=(422,))
         if done.status == 422:
@@ -4585,6 +4587,16 @@ class Factory:
         if blocker:
             _say("%s#%d is not updated: %s" % (repo, number, blocker))
         return bool(blocker)
+
+    def _ticket_hold_stands(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
+        """Whether an external-hold decision holds this pull request:
+        the ticket has an unticked Hold: do not merge box in its acceptance criteria."""
+        body = str(issue.get("body") or "")
+        hold_box = hold_boxes.hold_box_reason(body)
+        if hold_box:
+            _say("%s#%d is not updated: %s" % (repo, number, hold_box))
+            return True
+        return False
 
     def _update_to_land(self, repo: str, number: int, full: Dict[str, Any],
                         issue: Dict[str, Any], comments: List[Dict[str, Any]],

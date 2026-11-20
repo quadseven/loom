@@ -7387,6 +7387,42 @@ def merge_hold(gh: GitHub, repo: str, number: int) -> str:
                                    pr.get("mergeable"))
 
 
+def add_external_hold_box(gh: GitHub, repo: str, number: int, pr_number: int,
+                          precondition: str, evidence: str) -> None:
+    """Add an external-hold box to a ticket's acceptance criteria.
+    Called when a brain tick records an external-hold decision that holds an open pull request.
+    The box is idempotent: a second call adds nothing."""
+    issue = gh.rest("GET", "/repos/%s/issues/%d" % (repo, number)).data or {}
+    body = str(issue.get("body") or "")
+
+    # Check if a hold box already exists
+    if hold_boxes.hold_box_reason(body):
+        return  # Already has an external hold box, nothing to add
+
+    # Parse the acceptance criteria section
+    acceptance_section = "## Acceptance criteria"
+    if acceptance_section not in body:
+        body += "\n\n" + acceptance_section + "\n"
+
+    # Split the body into lines
+    lines = body.split('\n')
+
+    # Find the acceptance criteria section and add the hold box after it
+    new_lines = []
+    found_section = False
+    for line in lines:
+        new_lines.append(line)
+        if line == acceptance_section and not found_section:
+            found_section = True
+            new_lines.append("")  # Add a blank line
+            new_lines.append("- [ ] Hold: do not merge. Precondition: %s. Evidence that lifts it: Pull request #%d"
+                            % (precondition, pr_number))
+
+    # Update the issue body
+    new_body = '\n'.join(new_lines)
+    gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new_body})
+
+
 def _merge_holds(gh: GitHub, items: Sequence[handoff.Mark]) -> Dict[Tuple[str, int], str]:
     """The merge items no brain can merge, with why (merge_hold), read side
     by side. An item whose read fails is left as a resume item, as before."""
