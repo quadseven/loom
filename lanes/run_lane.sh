@@ -3542,11 +3542,11 @@ format_changed_files() {
   prefix="${prefix##*&&}"; prefix="${prefix##*;}"; prefix="${prefix##*|}"
   prefix="$(printf '%s' "$prefix" | sed -e 's/^ *//' -e 's/ *$//')"
   case "$prefix" in *ruff*) ;; *) return 0 ;; esac
-  printf '%s' "${prefix// /}" | grep -Eq "$safe" || return 0
+  grep -Eq "$safe" <<< "${prefix// /}" || return 0
   listed="$(safe_git diff --name-only "$BASE" HEAD 2> /dev/null)" || return 0
   while IFS= read -r path; do
-    printf '%s' "$path" | grep -Eq "$safe" || return 0
-    printf '%s\n' "$listed" | grep -Fxq -- "$path" || return 0
+    grep -Eq "$safe" <<< "$path" || return 0
+    grep -Fxq -- "$path" <<< "$listed" || return 0
     paths="$paths $path"; n=$((n + 1))
   done < <(tail -c +$((offset + 1)) "$LOG" | sed -n 's/^Would reformat: //p')
   [ "$n" -gt 0 ] || return 0
