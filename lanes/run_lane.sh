@@ -3528,7 +3528,7 @@ prepare_validation() {
 # Run changed Python tests on the base code in the check sandbox. This separate
 # pass has its own timeout because it archives the base tree and runs tests.
 final_base_tests() {
-  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names default_rev=""
+  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names all_names default_rev=""
   cp "$LOOM_ROOT/bus/vacuous.py" "$helper" || {
     VALIDATION_REASON="validation environment unavailable: could not stage the base-test gate"
     return 125
@@ -3549,6 +3549,7 @@ final_base_tests() {
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
+  all_names="$(tail -c +$((log_offset + 1)) "$LOG" | grep -E '^base-(pass|timeout|unrunnable): ')"
   names="$(tail -c +$((log_offset + 1)) "$LOG" \
     | sed -n -e 's/^base-pass: /passes on base: /p' \
              -e 's/^base-timeout: /timed out on base: /p' \
@@ -3560,7 +3561,16 @@ final_base_tests() {
     124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free for the base-test gate" ;;
     125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
-    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
+    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed"
+       # Only base-pass names, outside a fix round: the ticket's behaviour may
+       # already hold on the default branch, which no stronger model changes
+       # (loom#3005). The station holds it for a done-check, not a rung.
+       if [ -z "${FIX_PR:-}" ] && [ -n "$names" ]; then
+         case "$all_names" in
+           *base-timeout:*|*base-unrunnable:*) ;;
+           *) VALIDATION_REASON="validation failed: every changed test passes on base; the ticket may already hold on the default branch" ;;
+         esac
+       fi ;;
   esac
   [ -z "$names" ] || VALIDATION_REASON="$VALIDATION_REASON: ${names%;}"
   return "$rc"

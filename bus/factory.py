@@ -1381,6 +1381,10 @@ def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
     return history.needs_other_repo(comments)
 
 
+def base_pass_tests(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    return history.base_pass_tests(comments)
+
+
 def current_rung(issue: Dict[str, Any]) -> int:
     """The rung whose model and lane the ticket runs on now, 0 when none: a
     brief can start on a ladder model, and failing there tries that rung."""
@@ -4759,6 +4763,10 @@ class Factory:
         if other:
             self._hold_other_repo(repo, issue, other)
             return
+        passing = base_pass_tests(comments)
+        if passing is not None:
+            self._hold_done_check(repo, issue, passing)
+            return
         pr = prs.get(number)
         if self._not_work(repo, issue, comments, pr):
             return
@@ -4859,6 +4867,27 @@ class Factory:
                      {"labels": names + ["needs-brain"]})
         self.actions += 1
         _say("%s#%d failed again with no commit and no reason; left for the brain"
+             % (repo, number))
+
+    def _hold_done_check(self, repo: str, issue: Dict[str, Any], tests: str) -> None:
+        """Leave a ticket failed for the brain to done-check, once (needs-brain
+        says it was asked), when every test its run changed already passes on
+        the default branch: no rung is spent, as a stronger model cannot make
+        a test fail on code that already works (loom#3005)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        notify.post(self.gh, repo, number,
+                    "Not climbing the model ladder: every test lane %s changed already passes "
+                    "on the default branch%s, so the behaviour may already hold and a stronger "
+                    "model cannot make those tests fail. The brain checks whether the ticket "
+                    "is done, then closes it or rewrites the brief around what is missing."
+                    % (_lane(issue), " (" + tests + ")" if tests else ""), notify.HELD)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d failed with every changed test passing on base; left for a done-check"
              % (repo, number))
 
     def _hold_other_repo(self, repo: str, issue: Dict[str, Any], submodule: str) -> None:
