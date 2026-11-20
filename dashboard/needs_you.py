@@ -294,6 +294,55 @@ def _oldest_first(found: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(found, key=lambda entry: _since(entry) or "9999")
 
 
+_TITLE_WHO_RE = re.compile(r"^\s*needs\s+([A-Za-z][\w-]{0,38})\s*:", re.I)
+_UNBLOCKS_RE = re.compile(r"^\W*unblocks\W*:\s*(.+)$", re.I | re.M)
+NO_ACTION = "no action written"
+
+
+def board_who(entry: Dict[str, Any]) -> str:
+    """Who the item waits on: a person a "Needs <name>:" title names, else
+    the logins and the operator it waits on."""
+    named = _TITLE_WHO_RE.match(str(entry.get("title") or ""))
+    return named.group(1) if named else (
+        ", ".join(_who_name(login) for login in entry["who"]) or "answered")
+
+
+def board_unblocks(entry: Dict[str, Any]) -> str:
+    """What doing it unblocks: the ask's "Unblocks:" line, else the count of
+    items it holds up, else "not stated"."""
+    found = _UNBLOCKS_RE.search(full_ask(entry))
+    if found:
+        return " ".join(found.group(1).split())
+    count = _number(entry.get("unblocks"))
+    return "%d item%s" % (count, "" if count == 1 else "s") if count else "not stated"
+
+
+def board(found: Iterable[Dict[str, Any]]) -> str:
+    """The "Needs you" table at the top of the dashboard: one row per item
+    waiting on a person, oldest first, with who, the one-line action (or
+    "no action written", never hidden), what it unblocks, how long it has
+    waited and a link. Items already answered and waiting for the station
+    are not rows."""
+    esc = html.escape
+    shown = _oldest_first(entry for entry in found if not entry.get("pending"))
+    if not shown:
+        return ('<section class="needs-board" aria-label="Needs you"><h2>Needs you</h2>'
+                '<p class="empty-state">Nothing needs you right now.</p></section>')
+    rows = []
+    for entry in shown:
+        lead = first_sentence(ask_text(entry))
+        url = str(entry.get("html_url") or entry.get("url") or "/tickets")
+        rows.append(
+            '<tr data-key="%s"><td>%s</td><td%s>%s</td><td>%s</td><td>%s</td><td><a href="%s">%s</a></td></tr>' % (
+                esc(str(entry.get("key") or ""), quote=True), esc(board_who(entry)),
+                "" if lead else ' class="ask-missing"', esc(lead or NO_ACTION),
+                esc(board_unblocks(entry)), esc(views.format_age(_since(entry)) or "age unknown"),
+                esc(url, quote=True), esc(ref(entry))))
+    return ('<section class="needs-board" aria-label="Needs you"><h2>Needs you (%d)</h2><div class="table-wrap">'
+            '<table><thead><tr><th>Who</th><th>Do</th><th>Unblocks</th><th>Waiting</th><th>Link</th></tr>'
+            '</thead><tbody>%s</tbody></table></div></section>') % (len(shown), "".join(rows))
+
+
 def ref(entry: Dict[str, Any]) -> str:
     return "%s#%s" % (entry.get("repo"), entry.get("number"))
 

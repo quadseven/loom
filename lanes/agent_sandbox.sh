@@ -130,7 +130,8 @@ sandbox_command() {
 # so nothing else on the machine is there at all (HOME with the loom home and
 # the copied SSM values, /run/secrets, /var/run/secrets, the loom checkout).
 # Then the tree and the scratch home are bound writable, .git read-only, and
-# the CLI's folder, the skill snapshot and the check's uv files read-only.
+# the CLI's folder, the skill snapshot, the job cap's wrapper directory and
+# the check's uv files read-only.
 # /tmp is a private tmpfs; the root itself is read-only. Check runs get the same root as agent runs: their
 # writes go to the tree, the check home and /tmp only. A fresh /proc in a new
 # PID namespace hides the runner's processes and their environments.
@@ -146,7 +147,7 @@ bwrap_profile() {
   printf '%s\n' --bind "$tree" "$tree"
   [ -e "$tree/.git" ] && printf '%s\n' --ro-bind "$tree/.git" "$tree/.git"
   printf '%s\n' --bind "$agent_home" "$agent_home"
-  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
+  for p in "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
     printf '%s\n' --ro-bind "$p" "$p"
   done
   # The root tmpfs itself takes no writes (remount-ro does not reach the
@@ -310,7 +311,7 @@ sandbox_profile() {
     echo "refusing sandbox: bwrap serves api and check runs only, not mode '${3:-}' (lane $LANE)" >&2
     return 1
   fi
-  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny="" agy_home="" agy_token_deny=""
+  local home tree cli_link cli_real cli_root p allow_rw allow_ro meta="" agy_rules="" skills="" skills_rules="" loopback_rule="" agy_keychain_deny="" agy_home="" agy_token_deny="" jobs_bin=""
   if [ -n "${4:-}" ]; then
     [[ "$4" =~ ^[0-9]+$ ]] && [ "$4" -ge 49152 ] && [ "$4" -le 65535 ] ||
       { echo "refusing sandbox: loopback port $4 is not in 49152-65535" >&2; return 1; }
@@ -323,11 +324,17 @@ sandbox_profile() {
     agy_keychain_deny="(deny file-read* (subpath \"$agy_home/Library/Keychains\"))"
   fi
   [ -d "$SKILLS" ] && skills="$(cd "$SKILLS" && pwd -P)"
+  # The lane job cap's wrapper directory (BUILD_JOBS_BIN, lanes/build_jobs.sh):
+  # two scripts from the loom checkout that go first on the run's PATH. The
+  # checkout may sit under HOME, which the profile hides, so this one
+  # directory is readable, never writable, like the skill snapshot. Unset for
+  # every caller but the lane runner, and empty there when the cap is off.
+  [ -n "${BUILD_JOBS_BIN:-}" ] && [ -d "$BUILD_JOBS_BIN" ] && jobs_bin="$(cd "$BUILD_JOBS_BIN" && pwd -P)"
   cli_link="$(command -v "$2")" && [ -n "$cli_link" ] || { echo "refusing sandbox: $2 not on PATH" >&2; return 1; }
   cli_real="$(realpath "$cli_link")" && [ -n "$cli_real" ] || { echo "refusing sandbox: cannot resolve $cli_link" >&2; return 1; }
   cli_root="$(dirname "$cli_real")"
   # Paths go into the profile's string grammar: refuse any that could close it.
-  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills"; do
+  for p in "$home" "$tree" "$cli_link" "$cli_real" "$AGENT_HOME" "$skills" "$jobs_bin"; do
     # shellcheck disable=SC1003 # matching a literal backslash
     case "$p" in *'"'*|*'\'*|*$'\n'*) echo "refusing sandbox: unsafe path $p" >&2; return 1 ;; esac
   done
@@ -357,20 +364,23 @@ sandbox_profile() {
   [ -n "$skills" ] && skills_rules="(allow file-read* (subpath \"$skills\"))
 (deny file-write* (subpath \"$skills\"))
 "
+  [ -n "$jobs_bin" ] && skills_rules="$skills_rules(allow file-read* (subpath \"$jobs_bin\"))
+(deny file-write* (subpath \"$jobs_bin\"))
+"
   if [ "$kind" = bwrap ]; then
     local agent_home
     agent_home="$(cd "$AGENT_HOME" && pwd -P)" || return 1
     # A bind at or above HOME would hand the agent all of HOME (the loom
     # home, the copied SSM values): writable for the tree or scratch home,
     # readable for the rest. Every bind must sit below HOME or beside it.
-    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} $uv_files; do
+    for p in "$tree" "$agent_home" "$cli_root" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
       case "$p" in /) echo "refusing sandbox: $p is the root" >&2; return 1 ;; esac
       case "$home/" in "$p"/*) echo "refusing sandbox: $p sits at or above HOME" >&2; return 1 ;; esac
     done
     bwrap_profile
     return 0
   fi
-  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} $uv_files; do
+  for p in "$tree" "$AGENT_HOME" "$cli_root" "$cli_link" ${skills:+"$skills"} ${jobs_bin:+"$jobs_bin"} $uv_files; do
     p="$(dirname "$p")"
     while [ "${p#"$home"}" != "$p" ] && [ "$p" != "/" ]; do
       meta="$meta (literal \"$p\")"
@@ -428,6 +438,10 @@ api_agent() {
     export PATH="$keep_path" HOME="$AGENT_HOME" TMPDIR="$AGENT_HOME/tmp" \
       TMP="$AGENT_HOME/tmp" TEMP="$AGENT_HOME/tmp" TERM=dumb LANG="$keep_lang"
     [ "$key_var" = - ] || export "$key_var=$key"
+    # The lane job cap (lanes/build_jobs.sh): NAME=value words the lane
+    # runner set, none for any other caller or with the cap off. PATH above
+    # already starts with the wrapper directory when there is a cap.
+    for kv in ${BUILD_JOBS_ENV[@]+"${BUILD_JOBS_ENV[@]}"}; do export "${kv?}"; done
     # AGENT_EXTRA_ENV: NAME=value lines (opencode config, a provider's account id).
     while IFS= read -r kv; do [ -z "$kv" ] || export "${kv?}"; done <<< "$extra"
     if [ -n "$server_port" ]; then
