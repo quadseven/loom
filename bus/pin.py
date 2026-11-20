@@ -145,6 +145,10 @@ def body(source: str, revision: str, titles: list[str], digest: str = "") -> str
     return result
 
 
+READY_CONCLUSIONS = ("success", "neutral", "skipped")
+ELDER_CHECK = "Grug - Elder"
+
+
 def _checks_running(gh: GitHub, repo: str, active: dict | None) -> bool:
     head = active.get("head", {}) if active else {}
     sha = head.get("sha") if isinstance(head, dict) else None
@@ -153,6 +157,26 @@ def _checks_running(gh: GitHub, repo: str, active: dict | None) -> bool:
     data = gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
     runs = data.get("check_runs", []) if isinstance(data, dict) else []
     return any(run.get("status") != "completed" for run in runs if isinstance(run, dict))
+
+
+def _ready_pull(gh: GitHub, repo: str, active: dict | None) -> bool:
+    """An open pin pull request that can merge as it is: clean, with check runs
+    that all finished well and a passing Elder review. Rebuilding it for a
+    newer revision would restart its checks and its review."""
+    if not active or active.get("mergeable_state") != "clean":
+        return False
+    head = active.get("head", {})
+    sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        return False
+    data = gh.rest("GET", "/repos/%s/commits/%s/check-runs" % (repo, sha)).data
+    runs = [run for run in (data.get("check_runs", []) if isinstance(data, dict) else [])
+            if isinstance(run, dict)]
+    if not runs or any(run.get("status") != "completed"
+                       or run.get("conclusion") not in READY_CONCLUSIONS for run in runs):
+        return False
+    return any(run.get("name") == ELDER_CHECK and run.get("conclusion") == "success"
+               for run in runs)
 
 
 def _pin_commit(gh: GitHub, repo: str, base_sha: str, path: str, text: str,
@@ -189,6 +213,10 @@ def pin_one(gh: GitHub, source: str, revision: str, spec: dict[str, str],
         return
     if _checks_running(gh, repo, active):
         log("pin: waiting for checks on %s" % repo)
+        return
+    if _ready_pull(gh, repo, active):
+        log("pin: %s: pull request #%s is ready at %s; newer revision %s waits for the "
+            "next pin" % (repo, active["number"], current[:12], revision[:12]))
         return
     watch = spec.get("watch", DEFAULT_WATCH)
     compared = compare(gh, source, old, revision)
