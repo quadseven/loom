@@ -116,6 +116,9 @@ ARTIFACT_MAX = 64 * 1024 * 1024
 KEY_MAX = 4096
 MAC_MAX = 128
 UNPACKED_MAX = 128 * 1024 * 1024
+# The most of one run log the job packs; a larger one is cut to its tail, so
+# one runaway log cannot push the whole report past UNPACKED_MAX.
+REPORT_FILE_MAX = UNPACKED_MAX // 2
 MEMBERS_MAX = 20000
 CHUNK = 1024 * 1024
 # What the job's MAC covers comes after this label (lanes/k8s/lane_job.py).
@@ -1055,6 +1058,20 @@ class Runners:
                 raise ReportError("the decrypted report is larger than %d bytes" % ARTIFACT_MAX)
             return self._untar(plain)
 
+    @staticmethod
+    def _largest(path: str, current: "tarfile.TarInfo") -> str:
+        """Text naming the biggest file in the archive, for the refusal. The
+        headers only are read; a failure here just leaves the name out."""
+        best = current
+        try:
+            with tarfile.open(path, mode="r|gz") as tar:
+                for member in tar:
+                    if member.isfile() and member.size > best.size:
+                        best = member
+        except (tarfile.TarError, OSError, EOFError, zlib.error, ValueError):
+            pass
+        return " (largest file: %s, %d bytes)" % (best.name[:80], best.size)
+
     def _untar(self, path: str) -> Dict[str, bytes]:
         files: Dict[str, bytes] = {}
         total = 0
@@ -1068,7 +1085,8 @@ class Runners:
                     if not member.isfile():
                         raise ReportError("the report holds a link or device: %s" % member.name[:80])
                     if member.size < 0 or total + member.size > UNPACKED_MAX:
-                        raise ReportError("the report unpacks past %d bytes" % UNPACKED_MAX)
+                        raise ReportError("the report unpacks past %d bytes%s"
+                                          % (UNPACKED_MAX, self._largest(path, member)))
                     buf = io.BytesIO()
                     fh = tar.extractfile(member)
                     if fh is not None:

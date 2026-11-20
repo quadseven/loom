@@ -4652,7 +4652,9 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
-    if any(name.startswith("loom:") for name in names) or needs_human(names):
+    # loom:factory alone is a hand-filed issue, not one Loom has seen.
+    if (any(name.startswith("loom:") and name != "loom:factory" for name in names)
+            or needs_human(names)):
         return "already labelled"
     return not_work_reason(issue) or protected_reason(issue, journals, authors)
 
