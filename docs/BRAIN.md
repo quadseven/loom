@@ -1781,6 +1781,29 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   stuck goals to the dashboard (`POST /api/goal-caps`),
   whose Needs-you page lists each with that count.
 
+## Picking a ticket to work
+
+A worker told to take a ready ticket reads the tickets and decides by
+reading. It does not trust a label, because the same label means different
+things in different repos, and some repos carry no ready label at all (a
+Loom ticket waiting for a lane carries `loom:queued`, not a ready marker).
+The rule for any session that picks work, in the order it applies:
+
+1. List the open issues and read their bodies, not only their labels.
+2. Skip, and say why in the report, a ticket that: has an open pull request
+   naming it; is an epic, goal or tracker; carries `needs:human` or
+   `wait:blocked`; has a claim label whose holder acted in the last 24 hours
+   (a claim whose holder has been silent longer is stale and may be taken);
+   has only live or production boxes left; or needs a person, a credential
+   or a purchase.
+3. Check the ticket's premise in the code before building. If the described
+   problem is not there, or the work already merged, write that finding in
+   the report and take the next ticket. No pull request is opened for it.
+4. Build the smallest change that meets the code boxes, with a test that
+   fails before the change.
+
+This rule lives here so it does not depend on any one session's prompt.
+
 ## needs-brain holds nothing answers
 
 `needs-brain` holds a ticket for the brain, and the factory moves it no more.
