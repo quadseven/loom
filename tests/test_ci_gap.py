@@ -212,6 +212,65 @@ class RunnerSetupTest(unittest.TestCase):
             self.assertFalse(ci_gap.setup_only(command), command)
 
 
+EXTERNAL_WORKFLOW = """name: module
+on: pull_request
+jobs:
+  adapter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: example/outer
+      - uses: actions/checkout@v4
+        with:
+          path: outer/modules/inner
+      - name: Configure
+        run: cmake -S outer -B build
+      - name: Build
+        run: cmake --build build --target inner_tests
+"""
+
+
+class WorkspaceContextTest(unittest.TestCase):
+    """loom#3016: a step that needs the workspace around a module checked
+    into a subdirectory is not a contract line a module-only lane can run."""
+
+    RUN = {"id": 501, "name": "adapter", "conclusion": "failure", "app": {"slug": "github-actions"}}
+
+    def gaps(self, workflow, steps):
+        said = []
+        old = globals()["SETUP_WORKFLOW"]
+        globals()["SETUP_WORKFLOW"] = workflow
+        try:
+            found = ci_gap.find_gaps(SetupGh(steps), "o/r", 7, "a" * 40, {"check": "true"},
+                                     [self.RUN], lambda: [], said.append)
+        finally:
+            globals()["SETUP_WORKFLOW"] = old
+        return found, said
+
+    def test_a_build_after_an_outer_configure_is_no_runnable_contract_line(self):
+        steps = [_step("Configure", "success"), _step("Build")]
+        gaps, said = self.gaps(EXTERNAL_WORKFLOW, steps)
+        self.assertEqual(gaps, [])
+        self.assertEqual(len(said), 1)
+        self.assertIn("needs workspace context a lane tree lacks", said[0])
+        self.assertIn("outer/modules/inner", said[0])
+        # No gap means no ticket suggestion and no fix-round instruction.
+        self.assertEqual(ci_gap.fix_notes([(g, 0) for g in gaps]), "")
+        # The same failing step with its own working directory is a gap whose
+        # directory is kept, and a failing step of a plain job still is one.
+        local = EXTERNAL_WORKFLOW.replace(
+            "        run: cmake --build",
+            "        working-directory: outer\n        run: cmake --build")
+        gaps, said = self.gaps(local, steps)
+        self.assertEqual([g.command for g in gaps],
+                         ["cd outer && cmake --build build --target inner_tests"])
+        self.assertEqual(said, [])
+        plain = EXTERNAL_WORKFLOW.replace("          path: outer/modules/inner\n", "")
+        gaps, _ = self.gaps(plain, steps)
+        self.assertEqual([g.step for g in gaps], ["Build"])
+
+
 class FirstPushStatusTest(unittest.TestCase):
     def test_the_rate_is_per_repo_and_a_pull_request_counts_once(self):
         with tempfile.TemporaryDirectory() as home:
