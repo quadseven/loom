@@ -3225,7 +3225,9 @@ class BudgetTest(Base):
         writes1 = gh1.kinds.get("writes", 0)
         self.assertLessEqual(gh1.counted, station.PASS_REQUEST_TARGET + writes1)
         self.assertIn("carried over", err1)
-        self.assertRegex(err1, r"carried over.*comments")
+        # The claim pass gives each free lane its own slice (loom#3210): the
+        # first lane's events read stops at its slice and the second lane's
+        # ticket still gets its comments read, so only events carry over.
         self.assertRegex(err1, r"carried over.*events")
         ticket_reads_path = os.path.join(self.home, "state", "station", "ticket_reads.json")
         st_reads1 = station._read_json(ticket_reads_path, {}, strict=False)
@@ -3234,7 +3236,7 @@ class BudgetTest(Base):
         gh2 = GitHub("token", transport=self.fake, target=100000)
         gh2, err2 = self.passes(gh=gh2)
         self.assertNotIn("carried over", err2)
-        self.assertGreater(gh2.kinds.get("comments", 0), 100)
+        self.assertGreater(gh1.kinds.get("comments", 0), 50)
         self.assertGreater(gh2.kinds.get("events", 0), 50)
 
     def test_a_pass_log_line_names_the_reads_carried_over_when_target_reached(self):
