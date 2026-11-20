@@ -917,10 +917,10 @@ upsert_sticky_comment() {
   fi
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   else
     timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   fi
   rm -f "$old_file" "$input_file" "$new_file"
   return "$ok"
