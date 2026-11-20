@@ -26,7 +26,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
 from . import lane_markers, lane_state, tick_clock
-from . import brief_check, home_repo, state_store
+from . import brief_check, home_repo, incident_probe, state_store
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
 # A comment the brain posts to cancel a pending brain fix (loom#1998): the
@@ -4196,6 +4196,7 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
 
 
 _REPO_REF = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+")
+_REPO_NUMBER = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
 
 def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
@@ -4215,6 +4216,51 @@ def _check_no_foreign_refs(gh: GitHub, repo: str, text: str) -> None:
     if not private:
         raise ValueError("this repo is public: name another repo's issue in words "
                          "(for example \"issue 12 of another repo\"), not as owner/name#N")
+
+
+def _incident_subjects(repo: str, env: Optional[Dict[str, str]]) -> List[str]:
+    """How a factory incident names `repo` on its Repo: line: the repo itself,
+    or "private repo <alias>" with the alias the lane host keeps for it."""
+    subjects = [repo]
+    home = (env if env is not None else os.environ).get("LOOM_HOME") or ""
+    path = os.path.join(home, "state", "incidents", repo.replace("/", "_") + ".alias")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            alias = "".join(c for c in handle.read() if c in "0123456789abcdef")
+    except OSError:
+        alias = ""
+    if len(alias) == 8:
+        subjects.append("private repo %s" % alias)
+    return subjects
+
+
+def _repairs_header_for(gh: GitHub, repo: str, body: str, given: Optional[int],
+                        env: Optional[Dict[str, str]]) -> Optional[int]:
+    """The open base-check incident of `repo` the brief's body names, so the
+    ticket carries the Repairs incident header the lane needs to run past the
+    red base (incident_probe.is_fix). `given` is the --repairs-incident number:
+    kept when it is one of the named incidents, refused when the body names
+    another. Only owner/name#N of the factory repo counts; a body that names
+    none leaves `given` as it is."""
+    factory = home_repo.home_repo(env)
+    if not factory:
+        return given
+    numbers = sorted({int(m.group(2)) for m in _REPO_NUMBER.finditer(body)
+                      if m.group(1).lower() == factory.lower()})
+    subjects = _incident_subjects(repo, env)
+    named = []
+    for number in numbers:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % (factory, number), ok=(404,)).data
+        if incident_probe.open_base_check(issue) and any(
+                "Repo: %s" % x in str(issue.get("body") or "").splitlines() for x in subjects):
+            named.append(number)
+    if not named or given in named:
+        return given
+    if given is not None or len(named) > 1:
+        raise ValueError("the brief names open base-check incident(s) %s of this repo: "
+                         "pass --repairs-incident with one of them"
+                         % ", ".join("#%d" % n for n in named))
+    return named[0]
 
 
 def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
@@ -4307,6 +4353,7 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
     if base is None:
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
+    repairs_incident = _repairs_header_for(gh, repo, body, repairs_incident, env)
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
                              repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
