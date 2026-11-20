@@ -8435,7 +8435,41 @@ class Station:
                      repeat=incident_probe.last_repeat(issue, comments))
         for key in keys:
             self._release_fix(ref, key, comments)
+        self._file_cause(ref, issue, comments)
         return True
+
+    def _file_cause(self, ref: str, issue: Dict[str, Any], comments: List[Any]) -> None:
+        """File one cause ticket in the repo of an incident that failed
+        CAUSE_AFTER times with no `Cause:` line, and write the line into the
+        incident so no repeat files a second one (loom#2983). A repo with no
+        goal home or intake epic gets the reason on the line instead."""
+        body = issue.get("body")
+        repo = incident_probe.incident_repo(body)
+        incident_repo, _, raw = ref.rpartition("#")
+        if (not repo or incident_probe.has_cause(body) or not raw.isdigit()
+                or incident_probe.repeat_count(comments) < incident_probe.CAUSE_AFTER
+                or tickets._login(issue.get("user")).lower() not in
+                {a.lower() for a in self.s.authors}):
+            return
+        try:
+            goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
+            line = "none filed, %s has no goal home" % repo
+            if goal is not None:
+                title, text = incident_probe.cause_ticket(ref, body)
+                try:
+                    url = brain.brief_intake(self.gh, repo, goal, title, text,
+                                             difficulty="medium")
+                    line = "%s#%s" % (repo, str(url).rstrip("/").rpartition("/")[2])
+                except ValueError as err:
+                    line = "none filed, no intake epic could take it (%s)" % err
+            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw),
+                         {"body": incident_probe.with_cause(body, line)})
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident probe: could not file a cause for incident %s: %s" % (ref, err))
+            return
+        _say("incident probe: incident %s names its cause: %s" % (ref, line))
 
     def _release_fix(self, ref: str, key: str, comments: List[Any]) -> None:
         """Re-queue a held ticket that is the open incident's fix, with a
