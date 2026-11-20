@@ -551,6 +551,9 @@ def keep(line: str) -> bool:
     verify run (VERIFY_RUN_RE) and a designed station outcome (EXPECTED_RES).
     A relayed CI log line is the run's output (CI_LOG_RE)."""
     bare = _LEAD_RE.sub("", line).rstrip("\r\n")
+    # An escaped run-log tail (a literal backslash-n and what follows) does
+    # not turn a designed outcome into an error.
+    bare = bare.split("\\n", 1)[0]
     if HOLD_RE.fullmatch(bare) or any(r.fullmatch(bare) for r in EXPECTED_RES):
         return False
     if brain_status(line):
