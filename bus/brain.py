@@ -1353,6 +1353,8 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                       + _mid_round_note(at, "pr"))
         if reason:
             found.append(reason)
+    if not _loom_head_ok(repo, pr, {}):
+        found.append("pull request head is not a loom branch")
     held = _hold_box_reason(gh, repo, pr, ticket, issue)
     if held:
         found.append(held.removeprefix("blocked: "))
@@ -6130,16 +6132,23 @@ def _await_settled(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
     return pr, details
 
 
-def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
-                       env: Optional[Dict[str, str]] = None) -> None:
+def _loom_head_ok(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
+                  env: Optional[Dict[str, str]] = None) -> bool:
+    """A loom/ head, or a linked pull request by a trusted lane author: the one
+    rule merge and status share for the head branch."""
     head_ref = str((pr.get("head") or {}).get("ref") or details.get("headRefName") or "")
     trusted_lane_head = (
         _ticket_association(repo, pr) is not None
         and _pr_author(pr).lower() in {a.lower() for a in trusted_authors(env)})
+    return head_ref.startswith("loom/") or trusted_lane_head
+
+
+def _validate_merge_pr(repo: str, pr: Dict[str, Any], details: Dict[str, Any],
+                       env: Optional[Dict[str, str]] = None) -> None:
     rules = [
         (pr.get("state") == "open", "pull request is not open"),
         (not (details.get("isDraft") or pr.get("draft")), "pull request is a draft"),
-        (head_ref.startswith("loom/") or trusted_lane_head,
+        (_loom_head_ok(repo, pr, details, env),
          "pull request head is not a loom branch"),
         (_same_repo(repo, pr, details), "pull request must use the same repository"),
         (_mergeable(pr),
