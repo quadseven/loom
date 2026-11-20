@@ -6007,7 +6007,7 @@ class Factory:
                 counts[found.kind] += 1
                 names = _labels(issue)
                 triage = labels.in_triage(names)
-                if triage and (not found.at or labels.waiting_on_person(names)):
+                if triage and labels.waiting_on_person(names):
                     continue
                 if found.kind == brain_hold.LOOM:
                     due.append((age, repo, issue, found, triage))
