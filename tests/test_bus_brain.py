@@ -3922,8 +3922,11 @@ def fixc(at):
             "user": {"login": BRAIN}}
 
 
-def stuck_ticket(*states, body="Model: claude-sonnet-5-5\n\n" + BODY, created="2030-01-01T00:00:00Z"):
-    names = ["loom:ticket", "lane:claude"] + ["loom:" + x for x in states]
+def stuck_ticket(*states, body="Model: claude-sonnet-5-5\n\n" + BODY, created="2030-01-01T00:00:00Z",
+                 lane="codex-2"):
+    # The default lane is not one of rung 1's lanes, so a ticket on the
+    # first model does not already wait on its next rung (loom#3238).
+    names = ["loom:ticket", "lane:" + lane] + ["loom:" + x for x in states]
     return {"number": 9, "state": "open", "title": "T", "body": body, "created_at": created,
             "labels": [{"name": n} for n in names]}
 
@@ -4226,7 +4229,7 @@ class EscalateTests(unittest.TestCase):
     def test_escalate_takes_a_briefed_ticket_off_its_old_lane_in_the_count(self):
         # The stuck ticket sat briefed on claude, so it was counted there:
         # moving it to codex takes one off claude and puts one on codex.
-        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD), [], [],
+        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD, lane="claude"), [], [],
                                         free=("claude", "codex")), {REPO: {"claude": 5, "codex": 1}})
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
