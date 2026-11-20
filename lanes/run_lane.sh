@@ -2503,20 +2503,38 @@ record_base_flake() {  # base commit, first exit, bounded first-run excerpt
 # What failed in a check, from the log past byte $1: the tests it named (unittest
 # FAIL:/ERROR:, pytest FAILED/ERROR, go --- FAIL:) and the tools the shell could
 # not find, else its last line, so a validation record says why (loom#2418).
-check_failures() {  # log offset
-  local out names
+check_failure_names() {  # log offset: one failing name a line, at most 20
+  local out
   out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
   # LC_ALL=C: a check's output may be any bytes, and BSD sed and cut stop at
   # one that is not UTF-8.
-  names="$(printf '%s\n' "$out" | LC_ALL=C sed -nE \
+  printf '%s\n' "$out" | LC_ALL=C sed -nE \
     -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
     -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
-    awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
+    awk '!seen[$0]++' | head -n 20
+}
+check_failures() {  # log offset
+  local out names
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  names="$(check_failure_names "$1" | paste -sd ',' - | sed 's/,/, /g')"
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
+}
+# The first three failing test names a check named past the log offset $1,
+# "a, b, c" and, past three, ", and N more"; nothing when it named none
+# (loom#3198). One line, at most 400 characters.
+failing_summary() {  # log offset
+  local all total
+  all="$(check_failure_names "$1")"
+  [ -n "$all" ] || return 0
+  total="$(printf '%s\n' "$all" | wc -l | tr -d ' ')"
+  {
+    printf '%s\n' "$all" | head -n 3 | paste -sd ',' - | sed 's/,/, /g' | tr -d '\n'
+    [ "$total" -le 3 ] || printf ', and %s more' "$(( total - 3 ))"
+  } | LC_ALL=C cut -c1-400
 }
 # Error lines from a check's output for incident details: up to 8 lines
 # matching error|Error|FAILED|make: \*\*\*, each cut to 200 chars, or the
@@ -3533,7 +3551,7 @@ final_base_tests() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset failing
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -3566,6 +3584,7 @@ final_validation() {
      [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
     first_exit="$rc"
     record final "$C_CHECK" "$rc" "$rev" false
+    output_offset="$(wc -c < "$LOG")"
     contract_run "$C_CHECK"; rc=$?
     if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
       VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
@@ -3595,6 +3614,8 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  failing=""
+  [ "$rc" -eq 0 ] || [ "$rc" -ge 124 ] || failing="$(failing_summary "$output_offset")"
   if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
      tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
        python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
@@ -3622,9 +3643,10 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
-    *) [ -n "$VALIDATION_REASON" ] || VALIDATION_REASON="validation failed: the check exited $rc" ;;
+    *) [ -n "$VALIDATION_REASON" ] ||
+         VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
