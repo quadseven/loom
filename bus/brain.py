@@ -515,15 +515,16 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             warnings: List[str] = []
             loose, tree = goal_tree(gh, repo, int(issue["number"]), light=True,
                                    warnings=warnings)
+            children = _flatten(loose, tree, repo)
             lines.extend("  - warning: unresolved sub-issue %s" % warning
                          for warning in warnings)
             if shares is not None:
-                shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree, repo), issues, repo)
-            held, waiting = _count_unproven(_flatten(loose, tree, repo))
+                shares[int(issue["number"])] = goal_human_share(children, issues, repo)
+            held, waiting = _count_unproven(children)
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
                          % (held, limit, waiting))
-            apart = sum(1 for i in _flatten(loose, tree, repo) if _held_for_live_event(i))
+            apart = sum(1 for i in children if _held_for_live_event(i))
             if apart:
                 lines.append("  - %d more are held for a rare live event (%s): counted apart "
                              "from open work" % (apart, WAIT_LIVE_EVENT))
@@ -534,9 +535,10 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                              "brain files no ordinary brief for this goal until it is back under")
             # loom#1534: a goal where nothing moved is owed no report; each
             # one emailed its author "nothing moved" four times a day.
-            still = quiet.quiet(comments, _flatten(loose, tree, repo),
+            still = quiet.quiet(comments, children,
                                 goal_breaches(issues, int(issue["number"])), now, authors)
             lines += _quiet_lines(still)
+            lines.extend("  - " + reason for reason in quiet.stuck_triage(children, now))
         if naming.is_backlog_home(issue):
             # A backlog goal posts no report on GitHub: its line is in the
             # station's twice-daily Discord digest (2026-10-25).

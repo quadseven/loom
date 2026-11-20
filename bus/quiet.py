@@ -173,9 +173,21 @@ def _standing(issue: Dict[str, Any], now: datetime, stuck_age: float) -> List[st
     elif "loom:pr" in names and created is not None \
             and (now - created).total_seconds() > stuck_age:
         out.append("#%s is stuck in loom:pr" % n)
-    elif triage and not waiting and created is not None \
-            and (now - created).total_seconds() > TRIAGE_STUCK_AGE:
-        out.append("#%s is stuck in loom:triage" % n)
+    return out
+
+
+def stuck_triage(children: Iterable[Any], now: datetime) -> List[str]:
+    """One line for each open triage issue older than TRIAGE_STUCK_AGE that
+    waits on no person. These are reported, not movement: an issue that is
+    old and stuck has not moved, so `moved` leaves them out."""
+    out = []
+    for issue in children:
+        if not isinstance(issue, dict) or issue.get("state", "open") != "open":
+            continue
+        names, created = _labels(issue), _at(issue.get("created_at"))
+        if in_triage(names) and not waiting_on_person(names) and created is not None \
+                and (now - created).total_seconds() > TRIAGE_STUCK_AGE:
+            out.append("#%s is stuck in loom:triage" % issue.get("number"))
     return out
 
 
