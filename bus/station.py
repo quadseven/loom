@@ -1150,7 +1150,7 @@ class Settings:
                  live_evidence_env: Optional[Dict[str, str]] = None,
                  live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
-                 roll_pin_exempt: Optional[Sequence[str]] = None,
+                 roll_pin_exempt: Sequence[str] = (),
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
@@ -1277,7 +1277,7 @@ class Settings:
         # reads the lender's LOG adapter only (live_adapter.lends).
         self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
-        self.roll_pin_exempt = tuple(roll_pin_exempt or ())
+        self.roll_pin_exempt = tuple(roll_pin_exempt)
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
