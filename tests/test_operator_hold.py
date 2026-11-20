@@ -623,6 +623,36 @@ class FactoryHold(Base):
             with self.subTest(answer=answer):
                 self.assertEqual(operator_hold._manual_listed(GH(answer), "o/r", "main"), [])
 
+    def test_a_patchless_manifest_is_read_before_it_is_held(self):
+        # Kept behavior: a file GitHub sends no patch for still counts when it
+        # is a deploy manifest, when the read fails, and a patch decides alone.
+        pr = {"number": 8, "base": {"ref": "main", "sha": "b" * 40},
+              "head": {"sha": "a" * 40}}
+
+        class GH:
+            def __init__(self, answer):
+                self.answer = answer
+                self.paths = []
+
+            def rest(self, method, path, body=None, ok=()):
+                self.paths.append(path)
+                if isinstance(self.answer, Exception) and "k/app" in path:
+                    raise self.answer
+                return type("R", (), {"data": self.answer})()
+
+        deployment = base64.b64encode(b"apiVersion: apps/v1\nkind: Deployment\n").decode()
+        removed = {"filename": "k/app.yaml", "status": "removed", "patch": None}
+        found = operator_hold.placement_files(GH({"content": deployment}), "o/r", pr, [removed])
+        self.assertEqual(found, ["k/app.yaml"])
+        broken = GH(operator_hold.GitHubError("boom"))
+        broken.answer = operator_hold.GitHubError("boom")
+        self.assertEqual(operator_hold.placement_files(broken, "o/r", pr, [removed]),
+                         ["k/app.yaml"])
+        patched = {"filename": "k/app.json", "status": "modified", "patch": "+x"}
+        gh = GH({"content": deployment})
+        self.assertEqual(operator_hold.placement_files(gh, "o/r", pr, [patched]), [])
+        self.assertEqual(gh.paths, [])
+
     def test_a_change_to_the_deploy_rules_beside_a_placement_change_is_held(self):
         # Security review: the base branch's listing cannot stand when the
         # pull request edits it or a workflow.
