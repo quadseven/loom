@@ -980,6 +980,14 @@ def verify_note_text(shipped_at: float, now: float) -> str:
             % (time.strftime("%Y-%m-%d", time.gmtime(now)), waited))
 
 
+def _only_live_boxes_open(body: Optional[str]) -> bool:
+    """Whether the ticket has an open box and none of them is one a lane can
+    build: every unticked box is a Live or operator box."""
+    open_kinds = [criteria_gate.kind(text) for checked, text in proof.criteria(body or "")
+                  if not checked]
+    return bool(open_kinds) and criteria_gate.CODE not in open_kinds
+
+
 def live_needles(body: Optional[str]) -> Optional[List[str]]:
     """Needles for a Live criterion, or None when the ticket has no Live line."""
     live = brain.live_criterion(body, limit=None)
@@ -1153,6 +1161,7 @@ class Settings:
                  live_evidence_env: Optional[Dict[str, str]] = None,
                  live_evidence_lends: Optional[Dict[str, str]] = None,
                  roll_ship_docs: Optional[List[Dict[str, str]]] = None,
+                 roll_pin_exempt: Sequence[str] = (),
                  pin_ship_repos: Sequence[str] = (),
                  briefers: Sequence[str] = (),
                  ship_on_merge: Sequence[str] = (),
@@ -1279,6 +1288,7 @@ class Settings:
         # reads the lender's LOG adapter only (live_adapter.lends).
         self.live_evidence_lends = dict(live_evidence_lends or {})
         self.roll_ship_docs = roll_ship_docs or []
+        self.roll_pin_exempt = tuple(roll_pin_exempt)
         # Local times (hour, minute) to send one digest of every goal's
         # reports; empty forwards each report as it is posted.
         self.report_digest = tuple(report_digest)
@@ -1419,6 +1429,7 @@ class Settings:
                    friction_mode=friction_intake.mode(env.get("LOOM_FRICTION_INTAKE", "")),
                    roll_ship_docs=roll_pin.specs_from_env(env.get("LOOM_ROLL_SHIP_DOCS", "")),
                    pin_ship_repos=words("LOOM_PIN_SHIP_REPOS"),
+                   roll_pin_exempt=words("LOOM_ROLL_PIN_EXEMPT"),
                    briefers=words("LOOM_TRUSTED_BRIEFERS"),
                    ask_answerers=ask_state.answerers(env),
                    ship_on_merge=words("LOOM_SHIP_ON_MERGE"),
@@ -2098,6 +2109,13 @@ def fix_pr_merged(fix_pr: str, reason: str) -> bool:
     fix_pr, merged before the lane ran it (PR_GONE_RE)."""
     m = PR_GONE_RE.match(CLASS_RE.sub("", reason))
     return bool(m) and m.group(1) == fix_pr and m.group(2) == "MERGED"
+
+
+def fix_pr_closed(fix_pr: str, reason: str) -> bool:
+    """Whether a fix brief was parked unrun because its own pull request,
+    fix_pr, was closed without a merge (PR_GONE_RE)."""
+    m = PR_GONE_RE.match(CLASS_RE.sub("", reason))
+    return bool(m) and m.group(1) == fix_pr and m.group(2) == "CLOSED"
 
 
 def lane_takes_model(lane: str, model: str) -> bool:
@@ -3438,7 +3456,8 @@ class Station:
         credit = self._anthropic_spend() if labels.base_lane(lane) == "anthropic" else None
         beat = self._local_beat(lane)
         return lane_state.evaluate(beat, self.now, credit=credit, parked=parked,
-                                   has_job=lane not in self._missing_lane_jobs)
+                                   has_job=lane not in self._missing_lane_jobs,
+                                   running=self._keepalive_fresh(lane))
 
     def _heartbeat_ok(self, lane: str) -> bool:
         return self._lane_state(lane).available
@@ -5824,7 +5843,10 @@ class Station:
         already judged for it: one it sent back for unbuilt criteria, or one
         a verify run found wanting (tickets.judged_pulls)."""
         names = _label_names(issue)
-        if set(names) & {REGRESSION, factory.REVERT_LABEL} or live_needles(issue.get("body")) == []:
+        if set(names) & {REGRESSION, factory.REVERT_LABEL}:
+            return False
+        blank = live_needles(issue.get("body")) == []
+        if blank and not _only_live_boxes_open(issue.get("body")):
             return False
         number = int(issue["number"])
         merged = self._merged_linked(repo, issue) or self._merged_cited(repo, issue)
@@ -5846,6 +5868,9 @@ class Station:
         issue["labels"] = [{"name": n} for n in labels]
         self._routine(repo, number, tickets.MERGED_FIRST_NOTE % (
             int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
+        if blank:
+            self._routine(repo, number, tickets.LIVE_RESTATE_NOTE)
+            self._add_label(repo, number, "needs-brain")
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
         return True
@@ -8970,8 +8995,15 @@ class Station:
         last = converge.last_fix_body(comments, authors, (repo, pr_number))
         persisted = converge.persistent(
             last, failing, threads, ignore=(self.s.review_check, self.s.plan_check) + tuple(flaky))
+        timed_out = self._timed_out_round(comments, last, sha) if persisted or failed else None
+        if timed_out:
+            # The round pushed nothing, so the same failures prove nothing
+            # about the model; the next round merges the kept branch.
+            _say("%s#%d: its fix round timed out before it pushed (kept branch %s); not "
+                 "counted as persisted" % (repo, number, timed_out))
+            persisted = []
         review_output = next((tail for name, tail in failed if name == self.s.review_check), "")
-        review_failed = factory.review_findings_remain(
+        review_failed = not timed_out and factory.review_findings_remain(
             last or "", threads, self.s.review_check, review_output)
         if persisted or review_failed:
             reasons = persisted or ["check " + self.s.review_check]
@@ -8987,6 +9019,28 @@ class Station:
             return
         self._post_fix_comment(repo, number, pr_number, detail, sha, failed, threads, comments)
         self._move_fix_to_lane(repo, number, lane, names)
+
+    def _timed_out_round(self, comments: List[Any], last: Optional[str],
+                         sha: str) -> Optional[str]:
+        """The kept branch of a newest fix round that ended `[transient]` on a
+        timeout and pushed nothing: the head is still the one its fix brief
+        named and a later trusted comment names the branch. None otherwise."""
+        head = brain.FIX_HEAD_RE.search(last or "")
+        if not head or not sha or not sha.startswith(head.group(1)):
+            return None
+        allowed = {a.lower() for a in self.s.authors}
+        expanded = status.expand(comments, self.s.authors)
+        if not isinstance(expanded, list):
+            return None
+        sent = [factory.ts_of(c.get("created_at")) for c in expanded
+                if isinstance(c, dict) and str(c.get("body") or "") == last]
+        if not sent:
+            return None
+        return tickets.timedout_branch(
+            [str(c.get("body") or "") for c in expanded
+             if isinstance(c, dict) and tickets._login(c.get("user")).lower() in allowed
+             and "[transient]" in str(c.get("body") or "")
+             and factory.ts_of(c.get("created_at")) > max(sent)])
 
     @staticmethod
     def _rung_round_count(comments: List[Any], authors: set) -> int:
@@ -9326,6 +9380,9 @@ class Station:
             return True
         if fix_pr_merged(fix_pr, reason):
             self._fix_pr_merged(repo, number, lane, int(fix_pr))
+            return True
+        if fix_pr_closed(fix_pr, reason):
+            self._fix_pr_closed(repo, number, lane, int(fix_pr))
             return True
         no_change_result = self._report_box_no_change(repo, number, lane, text, name, bare)
         if no_change_result is not None:
@@ -9810,6 +9867,19 @@ class Station:
                       "pull request #%d merged before lane %s ran its fix round; nothing "
                       "ran, which is not a failure" % (pr, lane))
         _say("reported %s#%d: pull request #%d merged before lane %s's fix round"
+             % (repo, number, pr, lane))
+
+    def _fix_pr_closed(self, repo: str, number: int, lane: str, pr: int) -> None:
+        """A fix brief the runner parked unrun because its pull request was
+        closed without a merge. Nothing ran, so no rung is spent. The claim
+        that sent the run is newer than the ticket's loom:fix comment, so the
+        stale fix is retired (_fix_with_source) and the ticket, back at
+        loom:queued, gets a fresh build brief on its current rung."""
+        self._relabel(repo, number, "loom:queued")
+        self._stopped(repo, number, lane, "transient",
+                      "pull request #%d was closed unmerged before lane %s ran its fix round; "
+                      "nothing ran, which is not a failure" % (pr, lane))
+        _say("reported %s#%d: pull request #%d closed before lane %s's fix round"
              % (repo, number, pr, lane))
 
     def _post_answers(self, repo: str, pr: int, lane: str, name: str, brief: str) -> None:
@@ -14706,6 +14776,7 @@ class Station:
             _say("invariants: could not read the goal tickets: %s" % err)
         facts.roll_goals = self._roll_goals(homes)
         facts.roll_docs = len(self.s.roll_ship_docs)
+        facts.roll_exempt = self.s.roll_pin_exempt
         try:
             facts.journals, facts.posts = self._invariant_comments(homes)
         except RateLimited:

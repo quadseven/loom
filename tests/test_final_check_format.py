@@ -18,16 +18,22 @@ if [ "$1" = --check ]; then
   grep -qx fixed fix.txt 2> /dev/null || exit 0
   if ! grep -qx formatted fix.txt; then echo "Would reformat: fix.txt"; bad=1; fi
   if [ -n "EXTRA" ]; then echo "Would reformat: EXTRA"; bad=1; fi
+  if [ "RETRY_FAILS" = yes ]; then
+    if [ "$bad" -eq 0 ]; then echo "FAIL: after_format"; else echo "FAIL: before_format"; fi
+    bad=1
+  fi
   exit "$bad"
 fi
+[ "RETRY_FAILS" != yes ] || echo "FAIL: formatter_output"
 for f in "$@"; do grep -qx formatted "$f" || echo formatted >> "$f"; done
 """
 
 
 class FinalCheckFormatTest(base.LaneRunnerTest):
-    def format_lane(self, extra=""):
+    def format_lane(self, extra="", retry_fails=False):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
-        self.write_tool(self.bin / "ruff", FAKE_RUFF.replace("EXTRA", extra))
+        ruff = FAKE_RUFF.replace("EXTRA", extra).replace("RETRY_FAILS", "yes" if retry_fails else "no")
+        self.write_tool(self.bin / "ruff", ruff)
         self.contract_repo(contract="interpreter: loom-test-python\ncheck: ruff format --check .\n")
         self.drop_brief()
         return self.run_contract_lane()
@@ -43,6 +49,12 @@ class FinalCheckFormatTest(base.LaneRunnerTest):
             ["git", "-C", str(self.remote), "log", "--all", "--format=%s"],
             capture_output=True, text=True, check=True).stdout
         self.assertIn("format: apply ruff format to the lane's changed files", subjects)
+
+    def test_retry_reports_only_failures_from_the_second_check(self):
+        result = self.format_lane(retry_fails=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        finals = [r for r in self.records() if r["phase"] == "final"]
+        self.assertEqual(finals[-1]["detail"], "second run after exit 1; failing: after_format")
 
     def test_a_file_the_lane_did_not_change_is_never_formatted(self):
         result = self.format_lane(extra="check.py")

@@ -1289,6 +1289,23 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
+  APP_TOKEN_AT="$(date +%s)"
+}
+
+# A run can outlive its installation token (one hour), so each GitHub write
+# that can come late in a run mints again once the token is older than
+# LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
+# the log and keeps the old token, which may still work (loom#3231).
+fresh_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
+  now="$(date +%s)"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=2700
+  [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
+  lane_app_token && return 0
+  [ -z "$old" ] || export GH_TOKEN="$old"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  return 1
 }
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
@@ -1353,6 +1370,7 @@ post_park_note() {  # failure class, reason
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
+  fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
     grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
@@ -2503,20 +2521,38 @@ record_base_flake() {  # base commit, first exit, bounded first-run excerpt
 # What failed in a check, from the log past byte $1: the tests it named (unittest
 # FAIL:/ERROR:, pytest FAILED/ERROR, go --- FAIL:) and the tools the shell could
 # not find, else its last line, so a validation record says why (loom#2418).
-check_failures() {  # log offset
-  local out names
+check_failure_names() {  # log offset: one failing name a line, at most 20
+  local out
   out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
   # LC_ALL=C: a check's output may be any bytes, and BSD sed and cut stop at
   # one that is not UTF-8.
-  names="$(printf '%s\n' "$out" | LC_ALL=C sed -nE \
+  printf '%s\n' "$out" | LC_ALL=C sed -nE \
     -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
     -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
-    awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
+    awk '!seen[$0]++' | head -n 20
+}
+check_failures() {  # log offset
+  local out names
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  names="$(check_failure_names "$1" | paste -sd ',' - | sed 's/,/, /g')"
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
+}
+# The first three failing test names a check named past the log offset $1,
+# "a, b, c" and, past three, ", and N more"; nothing when it named none
+# (loom#3198). One line, at most 400 characters.
+failing_summary() {  # log offset
+  local all total
+  all="$(check_failure_names "$1")"
+  [ -n "$all" ] || return 0
+  total="$(printf '%s\n' "$all" | wc -l | tr -d ' ')"
+  {
+    printf '%s\n' "$all" | head -n 3 | paste -sd ',' - | sed 's/,/, /g' | tr -d '\n'
+    [ "$total" -le 3 ] || printf ', and %s more' "$(( total - 3 ))"
+  } | LC_ALL=C cut -c1-400
 }
 # Error lines from a check's output for incident details: up to 8 lines
 # matching error|Error|FAILED|make: \*\*\*, each cut to 200 chars, or the
@@ -3561,7 +3597,7 @@ format_changed_files() {
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset failing
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -3596,6 +3632,7 @@ final_validation() {
     record final "$C_CHECK" "$rc" "$rev" false
     format_changed_files "$output_offset"
     rev="$(safe_git rev-parse HEAD)"
+    output_offset="$(wc -c < "$LOG")"
     contract_run "$C_CHECK"; rc=$?
     if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
       VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
@@ -3625,11 +3662,21 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  failing=""
+  [ "$rc" -eq 0 ] || [ "$rc" -ge 124 ] || failing="$(failing_summary "$output_offset")"
   if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
      tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
        python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
     PARK_CLASS=transient
     VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ "${BASELINE_EXIT:-}" = 0 ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_refusal; then
+    # Every failure is the sandbox refusing an operation, in a check the base
+    # run may never have executed: the environment, not the agent's work.
+    PARK_CLASS=factory
+    VALIDATION_REASON="validation environment unavailable: sandbox refusal (Operation not permitted) in the final check"
   fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -3652,9 +3699,10 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
-    *) [ -n "$VALIDATION_REASON" ] || VALIDATION_REASON="validation failed: the check exited $rc" ;;
+    *) [ -n "$VALIDATION_REASON" ] ||
+         VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
@@ -3858,6 +3906,10 @@ push_side() {
   range="$BASE..$from"
   [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
   [ "${REPO_PRIVATE:-}" = true ] && scan=(--personal-data)
+  if ! fresh_app_token; then
+    printf 'the GitHub App token could not be refreshed; the edits are committed in the lane tree'
+    return 1
+  fi
   if ! (cd "$TREE" && leak_scan --diff "$range" "${scan[@]}") >> "$LOG" 2>&1; then
     printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
     return 1
@@ -4123,8 +4175,21 @@ update_fix_branch() {
   fi
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge-base HEAD "origin/$default" > /dev/null 2>&1; then
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+    # Two fetches on one shallow tree can race ("shallow file has changed since
+    # we read it"), so the deepening is tried a second time after a pause, as
+    # fetch_base_for_contract does.
+    local try
+    for try in 1 2; do
+      timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        fetch -q --unshallow origin >> "$LOG" 2>&1 && break
+      [ "$try" -eq 2 ] || sleep 3
+    done
+    # Still no common commit: a merge would only say "unrelated histories" and
+    # be read as the agent's failure, so name the shallow tree instead.
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+         merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+      UPDATE_REASON="could not deepen the shallow tree to merge $default"; return 1
+    fi
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
@@ -5530,6 +5595,7 @@ for BRIEF in "$INBOX"/*.md; do
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
+    fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
       if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then
