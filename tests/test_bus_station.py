@@ -257,6 +257,8 @@ class FakeGitHub:
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
             return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
+        if method == "GET" and parts.path == "/repos/%s/commits/main" % REPO:
+            return reply(200, {"sha": "a" * 40})
         changed = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, parts.path)
         if method == "GET" and changed and changed.group(1) in self.commit_files:
             return reply(200, {"sha": changed.group(1).ljust(40, "0"),
