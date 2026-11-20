@@ -218,7 +218,7 @@ def with_shipped_backlog(text: str, now: Optional[datetime] = None) -> str:
 
 
 # A handoff marker the brain wrote as a list item: GitHub hides the comment
-# and shows an empty bullet (loom#3321, seven in one wow-overseer tick).
+# and shows an empty bullet (loom#3321: seven in one tick).
 _MARKER_ITEM = re.compile(r"^[ \t]*[-*+][ \t]+(<!-- loom:(?:done|defer) v1 [^\n]*?-->)[ \t]*(?:\r?\n|$)", re.M)
 # A goal-home issue or pull request named in words with a bare number, which
 # GitHub does not link. "issue N of another repo" (_public_refs) stays words.
