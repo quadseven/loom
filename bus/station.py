@@ -9530,6 +9530,13 @@ class Station:
     def _retry_factory_check(self, repo: str, number: int, lane: str, reason: str) -> None:
         note = self._retry(repo, number, lane, "transient", reason)
         if note:
+            bare = CLASS_RE.sub("", reason)
+            if HELD_FOR_RE.search(bare):
+                # No other lane can run the check, and the reason names the
+                # open incident: hold the ticket for it, so it returns to its
+                # rung when the incident closes and is not left failed.
+                self._report_factory_hold(repo, number, lane, bare, reason)
+                return
             self._requeue_transient(repo, number, lane, reason, note)
 
     def _report_box_no_change(self, repo: str, number: int, lane: str, text: str,
