@@ -291,7 +291,11 @@ def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
 # What merge_ready reads for one pull request: the head commit's time and
 # check rollup, the reviews, and each review thread's state and first comment.
 READY_FIELDS = (
-    "isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    "isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state"
+    # The head's check runs, so status reads the review check with no extra
+    # request per pull request (loom#3100).
+    " contexts(first:100) { pageInfo { hasNextPage } nodes { __typename"
+    " ... on CheckRun { name status conclusion } } } } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { totalCount nodes { isResolved"
@@ -1244,7 +1248,8 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     if stacked:
         line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
-        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
+        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now,
+                                     node=node):
             line = _add_blocker(line, blocker)
     line = _pending_fix_blocker(gh, repo, int(pr["number"]), ticket, authors, line)
     hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
@@ -1332,10 +1337,28 @@ def _repo_cap_refusal(gh: GitHub, repo: str, caps: Optional[Dict[str, str]],
         return caps[repo]
 
 
+def _node_review_check(node: Optional[Dict[str, Any]], check: str) -> Optional[bool]:
+    """Whether the review check succeeded on the head, read from the check
+    runs status already fetched with the pull request; None when that read
+    holds no check-run data (or is cut at its page), which blocks nothing."""
+    commits = ((node or {}).get("commits") or {}).get("nodes") or []
+    rollup = (commits[-1].get("commit") or {}).get("statusCheckRollup") if commits else None
+    contexts = (rollup or {}).get("contexts")
+    if not isinstance(contexts, dict) or not isinstance(contexts.get("nodes"), list):
+        return None
+    for run in contexts["nodes"]:
+        if isinstance(run, dict) and run.get("name") == check:
+            return run.get("status") == "COMPLETED" and run.get("conclusion") == "SUCCESS"
+    if (contexts.get("pageInfo") or {}).get("hasNextPage"):
+        return None
+    return False
+
+
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                     ticket: Optional[Tuple[str, int]],
                     caps: Optional[Dict[str, str]] = None,
-                    now: Optional[datetime] = None) -> List[str]:
+                    now: Optional[datetime] = None,
+                    node: Optional[Dict[str, Any]] = None) -> List[str]:
     """What bus.brain merge would refuse a READY pull request for, read with
     the functions merge uses (loom#1643): its ticket's state, a conflict,
     a risk tier held for the operator, and the hourly merge cap."""
@@ -1369,6 +1392,12 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return list(merge_verdict.decide(pr, issue, found, ("operator",)).blockers)
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
+    elif tier != merge_tier.REVERT:
+        # merge refuses an auto tier unless the review check succeeded on the
+        # head (a neutral run is not enough), so status says so too.
+        check = review_check_name()
+        if _node_review_check(node, check) is False:
+            found.append("review check %s not success on head" % check)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
