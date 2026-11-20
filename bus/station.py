@@ -8219,7 +8219,7 @@ class Station:
         if not any(ref in str(c.get("body") or "") for c in event_comments
                    if isinstance(c, dict)):
             return
-        if self._claimed_since(event_comments, incident):
+        if self._claimed_since(event_comments, incident, at):
             return
         cleared = RUNAWAY in _label_names(issue)
         self._release_one(key, repo, number, issue, cleared,
@@ -8294,10 +8294,15 @@ class Station:
         return issue.get("state") == "open" and (
             RUNNING in names or {WAIT + "incident", "loom:queued"} <= set(names))
 
-    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any]) -> bool:
-        """A lane claim in a comment or the issue body is newer than close."""
+    def _claimed_since(self, comments: List[Any], incident: Dict[str, Any],
+                       held_at: Optional[float] = None) -> bool:
+        """A lane claim in a comment or the issue body is newer than the
+        incident's close and than the hold. A hold recorded after the close
+        is the claim's own outcome, so an earlier claim is not a new one."""
         from . import factory as _factory
         closed = self._epoch(str(incident.get("closed_at") or ""))
+        if closed is not None and held_at is not None:
+            closed = max(closed, held_at)
         return closed is not None and any(
             isinstance(c, dict)
             and _factory.CLAIMED_RE.fullmatch(str(c.get("body") or "").strip())
