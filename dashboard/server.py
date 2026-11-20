@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import re
 import hmac
@@ -10,6 +11,7 @@ import ssl
 import statistics
 import socket
 import socketserver
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -50,6 +52,8 @@ from bus.github import GitHubError
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
 from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
+LOG = logging.getLogger(__name__)
+
 
 def _all_tickets(state):
     payload = state.response()
@@ -1403,10 +1407,32 @@ def _ticket_detail_data(state, repo, number):
     return details.get(repo, number, prs, views.footer)
 
 
+NOT_READY_LOG_SECONDS = 60
+_not_ready_logged = [0.0]
+_not_ready_lock = threading.Lock()
+
+
+def _log_not_ready(state, now=None):
+    """Log why /readyz answers 503, at most once a NOT_READY_LOG_SECONDS: the
+    probe asks every few seconds, and the answer used to say nothing."""
+    now = time.monotonic() if now is None else now
+    # The server is threaded: check and set under one lock, so two probes
+    # arriving together cannot both log.
+    with _not_ready_lock:
+        if _not_ready_logged[0] and now - _not_ready_logged[0] < NOT_READY_LOG_SECONDS:
+            return False
+        _not_ready_logged[0] = now
+    reason = getattr(state, "not_ready_reason", None)
+    LOG.warning("readyz answered 503: %s", reason() if reason else "the first snapshot is not ready")
+    return True
+
+
 def _dispatch_basic(handler, state, path):
     if path == "/livez":
         return handler.send_text(200, "live")
     if path == "/readyz":
+        if not state.ready:
+            _log_not_ready(state)
         return handler.send_text(200 if state.ready else 503, "ready" if state.ready else "not ready")
     if path == "/api/tickets":
         return handler.send_json(200, _api_tickets(state.response()))
