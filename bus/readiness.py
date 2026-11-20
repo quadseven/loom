@@ -59,15 +59,10 @@ def _names(issue: Dict[str, Any]) -> List[str]:
             for x in issue.get("labels") or []]
 
 
-def classify(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Iterable[Any],
-             now: float, idle_seconds: float, own_logins: Iterable[str],
-             merged_pull: bool = False, own_apps: Iterable[str] = ()) -> Verdict:
-    """The Verdict for one open issue. `timeline` is its events, `pull_updates`
-    the updated_at stamps of the open pull requests naming it, `merged_pull`
-    whether a merged pull request names it."""
-    names = _names(issue)
-    events = [e for e in timeline if isinstance(e, dict)]
-    pulls = list(pull_updates)
+def _early(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any]],
+           merged_pull: bool) -> Optional[Verdict]:
+    """The verdicts that need no claim read: not a ticket, done, held for
+    outside work, or waiting on a person."""
     if "pull_request" in issue or "loom:ticket" not in names:
         return Verdict(HELD, "not a ticket")
     if merged_pull or any(n in DONE_STATES for n in names):
@@ -77,8 +72,14 @@ def classify(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Itera
     if human_claims.holder(issue, events) or any(
             n in PERSON_LABELS or n.startswith("needs:") for n in names):
         return Verdict(NEEDS_PERSON, "a person holds or must answer it")
-    if pulls:
-        return Verdict(HAS_PR, "an open pull request names it")
+    return None
+
+
+def _claimed(issue: Dict[str, Any], names: List[str], events: List[Dict[str, Any]],
+             pulls: List[Any], now: float, idle_seconds: float,
+             own_logins: Iterable[str], own_apps: Iterable[str]) -> Optional[Verdict]:
+    """The verdicts a claim decides: this Loom's own, stale or active, or
+    another operator's."""
     own = stale_claims.own_claims(issue, own_logins)
     if own:
         label = next(iter(own.values()))
@@ -87,6 +88,26 @@ def classify(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Itera
         return Verdict(HELD, "claimed and active")
     if stale_claims.claim_labels_not_ours(names, own_logins) or issue.get("assignees"):
         return Verdict(HELD, "another operator holds it")
+    return None
+
+
+def classify(issue: Dict[str, Any], timeline: Iterable[Any], pull_updates: Iterable[Any],
+             now: float, idle_seconds: float, own_logins: Iterable[str],
+             merged_pull: bool = False, own_apps: Iterable[str] = ()) -> Verdict:
+    """The Verdict for one open issue. `timeline` is its events, `pull_updates`
+    the updated_at stamps of the open pull requests naming it, `merged_pull`
+    whether a merged pull request names it."""
+    names = _names(issue)
+    events = [e for e in timeline if isinstance(e, dict)]
+    pulls = list(pull_updates)
+    early = _early(issue, names, events, merged_pull)
+    if early:
+        return early
+    if pulls:
+        return Verdict(HAS_PR, "an open pull request names it")
+    claimed = _claimed(issue, names, events, pulls, now, idle_seconds, own_logins, own_apps)
+    if claimed:
+        return claimed
     if any(n in RUNNING_STATES or n.startswith("wait:") for n in names):
         return Verdict(HELD, "a lane or a wait holds it")
     return Verdict(READY, "no claim, pull request, ask or merged work")
