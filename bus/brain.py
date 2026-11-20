@@ -1239,8 +1239,7 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     line = _status_pr_line(gh, repo, pr, node, bot, check)
     ticket = _safe_ticket_association(repo, pr)
     line = _docs_criterion_override(gh, repo, ticket, line)
-    stacked = _stacked_base_blocker(gh, repo, pr,
-                                    str(data.get("trunk") or ""))
+    stacked = _stacked_base_blocker(gh, repo, pr, str(data.get("trunk") or ""), ticket)
     if stacked:
         line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
@@ -1376,9 +1375,24 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                                      ("operator",) if found else ()).blockers)
 
 
+def _pr_goal_trunk(gh: GitHub, repo: str, ticket: Optional[Tuple[str, int]]) -> str:
+    """The Trunk: branch of the goal home the pull request's ticket belongs
+    to, or "" when the ticket, its goal or a trunk line cannot be read."""
+    if ticket is None or ticket[0] != repo:
+        return ""
+    try:
+        issue = gh.rest("GET", "/repos/%s/issues/%d" % ticket).data or {}
+        home = _goal_home_for_ticket(gh, repo, issue)
+    except GitHubError:
+        return ""
+    return goal_trunk(home) or "" if home else ""
+
+
 def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
-                          default_branch: str) -> str:
-    """Name an open stacked base pull request or its non-default branch."""
+                          default_branch: str,
+                          ticket: Optional[Tuple[str, int]] = None) -> str:
+    """Name an open stacked base pull request or its non-default branch. A
+    base equal to the Trunk: branch of the `ticket`'s goal is not stacked."""
     declared = re.search(r"\bstacked\s+on\s+(?:pull\s+request\s+)?#?(\d+)\b",
                          str(pr.get("body") or ""), re.I)
     if declared:
@@ -1396,7 +1410,10 @@ def _stacked_base_blocker(gh: GitHub, repo: str, pr: Dict[str, Any],
         return ""
     # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-stack:
     # Keep declared-parent handling separate from branch-parent lookup.
-    return _branch_stack_blocker(gh, repo, pr, base)
+    blocker = _branch_stack_blocker(gh, repo, pr, base)
+    if blocker == "stacked on branch %s" % base and base == _pr_goal_trunk(gh, repo, ticket):
+        return ""
+    return blocker
 
 
 def _branch_stack_blocker(gh: GitHub, repo: str, pr: Dict[str, Any], base: str) -> str:
@@ -5512,8 +5529,9 @@ def merge(gh: GitHub, repo: str, number: int,
         raise ValueError("--adopt merges a pull request that has no ticket")
     pr = gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
     base_repo = (pr.get("base") or {}).get("repo") or {}
-    stacked = _stacked_base_blocker(gh, repo, pr,
-                                    str(base_repo.get("default_branch") or ""))
+    stacked = _stacked_base_blocker(
+        gh, repo, pr, str(base_repo.get("default_branch") or ""),
+        ticket or _safe_ticket_association(repo, pr))
     if stacked:
         raise ValueError("blocked: " + stacked)
     details = _pr_graphql(gh, repo, number)
