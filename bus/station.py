@@ -8372,18 +8372,37 @@ class Station:
             at = entry.get("at")
             if not entry.get("open") or (self._num(at) and 0 <= self.now - at < every):
                 continue
-            lane = self._probe_lane(free, keys[0].rpartition("#")[0])
+            repo = keys[0].rpartition("#")[0]
+            # A probe on the head the last one failed on can only fail again.
+            head = self._default_head(repo)
+            if head and head == entry.get("base"):
+                continue
+            lane = self._probe_lane(free, repo)
             if lane is None:
                 continue
             name, text = incident_probe.brief(keys[0].rpartition("#")[0], lane, ref, int(self.now))
             claiming = self._write_brief(lane, name, text)
             os.replace(claiming, claiming[:-len(".claiming")] + ".md")
             entry["at"] = self.now
+            entry["base"] = head
             free = [x for x in free if x != lane]
             _say("handed lane %s a base check of %s for factory incident %s"
                  % (lane, keys[0].rpartition("#")[0], ref))
         _write_json(path, ledger)
         return free
+
+    def _default_head(self, repo: str) -> str:
+        """The head of the repo's default branch, or "" when it cannot be read."""
+        try:
+            branch = self._default_branch(repo)
+            commit = self.gh.rest(
+                "GET", "/repos/%s/commits/%s" % (repo, quote(branch, safe=""))).data \
+                if branch else None
+        except RateLimited:
+            raise
+        except GitHubError:
+            return ""
+        return str(commit.get("sha") or "") if isinstance(commit, dict) else ""
 
     def _read_probed_incident(self, ref: str, entry: Dict[str, Any], keys: List[str]) -> bool:
         """Read one held incident into its ledger entry and release its fix

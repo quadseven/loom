@@ -203,7 +203,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import human_claims, no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hold_boxes, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -1929,6 +1929,9 @@ def lane_state(lane: str) -> str:
 
 
 class Factory:
+    # How the base run of a remote-lane pull request gets a tree; None clones.
+    base_clone: Optional[Callable[[str, str], str]] = None
+
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -2263,8 +2266,17 @@ class Factory:
                           full: Dict[str, Any], issue: Dict[str, Any]) -> List[str]:
         """Check changed Python sources for vacuous lookup and fixture edits."""
         sha = str((full.get("head") or {}).get("sha") or "")
-        return vacuous.pull_findings(self.gh, repo, number, sha,
-                                     str(issue.get("body") or ""))
+        found = vacuous.pull_findings(self.gh, repo, number, sha,
+                                      str(issue.get("body") or ""))
+        if _lane(issue) not in REMOTE_LANES:
+            # A local lane's run already reported its own base pass.
+            return found
+        base = str((full.get("base") or {}).get("sha") or "")
+        if not base:
+            return found
+        modules = vacuous.added_test_modules(self.gh, repo, number)
+        return found + vacuous.base_run_findings(repo, base, sha, modules,
+                                                 self.base_clone)
 
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
@@ -4022,6 +4034,8 @@ class Factory:
             return
         if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
             return  # brought up to date less than the cooldown ago
+        if hold_boxes.hold_box_reason(str(issue.get("body") or "")):
+            return  # an unticked hold box: the ticket's pull request is not touched
         if self._hold_stands(repo, number, sha, _author(full)):
             return
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
