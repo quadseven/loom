@@ -34,7 +34,7 @@ import sys
 import urllib.error
 import urllib.request
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 from .github import _NoRedirect, read_ssm
 
@@ -153,10 +153,27 @@ def read(url: str, fetch: Fetch) -> object:
                         "not the product API's" % (url, len(raw))) from None
 
 
+def _decodings(path: str) -> List[str]:
+    """The path as written and after each percent-decoding, until it is stable.
+    A proxy or server may decode once or twice, so every form is judged."""
+    forms = [path]
+    for _ in range(4):
+        decoded = unquote(forms[-1])
+        if decoded == forms[-1]:
+            break
+        forms.append(decoded)
+    return forms
+
+
+def _unsafe(form: str) -> bool:
+    """A query, fragment, backslash or dot segment in one decoding of a path."""
+    return any(c in form for c in "?#\\") or any(
+        seg in (".", "..") for seg in form.split("/"))
+
+
 def check_path(path: str) -> str:
     """The path when it is a plain /api/ path, else ValueError saying why not."""
-    if not path.startswith("/api/") or any(c in path for c in "?#\\") \
-            or ".." in path.split("/"):
+    if not path.startswith("/api/") or any(_unsafe(form) for form in _decodings(path)):
         raise ValueError("the path %r is not a plain /api/ path (no query, fragment "
                          "or '..'; use --param for a query)" % path)
     return path

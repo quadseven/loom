@@ -38,7 +38,12 @@ class PathReadTest(unittest.TestCase):
             seen.append(url)
             return 200, {}, b"{}"
 
-        for bad in ("/admin/x", "api/x", "/api/../x", "/api/x?a=b", ""):
+        for bad in (
+            "/admin/x", "api/x", "/api/../x", "/api/x?a=b", "",
+            "/api/%2e%2e/admin", "/api/%2E%2E/x", "/api/.%2e/x",
+            "/api/%252e%252e/x", "/api/x%3fa=b", "/api/x%5c..%5cy",
+            "/api/%2e/x", "/api/x/%2e%2e",
+        ):
             code, _, err = run(["path", bad], fetch)
             self.assertEqual(code, 2, bad)
             self.assertIn("not a plain /api/ path", err)
