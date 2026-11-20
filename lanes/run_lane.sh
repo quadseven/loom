@@ -3622,6 +3622,14 @@ final_validation() {
     PARK_CLASS=transient
     VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
   fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ "${BASELINE_EXIT:-}" = 0 ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_refusal; then
+    # Every failure is the sandbox refusing an operation, in a check the base
+    # run may never have executed: the environment, not the agent's work.
+    PARK_CLASS=factory
+    VALIDATION_REASON="validation environment unavailable: sandbox refusal (Operation not permitted) in the final check"
+  fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
     124)
