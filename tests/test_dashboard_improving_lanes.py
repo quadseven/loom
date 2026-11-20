@@ -24,6 +24,21 @@ class ImprovingViewTest(unittest.TestCase):
 
 
 class LaneViewTest(unittest.TestCase):
+    def test_published_state_wins_over_an_old_usage_hold_and_an_active_ticket(self):
+        from dashboard.server import _lane_view_data
+
+        comment = ("<!-- loom:lanes v1 -->\n"
+                   "| anthropic | parked | 2030-01-02 00:01:00Z | No Anthropic budget |")
+        usage = [{"holds": {"anthropic": "limit: old provider hold"}}]
+        ticket = {"lane": "anthropic", "state": "running", "repo": "example-owner/sample",
+                  "number": 3, "title": "A running ticket"}
+        rendered = render_lanes(_lane_view_data({"lanes": [{"body": comment}], "usage": usage},
+                                               [ticket]))
+        self.assertIn('class="lane-state">parked</span>', rendered)
+        self.assertIn("No Anthropic budget", rendered)
+        self.assertIn("A running ticket", rendered)
+        self.assertNotIn("old provider hold", rendered)
+
     def test_models_counted_by_model_and_tier(self):
         prs = [
             {"body": "Loom ticket example-owner/sample" "#1, lane codex-2, model model-alpha.",

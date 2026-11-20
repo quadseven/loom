@@ -122,12 +122,22 @@ def _sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
 
 
+# A blockquote line quotes a ticket; a task-list line quotes a criterion. Neither
+# declares a step, but a task-list line may still name one when the body has no
+# "none" answer in its operator steps section.
+_QUOTE = re.compile(r"^\s*>")
+_TASK = re.compile(r"^\s*[-*+]\s+\[[ xX]\]")
+
+
 def named_steps(body: str) -> List[str]:
     """Each sentence of the body that names an operator step in words."""
     out: List[str] = []
     # Headings name sections, never steps ("## Operator steps before merge").
-    prose = "\n".join(line for line in _prose(body).split("\n")
-                      if not _HEADING.match(line))
+    none = section_steps(body) == []
+    prose = "\n".join(
+        line for line in _prose(body).split("\n")
+        if not _HEADING.match(line) and not _QUOTE.match(line)
+        and not (none and _TASK.match(line)))
     for sentence in _sentences(prose):
         if any(p.search(sentence) for p in BACKSTOP):
             clean = _BULLET.sub("", sentence).strip()

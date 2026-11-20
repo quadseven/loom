@@ -1,0 +1,74 @@
+#!/bin/bash
+# xcodebuild under the lane job cap (lanes/build_jobs.sh): this file sits
+# first on a lane run's PATH and runs the real xcodebuild, the next one on
+# PATH, with "-jobs $LOOM_BUILD_JOBS" added to a call that builds or tests.
+# xcodebuild takes a job count only as a flag, and without one it uses every
+# core. Every argument is passed on unchanged and in order; the flag goes in
+# front of them. The call is passed through as it came when LOOM_BUILD_JOBS is
+# unset, 0 or not a number, when it names its own job count, or when it
+# builds nothing (it lists, shows, exports or only cleans).
+
+# Shell builtins only up to the exec: PATH here is whatever the run has.
+self="${BASH_SOURCE[0]}"
+name="${self##*/}"
+case "$self" in */*) self_dir="${self%/*}" ;; *) self_dir=. ;; esac
+self_dir="$(cd "${self_dir:-/}" && pwd -P)"
+
+# The real tool: the first one on PATH outside this directory, so the wrapper
+# never runs itself, whatever name or link PATH reaches it by.
+real=""
+IFS=: read -r -a path_dirs <<< "${PATH:-}"
+for dir in ${path_dirs[@]+"${path_dirs[@]}"}; do
+  [ -n "$dir" ] || continue
+  [ -x "$dir/$name" ] && [ ! -d "$dir/$name" ] || continue
+  [ "$(cd "$dir" 2>/dev/null && pwd -P)" != "$self_dir" ] || continue
+  [ ! "$dir/$name" -ef "$self_dir/$name" ] || continue
+  real="$dir/$name"
+  break
+done
+[ -n "$real" ] || { echo "$name: command not found" >&2; exit 127; }
+
+jobs="${LOOM_BUILD_JOBS:-0}"
+[[ "$jobs" =~ ^[0-9]{1,4}$ ]] && [ "$((10#$jobs))" -gt 0 ] || exec "$real" "$@"
+jobs="$((10#$jobs))"
+
+# An option's value is never an action: "-scheme clean" names a scheme, and
+# the call still builds. The word after one of these options is skipped.
+builds="" other_action="" value=""
+for arg in "$@"; do
+  if [ -n "$value" ]; then value=""; continue; fi
+  case "$arg" in
+    -project | -target | -scheme | -workspace | -configuration | -destination | -sdk | -arch | \
+      -derivedDataPath | -resultBundlePath | -resultBundleVersion | -xcconfig | -toolchain | \
+      -testPlan | -only-testing | -skip-testing | -only-test-configuration | \
+      -skip-test-configuration | -xctestrun | -testLanguage | -testRegion | -test-iterations | \
+      -destination-timeout | -parallel-testing-enabled | -parallel-testing-worker-count | \
+      -maximum-concurrent-test-device-destinations | -maximum-parallel-testing-workers | \
+      -maximum-concurrent-test-simulator-destinations | -enableCodeCoverage | \
+      -enableAddressSanitizer | -enableThreadSanitizer | -enableUndefinedBehaviorSanitizer | \
+      -archivePath | -exportPath | -exportOptionsPlist | -localizationPath | -exportLanguage | \
+      -clonedSourcePackagesDirPath | -packageCachePath | -scmProvider | \
+      -defaultPackageRegistryURL | -authenticationKeyPath | -authenticationKeyID | \
+      -authenticationKeyIssuerID)
+      value=1; continue ;;
+  esac
+  case "$arg" in
+    # Its own job count: leave the call alone.
+    -jobs | -IDEBuildOperationMaxNumberOfConcurrentCompileTasks=*) exec "$real" "$@" ;;
+    # Calls that build nothing.
+    -version | -usage | -help | -license | -list | -showsdks | -showBuildSettings | \
+      -showdestinations | -showTestPlans | -find-executable | \
+      -find-library | -exportArchive | -exportLocalizations | -importLocalizations | \
+      -exportNotarizedApp | -resolvePackageDependencies | -create-xcframework | \
+      -runFirstLaunch | -checkFirstLaunchStatus | -downloadPlatform | -downloadAllPlatforms | \
+      -downloadComponent | -importPlatform | -deletePlatform | -showComponent)
+      exec "$real" "$@" ;;
+    build | build-for-testing | analyze | archive | test | test-without-building | docbuild | install)
+      builds=1 ;;
+    clean | installsrc) other_action=1 ;;
+  esac
+done
+# With no action named xcodebuild builds; with only clean or installsrc it
+# builds nothing.
+[ -n "$builds" ] || [ -z "$other_action" ] || exec "$real" "$@"
+exec "$real" -jobs "$jobs" "$@"

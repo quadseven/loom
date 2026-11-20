@@ -47,7 +47,8 @@ RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): move
 RETRY_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 HELD_RE = re.compile(r"^Lane \S+ held: ")
-STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
+WORKERSAI_SIZE_STOP = "Lane workersai stopped: [size] "
+STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:size|limit|auth|transient)\] )")
 # The comments that assign the ticket to a lane: a brief. Claims after the
 # newest of these ran on the lane the ticket was last briefed to.
 BRIEF_RES = (
@@ -146,7 +147,7 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     for c in comments:
         body = str(c.get("body") or "")
         if CLAIM_RE.match(body):
-            just_claimed = set(pending)
+            just_claimed = pending - tried
             tried |= pending
             pending = set()
         for m in RUNG_RE.finditer(body):
@@ -157,7 +158,9 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
                 pending = pending | {rung}
         if EQUIVALENT_RE.search(body):
             pending = set()
-        if re.search(r"^Lane \S+ stopped: \[limit\]", body):
+        if body.startswith(WORKERSAI_SIZE_STOP):
+            pending |= just_claimed
+        if re.search(r"^Lane \S+ stopped: \[(?:limit|size)\]", body):
             tried -= just_claimed
             just_claimed = set()
     return tried

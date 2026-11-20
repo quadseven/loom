@@ -49,7 +49,6 @@ OPENCODE_GO_MODELS: Tuple[str, ...] = (
     "opencode-go/mimo-v2.6-flash",              # 30,100
     "opencode-go/deepseek-v4.1-flash",          # 34,670
     "opencode-go/muse-spark-1.3-contributor",   # 45,300; trains on prompts
-    "opencode-go/gpt-6-luna",                   # 5,640; strong tier, guarded
     "opencode-go/claude-haiku-5-5",             # 5,133; strong tier, guarded
 )
 # What a ticket's Model: line naming another opencode-go model runs instead.
@@ -124,6 +123,9 @@ UNBUILT_NOTE = ("Pull request #%d merged and left ticket criteria unbuilt, so th
                 "is back at loom:queued for the rest: %s")
 MERGED_FIRST_NOTE = ("Pull request #%d (merged %s, merge commit %s) may already carry this "
                      "ticket's work, so the ticket goes to a verify run before any build.")
+LIVE_RESTATE_NOTE = ("Every box still open is a Live box that names no string a verify run can "
+                     "search for, so its Live criterion must be restated (bus.brain live) "
+                     "before it can be verified.")
 REFUTED_NOTE = ("A verify run found that pull request #%d does not meet this ticket's "
                 "criteria: %s. The ticket is back at loom:queued for a build, and that "
                 "pull request is not checked again.")

@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import runners
 from .github import (GitHub, GitHubError, RateLimited, ShadowHeld, _next_link, _utc, auth_from_env,
                      rest_login, unreadable)
-from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
+from . import already_done, audit, change_class, close_audit, closing, criteria_gate, handoff, hunt_plan, journal, live_check_due, lock, merge_effect, notify, pr_repair, proof, quiet, stale_claims, sweep, text, ticket_move, tickets
 from . import answer, ci_facts, ci_gap, comment_findings, decision_claim, fixrounds, history, hold_boxes, human_claims, hunk_overlap, issue_reads, landing, merge_tier, merge_verdict, naming, operator_hold, per_repo, rebuttal, shadow
 from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
@@ -25,7 +25,7 @@ from .status import (add as add_status_event, is_status as is_status_comment,
                      strip_body as strip_status_body)
 from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
-from . import lane_markers, tick_clock
+from . import lane_markers, lane_state, tick_clock
 from . import brief_check, home_repo, state_store
 
 BRAIN_FIX_MARKER = "<!-- loom:brain-fix v1 -->"
@@ -291,7 +291,11 @@ def _status_trunk_data(repo_data: Dict[str, Any]) -> Dict[str, Any]:
 # What merge_ready reads for one pull request: the head commit's time and
 # check rollup, the reviews, and each review thread's state and first comment.
 READY_FIELDS = (
-    "isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    "isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state"
+    # The head's check runs, so status reads the review check with no extra
+    # request per pull request (loom#3100).
+    " contexts(first:100) { pageInfo { hasNextPage } nodes { __typename"
+    " ... on CheckRun { name status conclusion } } } } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { totalCount nodes { isResolved"
@@ -515,28 +519,30 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
             warnings: List[str] = []
             loose, tree = goal_tree(gh, repo, int(issue["number"]), light=True,
                                    warnings=warnings)
+            children = _flatten(loose, tree, repo)
             lines.extend("  - warning: unresolved sub-issue %s" % warning
                          for warning in warnings)
             if shares is not None:
-                shares[int(issue["number"])] = goal_human_share(_flatten(loose, tree, repo), issues, repo)
-            held, waiting = _count_unproven(_flatten(loose, tree, repo))
+                shares[int(issue["number"])] = goal_human_share(children, issues, repo)
+            held, waiting = _count_unproven(children)
             lines.append("  - unproven work %d/%d (shipped with no standing proof; "
                          "%d more await live evidence and do not count)"
                          % (held, limit, waiting))
-            apart = sum(1 for i in _flatten(loose, tree, repo) if _held_for_live_event(i))
+            apart = sum(1 for i in children if _held_for_live_event(i))
             if apart:
                 lines.append("  - %d more are held for a rare live event (%s): counted apart "
                              "from open work" % (apart, WAIT_LIVE_EVENT))
             if tree:
-                lines += epic_lines(tree)
+                lines += epic_lines(tree, repo)
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
             # loom#1534: a goal where nothing moved is owed no report; each
             # one emailed its author "nothing moved" four times a day.
-            still = quiet.quiet(comments, _flatten(loose, tree, repo),
+            still = quiet.quiet(comments, children,
                                 goal_breaches(issues, int(issue["number"])), now, authors)
             lines += _quiet_lines(still)
+            lines.extend("  - " + reason for reason in quiet.stuck_triage(children, now))
         if naming.is_backlog_home(issue):
             # A backlog goal posts no report on GitHub: its line is in the
             # station's twice-daily Discord digest (2026-10-25).
@@ -582,15 +588,27 @@ def _split_owned_runaways(rows: List[Tuple[Any, Dict[str, Any]]]
     return own, held
 
 
+def _split_operator_ask(rows: List[Tuple[Any, Dict[str, Any]]]
+                        ) -> Tuple[List[Tuple[Any, Dict[str, Any]]],
+                                   List[Tuple[Any, Dict[str, Any]]]]:
+    """Runaway rows that need review, and those whose way forward is an open
+    operator ask (needs:human)."""
+    ask = [r for r in rows if needs_human(_labels(r[1]))]
+    return [r for r in rows if r not in ask], ask
+
+
 def runaway_lines(issues: List[Dict[str, Any]]) -> List[str]:
     """List held runaway tickets for immediate brain review."""
     rows = [(None, i) for i in issues if RUNAWAY in _labels(i)
             and tickets.ticket_state(i) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(rows)
+    own, ask = _split_operator_ask(own)
     lines = ["### Runaway tickets"] + (["- #%s %s" % (i["number"], i.get("title", ""))
                                         for _, i in own] or ["- none"])
     lines += ["- owned by %s: #%s %s" % (owner, issue["number"], issue.get("title", ""))
               for _, issue, owner in held]
+    lines += ["- waiting on the operator: #%s %s" % (i["number"], i.get("title", ""))
+              for _, i in ask]
     return lines
 
 
@@ -1230,7 +1248,8 @@ def _pull_request_line(gh: GitHub, repo: str, pr: Dict[str, Any],
     if stacked:
         line = _add_blocker(line, stacked)
     if line.endswith(" - READY"):
-        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now):
+        for blocker in _merge_refusals(gh, repo, pr, ticket, caps=caps, now=now,
+                                     node=node):
             line = _add_blocker(line, blocker)
     line = _pending_fix_blocker(gh, repo, int(pr["number"]), ticket, authors, line)
     hold = _hold_blocker(gh, repo, int(pr["number"]), _head_commit(node or {}),
@@ -1318,10 +1337,28 @@ def _repo_cap_refusal(gh: GitHub, repo: str, caps: Optional[Dict[str, str]],
         return caps[repo]
 
 
+def _node_review_check(node: Optional[Dict[str, Any]], check: str) -> Optional[bool]:
+    """Whether the review check succeeded on the head, read from the check
+    runs status already fetched with the pull request; None when that read
+    holds no check-run data (or is cut at its page), which blocks nothing."""
+    commits = ((node or {}).get("commits") or {}).get("nodes") or []
+    rollup = (commits[-1].get("commit") or {}).get("statusCheckRollup") if commits else None
+    contexts = (rollup or {}).get("contexts")
+    if not isinstance(contexts, dict) or not isinstance(contexts.get("nodes"), list):
+        return None
+    for run in contexts["nodes"]:
+        if isinstance(run, dict) and run.get("name") == check:
+            return run.get("status") == "COMPLETED" and run.get("conclusion") == "SUCCESS"
+    if (contexts.get("pageInfo") or {}).get("hasNextPage"):
+        return None
+    return False
+
+
 def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
                     ticket: Optional[Tuple[str, int]],
                     caps: Optional[Dict[str, str]] = None,
-                    now: Optional[datetime] = None) -> List[str]:
+                    now: Optional[datetime] = None,
+                    node: Optional[Dict[str, Any]] = None) -> List[str]:
     """What bus.brain merge would refuse a READY pull request for, read with
     the functions merge uses (loom#1643): its ticket's state, a conflict,
     a risk tier held for the operator, and the hourly merge cap."""
@@ -1355,6 +1392,12 @@ def _merge_refusals(gh: GitHub, repo: str, pr: Dict[str, Any],
         return list(merge_verdict.decide(pr, issue, found, ("operator",)).blockers)
     if tier != merge_tier.REVERT and tier not in merge_tier.auto_tiers(None):
         found.append("held for the operator: %s" % tier)
+    elif tier != merge_tier.REVERT:
+        # merge refuses an auto tier unless the review check succeeded on the
+        # head (a neutral run is not enough), so status says so too.
+        check = review_check_name()
+        if _node_review_check(node, check) is False:
+            found.append("review check %s not success on head" % check)
     refusal = _repo_cap_refusal(gh, repo, caps, now)
     if refusal:
         found.append("held by the hourly merge cap: %s" % refusal)
@@ -1548,6 +1591,7 @@ def _repo_section(gh: GitHub, repo: str, now: datetime, bot: str,
     lines += [_status_pr_line(gh, repo, pr, data["prs"].get(int(pr["number"])), bot, check)
               for pr in adoptable]
     lines += [""] + _verify_due_lines(verify_due(gh, repo, tickets, now), now)
+    lines += [""] + live_check_due.section_lines(_live_check_rows(gh, repo, tickets), now)
     lines += ["", INVARIANTS_HEADING]
     lines += ["- #%s %s" % (i["number"], i.get("title", ""))
               for i in issues if "loom:invariant" in _labels(i)] or ["- none"]
@@ -1663,6 +1707,24 @@ def _shipped_at(gh: GitHub, repo: str, issue: Dict[str, Any]) -> Optional[dateti
               if e.get("event") == "labeled" and (e.get("label") or {}).get("name") == "loom:shipped"]
     stamps = [x for x in stamps if x]
     return max(stamps) if stamps else _stamp(issue.get("updated_at"))
+
+
+def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
+                     ) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """(due date, ticket) for each open awaiting-live-check ticket; the label
+    time is read from the events, the ticket's update time when they do not say."""
+    waiting = [i for i in tickets if LIVE_CHECK_LABEL in _labels(i)]
+
+    def read(issue: Dict[str, Any]) -> datetime:
+        events = gh.paginate("/repos/%s/issues/%s/events" % (repo, issue["number"]))
+        stamps = [_stamp(e.get("created_at")) for e in events
+                  if e.get("event") == "labeled"
+                  and (e.get("label") or {}).get("name") == LIVE_CHECK_LABEL]
+        stamps = [x for x in stamps if x]
+        at = max(stamps) if stamps else _stamp(issue.get("updated_at"))
+        return live_check_due.due_date(issue.get("body"), at or datetime.now(timezone.utc))
+
+    return list(zip(_read_each(read, waiting), waiting, strict=True))
 
 
 def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
@@ -1906,10 +1968,14 @@ def _status_sections(reads: Any, repos: Sequence[str], found: Dict[str, List[Dic
                if RUNAWAY in _labels(issue)
                and tickets.ticket_state(issue) not in tickets.MERGED_STATES]
     own, held = _split_owned_runaways(runaway)
+    own, ask = _split_operator_ask(own)
     tail = [""] + ["## Runaway tickets"] + (["- %s#%s %s" % (
         repo, issue["number"], issue.get("title", "")) for repo, issue in own] or ["- none"])
     tail += ["- owned by %s: %s#%s %s" % (owner, repo, issue["number"], issue.get("title", ""))
              for repo, issue, owner in held]
+    tail += ["- waiting on the operator: %s#%s %s" % (repo, issue["number"],
+                                                     issue.get("title", ""))
+             for repo, issue in ask]
     tail += [""] + priority_lines(found, now)
     tail += [""] + waiting_lines(reads, waiting, repos)
     tail += [""] + _health_lines(env)
@@ -2770,14 +2836,21 @@ def _flatten(loose: List[Dict[str, Any]],
     return children
 
 
-def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[str]:
+def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+               repo: str = "") -> List[str]:
     """bus.brain status lines for a goal's epics: the open epics against
-    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP."""
+    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP.
+    An epic of a repository other than the goal's prints as OWNER/NAME#N, so
+    a brain never reads it as an epic of the goal's own repository."""
     open_epics = [(e, t) for e, t in tree if e.get("state", "open") == "open"]
     lines = ["  - open epics %d/%d" % (len(open_epics), GOAL_EPIC_CAP)]
     for epic, found in open_epics:
-        lines.append("  - epic #%s %s - tickets %d/%d" % (
-            epic.get("number"), epic.get("title", ""), len(found), EPIC_TICKET_CAP))
+        home = _epic_repo(epic, repo)
+        ref = "#%s" % epic.get("number")
+        if repo and home.lower() != repo.lower():
+            ref = "%s#%s" % (home, epic.get("number"))
+        lines.append("  - epic %s %s - tickets %d/%d" % (
+            ref, epic.get("title", ""), len(found), EPIC_TICKET_CAP))
     return lines
 
 
@@ -4225,7 +4298,8 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         # goal's intake epic (loom#2033).
         epic = _source_epic(gh, repo, source, elsewhere is None)
     if epic is not None:
-        _, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic_issue, goal, goal_issue = _open_epic_for(gh, repo, epic, source, elsewhere is None)
+        epic = _repairs_rollover(gh, repo, epic, epic_issue, goal)
     elif intake_of is not None:
         goal, goal_issue = intake_of, _goal_issue(gh, repo, intake_of)
     else:
@@ -4303,6 +4377,23 @@ def _source_parent(source: Dict[str, Any]) -> Optional[int]:
         return parent
     match = _PART_OF_ANY.search(strip_status_body(source.get("body")))
     return int(match.group(1)) if match else None
+
+
+def _repairs_rollover(gh: GitHub, repo: str, epic: int, issue: Dict[str, Any],
+                      goal: int) -> int:
+    """The epic a brief files under: the one named, except that a repairs epic
+    (standing or batch) at GitHub's SUB_ISSUE_LIMIT sends it to the batch
+    repairs_epic picks with room, and one stderr line names both (loom#3206:
+    a brief under a full standing epic got a Part of line and no sub-issue
+    link)."""
+    if not (standing_epic(issue) or repairs_batch(issue)):
+        return epic
+    if sub_issue_count(gh, repo, issue) < SUB_ISSUE_LIMIT:
+        return epic
+    used = repairs_epic(gh, repo, goal, full=(epic,))
+    print("brief: epic #%d holds %d sub-issues; filing under #%d" % (epic, SUB_ISSUE_LIMIT, used),
+          file=sys.stderr)
+    return used
 
 
 def _open_epic_for(gh: GitHub, repo: str, epic: int, source: Optional[Dict[str, Any]],
@@ -4508,6 +4599,9 @@ def missing_sections(body: Optional[str]) -> List[str]:
     return missing
 
 
+_TEST_PATH = re.compile(r"\btests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py\b")
+
+
 def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = None
                        ) -> Optional[str]:
     """Why a body cannot be filed or briefed as a ticket for want of acceptance
@@ -4522,17 +4616,25 @@ def acceptance_refusal(body: Optional[str], issue: Optional[Dict[str, Any]] = No
         return None
     criteria = _body_sections(body).get("acceptance criteria", [])
     if any(_CHECKBOX.match(line) for line in criteria):
-        for line in criteria:
-            criterion = _CHECKBOX.sub("", line, count=1)
+        texts = [_CHECKBOX.sub("", line, count=1) for line in criteria]
+        for at, criterion in enumerate(texts):
             kept = re.search(r"\b(?:still|keeps?|unchanged|continues?|no longer regresses)\b",
                              criterion, re.I)
             requests_test = re.search(r"\b(?:test|tests)\b", criterion, re.I)
-            names_test = re.search(r"\btests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py\b",
-                                   criterion)
-            if kept and requests_test and not names_test:
+            paths = _TEST_PATH.findall(criterion)
+            if kept and requests_test and not paths:
                 return ("kept behaviour criteria that ask for a test must name the existing "
                         "test path under tests/; otherwise reword the criterion as a "
                         "behaviour change whose test fails on main")
+            # Kept behaviour passes on main, so a test for it cannot sit in a
+            # module that this brief's other criteria make new (loom#3385).
+            fresh = {path for other, text in enumerate(texts) if other != at
+                     for path in _TEST_PATH.findall(text)
+                     if re.search(r"\bnew\b|fails on main", text, re.I)}
+            if kept and (re.search(r"\bnew (?:test )?module\b", criterion, re.I)
+                         or fresh.intersection(paths)):
+                return ("kept behaviour belongs in an existing test module: a new module's "
+                        "tests must fail on main, and kept behaviour passes there")
         return None
     return ("the body has no acceptance criteria: add an ## Acceptance criteria section "
             "with at least one - [ ] checkbox, so a lane has something to prove. The draft "
@@ -4650,7 +4752,9 @@ def _triage_skip(issue: Dict[str, Any], authors: Sequence[str] = (),
         # Another operator's Loom owns an issue assigned to them.
         return "another operator's"
     names = _labels(issue)
-    if any(name.startswith("loom:") for name in names) or needs_human(names):
+    # loom:factory alone is a hand-filed issue, not one Loom has seen.
+    if (any(name.startswith("loom:") and name != "loom:factory" for name in names)
+            or needs_human(names)):
         return "already labelled"
     return not_work_reason(issue) or protected_reason(issue, journals, authors)
 
@@ -4671,10 +4775,10 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
     """Label at most limit open issues that Loom has not seen, oldest first.
 
     Skips pull requests, epics (an epic label or sub-issues), asks and
-    anything with a loom: label. A ready issue (every brief section,
+    anything with a loom: label. A trusted author's ready issue (every brief section,
     checkboxes under Acceptance criteria) becomes a loom:queued ticket under
     the goal, while the goal has room; the rest get loom:triage, and the
-    returned line names what is missing. No comment: each one emailed the
+    returned line names the reason. No comment: each one emailed the
     issue's author, and 161 older issues got one on 2026-10-20. A ready issue goes under the goal's
     intake epic (intake_epic). Only labels, sub-issue links and
     an intake epic when one is needed are written, plus a Part of line at the
@@ -4701,7 +4805,7 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         if skip or _human_holder(gh, repo, issue):
             continue
         missing = missing_sections(issue.get("body"))
-        if not missing:
+        if not missing and tickets.brief_author_trusted(issue, authors, briefers, as_ticket=True):
             if in_flight >= cap:
                 lines.append("#%d held: ready, but the goal has %d tickets in flight (cap %d)"
                              % (number, in_flight, cap))
@@ -4730,7 +4834,8 @@ def triage(gh: GitHub, repo: str, goal: int, limit: int = TRIAGE_LIMIT) -> List[
         else:
             gh.rest("POST", "/repos/%s/issues/%d/labels" % (repo, number),
                     {"labels": ["loom:triage"]})
-            lines.append("#%d loom:triage, missing %s" % (number, ", ".join(missing)))
+            reason = "missing " + ", ".join(missing) if missing else "untrusted author"
+            lines.append("#%d loom:triage, %s" % (number, reason))
         done += 1
     return lines
 
@@ -5813,6 +5918,11 @@ def _risk_tier(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
             return merge_tier.REVERT, ""
         print("brain: %s#%d is not exempt as a revert: %s" % (repo, number, refused),
               file=sys.stderr)
+    named = merge_verdict.named_test_blocker(
+        change_class.class_of(pr), [text for _, text in proof.criteria(str(issue.get("body") or ""))],
+        [str(f.get("filename") or "") for f in entries])
+    if named:
+        raise ValueError(named)
     return merge_tier.classify(repo, entries, str(issue.get("body") or ""),
                                change_class.class_of(pr) == "sensitive")
 
@@ -8688,7 +8798,7 @@ def _stuck_marks(histories: Dict[int, History], skipped: List[int],
 def _available_lanes(gh: GitHub, lanes_repo: str,
                      authors: Optional[Sequence[str]] = None) -> List[str]:
     body = _lane_status(gh, lanes_repo, authors)
-    rows = re.findall(r"^\|\s*([a-z0-9-]+)\s*\|\s*yes\s*\|", body, re.M)
+    rows = [row["lane"] for row in lane_state.published_rows(body) if row["available"]]
     scorecard = globals().get("scorecard")
     if scorecard is None:
         from . import scorecard

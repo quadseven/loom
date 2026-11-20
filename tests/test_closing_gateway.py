@@ -20,14 +20,14 @@ GATEWAY = "bus/closing.py"
 # Names the shadow classifier matches on; it sends nothing.
 SHADOW = "bus/shadow.py"
 
-# The callers trusted to have put the reason in the thread themselves, as
+# The callers trusted to have put the reason in the thread or Proof due, as
 # {file: count of calls passing said=}. Each posts or edits a note just before.
 SAID = {
     "bus/brain.py": 1,        # settle_source: its marked note
     "bus/close_audit.py": 1,  # the refusal, kept across a failed reopen
     "bus/factory.py": 1,      # the split note on the ticket
     "bus/invariants.py": 4,   # the notes edited in place, and an earlier fold or clear
-    "bus/station.py": 2,      # the settle-claimed evidence comment, a posted send-back report
+    "bus/station.py": 3,      # claimed evidence comment, send-back report, claimed Proof due entry
 }
 
 _STATE_CALLS = ("close", "close_pull", "reopen")

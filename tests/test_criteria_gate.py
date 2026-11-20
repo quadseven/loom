@@ -323,6 +323,7 @@ class LiveWaitAsk(tbs.Base):
         self.label(1, "awaiting-live-check")
         self.again()
         self.assertIn("needs:human", self.fake.names(1))
+        self.assertNotIn("needs-brain", self.fake.names(1))
         self.assertEqual(len(self.asks(1)), 1)
 
     def test_an_explicit_wait_holds_the_operator_ask(self):

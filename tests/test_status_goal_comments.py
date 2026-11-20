@@ -31,7 +31,9 @@ COUNTS = {1: 0, 2: 40, 3: 100, 4: 192, 5: 250}
 PINNED_QUERY = (
     'query { repository(owner:"example-owner", name:"example-repo") {'
     " p7: pullRequest(number:7) {"
-    " isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state } } } }"
+    " isDraft commits(last:1) { nodes { commit { committedDate statusCheckRollup { state"
+    " contexts(first:100) { pageInfo { hasNextPage } nodes { __typename"
+    " ... on CheckRun { name status conclusion } } } } } } }"
     " reviews(last:100) { nodes { author { __typename login }"
     " authorCanPushToRepository state submittedAt } }"
     " reviewThreads(first:100) { totalCount nodes { isResolved"

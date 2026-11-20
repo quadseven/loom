@@ -3,6 +3,7 @@
 Callers gather the pull request and ticket facts they already read, then pass
 those facts and policy blockers here. Execution remains with the caller.
 """
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -132,3 +133,29 @@ def ready_verdict(node: Optional[Dict[str, Any]], bot: str) -> Verdict:
     found = [(blocker, actor) for blocker, actor in rules if blocker]
     return decide(node, blockers=[blocker for blocker, _ in found],
                   actors=[actor for _, actor in found])
+
+
+NO_NAMED_TEST = "no test in the diff for a criterion that names one"
+_NAMES_TEST = re.compile(r"\btests?\b|\bpytest\b|\btest_\w+|\b\w+_test\b|\btests/", re.I)
+_DATA_EXTS = (".json", ".yml", ".yaml", ".csv", ".txt", ".golden", ".snap", ".xml", ".toml")
+_DATA_FOLDERS = {"fixture", "fixtures", "testdata", "snapshots", "__snapshots__"}
+
+
+def _test_code(path: str) -> bool:
+    """A file under a test path that is code, not a fixture or data file."""
+    from . import change_class
+    lowered = path.lower()
+    if not change_class.is_test(lowered) or lowered.endswith(_DATA_EXTS):
+        return False
+    return not (_DATA_FOLDERS & set(lowered.split("/")[:-1]))
+
+
+def named_test_blocker(change_class_name: str, criteria: Iterable[str],
+                       paths: Iterable[str]) -> Optional[str]:
+    """The blocker for a logic or sensitive pull request whose ticket has a
+    criterion naming a test while its diff adds or changes no test code."""
+    if change_class_name not in ("logic", "sensitive"):
+        return None
+    if not any(_NAMES_TEST.search(text) for text in criteria):
+        return None
+    return None if any(_test_code(path) for path in paths) else NO_NAMED_TEST

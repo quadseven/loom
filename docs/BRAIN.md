@@ -82,7 +82,7 @@ decides who acts:
 | `loom:ticket` | Every ticket issue. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
-| `loom:running` | The station handed it to that lane's runner. |
+| `loom:running` | A lane has claimed the ticket. The station clears a local run's running label when it reports the outcome, and its lane label too when the ticket goes back to the queue; a ticket at `loom:pr` or `loom:failed` keeps its lane label for fix rounds and the model ladder. Each pass requeues stale running tickets with no local brief or pending outcome. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
@@ -825,31 +825,30 @@ files or claims (a `claim:<login>` label, no `loom:` label) had nothing to
 close it once its pull request merged: about 60 stayed open in one day
 (loom#1204). Once an hour the station reads each open issue carrying a
 `claim:` label (`bus/claimed.py`). It leaves alone any issue with a `loom:`,
-`needs:`, `needs-`, `ready-for-human`, `wontfix` or `awaiting-live-check`
-label, an epic (`epic` label, an `Epic:` title or sub-issues), and one with
-no acceptance boxes. The rest settle only when every pull request whose
-`Refs` line names the issue is merged into the default branch, the review
-check (`LOOM_REVIEW_CHECK`) concluded success on its head (neutral is not a
-pass), every other check on the head concluded success, skipped or neutral
-(the review bot's other checks conclude neutral when they have nothing to say),
-and no open pull request names the issue. Then:
+`needs:`, `needs-`, `ready-for-human` or `wontfix` label, an epic (`epic`
+label, an `Epic:` title or sub-issues), and one with no acceptance boxes.
+An unticked operator or decision box also keeps the issue open. With settlement on, the station considers issues with unticked
+live boxes for the evidence close below, including issues already labeled
+`awaiting-live-check`. Ordinary claimed settlement requires every pull request
+whose `Refs` line names the issue to have merged into the default branch. The
+review check (`LOOM_REVIEW_CHECK`) must have succeeded on its head. Each other head
+check must have concluded success, skipped or neutral.
 
 - **Every box asks for merged code or tests:** one comment starting
   `<!-- loom:claimed-settle v1 -->` states each pull request, its merge
   commit, each head check's conclusion by name, and the test functions it
   added that the default branch still defines; the boxes are ticked and the
   issue is closed as completed. A comment already there is not posted again.
-- **A box asks for live, deployed or production behaviour, a time window or
+- **A box asks for live, deployed or production behavior, a time window or
   an observed event:** the issue gets the `awaiting-live-check` label once and
-  stays open for a person. The test is wide on purpose: a box wrongly read as
-  live only labels the issue.
+  stays open until a later pass can settle it.
 
 `LOOM_SETTLE_CLAIMED` picks the mode. Unset or `dry` (the default) logs
 `settle-claimed: would close OWNER/NAME#N ...` or `would label ...` and writes
 nothing, so a dry run can be read in the station log first; `on` writes; `off`
 skips the step. `LOOM_SETTLE_CLAIMED_MAX` (default 10) caps the issues settled
-a run, and writes are at least 3 seconds apart. Turning writes on is the
-operator's call: set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
+a run. Ordinary settlement writes are at least 3 seconds apart. To turn
+on writes, the operator must set `LOOM_SETTLE_CLAIMED=on` and run the installer again.
 
 A pull request that merged with the review check neutral (the review degraded)
 can never pass that gate, so its issue would stay open with its work merged
@@ -1077,11 +1076,12 @@ merged after it was filed, or when every file its criteria ask to add already
 exists on the default branch. A mention under an Out of scope, Not in scope
 or Follow-ups heading, or on a line that says the ticket was filed for later
 ("filed for", "filed as", "follow-up"), names work not built and does not
-count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
-`needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
-gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
-once: once the operator removes `needs:human`, the same evidence does not hold
-it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+count; a `Refs` or `Part of` line always counts (loom#1856). A merge predating
+a body edit is context for the new brief. A stale ticket goes back to
+`loom:queued` with `needs-brain` and a note naming the evidence so the brain
+can review what shipped and rewrite any remaining work. Explicit event waits
+keep their wait path. Existing person-ask settlements still apply.
+The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
 caller and deny-list layer had shipped weeks before; the lane read "out of
 scope" as "must be absent" and deleted the working deny-list layer, in two
 repos.
@@ -2508,8 +2508,16 @@ that run in CI or a throwaway environment at build time, not in a live
 observation after the fact. A step only a person can take still keeps a
 ticket open.
 
-The station closes a `loom:shipped` ticket with its live boxes unproven when
-all of these hold:
+The evidence close applies to both a `loom:shipped` ticket and a claimed
+issue with unticked live boxes. The hourly claimed sweep uses each pull
+request's `Refs` line. An open or unmerged pull request naming the issue
+keeps it open, even when another has merged. The station runs checks supplied by trusted authors first.
+A runnable check from another author keeps the issue open. A failed or deferred check holds it open.
+If some boxes still lack a runnable check, the station lists only those
+boxes in Proof due before closing the issue as `closed-unproven`. That
+entry is the close reason. The station posts no comment on the issue.
+
+Both paths apply the following checks.
 
 - every unticked box is a live or a code box (`bus/criteria_gate.py`, `kind`),
   any number of them and at least one live; an unticked operator or decision
@@ -2523,12 +2531,18 @@ all of these hold:
 - every pull request's tier is below deploy-config;
 - each symbol a pull request added is still defined on the default branch,
   and each one it removed is still gone, read from the file itself;
-- Loom has no check of its own for any unticked live box (a station proof, a
-  runnable check or a time window): a box with one keeps that path first, and
-  its ticket with it;
+- each live box listed in Proof due has no station proof, runnable check
+  or time window outstanding;
 - the ticket's Live line, when it has one, is known to be meetable
   (`bus/unmeetable.py` reads that one line; a live box beside it is not
   looked up).
+
+For each shipped ticket within the read budget, the station reads its timeline once.
+It takes same-repo pull request numbers from cross-references, connected events
+and the lane's opening notice in the ticket's status comment or body. It reads
+those pull requests directly and checks that they cover the ticket. If the
+ticket names none, it searches the newest 500 closed pull requests. An
+incomplete timeline holds the evidence close for that ticket.
 
 A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
 refused ticket goes to the usual done close and is read again after 6 hours.
@@ -2536,20 +2550,24 @@ Checks still running leave the ticket for a later pass with no ask.
 
 The close carries `closed-unproven` and `force-close`, and is the one close
 that passes through shadow. The station names the ticket in code, so no label
-or `gh` call can ask for it. Merges stay held. Every unticked live box is
+or `gh` call can ask for it. Merges stay held. Every unproven live box is
 first written into the repo's one rolling Proof due issue, edited in place, so
 nothing closes unlisted. An unticked code box is not listed: the merged change
 is its evidence. The close makes no AI call.
 
-At most 10 closes and 20 tickets read a pass, and 150 closes a day (3, 6 and
-10 before the 2026-11-19 ruling). Each pass that reads one logs its counts and
-these bounds in one `evidence close:` line. The Proof due issue shows the
+Shipped tickets and claimed issues share one budget of 10 evidence closes
+and 20 reads per pass and 150 evidence closes per day. Reopens of either
+kind count toward the same guardrail. The Proof due issue shows the
 newest 150 boxes and counts the older ones.
 
-Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+Reopens stay at or below 5% of evidence closes in the last seven days.
+If fewer than 100 tickets closed in that span, the station uses the newest
+100 closes, or all closes since the last resume if there are fewer. A resume
+always excludes earlier closes. One listing per repo finds
 reopened tickets, and a reopen stays counted after the ticket closes again.
 Above the limit this close stops, says so in the log and in each Proof due
-issue, and the usual done close takes over. A first reopen in fewer than 20
+issue, and the usual done close takes over until the operator resumes the
+evidence close. A first reopen in fewer than 20
 closes stops it too. The count is a floor: it sees only reopens someone made.
 
     python3 -m bus.evidence_close status
@@ -2727,6 +2745,12 @@ Tick <UTC time>, <holder>
 - Friction: <what slowed the factory this tick, or none>
 - Cost: <GitHub requests>, <minutes>
 ```
+
+Name every issue and pull request of the goal home as `#N`, which GitHub
+links; a bare number is not a link. `bus journal` rewrites "issue N",
+"pull request N" and "PR N" to `#N`, and moves a handoff marker written as
+a list item to a bare line at the end of the tick, since GitHub shows a
+hidden comment in a list as an empty bullet (loom#3321).
 
 `- Friction:` is the canonical line for what slowed the factory (docs/MUSE.md,
 Improving Loom itself): one line per slowdown, each its own `- Friction:`

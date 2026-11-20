@@ -208,7 +208,10 @@ and the health findings. Read them with the helper, not a hand-built URL:
     python3 -m bus.product_read stuck
     python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
     python3 -m bus.product_read health
+    python3 -m bus.product_read path /api/<documented path> [--param KEY=VALUE]
 
+`path` reads any other GET path the product's API documents, with the same
+base checks and failure line; a path that does not start with `/api/` exits 2.
 It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
 overseer's own configured product URL, whatever mount the operator gave the
 site; the mount may be a secret path, so it is never written in a repository
