@@ -529,7 +529,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                 lines.append("  - %d more are held for a rare live event (%s): counted apart "
                              "from open work" % (apart, WAIT_LIVE_EVENT))
             if tree:
-                lines += epic_lines(tree)
+                lines += epic_lines(tree, repo)
             if held > limit:
                 lines.append("  - OVER LIMIT: the station claims no new build ticket and the "
                              "brain files no ordinary brief for this goal until it is back under")
@@ -2807,14 +2807,21 @@ def _flatten(loose: List[Dict[str, Any]],
     return children
 
 
-def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]) -> List[str]:
+def epic_lines(tree: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]],
+               repo: str = "") -> List[str]:
     """bus.brain status lines for a goal's epics: the open epics against
-    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP."""
+    GOAL_EPIC_CAP, then each open epic's tickets against EPIC_TICKET_CAP.
+    An epic of a repository other than the goal's prints as OWNER/NAME#N, so
+    a brain never reads it as an epic of the goal's own repository."""
     open_epics = [(e, t) for e, t in tree if e.get("state", "open") == "open"]
     lines = ["  - open epics %d/%d" % (len(open_epics), GOAL_EPIC_CAP)]
     for epic, found in open_epics:
-        lines.append("  - epic #%s %s - tickets %d/%d" % (
-            epic.get("number"), epic.get("title", ""), len(found), EPIC_TICKET_CAP))
+        home = _epic_repo(epic, repo)
+        ref = "#%s" % epic.get("number")
+        if repo and home.lower() != repo.lower():
+            ref = "%s#%s" % (home, epic.get("number"))
+        lines.append("  - epic %s %s - tickets %d/%d" % (
+            ref, epic.get("title", ""), len(found), EPIC_TICKET_CAP))
     return lines
 
 
