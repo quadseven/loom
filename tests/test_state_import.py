@@ -147,6 +147,16 @@ class BusyTest(unittest.TestCase):
             finally:
                 os.close(fd)
 
+    def test_the_lock_is_held_for_the_whole_import_and_freed_after(self):
+        with tempfile.TemporaryDirectory() as home:
+            os.makedirs(os.path.join(home, "state"))
+            with state_import.hold_station_lock(home) as acquired:
+                self.assertTrue(acquired)
+                self.assertTrue(state_import.station_busy(home))
+                with state_import.hold_station_lock(home) as second:
+                    self.assertFalse(second)
+            self.assertFalse(state_import.station_busy(home))
+
 
 if __name__ == "__main__":
     unittest.main()

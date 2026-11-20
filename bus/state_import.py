@@ -25,6 +25,7 @@ caller stops that one first.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -68,6 +69,30 @@ def station_busy(home: str) -> bool:
             return True
         fcntl.flock(fd, fcntl.LOCK_UN)
         return False
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def hold_station_lock(home: str):
+    """Hold the station lock for the whole block; yield False if a pass holds it.
+
+    station_busy only probes and lets go, so a pass could start between the
+    probe and the copy. A real import holds the lock until it is done.
+    """
+    import fcntl
+    path = os.path.join(home, "state", "station.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
 
@@ -135,7 +160,10 @@ def main(env: Mapping[str, str], dry_run: bool, overwrite: bool, skip: Tuple[str
     elif not dry_run:
         say("error: LOOM_STATE_BACKEND must be postgres, the store to import into")
         return 2
-    if not dry_run and station_busy(home):
-        say("error: a station pass on this host holds the station lock; stop the station first")
-        return 2
-    return run(home, target, dry_run, overwrite, skip, say)
+    if dry_run:
+        return run(home, target, dry_run, overwrite, skip, say)
+    with hold_station_lock(home) as acquired:
+        if not acquired:
+            say("error: a station pass on this host holds the station lock; stop the station first")
+            return 2
+        return run(home, target, dry_run, overwrite, skip, say)
