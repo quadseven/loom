@@ -8208,6 +8208,14 @@ class Station:
         if not isinstance(issue, dict) or not self._incident_held(issue):
             self._forget_held(key)
             return
+        if self._session_claimed_since_hold(repo, number, issue, at):
+            self._routine(repo, number,
+                          "held: an operator session claimed this ticket after the hold "
+                          "began, so it is not re-queued for a lane")
+            self._forget_held(key)
+            _say("factory release: %s#%d kept: an operator session holds it"
+                 % (repo, number))
+            return
         if ref is None:
             # The incident filing failed: nothing names an incident that can
             # close this hold, so release it once it has outlived
@@ -8248,6 +8256,26 @@ class Station:
                           "on its lane%s." % (ref, ", and its loom:runaway hold is cleared"
                                               if cleared else ""))
         _say("factory release: %s#%d re-queued after incident %s closed" % (repo, number, ref))
+
+    def _session_claimed_since_hold(self, repo: str, number: int, issue: Dict[str, Any],
+                                    at: Optional[float]) -> bool:
+        """Whether a claim:<login> label of this Loom's own operator logins was
+        added after the hold began (loom#2975). A lane never claims a held
+        ticket, so such a claim is an operator session working it by hand."""
+        mine = {a.lower() for a in self.s.authors}
+        if at is None or not (set(tickets.claimed_by(issue)) & mine):
+            return False
+        events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
+        for event in events:
+            if not isinstance(event, dict) or event.get("event") != "labeled":
+                continue
+            name = str((event.get("label") or {}).get("name") or "").lower()
+            login = name[len(tickets.CLAIM_LABEL_PREFIX):].strip()
+            when = self._epoch(str(event.get("created_at") or ""))
+            if (name.startswith(tickets.CLAIM_LABEL_PREFIX) and login in mine
+                    and when is not None and when > at):
+                return True
+        return False
 
     def _factory_incident(self, ref: str) -> Optional[Dict[str, Any]]:
         """Read one named incident once per pass; return it only when closed."""
