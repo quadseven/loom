@@ -2735,6 +2735,12 @@ Tick <UTC time>, <holder>
 - Cost: <GitHub requests>, <minutes>
 ```
 
+Name every issue and pull request of the goal home as `#N`, which GitHub
+links; a bare number is not a link. `bus journal` rewrites "issue N",
+"pull request N" and "PR N" to `#N`, and moves a handoff marker written as
+a list item to a bare line at the end of the tick, since GitHub shows a
+hidden comment in a list as an empty bullet (loom#3321).
+
 `- Friction:` is the canonical line for what slowed the factory (docs/MUSE.md,
 Improving Loom itself): one line per slowdown, each its own `- Friction:`
 line. The dashboard's Improving page reads it, and still reads the older
