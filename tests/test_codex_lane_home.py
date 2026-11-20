@@ -70,6 +70,14 @@ class CodexLaneHomeTest(unittest.TestCase):
         codex.write_text(FAKE_CODEX)
         codex.chmod(0o755)
         self.seen = root / "seen.txt"
+        # macOS runners ship no coreutils `timeout`; the script only needs it
+        # to run the command, so a shim keeps the test the same on every host.
+        shim = self.bin / "timeout"
+        shim.write_text('#!/bin/sh
+shift
+exec "$@"
+')
+        shim.chmod(0o755)
 
     def tearDown(self):
         self._tmp.cleanup()
