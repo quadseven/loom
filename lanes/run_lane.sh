@@ -2744,11 +2744,15 @@ incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr 
 # another host (a cluster runner, a second Mac) never closed an incident the
 # station host filed, and the tickets stayed held until that one host ran
 # again. Only a public repo has a title another host can rebuild: a private
-# repo's subject is a random alias kept per host (incident_subject).
+# repo's subject is a random alias kept per host unless the shared alias
+# key is readable (incident_subject).
 shared_incident_number() {  # kind
-  local listed
-  repo_is_public || return 1
-  if ! listed="$(TITLE="Factory incident: $REPO validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
+  local listed subject
+  # A private repo's title is rebuildable only when the shared alias key is
+  # readable (incident_subject then derives the alias from it).
+  repo_is_public || incident_alias_key >/dev/null || return 1
+  subject="$(incident_subject)" || return 1
+  if ! listed="$(TITLE="Factory incident: $subject validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
     echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
     return 1
   fi
@@ -2796,9 +2800,32 @@ repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
 incident_ticket() {
   if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
 }
+# The shared key a private repo's incident alias is derived from, so every
+# host names the same repo the same way. Read from the SSM parameter
+# LOOM_INCIDENT_ALIAS_SSM (a copy under LOOM_SSM_DIR on a pod). Prints
+# nothing and fails when it is unset or unreadable: the alias then stays a
+# random per-host id, as before.
+incident_alias_key() {
+  local name="${LOOM_INCIDENT_ALIAS_SSM:-/loom/incident-alias-key}" key
+  if [ -n "${LOOM_SSM_DIR:-}" ]; then
+    key="$(cat "$LOOM_SSM_DIR$name" 2>/dev/null)" || return 1
+  else
+    key="$(env ${LOOM_AWS_REGION:+AWS_REGION="$LOOM_AWS_REGION"} timeout "$NET_TIMEOUT" \
+      aws ssm get-parameter --name "$name" --with-decryption \
+      --query Parameter.Value --output text 2>/dev/null)" || return 1
+  fi
+  [ -n "$key" ] || return 1
+  printf '%s' "$key"
+}
 incident_subject() {
-  local file alias
+  local file alias key
   if repo_is_public; then printf '%s' "$REPO"; return 0; fi
+  if key="$(incident_alias_key)"; then
+    alias="$(KEY="$key" REPO_NAME="$REPO" python3 -B -c 'import hashlib,hmac,os; print(hmac.new(os.environ["KEY"].encode(), os.environ["REPO_NAME"].encode(), hashlib.sha256).hexdigest()[:8])')" || return 1
+    [ "${#alias}" -eq 8 ] || return 1
+    printf 'private repo %s' "$alias"
+    return 0
+  fi
   file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
   if [ ! -s "$file" ]; then
     mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
