@@ -40,7 +40,7 @@ Rules:
   holds the repo on every slot for the same base and revision, and clears
   by the recording slot's rules.
 
-Only lanes in RUNNER_LANES run there; agy and anthropic stay on this machine.
+Only lanes in RUNNER_LANES run there. The agy lane stays on this machine.
 docs/LANES.md, "Lanes on cluster runners".
 """
 from __future__ import annotations
@@ -67,7 +67,7 @@ import zlib
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from xml.parsers.expat import ExpatError
 
-from . import lane_state
+from . import lane_state, spend
 from .github import RateLimited
 from .github import GitHubError
 from .labels import LANES
@@ -81,7 +81,8 @@ REF = "main"
 INPUT_LIMIT = 65535
 # Provider lanes a runner may run: Codex and Claude subscription lanes, API
 # lanes whose key the workflow's role can read, and gateway-served spark/free.
-RUNNER_LANES = ("codex", "claude", "opencode-go", "zen", "openrouter", "zai", "workersai", "free", "spark")
+RUNNER_LANES = ("codex", "claude", "anthropic", "opencode-go", "zen", "openrouter", "zai",
+                "workersai", "free", "spark")
 # Slots that run on cluster runners wherever any runner slot does, with the
 # settings the station's plist does not hold. A plist changes only by a
 # reinstall, which replaces every lane; these deploy by merge, beside the Mac
@@ -93,9 +94,11 @@ TRACKED_SLOTS = {
     "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
     "opencode-go-3": {"LOOM_OPENCODE_GO_3_MODEL": "opencode-go/deepseek-v4.1-flash"},
     "opencode-go-4": {"LOOM_OPENCODE_GO_4_MODEL": "opencode-go/muse-spark-1.3-contributor"},
+    **{"anthropic-%d" % n: {} for n in range(2, 9)},
 }
 OPENCODE_GO_SLOTS = tuple("opencode-go-%d" % n for n in range(1, 5))
 OPENCODE_GO_KEY_SSM = "LOOM_OPENCODE_GO_KEY_SSM"
+ANTHROPIC_KEY_SSM = "LOOM_ANTHROPIC_KEY_SSM"
 # A run no runner has taken after this many seconds is cancelled and parked:
 # the runner set may be scaled to zero.
 QUEUE_MAX = 1800
@@ -234,6 +237,12 @@ def setting_allowed(slot: str, name: str) -> bool:
     return False
 
 
+def _api_key_setting(slot: str) -> str:
+    if slot in OPENCODE_GO_SLOTS:
+        return OPENCODE_GO_KEY_SSM
+    return ANTHROPIC_KEY_SSM if provider(slot) == "anthropic" else ""
+
+
 def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
     """The slot's settings from the station's environment: names and values
     only, never a secret (keys stay in SSM and are named by *_KEY_SSM)."""
@@ -244,14 +253,15 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
         name = LANES_APP.get(name, name)
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
             out[name] = str(value)
-    if slot in OPENCODE_GO_SLOTS and not out.get(OPENCODE_GO_KEY_SSM):
+    key = _api_key_setting(slot)
+    if key and not out.get(key):
         # run_lane.sh reads a lane's key setting slot first, then provider,
         # so a slot may name its key only as LOOM_<SLOT>_KEY_SSM. The
         # dispatch guard and the runner job read the provider name, so
         # carry the slot's own name under it as well.
         own = out.get(_prefix(slot) + "KEY_SSM")
         if own:
-            out[OPENCODE_GO_KEY_SSM] = own
+            out[key] = own
     return dict(sorted(out.items()))
 
 
@@ -406,13 +416,27 @@ class Runners:
                 self._follow(ledger, entry)
                 self.save(ledger)
         self._lift_setting_holds(ledger)
+        credit_hold = self._anthropic_credit_hold()
         if not self._cluster_paused(ledger):
             for slot in self.slots:
-                self._dispatch_slot(ledger, slot)
+                if not (provider(slot) == "anthropic" and credit_hold):
+                    self._dispatch_slot(ledger, slot)
         for slot in self.slots:
-            self._beat(ledger, slot)
+            self._beat(ledger, slot, credit_hold if provider(slot) == "anthropic" else "")
         self._prune(ledger)
         self.save(ledger)
+
+    def _anthropic_credit_hold(self) -> str:
+        if not any(provider(slot) == "anthropic" for slot in self.slots):
+            return ""
+        try:
+            budget = spend.Budget.from_env(self.env)
+        except ValueError as err:
+            return str(err)
+        if budget.usd is None:
+            return ""
+        summary = spend.summarize(self.home, budget, self.now)
+        return summary.floor_reason() if summary.under_floor() else ""
 
     def _lift_setting_holds(self, ledger: Dict[str, Any]) -> None:
         """Drop a hold set for a missing setting once the setting is present."""
@@ -459,17 +483,18 @@ class Runners:
         self._park(entry["slot"], entry["ticket"], reason, kind)
 
     def _dispatch_settings(self, slot: str) -> Dict[str, str]:
-        """Keep explicit station settings; fill only a missing tracked Go key path."""
+        """Keep explicit station settings and look up a missing installed key path."""
         settings = lane_settings(slot, self.env)
-        if slot in OPENCODE_GO_SLOTS and not settings.get(OPENCODE_GO_KEY_SSM):
+        key = _api_key_setting(slot)
+        if key and not settings.get(key):
             # AI-REVIEW 2026-11-11 [Dot review, model unreported] 2964-source:
             # a slot's installed key path may be absent from the station environment.
-            installed = self._installed_go_key_setting(slot)
+            installed = self._installed_key_setting(slot, key)
             if installed:
-                settings = lane_settings(slot, {**self.env, OPENCODE_GO_KEY_SSM: installed})
+                settings[key] = installed
         return settings
 
-    def _installed_go_key_setting(self, slot: str) -> Optional[str]:
+    def _installed_key_setting(self, slot: str, key: str) -> Optional[str]:
         """Select the key-parameter setting, never forward the installed environment."""
         home = self.env.get("HOME") or os.path.expanduser("~")
         path = os.path.join(home, "Library", "LaunchAgents", "com.loom.%s.plist" % slot)
@@ -489,7 +514,7 @@ class Runners:
             variables = document.get("EnvironmentVariables", {})
             if not isinstance(variables, dict):
                 raise ValueError("installed environment is not a map")
-            for name in (_prefix(slot) + "KEY_SSM", OPENCODE_GO_KEY_SSM):
+            for name in (_prefix(slot) + "KEY_SSM", key):
                 value = variables.get(name)
                 if value is None or value == "":
                     continue
@@ -533,7 +558,8 @@ class Runners:
             self._refuse(ledger, entry, red_reason(repo, red))
             return
         settings = self._dispatch_settings(slot)
-        required = (OPENCODE_GO_KEY_SSM,) if slot in OPENCODE_GO_SLOTS else ()
+        api_key_setting = _api_key_setting(slot)
+        required = (api_key_setting,) if api_key_setting else ()
         if slot == "workersai":
             required = ("LOOM_WORKERSAI_KEY_SSM", "LOOM_WORKERSAI_ACCOUNT_SSM")
         missing = next((name for name in required if not settings.get(name, "").strip()), None)
@@ -921,7 +947,7 @@ class Runners:
         self._note_not_lost(ledger)
         try:
             files = self._read_report(entry, artifact)
-            beat = self.apply(slot, ticket, files)
+            beat = self.apply(slot, ticket, files, entry["run_id"])
         except ReportError as err:
             self._park(slot, ticket, "could not read the runner's report: %s" % err, "transient")
             return
@@ -1125,10 +1151,13 @@ class Runners:
         if parts[:2] == ["logs", slot]:
             return self._log_path(ticket, parts[2:])
         if parts[:2] == ["state", "usage"] and len(parts) == 3:
+            if rel == spend.REPORT_PATH:
+                return provider(slot) == "anthropic"
             return parts[2] in [slot + suffix for suffix in usage_suffixes(slot)]
         return False
 
-    def apply(self, slot: str, ticket: str, files: Dict[str, bytes]) -> Optional[Dict[str, Any]]:
+    def apply(self, slot: str, ticket: str, files: Dict[str, bytes],
+              run_id: str = "") -> Optional[Dict[str, Any]]:
         """Write a report's files where a local runner writes them, move the
         inbox brief as the runner moved it, and return the run's heartbeat
         (None when the report has none). Every path is checked first: one
@@ -1139,6 +1168,13 @@ class Runners:
         kinds = [k for k in ("done", "failed") if "briefs/%s/%s/%s.md" % (slot, k, ticket) in files]
         if len(kinds) > 1:
             raise ReportError("the report moves the brief to both done/ and failed/")
+        if spend.REPORT_PATH in files:
+            if not RUN_ID_RE.fullmatch(run_id):
+                raise ReportError("the spend report needs its run id")
+            try:
+                spend.import_report(self.home, files[spend.REPORT_PATH], slot, ticket, run_id)
+            except (ValueError, OverflowError) as err:
+                raise ReportError("the report has invalid spend data for this run") from err
         beat: Optional[Dict[str, Any]] = None
         beat_rel = "state/usage/%s.json" % slot
         if beat_rel in files:
@@ -1150,8 +1186,8 @@ class Runners:
         for rel, data in sorted(files.items()):
             if rel.startswith("briefs/%s/" % slot) and "/answers/" not in rel:
                 continue   # the brief moves below; the local copy is the one sent
-            if rel == beat_rel:
-                continue   # the station writes the slot's heartbeat itself (_beat)
+            if rel in (beat_rel, spend.REPORT_PATH):
+                continue   # the heartbeat and shared spend ledger have their own writers
             _write(os.path.join(self.home, *rel.split("/")), data)
         if kinds:
             src = os.path.join(self.inbox(slot), ticket + ".md")
@@ -1187,7 +1223,7 @@ class Runners:
         ledger["holds"][slot] = {"until": until, "reason": reason,
                                  "limited_models": models if isinstance(models, dict) else {}}
 
-    def _beat(self, ledger: Dict[str, Any], slot: str) -> None:
+    def _beat(self, ledger: Dict[str, Any], slot: str, credit_hold: str = "") -> None:
         """The slot's heartbeat, as its runner would write it, and its
         keepalive stamp while a run is in flight."""
         alive = self._usage(slot, ".alive")
@@ -1209,6 +1245,8 @@ class Runners:
             beat.update({"available": True, "reason": ""})
             if not models:
                 ledger["holds"].pop(slot, None)
+        if credit_hold:
+            beat.update({"available": False, "reason": credit_hold})
         beat["limited_models"] = models
         beat = lane_state.heartbeat_fields(slot, beat, self.home)
         _write(self._usage(slot, ".json"), (json.dumps(beat) + "\n").encode("utf-8"))
@@ -1236,7 +1274,8 @@ def run_report_paths(slot: str, ticket: str) -> Tuple[str, ...]:
     return ("briefs/%s/done/%s.md" % (slot, ticket), "briefs/%s/failed/%s.md" % (slot, ticket),
             "briefs/%s/answers/%s" % (slot, ticket), "logs/%s/%s" % (slot, ticket),
             "logs/%s/%s.*" % (slot, ticket)) + tuple(
-                "state/usage/%s%s" % (slot, s) for s in usage_suffixes(slot))
+                "state/usage/%s%s" % (slot, s) for s in usage_suffixes(slot)) + (
+                    (spend.REPORT_PATH,) if provider(slot) == "anthropic" else ())
 
 
 # Names the station's plist writes itself (lanes/mac/install.sh): never
