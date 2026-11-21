@@ -205,6 +205,8 @@ class GithubAuthTest(unittest.TestCase):
     def test_git_gets_no_credential_without_the_app_token(self):
         run = self.credential_fill("exit 2")
         self.assertNotEqual(run.returncode, 0)
+        # Loom's helper told git to quit, so the person's helper never ran.
+        self.assertIn("told us to quit", run.stderr)
         self.assertNotIn("gho_person", run.stdout)
 
     def test_the_helper_answers_nothing_for_another_host(self):
