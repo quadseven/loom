@@ -52,6 +52,20 @@ class WithHeaderPackedLineTest(unittest.TestCase):
         self.assertIn("After: #5, #6\n", result)
         self.assertIn("Priority: P3\n", result)
 
+    def test_deliverable_value_with_header_shaped_word_is_not_split(self):
+        body = "Deliverable: Explain Model: selection\n\n## Why\nx\n"
+        result = _with_header(body, "Priority", "P1")
+        self.assertIn("Deliverable: Explain Model: selection\n", result)
+        self.assertNotIn("Model: selection\nDeliverable", result)
+
+    def test_packed_line_keeps_crlf_on_every_expanded_header(self):
+        body = "Difficulty: medium Priority: P3\r\n\r\n## Why\r\nx\r\n"
+        result = _with_header(body, "Difficulty", "easy")
+        self.assertIn("Difficulty: easy\r\n", result)
+        self.assertIn("Priority: P3\r\n", result)
+        self.assertNotIn("\r\r", result)
+        self.assertEqual(result.replace("\r\n", "").count("\n"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5228,9 +5228,15 @@ def _split_packed_header_line(line: str) -> List[str]:
     if not positions:
         return [line]
     positions.sort()
+    # A Deliverable value is free prose: a header-shaped word inside it is not
+    # a new header, so nothing after the Deliverable key starts another one.
+    for i, (_pos, hk) in enumerate(positions):
+        if hk == "Deliverable":
+            positions = positions[: i + 1]
+            break
     # Extract each header
     result = []
-    for i, (pos, hk) in enumerate(positions):
+    for i, (pos, _hk) in enumerate(positions):
         next_pos = positions[i + 1][0] if i + 1 < len(positions) else len(line)
         header_text = line[pos:next_pos].rstrip()
         result.append(header_text)
@@ -5251,8 +5257,8 @@ def _expand_packed_headers(lines: List[str], header_end: int) -> Tuple[List[str]
         if len(split) > 1:
             # It's a packed line, expand each header
             ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
-            for j, h in enumerate(split):
-                new_lines.append(h + (ending if j == len(split) - 1 else "\n"))
+            for h in split:
+                new_lines.append(h + ending)
         else:
             new_lines.append(line)
     # Append the rest of the lines (non-header section)
