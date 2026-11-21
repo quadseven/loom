@@ -74,6 +74,8 @@ def _parser() -> argparse.ArgumentParser:
                    "LOOM_SELF_REPO, else this checkout's origin); "
                    "the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
+    sub.add_parser("station-wait", help="wait for the next station pass: LOOM_STATION_INTERVAL "
+                   "seconds, or less when LOOM_INBOX=1 and an inbox event arrives")
     s = sub.add_parser("state-import", help="copy the file ledgers into the shared state backend, once")
     s.add_argument("--dry-run", action="store_true", help="print counts per ledger, write nothing")
     s.add_argument("--overwrite", action="store_true",
@@ -219,6 +221,10 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
     if args.command == "state-import":
         from . import state_import
         return state_import.main(os.environ, args.dry_run, args.overwrite, tuple(args.skip))
+    if args.command == "station-wait":
+        from . import event_inbox
+        print("station-wait: %s" % event_inbox.wait(os.environ, station._say))
+        return 0
     if args.command == "station":
         try:
             return station.run(station.Settings.from_env(), gh)
