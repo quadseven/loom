@@ -170,6 +170,8 @@ def rewritten_source(body: Any) -> Optional[int]:
 
 
 HEADER_RE = re.compile(r"(Difficulty|Priority|Foundational|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
+# Known header keys, in the same order as HEADER_RE's alternation.
+HEADER_KEYS = ("Difficulty", "Priority", "Foundational", "Model", "Base", "Not before", "After", "Deliverable", "Repairs incident")
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -279,6 +281,85 @@ def _check_header(key: str, value: str) -> None:
         raise ValueError(message(value))
 
 
+def _split_packed_headers(line: str) -> List[Tuple[str, str]]:
+    """Split a header line that may contain multiple packed headers.
+
+    Returns a list of (key, value) pairs if the entire line consists of
+    known header keys and their values, otherwise returns an empty list.
+    """
+    # Sort keys by length descending to match longer keys first (e.g., "Not before" before "Not")
+    sorted_keys = sorted(HEADER_KEYS, key=len, reverse=True)
+    line_len = len(line)
+
+    # Find all known key positions in the line (at valid key positions: start or after whitespace)
+    key_positions: List[Tuple[int, str]] = []
+    for key in sorted_keys:
+        key_with_colon = key + ":"
+        start = 0
+        while True:
+            idx = line.find(key_with_colon, start)
+            if idx == -1:
+                break
+            # Verify this is a key start (at line start or after whitespace)
+            if idx == 0 or line[idx - 1] in " \t":
+                key_positions.append((idx, key))
+            start = idx + 1
+
+    # Sort by position
+    key_positions.sort(key=lambda x: x[0])
+
+    # Need at least 2 keys to be considered "packed"
+    if len(key_positions) < 2:
+        return []
+
+    # Verify the first key is at position 0
+    if key_positions[0][0] != 0:
+        return []
+
+    # Check each value region for unknown key-like patterns
+    import re
+    # Key-like pattern: at line start or after whitespace, letter followed by letters/digits/spaces, then colon
+    key_like_re = re.compile(r"(^|[ \t])([A-Za-z][A-Za-z0-9 ]*):")
+    known_positions = {kp for kp, _ in key_positions}
+
+    for i, (kp, key) in enumerate(key_positions):
+        key_with_colon = key + ":"
+        value_start = kp + len(key_with_colon)
+        # Skip whitespace after colon
+        while value_start < line_len and line[value_start] in " \t":
+            value_start += 1
+        # Value ends at next key position or end of line
+        next_pos = key_positions[i + 1][0] if i + 1 < len(key_positions) else line_len
+        value_region = line[value_start:next_pos]
+
+        # Check for unknown key-like patterns in this value region
+        # We need to check at positions that are valid key positions within the region
+        # (start of region or after whitespace within region)
+        for match in key_like_re.finditer(value_region):
+            key_name = match.group(2)
+            region_pos = match.start(2)  # position within value_region
+            abs_pos = value_start + region_pos
+            # Check if this position is a known key position
+            if abs_pos not in known_positions:
+                # Check if the key name is a known key (could be a known key not at expected position)
+                if key_name not in HEADER_KEYS:
+                    # Unknown key found in value region
+                    return []
+
+    # Extract the parts
+    parts: List[Tuple[str, str]] = []
+    for i, (kp, key) in enumerate(key_positions):
+        key_with_colon = key + ":"
+        value_start = kp + len(key_with_colon)
+        while value_start < line_len and line[value_start] in " \t":
+            value_start += 1
+        next_pos = key_positions[i + 1][0] if i + 1 < len(key_positions) else line_len
+        value = line[value_start:next_pos].rstrip()
+        parts.append((key, value))
+
+    return parts
+
+
 def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     """Split the leading Difficulty:, Model: and Base: lines from the rest.
 
@@ -292,23 +373,36 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     headers: Dict[str, str] = {}
     i = 0
     while i < len(lines):
-        m = HEADER_RE.fullmatch(lines[i].rstrip())
+        line = lines[i].rstrip()
+        m = HEADER_RE.fullmatch(line)
         if not m:
             break
+        # Try to split packed headers on this line
+        packed = _split_packed_headers(line)
+        if packed:
+            # Process each packed header
+            for key, value in packed:
+                if key == "Difficulty":
+                    value = value.lower()
+                if key == "Model":
+                    value = allowed_model(value)
+                if key in headers:
+                    if headers[key] == value:
+                        # The same header twice says one thing; keep it.
+                        continue
+                    raise ValueError("%s: given twice" % key)
+                _check_header(key, value)
+                headers[key] = value
+            i += 1
+            continue
+        # Single header (original behavior)
         key, value = m.group(1), m.group(2).strip()
         if key == "Difficulty":
-            # A hand-edited "Difficulty: Medium" failed the check, so the
-            # ticket read as having no tier and no lane ever claimed it
-            # (2026-10-16).
             value = value.lower()
         if key == "Model":
-            # A ticket written before the operator's rule (grug#1189 named
-            # gemini-4-argon-high) runs the allowed model instead.
             value = allowed_model(value)
         if key in headers:
             if headers[key] == value:
-                # The same line twice (a brief whose file repeated the header
-                # the brief tool also writes) says one thing; keep it.
                 i += 1
                 continue
             raise ValueError("%s: given twice" % key)
