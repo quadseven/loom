@@ -5195,12 +5195,79 @@ def _with_priority(body: str, priority: str) -> str:
     return _with_header(body, "Priority", priority)
 
 
+def _split_packed_header_line(line: str) -> List[str]:
+    """Split a line containing multiple packed headers into separate header lines.
+
+    Known header keys from HEADER_RE: Difficulty, Priority, Foundational, Model,
+    Base, Not before, After, Deliverable, Repairs incident.
+    """
+    header_keys = (
+        "Difficulty",
+        "Priority",
+        "Foundational",
+        "Model",
+        "Base",
+        "Not before",
+        "After",
+        "Deliverable",
+        "Repairs incident",
+    )
+    # Find all positions where a header key starts
+    positions = []
+    for hk in header_keys:
+        search = hk + ":"
+        start = 0
+        while True:
+            idx = line.find(search, start)
+            if idx == -1:
+                break
+            # Make sure it's at the start or preceded by whitespace
+            if idx == 0 or line[idx - 1].isspace():
+                positions.append((idx, hk))
+            start = idx + 1
+    if not positions:
+        return [line]
+    positions.sort()
+    # Extract each header
+    result = []
+    for i, (pos, hk) in enumerate(positions):
+        next_pos = positions[i + 1][0] if i + 1 < len(positions) else len(line)
+        header_text = line[pos:next_pos].rstrip()
+        result.append(header_text)
+    return result
+
+
+def _expand_packed_headers(lines: List[str], header_end: int) -> Tuple[List[str], int]:
+    """Expand any packed header lines in the header section.
+
+    Returns the new lines list and the new header_end index.
+    """
+    new_lines = []
+    for i in range(header_end):
+        line = lines[i]
+        stripped = line.rstrip("\r\n").rstrip()
+        # Check if it's a packed line by trying to split it
+        split = _split_packed_header_line(stripped)
+        if len(split) > 1:
+            # It's a packed line, expand each header
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            for j, h in enumerate(split):
+                new_lines.append(h + (ending if j == len(split) - 1 else "\n"))
+        else:
+            new_lines.append(line)
+    # Append the rest of the lines (non-header section)
+    new_lines.extend(lines[header_end:])
+    return new_lines, len(new_lines) - (len(lines) - header_end)
+
+
 def _with_header(body: str, key: str, value: str) -> str:
     """Set one leading header line without changing the remaining text."""
     lines = body.splitlines(keepends=True)
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
         header += 1
+    # Expand any packed header lines first
+    lines, header = _expand_packed_headers(lines, header)
     for index in range(header):
         if lines[index].startswith(key + ":"):
             ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
