@@ -243,6 +243,10 @@ def _rejection_reason(item: Any, lane: str) -> Optional[str]:
     # unrun by the runner (loom#2249).
     if brief_check.criteria_verdict(str(item.get("body") or "")) is not None:
         return "no acceptance criteria"
+    # The same reading as the factory's hold and the station's claim, so a
+    # ticket they hold is not one this lane takes.
+    if brief_check.hand_filed_verdict(item) is not None:
+        return "no acceptance box names a test"
     split = brief_check.split_verdict(str(item.get("body") or ""))
     if split is not None:
         return split.reason
