@@ -1,5 +1,7 @@
 """The readiness classifier: a ticket is ready by what it says, not by a label."""
+import json
 import os
+import subprocess
 import sys
 import time
 import unittest
@@ -74,6 +76,17 @@ class Report(unittest.TestCase):
         self.assertIsNone(readiness.marker_change(ready, issue(readiness.READY_MARKER)))
         self.assertEqual(readiness.marker_change(
             readiness.Verdict(readiness.HAS_PR, ""), issue(readiness.READY_MARKER)), "remove")
+
+
+class Command(unittest.TestCase):
+    def test_module_command_classifies_a_ticket_from_json(self):
+        payload = {"issue": issue("needs:human"), "timeline": [], "pull_updates": [],
+                   "now": time.time(), "idle_seconds": DAY, "own_logins": OURS}
+        result = subprocess.run([sys.executable, "-B", "-m", "bus.readiness"],
+                                input=json.dumps(payload), text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         {"kind": "needs-person", "reason": "a person holds or must answer it"})
 
 
 if __name__ == "__main__":

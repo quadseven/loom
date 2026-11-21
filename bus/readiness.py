@@ -21,11 +21,16 @@ classify() is a pure read of one ticket and returns one Verdict:
                  operator's claim, a run in progress, a wait label, a
                  non-ticket
 
-Nothing here reads GitHub or writes a label: the station step that applies a
-Verdict and tallies it per repo is a later slice. Tally keeps those counts.
+The station step that applies a Verdict and tallies it per repo is a later
+slice. To inspect a ticket offline, run `python3 -m bus.readiness < ticket.json`.
+The file holds one JSON object with the keyword arguments to classify(). The
+command prints one JSON object with the verdict's kind and reason.
 """
 from __future__ import annotations
 
+import argparse
+import json
+import sys
 from typing import Any, Dict, Iterable, List, NamedTuple, Optional
 
 from . import human_claims, stale_claims
@@ -134,3 +139,20 @@ def marker_change(verdict: Verdict, issue: Dict[str, Any]) -> Optional[str]:
     has = READY_MARKER in _names(issue)
     want = verdict.kind == READY
     return None if has == want else ("add" if want else "remove")
+
+
+# AI-REVIEW 2026-11-20 [automated review] 4648878159 (PR #3440):
+# Run the classifier on a local ticket before the station integration lands.
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Classify a ticket from JSON on stdin.",
+                                     epilog="Use the keyword arguments to bus.readiness.classify.")
+    parser.parse_args()
+    try:
+        verdict = classify(**json.load(sys.stdin))
+    except (AttributeError, TypeError, ValueError) as error:
+        parser.error("invalid classifier input: %s" % error)
+    print(json.dumps(verdict._asdict()))
+
+
+if __name__ == "__main__":
+    main()
