@@ -6983,6 +6983,23 @@ class Station:
                 raise
             except (GitHubError, OSError, ValueError) as err:
                 _say("score_lanes failed: %s" % err)
+
+        # Run check_invariants if it is overdue by more than an hour (loom#3439).
+        # This prevents it from being starved when claim_new carries over every pass.
+        try:
+            invariants_path = os.path.join(self.state, "invariants.json")
+            inv_state = invariants.load(invariants_path, _say)
+            checked = inv_state.get("checked")
+            num_checked = self._num(checked)
+            if num_checked and self.now - checked >= 3600:
+                waited = self.now - checked
+                _say("step check_invariants ran (overdue by %ds)" % waited)
+                self.check_invariants()
+        except TargetReached:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("check_invariants (overdue) failed: %s" % err)
+
         if not self.s.metrics_goal:
             return
         if "post_metrics" in paused:
