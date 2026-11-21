@@ -18,12 +18,20 @@ def functions(*names: str) -> str:
 
 
 class IncidentAliasSharedKey(unittest.TestCase):
-    def subject(self, host_dir: Path, ssm_dir: Path, repo="example/repo") -> subprocess.CompletedProcess:
-        script = (functions("incident_alias_key", "incident_subject")
-                  + 'repo_is_public() { false; }\nincident_subject\n')
+    def subject(self, host_dir: Path, ssm_dir: Path, repo="example/repo", *,
+                trace=False, shared_only=False) -> subprocess.CompletedProcess:
+        script = ('set -o pipefail\n. "$1"\nshift\n' + functions("incident_subject")
+                  + 'repo_is_public() { false; }\n')
+        if trace:
+            script += 'python3() { [ -z "${KEY+x}" ] || return 90; command python3 "$@"; }\n'
+        script += 'incident_subject "$@"\n'
         env = {"PATH": "/usr/bin:/bin", "REPO": repo, "INCIDENT_DIR": str(host_dir),
                "LOOM_SSM_DIR": str(ssm_dir), "NET_TIMEOUT": "5"}
-        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        args = ["bash", "-xc" if trace else "-c", script, "bash",
+                str(RUNNER.with_name("agent_sandbox.sh"))]
+        if shared_only:
+            args.append("shared-only")
+        return subprocess.run(args, env=env, capture_output=True, text=True)
 
     def write_key(self, ssm: Path, value: str):
         param = ssm / "loom" / "incident-alias-key"
@@ -48,6 +56,15 @@ class IncidentAliasSharedKey(unittest.TestCase):
             b = self.subject(tmp / "h", tmp / "ssm", "example/two")
             self.assertNotEqual(a.stdout, b.stdout)
 
+    def test_signing_keeps_the_key_out_of_the_process_environment_and_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            self.write_key(tmp / "ssm", "shared-test-key\n\n")
+            result = self.subject(tmp / "host", tmp / "ssm", trace=True)
+            self.assertNotIn("shared-test-key", result.stderr)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "private repo 9111c25b")
+
     def test_with_no_key_each_host_keeps_its_own_random_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -55,6 +72,15 @@ class IncidentAliasSharedKey(unittest.TestCase):
             b = self.subject(tmp / "host-b", tmp / "none")
             self.assertRegex(a.stdout, r"^private repo [0-9a-f]{8}$")
             self.assertNotEqual(a.stdout, b.stdout)
+
+    def test_cross_host_lookup_requires_a_shared_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            host = tmp / "host"
+            result = self.subject(host, tmp / "ssm", shared_only=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse(host.exists())
 
 
 if __name__ == "__main__":
