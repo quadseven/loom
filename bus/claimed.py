@@ -8,18 +8,21 @@ day while their work had landed.
 
 The station's settle_claimed_tickets step reads each such issue at most once
 an hour. When every pull request whose `Refs` line names it is merged into
-the default branch, with the review check concluding success on its head and
-every other check success, skipped or neutral, and no open pull request
-names it:
+the default branch and no open pull request names it, the criteria decide
+how the issue settles.
 
 - every acceptance box asks only for merged code or tests: one evidence
-  comment of checked facts, the boxes ticked, the issue closed as completed;
-- a box asks for live, deployed or production behaviour, a time window or an
-  observed event: the `awaiting-live-check` label, once, and the issue stays
-  open for a person.
+  comment of checked facts, the boxes ticked, the issue closed as completed
+  once the head review succeeds and every other head check passes;
+- a box asks for live, deployed or production behavior, a time window or an
+  observed event: the evidence close checks the merge commits and the
+  default branch. It lists outstanding live boxes in Proof due before
+  closing. A held issue can carry `awaiting-live-check` into a later pass.
 
 An issue with a `loom:`, `needs:`, `needs-`, `ready-for-human` or `wontfix`
-label, an epic, or one with no acceptance boxes is never touched. LOOM_SETTLE_CLAIMED picks the mode:
+label, an epic, or one with no acceptance boxes is never touched.
+An unticked operator or decision box holds the issue open.
+LOOM_SETTLE_CLAIMED picks the mode:
 unset or `dry` logs what it would do and writes nothing, `on` writes, `off`
 skips the step. LOOM_SETTLE_CLAIMED_MAX caps the issues settled per run, and
 writes are at least WRITE_GAP seconds apart.
@@ -69,7 +72,7 @@ MAX_TEST_FILES = 10
 # head, and the merge gate takes that; the review check itself must succeed.
 PASSING = verify_data.GREEN_CONCLUSIONS + ("neutral",)
 HOLD_PREFIXES = ("loom:", "needs:", "needs-")
-HOLD_LABELS = ("ready-for-human", "epic", "wontfix", LIVE_LABEL)
+HOLD_LABELS = ("ready-for-human", "epic", "wontfix")
 
 _sleep = time.sleep
 _clock = time.monotonic

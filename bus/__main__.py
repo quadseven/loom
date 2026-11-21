@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -73,6 +74,12 @@ def _parser() -> argparse.ArgumentParser:
                    "LOOM_SELF_REPO, else this checkout's origin); "
                    "the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
+    s = sub.add_parser("state-import", help="copy the file ledgers into the shared state backend, once")
+    s.add_argument("--dry-run", action="store_true", help="print counts per ledger, write nothing")
+    s.add_argument("--overwrite", action="store_true",
+                   help="replace ledgers the shared store already holds (default: keep them)")
+    s.add_argument("--skip", action="append", default=[], metavar="LEDGER",
+                   help="a ledger key (path below state/) to leave out; repeatable")
     s = sub.add_parser("app", help="set up the Loom's own GitHub App")
     app_sub = s.add_subparsers(dest="app_command", required=True)
     a = app_sub.add_parser("manifest", help="print the App manifest and the page that creates it")
@@ -209,6 +216,9 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
     if args.command == "app":
         # No personal token: the manifest needs none, and ids signs as the App.
         return _app(args, app_transport, app_sign)
+    if args.command == "state-import":
+        from . import state_import
+        return state_import.main(os.environ, args.dry_run, args.overwrite, tuple(args.skip))
     if args.command == "station":
         try:
             return station.run(station.Settings.from_env(), gh)

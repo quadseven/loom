@@ -228,6 +228,22 @@ class UsageDashboardTests(unittest.TestCase):
         self.assertIn("free: its hold (provider limit reached) ended 2026-10-18 10:00 EDT (30m ago)", spark)
         self.assertIn("state/usage/spark.limit, state/usage/spark-2.limit, state/usage/spark-3.limit", spark)
 
+    def test_a_published_state_outside_the_known_four_falls_back_to_the_hold(self):
+        rows = [reading("spark", ["spark", "spark-2", "spark-3"], "thermal hold")]
+        rows[0]["holds"] = {"spark": "the spark endpoint did not answer (curl exit 28)"}
+        lane_rows = [{"lane": "spark", "state": "busy", "reason": "on a ticket"},
+                     {"lane": "spark-2", "state": "parked"},
+                     {"lane": "spark-3", "state": "serving", "reason": "Accepting work"}]
+        data = usage.build(rows, NOW, lane_rows=lane_rows)
+        groups = {g["kind"]: g for g in data["providers"][0]["groups"]}
+        # spark's unknown state is ignored for its own hold; spark-2 has no reason.
+        self.assertEqual(sorted(groups), ["down", "free"])
+        self.assertEqual(sorted(lane for g in data["providers"][0]["groups"]
+                                if g["kind"] == "down" for lane in g["lanes"]),
+                         ["spark", "spark-2"])
+        self.assertEqual(groups["free"]["lanes"], ["spark-3"])
+        self.assertIn("spark", usage.render(data))
+
     def test_a_hold_that_has_ended_stops_counting_the_lane_down(self):
         # The live page showed a spark lane "down" from a hold that ended over
         # an hour before, because the lane had written no heartbeat since.

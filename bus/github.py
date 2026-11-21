@@ -99,6 +99,22 @@ class ShadowHeld(GitHubError, ValueError):
         self.entry = entry or {}
 
 
+def _unchecked_acceptance(body: str) -> list:
+    """Unchecked box texts under any level-2 heading starting with
+    "Acceptance" (case-insensitive). Wider than proof.criteria, which reads
+    only the exact heading and stays as it is."""
+    found = []
+    inside = False
+    for line in body.replace("\r", "").split("\n"):
+        if line.startswith("## "):
+            inside = line[3:].strip().lower().startswith("acceptance")
+            continue
+        match = proof._BOX.match(line) if inside else None
+        if match and match.group(1) == " ":
+            found.append(match.group(2))
+    return found
+
+
 def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
     """Refuse a PATCH that would close an issue as completed while its
     acceptance criteria are unchecked.
@@ -134,8 +150,7 @@ def refuse_incomplete_close(gh: Any, method: str, path: str, body: Any) -> None:
               for label in issue.get("labels") or []]
     if any(name in labels for name in _FORCE_CLOSE_LABELS):
         return
-    unchecked = [text for checked, text in
-                 proof.criteria(str(issue.get("body") or "")) if not checked]
+    unchecked = _unchecked_acceptance(str(issue.get("body") or ""))
     if unchecked:
         raise ValueError(
             "refusing to close %s as completed with unchecked acceptance "

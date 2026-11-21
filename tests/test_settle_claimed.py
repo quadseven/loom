@@ -4,7 +4,7 @@ Pull requests never use closing keywords, so an issue an operator session
 claims (a claim:<login> label, no loom: label) stayed open after its pull
 request merged: nothing in Loom settled it. The station's
 settle_claimed_tickets step closes one whose boxes ask only for merged code
-or tests, with one evidence comment, and labels one with a live box.
+or tests with one evidence comment. Live boxes use the shared evidence close.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import claimed, station  # noqa: E402
+from bus import claimed, evidence_close, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
@@ -50,6 +50,7 @@ class FakeGitHub:
         self.closed_pulls = []
         self.open_pulls = []
         self.check_runs = {}
+        self.carried = {MERGE_SHA}
         self.files = {}
         self.contents = {"tests/test_parser.py": TEST_SOURCE}
         self.writes = []
@@ -90,6 +91,9 @@ class FakeGitHub:
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
         data = json.loads(body) if body else None
+        if method == "POST" and parts.path == "/graphql" and "timelineItems" in data["query"]:
+            page = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+            return reply(200, {"data": {"repository": {"issue": {"timelineItems": page}}}})
         if method != "GET":
             self.writes.append((method, parts.path, data))
         if parts.path == "/repos/%s" % REPO:
@@ -118,6 +122,9 @@ class FakeGitHub:
                          else self.closed_pulls)
         if runs:
             return reply(200, {"check_runs": self.check_runs.get(runs.group(1), [])})
+        if rest.startswith("compare/"):
+            sha = rest[len("compare/"):].split("...", 1)[0]
+            return reply(200, {"status": "ahead" if sha in self.carried else "behind"})
         if files:
             return reply(200, self.files.get(int(files.group(1)), []))
         if rest.startswith("contents/"):
@@ -133,6 +140,7 @@ class FakeGitHub:
 
     def _create(self, data):
         number = 900 + len(self.created)
+        self.add_issue(number, **data)
         self.created.append(dict(data, number=number))
         return reply(201, {"number": number})
 
@@ -148,6 +156,9 @@ class FakeGitHub:
             return reply(201, self.comments[n][-1])
         if sub == "comments":
             return reply(200, self.comments[n])
+        if sub == "labels" and method == "PUT":
+            self.issues[n]["labels"] = [{"name": name} for name in data["labels"]]
+            return reply(200, self.issues[n]["labels"])
         if sub == "labels" and method == "POST":
             have = self.names(n)
             self.issues[n]["labels"] += [{"name": x} for x in data["labels"] if x not in have]
@@ -184,6 +195,142 @@ class Base(unittest.TestCase):
         st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
         st.settle_claimed_tickets()
         return st
+
+
+class ClaimedEvidenceClose(Base):
+    def test_claimed_live_boxes_are_listed_before_a_quiet_evidence_close(self):
+        boxes = ["Live: the status page shows the count",
+                 "Live: the nightly report names the run"]
+        body = "## Acceptance criteria\n" + "".join("- [ ] %s\n" % box for box in boxes)
+        self.fake.add_issue(7, labels=("claim:example-login", claimed.LIVE_LABEL), body=body)
+        self.fake.add_merged(41, refs=7)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        self.settle()
+        self.assertEqual(self.fake.issues[7]["state"], "closed")
+        self.assertIn("closed-unproven", self.fake.names(7))
+        self.assertEqual(self.fake.issues[7]["body"], body)
+        self.assertEqual(self.fake.comments[7], [])
+        [due] = self.fake.created
+        self.assertEqual(due["labels"], ["loom:proof-due"])
+        writes = self.fake.writes
+        listed = next(i for i, (_, _, data) in enumerate(writes)
+                      if all("- #7: " + box in data.get("body", "") for box in boxes))
+        closed = next(i for i, (_, _, data) in enumerate(writes) if data.get("state") == "closed")
+        self.assertLess(listed, closed)
+
+    def test_operator_and_decision_boxes_hold_even_without_another_live_box(self):
+        for n, box in enumerate(("The operator signs off", "Decision: keep the new field"), 7):
+            self.fake.add_issue(n, body=CODE_BODY.replace("The parser reads the new field.", box))
+            self.fake.add_merged(40 + n, refs=n)
+        self.settle()
+        self.assertEqual([self.fake.issues[n]["state"] for n in (7, 8)], ["open", "open"])
+        self.assertEqual(self.fake.writes, [])
+
+    def test_every_linked_pull_must_be_merged_green_and_still_standing(self):
+        # Each has a qualifying first pull. Only its second pull holds it.
+        for n in range(1, 7):
+            sha = "%040x" % n
+            self.fake.add_issue(n, body=LIVE_BODY)
+            self.fake.add_merged(40 + n, refs=n)
+            self.fake.add_merged(50 + n, refs=n, merge=sha)
+            self.fake.check_runs[sha] = self.fake.check_runs[HEAD_SHA]
+            self.fake.carried.add(sha)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        other = {p["number"]: p for p in self.fake.closed_pulls}
+        self.fake.closed_pulls.remove(other[51])
+        self.fake.open_pulls.append(dict(other[51], state="open", merged_at=None))
+        other[52]["merged_at"] = None
+        self.fake.carried.remove("%040x" % 3)
+        self.fake.check_runs["%040x" % 4] = [{"name": "tests", "conclusion": "failure"}]
+        self.fake.files[55] = [{"filename": "parser.py", "patch": "+def removed():", "status": "modified"}]
+        self.settle()
+        self.assertEqual([self.fake.issues[n]["state"] for n in range(1, 7)],
+                         ["open"] * 5 + ["closed"])
+
+    def test_a_runnable_live_check_is_tried_first(self):
+        url = "https://status.example.com/check"
+        body = LIVE_BODY.replace("the deployed service answers within 24 hours.",
+                                 "the check at `%s` returns `ok`." % url)
+        self.fake.add_issue(7, body=body)
+        self.fake.add_merged(41, refs=7)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        with mock.patch("bus.criteria_gate._fetch", return_value=(500, "", "")) as fetch:
+            self.settle()
+        fetch.assert_called_once_with(url, station.criteria_gate.CHECK_TIMEOUT)
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+        self.assertFalse(self.fake.created)
+
+    def test_a_claim_on_an_untrusted_authors_issue_does_not_run_its_check(self):
+        body = LIVE_BODY.replace("the deployed service answers within 24 hours.",
+                                 "`https://status.example.com/check` returns `ok`")
+        self.fake.add_issue(7, body=body, user={"login": "outside-contributor"})
+        self.fake.add_merged(41, refs=7)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        with mock.patch("bus.criteria_gate._fetch") as fetch:
+            self.settle()
+        fetch.assert_not_called()
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+
+    def test_a_passing_check_leaves_only_outstanding_proof_due(self):
+        box = "Live: the response from `https://status.example.com/check` contains `ok`"
+        body = "## Acceptance criteria\n- [ ] %s\n" % box
+        self.fake.add_issue(7, body=body + "- [ ] Live: the report shows the count\n")
+        self.fake.add_issue(8, body=body)
+        for number in (7, 8):
+            self.fake.add_merged(40 + number, refs=number)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        with mock.patch("bus.criteria_gate._fetch", return_value=(200, "ok", "")):
+            self.settle()
+        self.assertEqual([self.fake.issues[n]["state"] for n in (7, 8)], ["closed", "closed"])
+        self.assertIn("closed-unproven", self.fake.names(7))
+        self.assertNotIn("closed-unproven", self.fake.names(8))
+        self.assertIn("- #7: Live: the report shows the count", self.fake.issues[900]["body"])
+        self.assertNotIn(box, self.fake.issues[900]["body"])
+        self.assertEqual(self.fake.comments[7], [])
+        [note] = self.fake.comments[8]
+        self.assertIn("live checks passed", note["body"])
+        self.assertNotIn("Not verified live", note["body"])
+
+    def test_a_later_revert_holds_even_when_the_merge_commit_is_an_ancestor(self):
+        self.fake.add_issue(7, body=LIVE_BODY)
+        self.fake.add_merged(41, refs=7)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        revert = "c" * 40
+        self.fake.add_merged(42, refs=0, merge=revert)
+        self.fake.closed_pulls[-1].update(title="Revert #41", merged_at="2030-01-03T00:00:00Z")
+        self.fake.carried.add(revert)
+        self.settle()
+        self.assertEqual(self.fake.issues[7]["state"], "open")
+        self.assertFalse(self.fake.created)
+
+    def test_runnable_checks_can_finish_across_passes(self):
+        body = ("## Acceptance criteria\n- [ ] Live: the report names the run\n"
+                "- [ ] Live: `https://status.example.com/one` serves `ok`\n"
+                "- [ ] Live: `https://status.example.com/two` serves `ok`\n")
+        self.fake.add_issue(7, body=body)
+        self.fake.add_merged(41, refs=7)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        with mock.patch.object(station, "LIVE_CHECKS_PER_PASS", 1), \
+                mock.patch("bus.criteria_gate._fetch", return_value=(200, "ok", "")) as fetch:
+            self.settle(now=10000)
+            self.assertEqual(self.fake.issues[7]["state"], "open")
+            self.settle(now=14000)
+        self.assertEqual(self.fake.issues[7]["state"], "closed")
+        self.assertEqual([c.args[0] for c in fetch.call_args_list], [
+            "https://status.example.com/one", "https://status.example.com/two"])
+        self.assertNotIn("https://", self.fake.issues[900]["body"])
+
+    def test_holds_and_an_unclaimed_issue_stay_open(self):
+        holds = ("loom:regression", "loom:urgent", "loom:runaway", "needs-brain",
+                 "loom:audit-failed", "needs:human", "wait:blocked", "closed-unproven")
+        for number, hold in enumerate(holds, 1):
+            self.fake.add_issue(number, labels=("claim:example-login", hold), body=LIVE_BODY)
+            self.fake.add_merged(40 + number, refs=number)
+        self.fake.add_issue(20, labels=(claimed.LIVE_LABEL,), body=LIVE_BODY)
+        self.fake.add_merged(60, refs=20)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+        self.settle()
+        self.assertEqual(self.fake.writes, [])
 
 
 class SettleClaimedTest(Base):
@@ -352,6 +499,57 @@ class SettleClaimedTest(Base):
                                lambda s, *a: calls.append(a) or reply(500)):
             self.settle()
         self.assertEqual(calls, [])
+
+
+class SharedEvidenceBudget(Base):
+    def add_live(self, number, shipped=False):
+        labels = ("loom:ticket", "loom:shipped") if shipped else ("claim:example-login",)
+        self.fake.add_issue(number, labels=labels, body=LIVE_BODY)
+        self.fake.add_merged(40 + number, refs=number)
+        self.fake.check_runs[MERGE_SHA] = self.fake.check_runs[HEAD_SHA]
+
+    def run_steps(self, now, claimed_first=False):
+        st = station.Station(GitHub("token", transport=self.fake), self.settings, now=now)
+        steps = [st.close_done_tickets, st.settle_claimed_tickets]
+        for step in reversed(steps) if claimed_first else steps:
+            step()
+
+    def closed(self):
+        return {n for n, issue in self.fake.issues.items() if issue["state"] == "closed"}
+
+    def test_rotated_steps_share_pass_and_daily_limits(self):
+        self.add_live(1)
+        self.add_live(2, shipped=True)
+        self.add_live(3, shipped=True)
+        self.add_live(4)
+        with mock.patch.object(evidence_close, "CLOSES_PER_PASS", 2), \
+                mock.patch.object(evidence_close, "CLOSES_PER_DAY", 3):
+            self.settings.settle_claimed_max = 1
+            self.run_steps(10000, claimed_first=True)
+            self.assertEqual(self.closed(), {1, 2})
+            self.run_steps(14000)
+            self.assertEqual(self.closed(), {1, 2, 3})
+            self.run_steps(18000)
+            self.assertEqual(self.closed(), {1, 2, 3})
+            self.run_steps(100000)
+            self.assertEqual(self.closed(), {1, 2, 3, 4})
+
+    def check_reopen(self, shipped):
+        self.add_live(1, shipped=shipped)
+        self.run_steps(10000)
+        self.assertEqual(self.closed(), {1})
+        self.fake.issues[1]["state"] = "open"
+        self.add_live(2, shipped=True)
+        self.add_live(3)
+        self.run_steps(14000)
+        self.assertEqual(self.closed(), set())
+        self.assertIn("1 of 1 closes reopened", self.fake.issues[900]["body"])
+
+    def test_a_claimed_reopen_stops_both(self):
+        self.check_reopen(shipped=False)
+
+    def test_a_ticket_reopen_stops_both(self):
+        self.check_reopen(shipped=True)
 
 
 class RereviewTest(Base):

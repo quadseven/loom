@@ -24,9 +24,9 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   each limited model and the epoch it lifts (`limited_models`); the station
   claims no ticket for that model on the lane until then, and the factory
   moves it as for a lane at a limit (a ladder ticket waits on its rung).
-- Each pass writes `state/usage/<lane>.json` with `available` and `at`. A lane
-  whose CLI or key is missing reports `available: false` and leaves its briefs
-  alone; the dispatcher routes only to fresh, available lanes.
+- Each pass writes `state/usage/<lane>.json` with the lane state, runner
+  readiness, and time. A lane whose CLI or key is missing reports unavailable
+  and leaves its briefs alone. The station routes only to serving lanes.
 
 ## How a lane is told to work
 
@@ -244,6 +244,78 @@ unset variables.
   setup may need (an API-lane agent has neither). A machine without `sandbox-exec` fails setup
   for repos with a contract. Each step has `LOOM_CHECK_TIMEOUT` seconds
   (default 1800).
+- Before claiming a ticket for a local lane, the station checks the same
+  host load limits as lane checks. A high reading leaves the ticket for
+  the next station pass. The local runner checks before preparing a brief
+  and again before starting its agent. It polls every
+  `LOOM_CHECK_SLOT_POLL` seconds (default 5) with its keepalive running.
+  After `LOOM_CHECK_SLOT_WAIT` seconds (default 5400) it leaves the same
+  brief in the inbox for the next pass. Heartbeats, brief handoffs and
+  cluster agent starts proceed independently of this gate.
+- `LOOM_HEAVY_REPOS` lists comma- or space-separated `owner/name` entries.
+  It defaults to empty, which disables repo locking. Each listed repo has
+  its own lock for the duration of a local agent run. Other build jobs on
+  the host can use the same protocol or call the helper directly. From
+  the shell that stays alive for the build, run
+  `python3 lanes/heavy_repo.py take "$lock"` and retry if busy. After the
+  build, run `python3 lanes/heavy_repo.py release "$lock"`.
+  Use the same `LOOM_HOME` and set `lock` to the
+  directory `$LOOM_HOME/run/heavy-repos/<owner>+<name>.lock`, with owner
+  and name in lowercase. Its `pid` file holds one positive decimal PID.
+  - Take an exclusive `flock(2)` on the persistent file
+    `$LOOM_HOME/run/heavy-repos/.guard` while reading or updating a lock.
+    Release the guard before building or waiting. Leave the guard file in place.
+  - If the PID is alive, release the guard and retry. A permission error
+    checking the PID also means busy. If the directory is absent, create
+    it. If the holder died or left an unfinished directory without a PID,
+    reclaim it. Write the new PID by renaming a temporary file to `pid`
+    before releasing the guard.
+  - On completion, take the guard, verify the PID still belongs to the
+    holder or the recorded process has exited, then remove `pid` and the
+    lock directory. The lane uses the same poll interval and wait limit as
+    for host load.
+- A lane agent run and every check step start under a job cap,
+  `LOOM_BUILD_JOBS` (default 4; 0 turns it off; a value that is not a whole
+  number counts as 4). The load gates above only stop a run from starting,
+  and a run in flight could still take every core. The default is 4
+  because the three check slots at that cap fit a 12-core lane host; a
+  host with fewer cores should set it lower. Set it in the lane
+  runner's environment, like `LOOM_CHECK_WORKERS`. The cap reaches build
+  tools two ways (`lanes/build_jobs.sh`):
+  - Through the environment, for the tools that read it: `MAKEFLAGS`
+    (`-jN`), `CMAKE_BUILD_PARALLEL_LEVEL`, `PYTEST_XDIST_AUTO_NUM_WORKERS`,
+    `CARGO_BUILD_JOBS`, `GOMAXPROCS`, `GRADLE_OPTS`
+    (`-Dorg.gradle.workers.max=N`), `RAYON_NUM_THREADS`, `OMP_NUM_THREADS`
+    and `npm_config_jobs`, each at the cap, and `UV_CONCURRENT_BUILDS=1`.
+    An agent or check with an emptied environment has them set where that
+    environment is built. A subscription lane's agent inherits the
+    runner's environment, so there the cap is added after any `MAKEFLAGS`
+    or `GRADLE_OPTS` the host already set.
+  - Through a wrapper first on `PATH`, for the two tools that take a job
+    count only as a flag: `lanes/jobcap/xcodebuild` adds `-jobs N` to a call
+    that builds or tests, and `lanes/jobcap/swift` adds `--jobs N` to
+    `swift build`, `swift test` and `swift run`. Each runs the next tool of
+    its name on `PATH` with every argument unchanged. A call that names its
+    own job count, or builds nothing (`xcodebuild -list`, `swift package`),
+    passes through untouched. The sandbox lets a run read that one
+    directory and write nothing in it.
+  - In a check, `LOOM_CHECK_WORKERS` keeps its meaning and the smaller of
+    the two wins: the test runner gets the smaller as
+    `PYTEST_XDIST_AUTO_NUM_WORKERS`, and `LOOM_CHECK_WORKERS` is lowered to
+    the cap when it is the larger.
+  - With `LOOM_BUILD_JOBS=0` Loom adds none of these names and leaves `PATH`
+    as it was. A name the runner's own environment already holds (a host
+    `MAKEFLAGS`, say) still reaches a lane that inherits that environment.
+  - Not covered: a tool that reads the core count for itself and takes no
+    setting; a build tool started by its full path or through `xcrun`, past
+    the wrapper; a command that sets its own job count, which wins; and
+    the agy lane where its user cannot read the loom checkout (the wrappers
+    are skipped there, the environment caps still apply). `MAKEFLAGS=-jN`
+    also makes a plain `make` run N jobs where it ran one, so a Makefile
+    that is not safe to run in parallel needs `.NOTPARALLEL` or its own
+    `-j1`. The cap is per run, not per host: how many runs start is the
+    load gates' and check slots' part, and one build at a time in a heavy
+    repo is `LOOM_HEAVY_REPOS`' part.
 - Steps share a host-wide semaphore: at most `LOOM_CHECK_SLOTS` (default 3)
   run at once across all lanes, as `run/check-slots/slot-N` directories that
   hold the runner's pid; a slot whose pid is gone is reclaimed. A free slot
@@ -643,17 +715,19 @@ The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
 being the first ticket's in that order.
 
-Lane status: every pass the station reads each lane's heartbeat (`yes` when
-available and at most 600 seconds older than the pass's start, else `no`; a
-beat written while the pass runs counts, one stamped more than a minute
-ahead of the clock does not) and keeps one comment on the
+Lane status: every pass the station reads each lane's heartbeat and evaluates
+whether it is serving, limited, parked, or off. Local heartbeats are usable
+for 600 seconds. A beat written while the pass runs counts, with a minute
+of tolerance for clock skew. The station keeps one comment on the
 open `loom:lanes` issue in `LOOM_STATUS_REPO` (default: this checkout's
 `origin`; the issue is created when missing) current. It edits the comment
-only when a yes or no changes, when an anthropic run is recorded, and when
+when a lane state or its public reason changes, when an Anthropic run is recorded, and when
 the table is older than 15 minutes (`LANES_REPUBLISH`), which it does at the
 start of the pass so a pass that stops at its request target still publishes.
-It never publishes the heartbeat's reason. `bus.brain status` prints the
-table's age beside `Updated` and calls it stale past the same age. With anthropic
+The table uses fixed reason text so raw runner details stay local. The
+launchd station removes stale heartbeat files for slots with no loaded job.
+Remote and cluster slots keep their own heartbeat sources. `bus.brain status`
+prints the table's age beside `Updated` and calls it stale past the same age. With Anthropic
 spend recorded or a budget set, it ends with the spend line ("Anthropic
 spend" below).
 
@@ -1539,6 +1613,20 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Moving file ledgers into the shared backend
+
+A station switched to `postgres` starts with empty ledgers, so it would send
+its reports, asks and notices again and forget its watches and holds.
+`python3 -m bus state-import` copies the file ledgers once: every `*.json`
+below `state/` except the host-local ones (`state_store.host_local`, which
+includes the ETag cache). `--dry-run` prints a count per ledger and writes
+nothing; it works without the database settings. A real run needs
+`LOOM_STATE_BACKEND=postgres` and its settings, refuses while a pass on this
+host holds the station lock, reads each copy back and compares it, and leaves
+ledgers the store already holds alone unless `--overwrite` is given, so a
+second run changes nothing. `--skip LEDGER` leaves one out. Stop the old
+station first; a station on another host cannot be seen from here.
+
 ### Standing by for another station
 
 The lease cannot stop a station that does not use it: one started by launchd
@@ -2007,7 +2095,7 @@ cannot query the viewer or any other local service.
   group of its own. An expired key still holds all four.
 - The Usage view's meters for the free lanes (loom#812). After a ready
   heartbeat the openrouter and workersai lanes read their provider's
-  read-only meter with the key they already hold, at most every five minutes,
+  read-only meter with the key they already hold, at most every five minutes on heartbeat,
   through `bus/meter.py` (key and account id on stdin, never argv or a log),
   into `state/usage/<slot>.meter.json`; `bus/usage.py` shows it. openrouter:
   `GET /api/v1/key`, the key's free-model requests in the current UTC day and
@@ -2160,6 +2248,12 @@ lookup leaves the brief for the next pass. The rule covers:
  When the base check left a uv cache, the agent gets a copy of it and runs uv
  offline (`UV_OFFLINE`, `PIP_NO_INDEX`), so tests that need packages run
  without network (loom#1665).
+- A lane run points `CODEX_HOME` at a lane-only home under the run's scratch
+ home: the operator's `config.toml` (model and provider config) and sign-in
+ are copied in, and the user-level `AGENTS.md` is not, so a personal startup
+ duty in that file never reaches a lane run (loom#3227). Session rollouts
+ still link to the operator's sessions folder, where the station reads them.
+ A brain run keeps the operator's Codex home as before.
 - Best for: scoped implementation, CI failure repair, `codex review` passes.
 - Models per ticket: Astra (hardest), Sol (default building), Luna (volume).
 
@@ -2283,6 +2377,22 @@ App wrote.
 - Runs `cloudflare-workers-ai/@cf/...` models only. Cloudflare does not train
   on prompts, so private repos are allowed.
 
+The station holds coding tickets by default. To test coding capacity on demand,
+run `python3 -B -m bus.workersai check "$LOOM_HOME" "$LOOM_WORKERSAI_MODEL"`
+with the lane's token and account ID piped on standard input, one per line.
+The check sends a synthetic prompt. It enables the checked model only when the
+provider returns an answer and reports at least 65,536 input tokens. A first
+coding request refused with HTTP 429 while a fresh daily meter is below 50
+percent clears that check. The station requeues the ticket on its current rung.
+
+Workers AI can still verify shipped tickets using the evidence in the brief.
+The lane sends one request with an 8,192-token budget. It counts one input
+token per UTF-8 byte, reserves 128 tokens for the chat template and caps the
+reply at 1,024 tokens. The runner checks the daily neuron meter before sending
+the request. Larger verify briefs stay eligible for other lanes. Cluster
+dispatch requires both provider parameter settings, and a successful cluster
+run refreshes the meter for its report.
+
 ## free provider slots on the spark-gateway
 
 Set `LOOM_FREE_GATEWAY_URL` to your gateway's origin. The six free slots use
@@ -2373,6 +2483,11 @@ Plan:
   `LOOM_AGY_EFFORT` (`high` by default); a model with `-low`, `-medium`, or
   `-high` keeps its suffix. A model outside the catalog is refused as a
   transient lane mismatch before agy starts.
+- Every 30 minutes, even with an empty inbox, agy can recheck held models
+  in its configured ladder. It sends one small print-mode request per held
+  `gemini-3.8-flash` effort (high, medium, or low). An answer releases
+  that model on the same pass. A refusal keeps the hold and updates its
+  expiry if the provider gives a reset time.
 - agy keeps its sign-in in the macOS keychain. A sandboxed agent that can
   reach the keychain server could ask for any of the operator's keychain
   entries, so the agent runs as a dedicated standard macOS user (default
@@ -2812,3 +2927,16 @@ refuses while any line is rejected, with a reason asking the lane to file
 the issue and cite it, or drop the line; a round whose summary has no such
 section keeps the body's earlier one. In a public repo another repo's
 citation is written as "issue N of another repo".
+
+## Restore after a reboot
+
+`lanes/win/restore_plan.py` plans the restore of Windows lanes from a
+manifest (`lanes/win/lanes.example.json` shows the shape), the newest session
+snapshot and the names of the agents already running. For each lane it
+returns one `agent start` command and one outcome (`resumed`, `fresh-primed`,
+`awaiting-decision`, `failed`, or `already-running`, which runs nothing), and
+an exit code that is 0 only when every lane resumed or was already running.
+A lane with no resumable session id waits for a decision and is never started
+fresh unless its policy says `fresh`. `check_snapshot` refuses snapshot text
+that holds a token variable name or a key shape. The PowerShell scripts that
+call it are a later change.

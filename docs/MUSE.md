@@ -208,7 +208,10 @@ and the health findings. Read them with the helper, not a hand-built URL:
     python3 -m bus.product_read stuck
     python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
     python3 -m bus.product_read health
+    python3 -m bus.product_read path /api/<documented path> [--param KEY=VALUE]
 
+`path` reads any other GET path the product's API documents, with the same
+base checks and failure line; a path that does not start with `/api/` exits 2.
 It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
 overseer's own configured product URL, whatever mount the operator gave the
 site; the mount may be a secret path, so it is never written in a repository
@@ -718,7 +721,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs:human` issue in `LOOM_REPOS`. Do yourself
+6. First run `python3 -m bus.brain step asks --holder muse`. Run `python3 -m bus.needs_you` and review only the items in its `## Brain review this tick` section (at most 5, oldest ask first, `--brain-batch N` sets the count; an item whose newest comment is from a `LOOM_BRIEF_AUTHORS` login is left out until someone else writes on it, so the batch rotates). A tick that acted on each of those items records no degraded asks step. For each of them, do yourself
    whatever does not need the operator's own hands, money, accounts or a
    decision the goal home reserves for the operator: fix it, ticket it, or
    record the decision the evidence supports. Then comment what was done and
@@ -1102,8 +1105,11 @@ factory has not already moved, in the same tick, whatever the time budget: it
 picks the lowest untried rung whose lane is free, rewrites the ticket's
 `Model:` line, swaps the lane label, comments the rung and the reason, and
 sends an open pull request back as a fix brief (`--file NOTES.md` adds your
-own notes to that brief). It refuses a ticket that is not repeatedly stuck,
-and one whose open pull request has nothing to fix.
+own notes to that brief). When a briefed or queued ticket already names
+the next rung's model and carries one of its lane labels, status shows the
+lane it is waiting for. If `escalate` selects the ticket's current rung, it
+reports the wait without rewriting the ticket. It also refuses a ticket
+that is not repeatedly stuck or whose open pull request has nothing to fix.
 Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
 or ask the operator with one exact ask when only the operator can unblock it.
 `status` reads the history of at most 20 tickets per repo, the least recently

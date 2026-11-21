@@ -329,8 +329,27 @@ def _lines(item: Item) -> List[str]:
     return out
 
 
-def render(items: Sequence[Item], unread: Sequence[str]) -> str:
-    """The report. A section with nothing in it is left out, except Needs you."""
+BRAIN_BATCH = 5  # items the brain's asks step reviews in one tick
+BRAIN_HEADING = "## Brain review this tick"
+
+
+def brain_batch(items: Sequence[Item], trusted: Sequence[str], size: int) -> List[Item]:
+    """At most size items for the brain's asks step: the oldest ask first,
+    leaving out an item whose newest comment is from a trusted login, so a
+    reviewed item drops out until someone else writes on it and the batch
+    rotates (loom#644)."""
+    brains = {login.lower() for login in trusted}
+    fresh = [i for i in items if i.latest_by.lower() not in brains]
+    # An ask with an unreadable time sorts last.
+    fresh.sort(key=lambda i: (not i.asked_at, i.asked_at, i.ref))
+    return fresh[:max(size, 0)]
+
+
+def render(items: Sequence[Item], unread: Sequence[str],
+           batch: Optional[Sequence[Item]] = None) -> str:
+    """The report. A section with nothing in it is left out, except Needs you.
+    With a batch (even an empty one) the report ends with the brain's review
+    section."""
     out: List[str] = []
     for section, heading in HEADINGS:
         found = sorted((i for i in items if i.section == section), key=lambda i: i.ref)
@@ -338,6 +357,11 @@ def render(items: Sequence[Item], unread: Sequence[str]) -> str:
             continue
         out.append("%s: %s" % (heading, len(found) if found or unread else "nothing"))
         for item in found:
+            out += _lines(item)
+        out.append("")
+    if batch is not None:
+        out.append("%s: %s" % (BRAIN_HEADING, len(batch) if batch else "nothing"))
+        for item in batch:
             out += _lines(item)
         out.append("")
     if unread:
@@ -349,8 +373,10 @@ def render(items: Sequence[Item], unread: Sequence[str]) -> str:
 
 def run(gh: Any, repos: Sequence[str], trusted: Sequence[str], ops: Sequence[str],
         answerers: Sequence[str] = (), deadline: Optional[float] = None,
-        workers: Optional[int] = None) -> Tuple[str, int]:
-    """(the report, the exit code). Repos and items are read on WORKERS
+        workers: Optional[int] = None,
+        batch: Optional[int] = None) -> Tuple[str, int]:
+    """(the report, the exit code). A batch size adds the brain's review
+    section of that many items. Repos and items are read on WORKERS
     threads; what is not read by the deadline (DEADLINE seconds when None)
     is named as unread, so a slow repo is a short report that says so, never
     a report that does not come (loom#2394)."""
@@ -415,7 +441,8 @@ def run(gh: Any, repos: Sequence[str], trusted: Sequence[str], ops: Sequence[str
     with lock:
         got, missed = list(items), list(unread)
     missed += ["%s: not read within the %gs deadline" % (name, seconds) for name in late]
-    return render(got, missed), 1 if missed else 0
+    chosen = None if batch is None else brain_batch(got, trusted, batch)
+    return render(got, missed, chosen), 1 if missed else 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -428,7 +455,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--workers", type=int, default=WORKERS, metavar="N",
                         help="reads sent at once (default %(default)d); on a slow network "
                              "more workers finish a first run sooner")
+    parser.add_argument("--brain-batch", type=int, default=BRAIN_BATCH, metavar="N",
+                        help="items in the brain review section (default %(default)d)")
     args = parser.parse_args(argv)
+    if args.brain_batch < 0:
+        parser.error("--brain-batch must not be negative")
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     repos = args.repo or os.environ.get("LOOM_REPOS", "").split()
@@ -442,7 +473,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gh.status_in_body = True  # read as the brain reads (bus.brain.main)
     gh.status_authors |= {login.lower() for login in trusted}
     text, code = run(gh, repos, trusted, answer.operators(trusted=trusted), ask_state.answerers(),
-                     deadline=args.deadline, workers=args.workers)
+                     deadline=args.deadline, workers=args.workers, batch=args.brain_batch)
     gh.prune_cache(CACHE_KEEP)
     sys.stdout.write(text)
     sys.stdout.flush()

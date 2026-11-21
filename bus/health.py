@@ -854,6 +854,23 @@ def regression_body(f: Finding, regressed: int, hours: float, diagnosed: str = "
     return "\n".join(lines)
 
 
+FOLD_CAUSE = "folded"
+FOLD_MARKER = "<!-- loom:health-fold area=%s -->"
+FOLD_MARKER_RE = re.compile(r"<!-- loom:health-fold area=([a-z-]{1,20}) -->")
+
+
+def fold_areas(env: Optional[Dict[str, str]] = None) -> set:
+    """The areas named in LOOM_HEALTH_FOLD_AREAS (space separated, empty by
+    default): their findings share one rolling ticket per area."""
+    raw = (os.environ if env is None else env).get("LOOM_HEALTH_FOLD_AREAS", "")
+    return {a for a in raw.split() if AREA_RE.fullmatch(a)}
+
+
+def fold_title(area: str) -> str:
+    """The folded ticket's title: the area's symptom, without any place."""
+    return naming.generated("Health", "Recurring findings in the %s area" % area)
+
+
 def cause(title: str) -> str:
     """The problem a finding or ticket title names, whoever it hits: "Ana is
     stuck: X" and "3 members are stuck: X" both name "stuck: x". Any other
@@ -1062,12 +1079,28 @@ class Intake:
         # pass, once the issue list carries it.
         briefed: set = set()
         observed: Dict[int, Tuple[Dict[str, Any], List[Finding]]] = {}
+        folds = fold_areas()
+        # Highest impact first, so a folded ticket is filed at its top priority.
+        found = sorted(found, key=lambda x: -x.impact) if folds else found
         returning = _returning(open_by_digest, ledger)
         for f in found:
             rec = ledger.setdefault(f.digest, {})
             issue = open_by_digest.get(f.digest)
             named = (f.area, cause(f.title))
-            if issue is None:
+            if f.area in folds:
+                # Every finding of a fold area joins the area's one ticket,
+                # even one an older per-place ticket still owns.
+                named = (f.area, FOLD_CAUSE)
+                umbrella = by_cause.get("%s|%s" % named)
+                if umbrella is None:
+                    if named in briefed:
+                        continue
+                    issue = None
+                elif issue is not umbrella:
+                    if MARKER % f.digest not in str(umbrella.get("body") or ""):
+                        self._join(source, f, rec, umbrella)
+                    open_by_digest[f.digest] = issue = umbrella
+            elif issue is None:
                 issue = _same_cause(by_cause, "%s|%s" % named)
                 if issue is not None:
                     self._join(source, f, rec, issue)
@@ -1082,7 +1115,30 @@ class Intake:
             if issue is not None:
                 observed.setdefault(int(issue["number"]), (issue, []))[1].append(f)
         self._flush_evidence(source.repo, observed, checked or self.stamp)
+        self._consolidate(source.repo, by_cause, folds)
         return open_by_digest
+
+    def _consolidate(self, repo: str, by_cause: Dict[str, Dict[str, Any]],
+                     folds: set) -> None:
+        """Close a per-place ticket of a fold area as a duplicate of the
+        area's ticket, once that ticket holds every marker the old one has."""
+        for issue in self.open_health:
+            body = str(issue.get("body") or "")
+            area = _AREA_LINE.search(body)
+            if FOLD_MARKER_RE.search(body) or not area or area.group(1) not in folds:
+                continue
+            umbrella = by_cause.get("%s|%s" % (area.group(1), FOLD_CAUSE))
+            owned = MARKER_RE.findall(body)
+            if umbrella is None or not owned or any(
+                    MARKER % d not in str(umbrella.get("body") or "") for d in owned):
+                continue
+            closing.close(self.gh, repo, int(issue["number"]),
+                          "Folded into #%d, the one rolling ticket of the %s area, "
+                          "which now holds this ticket's findings and their evidence. Closing "
+                          "this one as a duplicate." % (int(umbrella["number"]), area.group(1)),
+                          "duplicate")
+            self.say("health %s: closed #%d as a duplicate of #%d"
+                     % (repo, int(issue["number"]), int(umbrella["number"])))
 
     def _flush_evidence(self, repo: str,
                         observed: Dict[int, Tuple[Dict[str, Any], List[Finding]]],
@@ -1269,9 +1325,11 @@ class Intake:
                                                  Dict[str, Dict[str, Any]]]:
         """The open health tickets by finding digest, and by "<area>|<cause>"
         from the area line of their body and the cause their title names (the
-        oldest ticket of a cause)."""
+        oldest ticket of a cause). A folded ticket is keyed "<area>|folded"
+        from its fold marker; self.open_health lists every health ticket."""
         out: Dict[str, Dict[str, Any]] = {}
         by_cause: Dict[str, Dict[str, Any]] = {}
+        self.open_health = []
         for issue in self.gh.paginate("/repos/%s/issues?state=open&labels=loom:ticket" % repo):
             if "pull_request" in issue:
                 continue
@@ -1281,6 +1339,15 @@ class Intake:
             digests = MARKER_RE.findall(body)
             for digest in digests:
                 out.setdefault(digest, issue)
+            if digests:
+                self.open_health.append(issue)
+            folded = FOLD_MARKER_RE.search(body)
+            if folded:
+                named = "%s|%s" % (folded.group(1), FOLD_CAUSE)
+                held = by_cause.get(named)
+                if held is None or int(issue["number"]) < int(held["number"]):
+                    by_cause[named] = issue
+                continue
             area = _AREA_LINE.search(body)
             named = cause(str(issue.get("title") or ""))
             if digests and area and named:
@@ -1328,8 +1395,11 @@ class Intake:
         if issue is None:
             return self._file(source, f, rec, checked or self.stamp)
         rec["ticket"] = int(issue["number"])
+        lower = f.area in fold_areas() and tickets.PRIORITIES.index(f.priority) \
+            > tickets.PRIORITIES.index(tickets.priority_of(issue))
         if rec.get("band") != f.priority:
-            if rec.get("band") is not None or tickets.priority_of(issue) != f.priority:
+            if not lower and (rec.get("band") is not None
+                              or tickets.priority_of(issue) != f.priority):
                 self._set_priority(source.repo, issue, f.priority)
             rec["band"] = f.priority
         self._regression(source, f, rec, issue)
@@ -1422,10 +1492,14 @@ class Intake:
         if self.filed >= PER_PASS:
             return False
         body = ticket_body(f, diagnosis(source.diagnose, f.key, self.clock))
+        title = ticket_title(f)
+        if f.area in fold_areas():
+            body += FOLD_MARKER % f.area + "\n"
+            title = fold_title(f.area)
         try:
             # health: the ticket gets the loom:health label, the proof that
             # this intake filed it (a marker in a body is only text).
-            url = self.brief(self.gh, source.repo, source.goal, ticket_title(f),
+            url = self.brief(self.gh, source.repo, source.goal, title,
                              rolling_evidence(body, [f], checked),
                              difficulty="medium", priority=f.priority, health=True)
         except ValueError as err:

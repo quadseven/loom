@@ -122,12 +122,22 @@ def _sentences(text: str) -> List[str]:
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", text) if s.strip()]
 
 
+# A blockquote line quotes a ticket; a task-list line quotes a criterion. Neither
+# declares a step, but a task-list line may still name one when the body has no
+# "none" answer in its operator steps section.
+_QUOTE = re.compile(r"^\s*>")
+_TASK = re.compile(r"^\s*[-*+]\s+\[[ xX]\]")
+
+
 def named_steps(body: str) -> List[str]:
     """Each sentence of the body that names an operator step in words."""
     out: List[str] = []
     # Headings name sections, never steps ("## Operator steps before merge").
-    prose = "\n".join(line for line in _prose(body).split("\n")
-                      if not _HEADING.match(line))
+    none = section_steps(body) == []
+    prose = "\n".join(
+        line for line in _prose(body).split("\n")
+        if not _HEADING.match(line) and not _QUOTE.match(line)
+        and not (none and _TASK.match(line)))
     for sentence in _sentences(prose):
         if any(p.search(sentence) for p in BACKSTOP):
             clean = _BULLET.sub("", sentence).strip()
@@ -183,13 +193,44 @@ def _manual_listed(gh: Any, repo: str, branch: str) -> List[str]:
 DEPLOY_RULES = (ship_paths.WORKFLOWS_DIR + "/", ship_paths.MANUAL_PATHS_FILE)
 
 
-def _placement_manifests(entries: Sequence[Dict[str, Any]]) -> List[str]:
+def _deploy_manifest(gh: Any, repo: str, pr: Dict[str, Any], entry: Dict[str, Any]) -> bool:
+    """Whether a file GitHub sent no patch for may be a deploy manifest: the
+    base version of a removed file, else the head version, holds an
+    `apiVersion` and a `kind`. A read that fails or decodes to nothing says
+    yes, so an unread file stays held."""
+    removed = entry.get("status") == "removed"
+    side = pr.get("base" if removed else "head") or {}
+    ref = str(side.get("sha") or side.get("ref") or "")
+    if not ref:
+        return True
+    try:
+        data = gh.rest("GET", "/repos/%s/contents/%s?ref=%s" % (
+            repo, quote(str(entry.get("filename") or ""), safe="/"),
+            quote(ref, safe="")), ok=(404,)).data
+        content = data.get("content") if isinstance(data, dict) else None
+        text = base64.b64decode(content).decode("utf-8", "replace")
+    except (GitHubError, TypeError, ValueError):
+        return True
+    if not text.strip():
+        return True  # an empty read (a file too large for contents) is no proof
+    return "apiVersion" in text and "kind" in text
+
+
+def _placement_manifests(entries: Sequence[Dict[str, Any]],
+                         readable: Optional[Callable[[Dict[str, Any]], bool]] = None
+                         ) -> List[str]:
     """The manifests whose diff changes placement; one GitHub sends no patch
-    for counts as changing it."""
+    for counts as changing it, unless `readable` reads the file and finds
+    it is no deploy manifest."""
     out = set()
     for entry in entries:
         name, patch = str(entry.get("filename") or ""), entry.get("patch")
-        if manifest_paths([name]) and (not patch or ship_paths.placement_lines(str(patch))):
+        if not manifest_paths([name]):
+            continue
+        if patch:
+            if ship_paths.placement_lines(str(patch)):
+                out.add(name)
+        elif readable is None or readable(entry):
             out.add(name)
     return sorted(out)
 
@@ -207,7 +248,7 @@ def placement_files(gh: Any, repo: str, pr: Dict[str, Any],
     no deploy workflow covers still counts, and when the pull request also
     changes a workflow or .loom/manual-paths nothing is exempt."""
     entries = pull_files(gh, repo, int(pr.get("number") or 0)) if files is None else files
-    moved = _placement_manifests(entries)
+    moved = _placement_manifests(entries, lambda e: _deploy_manifest(gh, repo, pr, e))
     if not moved or _touches_deploy_rules(entries):
         return moved
     branch = str((pr.get("base") or {}).get("ref") or "main")

@@ -80,6 +80,9 @@ class DashboardTest(unittest.TestCase):
             if self.store.ready:
                 break
             threading.Event().wait(0.01)
+        # Ready now comes once the tickets are read; the first pass goes on.
+        with self.store._refresh_lock:
+            pass
         self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.server_thread.start()
 
@@ -157,6 +160,8 @@ class DashboardTest(unittest.TestCase):
             if self.store.ready:
                 break
             threading.Event().wait(0.01)
+        with self.store._refresh_lock:  # ready comes before the pass ends
+            pass
         before = len(self.api_calls)
         self.get_json("/api/tickets")
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)

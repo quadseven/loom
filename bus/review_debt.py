@@ -33,6 +33,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from . import change_class, close_audit, tickets
+from .handoff import JOURNAL_MARKER
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 
 STATE_FILE = "review-debt.json"
@@ -52,6 +53,7 @@ FILES_READ = 100
 LIVE_BUDGET = 2000
 FLEET_BRAINS = "agent-anthropic-claude-code[bot] agent-meta-muse[bot] agent-openai-dot[bot]"
 REVIEW_RE = re.compile(r"\A\s*(?:#+\s*)?Loom review\b", re.I)
+TICK_LINE_RE = re.compile(r"\A[ \t]*Tick [^\n]*\n?")
 GUARD_RE = re.compile(r"^The guard\b", re.M)
 SHIPPED, NO_CHECK, OPEN = "shipped", "no-check", "open"
 _TEST_WRITES = ("added", "modified", "renamed", "changed", "copied")
@@ -63,15 +65,25 @@ def review_authors(env: Optional[Mapping[str, str]] = None) -> List[str]:
     return str(values.get("LOOM_REVIEW_AUTHORS", FLEET_BRAINS)).replace(",", " ").split()
 
 
+def review_text(body: Any) -> str:
+    """The body with a `bus journal` marker and its Tick line taken off."""
+    text = str(body or "")
+    if text.lstrip().startswith(JOURNAL_MARKER):
+        text = text.lstrip()[len(JOURNAL_MARKER):].lstrip("\r\n")
+        text = TICK_LINE_RE.sub("", text, count=1)
+    return text
+
+
 def is_review(comment: Any, authors: Sequence[str]) -> bool:
-    if not isinstance(comment, dict) or not REVIEW_RE.match(str(comment.get("body") or "")):
+    if not isinstance(comment, dict) or not REVIEW_RE.match(review_text(comment.get("body"))):
         return False
     login = str((comment.get("user") or {}).get("login") or "")
     return login.lower() in {a.lower() for a in authors}
 
 
 def newest_review(comments: Sequence[Any], authors: Sequence[str]) -> Optional[float]:
-    found = [close_audit.epoch(c.get("created_at")) for c in comments if is_review(c, authors)]
+    found = [close_audit.epoch(c.get("created_at")) for c in comments
+             if is_review(c, authors)]
     return max([at for at in found if at is not None], default=None)
 
 

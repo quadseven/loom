@@ -314,6 +314,8 @@ class TicketStore:
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
         self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
+        self._stage, self._stage_since = "waiting", time.monotonic()
+        self._pass_begun: Optional[float] = None
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._refresh_thread: Optional[threading.Thread] = None
@@ -360,6 +362,28 @@ class TicketStore:
     @property
     def ready(self):
         return self._snapshot_get("ready")
+
+    def not_ready_reason(self) -> str:
+        """One line on why /readyz answers 503, or "" once ready: what the
+        first refresh pass is doing and for how long, or why it read no
+        repository. Read by the readiness route, which logs it."""
+        if self.ready:
+            return ""
+        now = time.monotonic()
+        stage, since, begun = self._stage, self._stage_since, self._pass_begun
+        if begun is None:
+            return "the first refresh pass has not started (the refresh thread is not running)"
+        errors = self._snapshot.get("errors") or {}
+        failed = "; ".join("%s: %s" % (repo, str(why)[:120]) for repo, why in list(errors.items())[:3])
+        return ("no repository has been read yet; first refresh pass is in stage %r for %.0fs "
+                "(pass running %.0fs)%s" % (stage, now - since, now - begun,
+                                            "; read errors: " + failed if failed else ""))
+
+    def _enter_stage(self, name: str) -> None:
+        """Note the stage the pass is in, for not_ready_reason: the first pass
+        reads every repo with an empty cache and takes many minutes (once
+        19), and its stages were silent."""
+        self._stage, self._stage_since = name, time.monotonic()
 
     def start_background(self) -> None:
         if self._refresh_thread is not None:
@@ -1239,6 +1263,8 @@ class TicketStore:
     def refresh(self) -> None:
         with self._refresh_lock:
             started = time.monotonic()
+            self._pass_begun = self._pass_begun or started
+            self._enter_stage("reading tickets")
             current = self._snapshot
             data = dict(current["tickets"])
             errors = dict(current["errors"])
@@ -1252,6 +1278,14 @@ class TicketStore:
                         "ticket_refreshed_at": refreshed_at, "next_refresh_at": reset_at,
                         "stale_reason": stale_reason,
                         "ready": any(rows is not None for rows in data.values())}
+            if snapshot["ready"] and not current["ready"]:
+                # Ready means the tickets are read, as it always did. Publish
+                # that now: the stages below (pull requests, waits, claims)
+                # took 19 minutes on an empty cache, and a replica answered
+                # 503 for all of it while the pages already had their data.
+                with self._snapshot_lock:
+                    self._snapshot = dict(current, **snapshot)
+            self._enter_stage("reading dashboard sources")
             if self._below_floor():
                 snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
             else:
@@ -1267,10 +1301,12 @@ class TicketStore:
             self._read_dashboard(snapshot)
             if not self._below_floor():
                 self._read_operator_asks(snapshot, previous_items)
+            self._enter_stage("reading runs and tier sources")
             self._read_latest_runs(snapshot)
             self.tier_sources.refresh()
             station_state.bench_pass(self, self.tier_sources.snapshot())
             now = time.time()
+            self._enter_stage("reading waits")
             self._refresh_waits(snapshot, now)
             self._read_open_issues(now)
             self._read_backlog(now)
@@ -1283,6 +1319,7 @@ class TicketStore:
                                   "needs_you_reason": ask_error,
                                   "waits_error": self.waits_error})
             snapshot["floor_context"] = floor_context
+            self._enter_stage("publishing")
             with self._snapshot_lock:
                 self._snapshot = snapshot
             self._log_requests(now)

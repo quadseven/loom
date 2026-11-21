@@ -20,12 +20,11 @@ Before the station hands a ticket to a lane (`check`), it reads:
   comments merged after the ticket was filed; or every file the criteria
   ask to add already exists on the default branch. A merged pull request of
   the ticket's own repo is bus/station.py's verify-before-build, which sends
-  the ticket to a verify run. A stale ticket goes back to the queue with
-  `needs:human` and one ask naming the evidence, once per piece of evidence:
-  when the operator gives it back to the factory, the same evidence does not
-  hold it again. New asks fingerprint the body: a later verified person
-  removal of the ask label settles all stale evidence for that same body,
-  until its text changes. Legacy asks keep their evidence-only behavior.
+  the ticket to a verify run. A body edit after a cited merge makes that
+  merge context. A stale ticket goes back to the queue with `needs-brain`
+  and a note naming the evidence. Earlier person asks still settle the
+  evidence they named. A verified person removal of a fingerprinted ask
+  label also settles all stale evidence for that same body.
   A recorded decision by a configured person beside blocked
   or awaiting-live-check, or a non-person Blocked on section beside those
   labels, keeps waiting work held before stale-evidence reads. A stale event
@@ -67,7 +66,8 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
-from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from functools import cache
+from typing import Any, Callable, Iterable, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import answer, decision_claim, proof, status, tickets
@@ -80,9 +80,7 @@ AREA = "area"
 SPLIT = "split"
 AREA_PREFIX = "area:"
 
-ASK_MARKER = "<!-- loom:stale-brief %s -->"
 ASK_MARKER_RE = re.compile(r"<!-- loom:stale-brief (\S+) -->")
-BODY_MARKER = "<!-- loom:stale-body %s -->"
 BODY_MARKER_RE = re.compile(r"<!-- loom:stale-body ([0-9a-f]{64}) -->")
 PERSON_ASK_LABELS = {"loom:human", "needs:human", "needs-operator"}
 # An evidence key the marker carries as it is: a word and a number or hex
@@ -125,9 +123,11 @@ DONE_RE = re.compile(
 NEGATED_RE = re.compile(
     r"\b(?:not|never|isn't|wasn't|hasn't|is not|was not|has not)\s+(?:\w+\s+){0,2}"
     r"(?:done|shipped|fixed|superseded|obsolete|in place)\b", re.I)
-# A criterion asking for a file to be added.
+# A criterion asking for a file to be added. A path after "in", "to" or
+# "inside" is a file that gets a test or function, not a file that is new.
 CREATE_RE = re.compile(
-    r"\b(?:adds?|added|creates?|created|new|introduces?|introduced|ships?)\b[^`\n]{0,60}"
+    r"\b(?:adds?|added|creates?|created|new|introduces?|introduced|ships?)\b"
+    r"(?:(?!\b(?:in|to|into|inside|within)\b)[^`\n]){0,60}"
     r"`([A-Za-z0-9_.][A-Za-z0-9_./-]*\.[A-Za-z0-9]+)`", re.I)
 REF_RE = re.compile(r"(?<![\w.-])([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)#(\d+)\b")
 PULL_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+)"
@@ -656,7 +656,8 @@ def _merged_naming(source: Mapping[str, Any], repo: str, number: int) -> bool:
             and _names_ticket(str(source.get("body") or ""), repo, number))
 
 
-def merged_elsewhere(gh: Any, repo: str, number: int) -> Optional[Verdict]:
+def merged_elsewhere(gh: Any, repo: str, number: int,
+                     edited_after: Callable[[str], bool]) -> Optional[Verdict]:
     """A merged pull request in another repo of the owner whose body names
     this ticket in full (its cross-reference on the ticket's timeline)."""
     for event in gh.paginate("/repos/%s/issues/%d/timeline" % (repo, number)):
@@ -665,11 +666,13 @@ def merged_elsewhere(gh: Any, repo: str, number: int) -> Optional[Verdict]:
         source = ((event.get("source") or {}).get("issue") or {})
         if not _merged_naming(source, repo, number):
             continue
+        merged = source["pull_request"]["merged_at"]
+        if edited_after(merged):
+            continue
         where = (source.get("repository") or {}).get("full_name")
         return Verdict(STALE, "pr-%s#%s" % (where, source.get("number")),
                        "pull request %s#%s, which names this ticket, merged at %s"
-                       % (where, source.get("number"),
-                          (source.get("pull_request") or {}).get("merged_at")))
+                       % (where, source.get("number"), merged))
     return None
 
 
@@ -694,22 +697,35 @@ def _person_texts(issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]
         if _login(c).lower() in people and (c.get("user") or {}).get("type") != "Bot"]
 
 
-def _merged_at(gh: Any, where: str, number: int) -> str:
-    """When the pull request merged, "" when it did not, is a revert, or is
-    no pull request."""
+def _merged_pull(gh: Any, where: str, number: int) -> Mapping[str, Any]:
+    """The pull request, or an empty mapping when it is a revert or is no
+    pull request (an issue, or gone)."""
     try:
         pr = gh.rest("GET", "/repos/%s/pulls/%d" % (where, number)).data or {}
     except GitHubError as err:
         if err.status == 404:
-            return ""  # an issue, not a pull request, or gone
+            return {}  # an issue, not a pull request, or gone
         raise
-    if not isinstance(pr, dict) or _is_revert(pr):
-        return ""
-    return str(pr.get("merged_at") or "")
+    return {} if not isinstance(pr, dict) or _is_revert(pr) else pr
+
+
+def _already_judged(repo: str, issue: Mapping[str, Any], where: str, pr: Mapping[str, Any],
+                    num: int) -> bool:
+    """A pull request of this repo the station judged when it requeued the
+    ticket for the rest, or one opened from the ticket's own branch: the
+    requeue already settled it, so the ticket goes on to a build lane."""
+    if where.lower() != repo.lower():
+        return False
+    notes = [text for _, text in status.body_events(issue.get("body"))]
+    if num in tickets.judged_pulls(notes):
+        return True
+    ref = str((pr.get("head") or {}).get("ref") or "")
+    return ref.startswith("loom/%s-" % issue["number"])
 
 
 def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
-                  comments: Sequence[Mapping[str, Any]], trusted: Iterable[str]) -> Optional[Verdict]:
+                  comments: Sequence[Mapping[str, Any]], trusted: Iterable[str],
+                  edited_after: Callable[[str], bool]) -> Optional[Verdict]:
     """A pull request in any repo of the owner, linked in the ticket or in a
     comment a person wrote (not one of Loom's own Apps), that merged after
     the ticket was filed. A link to work merged before it is context."""
@@ -719,8 +735,10 @@ def merged_linked(gh: Any, repo: str, issue: Mapping[str, Any],
     links = [(r, n) for r, n in _links(texts)
              if r.partition("/")[0].lower() == owner and (r, n) != (repo, int(issue["number"]))]
     for where, num in links[:LINKS_READ]:
-        merged = _merged_at(gh, where, num)
-        if merged and _ts(merged) > filed:
+        pr = _merged_pull(gh, where, num)
+        merged = str(pr.get("merged_at") or "")
+        if (merged and _ts(merged) > filed and not edited_after(merged)
+                and not _already_judged(repo, issue, where, pr, num)):
             return Verdict(STALE, "pr-%s#%d" % (where, num),
                            "pull request %s#%d, linked on this ticket, merged at %s, after "
                            "the ticket was filed" % (where, num, merged))
@@ -833,6 +851,19 @@ def settled_brief_wait(issue: Mapping[str, Any], trusted: Sequence[str], *,
             or labelled and _recorded_ask_decision(body, trusted))
 
 
+def _body_edited_at(gh: Any, repo: str, number: int) -> float:
+    """The last issue edit, excluding comments and label updates."""
+    owner, name = repo.split("/")
+    data = gh.graphql(
+        "query($owner:String!,$name:String!,$number:Int!){"
+        "repository(owner:$owner,name:$name){issue(number:$number){lastEditedAt}}}",
+        {"owner": owner, "name": name, "number": number})
+    item = ((data or {}).get("repository") or {}).get("issue")
+    if item is None:
+        raise GitHubError("graphql returned no issue %s#%d" % (repo, number))
+    return _ts(item["lastEditedAt"])
+
+
 def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mapping[str, Any]],
           trusted: Sequence[str], branch: str) -> Optional[Verdict]:
     """Why the ticket gets no lane, or None. A stale verdict the operator was
@@ -844,7 +875,7 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
         return health
     # The stale reads come before the criteria hold: a ticket whose work an
     # operator answered, a source shipped, or a twin already built surfaces
-    # that verdict and its ask, and the criteria park still waits for every
+    # that verdict and its evidence, and the criteria park still waits for every
     # ticket the stale reads pass over.
     criteria = criteria_verdict(body)
     split = split_verdict(body)
@@ -853,10 +884,20 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     # An answer an operator gave on the dashboard (bus/answer.py) reads as
     # the operator's own comment.
     spoken = answer.as_operator_comments(comments, trusted, answer.operators(trusted=trusted), operator)
+    number = int(issue["number"])
+
+    @cache
+    def edited_at() -> float:
+        return _body_edited_at(gh, repo, number)
+
+    def edited_after(merged: str) -> bool:
+        stamp = _ts(merged)
+        return bool(stamp and edited_at() > stamp)
+
     reads = (lambda: operator_done(spoken, operator),
              lambda: source_shipped(gh, repo, body),
-             lambda: merged_elsewhere(gh, repo, int(issue["number"])),
-             lambda: merged_linked(gh, repo, issue, comments, trusted),
+             lambda: merged_elsewhere(gh, repo, number, edited_after),
+             lambda: merged_linked(gh, repo, issue, comments, trusted, edited_after),
              lambda: already_built(gh, repo, body, branch))
     try:
         if settled_body(gh, repo, issue, comments, trusted):
@@ -868,15 +909,3 @@ def check(gh: Any, repo: str, issue: Mapping[str, Any], comments: Sequence[Mappi
     except (GitHubError, ValueError, KeyError, TypeError) as err:
         raise Unread(str(err)) from err
     return split if split is not None else criteria
-
-
-def ask(verdict: Verdict, body: Optional[str] = None) -> str:
-    """The one ask for a stale ticket."""
-    marker = ASK_MARKER % marker_key(verdict.key)
-    if body is not None:
-        marker += "\n" + BODY_MARKER % hashlib.sha256(body.encode("utf-8")).hexdigest()
-    return ("Kind: decision\n%s\nThis ticket did not go to a build lane: %s. A lane that "
-            "builds a stale ticket rewrites working code to match it. Close the ticket if "
-            "its work is done, or rewrite it to what is still missing and remove "
-            "`needs:human`; this evidence will not hold it again."
-            % (marker, verdict.reason))

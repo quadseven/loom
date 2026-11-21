@@ -306,7 +306,7 @@ class ModelPickTest(unittest.TestCase):
     def test_a_missing_scorecard_uses_the_brief_line(self):
         self.brief_demoted = "%s opencode-go/beam-free" % STRONG
         got = self.pick(tier=model_pick.TIER_STRONG)
-        self.assertEqual(got.model, model_pick.GO_STRONG[1])
+        self.assertEqual(got.model, "opencode-go/iceman-contributor-free")
         self.assertEqual(self.pick(tier=model_pick.TIER_EASY).model, "opencode-go/iceman-contributor-free")
 
     def test_no_scorecard_and_no_brief_line_leaves_only_free_models(self):

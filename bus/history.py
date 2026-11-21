@@ -47,7 +47,8 @@ RETRY_ENDED_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \([a-z]+\): move
 RETRY_RE = re.compile(r"^Automatic retry [0-9]+ of [0-9]+ \((?:limit|transient)\): "
                       r"moved from lane ([a-z0-9-]+) to lane ([a-z0-9-]+)\.")
 HELD_RE = re.compile(r"^Lane \S+ held: ")
-STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:limit|auth|transient)\] )")
+WORKERSAI_SIZE_STOP = "Lane workersai stopped: [size] "
+STOPPED_RE = re.compile(r"^Lane \S+ stopped: (?=\[(?:size|limit|auth|transient)\] )")
 # The comments that assign the ticket to a lane: a brief. Claims after the
 # newest of these ran on the lane the ticket was last briefed to.
 BRIEF_RES = (
@@ -146,7 +147,7 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
     for c in comments:
         body = str(c.get("body") or "")
         if CLAIM_RE.match(body):
-            just_claimed = set(pending)
+            just_claimed = pending - tried
             tried |= pending
             pending = set()
         for m in RUNG_RE.finditer(body):
@@ -157,7 +158,9 @@ def tried_rungs(comments: Sequence[Dict[str, Any]]) -> set:
                 pending = pending | {rung}
         if EQUIVALENT_RE.search(body):
             pending = set()
-        if re.search(r"^Lane \S+ stopped: \[limit\]", body):
+        if body.startswith(WORKERSAI_SIZE_STOP):
+            pending |= just_claimed
+        if re.search(r"^Lane \S+ stopped: \[(?:limit|size)\]", body):
             tried -= just_claimed
             just_claimed = set()
     return tried
@@ -309,6 +312,25 @@ def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
             newest = body
     match = SUBMODULE_EDIT_RE.search(newest or "")
     return match.group(1) if match else None
+
+
+# lanes/run_lane.sh's reason when every test the run changed passes on the
+# default branch (loom#3005): the ticket's behaviour may already hold there.
+BASE_PASS_RE = re.compile(r"every changed test passes on base; the ticket may already hold "
+                          r"on the default branch(?:: passes on base: (.*))?")
+
+
+def base_pass_tests(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The tests the ticket's newest failure says already pass on the default
+    branch ("" when it names none), else None. A stronger model cannot make
+    a test fail on code that already works, so no rung is spent on it."""
+    newest = None
+    for c in comments:
+        body = str(c.get("body") or "")
+        if FAILED_RE.match(body):
+            newest = body
+    match = BASE_PASS_RE.search(newest or "")
+    return (match.group(1) or "").strip() if match else None
 
 
 class History(NamedTuple):
