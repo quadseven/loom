@@ -32,7 +32,7 @@ class SessionPrCapTest(Base):
         self.fake.add(12)
         runner = self.runner()
         self.assertEqual(runner._repo_pr_count(REPO), 4)
-        runner._claim(REPO, "codex", self.fake.issues[12])
+        self.assertTrue(runner._claim(REPO, "codex", self.fake.issues[12]))
         self.assertNotIn("open pull requests (cap 8)", str(self.fake.comments[12]))
 
     def test_session_pr_on_a_loom_head_or_with_the_loom_line_still_counts(self):
