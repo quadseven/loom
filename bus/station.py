@@ -6000,6 +6000,7 @@ class Station:
 
     def _read_repo_pr_count(self, repo: str) -> int:
         trusted = {a.lower().removesuffix("[bot]") for a in (*self.s.authors, *self.s.briefers)}
+        authors = {a.lower().removesuffix("[bot]") for a in self.s.authors}
         counted = set()
         for page in range(1, 26):
             data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100&page=%d"
@@ -6007,7 +6008,7 @@ class Station:
             if not isinstance(data, list):
                 raise ValueError("open pull requests could not be read")
             for pr in data:
-                number = self._counted_pr_number(pr, trusted)
+                number = self._counted_pr_number(pr, trusted, authors)
                 if number is not None:
                     counted.add(number)
             if len(data) < 100:
@@ -6015,7 +6016,8 @@ class Station:
         raise ValueError("open pull request history exceeds the read budget")
 
     @staticmethod
-    def _counted_pr_number(pr: Any, trusted: set) -> Optional[int]:
+    def _counted_pr_number(pr: Any, trusted: set,
+                           authors: Optional[set] = None) -> Optional[int]:
         if isinstance(pr, dict) and pr.get("state") == "closed":
             return None
         if not isinstance(pr, dict) or not isinstance(pr.get("user"), dict):
@@ -6031,7 +6033,10 @@ class Station:
         if (not isinstance(head, dict) or not isinstance(head.get("ref"), str)
                 or not head["ref"]):
             raise ValueError("open pull request head could not be read")
-        is_agent = (user.get("type") == "Bot" or str(head.get("ref") or "").startswith("loom/")
+        # A Bot trusted only as a briefer (an operator's coding session) is
+        # not a Loom pull request unless its head or body says so (loom#3445).
+        bot = user.get("type") == "Bot" and (authors is None or login in authors)
+        is_agent = (bot or str(head.get("ref") or "").startswith("loom/")
                     or re.search(r"^Loom ticket .+, lane [A-Za-z0-9_.-]+, model \S+\.(?:\s|$)",
                                  str(pr.get("body") or ""), re.M))
         if not is_agent:
