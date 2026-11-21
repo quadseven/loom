@@ -2744,11 +2744,14 @@ incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr 
 # another host (a cluster runner, a second Mac) never closed an incident the
 # station host filed, and the tickets stayed held until that one host ran
 # again. Only a public repo has a title another host can rebuild: a private
-# repo's subject is a random alias kept per host (incident_subject).
+# repo's subject is a random alias kept per host unless the shared alias
+# key is readable (incident_subject).
 shared_incident_number() {  # kind
-  local listed
-  repo_is_public || return 1
-  if ! listed="$(TITLE="Factory incident: $REPO validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
+  local listed subject
+  # A private repo's title is rebuildable only when the shared alias key is
+  # readable (incident_subject then derives the alias from it).
+  subject="$(incident_subject shared-only)" || return 1
+  if ! listed="$(TITLE="Factory incident: $subject validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
     echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
     return 1
   fi
@@ -2796,9 +2799,24 @@ repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
 incident_ticket() {
   if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
 }
-incident_subject() {
+incident_subject() {  # [shared-only]
   local file alias
   if repo_is_public; then printf '%s' "$REPO"; return 0; fi
+  # Pipe the shared key straight to the signer. Strip trailing newlines
+  # as shell command substitution did so existing shared titles still match.
+  if alias="$(ssm_value "${LOOM_INCIDENT_ALIAS_SSM:-/loom/incident-alias-key}" |
+    REPO_NAME="$REPO" python3 -B -c '
+import hmac, os, sys
+
+key = sys.stdin.buffer.read().rstrip(b"\n")
+if not key:
+    sys.exit(1)
+print(hmac.digest(key, os.environ["REPO_NAME"].encode(), "sha256").hex()[:8])
+')"; then
+    printf 'private repo %s' "$alias"
+    return 0
+  fi
+  [ "${1:-}" != shared-only ] || return 1
   file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
   if [ ! -s "$file" ]; then
     mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
