@@ -208,7 +208,10 @@ and the health findings. Read them with the helper, not a hand-built URL:
     python3 -m bus.product_read stuck
     python3 -m bus.product_read stuck --param KEY=VALUE   # a query the endpoint takes
     python3 -m bus.product_read health
+    python3 -m bus.product_read path /api/<documented path> [--param KEY=VALUE]
 
+`path` reads any other GET path the product's API documents, with the same
+base checks and failure line; a path that does not start with `/api/` exits 2.
 It asks `<base>/api/v2/stuck` (or `/api/v2/health`). For WoW the base is the
 overseer's own configured product URL, whatever mount the operator gave the
 site; the mount may be a secret path, so it is never written in a repository
@@ -718,7 +721,7 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
    `python3 -m bus.brain close OWNER/NAME#N --reason not_planned --note TEXT`.
-6. First run `python3 -m bus.brain step asks --holder muse`. Read every open `needs:human` issue in `LOOM_REPOS`. Do yourself
+6. First run `python3 -m bus.brain step asks --holder muse`. Run `python3 -m bus.needs_you` and review only the items in its `## Brain review this tick` section (at most 5, oldest ask first, `--brain-batch N` sets the count; an item whose newest comment is from a `LOOM_BRIEF_AUTHORS` login is left out until someone else writes on it, so the batch rotates). A tick that acted on each of those items records no degraded asks step. For each of them, do yourself
    whatever does not need the operator's own hands, money, accounts or a
    decision the goal home reserves for the operator: fix it, ticket it, or
    record the decision the evidence supports. Then comment what was done and

@@ -470,7 +470,7 @@ PLAN_NOTE_MARKER = "<!-- loom:plan-hold-note v1 -->"
 # What the ticket needs for each body problem bus/hunt_plan.py names. The
 # runner writes those body sections from these ticket sections.
 _GAPS = (
-    ("## Why", "## Why (five or more words)"),
+    ("missing ## Why", "## Why (five or more words)"),
     ("Acceptance criteria", "## Acceptance criteria (three or more \"- [ ]\" lines)"),
     ("Test plan", "## Acceptance criteria (three or more \"- [ ]\" lines)"),
     ("no Size", "## Size (XS, S, M or L)"),
@@ -631,6 +631,7 @@ def _plan_main(argv: Sequence[str]) -> int:
         return 0
     if found["reason"]:
         print("repair refused: %s" % found["reason"], file=sys.stderr)
+        return 1
     for gap in ticket_gaps(list(found["after"])):  # type: ignore[arg-type]
         print(gap)
     return 1

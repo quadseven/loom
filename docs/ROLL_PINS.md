@@ -29,6 +29,9 @@ and write access to the deployment repository and goal home.
 A goal home whose body names a roll, but that no `LOOM_ROLL_SHIP_DOCS` entry
 names, gets a `roll-pin-off` invariant issue (docs/LANES.md, Invariants), so
 a pass left unconfigured is raised instead of skipped in silence.
+A goal home whose pins the operator bumps by hand on purpose is listed in
+`LOOM_ROLL_PIN_EXEMPT` (space separated `OWNER/NAME#N`); the invariant leaves
+it out.
 
 For a roll held by a family gate, set `gate_url` on its
 `LOOM_ROLL_SHIP_DOCS` entry. Keep the real endpoint in the station's private

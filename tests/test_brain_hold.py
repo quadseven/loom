@@ -235,6 +235,16 @@ class TriageBrainHoldsTest(unittest.TestCase):
         self.assertEqual(self.run_holds()[REPO]["lifted"], 0)
         self.assertEqual(self.gh.writes, [])
 
+    def test_a_triage_hold_with_no_label_time_ages_from_the_issues_creation(self):
+        triage_issue(self.gh, 5)
+        self.gh.issues[5]["created_at"] = iso(3 * DAY)
+        held_by(self.gh, 5, LOOM_APP)
+        for event in self.gh.events[5]:
+            event.pop("created_at")
+        report = self.run_holds()
+        self.assertEqual(self.names(5), [labels.NEEDS_HUMAN])
+        self.assertEqual(report[REPO]["lifted"], 1)
+
     def hold_by_rewrite(self, number, ask, seconds_ago):
         """The rewrite step holds the issue itself (bus/rewrite.py
         apply_answer on a person-only answer), and GitHub records the label

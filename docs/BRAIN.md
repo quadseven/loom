@@ -82,7 +82,7 @@ decides who acts:
 | `loom:ticket` | Every ticket issue. |
 | `loom:queued` | Ready ticket with no lane yet. After claims, the station gives it a free lane of its Difficulty tier, by priority then oldest; a future `Not before:` or missing Difficulty keeps it queued. |
 | `loom:briefed` | Assigned to the lane named by its single `lane:<name>` label; waiting for the station. An `After:` line holds it there until the tickets it names are merged. |
-| `loom:running` | The station handed it to that lane's runner. |
+| `loom:running` | A lane has claimed the ticket. The station clears a local run's running label when it reports the outcome, and its lane label too when the ticket goes back to the queue; a ticket at `loom:pr` or `loom:failed` keeps its lane label for fix rounds and the model ladder. Each pass requeues stale running tickets with no local brief or pending outcome. |
 | `loom:pr` | The runner opened a pull request; the ticket links it. |
 | `loom:answered` | The runner posted a diagnosis answer, or a run found its work already done or no longer applying and no merged pull request carries it (see Claim and outcome); the brain reviews it, then closes/verifies the ticket or briefs it again. |
 | `loom:ready` | Checks passed and review-bot threads are resolved for the current PR head. |
@@ -1076,11 +1076,12 @@ merged after it was filed, or when every file its criteria ask to add already
 exists on the default branch. A mention under an Out of scope, Not in scope
 or Follow-ups heading, or on a line that says the ticket was filed for later
 ("filed for", "filed as", "follow-up"), names work not built and does not
-count; a `Refs` or `Part of` line always counts (loom#1856). A stale ticket goes back to `loom:queued` with
-`needs:human` and one ask (`Kind: decision`) naming the evidence; the factory
-gives a queued `needs:human` ticket no lane. Each piece of evidence holds it
-once: once the operator removes `needs:human`, the same evidence does not hold
-it again. The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
+count; a `Refs` or `Part of` line always counts (loom#1856). A merge predating
+a body edit is context for the new brief. A stale ticket goes back to
+`loom:queued` with `needs-brain` and a note naming the evidence so the brain
+can review what shipped and rewrite any remaining work. Explicit event waits
+keep their wait path. Existing person-ask settlements still apply.
+The audit of 2026-10-22 found a rewrite of an issue whose leak-scan
 caller and deny-list layer had shipped weeks before; the lane read "out of
 scope" as "must be absent" and deleted the working deny-list layer, in two
 repos.
@@ -1779,6 +1780,29 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   `goal stuck at its cap for N hours` past 6 hours. The station sends the
   stuck goals to the dashboard (`POST /api/goal-caps`),
   whose Needs-you page lists each with that count.
+
+## Picking a ticket to work
+
+A worker told to take a ready ticket reads the tickets and decides by
+reading. It does not trust a label, because the same label means different
+things in different repos, and some repos carry no ready label at all (a
+Loom ticket waiting for a lane carries `loom:queued`, not a ready marker).
+The rule for any session that picks work, in the order it applies:
+
+1. List the open issues and read their bodies, not only their labels.
+2. Skip, and say why in the report, a ticket that: has an open pull request
+   naming it; is an epic, goal or tracker; carries `needs:human` or
+   `wait:blocked`; has a claim label whose holder acted in the last 24 hours
+   (a claim whose holder has been silent longer is stale and may be taken);
+   has only live or production boxes left; or needs a person, a credential
+   or a purchase.
+3. Check the ticket's premise in the code before building. If the described
+   problem is not there, or the work already merged, write that finding in
+   the report and take the next ticket. No pull request is opened for it.
+4. Build the smallest change that meets the code boxes, with a test that
+   fails before the change.
+
+This rule lives here so it does not depend on any one session's prompt.
 
 ## needs-brain holds nothing answers
 
@@ -2536,6 +2560,13 @@ Both paths apply the following checks.
   (`bus/unmeetable.py` reads that one line; a live box beside it is not
   looked up).
 
+For each shipped ticket within the read budget, the station reads its timeline once.
+It takes same-repo pull request numbers from cross-references, connected events
+and the lane's opening notice in the ticket's status comment or body. It reads
+those pull requests directly and checks that they cover the ticket. If the
+ticket names none, it searches the newest 500 closed pull requests. An
+incomplete timeline holds the evidence close for that ticket.
+
 A doubt refuses: a missing patch, an unreadable file, a failed lookup. A
 refused ticket goes to the usual done close and is read again after 6 hours.
 Checks still running leave the ticket for a later pass with no ask.
@@ -2552,10 +2583,14 @@ and 20 reads per pass and 150 evidence closes per day. Reopens of either
 kind count toward the same guardrail. The Proof due issue shows the
 newest 150 boxes and counts the older ones.
 
-Reopens stay at or below 5% of the last 100 closes. One listing per repo finds
+Reopens stay at or below 5% of evidence closes in the last seven days.
+If fewer than 100 tickets closed in that span, the station uses the newest
+100 closes, or all closes since the last resume if there are fewer. A resume
+always excludes earlier closes. One listing per repo finds
 reopened tickets, and a reopen stays counted after the ticket closes again.
 Above the limit this close stops, says so in the log and in each Proof due
-issue, and the usual done close takes over. A first reopen in fewer than 20
+issue, and the usual done close takes over until the operator resumes the
+evidence close. A first reopen in fewer than 20
 closes stops it too. The count is a floor: it sees only reopens someone made.
 
     python3 -m bus.evidence_close status
@@ -2733,6 +2768,12 @@ Tick <UTC time>, <holder>
 - Friction: <what slowed the factory this tick, or none>
 - Cost: <GitHub requests>, <minutes>
 ```
+
+Name every issue and pull request of the goal home as `#N`, which GitHub
+links; a bare number is not a link. `bus journal` rewrites "issue N",
+"pull request N" and "PR N" to `#N`, and moves a handoff marker written as
+a list item to a bare line at the end of the tick, since GitHub shows a
+hidden comment in a list as an empty bullet (loom#3321).
 
 `- Friction:` is the canonical line for what slowed the factory (docs/MUSE.md,
 Improving Loom itself): one line per slowdown, each its own `- Friction:`

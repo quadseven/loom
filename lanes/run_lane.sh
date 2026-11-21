@@ -317,12 +317,25 @@ stop_keepalive() {
 mkdir -p "$LOOM_HOME/state/usage"
 keepalive_loop $$ > /dev/null 2>&1 &
 KEEPALIVE_PID=$!
-trap 'release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+HEAVY_LOCK=""
+heavy_lock() {
+  python3 -IB "$LOOM_ROOT/lanes/heavy_repo.py" "$@"
+}
+release_heavy_repo() {
+  [ -z "$HEAVY_LOCK" ] || heavy_lock release "$HEAVY_LOCK"
+  HEAVY_LOCK=""
+}
+trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
 CHECK_TIMEOUT="${LOOM_CHECK_TIMEOUT:-1800}"
 CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
+# The job cap an agent run and each check step start under (LOOM_BUILD_JOBS,
+# default 4, 0 for none): BUILD_JOBS_ENV, BUILD_JOBS_CHECK_ENV, BUILD_JOBS_BIN
+# and build_jobs_export.
+# shellcheck source=lanes/build_jobs.sh
+. "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
@@ -589,21 +602,23 @@ live_cluster_check() {
   LIVE_NOTES="$(printf '%s\n' "$out" | grep '^live-cluster check could not run: ' || true)"
 }
 
-# Check the composed pull request checklist against only this run's log.
+# Untick each checked live box of the composed pull request checklist whose
+# expected output is not in this run's log, and go on: the finished work is
+# pushed with the box open. A check that cannot run parks the run.
 live_acceptance_check() {
-  local gap
-  if ! gap="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
+  local body
+  if ! body="$(printf '%s\n' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -c '
 import sys
-from bus.live_proof import lane_output_gap
+from bus.live_proof import untick_unproven_live
 with open(sys.argv[1], encoding="utf-8", errors="replace") as log:
     log.seek(int(sys.argv[2]))
-    print(lane_output_gap(sys.stdin.read(), log))
+    print(untick_unproven_live(sys.stdin.read().rstrip("\n"), log))
 ' "$LOG" "$LOG_START" 2>&1)"; then
-    printf '%s\n' "$gap" >> "$LOG"
+    printf '%s\n' "$body" >> "$LOG"
     park "$BRIEF" "could not check live acceptance criteria; nothing pushed" transient
     return 1
   fi
-  [ -z "$gap" ] || { park "$BRIEF" "$gap; nothing pushed"; return 1; }
+  PR_BODY="$body"
 }
 
 # STRAY_FILES as one comma-separated line, at most ten names.
@@ -721,22 +736,45 @@ pr_body() {
 PLAN_HOLD_MARKER="<!-- loom:plan-hold v1 -->"
 PLAN_NOTE_MARKER="<!-- loom:plan-hold-note v1 -->"
 
-# The body of a new pull request, in PR_BODY. A body that fails the review
-# bot's plan checks (bus/hunt_plan.py) has the failing parts rebuilt from the
-# brief by bus/pr_repair.py, the code the factory and fix rounds use. What the
-# brief still lacks goes in PLAN_GAPS, one per line: the pull request opens
-# anyway (the work is done), marked so the factory sends it no lane round,
-# whose agent edits code and never the body (loom#1837).
+# Compose from the filed brief, or render the ticket again if the run lost it.
+# Keep the recovered copy outside the inbox so it cannot start another run.
 compose_pr_body() {
-  local problems body_file out_file summary=() private=()
+  local recovered
   PLAN_GAPS=""
-  PR_BODY="$(pr_body "$BRIEF" "$TICKET")"
+  if [ -f "$BRIEF" ]; then
+    compose_pr_body_from "$BRIEF"
+    return
+  fi
+  if [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] && recovered="$(mktemp "$TMPDIR/pr-brief.XXXXXX")" &&
+     timeout "$NET_TIMEOUT" gh api "repos/$REPO/issues/$ISSUE_NUMBER" 2>> "$LOG" |
+       PYTHONPATH="$REPO_ROOT" python3 -B -c '
+import json, sys
+from bus.tickets import render_brief
+issue = json.load(sys.stdin)
+if not (issue.get("body") or "").strip():
+    sys.exit("ticket body is empty")
+print(render_brief(sys.argv[1], issue, sys.argv[2]))
+' "$REPO" "$LANE" > "$recovered" 2>> "$LOG"; then
+    compose_pr_body_from "$recovered"
+  else
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] brief file missing: ${BRIEF##*/}; could not rebuild from ticket" >> "$LOG"
+    PR_BODY="$(pr_body /dev/null "$TICKET")"
+  fi
+  [ -z "${recovered:-}" ] || rm -f "$recovered"
+}
+
+# Repair a failing body from the same source used to compose it. PLAN_GAPS
+# holds any sections that source still lacks for the ticket's plan-hold note.
+compose_pr_body_from() {
+  local problems dir summary=() private=()
+  PR_BODY="$(pr_body "$1" "$TICKET")"
   problems="$(printf '%s' "$PR_BODY" | PYTHONPATH="$REPO_ROOT" python3 -B -m bus.hunt_plan check - 2>&1)" && return 0
   echo "[$(date -u +%FT%TZ)] $TICKET pull request body fails the plan checks: $(printf '%s' "$problems" | tr '\n' ';')" >> "$LOG"
-  if ! body_file="$(mktemp)" || ! out_file="$(mktemp)"; then
-    PLAN_GAPS="$problems"; return 0
+  if ! dir="$(mktemp -d "$TMPDIR/pr-plan.XXXXXX")"; then
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] could not create scratch files for plan repair" >> "$LOG"
+    return 0
   fi
-  printf '%s\n' "$PR_BODY" > "$body_file"
+  printf '%s\n' "$PR_BODY" > "$dir/body"
   if [ -f "$WORKDIR/$TICKET.summary.md" ]; then
     summary=(--summary "$WORKDIR/$TICKET.summary.md")
   elif [ -f "$TREE/$SUMMARY_FILE" ]; then
@@ -744,16 +782,17 @@ compose_pr_body() {
   fi
   repo_is_public || private=(--private)
   if PLAN_GAPS="$(NET_TIMEOUT="$NET_TIMEOUT" PYTHONPATH="$REPO_ROOT" python3 -B -m bus.pr_repair plan \
-       "$BRIEF" "$body_file" "$LANE" "$MODEL" "$TICKET" --out "$out_file" --repo "$REPO" \
+       "$1" "$dir/body" "$LANE" "$MODEL" "$TICKET" --out "$dir/out" --repo "$REPO" \
        ${summary[@]+"${summary[@]}"} ${private[@]+"${private[@]}"} 2>> "$LOG")"; then
-    PR_BODY="$(cat "$out_file")"
+    PR_BODY="$(cat "$dir/out")"
     PLAN_GAPS=""
     echo "[$(date -u +%FT%TZ)] $TICKET pull request body rebuilt from the brief; it passes the plan checks" >> "$LOG"
-  else
-    [ -n "$PLAN_GAPS" ] || PLAN_GAPS="$problems"
+  elif [ -n "$PLAN_GAPS" ]; then
     echo "[$(date -u +%FT%TZ)] $TICKET the brief lacks for the plan checks: $(printf '%s' "$PLAN_GAPS" | tr '\n' ';')" >> "$LOG"
+  else
+    echo "[$(date -u +%FT%TZ)] $TICKET [factory] could not check the brief for plan gaps" >> "$LOG"
   fi
-  rm -f "$body_file" "$out_file"
+  rm -rf "$dir"
 }
 
 # The ticket's one plan-hold note, edited in place on every later pull
@@ -880,10 +919,10 @@ upsert_sticky_comment() {
   fi
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   else
     timeout "$NET_TIMEOUT" gh api -X POST "repos/$repo/issues/$number/comments" \
-      -F "body=@$new_file" >> "$LOG" 2>&1 || ok=1
+      -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
   fi
   rm -f "$old_file" "$input_file" "$new_file"
   return "$ok"
@@ -1250,6 +1289,23 @@ lane_app_token() {
   # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
   [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
   export GH_TOKEN="$token"
+  APP_TOKEN_AT="$(date +%s)"
+}
+
+# A run can outlive its installation token (one hour), so each GitHub write
+# that can come late in a run mints again once the token is older than
+# LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
+# the log and keeps the old token, which may still work (loom#3231).
+fresh_app_token() {
+  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
+  local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
+  now="$(date +%s)"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=2700
+  [[ "${APP_TOKEN_AT:-}" =~ ^[0-9]+$ ]] && [ $((now - APP_TOKEN_AT)) -lt "$max" ] && return 0
+  lane_app_token && return 0
+  [ -z "$old" ] || export GH_TOKEN="$old"
+  echo "[$(date -u +%FT%TZ)] ${TICKET:-run}: could not mint a fresh GitHub App token before a GitHub write" >> "$LOG"
+  return 1
 }
 
 # The agent's own gh config directory (loom#665): a fresh one per run, holding
@@ -1314,6 +1370,7 @@ post_park_note() {  # failure class, reason
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
+  fresh_app_token || true
   file="$(mktemp "${TMPDIR:-/tmp}/loom-park-note.XXXXXX")" || return 0
   printf '%s\n' "${2:-}" | tr -d '\r' | LC_ALL=C tr -d '\000-\010\013\014\016-\037' |
     grep -m1 -v '^[[:space:]]*$' | cut -c1-200 |
@@ -1474,7 +1531,7 @@ agy_agent() {
   settings="$(agy_settings merge < "$AGY_SETTINGS")" || { echo "could not write agy's settings" >&2; return 3; }
   # shellcheck disable=SC2031 # PATH and LANG here are this shell's, not api_agent's subshell's
   "${AGY_RUNAS[@]}" /usr/bin/env -i PATH="$PATH" HOME="$AGY_HOME" TMPDIR="$AGENT_HOME" TERM=dumb \
-    LANG="${LANG:-en_US.UTF-8}" timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
+    LANG="${LANG:-en_US.UTF-8}" ${BUILD_JOBS_ENV[@]+"${BUILD_JOBS_ENV[@]}"} timeout "$AGENT_TIMEOUT" sandbox-exec -p "$profile" \
     "$AGY_BIN" -p "$@" --disable-slash-commands --model "$MODEL" < /dev/null | timeout "$((AGENT_TIMEOUT + 60))" cat
   local rc=$?
   # A failed restore must fail the run, even if agy itself succeeded. Only the
@@ -2464,20 +2521,38 @@ record_base_flake() {  # base commit, first exit, bounded first-run excerpt
 # What failed in a check, from the log past byte $1: the tests it named (unittest
 # FAIL:/ERROR:, pytest FAILED/ERROR, go --- FAIL:) and the tools the shell could
 # not find, else its last line, so a validation record says why (loom#2418).
-check_failures() {  # log offset
-  local out names
+check_failure_names() {  # log offset: one failing name a line, at most 20
+  local out
   out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
   # LC_ALL=C: a check's output may be any bytes, and BSD sed and cut stop at
   # one that is not UTF-8.
-  names="$(printf '%s\n' "$out" | LC_ALL=C sed -nE \
+  printf '%s\n' "$out" | LC_ALL=C sed -nE \
     -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
     -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' \
     -e 's/^.*: ([^ :]+): (command )?not found$/missing \1/p' |
-    awk '!seen[$0]++' | head -n 20 | paste -sd ',' - | sed 's/,/, /g')"
+    awk '!seen[$0]++' | head -n 20
+}
+check_failures() {  # log offset
+  local out names
+  out="$(tail -c +"$(( $1 + 1 ))" "$LOG" 2>/dev/null)"
+  names="$(check_failure_names "$1" | paste -sd ',' - | sed 's/,/, /g')"
   [ -n "$names" ] || names="$(printf '%s\n' "$out" | LC_ALL=C grep -av '^[[:space:]]*$' | tail -n 1)"
   printf '%s' "$names" | LC_ALL=C cut -c1-1000
+}
+# The first three failing test names a check named past the log offset $1,
+# "a, b, c" and, past three, ", and N more"; nothing when it named none
+# (loom#3198). One line, at most 400 characters.
+failing_summary() {  # log offset
+  local all total
+  all="$(check_failure_names "$1")"
+  [ -n "$all" ] || return 0
+  total="$(printf '%s\n' "$all" | wc -l | tr -d ' ')"
+  {
+    printf '%s\n' "$all" | head -n 3 | paste -sd ',' - | sed 's/,/, /g' | tr -d '\n'
+    [ "$total" -le 3 ] || printf ', and %s more' "$(( total - 3 ))"
+  } | LC_ALL=C cut -c1-400
 }
 # Error lines from a check's output for incident details: up to 8 lines
 # matching error|Error|FAILED|make: \*\*\*, each cut to 200 chars, or the
@@ -2868,45 +2943,7 @@ CHECK_SLOT_HELD=""
 [[ "$CHECK_SLOTS" =~ ^[1-9][0-9]*$ ]] || CHECK_SLOTS=3
 [[ "$CHECK_SLOT_WAIT" =~ ^[0-9]+$ ]] || CHECK_SLOT_WAIT=5400
 [[ "$CHECK_SLOT_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_SLOT_POLL=5
-CHECK_LOAD_1M="${LOOM_CHECK_LOAD_1M:-24}"
-CHECK_LOAD_5M="${LOOM_CHECK_LOAD_5M:-18}"
-CHECK_LOAD_FILE="${LOOM_CHECK_LOAD_FILE:-/proc/loadavg}"
-CHECK_LOAD_NOTE=""
-[[ "$CHECK_LOAD_1M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_1M=24
-[[ "$CHECK_LOAD_5M" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CHECK_LOAD_5M=18
-
-# Print the host's 1-minute and 5-minute load averages as "<1m> <5m>";
-# return 1 when there is no reading.
-check_load_reading() {
-  local line="" one="" five="" rest=""
-  if [ -r "$CHECK_LOAD_FILE" ]; then
-    IFS= read -r line < "$CHECK_LOAD_FILE" || [ -n "$line" ] || return 1
-  else
-    line="$(sysctl -n vm.loadavg 2>/dev/null || /usr/sbin/sysctl -n vm.loadavg 2>/dev/null)" || return 1
-  fi
-  # macOS prints "{ 2.92 3.15 3.21 }", and a comma for the point in some locales.
-  line="${line//[\{\}]/ }"
-  line="${line//,/.}"
-  read -r one five rest <<< "$line"
-  [[ "$one" =~ ^[0-9]+(\.[0-9]+)?$ && "$five" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
-  printf '%s %s\n' "$one" "$five"
-}
-
-# Return 0 when the host load is above a limit, with CHECK_LOAD_NOTE saying
-# which reading and limit; 1 when there is room, both limits are 0, or the
-# load cannot be read (CHECK_LOAD_NOTE is then "unread").
-check_load_high() {
-  local reading one five
-  CHECK_LOAD_NOTE=""
-  [[ "$CHECK_LOAD_1M" =~ ^0+(\.0+)?$ && "$CHECK_LOAD_5M" =~ ^0+(\.0+)?$ ]] && return 1
-  reading="$(check_load_reading)" || { CHECK_LOAD_NOTE=unread; return 1; }
-  read -r one five <<< "$reading"
-  CHECK_LOAD_NOTE="$(awk -v a="$one" -v b="$five" -v la="$CHECK_LOAD_1M" -v lb="$CHECK_LOAD_5M" 'BEGIN {
-    if (la + 0 > 0 && a + 0 > la + 0) printf "1-minute load %s is above %s", a, la
-    else if (lb + 0 > 0 && b + 0 > lb + 0) printf "5-minute load %s is above %s", b, lb
-  }')"
-  [ -n "$CHECK_LOAD_NOTE" ]
-}
+. "$LOOM_ROOT/lanes/host_load.sh" || exit 1
 
 # Try each slot once; sets CHECK_SLOT_HELD and returns 0 on a take.
 try_check_slot() {
@@ -2984,6 +3021,35 @@ acquire_check_slot() {
 release_check_slot() {
   [ -z "$CHECK_SLOT_HELD" ] || rm -rf "$CHECK_SLOT_HELD"
   CHECK_SLOT_HELD=""
+}
+
+wait_for_agent() {
+  [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || return 0
+  local requested="${1:-}" start=$SECONDS noted="" why left poll="$CHECK_SLOT_POLL"
+  while :; do
+    if check_load_high; then
+      why="$CHECK_LOAD_NOTE"
+    elif [ -n "$requested" ] && ! heavy_lock take "$requested"; then
+      why="heavy repo lock for $REPO"
+    else
+      HEAVY_LOCK="$requested"
+      if [ "$CHECK_LOAD_NOTE" = unread ]; then
+        echo "host load could not be read before agent start" >> "$LOG"
+      fi
+      return 0
+    fi
+    if [ -z "$noted" ]; then
+      echo "waiting to start agent: $why" >> "$LOG"
+      noted=1
+    fi
+    left=$((10#$CHECK_SLOT_WAIT - (SECONDS - start)))
+    if [ "$left" -le 0 ]; then
+      echo "agent deferred until next pass: $why" >> "$LOG"
+      return 1
+    fi
+    if [ "${poll%%.*}" -ge "$left" ]; then poll="$left"; fi
+    sleep "$poll"
+  done
 }
 
 # A check that never ran for want of a slot (75) or that the timeout killed
@@ -3091,13 +3157,18 @@ contract_run_sandboxed() {
     # (2026-10-16).
     # UV_CACHE_DIR and UV_PYTHON_INSTALL_DIR name uv's own defaults under
     # the scratch home, where agent_uv_cache copies them for a codex agent.
-    export PATH="${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
+    export PATH="${BUILD_JOBS_BIN:+$BUILD_JOBS_BIN:}${uv_path_dirs:+$uv_path_dirs:}$keep_path" HOME="$home" TMPDIR="$home/tmp" TERM=dumb LANG="$keep_lang" UV_MANAGED_PYTHON=1
     export UV_CACHE_DIR="$home/.cache/uv" UV_PYTHON_INSTALL_DIR="$home/.local/share/uv/python"
     # LOOM_CHECK_SANDBOX=1 tells a repo's tests they run in this sandbox,
     # which denies localhost, so a test that needs a loopback connection can
     # skip here and still run on CI (docs/LANES.md, "Validation").
     export LOOM_CHECK_SANDBOX=1
     export LOOM_CHECK_WORKERS="$CHECK_WORKERS"
+    # The job cap (lanes/build_jobs.sh). This environment was emptied above,
+    # so the cap is set here, not inherited; it lowers LOOM_CHECK_WORKERS
+    # when that is the larger of the two. The wrapper directory is first on
+    # PATH above. With LOOM_BUILD_JOBS=0 the list is empty.
+    for kv in ${BUILD_JOBS_CHECK_ENV[@]+"${BUILD_JOBS_CHECK_ENV[@]}"}; do export "${kv?}"; done
     # Host-red tests to set aside (host_red_deselected_passes): node ids
     # host_red_names checked are plain, so each is one word. LOOM_DESELECT_TESTS
     # names them for a check that reads them itself.
@@ -3457,7 +3528,7 @@ prepare_validation() {
 # Run changed Python tests on the base code in the check sandbox. This separate
 # pass has its own timeout because it archives the base tree and runs tests.
 final_base_tests() {
-  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names default_rev=""
+  local rev="$1" helper="$CHECK_HOME/vacuous.py" command rc log_offset names all_names default_rev=""
   cp "$LOOM_ROOT/bus/vacuous.py" "$helper" || {
     VALIDATION_REASON="validation environment unavailable: could not stage the base-test gate"
     return 125
@@ -3478,6 +3549,7 @@ final_base_tests() {
   log_offset="$(wc -c < "$LOG")"
   contract_run "$command"
   rc=$?
+  all_names="$(tail -c +$((log_offset + 1)) "$LOG" | grep -E '^base-(pass|timeout|unrunnable): ')"
   names="$(tail -c +$((log_offset + 1)) "$LOG" \
     | sed -n -e 's/^base-pass: /passes on base: /p' \
              -e 's/^base-timeout: /timed out on base: /p' \
@@ -3489,16 +3561,71 @@ final_base_tests() {
     124) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate timed out" ;;
     75) PARK_CLASS=transient; VALIDATION_REASON="validation did not run: no check slot free for the base-test gate" ;;
     125|126|127) VALIDATION_REASON="validation environment unavailable: the base-test gate exited $rc" ;;
-    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed" ;;
+    *) VALIDATION_REASON="validation failed: a changed test passed on base or the base-test gate failed"
+       # Only base-pass names, outside a fix round: the ticket's behaviour may
+       # already hold on the default branch, which no stronger model changes
+       # (loom#3005). The station holds it for a done-check, not a rung.
+       if [ -z "${FIX_PR:-}" ] && [ -n "$names" ]; then
+         case "$all_names" in
+           *base-timeout:*|*base-unrunnable:*) ;;
+           *) VALIDATION_REASON="validation failed: every changed test passes on base; the ticket may already hold on the default branch" ;;
+         esac
+       fi ;;
   esac
   [ -z "$names" ] || VALIDATION_REASON="$VALIDATION_REASON: ${names%;}"
   return "$rc"
 }
 
+# A ruff format --check failure repeats on a second run, so a lane whose only
+# defect is formatting failed as work (loom#3267). After a red first run,
+# format the files its log names with `Would reformat:` when every one is a
+# file the lane's commits changed, and commit that for the second run. Takes
+# the log offset where the first run's output starts; always returns 0.
+format_changed_files() {
+  local offset="$1" prefix path paths="" listed n=0 safe='^[A-Za-z0-9_./@=+-]+$'
+  case "$C_CHECK" in *"ruff format --check"*) ;; *) return 0 ;; esac
+  prefix="${C_CHECK%%format --check*}"
+  prefix="${prefix##*&&}"; prefix="${prefix##*;}"; prefix="${prefix##*|}"
+  prefix="$(printf '%s' "$prefix" | sed -e 's/^ *//' -e 's/ *$//')"
+  case "$prefix" in *ruff*) ;; *) return 0 ;; esac
+  grep -Eq "$safe" <<< "${prefix// /}" || return 0
+  listed="$(safe_git diff --name-only "$BASE" HEAD 2> /dev/null)" || return 0
+  while IFS= read -r path; do
+    grep -Eq "$safe" <<< "$path" || return 0
+    grep -Fxq -- "$path" <<< "$listed" || return 0
+    paths="$paths $path"; n=$((n + 1))
+  done < <(tail -c +$((offset + 1)) "$LOG" | sed -n 's/^Would reformat: //p')
+  [ "$n" -gt 0 ] || return 0
+  contract_run "$prefix format$paths" || { safe_git checkout -q -- $paths >> "$LOG" 2>&1; return 0; }
+  safe_git add -- $paths >> "$LOG" 2>&1 || return 0
+  safe_git diff --cached --quiet && return 0
+  safe_git commit -qm "format: apply ruff format to the lane's changed files" >> "$LOG" 2>&1 || return 0
+  echo "formatted $n files the change touched before the second run" >> "$LOG"
+  return 0
+}
+
+# One more agent turn in the same run, after the base-test gate refused: the
+# brief names each test that passed on base and asks for a change that makes it
+# fail there. Whatever the turn changed is committed on the lane branch.
+base_retry_turn() {
+  local named="$1" brief="$WORKDIR/$TICKET.base-retry-brief"
+  { cat "$RUN_BRIEF"
+    printf '\n\n## Tests that pass on the base commit\n\n'
+    printf 'The base-test gate refused this branch: each test below passes on the base commit, so it proves nothing about your change.\n'
+    printf 'Change each one so it fails on the base commit and passes with your change. You have one turn.\n\n'
+    printf '%s\n' "$named" | grep -o 'passes on base: [^;]*' | sed 's/^passes on base: /- /'
+  } > "$brief" || return 1
+  ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  if [ -n "$(safe_git status --porcelain)" ]; then
+    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
+  fi
+}
+
 # After the agent, on the committed branch head: the same check again. Sets
 # VALIDATION_REASON when it did not pass.
 final_validation() {
-  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset
+  local rc first_exit rev changed ok=false gate_rc host_red="" touched="" output_offset failing
   VALIDATION_REASON=""
   safe_git checkout -q "$BRANCH" >> "$LOG" 2>&1
   rev="$(safe_git rev-parse HEAD)"
@@ -3513,6 +3640,17 @@ final_validation() {
   contract_run "$C_CHECK"; rc=$?
   if [ "$rc" -eq 0 ]; then
     final_base_tests "$rev"; gate_rc=$?
+    # The agent answers a refusal once: one more turn, then the whole check
+    # again. A second refusal ends the run as before.
+    if [ "$gate_rc" -ne 0 ] && [ -z "${BASE_RETRY_USED:-}" ] &&
+       [[ "$VALIDATION_REASON" == *"passes on base: "* ]]; then
+      BASE_RETRY_USED=1
+      echo "base-test gate refused; giving the agent one more turn" >> "$LOG"
+      if base_retry_turn "$VALIDATION_REASON"; then
+        final_validation
+        return $?
+      fi
+    fi
     if [ "$gate_rc" -ne 0 ]; then
       [ "$gate_rc" -eq 124 ] || [ "$gate_rc" -eq 125 ] || [ "$gate_rc" -eq 75 ] || [ "$gate_rc" -eq 126 ] ||
         [ "$gate_rc" -eq 127 ] || record base-tests-finding "$VALIDATION_REASON" "$gate_rc" "$rev" false
@@ -3531,6 +3669,9 @@ final_validation() {
      [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
     first_exit="$rc"
     record final "$C_CHECK" "$rc" "$rev" false
+    format_changed_files "$output_offset"
+    rev="$(safe_git rev-parse HEAD)"
+    output_offset="$(wc -c < "$LOG")"
     contract_run "$C_CHECK"; rc=$?
     if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
       VALIDATION_REASON="validation environment unavailable: Python interpreter query was denied by the sandbox"
@@ -3560,11 +3701,21 @@ final_validation() {
     rc=0
   fi
   changed="$(tracked_changes)"
+  failing=""
+  [ "$rc" -eq 0 ] || [ "$rc" -ge 124 ] || failing="$(failing_summary "$output_offset")"
   if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ -z "$changed" ] &&
      tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
        python3 -B -m bus.validation_timeout "$TREE" "$BASE" "$rev"; then
     PARK_CLASS=transient
     VALIDATION_REASON="validation failed: only unchanged test files reported TimeoutExpired errors"
+  fi
+  if [ "$rc" -ne 0 ] && [ "$rc" -lt 124 ] && [ "${BASELINE_EXIT:-}" = 0 ] &&
+     tail -c +$((output_offset + 1)) "$LOG" | PYTHONPATH="$LOOM_ROOT" \
+       python3 -B -m bus.validation_refusal; then
+    # Every failure is the sandbox refusing an operation, in a check the base
+    # run may never have executed: the environment, not the agent's work.
+    PARK_CLASS=factory
+    VALIDATION_REASON="validation environment unavailable: sandbox refusal (Operation not permitted) in the final check"
   fi
   case "$rc" in
     0) [ -z "$changed" ] && ok=true || VALIDATION_REASON="validation failed: the check changed tracked files ($changed)" ;;
@@ -3587,9 +3738,10 @@ final_validation() {
       VALIDATION_REASON="validation environment unavailable: the check exited $rc"
       note_factory_incident environment "check: $C_CHECK (exit $rc)" VALIDATION_REASON
       ;;
-    *) [ -n "$VALIDATION_REASON" ] || VALIDATION_REASON="validation failed: the check exited $rc" ;;
+    *) [ -n "$VALIDATION_REASON" ] ||
+         VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red")"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
@@ -3793,6 +3945,10 @@ push_side() {
   range="$BASE..$from"
   [ -n "${FIX_UPSTREAM:-}" ] && range="$FIX_UPSTREAM...$from"
   [ "${REPO_PRIVATE:-}" = true ] && scan=(--personal-data)
+  if ! fresh_app_token; then
+    printf 'the GitHub App token could not be refreshed; the edits are committed in the lane tree'
+    return 1
+  fi
   if ! (cd "$TREE" && leak_scan --diff "$range" "${scan[@]}") >> "$LOG" 2>&1; then
     printf 'the leak scan refused or could not check the edits, so no branch was kept; the edits are committed in the lane tree'
     return 1
@@ -4058,8 +4214,21 @@ update_fix_branch() {
   fi
   if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        merge-base HEAD "origin/$default" > /dev/null 2>&1; then
-    timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-      fetch -q --unshallow origin >> "$LOG" 2>&1 || true
+    # Two fetches on one shallow tree can race ("shallow file has changed since
+    # we read it"), so the deepening is tried a second time after a pause, as
+    # fetch_base_for_contract does.
+    local try
+    for try in 1 2; do
+      timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+        fetch -q --unshallow origin >> "$LOG" 2>&1 && break
+      [ "$try" -eq 2 ] || sleep 3
+    done
+    # Still no common commit: a merge would only say "unrelated histories" and
+    # be read as the agent's failure, so name the shallow tree instead.
+    if ! timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+         merge-base HEAD "origin/$default" > /dev/null 2>&1; then
+      UPDATE_REASON="could not deepen the shallow tree to merge $default"; return 1
+    fi
   fi
   timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
     merge-base --is-ancestor "origin/$default" HEAD 2> /dev/null && return 0
@@ -4756,6 +4925,7 @@ for BRIEF in "$INBOX"/*.md; do
     esac
   fi
 
+  BASE_RETRY_USED=""
   FIX_PR="$(field Fix-PR "$BRIEF" || true)"
   OPERATOR_REVIEW="$(field Operator-Review "$BRIEF" || true)"
   REVIEW_PR="$(field Review-PR "$BRIEF" || true)"
@@ -4810,6 +4980,7 @@ for BRIEF in "$INBOX"/*.md; do
     park "$BRIEF" "limit: $LIMIT_WHY" limit; continue
   fi
 
+  [ "$DELIVERABLE" = base-check ] || wait_for_agent || exit 0
   TREE="$WORKDIR/$TICKET"
   rm -rf "$TREE"
   rm -f "$WORKDIR/$TICKET.described-step" "$WORKDIR/$TICKET.opencode-events" "$WORKDIR/$TICKET.last-message"
@@ -4864,6 +5035,15 @@ for BRIEF in "$INBOX"/*.md; do
     continue
   fi
   resume_earlier_attempt
+  repo_lock=""
+  if [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && [ -n "${LOOM_HEAVY_REPOS:-}" ]; then
+    repo_key="$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
+    heavy_repos="$(printf '%s' "$LOOM_HEAVY_REPOS" | tr '[:upper:]' '[:lower:]' | tr ',[:space:]' ' ')"
+    case " $heavy_repos " in
+      *" $repo_key "*) repo_lock="$LOOM_HOME/run/heavy-repos/${repo_key/\//+}.lock" ;;
+    esac
+  fi
+  wait_for_agent "$repo_lock" || exit 0
   [ "$LANE" = opencode-go ] && { catalogue_cmd record-call "$MODEL" >> "$LOG" 2>&1 || true; }
 
   # The agent runs as a background job of a job-control subshell, which puts
@@ -4871,13 +5051,23 @@ for BRIEF in "$INBOX"/*.md; do
   # runner is killed (a reinstall's bootout), the agent survives in its group,
   # and the next pass's stale-lock recovery above kills exactly that group.
   LOG_START="$(log_size)"
-  if ! agent_gh_config; then park "$BRIEF" "$AGENT_GH_WHY" transient; continue; fi
+  if ! agent_gh_config; then
+    release_heavy_repo
+    park "$BRIEF" "$AGENT_GH_WHY" transient; continue
+  fi
   rm -f "$LOCK/watchdog-limit" "$LOCK/egress-opened"
   # The job's proof that an agent started: without it a cluster run fails in
   # Actions (lanes/k8s/lane_job.py run), whatever this runner exits.
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || : > "$LOGDIR/$TICKET.agent-ran"
   ( set -m
-    (cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
+    (if [ -n "$HEAVY_LOCK" ]; then
+       # This process group can outlive the runner. Keep its own PID in the lock.
+       heavy_lock adopt "$HEAVY_LOCK" "$$" || exit 1
+       trap 'release_heavy_repo' EXIT
+     fi
+     # The job cap, in this subshell only (lanes/build_jobs.sh).
+     build_jobs_export &&
+     cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
       { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
@@ -4904,6 +5094,7 @@ for BRIEF in "$INBOX"/*.md; do
     exit $agent_status ) &
   wait $!
   STATUS=$?
+  release_heavy_repo
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   GH_CLEANUP_FAILURE=""
@@ -5444,6 +5635,7 @@ for BRIEF in "$INBOX"/*.md; do
   # round, a person's commit) is not this run's failure: it is parked as
   # "branch moved", and the station hands the new head back to the factory.
   if [ "$COMMITTED" -eq 1 ]; then
+    fresh_app_token || { park "$BRIEF" "the GitHub App token could not be refreshed before the push; the edits are committed in the lane tree" transient; continue; }
     if ! PUSH_OUT="$(timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q -u origin "$BRANCH" 2>&1)"; then
       printf '%s\n' "$PUSH_OUT" >> "$LOG"
       if [ -n "$FIX_PR" ] && grep -qE '\[rejected\].*\((fetch first|non-fast-forward)\)' <<<"$PUSH_OUT"; then
@@ -5562,5 +5754,5 @@ Review threads this round left without a reply: $UNANSWERED"
   fi
   echo "[$(date -u +%FT%TZ)] $TICKET done" >> "$LOG"
   printf '[%s] %s agent gh calls: %s\n' "$(date -u +%FT%TZ)" "$TICKET" "$AGENT_GH_CALLS" >> "$LOG"
-  mv "$BRIEF" "$INBOX/done/"
+  if [ -f "$BRIEF" ]; then mv "$BRIEF" "$INBOX/done/"; fi
 done

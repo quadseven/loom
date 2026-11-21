@@ -91,6 +91,9 @@ class FakeGitHub:
     def __call__(self, method, url, headers, body):
         parts = urlsplit(url)
         data = json.loads(body) if body else None
+        if method == "POST" and parts.path == "/graphql" and "timelineItems" in data["query"]:
+            page = {"nodes": [], "pageInfo": {"hasNextPage": False}}
+            return reply(200, {"data": {"repository": {"issue": {"timelineItems": page}}}})
         if method != "GET":
             self.writes.append((method, parts.path, data))
         if parts.path == "/repos/%s" % REPO:

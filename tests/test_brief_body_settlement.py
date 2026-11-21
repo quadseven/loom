@@ -57,11 +57,6 @@ class BodySettlementTests(unittest.TestCase):
         with self.assertRaises(brief_check.Unread):
             self.check()
 
-    def test_ask_records_the_exact_body_fingerprint(self):
-        verdict = brief_check.Verdict(brief_check.STALE, 'source-124', 'done')
-        got = brief_check.ask(verdict, self.issue['body'])
-        self.assertIn(hashlib.sha256(self.issue['body'].encode()).hexdigest(), got)
-
     def test_automation_using_a_person_login_does_not_settle(self):
         self.fake.routes['/user'] = {'login': OPERATOR}
         self.assertEqual(self.check().key, 'source-124')
@@ -81,7 +76,7 @@ class BodySettlementTests(unittest.TestCase):
         self.assertEqual(self.check().key, 'source-124')
         self.assertFalse(any('/events' in p for p in self.fake.reads))
 
-    def test_station_asks_persist_the_body_for_later_settlement(self):
+    def test_station_brain_note_does_not_waive_stale_evidence(self):
         import tempfile
         from bus import station
         with tempfile.TemporaryDirectory() as home:
@@ -90,8 +85,9 @@ class BodySettlementTests(unittest.TestCase):
             settings = station.Settings(home, [REPO], TRUSTED, ['example-owner'])
             worker = station.Station(GitHub('t', transport=fake), settings)
             found = brief_check.Verdict(brief_check.STALE, 'source-124', 'already done')
-            self.assertTrue(worker._apply_brief_hold(REPO, 206, found, self.issue['body']))
-            bodies = [str(payload) for method, path, payload in fake.writes
+            self.assertTrue(worker._apply_brief_hold(REPO, 206, found))
+            bodies = [payload['body'] for method, path, payload in fake.writes
                       if path.endswith('/comments')]
-            self.assertTrue(any(hashlib.sha256(self.issue['body'].encode()).hexdigest()
-                                in body for body in bodies))
+            self.assertEqual(len(bodies), 1)
+            self.notes = [comment(bodies[0], login='loom-station[bot]', bot=True)]
+            self.assertEqual(self.check().key, 'source-124')

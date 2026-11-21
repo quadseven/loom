@@ -12,8 +12,10 @@ from . import labels, spend, state_store
 
 HEARTBEAT_MAX_AGE = 600
 LIMIT = "limit:"
-STATES = ("serving", "limited", "parked", "off")
+STATES = ("serving", "limited", "parked", "off", "busy")
 RUNNER_UNAVAILABLE = "Runner reported unavailable"
+STALE = "Heartbeat is stale"
+RUN_IN_PROGRESS = "Run in progress"
 
 
 def epoch(value: Any) -> Optional[float]:
@@ -41,7 +43,7 @@ class State:
 
 def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
              credit: Optional[spend.Summary] = None, parked: str = "",
-             has_job: bool = True) -> State:
+             has_job: bool = True, running: bool = False) -> State:
     """Return the lane state, a publishable reason and the heartbeat time."""
     beat = beat if isinstance(beat, dict) else {}
     at = epoch(beat.get("at"))
@@ -53,7 +55,7 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
     if at is None:
         return State("off", "No heartbeat", at)
     if not fresh(at, now, window):
-        return State("off", "Heartbeat is stale", at)
+        return _stale_state(beat, at, now, running)
     if parked:
         return State("parked", parked, at)
     if beat.get("available") is True:
@@ -64,6 +66,21 @@ def evaluate(beat: Any, now: float, *, window: float = HEARTBEAT_MAX_AGE,
     if reason.startswith(LIMIT):
         return _limit_state(reason, at, epoch(beat.get("retry_at")), now)
     return State("off", RUNNER_UNAVAILABLE, at)
+
+
+def _stale_state(beat: dict[str, Any], at: float, now: float,
+                 running: bool = False) -> State:
+    """Keep a timed limit active until its retry time (loom#3226). A runner
+    beats between runs, not during one, so a fresh keepalive stamp (`running`)
+    says a lane with a stale heartbeat is in the middle of a run, not down."""
+    if beat.get("available") is False:
+        reason = str(beat.get("reason") or "")
+        until = epoch(beat.get("retry_at"))
+        if reason.startswith(LIMIT) and until is not None and until > now:
+            return _limit_state(reason, at, until, now)
+    if running:
+        return State("busy", RUN_IN_PROGRESS, at)
+    return State("off", STALE, at)
 
 
 def _limit_state(reason: str, at: float, until: Optional[float], now: float) -> State:
@@ -91,7 +108,7 @@ def heartbeat_fields(slot: str, beat: Dict[str, Any], home: str) -> Dict[str, An
     return {**beat, "state": state.state, "state_reason": state.reason}
 
 
-ROW = re.compile(r"\|\s*([a-z0-9_.-]+)\s*\|\s*(serving|limited|parked|off|yes|no)\s*"
+ROW = re.compile(r"\|\s*([a-z0-9_.-]+)\s*\|\s*(serving|limited|parked|off|busy|yes|no)\s*"
                  r"\|\s*([^|]+)\|(?:\s*([^|]+)\|)?", re.I)
 
 

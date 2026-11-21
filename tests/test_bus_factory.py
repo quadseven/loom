@@ -3525,6 +3525,18 @@ class Queued(Base):
         self.assign(available=["codex", "codex-2"])
         self.assertEqual(self.lane(7), "codex-2")
 
+    def test_a_queued_outcome_hold_gets_no_lane(self):
+        self.queued(7)
+        self.queued(8)
+        self.queued(9)
+        self.gh.issues[7]["labels"].append({"name": "wait:incident"})
+        self.gh.issues[8]["labels"].append({"name": "wait:no-change"})
+
+        self.assign(available=["codex"])
+
+        self.assertEqual([factory._state(self.gh.issues[n]) for n in (7, 8, 9)],
+                         ["queued", "queued", "briefed"])
+
     OPUS = "Model: claude-opus-5-5\nDifficulty: hard\n\n## Why\nx\n"
     OUT = factory.ANTHROPIC + ("claude",)
 
@@ -5713,6 +5725,17 @@ class BranchHygiene(Base):
         self.go()
         self.assertEqual(self.updates(), ["/repos/%s/pulls/50/update-branch" % REPO])
         self.assertEqual((self.merged, self.fixed), ([], []))
+
+    def test_a_ticket_with_an_unticked_hold_box_gets_no_branch_refresh(self):
+        held = "## Acceptance criteria\n- [ ] Hold: do not merge until the service returns\n"
+        self.gh.ticket(5, "pr", body=held)
+        self.gh.pull(50, 5, created=7200, runs=self.WAITING)
+        self.gh.behind[50] = 3
+        self.gh.ticket(6, "pr", body="## Acceptance criteria\n- [ ] A real box\n")
+        self.gh.pull(60, 6, created=7200, runs=self.WAITING)
+        self.gh.behind[60] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/60/update-branch" % REPO])
 
     def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
         self.gh.ticket(5, "briefed")

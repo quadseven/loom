@@ -54,6 +54,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from typing import Callable, Dict, FrozenSet, Iterator, List, NamedTuple, Optional, Tuple
 
@@ -469,17 +470,44 @@ def _rmtree(path: str) -> None:
 
 
 def _measure(path: str, deadline: float) -> int:
-    """Bytes on disk under path, counted until deadline."""
+    """Bytes on disk under path, counted until deadline, never inside another
+    mount (a folder whose st_dev differs from path's)."""
     size = 0
+    try:
+        device = os.lstat(path).st_dev
+    except OSError:
+        return 0
     for top, dirs, names in os.walk(path, followlinks=False):
         if time.monotonic() > deadline:
             break
+        other = set()
         for name in dirs + names:
             try:
-                size += _bytes(os.lstat(os.path.join(top, name)))
+                st = os.lstat(os.path.join(top, name))
             except OSError:
                 continue
+            if name in dirs and st.st_dev != device:
+                other.add(name)
+                continue
+            size += _bytes(st)
+        dirs[:] = [d for d in dirs if d not in other]
     return size
+
+
+def _measure_bounded(path: str, deadline: float, measure=None) -> Optional[int]:
+    """measure(path), or None when it has not finished by deadline. The read
+    runs on a daemon thread the caller stops waiting for, because one blocked
+    directory read cannot be interrupted from inside os.walk."""
+    measure = measure or _measure
+    box: List[int] = []
+
+    def run() -> None:
+        box.append(measure(path, deadline))
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    return box[0] if box else None
 
 
 def _private_dirs(folder: str) -> None:
@@ -656,9 +684,11 @@ class RealDisk:
             raise OSError("archive of %s did not verify: %d files read back, %d written"
                           % (src, len(got), len(want)))
 
-    def largest(self, root: str, skip, deadline: float) -> List[Tuple[str, int]]:
+    def largest(self, root: str, skip, deadline: float,
+                measure=None) -> List[Tuple[str, int]]:
         """The folders in root (and in its largest few) by size, measured
-        until deadline, never inside skip."""
+        until deadline, never inside skip. A folder whose read has not
+        finished by deadline is left out (not measured), never waited on."""
         sizes: List[Tuple[str, int]] = []
         for name in self.listdir(root):
             path = os.path.join(root, name)
@@ -666,8 +696,10 @@ class RealDisk:
                 break
             if path in skip or any(s.startswith(path + os.sep) for s in skip):
                 if path not in skip:
-                    sizes += self.largest(path, skip, deadline)
+                    sizes += self.largest(path, skip, deadline, measure)
                 continue
             if os.path.isdir(path) and not os.path.islink(path):
-                sizes.append((path, _measure(path, deadline)))
+                size = _measure_bounded(path, deadline, measure)
+                if size is not None:
+                    sizes.append((path, size))
         return sorted(sizes, key=lambda kv: -kv[1])

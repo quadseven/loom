@@ -2,6 +2,7 @@
 
     python3 -m bus.product_read stuck [--param key=value ...]
     python3 -m bus.product_read health
+    python3 -m bus.product_read path /api/<documented path> [--param key=value ...]
 
 The read goes to `<base>/api/v2/stuck` or `<base>/api/v2/health`, where the
 base is the product's own address with its path prefix (the world the API
@@ -33,7 +34,7 @@ import sys
 import urllib.error
 import urllib.request
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 from .github import _NoRedirect, read_ssm
 
@@ -105,7 +106,7 @@ def resolve_base(env: Dict[str, str],
 
 def read_url(base: str, what: str, params: Sequence[Tuple[str, str]] = ()) -> str:
     """The URL one read asks: base + the read's path, with its query."""
-    url = base.rstrip("/") + PATHS[what]
+    url = base.rstrip("/") + (PATHS[what] if what in PATHS else what)
     return url + ("?" + urlencode(list(params)) if params else "")
 
 
@@ -152,6 +153,32 @@ def read(url: str, fetch: Fetch) -> object:
                         "not the product API's" % (url, len(raw))) from None
 
 
+def _decodings(path: str) -> List[str]:
+    """The path as written and after each percent-decoding, until it is stable.
+    A proxy or server may decode once or twice, so every form is judged."""
+    forms = [path]
+    for _ in range(4):
+        decoded = unquote(forms[-1])
+        if decoded == forms[-1]:
+            break
+        forms.append(decoded)
+    return forms
+
+
+def _unsafe(form: str) -> bool:
+    """A query, fragment, backslash or dot segment in one decoding of a path."""
+    return any(c in form for c in "?#\\") or any(
+        seg in (".", "..") for seg in form.split("/"))
+
+
+def check_path(path: str) -> str:
+    """The path when it is a plain /api/ path, else ValueError saying why not."""
+    if not path.startswith("/api/") or any(_unsafe(form) for form in _decodings(path)):
+        raise ValueError("the path %r is not a plain /api/ path (no query, fragment "
+                         "or '..'; use --param for a query)" % path)
+    return path
+
+
 def _param(text: str) -> Tuple[str, str]:
     key, sep, value = text.partition("=")
     if not sep or not key:
@@ -164,17 +191,28 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Dict[str, str]] = N
          ssm: Callable[[str, str], str] = read_ssm) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m bus.product_read",
                                      description="One GET of a goal home's product API.")
-    parser.add_argument("what", choices=sorted(PATHS))
+    parser.add_argument("what", choices=sorted(PATHS) + ["path"])
+    parser.add_argument("target", nargs="?", default="",
+                        help="with 'path': a GET path under the base, starting /api/")
     parser.add_argument("--param", action="append", type=_param, default=[],
                         help="a query parameter, key=value (repeatable)")
     args = parser.parse_args(argv)
+    what = args.what
+    if what == "path":
+        try:
+            what = check_path(args.target)
+        except ValueError as exc:
+            print("product read: %s" % exc, file=sys.stderr)
+            return 2
+    elif args.target:
+        parser.error("a path is only taken by 'path'")
     env = dict(os.environ) if env is None else env
     try:
         base, source = resolve_base(env, ssm)
     except BaseError as exc:
         print("product read: %s" % exc, file=sys.stderr)
         return 2
-    url = read_url(base, args.what, args.param)
+    url = read_url(base, what, args.param)
     if fetch is None:
         fetch = urllib_fetch(env.get("LOOM_TAILNET_PROXY", "").strip())
     try:

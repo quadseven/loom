@@ -33,7 +33,7 @@ class JournalChecks(unittest.TestCase):
 
     def test_counted_work_and_plain_counted_footer_are_preserved(self):
         for line in ("- Moved: merged 1, briefed 0", "merged 1, briefed 2",
-                     "- Merged: 1", "- Moved: 1, with issue 7 merged"):
+                     "- Merged: 1", "- Moved: 1, with issue #7 merged"):
             with self.subTest(line=line):
                 body = self.publish([line])
                 self.assertIn(line, body)
