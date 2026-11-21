@@ -3576,6 +3576,34 @@ final_base_tests() {
   return "$rc"
 }
 
+# A ruff format --check failure repeats on a second run, so a lane whose only
+# defect is formatting failed as work (loom#3267). After a red first run,
+# format the files its log names with `Would reformat:` when every one is a
+# file the lane's commits changed, and commit that for the second run. Takes
+# the log offset where the first run's output starts; always returns 0.
+format_changed_files() {
+  local offset="$1" prefix path paths="" listed n=0 safe='^[A-Za-z0-9_./@=+-]+$'
+  case "$C_CHECK" in *"ruff format --check"*) ;; *) return 0 ;; esac
+  prefix="${C_CHECK%%format --check*}"
+  prefix="${prefix##*&&}"; prefix="${prefix##*;}"; prefix="${prefix##*|}"
+  prefix="$(printf '%s' "$prefix" | sed -e 's/^ *//' -e 's/ *$//')"
+  case "$prefix" in *ruff*) ;; *) return 0 ;; esac
+  grep -Eq "$safe" <<< "${prefix// /}" || return 0
+  listed="$(safe_git diff --name-only "$BASE" HEAD 2> /dev/null)" || return 0
+  while IFS= read -r path; do
+    grep -Eq "$safe" <<< "$path" || return 0
+    grep -Fxq -- "$path" <<< "$listed" || return 0
+    paths="$paths $path"; n=$((n + 1))
+  done < <(tail -c +$((offset + 1)) "$LOG" | sed -n 's/^Would reformat: //p')
+  [ "$n" -gt 0 ] || return 0
+  contract_run "$prefix format$paths" || { safe_git checkout -q -- $paths >> "$LOG" 2>&1; return 0; }
+  safe_git add -- $paths >> "$LOG" 2>&1 || return 0
+  safe_git diff --cached --quiet && return 0
+  safe_git commit -qm "format: apply ruff format to the lane's changed files" >> "$LOG" 2>&1 || return 0
+  echo "formatted $n files the change touched before the second run" >> "$LOG"
+  return 0
+}
+
 # One more agent turn in the same run, after the base-test gate refused: the
 # brief names each test that passed on base and asks for a change that makes it
 # fail there. Whatever the turn changed is committed on the lane branch.
@@ -3641,6 +3669,8 @@ final_validation() {
      [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ]; then
     first_exit="$rc"
     record final "$C_CHECK" "$rc" "$rev" false
+    format_changed_files "$output_offset"
+    rev="$(safe_git rev-parse HEAD)"
     output_offset="$(wc -c < "$LOG")"
     contract_run "$C_CHECK"; rc=$?
     if validation_interpreter_denied "$rc" "$(tail -c +$((LOG_START + 1)) "$LOG")"; then
