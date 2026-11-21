@@ -859,16 +859,27 @@ def move_cap() -> int:
 def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) -> int:
     """The moves between lanes or rungs since a lane last claimed the ticket
     or the cap last held it: status events and escalations written by
-    `authors`. These repos take comments from strangers, whose text could
+    `authors`. Repeated escalation to the same known model and lane is
+    one move. These repos take comments from strangers, whose text could
     otherwise hold a ticket or keep one moving."""
     count = 0
+    destination = None
     for comment in sorted(brain.trusted_comments(comments, authors), key=lambda c: str(c.get("created_at") or "")):
         body = str(comment.get("body") or "")
         if CLAIM_RE.match(body) or body.startswith(MOVE_CAP_MARKER):
             count = 0
-        elif (body.startswith(brain.ESCALATE_MARKER)
-              or any(rx.search(body) for rx in BRIEF_RES[1:])):
+            destination = None
+        elif body.startswith(brain.ESCALATE_MARKER):
+            rung = brain._RUNG_LINE.search(body)
+            target = (rung.group(2), rung.group(3)) if rung else None
+            if target is None or target != destination:
+                count += 1
+            destination = target
+        elif any(rx.search(body) for rx in BRIEF_RES[1:]):
             count += 1
+            destination = None
+        elif BRIEF_RES[0].search(body) or body.startswith(FIX_MARKER):
+            destination = None
     return count
 
 

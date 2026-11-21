@@ -8711,7 +8711,7 @@ class History:
 
     def __init__(self, failed: int, fixes: int, tried: List[str],
                  reasons: List[str], rung: Optional[int], rungs: Optional[set] = None,
-                 held: Sequence[tickets.After] = ()) -> None:
+                 held: Sequence[tickets.After] = (), rung_wait: str = "") -> None:
         self.failed = failed
         self.fixes = fixes
         self.tried = tried
@@ -8723,6 +8723,7 @@ class History:
         # The tickets it builds on that are not merged yet; a held ticket is
         # never late, so no rung of the ladder is the answer for it.
         self.held = list(held)
+        self.rung_wait = rung_wait
 
     @property
     def attempts(self) -> int:
@@ -8861,8 +8862,9 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
     rungs = read.tried_rungs
-    return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
-                   rungs, held)
+    rung = _lowest_untried(tried, rungs)
+    wait = _rung_wait(issue, rung) if not held and rung is not None else ""
+    return History(failed, fixes, tried, reasons, rung, rungs, held, wait)
 
 
 def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
@@ -8884,6 +8886,23 @@ def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[i
     return left[0] - 1 if left else None
 
 
+def _rung_wait(issue: Dict[str, Any], rung: int) -> str:
+    """Describe a pending assignment to this rung, indexed from zero."""
+    from . import factory  # factory imports this module
+    lanes, model = factory.CLIMB[rung]
+    lane = factory._lane(issue)
+    if (factory._state(issue) in ("briefed", "queued")
+            and lane in lanes and factory.issue_model(issue) == model):
+        return "waiting for lane %s on rung %d %s" % (lane, rung + 1, model)
+    return ""
+
+
+def _has_stuck_history(issue: Dict[str, Any]) -> bool:
+    names = _labels(issue)
+    return (any("loom:" + state in names for state in STUCK_STATES)
+            or ("loom:queued" in names and any(name.startswith("lane:") for name in names)))
+
+
 def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime,
                authors: Sequence[str] = (),
                held: Optional[Dict[int, List[tickets.After]]] = None
@@ -8891,7 +8910,7 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     """The histories of stuck-state tickets, and the numbers it skipped. Each
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
-    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
+    candidates = sorted((i for i in found if _has_stuck_history(i)
                          and owned_elsewhere(i) is None and not tickets.claimed_by(i)),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
@@ -8908,19 +8927,20 @@ def person_claims(found: Sequence[Dict[str, Any]]) -> Dict[int, str]:
     person's work, not lane work: status never marks it stuck and escalate
     never moves it (loom#2003)."""
     return {int(i["number"]): tickets.claimed_by(i)[0] for i in found
-            if tickets.claimed_by(i) and any("loom:" + x in _labels(i) for x in STUCK_STATES)}
+            if tickets.claimed_by(i) and _has_stuck_history(i)}
 
 
 def _stuck_marks(histories: Dict[int, History], skipped: List[int],
                  claimed: Optional[Dict[int, str]] = None) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets, for those status skipped, and for
-    those a person claimed (person_claims), which carry no next rung."""
+    """Marks for stuck tickets, rung waits, skipped histories and claims."""
     marks: Dict[int, str] = {n: " - claimed by %s" % login
                              for n, login in (claimed or {}).items()}
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
-        if history.reasons:
+        if history.rung_wait:
+            marks[number] = " - " + history.rung_wait
+        elif history.reasons:
             marks[number] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
                 ", ".join(history.reasons), history.attempts,
                 ", ".join(history.tried) or "none", history.next_text())
@@ -9162,11 +9182,6 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
-    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
-                                    trusted_authors())
-    if past_move_cap(moves):
-        hold_unclaimed(gh, repo, number, names, moves)
-        return "needs-brain"
     pending_brain_fix = open_pr is not None and _pending_brain_fix(
         gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors(),
         station_login=writer_login(gh))
@@ -9190,6 +9205,22 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
 
     left = [n for n in factory.climb_rungs(_done_rungs(history.tried, history.rungs),
                                            max(history.rungs or {0})) if rung_lanes(n)]
+    choice = skipped_load = None
+    load = {}
+    if left:
+        free = _available_lanes(gh, lanes_repo)
+        load = _lane_load(gh, repo)
+        choice, skipped_load = _rung_by_load(
+            left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
+        if choice is not None:
+            wait = _rung_wait(issue, choice[0] - 1)
+            if wait:
+                return "not escalated: " + wait
+    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                    trusted_authors())
+    if past_move_cap(moves):
+        hold_unclaimed(gh, repo, number, names, moves)
+        return "needs-brain"
     if not left:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
@@ -9198,10 +9229,6 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                     "(tried %s); %s. The ticket is held for brain review." % (
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
-    free = _available_lanes(gh, lanes_repo)
-    load = _lane_load(gh, repo)
-    choice, skipped_load = _rung_by_load(
-        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice[0] - 1, choice[1]
