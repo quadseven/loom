@@ -93,6 +93,7 @@ from . import revert
 from . import spend
 from . import state_store
 from . import station_lease
+from . import event_inbox
 from . import status
 from . import usage
 from . import verify_data
@@ -2442,6 +2443,9 @@ class Station:
         # This pass's repo scans: the repos due, what was read of each, and
         # which held a ticket in flight.
         self._due: Optional[List[str]] = None
+        # Repos the fleet inbox named this pass (LOOM_INBOX=1): scanned
+        # first, and now even when idle. Empty with the inbox off.
+        self.priority_repos: List[str] = []
         self._scans: Dict[str, Any] = {}
         self._seen: Dict[str, set] = {}
         # Compare answers kept across passes (_carries), read on first use.
@@ -2670,8 +2674,11 @@ class Station:
             saved = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
             self._scans = saved if isinstance(saved, dict) else {}
             local = self._inbox_repos()
-            self._due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
-                         and (r in local or self._scan_due(self._scans.get(r)))]
+            due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
+                   and (r in local or self._scan_due(self._scans.get(r)))]
+            first = [r for r in self.priority_repos
+                     if r in self.s.repos and tickets.REPO_RE.fullmatch(r)]
+            self._due = first + [r for r in due if r not in first]
         return self._due
 
     def _observe(self, repo: str, kind: str, busy: bool) -> None:
@@ -18782,16 +18789,42 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
             return 1
         deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
-            return _locked_pass(settings, state, gh, hooks)
+            return _inbox_pass(settings, state, gh, hooks, lease)
         finally:
             _disarm_pass_deadline(deadline)
     finally:
         os.close(fd)
 
 
+def _inbox_pass(settings: Settings, state: str, gh: Optional[GitHub],
+                hooks: Dict[str, Any], lease: Optional[station_lease.StationLease]) -> int:
+    """The locked pass, as the fleet inbox's consumer when LOOM_INBOX=1
+    (bus/event_inbox.py): claim the due events under the inbox lease tied to
+    the station lease, read their repos first, and mark them done once the
+    pass ran. With the inbox off this is _locked_pass and nothing else."""
+    consumer = event_inbox.select(os.environ, lease, _say)
+    if consumer is None:
+        return _locked_pass(settings, state, gh, hooks)
+    try:
+        claimed = consumer.begin()
+        priority = event_inbox.priority_repos([c.subject for c in claimed], settings.repos)
+        if priority:
+            _say("inbox: reading first: %s" % " ".join(priority))
+        outcome: Dict[str, Any] = {}
+        code = _locked_pass(settings, state, gh, hooks, priority, outcome)
+        if outcome.get("passed"):
+            consumer.finish(event_inbox.run_ref(lease, time.time()))
+        return code
+    finally:
+        consumer.close()
+
+
 def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
-                 hooks: Dict[str, Any]) -> int:
-    """The pass run() starts once it holds the lock."""
+                 hooks: Dict[str, Any], priority: Sequence[str] = (),
+                 outcome: Optional[Dict[str, Any]] = None) -> int:
+    """The pass run() starts once it holds the lock. `priority` are the
+    repos the inbox named; `outcome["passed"]` is set once run_pass returned,
+    so the inbox marks its events done only after a pass that ran."""
     use_launchd = gh is None
     if gh is None:
         from .github import auth_from_env
@@ -18819,6 +18852,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
             return 0
         beat.stamp()
     st = Station(gh, settings, **hooks)
+    st.priority_repos = list(priority)
     try:
         if use_launchd:
             st._refresh_lane_jobs()
@@ -18828,6 +18862,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         if isinstance(writers, set):
             writers.update(settings.authors)
         st.run_pass()
+        if outcome is not None:
+            outcome["passed"] = True
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
     except (StateError, station_lease.LeaseLost) as err:
