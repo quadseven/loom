@@ -368,11 +368,16 @@ class RunnersTest(unittest.TestCase):
             self.gh.zips[77] = artifact
 
     def test_anthropic_report_records_cost_once_and_holds_the_next_brief_under_the_floor(self):
-        slot = "anthropic-2"
+        self.check_anthropic_report("anthropic-2")
+
+    def test_base_anthropic_slot_report_records_cost_once_and_holds_the_next_brief(self):
+        self.check_anthropic_report("anthropic")
+
+    def check_anthropic_report(self, slot):
         self.env.update(LOOM_ANTHROPIC_KEY_SSM="/example/anthropic",
                         LOOM_ANTHROPIC_BUDGET_USD="5.25")
         self.inbox = self.home / "briefs" / slot
-        self.inbox.mkdir()
+        self.inbox.mkdir(exist_ok=True)
         runner = self.runner()
         runner.slots = [slot]
         self.drop_brief(BRIEF.replace("opencode-go", slot))
