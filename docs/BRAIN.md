@@ -2050,6 +2050,8 @@ after the ticket's last brief and outside the closed page the station reads.
 A ticket moved `LOOM_UNCLAIMED_MOVE_CAP`
 times (default 6, 0 is off) with no lane claiming it stops moving: it takes
 `needs-brain` and `loom:runaway` with one comment (loom#2333).
+Repeated escalation to the same known model and lane counts as one move
+while that assignment stays in place.
 
 A `; not built:` reason that says the work is already there must cite code on
 the pull request's base branch: `<path>:<line>`, `<path>#L<line>`,

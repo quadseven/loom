@@ -1105,8 +1105,11 @@ factory has not already moved, in the same tick, whatever the time budget: it
 picks the lowest untried rung whose lane is free, rewrites the ticket's
 `Model:` line, swaps the lane label, comments the rung and the reason, and
 sends an open pull request back as a fix brief (`--file NOTES.md` adds your
-own notes to that brief). It refuses a ticket that is not repeatedly stuck,
-and one whose open pull request has nothing to fix.
+own notes to that brief). When a briefed or queued ticket already names
+the next rung's model and carries one of its lane labels, status shows the
+lane it is waiting for. If `escalate` selects the ticket's current rung, it
+reports the wait without rewriting the ticket. It also refuses a ticket
+that is not repeatedly stuck or whose open pull request has nothing to fix.
 Past the third rung it adds `needs-brain` instead: rewrite the brief smaller,
 or ask the operator with one exact ask when only the operator can unblock it.
 `status` reads the history of at most 20 tickets per repo, the least recently
