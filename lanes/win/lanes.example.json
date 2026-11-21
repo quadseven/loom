@@ -1,0 +1,10 @@
+{
+  "lanes": [
+    {"name": "lane-a", "kind": "codex", "cwd": "C:\\work\\example",
+     "identity": "identity-a.ps1", "model": "example-model",
+     "flags": ["--sandbox", "workspace-write"], "restore_policy": "resume"},
+    {"name": "lane-b", "kind": "agy", "cwd": "C:\\work\\other",
+     "identity": "identity-b.ps1", "model": "example-model",
+     "flags": [], "restore_policy": "ask"}
+  ]
+}
