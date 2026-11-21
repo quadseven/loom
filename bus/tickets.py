@@ -170,6 +170,20 @@ def rewritten_source(body: Any) -> Optional[int]:
 
 
 HEADER_RE = re.compile(r"(Difficulty|Priority|Foundational|Model|Base|Not before|After|Deliverable|Repairs incident):[ \t]*(.*)")
+_HEADER_KEYS_RE = re.compile(
+    r"(?:^|(?<=[ \t]))(Difficulty|Priority|Foundational|Model|Base|Not before|After|Deliverable|Repairs incident):")
+
+
+def _packed_header_lines(line: str) -> list:
+    """One header line, or the several a writer packed onto one line
+    ("Difficulty: medium Priority: P2 Model: x"). A line is split only when
+    it starts with a header key; each part starts at a known key."""
+    starts = [m.start() for m in _HEADER_KEYS_RE.finditer(line)]
+    if len(starts) < 2 or starts[0] != 0:
+        return [line]
+    return [line[a:b].strip() for a, b in zip(starts, starts[1:] + [len(line)])]
+
+
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
 # earlier than that UTC time, and the brain does not brief it before then.
 NOT_BEFORE_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -291,10 +305,14 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     lines = status.strip_body(body).replace("\r\n", "\n").replace("\r", "\n").split("\n")
     headers: Dict[str, str] = {}
     i = 0
+    pending: list = []
     while i < len(lines):
-        m = HEADER_RE.fullmatch(lines[i].rstrip())
-        if not m:
-            break
+        if not pending:
+            if not HEADER_RE.fullmatch(lines[i].rstrip()):
+                break
+            pending = _packed_header_lines(lines[i].rstrip())
+            i += 1
+        m = HEADER_RE.fullmatch(pending.pop(0))
         key, value = m.group(1), m.group(2).strip()
         if key == "Difficulty":
             # A hand-edited "Difficulty: Medium" failed the check, so the
@@ -309,12 +327,10 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
             if headers[key] == value:
                 # The same line twice (a brief whose file repeated the header
                 # the brief tool also writes) says one thing; keep it.
-                i += 1
                 continue
             raise ValueError("%s: given twice" % key)
         _check_header(key, value)
         headers[key] = value
-        i += 1
     rest = lines[i:]
     while rest and not rest[0].strip():
         rest.pop(0)
