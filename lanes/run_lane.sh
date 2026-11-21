@@ -1296,36 +1296,25 @@ fresh_app_token() {
   return 1
 }
 
-# The agent's own gh config directory (loom#665): a fresh one per run, holding
-# this run's App token in the hosts.yml gh reads, so the agent's gh calls bill
-# the App and not the operator. The token never enters the agent's
-# environment and never passes through a gh command whose error text could
-# echo it into the log; printf is a builtin, so it is in no process's argv.
-# Sets AGENT_GH_CONFIG; fails with no token, so the agent never runs gh
-# against an empty store.
+# Give the agent an empty gh config directory. The wrapper and credential
+# helper read the App token from the private token file; gh never gets a
+# stored login to fall back to.
 agent_gh_config() {
   AGENT_GH_CONFIG=""
   github_valid_token "${GH_TOKEN:-}" || return 1
-  # One runner per lane holds its lock, so this lane's stores are its own:
-  # drop one a killed run left behind before making the next.
   rm -rf "$LOOM_HOME/run/$SLOT-gh."* || return 1
   local dir
   dir="$(mktemp -d "$LOOM_HOME/run/$SLOT-gh.XXXXXX")" || return 1
-  if ! (umask 077 && printf 'github.com:\n    oauth_token: %s\n    git_protocol: https\n' "$GH_TOKEN" > "$dir/hosts.yml"); then
-    rm -rf "$dir"
-    return 1
-  fi
   AGENT_GH_CONFIG="$dir"
 }
 AGENT_GH_WHY="could not write the agent's gh credential store; the agent did not run"
 
-# In an agent's subshell only: drop the runner's token, App settings, git
-# credential helper and gh wrapper, so the agent's gh is the real one and its
-# only login is the store agent_gh_config wrote (none for a turn without it).
+# In an agent's subshell only: drop ambient tokens and App settings. Keep the
+# gh wrapper, token file and credential helper so every GitHub request still
+# uses this run's App identity.
 agent_github_env() {
-  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" \
-    LOOM_APP_TOKEN_CMD LOOM_APP_TOKEN_FILE LOOM_REAL_GH
-  PATH="$(printf '%s' ":$PATH:" | sed "s#:$LOOM_GITHUB_BIN:#:#g; s#^:##; s#:\$##")"
+  unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" \
+    LOOM_APP_TOKEN_CMD
 }
 
 # How many gh commands the agent's output shows (loom#665), counted in the
@@ -5111,7 +5100,7 @@ for BRIEF in "$INBOX"/*.md; do
   STATUS=$?
   release_heavy_repo
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
-  # The token in the store outlives the agent by up to an hour: remove it now.
+  # Remove the agent's isolated gh config directory when it exits.
   GH_CLEANUP_FAILURE=""
   if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
     GH_CLEANUP_FAILURE="could not remove the agent's gh credential store"

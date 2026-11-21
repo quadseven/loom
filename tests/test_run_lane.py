@@ -228,6 +228,7 @@ FAKE_AGENT = """#!/usr/bin/env bash
 printf '%s %s\\n' "$(basename "$0")" "$*" >> "$FAKE_LOG"
 printf 'agent-tmpdir=%s tmpdir-exists=%s tmpdir-islink=%s stale=%s targetfile=%s\\n' "${TMPDIR:-}" "$([ -d "${TMPDIR:-/nonexistent}" ] && echo yes || echo no)" "$([ -L "${TMPDIR:-/nonexistent}" ] && echo yes || echo no)" "$([ -e "${TMPDIR:-/nonexistent}/stale.txt" ] && echo yes || echo no)" "$([ -e "${TMPDIR:-/nonexistent}/target-sentinel.txt" ] && echo yes || echo no)" >> "$FAKE_LOG"
 [ -z "${FAKE_AGENT_ENV:-}" ] || printf '%s\\n' "${GH_TOKEN:-none}" "${LOOM_GITHUB_APP_ID:-none}" "${GIT_CONFIG_COUNT:-none}" "${GH_CONFIG_DIR:-none}" "$(cat "${GH_CONFIG_DIR:-/nonexistent}/hosts.yml" 2>/dev/null | tr '\\n' ' ')" "${LOOM_APP_TOKEN_FILE:-none}" "$PATH" >> "$FAKE_AGENT_ENV"
+[ -z "${FAKE_AGENT_GH:-}" ] || gh api user
 [ -z "${FAKE_AGENT_SAYS:-}" ] || printf '%s\\n' "$FAKE_AGENT_SAYS"
 cat > /dev/null
 if [ "${FAKE_AGENT:-commit}" = fail ]; then exit 3; fi
@@ -831,6 +832,16 @@ print('leak guard: clean (shape patterns only)')
         for agent in sorted((self.loom / "run").glob("*-home/tmp/agent.log")):
             extra += agent.read_text().splitlines()
         return self.log.read_text().splitlines() + extra
+
+    def assert_agent_uses_app_auth(self, path):
+        values = Path(path).read_text().splitlines()
+        self.assertEqual(values[:3], ["none", "none", "5"])
+        config = Path(values[3])
+        self.assertEqual(config.parent, self.loom / "run")
+        self.assertTrue(config.name.startswith("codex-gh."), config)
+        self.assertEqual(values[4], "")
+        self.assertTrue(values[5].endswith("/token"), values[5])
+        self.assertIn(str(RUNNER.parent / "github-bin"), values[6].split(":"))
 
     def test_fix_items_ignores_dispositions_before_a_finding(self):
         brief = Path(self._tmp.name) / "fix-items.md"
@@ -3765,12 +3776,14 @@ exec /usr/bin/git "$@"
 
     def test_a_fix_brief_never_forces_over_a_branch_that_moved(self):
         name, before = self.fix_brief()
+        auth_env = Path(self._tmp.name) / "auth-env"
         # The fake agent rewrites the branch from its parent instead of
         # building on it: the push must be refused, not forced.
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
             "git add fix.txt", "git reset -q --hard HEAD^ && echo fixed > fix.txt && git add fix.txt"))
-        result = self.run_lane()
+        result = self.run_lane(FAKE_AGENT_ENV=str(auth_env))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_agent_uses_app_auth(auth_env)
         self.assertEqual(self.remote_head(self.FIX_BRANCH), before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
         # The remote did not move: this run's own rewrite is a push failure.
@@ -3805,6 +3818,7 @@ exec /usr/bin/git "$@"
 
     def test_a_fix_brief_whose_branch_moved_during_the_run_is_parked_as_branch_moved(self):
         name, before = self.fix_brief()
+        auth_env = Path(self._tmp.name) / "auth-env"
         # Another lane pushes to the pull request's branch while this run's
         # agent works: the push is refused, and that is not this run's failure.
         work = Path(self._tmp.name) / "pr-work"
@@ -3814,8 +3828,9 @@ exec /usr/bin/git "$@"
             " git -c user.name=t -c user.email=t@example.invalid commit -qm Other &&"
             " git push -q origin %s)\n"
             "printf '%%s\\n' \"${FAKE_AGENT_TEXT:-fixed}\" > fix.txt\n" % (work, self.FIX_BRANCH), 1))
-        result = self.run_lane()
+        result = self.run_lane(FAKE_AGENT_ENV=str(auth_env))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_agent_uses_app_auth(auth_env)
         moved = self.remote_head(self.FIX_BRANCH)
         self.assertNotEqual(moved, before)
         self.assertTrue((self.inbox / "failed" / (name + ".md")).exists())
@@ -3882,11 +3897,13 @@ exec /usr/bin/git "$@"
             "## Acceptance criteria",
             "An earlier attempt timed out after editing, and the runner kept its edits on "
             "branch %s.\n\n## Acceptance criteria" % side))
+        auth_env = Path(self._tmp.name) / "auth-env"
         self.write_tool(self.bin / "codex", FAKE_AGENT.replace(
             "cat > /dev/null\n",
             "cat > /dev/null\n[ -f earlier.txt ] && echo agent-saw-earlier >> \"$FAKE_LOG\"\n", 1))
-        result = self.run_lane()
+        result = self.run_lane(FAKE_AGENT_ENV=str(auth_env))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_agent_uses_app_auth(auth_env)
         self.assertNotIn("agent-saw-earlier", self.calls())
         self.assertNotIn("earlier attempt's branch", self.lane_log())
 
@@ -4313,7 +4330,7 @@ touch {shlex.quote(str(completed))}
     def test_egress_failure_reports_credential_cleanup_failure(self):
         self.write_tool(self.bin / "rm", """#!/bin/sh
 case "$1:$2" in
-  -rf:*/opencode-go-gh.*) [ ! -f "$2/hosts.yml" ] || exit 1 ;;
+  -rf:*/opencode-go-gh.*) [ ! -d "$2" ] || exit 1 ;;
 esac
 exec /bin/rm "$@"
 """)
@@ -6765,24 +6782,20 @@ exit %d
                       # characters, ghs_ then a JWT-like body).
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
                       GITHUB_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
-                      FAKE_AGENT_ENV=str(seen_agent))
+                      FAKE_AGENT_ENV=str(seen_agent), FAKE_AGENT_GH="1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
-        # No token in its environment, nor the App's settings to mint one, nor
-        # git's helper to borrow one.
+        # No token or App settings enter the environment; the empty config
+        # directory has no stored login, and the wrapper remains first on PATH.
         agent_env = seen_agent.read_text().splitlines()
-        self.assertEqual(agent_env[:3], ["none", "none", "none"])
-        # loom#665: its gh reads the minted App token, never the operator's,
-        # from a per-run config directory the runner removes after the agent.
+        self.assertEqual(agent_env[:3], ["none", "none", "5"])
         store = Path(agent_env[3])
         self.assertEqual(store.parent, self.loom / "run")
         self.assertTrue(store.name.startswith("codex-gh."), store)
-        self.assertIn("oauth_token: ghs_lanes.tok-en ", agent_env[4])
-        self.assertNotIn("ghp_personal", agent_env[4])
-        # Nor the runner's token file or its gh wrapper, which refuses a store.
-        self.assertEqual(agent_env[5], "none")
-        self.assertNotIn(str(RUNNER.parent / "github-bin"), agent_env[6].split(":"))
+        self.assertEqual(agent_env[4], "")
+        self.assertTrue(agent_env[5].endswith("/token"), agent_env[5])
+        self.assertIn(str(RUNNER.parent / "github-bin"), agent_env[6].split(":"))
         self.assertFalse(store.exists())
         self.assertFalse(stale.exists())
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
@@ -7868,8 +7881,10 @@ exit %d
     def test_a_prepared_workspace_checks_the_agents_commit_before_the_pr(self):
         pinned = self.contract_repo()
         self.drop_brief()
-        result = self.run_contract_lane()
+        auth_env = Path(self._tmp.name) / "auth-env"
+        result = self.run_contract_lane(FAKE_AGENT_ENV=str(auth_env))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_agent_uses_app_auth(auth_env)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
         # The agent worked in the prepared tree and was told the check.
         self.assertIn("agent-saw submodule", self.calls())
@@ -7916,8 +7931,10 @@ exit %d
             ': "${UV_CACHE_DIR:?missing uv cache}"\n'
             'printf "uv-pkg %s\\n" "$(cat "$UV_CACHE_DIR/pkg" 2>&1)" >> "$FAKE_LOG"\n'
             'echo agent > "$UV_CACHE_DIR/pkg"\n'), 1))
-        result = self.run_contract_lane()
+        auth_env = Path(self._tmp.name) / "auth-env"
+        result = self.run_contract_lane(FAKE_AGENT_ENV=str(auth_env))
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_agent_uses_app_auth(auth_env)
         self.assertTrue((self.inbox / "done" / "T042-fix-the-thing.md").exists(), self.lane_log())
         check_home = self.loom / "run" / "codex-check"
         calls = self.calls()
@@ -9869,9 +9886,9 @@ echo fixed > fix.txt
     def test_a_job_cap_of_zero_sets_no_cap_and_leaves_path_alone(self):
         env, tools = self.codex_env_run(LOOM_BUILD_JOBS="0")
         self.assert_uncapped(env, inherited=True)
-        # PATH is what the runner makes of the one it was started with, and
-        # nothing was put in front of it.
-        self.assertTrue(env["PATH"].startswith(self.lane_env()["PATH"]), env["PATH"])
+        # The gh wrapper is prepended; the inherited tool path stays intact.
+        self.assertTrue(env["PATH"].startswith(
+            str(RUNNER.parent / "github-bin") + ":" + self.lane_env()["PATH"]), env["PATH"])
         self.assertEqual(tools, ["xcodebuild [-scheme] [My App] [build]",
                                  "swift [test] [--filter] [a b]"])
 

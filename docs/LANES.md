@@ -652,13 +652,14 @@ agent exits, and before a late write (a park note, the push) it mints again
 once the token is older than `LOOM_APP_TOKEN_MAX_AGE` seconds (default 2700).
 A failed mint parks the brief as `[transient]` without posting; a lane with no
 App settings never calls GitHub.
-The lane agent receives no App key settings, token environment variables,
-token file, credential helper or gh wrapper. So that its own `gh` calls spend
-the App's budget and not the operator's (loom#665), each run writes the token
-into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*` (mode 700, the
-token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR` at it and
-removes it when the agent exits. The brief tells the agent not to poll pull
-request checks or reviews and the log records its gh command count.
+The lane agent receives no App key settings or token environment variables.
+Its `GH_CONFIG_DIR` points to a fresh empty directory under
+`$LOOM_HOME/run/<lane>-gh.*`; the `gh` wrapper and Git credential helper read
+the App token from a mode-600 file and refuse stored credentials. The wrapper
+stays first on the agent's `PATH`, so its `gh` calls use the App's identity.
+The config directory is removed when the agent exits. The brief tells the
+agent not to poll pull request checks or reviews and the log records its gh
+command count.
 
 Add the brain and lane bot logins (`<slug>[bot]`) to `LOOM_BRIEF_AUTHORS`.
 Repository workflow gates that admit only collaborators must also admit the
