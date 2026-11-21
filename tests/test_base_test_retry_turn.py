@@ -15,7 +15,7 @@ BRANCH=b; BASE=base; TREE="$ROOT"; LOOM_ROOT="$SOURCE_ROOT"; BASELINE_EXIT=0
 C_CHECK=fakecheck; C_AFFECTED=""; CHECK_TIMEOUT=5; CHECK_SLOT_WAIT=5; LOG_START=0
 PARK_CLASS=""; HOST_RED_BASE=""; WORKDIR="$ROOT"; TICKET=t1; TITLE=t
 RUN_BRIEF="$ROOT/brief"; printf 'Build the thing.\n' > "$RUN_BRIEF"
-BASE_RETRY_USED=""
+BASE_RETRY_USED=""; LOOM_GITHUB_BIN="$ROOT/github-bin"
 safe_git() { case "$1" in rev-parse) printf 0123456789abcdef ;; status) cat "$ROOT/dirty" 2> /dev/null ;;
   commit) : > "$ROOT/dirty"; echo commit >> "$ROOT/events" ;; esac; return 0; }
 remove_untracked_venvs() { return 0; }
@@ -47,7 +47,7 @@ printf '%s' "$VALIDATION_REASON" > "$ROOT/reason"; printf '%s' "$rc" > "$ROOT/rc
 
 def run_final(fixes, gate_passes=False):
     functions = ""
-    for name in ["base_retry_turn", "join_detail", "final_validation"]:
+    for name in ["agent_github_env", "base_retry_turn", "join_detail", "final_validation"]:
         match = re.search(r"^%s\(\) \{.*?^\}\n" % name, SOURCE, re.S | re.M)
         assert match, name
         functions += match.group(0)

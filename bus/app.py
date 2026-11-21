@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sys
 from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 
@@ -107,43 +108,47 @@ def print_manifest(owner: str, org: bool, name: Optional[str], as_form: bool,
     return 0
 
 
-def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
-                transport: Optional[Transport] = None,
-                sign: Callable[[bytes, str], bytes] = openssl_sign) -> int:
-    """Print the installation token of the App the LOOM_GITHUB_APP_* settings
-    name, for a lane's or the brain's `gh` and `git` (loom#1142). Without
-    those settings it prints nothing and fails: a writer that should post as
-    its App never falls back to the operator's personal token."""
+def configured_client(env: Optional[Dict[str, str]] = None,
+                      transport: Optional[Transport] = None,
+                      sign: Callable[[bytes, str], bytes] = openssl_sign) -> GitHub:
+    """Build an App client from this process's settings, with no login fallback."""
     env = os.environ if env is None else env
     found = AppToken.from_env(env)
     if found is None:
-        print("error: LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
-              "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no App",
-              file=sys.stderr)
-        return 2
-    gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
-                transport=transport or urllib_transport)
-    out.write(gh.app_token() + "\n")
+        raise GitHubError("LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
+                          "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) must name an App")
+    return GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
+                  transport=transport or urllib_transport)
+
+
+def check_login(gh: GitHub) -> str:
+    """Verify that GitHub identifies the signing key as an App."""
+    login = gh.app_login()
+    if not login or not re.fullmatch(r"[a-z0-9-]+\[bot\]", login):
+        raise GitHubError("GitHub returned no usable App slug")
+    return login
+
+
+def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
+                transport: Optional[Transport] = None,
+                sign: Callable[[bytes, str], bytes] = openssl_sign,
+                cache_file: Optional[str] = None) -> int:
+    """Print only the configured App's token, after verifying its slug."""
+    gh = configured_client(env, transport, sign)
+    check_login(gh)
+    gh.app.state_file = cache_file
+    token = gh.app_token()
+    if not re.fullmatch(r"ghs_[A-Za-z0-9_.-]+", token):
+        raise GitHubError("GitHub returned no usable installation token")
+    out.write(token + "\n")
     return 0
 
 
 def print_login(out: TextIO, env: Optional[Dict[str, str]] = None,
                 transport: Optional[Transport] = None,
                 sign: Callable[[bytes, str], bytes] = openssl_sign) -> int:
-    """Print the "<slug>[bot]" login of the App the LOOM_GITHUB_APP_* settings
-    name. The brain's agent holds only the installation token, and GET /user
-    refuses one with 403, so brain.sh hands the agent this login for its
-    journal (LOOM_GITHUB_LOGIN)."""
-    env = os.environ if env is None else env
-    found = AppToken.from_env(env)
-    if found is None:
-        print("error: LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
-              "LOOM_GITHUB_APP_KEY_SSM (or LOOM_GITHUB_APP_KEY_FILE) name no App",
-              file=sys.stderr)
-        return 2
-    gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
-                transport=transport or urllib_transport)
-    out.write("%s\n" % gh.app_login())
+    """Print the configured App's bot login for the brain's journal."""
+    out.write(check_login(configured_client(env, transport, sign)) + "\n")
     return 0
 
 

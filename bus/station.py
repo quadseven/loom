@@ -18794,10 +18794,10 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     """The pass run() starts once it holds the lock."""
     use_launchd = gh is None
     if gh is None:
-        from .github import auth_from_env
-        gh = GitHub(auth_from_env())
+        from .app import check_login, configured_client
+        gh = configured_client()
+        check_login(gh)
         gh.status_in_body = True
-        hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
         # Every GET is conditional: a list re-read each pass costs a 304.
         gh.cache_dir = os.path.join(state, "station", "etags")

@@ -229,6 +229,8 @@ class Token(unittest.TestCase):
 
     def fake(self, method, url, headers, body):
         self.minted.append((method, url))
+        if url.endswith("/app"):
+            return 200, {}, b'{"slug":"loom-lanes"}'
         answer = {"token": "ghs_lanes_token", "expires_at": "2099-01-01T00:00:00Z"}
         return 201, {}, json.dumps(answer).encode()
 
@@ -243,8 +245,32 @@ class Token(unittest.TestCase):
                                      "LOOM_GITHUB_APP_KEY_FILE": self.key})
         self.assertEqual((code, out), (0, "ghs_lanes_token\n"))
         self.assertEqual(self.minted, [
+            ("GET", "https://api.github.com/app"),
             ("POST", "https://api.github.com/app/installations/77/access_tokens")])
         self.assertNotIn(KEY_MARK, out + err)
+
+    def test_token_failures_leave_stdout_empty(self):
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        slug = (200, {}, b'{"slug":"loom-lanes"}')
+        with mock.patch.dict(os.environ, env, clear=True):
+            for replies in ([(200, {}, b"{}")], [slug, (403, {}, b"{}")],
+                            [slug, (201, {}, b"{}")], [slug, (201, {}, b'{"token":""}')]):
+                with self.subTest(replies=replies):
+                    code, out, _ = run(["app", "token"],
+                                       app_transport=mock.Mock(side_effect=replies),
+                                       app_sign=lambda data, key: b"sig")
+                    self.assertEqual((code, out), (2, ""))
+
+    def test_empty_and_missing_keys_fail_before_github(self):
+        env = {"LOOM_GITHUB_APP_ID": "124", "LOOM_GITHUB_APP_INSTALLATION_ID": "77",
+               "LOOM_GITHUB_APP_KEY_FILE": self.key}
+        with open(self.key, "w", encoding="ascii") as stream:
+            stream.write("  \n")
+        self.assertEqual(self.token(env)[:2], (2, ""))
+        self.assertEqual(self.token(dict(env, LOOM_GITHUB_APP_KEY_FILE=self.key + ".missing"))[:2],
+                         (2, ""))
+        self.assertEqual(self.minted, [])
 
     def test_prints_the_apps_bot_login_for_the_brains_agent(self):
         def fake(method, url, headers, body):
@@ -268,3 +294,23 @@ class Token(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StationPassAuth(unittest.TestCase):
+    """loom#3083: a station pass without its App calls GitHub as nobody."""
+
+    def test_a_pass_without_app_settings_refuses_before_any_github_call(self):
+        from types import SimpleNamespace
+
+        from bus import station
+        from bus.github import GitHubError
+        settings = SimpleNamespace(status_repo="")
+        personal = {"GITHUB_TOKEN": "ghp_fake_personal", "LOOM_GITHUB_TOKEN": "ghp_fake_personal"}
+        with tempfile.TemporaryDirectory() as state, \
+             mock.patch.dict(os.environ, personal, clear=True), \
+             mock.patch.object(station, "Station") as constructor, \
+             mock.patch("bus.github.urllib_transport") as transport:
+            with self.assertRaisesRegex(GitHubError, "must name an App"):
+                station._locked_pass(settings, state, None, {})
+        constructor.assert_not_called()
+        transport.assert_not_called()

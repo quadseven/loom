@@ -35,6 +35,10 @@ esac
 # Fake python3: records that the station pass ran, from which directory.
 FAKE_PY = """#!/usr/bin/env bash
 printf 'python3 %s in %s\\n' "$*" "$PWD" >> "$FAKE_LOG"
+if [ "$3 $4" = "app token" ]; then
+  [ -n "${FAKE_APP_TOKEN:-}" ] || exit 2
+  printf '%s\\n' "$FAKE_APP_TOKEN"
+fi
 """
 
 
@@ -61,6 +65,9 @@ class StationScriptTest(unittest.TestCase):
         git("clone", "-q", str(self.remote), str(self.checkout))
         (self.checkout / "lanes" / "mac").mkdir(parents=True)
         shutil.copy(SCRIPT, self.checkout / "lanes" / "mac" / "station.sh")
+        for shared in ("github_auth.sh", "fleet-token"):
+            shutil.copy(SCRIPT.parents[1] / shared, self.checkout / "lanes" / shared)
+        shutil.copytree(SCRIPT.parents[1] / "github-bin", self.checkout / "lanes" / "github-bin")
         (self.checkout / ".git" / "info" / "exclude").write_text("lanes/\n")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
@@ -82,7 +89,11 @@ class StationScriptTest(unittest.TestCase):
 
     def run_script(self, **env):
         full = dict(os.environ, PATH="%s:%s" % (self.bin, os.environ["PATH"]),
-                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"), **env)
+                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"))
+        full.pop("GH_TOKEN", None)
+        full.pop("GH_CONFIG_DIR", None)
+        full.update(FAKE_APP_TOKEN="ghs_fake_station")
+        full.update(env)
         return subprocess.run(["bash", str(self.checkout / "lanes" / "mac" / "station.sh")],
                               env=full, capture_output=True, text=True, timeout=60)
 
@@ -93,6 +104,25 @@ class StationScriptTest(unittest.TestCase):
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_failed_mint_stops_before_deploy_or_station_pass(self):
+        before = self.head()
+        self.push_change()
+        result = self.run_script(FAKE_APP_TOKEN="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(any(c.startswith("python3 -m bus app token") for c in self.calls()))
+        self.assertFalse(any(c.startswith(("gh ", "python3 -m bus station"))
+                             for c in self.calls()), self.calls())
+        self.assertEqual(self.head(), before)
+
+    def test_nonempty_ambient_gh_config_stops_the_pass(self):
+        config = self.tmp / "config"
+        config.mkdir()
+        (config / ".stored").touch()
+        result = self.run_script(GH_CONFIG_DIR=str(config))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GH_CONFIG_DIR is not empty", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_a_green_head_is_deployed_then_the_station_runs(self):
         target = self.push_change()
