@@ -149,6 +149,13 @@ class RunnersTest(unittest.TestCase):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
+        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
+                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
+
+    def test_the_base_anthropic_slot_can_be_selected_explicitly(self):
         slots = runners.runner_slots({"LOOM_RUNNER_SLOTS": "anthropic, free-gemma"})
         self.assertEqual(slots[:2], ["anthropic", "free-gemma"])
         self.assertEqual(slots[-7:], ["anthropic-%d" % n for n in range(2, 9)])
