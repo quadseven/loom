@@ -3635,6 +3635,15 @@ base_retry_turn() {
   } > "$brief" || return 1
   ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
     run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  REPLIES_FILE=""
+  if [ -n "$FIX_PR" ]; then capture_replies; else rm -f "$TREE/.loom/replies.json"; fi
+  rm -f "$WORKDIR/$TICKET.summary.md"
+  if [ -f "$TREE/$SUMMARY_FILE" ] && [ ! -L "$TREE/$SUMMARY_FILE" ]; then
+    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>/dev/null || true
+    rm -f "$TREE/$SUMMARY_FILE"
+  else
+    rm -f "$TREE/$SUMMARY_FILE"
+  fi
   if [ -n "$(safe_git status --porcelain)" ]; then
     safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
   fi
