@@ -7665,6 +7665,7 @@ exit %d
                   '"$(printf "%s" "$REPO" | tr "/" "_")" "$1"; }\n'
                   'incident_ticket() { printf "a ticket"; }\n'
                   'repo_is_public() { [ "$PUBLIC" = 1 ]; }\n'
+                  'incident_subject() { repo_is_public && printf "%s" "$REPO"; }\n'
                   'python3() { return 0; }\n'
                   'gh() { printf "gh %s TITLE=%s MARKER=%s\n" "$*" "$TITLE" "$MARKER" >> "$CALLS"; '
                   '[ "$1 $2" = "issue list" ] && { [ "$GH_FAILS" = 1 ] && return 1; printf "%s\n" "$LISTED"; }; return 0; }\n'

@@ -42,6 +42,7 @@ def functions(*names: str) -> str:
 # open incident, and a `gh` that fails `issue create` the way $GH_ERROR says.
 STUBS = r'''
 repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
+ssm_value() { return 1; }
 incident_ticket() { printf 'T042'; }
 leak_scan() { return 0; }
 open_issue() { :; }
