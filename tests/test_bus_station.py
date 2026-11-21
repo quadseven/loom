@@ -13395,6 +13395,24 @@ class CloseDoneTest(Base):
         (said,) = [c["body"] for c in self.fake.comments[5] if not status.is_status(c.get("body"))]
         self.assertIn("Closed:", said)
 
+    def test_failed_ticket_is_closed_with_merged_pull_evidence_or_queued_once(self):
+        met = "Difficulty: easy\n\n## Acceptance criteria\n- [ ] A test passes\n"
+        unmet = "Difficulty: easy\n\n## Acceptance criteria\n- [ ] A test passes\n"
+        self.fake.add(61, body=met, state="failed")
+        self.fake.add(62, body=unmet, state="failed")
+        self.fake.pulls = [{"number": 91, "state": "closed", "merged_at": "2030-01-02T00:00:00Z",
+                            "body": "Refs %s#61\n\n## Acceptance criteria\n- [x] A test passes\n" % REPO,
+                            "head": {"ref": "loom/61-test"}}]
+        st = station.Station(GitHub("token", transport=self.fake), self.settings)
+        st.retriage_failed_tickets()
+        self.assertEqual("closed", self.fake.issues[61]["state"])
+        self.assertIn("loom:queued", self.fake.names(62))
+        self.assertNotIn("loom:failed", self.fake.names(62))
+        st.retriage_failed_tickets()
+        self.assertEqual(1, sum("loom:failed-retriaged" in c.get("body", "")
+                               for c in self.fake.comments[62]))
+        self.assertTrue(any("pull/91" in c.get("body", "") for c in self.fake.comments[61]))
+
     def test_a_shipped_ticket_of_unproven_host_checks_stays_open(self):
         # 2026-10-22: a ticket whose criteria were all host checks closed as
         # shipped on a merge that replaced a README; no merge proves them.

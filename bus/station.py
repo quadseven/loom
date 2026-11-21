@@ -6859,6 +6859,7 @@ class Station:
                      self.ship_workflows, self.ship_path_workflows, self.unwind_reverts,
                      self.adopt_untracked_pulls, self.publish_lanes, self.forward_asks, self.post_overdue_standups,
                      self.forward_reports, self.triage_backlogs, self.rewrite_triaged,
+                     self.retriage_failed_tickets,
                      self.close_done_tickets, self.audit_closes, self.settle_orphan_sources,
                      self.settle_claimed_tickets, self.release_stale_claims,
                      self.referee_claims,
@@ -12575,6 +12576,47 @@ class Station:
             finally:
                 _write_json(path, state)
         self.post_stuck_goals(state)
+
+    def retriage_failed_tickets(self) -> None:
+        """Close failed tickets proved by merged PRs, or queue each once."""
+        marker = "<!-- loom:failed-retriaged v1 -->"
+        if self._deferred():
+            return
+        for repo in self._verify_repos():
+            pulls = self._paginate("/repos/%s/pulls?state=closed" % repo)
+            merged = [p for p in pulls if isinstance(p, dict) and p.get("merged_at")]
+            by_ticket: Dict[int, List[Dict[str, Any]]] = {}
+            for pr in merged:
+                number = self._pr_ticket_number(repo, pr)
+                if number is not None:
+                    by_ticket.setdefault(number, []).append(pr)
+            for issue in self._tickets_open(repo):
+                if "loom:failed" not in _label_names(issue):
+                    continue
+                comments = self._paginate("/repos/%s/issues/%d/comments" %
+                                          (repo, int(issue["number"])))
+                if any(marker in str(c.get("body") or "") for c in comments
+                       if isinstance(c, dict)):
+                    continue
+                prs = by_ticket.get(int(issue["number"]), [])
+                bodies = [str(pr.get("body") or "") for pr in prs]
+                left = factory.unticked_criteria(str(issue.get("body") or ""), bodies)
+                if prs and not left:
+                    links = ["https://github.com/%s/pull/%d" % (repo, int(pr["number"]))
+                             for pr in prs]
+                    reason = "Merged pull requests prove the ticket criteria: " + ", ".join(links)
+                    self.gh.rest("POST", "/repos/%s/issues/%d/labels" %
+                                 (repo, int(issue["number"])), {"labels": [CLOSE_DONE_LABEL]})
+                    closing.close(self.gh, repo, int(issue["number"]), reason, "completed")
+                    continue
+                labels = [name for name in _label_names(issue) if name != "loom:failed"]
+                labels = [name for name in labels if not name.startswith("lane:")]
+                labels.append("loom:queued")
+                self.gh.rest("PUT", "/repos/%s/issues/%d/labels" %
+                             (repo, int(issue["number"])), {"labels": labels})
+                self.gh.rest("POST", "/repos/%s/issues/%d/comments" %
+                             (repo, int(issue["number"])),
+                             {"body": "Requeued once because merged work does not prove every criterion.\n\n" + marker})
 
     def close_done_tickets(self) -> None:
         """Close each done ticket, by the operator's rule (2026-10-19): a
