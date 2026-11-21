@@ -3227,7 +3227,9 @@ class BudgetTest(Base):
         writes1 = gh1.kinds.get("writes", 0)
         self.assertLessEqual(gh1.counted, station.PASS_REQUEST_TARGET + writes1)
         self.assertIn("carried over", err1)
-        self.assertRegex(err1, r"carried over.*comments")
+        # The claim pass spends half the target (loom#3119): the event reads of
+        # the two tickets use it up before their comment reads are tried, so
+        # the comment reads wait without being named; pass two reads them.
         self.assertRegex(err1, r"carried over.*events")
         ticket_reads_path = os.path.join(self.home, "state", "station", "ticket_reads.json")
         st_reads1 = station._read_json(ticket_reads_path, {}, strict=False)
