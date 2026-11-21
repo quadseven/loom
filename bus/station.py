@@ -3593,6 +3593,7 @@ class Station:
         started = self._pass_counted()
         capped = isinstance(target, int) and not isinstance(target, bool)
         budget = 0
+        self._claim_deferred = 0
         if capped:
             budget = int(target * CLAIM_REQUEST_SHARE)
             self.gh.target = min(target, started + budget)
@@ -3601,9 +3602,10 @@ class Station:
         finally:
             if capped:
                 self.gh.target = target
-            _say("claim pass: %d of %s requests (share %d)"
+            _say("claim pass: %d of %s requests (share %d); %d briefed ticket(s) left "
+                 "unclaimed for budget"
                  % (self._pass_counted() - started, target if capped else "no target",
-                    budget))
+                    budget, self._claim_deferred))
 
     def _claim_new_pass(self) -> None:
         """Assign free lanes to ready tickets once per station pass.
@@ -3640,8 +3642,7 @@ class Station:
         idle = [lane for lane in builders if before[lane] and not by_lane[lane]]
         for hold in self._gate_holds.values():
             hold["idle"] = len(idle)
-        for lane in builders:
-            self._claim_for_lane(lane, by_lane[lane], builders)
+        self._claim_each_lane(builders, by_lane)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in builders))
         self._hand_verifies([lane for lane in free if not by_lane.get(lane)])
@@ -3916,6 +3917,25 @@ class Station:
             _say("claim for %s waits for the next pass: %s" % (lane, note))
         return bool(note)
 
+    def _claim_each_lane(self, builders: List[str],
+                         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> None:
+        """Claim for every free lane, each within an equal slice of the
+        request budget left, so one lane with many held tickets cannot spend
+        the claim share while the lanes after it sit idle (loom#3210). A lane
+        that stops early leaves its unspent requests to the lanes after it."""
+        ceiling = getattr(self.gh, "target", None)
+        capped = isinstance(ceiling, int) and not isinstance(ceiling, bool)
+        for index, lane in enumerate(builders):
+            if capped:
+                left = max(0, ceiling - self._pass_counted())
+                share = -(-left // (len(builders) - index))
+                self.gh.target = min(ceiling, self._pass_counted() + max(1, share))
+            try:
+                self._claim_for_lane(lane, by_lane[lane], builders)
+            finally:
+                if capped:
+                    self.gh.target = ceiling
+
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
         """Claim the first ticket in work order for one free lane that can be
@@ -3935,6 +3955,7 @@ class Station:
             except TargetReached as err:
                 # Claims made earlier this pass stay made; the rest wait.
                 _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
+                self._claim_deferred += len(cands) - cands.index((repo, issue))
                 return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
