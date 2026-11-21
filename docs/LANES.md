@@ -2927,3 +2927,16 @@ refuses while any line is rejected, with a reason asking the lane to file
 the issue and cite it, or drop the line; a round whose summary has no such
 section keeps the body's earlier one. In a public repo another repo's
 citation is written as "issue N of another repo".
+
+## Restore after a reboot
+
+`lanes/win/restore_plan.py` plans the restore of Windows lanes from a
+manifest (`lanes/win/lanes.example.json` shows the shape), the newest session
+snapshot and the names of the agents already running. For each lane it
+returns one `agent start` command and one outcome (`resumed`, `fresh-primed`,
+`awaiting-decision`, `failed`, or `already-running`, which runs nothing), and
+an exit code that is 0 only when every lane resumed or was already running.
+A lane with no resumable session id waits for a decision and is never started
+fresh unless its policy says `fresh`. `check_snapshot` refuses snapshot text
+that holds a token variable name or a key shape. The PowerShell scripts that
+call it are a later change.
