@@ -181,7 +181,7 @@ def _packed_header_lines(line: str) -> list:
     starts = [m.start() for m in _HEADER_KEYS_RE.finditer(line)]
     if len(starts) < 2 or starts[0] != 0:
         return [line]
-    return [line[a:b].strip() for a, b in zip(starts, starts[1:] + [len(line)])]
+    return [line[a:b].strip() for a, b in zip(starts, starts[1:] + [len(line)], strict=True)]
 
 
 # "Not before: 2026-10-13T17:00:00Z": the station claims the ticket no
