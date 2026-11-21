@@ -1025,7 +1025,7 @@ class HandFiled(unittest.TestCase):
         return "\n".join(str(c.get("body") or "") for c in self.gh.comments[number])
 
     def test_the_cutoff_is_a_fixed_time_and_not_the_clock(self):
-        self.assertEqual(brief_check.TEST_RULE_SINCE, "2026-11-21T00:00:00Z")
+        self.assertEqual(brief_check.TEST_RULE_SINCE, "2026-11-25T00:00:00Z")
         self.assertGreater(brief_check._ts(brief_check.TEST_RULE_SINCE), 0)
 
     def test_a_ticket_created_after_the_cutoff_with_no_marker_and_no_test_gets_no_lane(self):

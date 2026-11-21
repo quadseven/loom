@@ -2950,7 +2950,7 @@ string alone.
 
 A ticket filed by hand (it carries no `<!-- loom:test-named -->` marker, which
 the `brief` command and the rewrite write) that was created at or after
-2026-11-21T00:00:00Z and names no test in an acceptance box gets no lane: it
+2026-11-25T00:00:00Z and names no test in an acceptance box gets no lane: it
 gains `needs-brain` and one note naming the missing box. Add the box, or
 rewrite the ticket. A ticket created before that time is never held by this
 rule.
