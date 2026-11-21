@@ -71,7 +71,7 @@
 # a bwrap agent run, default 60),
 # LOOM_DROP_TREES (1: each run's scratch goes when it ends), LOOM_SSM_DIR (a
 # folder of copied SSM values read in place of SSM; docs/LANES.md, "Lane
-# pods"), LOOM_CLONE_BASE (default git@github.com:), for the anthropic lanes
+# pods"), LOOM_CLONE_BASE (default https://github.com/), for the anthropic lanes
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
@@ -91,6 +91,10 @@ LOOM_HOME="${LOOM_HOME:-$HOME/loom}"
 export LOOM_HOME
 # This checkout, for its python helpers (bus/spend.py).
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The fail-closed GitHub identity (loom#3083): github_auth_init,
+# github_auth_mint, github_auth_cleanup.
+# shellcheck source=lanes/github_auth.sh
+. "$LOOM_ROOT/lanes/github_auth.sh" || exit 1
 # The leak scanner a public-repo push reads lives in infra-public, kept at
 # $LOOM_HOME/infra-public and fast-forwarded at most hourly
 # (keep_scanner_current). The default reads it from there.
@@ -155,7 +159,7 @@ keep_scanner_current() {
     echo "set LOOM_INFRA_PUBLIC_REPO or LOOM_LEAK_SCANNER to provide the leak scanner" >&2
     return 1
   fi
-  local now stamp=0 remote="${LOOM_CLONE_BASE:-git@github.com:}$INFRA_PUBLIC_REPO"
+  local now stamp=0 remote="${LOOM_CLONE_BASE:-https://github.com/}$INFRA_PUBLIC_REPO"
   now="$(date +%s)"
   [ -f "$INFRA_PUBLIC_STAMP" ] && stamp="$(tr -cd '0-9' < "$INFRA_PUBLIC_STAMP")"
   if [ -d "$INFRA_PUBLIC/.git" ]; then
@@ -325,7 +329,7 @@ release_heavy_repo() {
   [ -z "$HEAVY_LOCK" ] || heavy_lock release "$HEAVY_LOCK"
   HEAVY_LOCK=""
 }
-trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; rm -rf "$LOCK"' EXIT
+trap 'release_heavy_repo; release_check_slot; drop_build_output; drop_run_scratch; drop_check_home; stop_keepalive; github_auth_cleanup; rm -rf "$LOCK"' EXIT
 
 AGENT_TIMEOUT="${LOOM_AGENT_TIMEOUT:-3600}"
 NET_TIMEOUT="${LOOM_NET_TIMEOUT:-120}"
@@ -337,23 +341,17 @@ CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
 # shellcheck source=lanes/build_jobs.sh
 . "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
-# A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
-# writes as that App, never as the operator (loom#1142): lanes opened 58 pull
+# A lane writes only as its GitHub App (LOOM_GITHUB_APP_*, the Loom Lanes
+# App), never as the operator (loom#1142, loom#3083): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
-# an installation token for gh and git (lane_app_token). The agent never gets
-# the token in its environment, nor the App's settings or git's helper: its gh
-# reads the token from a per-run gh config directory (agent_gh_config, loom#665).
+# an installation token (lanes/fleet-token) for the gh wrapper and git's one
+# credential helper (lanes/github_auth.sh); with no App or no token the run
+# parks and calls GitHub not at all. The agent never gets the token in its
+# environment, nor the App's settings or git's helper: its gh reads the token
+# from a per-run gh config directory (agent_gh_config, loom#665).
 # LOOM_APP_TOKEN_CMD, when set, prints the token in place of
 # `python3 -m bus app token`.
-if [ -n "${LOOM_GITHUB_APP_ID:-}" ]; then
-  CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
-  # git asks gh for github.com credentials, and gh answers with GH_TOKEN.
-  export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_0="" GIT_CONFIG_KEY_1=credential.https://github.com.helper \
-    GIT_CONFIG_VALUE_1="!gh auth git-credential"
-else
-  CLONE_BASE="${LOOM_CLONE_BASE:-git@github.com:}"
-fi
+CLONE_BASE="${LOOM_CLONE_BASE:-https://github.com/}"
 WORKDIR="$LOOM_HOME/worktrees"
 LOGDIR="$LOOM_HOME/logs/$SLOT"
 # The agy lane's agent runs as a dedicated macOS user (default "loom") that
@@ -370,6 +368,14 @@ if [ -n "${LOOM_AGY_RUNAS:-}" ]; then AGY_RUNAS=("$LOOM_AGY_RUNAS"); else AGY_RU
 mkdir -p "$WORKDIR" "$LOGDIR"
 # launchd starts with a bare PATH; the agent CLIs live in these.
 PATH="$PATH:$HOME/.local/bin:$HOME/.opencode/bin:/opt/homebrew/bin:/usr/local/bin"
+# No ambient GH_TOKEN, no stored login: the gh wrapper first on PATH and a
+# fresh empty GH_CONFIG_DIR from here on (lanes/github_auth.sh).
+# The full EXIT trap names helpers defined further down, so a stop here
+# runs only the ones that exist yet.
+if ! github_auth_init "$LOOM_ROOT/lanes"; then
+  trap 'release_heavy_repo; stop_keepalive; rm -rf "$LOCK"' EXIT
+  exit 1
+fi
 
 # A check that hashes a file needs a sha256sum this machine can execute. The
 # lane plist puts the Intel Homebrew bin directory ahead of everything but the
@@ -1274,21 +1280,11 @@ signin_rest_until() {
   [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ] && printf '%s' "$until"
 }
 
-# Mint this run's App token into GH_TOKEN. A personal token in the
-# environment is dropped first, so a failed mint leaves gh with nothing to
-# post as. Installation tokens last an hour: a run mints again after its agent.
+# Mint this run's App token into GH_TOKEN (lanes/fleet-token). The old token
+# is dropped first, so a failed mint leaves gh with nothing to post as.
+# Installation tokens last an hour: a run mints again after its agent.
 lane_app_token() {
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  local token
-  unset GH_TOKEN GITHUB_TOKEN
-  if [ -n "${LOOM_APP_TOKEN_CMD:-}" ]; then
-    token="$("$LOOM_APP_TOKEN_CMD" 2>> "$LOG")" || return 1
-  else
-    token="$(cd "$LOOM_ROOT" && timeout "$NET_TIMEOUT" python3 -B -m bus app token 2>> "$LOG")" || return 1
-  fi
-  # Installation tokens are ghs_ and a JWT-like body: letters, digits, _ . -
-  [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
-  export GH_TOKEN="$token"
+  github_auth_mint 2>> "$LOG" || return 1
   APP_TOKEN_AT="$(date +%s)"
 }
 
@@ -1297,7 +1293,6 @@ lane_app_token() {
 # LOOM_APP_TOKEN_MAX_AGE seconds (default 45 minutes). A failed mint says so in
 # the log and keeps the old token, which may still work (loom#3231).
 fresh_app_token() {
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
   local now old="${GH_TOKEN:-}" max="${LOOM_APP_TOKEN_MAX_AGE:-2700}"
   now="$(date +%s)"
   [[ "$max" =~ ^[0-9]+$ ]] || max=2700
@@ -1313,11 +1308,10 @@ fresh_app_token() {
 # the App and not the operator. The token never enters the agent's
 # environment and never passes through a gh command whose error text could
 # echo it into the log; printf is a builtin, so it is in no process's argv.
-# Sets AGENT_GH_CONFIG, empty on a lane without App settings.
+# Sets AGENT_GH_CONFIG.
 agent_gh_config() {
   AGENT_GH_CONFIG=""
-  [ -n "${LOOM_GITHUB_APP_ID:-}" ] || return 0
-  [[ "${GH_TOKEN:-}" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "${GH_TOKEN:-}" =~ ^ghs_[A-Za-z0-9_.-]+$ ]] || return 1
   # One runner per lane holds its lock, so this lane's stores are its own:
   # drop one a killed run left behind before making the next.
   rm -rf "$LOOM_HOME/run/$SLOT-gh."* || return 1
@@ -1361,12 +1355,12 @@ APP_TOKEN_WHY="could not mint the lane's GitHub App token (LOOM_GITHUB_APP_*); n
 # Only a brief whose repo passed the owner check and whose privacy is known
 # (LOG_TAIL_OK, set in the brief loop) gets one: a brief is input, and a
 # refused one must not make the lane write to a repo it names. A lane with
-# App settings and no minted token posts nothing, as nothing else does.
+# no minted token posts nothing, as nothing else does.
 LOG_TAIL_MARKER="<!-- loom:lane-log-tail v1 -->"
 LOG_TAIL_OK=0
 post_park_note() {  # failure class, reason
   [ "${LOOM_LOG_TAIL:-on}" != off ] && [ "$LOG_TAIL_OK" = 1 ] || return 0
-  [ -z "${LOOM_GITHUB_APP_ID:-}" ] || [ -n "${GH_TOKEN:-}" ] || return 0
+  [ -n "${GH_TOKEN:-}" ] || return 0
   local class="${1:-work}" reason file scan=() rc=0 text
   case "$class" in limit|size|auth) return 0 ;; esac
   [ -n "${ISSUE_NUMBER:-}" ] && [ -n "${REPO:-}" ] || return 0
@@ -5068,7 +5062,7 @@ for BRIEF in "$INBOX"/*.md; do
      # The job cap, in this subshell only (lanes/build_jobs.sh).
      build_jobs_export &&
      cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
-      { [ -z "$AGENT_GH_CONFIG" ] || export GH_CONFIG_DIR="$AGENT_GH_CONFIG"; } &&
+      export GH_CONFIG_DIR="$AGENT_GH_CONFIG" && github_auth_agent_path &&
       run_agent "$RUN_BRIEF") >> "$LOG" 2>&1 &
     agent_pid=$!
     echo $agent_pid > "$LOCK/pgid"
@@ -5098,7 +5092,7 @@ for BRIEF in "$INBOX"/*.md; do
   [ -s "$LOCK/egress-opened" ] || AGENT_GH_CALLS="$(agent_gh_calls)"
   # The token in the store outlives the agent by up to an hour: remove it now.
   GH_CLEANUP_FAILURE=""
-  if [ -n "$AGENT_GH_CONFIG" ] && ! rm -rf "$AGENT_GH_CONFIG"; then
+  if ! rm -rf "$AGENT_GH_CONFIG"; then
     GH_CLEANUP_FAILURE="could not remove the agent's gh credential store"
     if [ ! -s "$LOCK/egress-opened" ]; then
       park "$BRIEF" "$GH_CLEANUP_FAILURE" transient; continue

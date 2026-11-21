@@ -10,11 +10,13 @@ import time
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parent.parent / "lanes" / "mac" / "station.sh"
+LANES = Path(__file__).resolve().parent.parent / "lanes"
+SCRIPT = LANES / "mac" / "station.sh"
 
 # Fake gh: returns check-run and revert-ticket API responses.
 FAKE_GH = """#!/usr/bin/env bash
 printf 'gh %s\\n' "$*" >> "$FAKE_LOG"
+[ "$GH_TOKEN" = ghs_station ] || { echo "gh ran as someone else" >&2; exit 1; }
 if [ "${FAKE_FAIL:-}" = 1 ]; then echo 'API rate limit exceeded' >&2; exit 1; fi
 case "$*" in
   *loom:revert*) jq -n --arg body "${FAKE_REVERTS:-}" '[{"body":$body,"labels":[]}]' ;;
@@ -61,6 +63,10 @@ class StationScriptTest(unittest.TestCase):
         git("clone", "-q", str(self.remote), str(self.checkout))
         (self.checkout / "lanes" / "mac").mkdir(parents=True)
         shutil.copy(SCRIPT, self.checkout / "lanes" / "mac" / "station.sh")
+        # The station's GitHub identity (loom#3083), as the real checkout has it.
+        shutil.copy(LANES / "github_auth.sh", self.checkout / "lanes" / "github_auth.sh")
+        shutil.copy(LANES / "fleet-token", self.checkout / "lanes" / "fleet-token")
+        shutil.copytree(LANES / "github-bin", self.checkout / "lanes" / "github-bin")
         (self.checkout / ".git" / "info" / "exclude").write_text("lanes/\n")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
@@ -68,6 +74,10 @@ class StationScriptTest(unittest.TestCase):
             (self.bin / name).write_text(body)
             (self.bin / name).chmod(0o755)
         self.log = self.tmp / "calls.log"
+        self.mint = self.tmp / "mint"
+        self.mint.write_text('#!/usr/bin/env bash\necho mint >> "$FAKE_LOG"\n'
+                             '[ -z "${FAKE_NO_TOKEN:-}" ] || exit 2\necho ghs_station\n')
+        self.mint.chmod(0o755)
 
     def push_change(self, text="two\n"):
         (self.seed / "a.txt").write_text(text)
@@ -81,8 +91,10 @@ class StationScriptTest(unittest.TestCase):
                               capture_output=True, text=True, check=True).stdout.strip()
 
     def run_script(self, **env):
-        full = dict(os.environ, PATH="%s:%s" % (self.bin, os.environ["PATH"]),
-                    FAKE_LOG=str(self.log), LOOM_HOME=str(self.tmp / "home"), **env)
+        full = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "GH_CONFIG_DIR")}
+        full.update(PATH="%s:%s" % (self.bin, os.environ["PATH"]), FAKE_LOG=str(self.log),
+                    LOOM_HOME=str(self.tmp / "home"), LOOM_GITHUB_APP_ID="124",
+                    LOOM_APP_TOKEN_CMD=str(self.mint), **env)
         return subprocess.run(["bash", str(self.checkout / "lanes" / "mac" / "station.sh")],
                               env=full, capture_output=True, text=True, timeout=60)
 
@@ -211,6 +223,41 @@ class StationScriptTest(unittest.TestCase):
         self.run_script()
         self.assertEqual(self.head(), before)
         self.assertFalse([c for c in self.calls() if c.startswith("gh ")])
+
+    def test_a_pass_whose_app_token_cannot_be_minted_calls_no_github(self):
+        # loom#3083: gh fell back to the operator's stored login.
+        before = self.head()
+        self.push_change()
+        result = self.run_script(FAKE_NO_TOKEN="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("could not mint the station's GitHub App token", result.stdout)
+        self.assertEqual(self.calls(), ["mint"])
+        self.assertEqual(self.head(), before)
+
+    def test_a_pass_with_an_ambient_gh_token_stops_before_github(self):
+        self.push_change()
+        result = self.run_script(GH_TOKEN="gho_person")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("ambient GH_TOKEN", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_pass_reads_github_through_the_wrapper_with_an_empty_config(self):
+        self.write_env_probe()
+        self.push_change()
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        probe = [c for c in self.calls() if c.startswith("probe ")]
+        self.assertTrue(probe, self.calls())
+        token, real, entries = probe[0].split()[1:]
+        self.assertEqual((token, entries), ("ghs_station", "0"))
+        self.assertEqual(real, str(self.bin / "gh"))
+
+    def write_env_probe(self):
+        body = (self.bin / "gh").read_text().replace(
+            "#!/usr/bin/env bash\n", '#!/usr/bin/env bash\nprintf "probe %s %s %s\\n" '
+            '"$GH_TOKEN" "$LOOM_REAL_GH" "$(ls -A "$GH_CONFIG_DIR" | wc -l | tr -d " ")" '
+            '>> "$FAKE_LOG"\n', 1)
+        (self.bin / "gh").write_text(body)
 
 
 if __name__ == "__main__":

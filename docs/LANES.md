@@ -595,8 +595,8 @@ models.dev marks deprecated). A missing model is a limit on that model for
 24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
-install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
-`GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
+install (empty `LOOM_REPOS` keeps it idle) and calls GitHub only as its
+GitHub App (below). docs/BRAIN.md has the rules.
 
 GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
 `LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
@@ -614,7 +614,9 @@ written is a lane agent's per-run gh store, below)
 and the next pass reuses it until 5 minutes before expiry; the ETags cached on
 the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. Instead of SSM, the station
+three unset, a `bus` command run by hand uses the token above as before, but
+the station pass, a brain tick and a lane run refuse to start (below).
+Instead of SSM, the station
 and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
 its path (it wins when both are set). `lanes/mac/install.sh` writes it into
 both plists, refuses a key file readable by group or others (it must be mode
@@ -649,10 +651,36 @@ into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
 launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
 it has its own, and half an App's settings install nothing.
 `python3 -m bus app token` prints the installation token of the App those
-settings name, and fails with no output without them. A lane with the
-settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
+settings name, and fails with no output without them.
+
+Fail closed (loom#3083): plain `gh` falls back to any stored login when its
+token is empty, so an agent could act as a person unseen. `lanes/run_lane.sh`,
+`lanes/mac/brain.sh` and `lanes/mac/station.sh` each source
+`lanes/github_auth.sh` before their first GitHub call. It stops the process,
+with a message, when it finds an ambient `GH_TOKEN` (even an empty one) or a
+`GH_CONFIG_DIR` that is not an empty directory. Otherwise it points
+`GH_CONFIG_DIR` at a fresh empty directory (removed on exit), puts
+`lanes/github-bin` first on `PATH`, and sets git's only github.com credential
+helper to `lanes/github-bin/git-credential-loom`, with pushes to SSH remotes
+sent over https. That helper answers with the process's own App token, or
+tells git to quit without one. `lanes/github-bin/gh` runs the real `gh` only
+with an App installation token (`ghs_...`) in `GH_TOKEN` and an empty config
+directory. It refuses `gh auth login`, `refresh`, `setup-git`, `switch` and
+`token`. `lanes/fleet-token` is the one token helper: it prints only the token
+and exits 1 with empty output on every failure, which covers no App named, a
+missing or empty installation id or key, GitHub refusing, or a reply with no
+token. The station mints before its deploy step and reuses its
+`state/station/app-token.json` (`bus app token --cache-file`). Its Python pass
+refuses to start without the App settings, and a pass whose mint fails reads
+nothing from GitHub. A brain tick mints before it takes the lock and again
+once it holds it. Two reads still use the operator's own token on purpose:
+the pin pass (`bus/pin.py`, loom#612) and the operator budget sample
+(`bus/operator_budget.py`). Each reads `LOOM_GITHUB_TOKEN` from its own
+environment, since the wrapper refuses `gh auth token`.
+
+A lane drops nothing quietly: it mints a token at the
 start of each run and again after its agent (a token lasts an hour), clones
-over https with `gh` as git's credential helper, and runs its agent without
+over https with the credential helper above, and runs its agent without
 the token in its environment, the App settings or that helper; a failed mint
 parks the run `[transient]` before anything is posted. So that the agent's own
 `gh` calls spend the App's budget and not the operator's (loom#665), each run
@@ -660,8 +688,10 @@ writes the token into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*`
 (mode 700, the token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR`
 at it and removes it when the agent exits. The brief tells the agent not to
 poll pull request checks or reviews, and the run's log records
-`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output. `lanes/mac/brain.sh` mints once per
-tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output.
+The agent's `gh` is the real one (the wrapper is dropped from its `PATH`), so
+it reads only that store. `lanes/mac/brain.sh` mints before the lock and
+again after it, and gives every rung that token as `GH_TOKEN`,
 `GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
 `LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
 login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in

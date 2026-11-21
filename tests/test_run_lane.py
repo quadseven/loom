@@ -679,6 +679,9 @@ class LaneRunnerTest(unittest.TestCase):
         self.write_tool(self.bin / "copilot", FAKE_COPILOT)
         self.write_tool(self.bin / "aws", FAKE_AWS)
         self.write_tool(self.bin / "curl", FAKE_CURL)
+        # The Lanes App's token (loom#3083): a lane calls GitHub with nothing else.
+        self.default_mint = root / "default-app-token"
+        self.write_tool(self.default_mint, "#!/usr/bin/env bash\necho ghs_test\n")
         self.scanner = root / "check_private_leaks.py"
         self.scanner.write_text("""#!/usr/bin/env python3
 import os, re, subprocess, sys
@@ -798,6 +801,7 @@ print('leak guard: clean (shape patterns only)')
             "LOOM_CHECK_LOAD_1M": "0", "LOOM_CHECK_LOAD_5M": "0",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+            "LOOM_GITHUB_APP_ID": "124", "LOOM_APP_TOKEN_CMD": str(self.default_mint),
             **env,
         }
 
@@ -1485,7 +1489,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         count = Path(self._tmp.name) / "mints"
         self.drop_brief()
         result = self.run_lane(
-            LOOM_GITHUB_APP_ID="124", GH_TOKEN="ghp_personal",
+            LOOM_GITHUB_APP_ID="124",
             LOOM_APP_TOKEN_CMD=self.app_token_cmd(
                 'n=$(cat "%s" 2>/dev/null || echo 0); echo $((n + 1)) > "%s"\n'
                 '[ "$n" = 0 ] && echo ghs_first.tok-en || { echo "key not found" >&2; exit 2; }'
@@ -4127,7 +4131,7 @@ exec /usr/bin/git "$@"
         (inbox / "T042-fix-the-thing.md").write_text(
             BRIEF.replace("Lane: codex", f"Lane: {lane}").replace("Difficulty: medium", f"Difficulty: {difficulty}\n{brief_header}")
             + f"\nPROBE_PORT={port}\n{extra}")
-        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GH_TOKEN="fake-token-not-real", **env)
+        result = self.run_lane(lane, SSH_AUTH_SOCK="/nonexistent/agent.sock", GITHUB_TOKEN="fake-token-not-real", **env)
         return inbox, result
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
@@ -5233,7 +5237,7 @@ echo fixed > fix.txt
         self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
         self.assertFalse((inbox / "failed" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.beat("opencode-go")["available"])
-        second = self.run_lane("opencode-go", GH_TOKEN="fake-token-not-real", **env)
+        second = self.run_lane("opencode-go", GITHUB_TOKEN="fake-token-not-real", **env)
         self.assertEqual(second.returncode, 0, second.stderr)
         log = (self.loom / "logs" / "opencode-go" / "T042-fix-the-thing.log").read_text()
         self.assertIn("opencode-go/beam-free paused for 86400 s", log)
@@ -6758,7 +6762,7 @@ exit %d
                       # Installation tokens carry dots and dashes (2026-10-20: 383
                       # characters, ghs_ then a JWT-like body).
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo ghs_lanes.tok-en"),
-                      GH_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
+                      GITHUB_TOKEN="ghp_personal", FAKE_GH_TOKENS=str(seen_gh),
                       FAKE_AGENT_ENV=str(seen_agent))
         self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), self.calls())
         self.assertEqual(set(seen_gh.read_text().split()), {"ghs_lanes.tok-en"})
@@ -6778,12 +6782,33 @@ exit %d
         log = (self.loom / "logs" / "codex" / "T042-fix-the-thing.log").read_text()
         self.assertNotIn("ghs_lanes.tok-en", log)
 
-    def test_a_lane_without_app_settings_leaves_the_agent_gh_config_alone(self):
-        seen_agent = Path(self._tmp.name) / "agent-tokens"
+    def test_a_lane_without_app_settings_calls_no_github_and_runs_no_agent(self):
+        # loom#3083: with no App, gh fell back to the operator's stored login.
         self.drop_brief()
-        self.run_lane(FAKE_AGENT_ENV=str(seen_agent))
-        self.assertEqual(seen_agent.read_text().splitlines()[3], "none")
-        self.assertEqual(list((self.loom / "run").glob("codex-gh.*")), [])
+        result = self.run_lane(LOOM_GITHUB_APP_ID="", GITHUB_TOKEN="ghp_personal")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
+        line = self.failure_line()
+        self.assertTrue(line.startswith("[transient] "), line)
+        self.assertIn("could not mint the lane's GitHub App token", line)
+
+    def test_a_lane_with_an_ambient_gh_token_stops_before_any_brief(self):
+        self.drop_brief()
+        result = self.run_lane(GH_TOKEN="ghp_personal")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ambient GH_TOKEN", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((self.inbox / "T042-fix-the-thing.md").exists())
+
+    def test_a_lane_with_a_stored_gh_login_stops_before_any_brief(self):
+        config = Path(self._tmp.name) / "gh-config"
+        config.mkdir()
+        (config / "hosts.yml").write_text("github.com:\n    user: person\n")
+        self.drop_brief()
+        result = self.run_lane(GH_CONFIG_DIR=str(config))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not an empty directory", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_the_brief_says_not_to_poll_and_the_run_reports_its_gh_calls(self):
         # loom#665: agents polled their own pull requests hundreds of times.
@@ -6805,8 +6830,8 @@ exit %d
         self.assertRegex(
             source,
             r'cd "\$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "\$\{!LOOM_GITHUB_APP_@\}" '
-            r'"\$\{!GIT_CONFIG_@\}" &&\s*\{ \[ -z "\$AGENT_GH_CONFIG" \] '
-            r'\|\| export GH_CONFIG_DIR="\$AGENT_GH_CONFIG"; \} &&\s*'
+            r'"\$\{!GIT_CONFIG_@\}" &&\s*export GH_CONFIG_DIR="\$AGENT_GH_CONFIG" && '
+            r'github_auth_agent_path &&\s*'
             r'run_agent "\$RUN_BRIEF"',
         )
 
@@ -6814,7 +6839,7 @@ exit %d
         self.drop_brief()
         self.run_lane(LOOM_GITHUB_APP_ID="124",
                       LOOM_APP_TOKEN_CMD=self.app_token_cmd("echo 'key not found' >&2; exit 2"),
-                      GH_TOKEN="ghp_personal")
+                      GITHUB_TOKEN="ghp_personal")
         self.assertEqual([c for c in self.calls() if c.startswith(("gh ", "codex "))], [])
         line = self.failure_line()
         self.assertTrue(line.startswith("[transient] "), line)

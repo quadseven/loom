@@ -18794,8 +18794,9 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     """The pass run() starts once it holds the lock."""
     use_launchd = gh is None
     if gh is None:
-        from .github import auth_from_env
-        gh = GitHub(auth_from_env())
+        # The station calls GitHub only as its App (loom#3083).
+        from .github import app_auth_from_env
+        gh = GitHub(app_auth_from_env())
         gh.status_in_body = True
         hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:
