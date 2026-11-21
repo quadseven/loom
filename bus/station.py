@@ -2433,6 +2433,7 @@ class Station:
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
+        self._causes_filed: Dict[str, str] = {}
         self._pass_started = time.monotonic()
         self.state = os.path.join(settings.home, "state", "station")
         self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
@@ -8467,7 +8468,45 @@ class Station:
                      repeat=incident_probe.last_repeat(issue, comments))
         for key in keys:
             self._release_fix(ref, key, comments)
+        self._file_cause(ref, issue, comments)
         return True
+
+    def _file_cause(self, ref: str, issue: Dict[str, Any], comments: List[Any]) -> None:
+        """File one cause ticket in the repo of an incident that failed
+        CAUSE_AFTER times with no `Cause:` line, and write the line into the
+        incident so no repeat files a second one (loom#2983). A repo with no
+        goal home or intake epic gets the reason on the line instead."""
+        body = issue.get("body")
+        repo = incident_probe.incident_repo(body)
+        incident_repo, _, raw = ref.rpartition("#")
+        if (not repo or incident_probe.has_cause(body) or not raw.isdigit()
+                or incident_probe.repeat_count(comments) < incident_probe.CAUSE_AFTER
+                or tickets._login(issue.get("user")).lower() not in
+                {a.lower() for a in self.s.authors}):
+            return
+        try:
+            goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
+            line = self._causes_filed.get(ref) or "none filed, %s has no goal home" % repo
+            if goal is not None and ref not in self._causes_filed:
+                title, text = incident_probe.cause_ticket(ref, body)
+                try:
+                    url = brain.brief_intake(self.gh, repo, goal, title, text,
+                                             difficulty="medium")
+                    line = "%s#%s" % (repo, str(url).rstrip("/").rpartition("/")[2])
+                    # Kept so a failed write of the line below retries only
+                    # the write, not a second ticket.
+                    self._causes_filed[ref] = line
+                except ValueError as err:
+                    line = "none filed, no intake epic could take it (%s)" % err
+            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw),
+                         {"body": incident_probe.with_cause(body, line)})
+            self._causes_filed.pop(ref, None)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident probe: could not file a cause for incident %s: %s" % (ref, err))
+            return
+        _say("incident probe: incident %s names its cause: %s" % (ref, line))
 
     def _release_fix(self, ref: str, key: str, comments: List[Any]) -> None:
         """Re-queue a held ticket that is the open incident's fix, with a
