@@ -2433,6 +2433,7 @@ class Station:
         self.discord = discord or discord_call
         self._goals: Optional[List[Tuple[str, Dict[str, Any]]]] = None
         self.now = time.time() if now is None else now
+        self._causes_filed: Dict[str, str] = {}
         self._pass_started = time.monotonic()
         self.state = os.path.join(settings.home, "state", "station")
         self._fabric_asks = 0  # Fabric questions this pass (FABRIC_ASKS)
@@ -3592,6 +3593,7 @@ class Station:
         started = self._pass_counted()
         capped = isinstance(target, int) and not isinstance(target, bool)
         budget = 0
+        self._claim_deferred = 0
         if capped:
             budget = int(target * CLAIM_REQUEST_SHARE)
             self.gh.target = min(target, started + budget)
@@ -3600,9 +3602,10 @@ class Station:
         finally:
             if capped:
                 self.gh.target = target
-            _say("claim pass: %d of %s requests (share %d)"
+            _say("claim pass: %d of %s requests (share %d); %d briefed ticket(s) left "
+                 "unclaimed for budget"
                  % (self._pass_counted() - started, target if capped else "no target",
-                    budget))
+                    budget, self._claim_deferred))
 
     def _claim_new_pass(self) -> None:
         """Assign free lanes to ready tickets once per station pass.
@@ -3639,8 +3642,7 @@ class Station:
         idle = [lane for lane in builders if before[lane] and not by_lane[lane]]
         for hold in self._gate_holds.values():
             hold["idle"] = len(idle)
-        for lane in builders:
-            self._claim_for_lane(lane, by_lane[lane], builders)
+        self._claim_each_lane(builders, by_lane)
         self._record_slot_sample(any(by_lane[lane] and self._inbox_empty(lane)
                                      for lane in builders))
         self._hand_verifies([lane for lane in free if not by_lane.get(lane)])
@@ -3915,6 +3917,25 @@ class Station:
             _say("claim for %s waits for the next pass: %s" % (lane, note))
         return bool(note)
 
+    def _claim_each_lane(self, builders: List[str],
+                         by_lane: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> None:
+        """Claim for every free lane, each within an equal slice of the
+        request budget left, so one lane with many held tickets cannot spend
+        the claim share while the lanes after it sit idle (loom#3210). A lane
+        that stops early leaves its unspent requests to the lanes after it."""
+        ceiling = getattr(self.gh, "target", None)
+        capped = isinstance(ceiling, int) and not isinstance(ceiling, bool)
+        for index, lane in enumerate(builders):
+            if capped:
+                left = max(0, ceiling - self._pass_counted())
+                share = -(-left // (len(builders) - index))
+                self.gh.target = min(ceiling, self._pass_counted() + max(1, share))
+            try:
+                self._claim_for_lane(lane, by_lane[lane], builders)
+            finally:
+                if capped:
+                    self.gh.target = ceiling
+
     def _claim_for_lane(self, lane: str, found: List[Tuple[str, Dict[str, Any]]],
                         free: List[str]) -> None:
         """Claim the first ticket in work order for one free lane that can be
@@ -3934,6 +3955,7 @@ class Station:
             except TargetReached as err:
                 # Claims made earlier this pass stay made; the rest wait.
                 _say("%s#%s waits for the next pass: %s" % (repo, issue["number"], err))
+                self._claim_deferred += len(cands) - cands.index((repo, issue))
                 return
             except (GitHubError, OSError) as err:
                 _say("could not claim %s#%s: %s" % (repo, issue["number"], err))
@@ -6139,7 +6161,39 @@ class Station:
             return False
         if self._label_stale_brief_wait(repo, issue, found):
             return True
+        if self._move_ticked_merged(repo, issue, found):
+            return True
         return self._apply_brief_hold(repo, number, found)
+
+    def _move_ticked_merged(self, repo: str, issue: Dict[str, Any],
+                            found: brief_check.Verdict) -> bool:
+        """A stale verdict that names a merged pull request, on a ticket with
+        every acceptance box ticked, moves the ticket to loom:merged without its
+        lane label and with a note naming the pull request, instead of asking
+        the operator. Any unticked box keeps the existing hold. Other labels,
+        awaiting-live-check among them, stay."""
+        if found.kind != brief_check.STALE or not found.key.startswith("pr-"):
+            return False
+        boxes = proof.criteria(str(issue.get("body") or ""))
+        if not boxes or not all(checked for checked, _ in boxes):
+            return False
+        number = int(issue["number"])
+        states = {"loom:" + state for state in brain.STATES}
+        labels = [n for n in _label_names(issue)
+                  if n not in states and not n.startswith(("lane:", WAIT))]
+        labels.append("loom:merged")
+        try:
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                         {"labels": labels})
+        except GitHubError as err:
+            _say("%s#%d: moving it to merged failed (%s); the hold runs"
+                 % (repo, number, err))
+            return False
+        issue["labels"] = [{"name": n} for n in labels]
+        self._routine(repo, number, "Every box is ticked and %s, so the ticket moves "
+                      "to loom:merged without its lane." % found.reason)
+        _say("%s#%d moves to merged: %s" % (repo, number, found.reason))
+        return True
 
     def _label_stale_brief_wait(self, repo: str, issue: Dict[str, Any],
                                found: brief_check.Verdict) -> bool:
@@ -8467,7 +8521,45 @@ class Station:
                      repeat=incident_probe.last_repeat(issue, comments))
         for key in keys:
             self._release_fix(ref, key, comments)
+        self._file_cause(ref, issue, comments)
         return True
+
+    def _file_cause(self, ref: str, issue: Dict[str, Any], comments: List[Any]) -> None:
+        """File one cause ticket in the repo of an incident that failed
+        CAUSE_AFTER times with no `Cause:` line, and write the line into the
+        incident so no repeat files a second one (loom#2983). A repo with no
+        goal home or intake epic gets the reason on the line instead."""
+        body = issue.get("body")
+        repo = incident_probe.incident_repo(body)
+        incident_repo, _, raw = ref.rpartition("#")
+        if (not repo or incident_probe.has_cause(body) or not raw.isdigit()
+                or incident_probe.repeat_count(comments) < incident_probe.CAUSE_AFTER
+                or tickets._login(issue.get("user")).lower() not in
+                {a.lower() for a in self.s.authors}):
+            return
+        try:
+            goal = next((int(g["number"]) for r, g in self._goal_homes() if r == repo), None)
+            line = self._causes_filed.get(ref) or "none filed, %s has no goal home" % repo
+            if goal is not None and ref not in self._causes_filed:
+                title, text = incident_probe.cause_ticket(ref, body)
+                try:
+                    url = brain.brief_intake(self.gh, repo, goal, title, text,
+                                             difficulty="medium")
+                    line = "%s#%s" % (repo, str(url).rstrip("/").rpartition("/")[2])
+                    # Kept so a failed write of the line below retries only
+                    # the write, not a second ticket.
+                    self._causes_filed[ref] = line
+                except ValueError as err:
+                    line = "none filed, no intake epic could take it (%s)" % err
+            self.gh.rest("PATCH", "/repos/%s/issues/%s" % (incident_repo, raw),
+                         {"body": incident_probe.with_cause(body, line)})
+            self._causes_filed.pop(ref, None)
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("incident probe: could not file a cause for incident %s: %s" % (ref, err))
+            return
+        _say("incident probe: incident %s names its cause: %s" % (ref, line))
 
     def _release_fix(self, ref: str, key: str, comments: List[Any]) -> None:
         """Re-queue a held ticket that is the open incident's fix, with a
@@ -13715,7 +13807,11 @@ class Station:
             self._add_labels(repo, number, found.add)
             for removal in found.remove:
                 self._unlabel(repo, number, removal)
-            changed += 1
+            # A shadow repo's removals are ledger lines that are never sent,
+            # so the same issues come first on every pass: they must not use
+            # up the budget of the repos after it.
+            if not shadow.active(repo):
+                changed += 1
         return changed
 
     def _add_labels(self, repo: str, number: int, names: Sequence[str]) -> None:

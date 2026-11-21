@@ -32,6 +32,14 @@ INCIDENT_MARKER = "<!-- loom:factory-incident v1 -->"
 # The runner's running count on an open incident (lanes/run_lane.sh).
 REPEAT_MARKER = "<!-- loom:incident-repeat v1 -->"
 DELIVERABLE = "base-check"
+# Repeats after which an incident with no named cause gets a cause ticket
+# in its own repo (loom#2983).
+CAUSE_AFTER = 3
+CAUSE_TITLE = "Fix the failing base check named by a factory incident"
+_COUNT_RE = re.compile(r"^Still failing: (\d+) times since ", re.M)
+_CAUSE_RE = re.compile(r"^Cause:[ \t]*\S", re.M)
+_REPO_RE = re.compile(r"^Repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*$", re.M)
+CAUSE_DETAIL_MAX = 1500
 
 
 def epoch(stamp: Any) -> Optional[float]:
@@ -119,3 +127,53 @@ def brief(repo: str, lane: str, ref: str, stamp: int) -> Tuple[str, str]:
             "incident, a fail updates it. No agent runs.\n"
             % (name, repo, stamp, lane, DELIVERABLE, ref))
     return name, text
+
+
+def repeat_count(comments: Iterable[Any]) -> int:
+    """How many times the runner counted its base check failing on the
+    incident, from its repeat comment; 0 when it has none."""
+    for comment in comments:
+        body = str(comment.get("body") or "") if isinstance(comment, dict) else ""
+        if body.startswith(REPEAT_MARKER):
+            found = _COUNT_RE.search(body)
+            return int(found.group(1)) if found else 0
+    return 0
+
+
+def has_cause(body: Any) -> bool:
+    """Whether the incident body already has a `Cause:` line."""
+    return _CAUSE_RE.search(str(body or "")) is not None
+
+
+def incident_repo(body: Any) -> str:
+    """The repo an incident names on its `Repo:` line, empty for a private
+    repo, whose incident names a withheld alias instead."""
+    found = _REPO_RE.search(str(body or ""))
+    return found.group(1) if found else ""
+
+
+def cause_ticket(ref: str, body: Any) -> Tuple[str, str]:
+    """The cause ticket's title and body: the incident's check line and error
+    lines (the text after its `Ticket:` line), quoted."""
+    lines = str(body or "").splitlines()
+    start = next((i + 1 for i, line in enumerate(lines) if line.startswith("Ticket:")),
+                 len(lines))
+    detail = "\n".join(lines[start:]).strip()[:CAUSE_DETAIL_MAX] or "no error text"
+    fence = "`" * 3
+    text = ("## Why\nFactory incident %s has held this repo's tickets while its base check "
+            "failed on the unmodified default branch, and nothing names the cause.\n\n"
+            "Failing check and errors the incident records:\n\n%stext\n%s\n%s\n\n"
+            "## What\nFind why the check fails on the default branch and fix it, so the "
+            "incident closes.\n\n## Acceptance criteria\n- [ ] The repo's validation check "
+            "passes on the default branch.\n\n## Size\nS\n"
+            % (ref, fence, detail.replace(fence, "'''"), fence))
+    return CAUSE_TITLE, text
+
+
+def with_cause(body: Any, line: str) -> str:
+    """The incident body with a `Cause:` line after its `Ticket:` line (at the
+    end when it has none)."""
+    lines = str(body or "").rstrip("\n").split("\n")
+    at = next((i + 1 for i, text in enumerate(lines) if text.startswith("Ticket:")), len(lines))
+    lines.insert(at, "Cause: " + line)
+    return "\n".join(lines) + "\n"
