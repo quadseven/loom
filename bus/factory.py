@@ -5486,6 +5486,9 @@ class Factory:
         person = self._human_holder(repo, issue)
         if person:
             return "%s is claimed by %s" % (ref, person)
+        label_claim = person_claim(issue)
+        if label_claim:
+            return "%s is claimed by the claim:%s label" % (ref, label_claim)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
         held = self._queued_hold(repo, issue)
