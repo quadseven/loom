@@ -18,8 +18,9 @@ class MergedRefsPr(Base):
         self.gh.pull(number, 7, state="closed", body=body, user=user or {"login": "alice-example"},
                      merged_at="2020-01-01T00:00:00Z" if merged else None)
 
-    def assign(self):
-        worker = factory.Factory(self.gh, [REPO], NOW, trusted=["alice-example"])
+    def assign(self, **kw):
+        kw.setdefault("trusted", ["alice-example"])
+        worker = factory.Factory(self.gh, [REPO], NOW, **kw)
         worker.assign_queued()
         return worker
 
@@ -34,6 +35,22 @@ class MergedRefsPr(Base):
         self.assertIn("loom:merged", have)
         self.assertNotIn("loom:queued", have)
         self.assertFalse([x for x in have if x.startswith("lane:") or x == "wait:blocked"])
+
+    def test_a_merged_briefer_pull_request_moves_the_ticket_to_merged(self):
+        self.queued(7)
+        self.closed_pull(20, "Refs #7\n", merged=True, user={"login": "briefer-example"})
+        self.assign(briefers=["briefer-example"])
+        have = self.labels(7)
+        self.assertIn("loom:merged", have)
+        self.assertNotIn("loom:queued", have)
+
+    def test_a_merged_pull_request_from_a_login_in_neither_list_leaves_the_ticket_free(self):
+        self.queued(7)
+        self.closed_pull(20, "Refs #7\n", merged=True, user={"login": "someone-else"})
+        self.assign(briefers=["briefer-example"])
+        have = self.labels(7)
+        self.assertNotIn("loom:merged", have)
+        self.assertTrue([x for x in have if x.startswith("lane:")], have)
 
     def test_an_unmerged_untrusted_or_other_ticket_pull_request_changes_nothing(self):
         for number, body, merged, user in (
