@@ -2267,7 +2267,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         heads = subprocess.run(
             ["git", "ls-remote", "--heads", str(self.remote), "loom/42-fix-the-thing"],
             capture_output=True, text=True, check=True).stdout
-        self.assertIn("refs/heads/loom/T042-fix-the-thing", heads)
+        self.assertIn("refs/heads/loom/42-fix-the-thing", heads)
         self.assertIn("\nRefs example/repo" "#42", self.body.read_text())
 
     FIX_BRANCH = "loom/42-fix-the-thing"

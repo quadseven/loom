@@ -51,6 +51,7 @@ record() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${6:-}" >> "$ROOT/records"; }
 base_verdict_key() { printf fixture-key; }
 base_verdict_read() { return 1; }
 base_verdict_write() { return 0; }
+remote_checks_on() { return 1; }
 tracked_changes() {
   [ "$MODE" = mutated ] && [ -e "$ROOT/failed-once" ] && printf ' M generated.txt'
   return 0
