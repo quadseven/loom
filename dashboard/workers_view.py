@@ -38,7 +38,8 @@ def workers(body: Any, now: float) -> Dict[str, Any]:
             raise ValueError("each row must be an object")
         if row.get("kind") not in KINDS or row.get("state") not in STATES:
             raise ValueError("kind must be one of %s and state one of %s" % (KINDS, STATES))
-        if not _NAME_RE.fullmatch(str(row.get("name") or "")):
+        name = row.get("name")
+        if not isinstance(name, str) or not _NAME_RE.fullmatch(name):
             raise ValueError("each row needs a name")
         started = row.get("started")
         if isinstance(started, bool) or not isinstance(started, (int, float)) or not 0 <= started < 1e12:
@@ -47,7 +48,7 @@ def workers(body: Any, now: float) -> Dict[str, Any]:
         if url and not _URL_RE.fullmatch(url):
             raise ValueError("url must be an https link or empty")
         action = " ".join(str(row.get("last_action") or "").split())[:TEXT_MAX]
-        kept.append({"kind": row["kind"], "name": row["name"], "state": row["state"],
+        kept.append({"kind": row["kind"], "name": name, "state": row["state"],
                      "started": float(started), "last_action": action, "url": url})
     return {"rows": kept, "received_at": now}
 

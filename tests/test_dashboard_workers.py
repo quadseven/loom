@@ -26,7 +26,7 @@ class WorkersBodyTest(unittest.TestCase):
     def test_bad_bodies_are_refused(self):
         for body in (None, {"rows": "x"}, {"rows": [1]},
                      {"rows": [dict(ROW, kind="lane")]}, {"rows": [dict(ROW, state="paused")]},
-                     {"rows": [dict(ROW, name="a b")]}, {"rows": [dict(ROW, started="soon")]},
+                     {"rows": [dict(ROW, name="a b")]}, {"rows": [dict(ROW, name=123)]}, {"rows": [dict(ROW, started="soon")]},
                      {"rows": [dict(ROW, started=True)]},
                      {"rows": [dict(ROW, url="javascript:alert(1)")]},
                      {"rows": [ROW] * (workers_view.WORKERS_MAX + 1)}):
