@@ -29,7 +29,7 @@ from . import usage as usage_store
 
 LOG = logging.getLogger(__name__)
 
-KEYS = ("usage", "chain", "chain_seen", "goal_caps", "brain_holds", "bench")
+KEYS = ("usage", "chain", "chain_seen", "goal_caps", "brain_holds", "bench", "workers")
 # A page read refreshes from the database at most this often; after a failed
 # read it waits RETRY_AFTER instead, so a database outage costs one slow
 # request a minute rather than every request.
