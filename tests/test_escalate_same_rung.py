@@ -1,75 +1,66 @@
-"""escalate and status leave a ticket alone that already waits on its next rung."""
-from __future__ import annotations
-
+"""A ladder assignment waits for a claim without spending another move."""
+import datetime
 import os
-import sys
 import unittest
-import unittest.mock
+from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from bus import brain  # noqa: E402
-from bus.github import GitHub  # noqa: E402
-from tests import test_bus_brain as base  # noqa: E402
-from tests.test_bus_brain import (  # noqa: E402
-    BODY, REPO, TRUSTED, TWICE, Routed, claim, lanes_routes, reply, stuck_ticket,
-    ticket_routes,
-)
+from bus import brain, factory
+from bus.github import GitHub
+from tests.test_bus_brain import (BODY, BRAIN, OLD, REPO, TRUSTED, TWICE, Routed,
+                                  claim, lanes_routes, reply, stuck_ticket, ticket_routes)
 
 
-def issue_on(model, lane):
-    """A stuck ticket briefed on a model and one lane."""
-    issue = stuck_ticket("failed", body="Model: %s\n\n%s" % (model, BODY))
-    issue["labels"] = [{"name": n} for n in
-                       ("loom:ticket", "loom:briefed", "lane:" + lane)]
-    return issue
+class SameRungTests(unittest.TestCase):
+    def test_escalate_leaves_an_unclaimed_rung_alone(self):
+        for state in ("briefed", "queued"):
+            with self.subTest(state=state):
+                issue = stuck_ticket(state, created=OLD)
+                routes = ticket_routes(issue, TWICE, [])
+                routes[("GET", "/repos/%s/pulls" % REPO)] = reply(200, [])
+                fake = Routed(routes)
+                with patch.dict(os.environ, {**TRUSTED, "LOOM_REPOS": "",
+                                             "LOOM_UNCLAIMED_MOVE_CAP": "6"}), \
+                        patch.object(brain, "_LANE_LOAD", {}):
+                    outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9,
+                                             lanes_repo="quadseven/loom")
+                self.assertEqual([method for method, _, _ in fake.calls if method != "GET"], [])
+                self.assertIn("waiting for lane claude on rung 1 claude-sonnet-5-5", outcome)
 
+    def test_status_shows_the_wait_and_still_marks_a_ticket_that_failed(self):
+        briefed = stuck_ticket("briefed", created=OLD)
+        queued = dict(stuck_ticket("queued", created=OLD), number=10)
+        failed = dict(stuck_ticket("briefed", body="Model: gpt-6-luna\n\n" + BODY),
+                      number=11, labels=[{"name": name} for name in
+                                         ("loom:ticket", "loom:briefed", "lane:codex")])
+        routes = lanes_routes(())
+        routes.update({
+            ("GET", "/repos/%s/issues" % REPO): reply(200, [briefed, queued, failed]),
+            ("GET", "/repos/%s/pulls" % REPO): reply(200, []),
+            ("GET", "/issues/9/events"): reply(200, TWICE),
+            ("GET", "/issues/10/events"): reply(200, TWICE),
+            ("GET", "/issues/11/events"): reply(200, TWICE),
+            ("GET", "/issues/11/comments"): reply(200, [claim("2030-01-01T00:09:00Z", "codex")]),
+        })
+        report = brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
+                              now=datetime.datetime(2030, 1, 2, tzinfo=datetime.timezone.utc),
+                              env=TRUSTED)
+        lines = {line.split()[1]: line for line in report.splitlines() if line.startswith("- #")}
+        for number in ("#9", "#10"):
+            self.assertIn("waiting for lane claude on rung 1 claude-sonnet-5-5", lines[number])
+            self.assertNotIn("next rung", lines[number])
+            self.assertNotIn("REPEATEDLY STUCK", lines[number])
+        self.assertIn("REPEATEDLY STUCK", lines["#11"])
+        self.assertIn("next rung 1 claude-sonnet-5-5", lines["#11"])
 
-class SameRungTest(unittest.TestCase):
-    setUp = base.EscalateTests.setUp
-    run_escalate = base.EscalateTests.run_escalate
-
-    def test_escalate_refuses_a_ticket_already_on_its_next_rung(self):
-        # Sonnet on lane claude is rung 1, and no claim has run there.
-        with self.assertRaises(ValueError) as caught:
-            self.run_escalate(ticket_routes(issue_on("claude-sonnet-5-5", "claude"),
-                                            TWICE, []))
-        self.assertIn("rung 1", str(caught.exception))
-
-    def test_a_refused_escalate_writes_nothing(self):
-        fake = Routed(ticket_routes(issue_on("claude-sonnet-5-5", "claude"), TWICE, []))
-        gh = GitHub("t", transport=fake)
-        with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": base.BRAIN}):
-            with self.assertRaises(ValueError):
-                brain.escalate(gh, REPO, 9)
-        self.assertEqual([c for c in fake.calls if c[0] != "GET" and c[1] != "/graphql"], [])
-
-    def test_a_ticket_that_ran_and_failed_on_its_rung_still_climbs(self):
-        fake, outcome = self.run_escalate(ticket_routes(
-            issue_on("claude-sonnet-5-5", "claude"), TWICE,
-            [claim("2030-01-01T00:11:00Z")]))
-        self.assertEqual(outcome, "rung 2 gpt-6-luna on codex")
-
-    def status(self, issue, comments):
-        routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [issue]),
-                  ("GET", "/issues/9/events"): reply(200, TWICE),
-                  ("GET", "/issues/9/comments"): reply(200, comments),
-                  ("GET", "/repos/%s/pulls" % REPO): reply(200, [])}
-        routes.update(lanes_routes(()))
-        return brain.status(GitHub("t", transport=Routed(routes)), [REPO], REPO,
-                            env=TRUSTED)
-
-    def test_status_does_not_mark_a_ticket_waiting_on_its_next_rung(self):
-        report = self.status(issue_on("claude-sonnet-5-5", "claude"), [])
-        self.assertNotIn("next rung 1", report)
-        self.assertNotIn("REPEATEDLY STUCK", report)
-
-    def test_status_still_marks_a_ticket_that_failed_on_its_rung(self):
-        report = self.status(issue_on("gpt-6-luna", "codex"),
-                             [claim("2030-01-01T00:11:00Z", lane="codex")])
-        self.assertIn("REPEATEDLY STUCK", report)
-        self.assertIn("next rung 1", report)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_move_cap_counts_changes_of_model_or_lane(self):
+        destinations = (
+            "1 claude-sonnet-5-5 claude",
+            "1 claude-sonnet-5-5 claude",
+            "3 claude-opus-5-5 claude",
+            "3 claude-opus-5-5 anthropic",
+            "3 claude-opus-5-5 anthropic",
+        )
+        comments = [{"body": "%s\nRung: %s" % (brain.ESCALATE_MARKER, destination),
+                     "user": {"login": BRAIN}, "created_at": "2030-01-01T00:00:0%dZ" % i}
+                    for i, destination in enumerate(destinations)]
+        self.assertEqual(factory.unclaimed_moves(comments, [BRAIN]), 3)

@@ -160,6 +160,10 @@ PROVIDER_FAULT_RE='prompt_rendering_failed'
 # itself dropped, "[Cohere] missing required parameter: 'messages[60].content'".
 # Eight run logs ended on it from 2026-10-31, five parked as work (loom#2754).
 PROVIDER_PARAM_FAULT_RE="missing required parameter: 'messages\\[[0-9]+\\]"
+# A provider answering HTTP 410 because the model it was asked for has reached
+# its end of life. The ticket did not choose the model, so the run is no work
+# failure and keeps its rung (loom#3243).
+PROVIDER_RETIRED_RE="Gone.*has reached its end of life|has reached its end of life.*Gone"
 # The agy CLI's own ending: its root agent went idle, it waited on a
 # background task it had left running, and the wait was interrupted. Two runs
 # that had finished their work and a green suite ended this way and were
@@ -267,6 +271,8 @@ classify_failure() {
     FAIL_CLASS=transient FAIL_REASON="provider could not render the prompt (prompt_rendering_failed)"
   elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_PARAM_FAULT_RE ]]; then
     FAIL_CLASS=transient FAIL_REASON="provider fault: the provider rejected its own request (missing required parameter in messages)"
+  elif [ "$status" -ne 0 ] && [[ "$tail" =~ $PROVIDER_RETIRED_RE ]]; then
+    FAIL_CLASS=transient FAIL_REASON="provider fault: the provider retired the requested model (HTTP 410, end of life)"
   elif [ "$status" -ne 0 ] && [[ "$tail" =~ $CLI_BACKGROUND_WAIT_RE ]] &&
        [[ "$tail" =~ $CLI_INTERRUPTED_RE ]]; then
     FAIL_CLASS=transient FAIL_REASON="the agent CLI was interrupted while it waited on a background task after its root agent went idle"

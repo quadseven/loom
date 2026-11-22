@@ -257,6 +257,8 @@ class FakeGitHub:
             if parts.path.endswith("/.github/workflows"):
                 return reply(200, [])
             return self._head_file(parts.path[len("/repos/%s/contents/" % REPO):])
+        if method == "GET" and parts.path == "/repos/%s/commits/main" % REPO:
+            return reply(200, {"sha": "a" * 40})
         changed = re.match(r"/repos/%s/commits/([0-9a-f]+)$" % REPO, parts.path)
         if method == "GET" and changed and changed.group(1) in self.commit_files:
             return reply(200, {"sha": changed.group(1).ljust(40, "0"),
@@ -3225,7 +3227,9 @@ class BudgetTest(Base):
         writes1 = gh1.kinds.get("writes", 0)
         self.assertLessEqual(gh1.counted, station.PASS_REQUEST_TARGET + writes1)
         self.assertIn("carried over", err1)
-        self.assertRegex(err1, r"carried over.*comments")
+        # The claim pass gives each free lane its own slice (loom#3210): the
+        # first lane's events read stops at its slice and the second lane's
+        # ticket still gets its comments read, so only events carry over.
         self.assertRegex(err1, r"carried over.*events")
         ticket_reads_path = os.path.join(self.home, "state", "station", "ticket_reads.json")
         st_reads1 = station._read_json(ticket_reads_path, {}, strict=False)
@@ -3234,7 +3238,7 @@ class BudgetTest(Base):
         gh2 = GitHub("token", transport=self.fake, target=100000)
         gh2, err2 = self.passes(gh=gh2)
         self.assertNotIn("carried over", err2)
-        self.assertGreater(gh2.kinds.get("comments", 0), 100)
+        self.assertGreater(gh1.kinds.get("comments", 0), 50)
         self.assertGreater(gh2.kinds.get("events", 0), 50)
 
     def test_a_pass_log_line_names_the_reads_carried_over_when_target_reached(self):
@@ -7369,14 +7373,14 @@ class RetryTest(Base):
                          "lane codex ran its fix round; nothing ran, which is not a failure")
         self.assertEqual(self.listing("codex-2"), [])
 
-    def test_a_fix_round_whose_pull_request_closed_unmerged_still_fails_its_work(self):
+    def test_a_fix_round_whose_pull_request_closed_unmerged_requeues_the_ticket(self):
         self.heartbeat("codex-2")
         fix = tickets.parse_fix(REPO, FIX_BODY)
         self.failed(reason="[work] pull request #99 is no longer open on "
                            "loom/12-fix-the-thing (CLOSED loom/12-fix-the-thing)",
                     attempt=1, fix=fix)
         self.run_pass()
-        self.assertEqual(self.fake.names(12), ["loom:ticket", "lane:codex", "loom:failed"])
+        self.assertEqual(self.fake.names(12), ["loom:ticket", "loom:queued"])
 
     def test_a_merged_ticket_is_never_held_as_a_runaway(self):
         self.failed(body=BODY_WITH_CRITERIA, reason="[work] agent made no commit on loom/12-fix-the-thing")

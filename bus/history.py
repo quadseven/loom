@@ -314,6 +314,25 @@ def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
     return match.group(1) if match else None
 
 
+# lanes/run_lane.sh's reason when every test the run changed passes on the
+# default branch (loom#3005): the ticket's behaviour may already hold there.
+BASE_PASS_RE = re.compile(r"every changed test passes on base; the ticket may already hold "
+                          r"on the default branch(?:: passes on base: (.*))?")
+
+
+def base_pass_tests(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """The tests the ticket's newest failure says already pass on the default
+    branch ("" when it names none), else None. A stronger model cannot make
+    a test fail on code that already works, so no rung is spent on it."""
+    newest = None
+    for c in comments:
+        body = str(c.get("body") or "")
+        if FAILED_RE.match(body):
+            newest = body
+    match = BASE_PASS_RE.search(newest or "")
+    return (match.group(1) or "").strip() if match else None
+
+
 class History(NamedTuple):
     """A ticket's history, read once from its trusted comments."""
 

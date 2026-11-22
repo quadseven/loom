@@ -203,7 +203,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
 from . import human_claims, no_change
-from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
+from . import already_done, answer, bench, brain, brain_hold, brief_check, change_class, claimed, closing, comment_findings, converge, criteria_gate, flake, history, hold_boxes, hunk_overlap, hunt_plan, labels, landing, merge_tier, merge_verdict, naming, notify, operator_hold, pr_repair, scope_fit, split, stale_claims, status, tickets, vacuous
 from .github import GitHub, GitHubError, RateLimited, ShadowHeld, rest_login
 from .labels import HUMAN_LABELS, NEEDS_HUMAN, REMOTE_LANES, needs_human
 from . import runners
@@ -267,6 +267,9 @@ PIN_FALLBACK_WAIT = 30 * 60
 # cycle across every free lane.
 PIN_FALLBACK_MAX = 2
 PIN_FALLBACK_MARKER = "<!-- loom:pin-fallback %s -->"
+# A ticket the model ladder escalated carries one of these, in a comment or in
+# its status body: its model is the ladder's rung, not a default (loom#3191).
+LADDER_RE = re.compile(r"<!-- loom:(?:rung \d+|escalate v1) -->")
 PIN_FALLBACK_RE = re.compile(r"<!-- loom:pin-fallback \S+ -->")
 # Labels whose ticket keeps its Model: line however long it waits: its change
 # needs the reviewer-grade model it was pinned to (bus/merge_tier.py).
@@ -856,16 +859,27 @@ def move_cap() -> int:
 def unclaimed_moves(comments: Sequence[Dict[str, Any]], authors: Sequence[str]) -> int:
     """The moves between lanes or rungs since a lane last claimed the ticket
     or the cap last held it: status events and escalations written by
-    `authors`. These repos take comments from strangers, whose text could
+    `authors`. Repeated escalation to the same known model and lane is
+    one move. These repos take comments from strangers, whose text could
     otherwise hold a ticket or keep one moving."""
     count = 0
+    destination = None
     for comment in sorted(brain.trusted_comments(comments, authors), key=lambda c: str(c.get("created_at") or "")):
         body = str(comment.get("body") or "")
         if CLAIM_RE.match(body) or body.startswith(MOVE_CAP_MARKER):
             count = 0
-        elif (body.startswith(brain.ESCALATE_MARKER)
-              or any(rx.search(body) for rx in BRIEF_RES[1:])):
+            destination = None
+        elif body.startswith(brain.ESCALATE_MARKER):
+            rung = brain._RUNG_LINE.search(body)
+            target = (rung.group(2), rung.group(3)) if rung else None
+            if target is None or target != destination:
+                count += 1
+            destination = target
+        elif any(rx.search(body) for rx in BRIEF_RES[1:]):
             count += 1
+            destination = None
+        elif BRIEF_RES[0].search(body) or body.startswith(FIX_MARKER):
+            destination = None
     return count
 
 
@@ -1376,6 +1390,10 @@ SUBMODULE_EDIT_RE = history.SUBMODULE_EDIT_RE
 
 def needs_other_repo(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
     return history.needs_other_repo(comments)
+
+
+def base_pass_tests(comments: Sequence[Dict[str, Any]]) -> Optional[str]:
+    return history.base_pass_tests(comments)
 
 
 def current_rung(issue: Dict[str, Any]) -> int:
@@ -1920,7 +1938,15 @@ def native_blockers(gh: Any, repo: str, issue: Dict[str, Any]) -> List[str]:
     return refs
 
 
+def lane_state(lane: str) -> str:
+    """The state a ticket takes on `lane`: remote pull lanes claim queued."""
+    return "queued" if lane in REMOTE_LANES else "briefed"
+
+
 class Factory:
+    # How the base run of a remote-lane pull request gets a tree; None clones.
+    base_clone: Optional[Callable[[str, str], str]] = None
+
     def __init__(self, gh: GitHub, repos: Sequence[str], now: float,
                  trusted: Sequence[str] = (),
                  briefers: Sequence[str] = (),
@@ -2255,8 +2281,17 @@ class Factory:
                           full: Dict[str, Any], issue: Dict[str, Any]) -> List[str]:
         """Check changed Python sources for vacuous lookup and fixture edits."""
         sha = str((full.get("head") or {}).get("sha") or "")
-        return vacuous.pull_findings(self.gh, repo, number, sha,
-                                     str(issue.get("body") or ""))
+        found = vacuous.pull_findings(self.gh, repo, number, sha,
+                                      str(issue.get("body") or ""))
+        if _lane(issue) not in REMOTE_LANES:
+            # A local lane's run already reported its own base pass.
+            return found
+        base = str((full.get("base") or {}).get("sha") or "")
+        if not base:
+            return found
+        modules = vacuous.added_test_modules(self.gh, repo, number)
+        return found + vacuous.base_run_findings(repo, base, sha, modules,
+                                                 self.base_clone)
 
     def _needs_test(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
         """Does this pull request change code and no test, in a repo and on a
@@ -4014,6 +4049,8 @@ class Factory:
             return
         if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
             return  # brought up to date less than the cooldown ago
+        if hold_boxes.hold_box_reason(str(issue.get("body") or "")):
+            return  # an unticked hold box: the ticket's pull request is not touched
         if self._hold_stands(repo, number, sha, _author(full)):
             return
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),
@@ -4737,6 +4774,10 @@ class Factory:
         if other:
             self._hold_other_repo(repo, issue, other)
             return
+        passing = base_pass_tests(comments)
+        if passing is not None:
+            self._hold_done_check(repo, issue, passing)
+            return
         pr = prs.get(number)
         if self._not_work(repo, issue, comments, pr):
             return
@@ -4768,7 +4809,7 @@ class Factory:
             self._give_up(repo, issue, "it failed on lane %s" % _lane(issue))
             return
         if pr is None:
-            self.move(self.gh, repo, number, "briefed", lane=lane)
+            self.brief_on(repo, number, lane)
         self.actions += 1
         _say("re-briefed failed %s#%d on %s" % (repo, number, lane))
 
@@ -4837,6 +4878,27 @@ class Factory:
                      {"labels": names + ["needs-brain"]})
         self.actions += 1
         _say("%s#%d failed again with no commit and no reason; left for the brain"
+             % (repo, number))
+
+    def _hold_done_check(self, repo: str, issue: Dict[str, Any], tests: str) -> None:
+        """Leave a ticket failed for the brain to done-check, once (needs-brain
+        says it was asked), when every test its run changed already passes on
+        the default branch: no rung is spent, as a stronger model cannot make
+        a test fail on code that already works (loom#3005)."""
+        names = _labels(issue)
+        if "needs-brain" in names:
+            return
+        number = int(issue["number"])
+        notify.post(self.gh, repo, number,
+                    "Not climbing the model ladder: every test lane %s changed already passes "
+                    "on the default branch%s, so the behaviour may already hold and a stronger "
+                    "model cannot make those tests fail. The brain checks whether the ticket "
+                    "is done, then closes it or rewrites the brief around what is missing."
+                    % (_lane(issue), " (" + tests + ")" if tests else ""), notify.HELD)
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": names + ["needs-brain"]})
+        self.actions += 1
+        _say("%s#%d failed with every changed test passing on base; left for a done-check"
              % (repo, number))
 
     def _hold_other_repo(self, repo: str, issue: Dict[str, Any], submodule: str) -> None:
@@ -4921,7 +4983,7 @@ class Factory:
             self._status_note(repo, number, said + "the factory moved this ticket to lane "
                               "%s, %s." % (lane, "in its difficulty tier"
                                            if model == "unspecified" else "which takes its model"))
-            kept = brain._moved_labels(_labels(issue), "briefed", lane)
+            kept = brain._moved_labels(_labels(issue), lane_state(lane), lane)
             self._relabel(repo, issue, kept)
             self.load[lane] = self.load.get(lane, 0) + 1
             _say("moved running %s#%d off silent lane %s to %s" % (repo, number, old, lane))
@@ -5532,9 +5594,10 @@ class Factory:
         """Why a queued ticket gets no lane this pass, or ""."""
         if self.now < held_until(issue) or self._host_only(repo, issue):
             return "is held"
-        if repo in self.capped:
+        if repo in self.capped and priority_of(issue) != "P0":
             # Briefed, the station would hold it at the cap and its lane would
-            # take nothing else (loom#3158). Reads nothing.
+            # take nothing else (loom#3158). Reads nothing. A P0 ticket is
+            # claimed over the cap, so it is not held here.
             self._waiting(repo, issue["number"], CAP_WAIT)
             return "waits: " + CAP_WAIT
         held = (self._brief_wait(repo, issue) or self._no_criteria(repo, issue)
@@ -5752,16 +5815,21 @@ class Factory:
         lane of its tier, with that lane's own model: its Model: line is
         removed, so the runner's footer names the model that ran. None when
         it keeps waiting for its model: inside the wait, a hard pin
-        (hard_pin), PIN_FALLBACK_MAX fallbacks already, or no free lane it has
-        not run on. Else "" when it got the lane, or why giving it failed."""
+        (hard_pin), a ladder marker (the rung's model is not a default),
+        PIN_FALLBACK_MAX fallbacks already, or no free lane it has not run
+        on. Else "" when it got the lane, or why giving it failed."""
         key = "%s#%s" % (repo, issue["number"])
         waited = self.now - self.no_lane_since.get(key, self.now)
         if self.pin_fallback is None or waited < self.pin_fallback or hard_pin(issue):
+            return None
+        if LADDER_RE.search(str(issue.get("body") or "")):
             return None
         if self._fallback_lane(repo, issue)[0] is None:
             return None  # nothing to move to: no comment read, every pass
         number = int(issue["number"])
         comments = self._comments(repo, number)
+        if any(LADDER_RE.search(str(c.get("body") or "")) for c in comments):
+            return None
         if sum(bool(PIN_FALLBACK_RE.search(str(c.get("body") or "")))
                for c in comments) >= PIN_FALLBACK_MAX:
             return None
@@ -5784,13 +5852,21 @@ class Factory:
                           "ran." % (PIN_FALLBACK_MARKER % model, model, minutes, lane))
         return ""
 
+    def brief_on(self, repo: str, number: int, lane: str, **kw: Any) -> None:
+        """Move a ticket onto `lane`: briefed for a local lane, queued for a
+        remote pull lane, which claims only queued tickets (as brain.move)."""
+        if lane in REMOTE_LANES:
+            self.move(self.gh, repo, number, "queued", lane=lane)
+        else:
+            self.move(self.gh, repo, number, "briefed", lane=lane, **kw)
+
     def _assign_equivalent(self, repo: str, issue: Dict[str, Any], pinned: str,
                            lane: str, model: str, why: str) -> None:
         """Brief a queued ticket on `lane` with the equivalent `model` written
         to its Model: line, so its claim records the model that ran. The note
         carries EQUIVALENT_MARKER, which leaves the pinned rung untried."""
         number = int(issue["number"])
-        self.move(self.gh, repo, number, "briefed", lane=lane, model=model)
+        self.brief_on(repo, number, lane, model=model)
         self._status_note(repo, number,
                           "%s\nThe station gave this queued ticket lane %s with model %s in "
                           "place of %s (equivalent: %s)." % (

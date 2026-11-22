@@ -1613,6 +1613,39 @@ driver stops with a message instead of using files.
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
 
+### Fleet event inbox
+
+With `LOOM_INBOX=1` the station is the consumer of one inbox in a fleet event
+table (`bus/event_inbox.py`): a webhook receiver or a scheduler appends rows
+to `inbox_event` and sends `NOTIFY fleet_inbox, '<inbox>'`. It is off by
+default. With it off nothing connects, and `python3 -m bus station-wait`
+sleeps exactly `LOOM_STATION_INTERVAL` seconds.
+
+- Events are hints and the pass stays the truth. A pass claims its due events
+  and moves the watched repos their subjects name to the front of
+  `scan_repos`, scanning an idle one now. It never reads an event's payload,
+  and a subject outside `LOOM_REPOS` is dropped.
+- The inbox lease (`inbox_lease`, row `LOOM_INBOX_NAME`, default
+  `loom-station`) is tied to the station lease. It needs `LOOM_STATION_LEASE=1`
+  and is taken only after the station lease is checked, under the same holder
+  and TTL. A pass that ran marks its events `done` with the pass id as
+  `run_ref`, after it checks the station lease again. Every write is fenced by
+  the inbox lease's epoch. The pass then gives the inbox lease up.
+- A pass that stops early marks nothing done, and the next pass claims those
+  events again. A pass that dies leaves the inbox lease to expire with its TTL.
+  An event claimed 5 times without finishing is `dead`.
+- Between passes, `python3 -m bus station-wait` LISTENs for up to
+  `LOOM_STATION_INTERVAL` seconds. A NOTIFY for this inbox ends the wait
+  `LOOM_INBOX_DEBOUNCE` seconds (default 15) after the first pending event, so
+  a burst becomes one pass. A wait that cannot reach the database sleeps out
+  the interval.
+- Settings: `LOOM_INBOX_DB_HOST`, `LOOM_INBOX_DB_NAME`, `LOOM_INBOX_DB_USER`,
+  `LOOM_INBOX_DB_PASSWORD` (a role of its own, not `LOOM_DB_*`) and
+  `LOOM_INBOX_INSTANCE`. A missing setting logs a line and leaves the inbox
+  off. An inbox failure never stops a pass.
+- The launchd schedule starts passes on its own interval, so only a station
+  whose loop calls `station-wait` between passes starts early.
+
 ### Moving file ledgers into the shared backend
 
 A station switched to `postgres` starts with empty ledgers, so it would send
@@ -2927,3 +2960,16 @@ refuses while any line is rejected, with a reason asking the lane to file
 the issue and cite it, or drop the line; a round whose summary has no such
 section keeps the body's earlier one. In a public repo another repo's
 citation is written as "issue N of another repo".
+
+## Restore after a reboot
+
+`lanes/win/restore_plan.py` plans the restore of Windows lanes from a
+manifest (`lanes/win/lanes.example.json` shows the shape), the newest session
+snapshot and the names of the agents already running. For each lane it
+returns one `agent start` command and one outcome (`resumed`, `fresh-primed`,
+`awaiting-decision`, `failed`, or `already-running`, which runs nothing), and
+an exit code that is 0 only when every lane resumed or was already running.
+A lane with no resumable session id waits for a decision and is never started
+fresh unless its policy says `fresh`. `check_snapshot` refuses snapshot text
+that holds a token variable name or a key shape. The PowerShell scripts that
+call it are a later change.

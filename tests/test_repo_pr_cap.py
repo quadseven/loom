@@ -157,6 +157,14 @@ class RepoPrCapTest(Base):
         self.assertTrue(claimed)
         self.assertEqual(runner._repo_pr_count(REPO), 1)
 
+    def test_loom_head_counts_whatever_the_author_type(self):
+        self.pulls(2)
+        self.fake.pulls[0]["user"]["type"] = "User"
+        self.fake.pulls[1]["head"]["ref"] = "manual/work"
+        self.fake.pulls[1]["user"]["type"] = "Bot"
+        runner = station.Station(GitHub("token", transport=self.fake), self.settings)
+        self.assertEqual(runner._repo_pr_count(REPO), 2)
+
     def test_second_page_is_counted_and_duplicate_numbers_are_not(self):
         runner = station.Station(GitHub("token", transport=self.fake), self.settings)
         self.pulls(100)

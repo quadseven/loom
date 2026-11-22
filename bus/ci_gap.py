@@ -74,6 +74,10 @@ class Step(NamedTuple):
     workdir: str
     # Its timeout-minutes (0 when it has none).
     timeout: float = 0
+    # Why the command is not runnable in a lane tree alone ("" when it is):
+    # CI checked the repository into a subdirectory of another workspace and
+    # ran earlier steps there (loom#3016).
+    context: str = ""
 
 
 class Job(NamedTuple):
@@ -135,12 +139,26 @@ def _steps(lines: List[str], start: int, end: int, job_workdir: str) -> List[Ste
     found: List[Step] = []
     current: Optional[Dict[str, str]] = None
     item_indent = key_indent = -1
+    subdir = ""
+    ran = False
 
     def close() -> None:
-        if current and current.get("run"):
-            found.append(Step(current.get("name", ""), current["run"],
-                              current.get("working-directory", job_workdir),
-                              _minutes(current.get("timeout-minutes", ""))))
+        nonlocal subdir, ran
+        if not current:
+            return
+        if current.get("run"):
+            workdir = current.get("working-directory", job_workdir)
+            context = ""
+            if subdir and ran and not workdir:
+                context = ("the job checks the repository into %s and runs earlier steps "
+                           "in the workspace around it" % subdir)
+            found.append(Step(current.get("name", ""), current["run"], workdir,
+                              _minutes(current.get("timeout-minutes", "")), context))
+            ran = True
+        elif current.get("uses", "").startswith("actions/checkout"):
+            path = current.get("path", "").strip("/")
+            if path and path != ".":
+                subdir = path
 
     for index, indent, line in _content(lines, start, end):
         item = re.match(r"^(\s*-\s+)(\S.*)$", line)
@@ -150,10 +168,20 @@ def _steps(lines: List[str], start: int, end: int, job_workdir: str) -> List[Ste
             text = item.group(2)
         elif current is not None and indent == key_indent:
             text = line.strip()
+            current.pop("_with", None)
+        elif current is not None and current.get("_with") and indent > key_indent:
+            name, rest = ship_paths._name(line)
+            if name == "path":
+                current["path"] = ship_paths._strip(rest)
+            continue
         else:
             continue
         name, rest = ship_paths._name(text)
-        if name == "run":
+        if name == "with":
+            current["_with"] = "1"
+        elif name == "uses":
+            current["uses"] = ship_paths._strip(rest)
+        elif name == "run":
             current["run"] = _scalar(lines, index, key_indent, rest)
         elif name in ("name", "working-directory", "timeout-minutes"):
             current[name] = ship_paths._strip(rest)
@@ -464,6 +492,11 @@ def find_gaps(gh: Any, repo: str, pr: int, sha: str, fields: Dict[str, str],
         paths = pull_request_paths(text)
         for step in failing_steps(job, job_data.get("steps") or []):
             if covered(step.command, have, step.workdir):
+                continue
+            if step.context:
+                say("validation gap: %s#%d CI job %s step %s needs workspace context a lane "
+                    "tree lacks (%s); not a gap" % (repo, pr, job.name,
+                                                    step.name or "run step", step.context))
                 continue
             if setup_only(step.command):
                 say("validation gap: %s#%d CI job %s step %s only installs system packages; "

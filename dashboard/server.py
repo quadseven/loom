@@ -51,6 +51,7 @@ from bus.github import GitHubError
 
 STATES = ("queued", "briefed", "running", "pr", "merged", "shipped", "verified", "failed")
 from . import views
+from . import workers_view
 from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
 LOG = logging.getLogger(__name__)
 
@@ -1149,6 +1150,18 @@ def _handle_brain_holds_post(handler, state):
     return _publish(handler, state, {"repos": len(state.brain_holds["repos"])}, "brain_holds")
 
 
+def _handle_workers_post(handler, state):
+    """POST /api/workers: the feed's cluster workers and goal bots, with the
+    upload token, shown on /workers."""
+    if not _authorized(handler):
+        return handler.send_json(401, {"error": "unauthorized"})
+    try:
+        state.workers = workers_view.workers(_json_body(handler), time.time())
+    except (ValueError, json.JSONDecodeError) as exc:
+        return handler.send_json(400, {"error": str(exc)})
+    return _publish(handler, state, {"rows": len(state.workers["rows"])}, "workers")
+
+
 def _handle_chain_post(handler, state):
     """POST /api/chain: the station's shadow mode per repo and its last held
     and acted entries, with the upload token, shown on /chain."""
@@ -1217,6 +1230,8 @@ def _handler_for(state):
                 return _handle_goal_caps_post(self, state)
             if path == "/api/brain-holds":
                 return _handle_brain_holds_post(self, state)
+            if path == "/api/workers":
+                return _handle_workers_post(self, state)
             if path == "/api/chain":
                 return _handle_chain_post(self, state)
             if path == "/api/needs-you/answer":
@@ -1283,6 +1298,9 @@ def _dispatch_get(handler, state):
         return _dispatch_roster(handler, state)
     if path == "/fleet":
         return _dispatch_fleet(handler, state)
+    if path == "/workers":
+        return handler.send_page(page("Workers and bots", "workers", workers_view.page_html(
+            getattr(state, "workers", None), time.time()), status="live"))
     if path == "/chain":
         return _dispatch_chain(handler, state)
     if path in ("/", "/goals", "/tickets", "/tree"):

@@ -3922,11 +3922,8 @@ def fixc(at):
             "user": {"login": BRAIN}}
 
 
-def stuck_ticket(*states, body="Model: claude-sonnet-5-5\n\n" + BODY, created="2030-01-01T00:00:00Z",
-                 lane="codex-2"):
-    # The default lane is not one of rung 1's lanes, so a ticket on the
-    # first model does not already wait on its next rung (loom#3238).
-    names = ["loom:ticket", "lane:" + lane] + ["loom:" + x for x in states]
+def stuck_ticket(*states, body="Model: claude-sonnet-5-5\n\n" + BODY, created="2030-01-01T00:00:00Z"):
+    names = ["loom:ticket", "lane:claude"] + ["loom:" + x for x in states]
     return {"number": 9, "state": "open", "title": "T", "body": body, "created_at": created,
             "labels": [{"name": n} for n in names]}
 
@@ -4095,7 +4092,9 @@ class EscalateTests(unittest.TestCase):
     def test_status_marks_each_kind_of_repeatedly_stuck_ticket(self):
         for name, (events, comments, state) in self.stuck_cases().items():
             with self.subTest(name):
-                routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [stuck_ticket(state)]),
+                issue = (stuck_ticket(state, body=BODY) if state == "briefed"
+                         else stuck_ticket(state))
+                routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [issue]),
                     ("GET", "/issues/9/events"): reply(200, events),
                     ("GET", "/issues/9/comments"): reply(200, comments)}
                 routes.update(lanes_routes(()))
@@ -4229,7 +4228,7 @@ class EscalateTests(unittest.TestCase):
     def test_escalate_takes_a_briefed_ticket_off_its_old_lane_in_the_count(self):
         # The stuck ticket sat briefed on claude, so it was counted there:
         # moving it to codex takes one off claude and puts one on codex.
-        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD, lane="claude"), [], [],
+        fake = LoadRouted(ticket_routes(stuck_ticket("briefed", created=OLD), [], [],
                                         free=("claude", "codex")), {REPO: {"claude": 5, "codex": 1}})
         with unittest.mock.patch.dict(os.environ, {"LOOM_BRIEF_AUTHORS": BRAIN, "LOOM_REPOS": ""}):
             outcome = brain.escalate(GitHub("t", transport=fake), REPO, 9)
