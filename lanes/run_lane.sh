@@ -3639,7 +3639,7 @@ base_retry_turn() {
   # path: keep them out of the commit this turn makes.
   rm -f "$TREE/.loom/replies.json"
   if [ -f "$TREE/$SUMMARY_FILE" ] && [ ! -L "$TREE/$SUMMARY_FILE" ]; then
-    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>/dev/null || true
+    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>> "$LOG" || return 1
   fi
   rm -f "$TREE/$SUMMARY_FILE"
   if [ -n "$(safe_git status --porcelain)" ]; then
