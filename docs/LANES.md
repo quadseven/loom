@@ -365,37 +365,53 @@ unset variables.
 
 ### Remote checks
 
-`LOOM_REMOTE_CHECKS=1` (off by default) lets a lane on a **public** repo use
-GitHub's hosted runners for its checks instead of waiting for a host check
-slot. A private repo, a fix round and a repo whose pushes start no checks keep
-the local slot path unchanged.
+`LOOM_REMOTE_CHECKS=1` (off by default) lets a lane on a **public** repo run
+its final check on a GitHub-hosted runner (free for public repos) instead of
+waiting for a host check slot. A private repo, a fix round, a repo with no
+check contract and a lane on a cluster runner keep the local slot path.
 
-- **Base check.** When the base commit's GitHub checks already passed (the
-  same test `github_checks_green` gives a host-only red), the base check is not
-  run and takes no slot. Any other state runs it on the host as before. The
-  `setup` step still runs on the host, since the agent works in that tree.
-- **Final check.** A new run does the pre-push gates, then pushes its work
-  branch (fast-forward only, never the default branch, after the leak scans),
-  and waits for that commit's checks with `gh api` (bounded:
-  `LOOM_REMOTE_CHECK_WAIT`, default 1800 seconds; poll
-  `LOOM_REMOTE_CHECK_POLL`, default 20). Green needs the same check count on
-  two polls in a row. The host base-test gate and the affected check are left
-  out of that pass, since both are host runs that would take a slot.
-- **Red.** The run parks as work with the failing test names read from the
-  failed jobs' logs (and their annotations), the same `FAIL:`, `FAILED` and
-  `--- FAIL` lines the local check yields, so the repair round sees them. The
-  edits are kept on the usual `-unvalidated-` side branch and the work branch
-  is removed (only while it still points at the pushed commit), so a retry
-  pushes fresh.
-- **No answer.** No check starting within `LOOM_REMOTE_CHECK_START_WAIT`
-  (default 180 seconds) or none finishing in the wait falls back to the full
-  local check, gate included, with a slot.
-- **Workflows that run only on `pull_request`.** A push to a work branch then
-  starts nothing, so the lane waits out the start window and runs the check
-  locally. The lane does not open a draft pull request to trigger them: that
-  would break the rule that a pull request opens only after the checks pass.
-  A repo that wants remote checks adds its work-branch pattern to the
-  workflow's `push:` trigger.
+Public repos usually run their own CI only on a push to their default branch,
+so the lane does not wait for the repo's checks on a work branch. This repo's
+`.github/workflows/remote-check.yml` runs the check instead: a
+`workflow_dispatch` with the repo, the commit, and the check spec the lane
+already resolved for that repo (`.loom/validation.conf`: submodules, setup and
+check). It checks the public repo out at that commit, runs the same commands
+the host would, with no secrets and read-only contents, and uploads a small
+result artifact: the exit code and up to twenty failing test names.
+
+- **Who dispatches.** The lanes' GitHub App has no `actions: write` (only the
+  station's does, as for `lane.yml`), so the lane files a request under
+  `$LOOM_HOME/state/remote-checks/` and the station dispatches the workflow
+  with its own App (`bus/remote_checks.py`). The station follows only the run
+  id the dispatch returned and believes a run only when it ran
+  `remote-check.yml` on `main` as a `workflow_dispatch` triggered by the
+  station's own App, and its conclusion agrees with the artifact. Any other
+  run is ignored, and the lane runs the check on the host.
+- **Base check.** When the base commit's GitHub checks already passed (those
+  repos do run CI on a push to their default branch; the test
+  `github_checks_green` gives a host-only red), the base check is not run and
+  takes no slot. Any other state runs it on the host as before. The `setup`
+  step still runs on the host, since the agent works in that tree.
+- **Final check.** A new run does the pre-push gates, pushes its work branch
+  (fast-forward only, never the default branch, after the leak scans), then
+  asks for the remote check and waits, bounded: `LOOM_REMOTE_CHECK_WAIT`
+  (default 1800 seconds) overall, `LOOM_REMOTE_CHECK_START_WAIT` (default 180)
+  for the station to pick the request up, polling every
+  `LOOM_REMOTE_CHECK_POLL` seconds (default 10). No host slot is taken. The
+  host base-test gate and the affected check are left out of that pass, since
+  both are host runs.
+- **Green** opens the pull request as before: a pull request still opens only
+  after the checks pass.
+- **Red** parks the run as work with the failing test names as `FAIL:` lines in
+  the log, so the repair round sees them. The edits are kept on the usual
+  `-unvalidated-` side branch and the work branch is removed (only while it
+  still points at the pushed commit), so a retry pushes fresh.
+- **No answer.** A dispatch error, a run that is not the station's, an
+  unreadable artifact, a station that is down or a timeout falls back to the
+  full local check, gate included, with a slot.
+- The check runs on `ubuntu-latest`; a repo whose check needs another
+  platform or a host tool should leave `LOOM_REMOTE_CHECKS` off or expect the
+  fallback.
 
 ### Validation gaps
 

@@ -1,0 +1,138 @@
+name: remote-check
+
+# A public repo's check, run on a GitHub-hosted runner (free for public repos)
+# instead of in a host check slot (docs/LANES.md, "Remote checks"). A lane with
+# LOOM_REMOTE_CHECKS=1 pushes its work commit and files a request; the
+# station dispatches this workflow on main with its own App (bus/remote_checks.py)
+# and reads back the small result artifact. The check spec is the one the lane
+# resolved for that repo (its .loom/validation.conf), so the commands are the
+# ones the lane would have run on the host.
+#
+# The job has no secrets and read-only contents, and every input reaches the
+# shell through the environment, never by interpolation into a script. The
+# target repo's code runs here, as it does on its own CI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Public repo to check, owner/name
+        required: true
+        type: string
+      sha:
+        description: Commit to check (40 hex digits)
+        required: true
+        type: string
+      run_id:
+        description: The station's id for this request (32 hex digits)
+        required: true
+        type: string
+      interpreter:
+        description: The check spec's interpreter (informational)
+        required: false
+        type: string
+      submodules:
+        description: The check spec's submodules, yes or no
+        required: false
+        type: string
+        default: "no"
+      setup:
+        description: The check spec's setup command
+        required: false
+        type: string
+      check:
+        description: The check spec's check command
+        required: true
+        type: string
+
+run-name: remote-check ${{ inputs.run_id }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-check-${{ inputs.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check one commit
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TARGET_REPO: ${{ inputs.repo }}
+      TARGET_SHA: ${{ inputs.sha }}
+      RUN_ID: ${{ inputs.run_id }}
+      SUBMODULES: ${{ inputs.submodules }}
+      SETUP_CMD: ${{ inputs.setup }}
+      CHECK_CMD: ${{ inputs.check }}
+    steps:
+      - name: Validate the inputs
+        shell: bash
+        run: |
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$ ]] || { echo "bad repo"; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad sha"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9a-f]{32}$ ]] || { echo "bad run id"; exit 1; }
+          case "$SUBMODULES" in yes|no|"") ;; *) echo "bad submodules"; exit 1 ;; esac
+          [ -n "$CHECK_CMD" ] || { echo "no check"; exit 1; }
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.sha }}
+          submodules: ${{ inputs.submodules == 'yes' && 'recursive' || 'false' }}
+          persist-credentials: false
+          path: target
+      - name: Setup and check
+        id: check
+        shell: bash
+        working-directory: target
+        run: |
+          # The commands run as the lane would run them: bash -c, one at a time.
+          # The step records the exit code and never fails on it; the last
+          # step does, after the result is uploaded.
+          rc=0
+          if [ -n "$SETUP_CMD" ]; then
+            /bin/bash -c "$SETUP_CMD" > "$RUNNER_TEMP/check.log" 2>&1 || rc=$?
+          fi
+          if [ "$rc" -eq 0 ]; then
+            /bin/bash -c "$CHECK_CMD" >> "$RUNNER_TEMP/check.log" 2>&1 || rc=$?
+          fi
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          tail -n 60 "$RUNNER_TEMP/check.log" || true
+      - name: Write the result
+        if: always()
+        shell: bash
+        env:
+          CHECK_EXIT: ${{ steps.check.outputs.exit }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/result"
+          # The failing test names, by the patterns lanes/run_lane.sh reads on
+          # the host (check_failure_set), bounded; a step that never ran is
+          # exit 1 with no names.
+          names="$(LC_ALL=C sed -nE \
+            -e 's/^(FAIL|ERROR): [^ ]+ \(([^)]+)\).*/\2/p' \
+            -e 's/^(FAIL|ERROR): ([^ ]+)$/\2/p' \
+            -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
+            -e 's/^--- FAIL: ([^ ]+).*/\1/p' "$RUNNER_TEMP/check.log" 2>/dev/null | LC_ALL=C sort -u | head -n 20 || true)"
+          code="${CHECK_EXIT:-1}"
+          [[ "$code" =~ ^[0-9]+$ ]] || code=1
+          NAMES="$names" CODE="$code" python3 -c '
+          import json, os
+          names = [n for n in os.environ["NAMES"].split("\n") if n][:20]
+          json.dump({"exit": int(os.environ["CODE"]), "failing": names},
+                    open(os.environ["RUNNER_TEMP"] + "/result/result.json", "w"))
+          '
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: remote-check-result-${{ inputs.run_id }}
+          path: ${{ runner.temp }}/result/result.json
+          retention-days: 1
+          if-no-files-found: error
+      - name: Fail when the check failed
+        if: always()
+        shell: bash
+        env:
+          CHECK_EXIT: ${{ steps.check.outputs.exit }}
+        run: '[ "${CHECK_EXIT:-1}" = 0 ]'

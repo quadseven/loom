@@ -2578,31 +2578,14 @@ check_failure_set() {  # log offset
     -e 's/^(FAILED|ERROR) ([^ ]+::[^ ]+).*/\2/p' \
     -e 's/^--- FAIL: ([^ ]+).*/\1/p' | LC_ALL=C sort -u
 }
-# The state of GitHub's own checks on a commit, one word and the number of
-# check runs: none (no check run), pending (one not completed), red (one
-# completed as anything but success, neutral or skipped; red wins over
-# pending), green, or error (the API call failed).
-github_checks_state() {  # sha
-  local runs total done_runs
-  runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || { echo "error 0"; return 0; }
-  [ -n "$runs" ] || { echo "none 0"; return 0; }
-  total="$(printf '%s\n' "$runs" | wc -l | tr -d ' ')"
-  done_runs="$(printf '%s\n' "$runs" | LC_ALL=C grep -E '^completed ' || true)"
-  if [ -n "$done_runs" ] && printf '%s\n' "$done_runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'; then
-    echo "red $total"
-  elif printf '%s\n' "$runs" | LC_ALL=C grep -qv '^completed '; then
-    echo "pending $total"
-  else
-    echo "green $total"
-  fi
-}
 # Whether GitHub's own checks passed on a commit: at least one check run,
 # and every one completed as success, neutral or skipped.
 github_checks_green() {  # sha
-  local state
-  state="$(github_checks_state "$1")"
-  [ "${state%% *}" = green ]
+  local runs
+  runs="$(timeout "$CHECK_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
+    --jq '.check_runs[] | "\(.status) \(.conclusion)"' 2>>"$LOG")" || return 1
+  [ -n "$runs" ] || return 1
+  ! printf '%s\n' "$runs" | LC_ALL=C grep -qvxE 'completed (success|neutral|skipped)'
 }
 # At most this many host-red tests may be set aside; a base red in more
 # places is not a sandbox quirk, and stays a factory incident.
@@ -3060,67 +3043,43 @@ release_check_slot() {
 }
 
 # LOOM_REMOTE_CHECKS=1 (off by default): on a PUBLIC repo a new run's final
-# check, and a base check whose commit GitHub already passed, run on GitHub's
-# hosted runners instead of taking a host check slot. A private repo, a fix
-# round and a repo whose pushes start no checks keep the local slot path.
-# docs/LANES.md, "Remote checks".
+# check runs on a GitHub-hosted runner through this repo's remote-check.yml,
+# and a base check whose commit GitHub already passed is not run, so neither
+# takes a host check slot. The lanes' App cannot dispatch a workflow, so the
+# request goes to the station through files (bus/remote_checks.py). A private
+# repo, a fix round, a repo with no check contract, a lane on a cluster runner
+# (no station files) and any dispatch error or timeout keep the local slot
+# path. docs/LANES.md, "Remote checks".
 REMOTE_CHECKS="${LOOM_REMOTE_CHECKS:-0}"
 REMOTE_CHECK_WAIT="${LOOM_REMOTE_CHECK_WAIT:-1800}"
 REMOTE_CHECK_START_WAIT="${LOOM_REMOTE_CHECK_START_WAIT:-180}"
-REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-20}"
+REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-10}"
 [[ "$REMOTE_CHECK_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_WAIT=1800
 [[ "$REMOTE_CHECK_START_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_START_WAIT=180
-[[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=20
-remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && repo_is_public; }
-# The failing tests of the red check runs on a commit, appended to the log in
-# the lines check_failure_names reads: the failed jobs' own logs and their
-# annotations, keeping only lines that name a failing test (the logs hold
-# output of the agent's own code, so nothing else is copied).
-remote_failure_log() {  # sha
-  local ids id name n=0 keep='^(FAIL|ERROR): |^(FAILED|ERROR) [^ ]+::|^--- FAIL: '
-  ids="$(timeout "$NET_TIMEOUT" gh api --paginate "repos/$REPO/commits/$1/check-runs?per_page=100" \
-    --jq '.check_runs[] | select(.status == "completed" and (.conclusion | IN("success","neutral","skipped") | not)) | "\(.id) \(.name)"' 2>>"$LOG")" || return 0
-  while IFS=' ' read -r id name; do
-    [[ "$id" =~ ^[0-9]+$ ]] || continue
-    n=$((n + 1)); [ "$n" -le 5 ] || break
-    printf 'GitHub check failed: %s\n' "$(printf '%s' "$name" | LC_ALL=C tr -cd 'A-Za-z0-9 ._/()+-' | cut -c1-120)" >> "$LOG"
-    timeout "$NET_TIMEOUT" gh api "repos/$REPO/actions/jobs/$id/logs" 2>>"$LOG" |
-      LC_ALL=C sed -E -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/^[0-9T:.Z-]+ //' |
-      LC_ALL=C grep -aE "$keep" | LC_ALL=C cut -c1-300 | head -n 40 >> "$LOG" || true
-    timeout "$NET_TIMEOUT" gh api "repos/$REPO/check-runs/$id/annotations" \
-      --jq '.[] | select(.annotation_level == "failure") | .message' 2>>"$LOG" |
-      LC_ALL=C grep -aE "$keep" | LC_ALL=C cut -c1-300 | head -n 20 >> "$LOG" || true
-  done <<<"$ids"
-}
-# Wait, bounded, for the GitHub checks on a pushed commit. Returns 0 green
-# (the same count on two polls in a row, so a check that registers late is
-# not missed), 1 red, 2 when the remote cannot answer: no check started within
-# LOOM_REMOTE_CHECK_START_WAIT seconds (a repo whose workflows run only on
-# pull_request) or none finished within LOOM_REMOTE_CHECK_WAIT. The caller
-# then runs the check locally.
+[[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=10
+remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && repo_is_public; }
+# Ask for the check of a pushed commit on GitHub and wait, bounded. Returns 0
+# green, 1 red (the failing test names are appended to the log as FAIL: lines,
+# the ones check_failures reads), 2 when the remote cannot answer: the caller
+# then runs the check on the host.
 wait_remote_checks() {  # sha
-  local start=$SECONDS state word count last=""
-  while :; do
-    state="$(github_checks_state "$1")"; word="${state%% *}"; count="${state##* }"
-    case "$word" in
-      red) return 1 ;;
-      green)
-        [ "$last" = "$count" ] && return 0
-        last="$count" ;;
-      none)
-        last=""
-        if [ $((SECONDS - start)) -ge "$REMOTE_CHECK_START_WAIT" ]; then
-          echo "no GitHub checks started on ${1:0:12} within ${REMOTE_CHECK_START_WAIT}s; running the check on the host" >> "$LOG"
-          return 2
-        fi ;;
-      *) last="" ;;
-    esac
-    if [ $((SECONDS - start)) -ge "$REMOTE_CHECK_WAIT" ]; then
-      echo "GitHub checks on ${1:0:12} not done after ${REMOTE_CHECK_WAIT}s ($word); running the check on the host" >> "$LOG"
-      return 2
-    fi
-    sleep "$REMOTE_CHECK_POLL"
-  done
+  local spec out word names name
+  spec="$CHECK_HOME/remote-check.spec"
+  mkdir -p "$CHECK_HOME" 2>/dev/null || return 2
+  printf '%s\n%s\n%s\n%s\n' "$C_INTERP" "$C_SUBMODULES" "$C_SETUP" "$C_CHECK" > "$spec" || return 2
+  out="$(cd "$LOOM_ROOT" && LOOM_HOME="$LOOM_HOME" timeout "$((REMOTE_CHECK_WAIT + 60))" python3 -B -m bus remote-check \
+    wait "$REPO" "$1" "$spec" "$REMOTE_CHECK_START_WAIT" "$REMOTE_CHECK_WAIT" "$REMOTE_CHECK_POLL" 2>>"$LOG" | tail -n 1)"
+  rm -f "$spec"
+  word="${out%% *}"
+  case "$word" in
+    green) return 0 ;;
+    red)
+      names="${out#red}"
+      for name in $names; do printf 'FAIL: %s\n' "$name" >> "$LOG"; done
+      return 1 ;;
+  esac
+  echo "no remote check answer for ${1:0:12} (${out:-none}); running the check on the host" >> "$LOG"
+  return 2
 }
 # Remove the work branch this run pushed for its remote check, only while it
 # still points at the commit pushed (never a branch someone else moved), so a
@@ -3757,7 +3716,7 @@ final_validation() {
     # runs that would take a slot, so they are left out of this pass; the
     # host fallback in remote_final_gate runs them.
     rc=0
-    echo "final check left to GitHub's checks on the pushed branch" >> "$LOG"
+    echo "final check left to the remote check on the pushed branch" >> "$LOG"
   else
     contract_run "$C_CHECK"; rc=$?
   fi
@@ -3864,7 +3823,7 @@ final_validation() {
     *) [ -n "$VALIDATION_REASON" ] ||
          VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}" "${REMOTE_FINAL:+check left to GitHub after the push}")"
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}" "${REMOTE_FINAL:+check left to the remote check after the push}")"
   [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
@@ -3872,16 +3831,17 @@ final_validation() {
   VALIDATED="check exited 0 at ${rev:0:12}"
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
-  [ -z "${REMOTE_FINAL:-}" ] || VALIDATED="the check is left to GitHub's checks at ${rev:0:12}"
+  [ -z "${REMOTE_FINAL:-}" ] || VALIDATED="the check is left to the remote check at ${rev:0:12}"
   [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
   assess_validation_paths
 }
 
 # A new run on a public repo with LOOM_REMOTE_CHECKS: the work branch is
-# pushed (after every pre-push gate), and its GitHub checks stand in for the
-# host check. Green passes the run on to the pull request; red parks it with
-# the failing tests named, keeping the edits on a side branch and removing
-# the work branch; no checks or no answer in time runs the host check, with
+# pushed (after every pre-push gate), and a check on a GitHub-hosted runner
+# (remote-check.yml, through the station) stands in for the host check.
+# Green passes the run on to the pull request; red parks it with the failing
+# tests named, keeping the edits on a side branch and removing
+# the work branch; no answer, an error or a timeout runs the host check, with
 # its slot, as without the setting. Returns 1 when the run is parked.
 remote_final_gate() {
   local rev rc offset failing
@@ -3890,14 +3850,13 @@ remote_final_gate() {
   wait_remote_checks "$rev"; rc=$?
   case "$rc" in
     0)
-      VALIDATED="GitHub checks green at ${rev:0:12}; no host check slot taken"
-      record final "$C_CHECK" 0 "$rev" true "GitHub checks green on the pushed branch"
+      VALIDATED="the remote check passed at ${rev:0:12}; no host check slot taken"
+      record final "$C_CHECK" 0 "$rev" true "remote check green; no host check slot taken"
       return 0 ;;
     1)
-      remote_failure_log "$rev"
       failing="$(failing_summary "$offset")"
-      VALIDATION_REASON="validation failed: GitHub's checks were red at ${rev:0:12}${failing:+ (failing: $failing)}"
-      record final "$C_CHECK" 1 "$rev" false "GitHub checks red${failing:+; failing: $failing}"
+      VALIDATION_REASON="validation failed: the remote check was red at ${rev:0:12}${failing:+ (failing: $failing)}"
+      record final "$C_CHECK" 1 "$rev" false "remote check red${failing:+; failing: $failing}"
       park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); no pull request opened" ""
       drop_remote_branch "$rev"
       return 1 ;;

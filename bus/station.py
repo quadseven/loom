@@ -57,7 +57,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
-from . import lane_state, runners
+from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
 from . import shadow
@@ -18527,6 +18527,12 @@ class Station:
                 raise
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
+            try:
+                self._timed(self.tend_remote_checks)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_remote_checks failed: %s" % err)
             self.report_outcomes()
             # A ticket left loom:running after its run ended counts as lane
             # load, so it is settled before queued tickets look for a lane.
@@ -18716,6 +18722,24 @@ class Station:
             actor = None
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
+
+    def tend_remote_checks(self) -> None:
+        """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
+        write back their results (bus/remote_checks.py). Nothing happens
+        without a request or a run in flight."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        directory = remote_checks.root(self.s.home)
+        if not (os.path.isdir(os.path.join(directory, "req")) and repo):
+            return
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for remote checks: %s" % err)
+            actor = None
+        remote_checks.RemoteChecks(self.gh, self.s.home, repo, self._public, _say,
+                                   actor=actor, now=self.now).tend()
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""
