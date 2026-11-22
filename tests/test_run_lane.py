@@ -9126,12 +9126,14 @@ echo fixed > fix.txt
         self.assertEqual(dispatched, [])
 
     def test_a_red_remote_check_feeds_the_failing_test_names_to_the_repair_round(self):
-        _, dispatched = self.fake_station(exit_code=1, failing=["tests.test_a.ATest.test_x"])
-        log = self.run_remote(FAKE_GH_CHECKS="")
+        cwd = Path(self._tmp.name)
+        (cwd / "test_casea").touch()
+        _, dispatched = self.fake_station(exit_code=1, failing=["tests.test_a.ATest.test_x", "test_case[a]"])
+        log = self.run_remote(cwd=cwd, FAKE_GH_CHECKS="")
         self.assertEqual(len(dispatched), 1)
         self.assertIn("failed: [work]", log)
         self.assertIn("the remote check was red", log)
-        self.assertIn("(failing: tests.test_a.ATest.test_x)", log)
+        self.assertIn("(failing: tests.test_a.ATest.test_x, test_case[a])", log)
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
         self.assertIn("unvalidated", self.remote_heads())
         self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())

@@ -3063,7 +3063,8 @@ remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" !=
 # the ones check_failures reads), 2 when the remote cannot answer: the caller
 # then runs the check on the host.
 wait_remote_checks() {  # sha
-  local spec out word names name
+  local spec out word name
+  local -a names
   spec="$CHECK_HOME/remote-check.spec"
   mkdir -p "$CHECK_HOME" 2>/dev/null || return 2
   printf '%s\n%s\n%s\n%s\n' "$C_INTERP" "$C_SUBMODULES" "$C_SETUP" "$C_CHECK" > "$spec" || return 2
@@ -3074,8 +3075,8 @@ wait_remote_checks() {  # sha
   case "$word" in
     green) return 0 ;;
     red)
-      names="${out#red}"
-      for name in $names; do printf 'FAIL: %s\n' "$name" >> "$LOG"; done
+      IFS=' ' read -r -a names <<< "$out"
+      for name in "${names[@]:1}"; do printf 'FAIL: %s\n' "$name" >> "$LOG"; done
       return 1 ;;
   esac
   echo "no remote check answer for ${1:0:12} (${out:-none}); running the check on the host" >> "$LOG"
