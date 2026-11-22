@@ -76,6 +76,12 @@ class Workflow(unittest.TestCase):
         for block in re.findall(r"run: \|?\n?((?:\s{10}.*\n)+)", self.text):
             self.assertNotIn("${{", block)
 
+    def test_uv_is_installed_before_the_check_as_on_the_lane_image(self):
+        # A hosted runner has no uv; contracts that call uvx failed at once without it.
+        uv = self.text.index("astral-sh/setup-uv@")
+        self.assertLess(uv, self.text.index("- name: Setup and check"))
+        self.assertRegex(self.text, r"astral-sh/setup-uv@[0-9a-f]{40} ")
+
     def test_it_takes_the_inputs_the_station_sends(self):
         for name in ("repo", "sha", "run_id", "interpreter", "submodules", "setup", "check"):
             self.assertRegex(self.text, r"(?m)^      %s:$" % name)

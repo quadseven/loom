@@ -83,6 +83,10 @@ jobs:
           submodules: ${{ inputs.submodules == 'yes' && 'recursive' || 'false' }}
           persist-credentials: false
           path: target
+      # The lane image carries uv and uvx; ubuntu-latest does not, and a contract
+      # such as `bash scripts/check-locally.sh all` stops at once with "uvx is not
+      # on PATH". Pinned by commit like every action here.
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8
       - name: Setup and check
         id: check
         shell: bash
