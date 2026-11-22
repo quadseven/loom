@@ -2675,6 +2675,17 @@ no service account token, and its code is read-only and owned by root. The image
 python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
 CLI, plus this repo and the leak scanner at a pinned commit.
 
+Two settings serve a codex slot that runs on a login shared outside the
+operator's own repos. `LOOM_PUBLIC_ONLY_SLOTS` (space- or comma-separated, empty
+by default) names slots that take public repos only, whatever their provider:
+the station never claims a private repo's ticket for one
+(`station.needs_public_repo`), and the runner parks a brief for a private repo
+(`trains_on_prompts` in `lanes/run_lane.sh`), so the rule holds even when only
+the lane's container carries the setting. `LOOM_CODEX_EFFORT` (none, minimal,
+low, medium, high or xhigh) sets a codex lane run's reasoning effort with
+`-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
+config's own setting applies. A brain run ignores it.
+
 A long-lived lane pod takes no work from the station. Lane runs on the
 cluster go through ephemeral runners instead (next section).
 

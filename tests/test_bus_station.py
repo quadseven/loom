@@ -7418,6 +7418,32 @@ class RetryTest(Base):
         named = set(re.search(r'case "\$SLOT" in ([\w|-]+)\)', body).group(1).split("|"))
         self.assertEqual(named, {x for x in factory.PUBLIC_ONLY if x.startswith("free-")})
 
+    def test_loom_public_only_slots_names_slots_that_need_a_public_repo(self):
+        # A slot on a login shared outside the operator's repos (LOOM_PUBLIC_ONLY_SLOTS)
+        # is public only at the station, whatever its provider.
+        with mock.patch.dict(os.environ, {"LOOM_PUBLIC_ONLY_SLOTS": "codex-5, codex-6 codex-7"}):
+            self.assertEqual(station.public_only_slots(), ["codex-5", "codex-6", "codex-7"])
+            for slot in ("codex-5", "codex-6", "codex-7"):
+                self.assertTrue(station.needs_public_repo(slot, "gpt-x"), slot)
+            for slot in ("codex", "codex-4", "codex-50", "claude"):
+                self.assertFalse(station.needs_public_repo(slot, "gpt-x"), slot)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LOOM_PUBLIC_ONLY_SLOTS", None)
+            self.assertEqual(station.public_only_slots(), [])
+            self.assertFalse(station.needs_public_repo("codex-5", "gpt-x"))
+
+    def test_the_lane_runner_refuses_a_private_repo_for_a_public_only_slot(self):
+        root = Path(__file__).resolve().parent.parent
+        script = (root / "lanes" / "run_lane.sh").read_text()
+        body = script.split("trains_on_prompts() {", 1)[1].split("\n}\n", 1)[0]
+        harness = "SLOT=%s; LANE=codex; MODEL=gpt-x\ntrains_on_prompts() {%s\n}\ntrains_on_prompts"
+        for slot, listed, trains in (("codex-5", "codex-5 codex-6", 0), ("codex-6", "codex-5,codex-6", 0),
+                                     ("codex-4", "codex-5 codex-6", 1), ("codex-5", "", 1),
+                                     ("codex-50", "codex-5", 1)):
+            res = subprocess.run(["/bin/bash", "-c", harness % (slot, body)], capture_output=True, text=True,
+                                 env={"PATH": "/usr/bin:/bin", "LOOM_PUBLIC_ONLY_SLOTS": listed})
+            self.assertEqual(res.returncode, trains, (slot, listed, res.stderr))
+
 
 class SilentLaneTest(Base):
     """A running ticket on a lane with no heartbeat for 30 minutes (loom#538):

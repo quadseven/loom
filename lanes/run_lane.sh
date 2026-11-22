@@ -4200,6 +4200,9 @@ trains_on_prompts() {
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
   case "$SLOT" in free-nvidia|free-kilo|free-groq|free-openrouter) return 0 ;; esac
+  # LOOM_PUBLIC_ONLY_SLOTS (bus/station.py public_only_slots): slots on a login
+  # shared outside the operator's own repos.
+  case " $(printf '%s' "${LOOM_PUBLIC_ONLY_SLOTS:-}" | tr ',' ' ' | tr -s '[:space:]' ' ') " in *" $SLOT "*) return 0 ;; esac
   return 1
 }
 

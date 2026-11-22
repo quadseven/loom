@@ -2161,13 +2161,21 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def public_only_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The slots LOOM_PUBLIC_ONLY_SLOTS (space or comma separated) names: a
+    slot that runs on a login shared outside the operator's own repos takes
+    public repos only, whatever its provider. Empty by default."""
+    env = os.environ if env is None else env
+    return [n for n in re.split(r"[\s,]+", str(env.get("LOOM_PUBLIC_ONLY_SLOTS") or "").strip()) if n]
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
     to its provider: free-nvidia, free-kilo and free-groq are free provider
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
-    if lane in factory.PUBLIC_ONLY:
+    if lane in factory.PUBLIC_ONLY or lane in public_only_slots():
         return True
     # A cluster runner's inputs and logs live in this public repo's Actions
     # (bus/runners.py).
