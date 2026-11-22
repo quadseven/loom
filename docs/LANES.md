@@ -363,6 +363,40 @@ unset variables.
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
 
+### Remote checks
+
+`LOOM_REMOTE_CHECKS=1` (off by default) lets a lane on a **public** repo use
+GitHub's hosted runners for its checks instead of waiting for a host check
+slot. A private repo, a fix round and a repo whose pushes start no checks keep
+the local slot path unchanged.
+
+- **Base check.** When the base commit's GitHub checks already passed (the
+  same test `github_checks_green` gives a host-only red), the base check is not
+  run and takes no slot. Any other state runs it on the host as before. The
+  `setup` step still runs on the host, since the agent works in that tree.
+- **Final check.** A new run does the pre-push gates, then pushes its work
+  branch (fast-forward only, never the default branch, after the leak scans),
+  and waits for that commit's checks with `gh api` (bounded:
+  `LOOM_REMOTE_CHECK_WAIT`, default 1800 seconds; poll
+  `LOOM_REMOTE_CHECK_POLL`, default 20). Green needs the same check count on
+  two polls in a row. The host base-test gate and the affected check are left
+  out of that pass, since both are host runs that would take a slot.
+- **Red.** The run parks as work with the failing test names read from the
+  failed jobs' logs (and their annotations), the same `FAIL:`, `FAILED` and
+  `--- FAIL` lines the local check yields, so the repair round sees them. The
+  edits are kept on the usual `-unvalidated-` side branch and the work branch
+  is removed (only while it still points at the pushed commit), so a retry
+  pushes fresh.
+- **No answer.** No check starting within `LOOM_REMOTE_CHECK_START_WAIT`
+  (default 180 seconds) or none finishing in the wait falls back to the full
+  local check, gate included, with a slot.
+- **Workflows that run only on `pull_request`.** A push to a work branch then
+  starts nothing, so the lane waits out the start window and runs the check
+  locally. The lane does not open a draft pull request to trigger them: that
+  would break the rule that a pull request opens only after the checks pass.
+  A repo that wants remote checks adds its work-branch pattern to the
+  workflow's `push:` trigger.
+
 ### Validation gaps
 
 When a lane pull request goes back for a fix round on a red CI job, the

@@ -92,6 +92,14 @@ if [ "$1" = api ]; then
   case "$*" in
     # A commit's GitHub checks, one "status conclusion" line each, from
     # $FAKE_GH_CHECKS (default none).
+    # The failed runs ("ID NAME" lines, $FAKE_GH_FAILED_RUNS), a job's log
+    # ($FAKE_GH_JOB_LOG) and a run's annotations (none).
+    "api --paginate repos/"*"/check-runs"*".id"*)
+      printf '%s' "${FAKE_GH_FAILED_RUNS:-}"; exit 0 ;;
+    "api repos/"*"/actions/jobs/"*"/logs")
+      printf '%s' "${FAKE_GH_JOB_LOG:-}"; exit 0 ;;
+    "api repos/"*"/check-runs/"*"/annotations"*)
+      exit 0 ;;
     "api --paginate repos/"*"/check-runs"*)
       printf '%s' "${FAKE_GH_CHECKS:-}"; exit 0 ;;
     "api --paginate repos/"*"/comments --jq "*)
@@ -2259,7 +2267,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         heads = subprocess.run(
             ["git", "ls-remote", "--heads", str(self.remote), "loom/42-fix-the-thing"],
             capture_output=True, text=True, check=True).stdout
-        self.assertIn("refs/heads/loom/42-fix-the-thing", heads)
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", heads)
         self.assertIn("\nRefs example/repo" "#42", self.body.read_text())
 
     FIX_BRANCH = "loom/42-fix-the-thing"
@@ -9013,6 +9021,79 @@ echo fixed > fix.txt
         self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertEqual((held / "pid").read_text().strip(), str(os.getpid()))
+
+    # LOOM_REMOTE_CHECKS: a public repo's check runs on GitHub's runners, not
+    # in a host check slot. The contract below has no setup step and a check
+    # that fails on the host (nothing prepares the tree), so a pass proves the
+    # check never ran there.
+    REMOTE_CONTRACT = "interpreter: loom-test-python\ncheck: test -f .prepared && loom-test-python check.py\n"
+    REMOTE_ENV = {"LOOM_REMOTE_CHECKS": "1", "LOOM_REMOTE_CHECK_POLL": "0.2",
+                  "LOOM_REMOTE_CHECK_WAIT": "2", "LOOM_REMOTE_CHECK_START_WAIT": "2"}
+
+    def run_remote(self, contract=None, hold_slot=False, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract=contract or CONTRACT)
+        self.drop_brief()
+        if hold_slot:
+            held = self.loom / "run" / "check-slots" / "slot-1"
+            held.mkdir(parents=True)
+            (held / "pid").write_text(f"{os.getpid()}\n")
+            env.update(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.2")
+        result = self.run_contract_lane(**{**self.REMOTE_ENV, **env})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.lane_log()
+
+    def test_remote_checks_on_a_public_repo_take_no_check_slot(self):
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True, FAKE_GH_CHECKS=self.GREEN_CHECKS)
+        self.assertNotIn("waiting for a check slot", log)
+        self.assertNotIn("failed:", log)
+        self.assertIn("base check not run: GitHub's checks passed", log)
+        self.assertIn("final check left to GitHub's checks", log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", self.remote_heads())
+
+    def test_remote_checks_on_a_private_repo_still_take_a_check_slot(self):
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True,
+                              FAKE_GH_CHECKS=self.GREEN_CHECKS, FAKE_GH_PRIVATE="true")
+        self.assertIn("waiting for a check slot", log)
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("final check left to GitHub", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_remote_checks_stay_off_unless_set(self):
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True,
+                              FAKE_GH_CHECKS=self.GREEN_CHECKS, LOOM_REMOTE_CHECKS="0")
+        self.assertIn("waiting for a check slot", log)
+        self.assertNotIn("GitHub's checks", log)
+
+    def test_red_remote_checks_feed_the_failing_test_names_to_the_repair_round(self):
+        log = self.run_remote(
+            FAKE_GH_CHECKS="completed failure\n", FAKE_GH_FAILED_RUNS="123 unittest-linux\n",
+            FAKE_GH_JOB_LOG="2026-11-20T10:00:00.1234567Z FAIL: test_x (tests.test_a.ATest.test_x)\n"
+                            "2026-11-20T10:00:01.1234567Z ordinary output a log may carry\n")
+        self.assertIn("failed: [work]", log)
+        self.assertIn("GitHub's checks were red", log)
+        self.assertIn("(failing: tests.test_a.ATest.test_x)", log)
+        self.assertNotIn("ordinary output", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("unvalidated", self.remote_heads())
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+
+    def test_remote_checks_that_never_finish_fall_back_to_the_local_check_and_slot(self):
+        log = self.run_remote(FAKE_GH_CHECKS="in_progress null\n")
+        self.assertIn("not done after 2s", log)
+        self.assertIn("running the check on the host", log)
+        self.assertNotIn("failed:", log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+        finals = [r for r in self.records() if r["phase"] == "final"]
+        self.assertEqual(len(finals), 2, finals)
+        self.assertIn("left to GitHub", finals[0]["detail"])
+        self.assertNotIn("GitHub", finals[1]["detail"])
+
+    def test_a_push_that_starts_no_github_checks_runs_the_local_check(self):
+        log = self.run_remote(FAKE_GH_CHECKS="")
+        self.assertIn("no GitHub checks started", log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
 
     def test_a_lane_run_releases_its_check_slot(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
