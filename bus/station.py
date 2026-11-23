@@ -26,6 +26,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -825,6 +826,9 @@ PAUSED_STEPS_FILE = "paused_steps.txt"
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
 SLOW_STEP_SECONDS = 60
+# How often remote checks are tended while a pass runs (loom#3499).
+REMOTE_TEND_SECONDS = 60
+_REMOTE_LOCK = threading.Lock()
 # A loom:ticket with no state label is queued (loom#1653), a few an hour.
 STATELESS_EVERY = 3600
 STATELESS_PER_RUN = 5
@@ -18214,6 +18218,7 @@ class Station:
         return True
 
     def end_pass(self) -> None:
+        self.stop_remote_tender()
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
         gh = self.gh
@@ -18555,6 +18560,7 @@ class Station:
                 _say("log capture: %s holds logs from %s" % (source.name, first))
 
     def run_pass(self) -> None:
+        self.start_remote_tender()
         self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
@@ -18773,10 +18779,40 @@ class Station:
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
 
-    def tend_remote_checks(self) -> None:
+    def start_remote_tender(self) -> None:
+        """Tend remote checks every REMOTE_TEND_SECONDS while the pass runs,
+        so a result does not wait for the pass to reach its step (a pass takes
+        15 to 20 minutes). The step in the pass stays; both take one lock."""
+        if getattr(self, "_remote_thread", None) is not None:
+            return
+        stop = threading.Event()
+
+        def loop() -> None:
+            while not stop.wait(REMOTE_TEND_SECONDS):
+                try:
+                    self.tend_remote_checks(now=time.time())
+                except (RateLimited, TargetReached, GitHubError, OSError, ValueError,
+                        runners.ReportError) as err:
+                    _say("remote check tender: %s" % type(err).__name__)
+
+        self._remote_stop = stop
+        self._remote_thread = threading.Thread(target=loop, name="remote-checks", daemon=True)
+        self._remote_thread.start()
+
+    def stop_remote_tender(self) -> None:
+        stop = getattr(self, "_remote_stop", None)
+        if stop is not None:
+            stop.set()
+        self._remote_thread = None
+
+    def tend_remote_checks(self, now: Optional[float] = None) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
         write back their results (bus/remote_checks.py). Nothing happens
         without a request or a run in flight."""
+        with _REMOTE_LOCK:
+            self._tend_remote_checks(now)
+
+    def _tend_remote_checks(self, now: Optional[float]) -> None:
         repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
         directory = remote_checks.root(self.s.home)
         if not (os.path.isdir(os.path.join(directory, "req")) and repo):
@@ -18789,7 +18825,7 @@ class Station:
             _say("could not read the station App's login for remote checks: %s" % err)
             actor = None
         remote_checks.RemoteChecks(self.gh, self.s.home, repo, self._public, _say,
-                                   actor=actor, now=self.now).tend()
+                                   actor=actor, now=self.now if now is None else now).tend()
 
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""
