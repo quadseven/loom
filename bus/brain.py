@@ -5240,7 +5240,16 @@ def _split_packed_header_line(line: str) -> List[str]:
         if hk == "Deliverable" or prose_start is not None:
             value = line[pos + len(hk) + 1:next_pos].strip()
             valid, _ = tickets._HEADER_RULES[hk]
-            if not valid(value.lower() if hk == "Difficulty" else value):
+            ok = valid(value.lower() if hk == "Difficulty" else value)
+            if ok and hk == "Deliverable" and i + 1 < len(positions):
+                # A following Model/Base whose own value is prose-shaped
+                # belongs to the Deliverable text, so judge the whole span.
+                npos, nhk = positions[i + 1]
+                if nhk in ("Model", "Base"):
+                    nnext = positions[i + 2][0] if i + 2 < len(positions) else len(line)
+                    nval = line[npos + len(nhk) + 1:nnext].strip()
+                    ok = tickets._HEADER_RULES[nhk][0](nval)
+            if not ok:
                 if prose_start is None:
                     prose_start = pos
                 continue
