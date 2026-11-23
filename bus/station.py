@@ -57,7 +57,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
-from . import lane_state, runners
+from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
 from . import shadow
@@ -1904,9 +1904,13 @@ REFUSED_BODY = (400, 413, 422)
 class UploadRefused(OSError):
     """The dashboard read the body and refused it (REFUSED_BODY)."""
 
-    def __init__(self, status: int) -> None:
-        super().__init__("the transcript upload answered %d" % status)
+    def __init__(self, status: int, error_text: str = "") -> None:
+        msg = "the transcript upload answered %d" % status
+        if error_text:
+            msg += ": %s" % error_text
+        super().__init__(msg)
         self.status = status
+        self.error_text = error_text
 
 
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
@@ -1921,13 +1925,28 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status = resp.status
+            if status in REFUSED_BODY:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    error_data = json.loads(raw)
+                    error_text = str(error_data.get("error", ""))
+                except ValueError:
+                    error_text = raw[:200]
+                raise UploadRefused(status, error_text)
     except urllib.error.HTTPError as err:
         status = err.code
+        if status in REFUSED_BODY:
+            raw = err.read().decode("utf-8", "replace")
+            try:
+                error_data = json.loads(raw)
+                error_text = str(error_data.get("error", ""))
+            except ValueError:
+                error_text = raw[:200]
+            err.close()
+            raise UploadRefused(status, error_text)
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
-    if status in REFUSED_BODY:
-        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -2161,13 +2180,21 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def public_only_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The slots LOOM_PUBLIC_ONLY_SLOTS (space or comma separated) names: a
+    slot that runs on a login shared outside the operator's own repos takes
+    public repos only, whatever its provider. Empty by default."""
+    env = os.environ if env is None else env
+    return [n for n in re.split(r"[\s,]+", str(env.get("LOOM_PUBLIC_ONLY_SLOTS") or "").strip()) if n]
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
     to its provider: free-nvidia, free-kilo and free-groq are free provider
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
-    if lane in factory.PUBLIC_ONLY:
+    if lane in factory.PUBLIC_ONLY or lane in public_only_slots():
         return True
     # A cluster runner's inputs and logs live in this public repo's Actions
     # (bus/runners.py).
@@ -15379,8 +15406,11 @@ class Station:
             except UploadRefused as err:
                 # The dashboard is up and refused this body: give it up now and
                 # send the next, so one bad run never blocks the rest.
-                _say("the dashboard refused the transcript of %s (%d); given up"
-                     % (key, err.status))
+                msg = "the dashboard refused the transcript of %s (%d)" % (key, err.status)
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                msg += "; given up"
+                _say(msg)
                 self._record(ledger, key, tick, "refused")
                 _write_json(path, ledger)
                 continue
@@ -15474,7 +15504,11 @@ class Station:
             ledger["closings_safe"] = False
             ledger.pop("closings_cache", None)
         except UploadRefused as err:
-            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            msg = "the dashboard refused the brain tick of %s (%d)" % (when, err.status)
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; given up"
+            _say(msg)
             result = "refused"
         # Deliberately broad, as in upload_transcripts: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -15514,10 +15548,13 @@ class Station:
             ledger["closings_cache"] = [c for _, c in closings]
             if fails >= CLOSE_SAFE_AFTER:
                 ledger["closings_safe"] = True
-            _say("could not send the brain's done markers (UploadRefused status %d); "
-                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
-                                           "; safe mode on, caching locally"
-                                           if ledger.get("closings_safe") else ""))
+            msg = "could not send the brain's done markers (UploadRefused status %d)" % err.status
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; next in %d minutes%s" % (max(1, delay // 60),
+                                               "; safe mode on, caching locally"
+                                               if ledger.get("closings_safe") else "")
+            _say(msg)
             return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -18519,6 +18556,12 @@ class Station:
                 raise
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
+            try:
+                self._timed(self.tend_remote_checks)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_remote_checks failed: %s" % err)
             self.report_outcomes()
             # A ticket left loom:running after its run ended counts as lane
             # load, so it is settled before queued tickets look for a lane.
@@ -18709,6 +18752,24 @@ class Station:
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
 
+    def tend_remote_checks(self) -> None:
+        """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
+        write back their results (bus/remote_checks.py). Nothing happens
+        without a request or a run in flight."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        directory = remote_checks.root(self.s.home)
+        if not (os.path.isdir(os.path.join(directory, "req")) and repo):
+            return
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for remote checks: %s" % err)
+            actor = None
+        remote_checks.RemoteChecks(self.gh, self.s.home, repo, self._public, _say,
+                                   actor=actor, now=self.now).tend()
+
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
@@ -18722,7 +18783,10 @@ class Station:
                 self.upload(url, token, records)
                 return
             except UploadRefused as err:
-                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                msg = "the dashboard refused the usage snapshot (%d)" % err.status
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                _say(msg)
                 return
             except Exception as err:  # noqa: BLE001
                 if attempt == 1:

@@ -4,6 +4,7 @@ the remote, and fake agent and gh commands on PATH that record their calls."""
 import base64
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import sys
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import unittest
@@ -25,7 +27,8 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from bus import hunt_plan, labels, pr_repair, text, tickets  # noqa: E402
+from bus import hunt_plan, labels, pr_repair, remote_checks, text, tickets  # noqa: E402
+from bus.github import Response  # noqa: E402
 from tests import sandbox_caps, session_procs  # noqa: E402
 from tests.local_http import LocalHTTPServer  # noqa: E402
 
@@ -9013,6 +9016,155 @@ echo fixed > fix.txt
         self.assertFalse(list((self.loom / "state" / "incidents").glob("*base-check")))
         self.assertFalse(any(c.startswith("codex") for c in self.calls()))
         self.assertEqual((held / "pid").read_text().strip(), str(os.getpid()))
+
+    # LOOM_REMOTE_CHECKS: a public repo's final check runs through
+    # remote-check.yml on GitHub's runners, asked for through the station, and
+    # takes no host check slot. The contract below has no setup step and a
+    # check that fails on the host (nothing prepares the tree), so a pass
+    # proves the check never ran there. The station is the real
+    # bus.remote_checks.RemoteChecks on a fake GitHub, tended by a thread.
+    REMOTE_CONTRACT = "interpreter: loom-test-python\ncheck: test -f .prepared && loom-test-python check.py\n"
+    REMOTE_ENV = {"LOOM_REMOTE_CHECKS": "1", "LOOM_REMOTE_CHECK_POLL": "0.2",
+                  "LOOM_REMOTE_CHECK_WAIT": "6", "LOOM_REMOTE_CHECK_START_WAIT": "3"}
+    STATION_ACTOR = "loom-station[bot]"
+    GREEN_CHECKS = "completed success\ncompleted skipped\n"
+
+    def fake_station(self, exit_code=0, failing=(), actor=None, finish=True):
+        """A station thread: tends real RemoteChecks with a fake GitHub until
+        stopped. Returns (stop, dispatched), the inputs of each dispatch."""
+        class Dispatched(list):
+            said = None
+
+        dispatched = Dispatched()
+        said = []
+        outer = self
+
+        class FakeGH:
+            def rest(self, method, path, body=None, ok=()):
+                if method == "POST" and path.endswith("/remote-check.yml/dispatches"):
+                    dispatched.append(body["inputs"])
+                    return Response(200, {"workflow_run_id": 777})
+                if path.endswith("/actions/runs/777"):
+                    done = finish
+                    return Response(200, {
+                        "head_branch": "main", "event": "workflow_dispatch",
+                        "path": ".github/workflows/remote-check.yml@refs/heads/main",
+                        "triggering_actor": {"login": actor or outer.STATION_ACTOR},
+                        "status": "completed" if done else "in_progress",
+                        "conclusion": ("success" if exit_code == 0 else "failure") if done else None})
+                if path.endswith("/actions/runs/777/artifacts"):
+                    return Response(200, {"artifacts": [
+                        {"id": 9, "name": remote_checks.ARTIFACT_PREFIX + dispatched[-1]["run_id"],
+                         "expired": False}]})
+                if path.endswith("/actions/artifacts/9/zip"):
+                    return Response(302, None, headers={"location": "https://example.invalid/zip"})
+                raise AssertionError((method, path))
+
+        def fetch(_url):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w") as zf:
+                zf.writestr("result.json", json.dumps({"exit": exit_code, "failing": list(failing)}))
+            return buf.getvalue()
+
+        stop = threading.Event()
+
+        def run():
+            while not stop.is_set():
+                remote_checks.RemoteChecks(
+                    FakeGH(), str(self.loom), "example/loom", lambda repo: True, said.append,
+                    actor=self.STATION_ACTOR, fetch=fetch).tend()
+                stop.wait(0.2)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(stop.set)
+        dispatched.said = said
+        return stop, dispatched
+
+    def run_remote(self, contract=None, hold_slot=False, station=None, **env):
+        self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
+        self.contract_repo(contract=contract or CONTRACT)
+        self.drop_brief()
+        if hold_slot:
+            held = self.loom / "run" / "check-slots" / "slot-1"
+            held.mkdir(parents=True)
+            (held / "pid").write_text(f"{os.getpid()}\n")
+            env.update(LOOM_CHECK_SLOTS="1", LOOM_CHECK_SLOT_WAIT="1", LOOM_CHECK_SLOT_POLL="0.2")
+        result = self.run_contract_lane(**{**self.REMOTE_ENV, **env})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.lane_log()
+
+    def test_remote_checks_on_a_public_repo_take_no_check_slot(self):
+        _, dispatched = self.fake_station()
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True, FAKE_GH_CHECKS=self.GREEN_CHECKS)
+        self.assertNotIn("waiting for a check slot", log)
+        self.assertNotIn("failed:", log)
+        self.assertIn("base check not run: GitHub's checks passed", log)
+        self.assertIn("final check left to the remote check", log)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["repo"], "example/repo")
+        self.assertEqual(dispatched[0]["check"], "test -f .prepared && loom-test-python check.py")
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+        self.assertIn("refs/heads/loom/T042-fix-the-thing", self.remote_heads())
+
+    def test_remote_checks_on_a_private_repo_still_take_a_check_slot(self):
+        _, dispatched = self.fake_station()
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True,
+                              FAKE_GH_CHECKS=self.GREEN_CHECKS, FAKE_GH_PRIVATE="true")
+        self.assertIn("waiting for a check slot", log)
+        self.assertIn("failed: [transient]", log)
+        self.assertNotIn("final check left to the remote check", log)
+        self.assertEqual(dispatched, [])
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_remote_checks_stay_off_unless_set(self):
+        _, dispatched = self.fake_station()
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, hold_slot=True,
+                              FAKE_GH_CHECKS=self.GREEN_CHECKS, LOOM_REMOTE_CHECKS="0")
+        self.assertIn("waiting for a check slot", log)
+        self.assertEqual(dispatched, [])
+
+    def test_a_red_remote_check_feeds_the_failing_test_names_to_the_repair_round(self):
+        cwd = Path(self._tmp.name)
+        (cwd / "test_casea").touch()
+        _, dispatched = self.fake_station(exit_code=1, failing=["tests.test_a.ATest.test_x", "test_case[a]"])
+        log = self.run_remote(cwd=cwd, FAKE_GH_CHECKS="")
+        self.assertEqual(len(dispatched), 1)
+        self.assertIn("failed: [work]", log)
+        self.assertIn("the remote check was red", log)
+        self.assertIn("(failing: tests.test_a.ATest.test_x, test_case[a])", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+        self.assertIn("unvalidated", self.remote_heads())
+        self.assertNotIn("refs/heads/loom/T042-fix-the-thing\n", self.remote_heads())
+
+    def test_a_remote_check_that_never_finishes_falls_back_to_the_local_check_and_slot(self):
+        _, dispatched = self.fake_station(finish=False)
+        log = self.run_remote(FAKE_GH_CHECKS="", LOOM_REMOTE_CHECK_WAIT="3")
+        self.assertEqual(len(dispatched), 1)
+        self.assertIn("no result in time", log)
+        self.assertIn("running the check on the host", log)
+        self.assertNotIn("failed:", log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+        finals = [r for r in self.records() if r["phase"] == "final"]
+        self.assertEqual(len(finals), 2, finals)
+        self.assertIn("left to the remote check", finals[0]["detail"])
+        self.assertNotIn("remote check", finals[1]["detail"])
+
+    def test_a_station_that_never_answers_falls_back_to_the_local_check(self):
+        log = self.run_remote(FAKE_GH_CHECKS="", LOOM_REMOTE_CHECK_START_WAIT="1")
+        self.assertIn("the station did not pick up the request", log)
+        self.assertTrue(any(c.startswith("gh pr create") for c in self.calls()), log)
+
+    def test_a_run_by_someone_else_is_ignored_and_the_check_runs_on_the_host(self):
+        # The run claims a pass, but its trigger is not the station's App: the
+        # lane runs the host check, which fails here, so nothing is opened.
+        _, dispatched = self.fake_station(actor="someone-else", exit_code=0)
+        log = self.run_remote(contract=self.REMOTE_CONTRACT, FAKE_GH_CHECKS=self.GREEN_CHECKS)
+        self.assertEqual(len(dispatched), 1)
+        self.assertIn("not the station's App", " ".join(dispatched.said))
+        self.assertIn("running the check on the host", log)
+        self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
 
     def test_a_lane_run_releases_its_check_slot(self):
         self.write_tool(self.bin / "sandbox-exec", '#!/bin/sh\nshift 2\nexec "$@"\n')
