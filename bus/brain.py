@@ -5195,12 +5195,8 @@ def _with_priority(body: str, priority: str) -> str:
     return _with_header(body, "Priority", priority)
 
 
-def _split_packed_header_line(line: str) -> List[str]:
-    """Split a line containing multiple packed headers into separate header lines.
-
-    Known header keys from HEADER_RE: Difficulty, Priority, Foundational, Model,
-    Base, Not before, After, Deliverable, Repairs incident.
-    """
+def _packed_header_starts(line: str) -> List[Tuple[int, str]]:
+    """Find candidate header keys in the order they appear on the line."""
     header_keys = (
         "Difficulty",
         "Priority",
@@ -5212,7 +5208,6 @@ def _split_packed_header_line(line: str) -> List[str]:
         "Deliverable",
         "Repairs incident",
     )
-    # Find all positions where a header key starts
     positions = []
     for hk in header_keys:
         search = hk + ":"
@@ -5225,9 +5220,35 @@ def _split_packed_header_line(line: str) -> List[str]:
             if idx == 0 or line[idx - 1].isspace():
                 positions.append((idx, hk))
             start = idx + 1
+    positions.sort()
+    return positions
+
+
+def _packed_header_value_is_valid(line: str, positions: List[Tuple[int, str]],
+                                  index: int, end: int) -> bool:
+    """Check whether the candidate can stand apart from Deliverable prose."""
+    pos, key = positions[index]
+    value = line[pos + len(key) + 1:end].strip()
+    if key == "Difficulty":
+        value = value.lower()
+    valid, _ = tickets._HEADER_RULES[key]
+    if not valid(value):
+        return False
+    if key == "Deliverable" and index + 1 < len(positions):
+        # A following Model/Base with an invalid value is part of the prose.
+        next_pos, next_key = positions[index + 1]
+        if next_key in ("Model", "Base"):
+            next_end = positions[index + 2][0] if index + 2 < len(positions) else len(line)
+            next_value = line[next_pos + len(next_key) + 1:next_end].strip()
+            return tickets._HEADER_RULES[next_key][0](next_value)
+    return True
+
+
+def _split_packed_header_line(line: str) -> List[str]:
+    """Split a line containing multiple packed headers into separate header lines."""
+    positions = _packed_header_starts(line)
     if not positions:
         return [line]
-    positions.sort()
     # AI-REVIEW 2026-11-23 [automated PR review] 4662635821 (PR #3463):
     # In free-form Deliverable text, resume at a header with a constrained,
     # valid value. Model and Base values can look like ordinary prose words.
@@ -5238,18 +5259,7 @@ def _split_packed_header_line(line: str) -> List[str]:
         if prose_start is not None and hk in ("Model", "Base", "Deliverable"):
             continue
         if hk == "Deliverable" or prose_start is not None:
-            value = line[pos + len(hk) + 1:next_pos].strip()
-            valid, _ = tickets._HEADER_RULES[hk]
-            ok = valid(value.lower() if hk == "Difficulty" else value)
-            if ok and hk == "Deliverable" and i + 1 < len(positions):
-                # A following Model/Base whose own value is prose-shaped
-                # belongs to the Deliverable text, so judge the whole span.
-                npos, nhk = positions[i + 1]
-                if nhk in ("Model", "Base"):
-                    nnext = positions[i + 2][0] if i + 2 < len(positions) else len(line)
-                    nval = line[npos + len(nhk) + 1:nnext].strip()
-                    ok = tickets._HEADER_RULES[nhk][0](nval)
-            if not ok:
+            if not _packed_header_value_is_valid(line, positions, i, next_pos):
                 if prose_start is None:
                     prose_start = pos
                 continue
