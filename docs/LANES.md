@@ -763,7 +763,8 @@ status event with its age.
 The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
-being the first ticket's in that order.
+being the first ticket's in that order, followed by `(by reason: N x ...)`
+counting every queued ticket's wait, since each is judged on its own.
 
 Lane status: every pass the station reads each lane's heartbeat and evaluates
 whether it is serving, limited, parked, or off. Local heartbeats are usable
