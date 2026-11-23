@@ -6449,6 +6449,22 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if "loom:failed" in labels and target != "loom:merged":
+            return
+        if target == "loom:merged" and "loom:failed" in labels:
+            states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
+            kept = self._drop_claim(name for name in labels
+                                    if name not in states and not name.startswith(("lane:", WAIT)))
+            kept.append("loom:merged")
+            self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                         {"labels": kept})
+            ticket["labels"] = [{"name": name} for name in kept]
+            self._routine(repo, int(number),
+                          "Pull request #%d merged, so this failed ticket moved to loom:merged."
+                          % int(pr["number"]))
+            _say("%s#%d: merged pull request #%d moved failed ticket to loom:merged"
+                 % (repo, number, int(pr["number"])))
+            return
         if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
                 self._status_texts(repo, int(number))):
             return
@@ -6558,6 +6574,11 @@ class Station:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
         open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        for issue in open_tickets:
+            if (isinstance(issue, dict) and "pull_request" not in issue
+                    and "loom:ticket" in _label_names(issue)
+                    and "loom:failed" in _label_names(issue)):
+                tickets_by_number.setdefault(int(issue["number"]), issue)
         self._open_work[repo] = {
             int(i["number"]) for i in open_tickets
             if isinstance(i, dict) and "pull_request" not in i and "number" in i
