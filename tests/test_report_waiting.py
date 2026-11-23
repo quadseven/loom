@@ -69,6 +69,20 @@ class CheckTest(unittest.TestCase):
         with self.assertRaisesRegex(journal.ReportInvalid, "Waiting on you"):
             journal.check_report(report("Waiting on you: nothing, 28 open needs:human"))
 
+    def test_a_blank_waiting_line_is_refused(self):
+        # loom#3506: a quoting bug left "Waiting on you:" empty.
+        for blank in ("Waiting on you:", "Waiting on you:   ", "- Waiting on you:"):
+            with self.assertRaisesRegex(journal.ReportInvalid, "is blank"):
+                journal.check_report(report(blank))
+
+    def test_two_asks_and_none_never_build_a_blank_line(self):
+        for counts, share in (({REPO: 2}, 2), ({}, 0)):
+            line = journal.waiting_line(counts, share)
+            self.assertTrue(line.split(":", 1)[1].strip())
+            journal.check_report(report(line))
+        self.assertIn("2 open needs:human", journal.waiting_line({REPO: 2}, 2))
+        self.assertEqual(journal.waiting_line({}, 0), "Waiting on you: nothing")
+
     def test_the_two_line_forms_pass(self):
         journal.check_report(report(journal.waiting_line({REPO: 28}, 4)))
         journal.check_report(report("Waiting on you: nothing"))

@@ -145,6 +145,13 @@ class RunnersTest(unittest.TestCase):
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
                           "anthropic-6", "anthropic-7", "anthropic-8"])
 
+    def test_copilot_can_be_configured_as_a_runner_slot(self):
+        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "copilot"}),
+                         ["copilot", "free-openrouter", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
+
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
