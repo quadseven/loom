@@ -3691,6 +3691,13 @@ base_retry_turn() {
   } > "$brief" || return 1
   ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
     run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  # The Intent summary and the replies file are runner metadata, as on the main
+  # path: keep them out of the commit this turn makes.
+  rm -f "$TREE/.loom/replies.json"
+  if [ -f "$TREE/$SUMMARY_FILE" ] && [ ! -L "$TREE/$SUMMARY_FILE" ]; then
+    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>> "$LOG" || return 1
+  fi
+  rm -f "$TREE/$SUMMARY_FILE"
   if [ -n "$(safe_git status --porcelain)" ]; then
     safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
   fi

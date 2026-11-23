@@ -140,14 +140,14 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
+                         ["claude", "zen", "free-kilo", "free-openrouter", "zai", "workersai",
                           "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
                           "anthropic-6", "anthropic-7", "anthropic-8"])
 
     def test_copilot_can_be_configured_as_a_runner_slot(self):
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "copilot"}),
-                         ["copilot", "free-openrouter", "workersai", "opencode-go-1",
+                         ["copilot", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
                           "anthropic-6", "anthropic-7", "anthropic-8"])
@@ -157,7 +157,7 @@ class RunnersTest(unittest.TestCase):
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
+                         ["free-gemma", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
                           "opencode-go-2", "opencode-go-3", "opencode-go-4",
                           "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
                           "anthropic-6", "anthropic-7", "anthropic-8"])
@@ -175,6 +175,23 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(settings["LOOM_WORKERSAI_MODEL"],
                          "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b")
         self.assertEqual(settings["LOOM_WORKERSAI_ACCOUNT_SSM"], "/workersai/account")
+
+    def test_zai_and_zen_are_tracked_and_zai_uses_the_gateway_without_a_key_setting(self):
+        self.assertIn("zai", runners.TRACKED_SLOTS)
+        self.assertIn("zen", runners.TRACKED_SLOTS)
+        settings = runners.lane_settings("zai", {
+            "LOOM_ZAI_KEY_SSM": "/zai/key",
+            "LOOM_ZAI_URL": "https://api.z.ai/free-public/zai/v1",
+        })
+        self.assertEqual(settings["LOOM_ZAI_URL"], "https://api.z.ai/free-public/zai/v1")
+        self.assertFalse([name for name in settings if name.endswith("_KEY_SSM")])
+
+    def test_zai_endpoint_moves_to_the_runner_gateway(self):
+        job = load_job()
+        self.assertEqual(job.rebase_gateway(
+            "zai", {"LOOM_ZAI_URL": "https://api.z.ai/free-public/zai/v1"},
+            "http://gateway.example.invalid:8080"),
+            {"LOOM_ZAI_URL": "http://gateway.example.invalid:8080/free-public/zai/v1"})
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",

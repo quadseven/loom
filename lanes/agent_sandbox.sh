@@ -491,7 +491,7 @@ opencode_config() {
   # spark_ready), serving the one model after "spark/". No key.
   # The free lane (a free provider's route on the spark-gateway) is declared the
   # same way, as provider free serving the model after "free/".
-  local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}"
+  local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}" zai_url
   # Reads in the tree are allowed: opencode asks before a *.env read by
   # default, a run cannot answer, and a tracked pin file stopped two runs
   # (loom#1728). The tree is a fresh clone, and reads outside it stay denied.
@@ -513,6 +513,10 @@ opencode_config() {
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
   [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  if [ "$LANE" = zai ]; then
+    zai_url="$(lane_setting URL)"
+    [ -z "$zai_url" ] || provider=", \"provider\": {\"zai\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Z.ai gateway\", \"options\": {\"baseURL\": \"$zai_url\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  fi
   AGENT_EXTRA_ENV="${AGENT_EXTRA_ENV:+$AGENT_EXTRA_ENV
 }OPENCODE_CONFIG_CONTENT={\"model\": \"$MODEL\", \"small_model\": \"$MODEL\", \"permission\": $permission$provider}"
 }
