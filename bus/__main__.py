@@ -97,6 +97,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="which writer's App: only the station's may dispatch workflow runs")
     app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
+    a = app_sub.add_parser("lane-identity", help="print the App identity LOOM_LANE_APPS gives a lane "
+                           "(five lines), nothing for an unmapped lane")
+    a.add_argument("slot")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
@@ -206,6 +209,8 @@ def _app(args: argparse.Namespace, transport: Optional[Transport],
     try:
         if args.app_command == "token":
             return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
+        if args.app_command == "lane-identity":
+            return app.print_lane_identity(args.slot, sys.stdout, sys.stderr)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
         return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)

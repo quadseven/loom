@@ -720,6 +720,28 @@ admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
 `https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
+A lane can write as its own App instead of the lanes App. `LOOM_LANE_APPS` is
+one JSON object; each key is a comma-separated list of lanes (`codex`, every
+slot of that lane) or slots (`codex-2`), and a slot's own key wins over its
+lane's. Each value gives `app_id`, `key_ssm` (the SSM parameter of the App's
+private key), `git_name` and `git_email`, and optionally `installation_id`;
+without it the lane's token command uses the App's installation for the
+`LOOM_REPO_OWNERS` owner, or its only one, and fails when it cannot tell.
+`python3 -m bus app lane-identity SLOT` prints the five values for
+`run_lane.sh`, and nothing for a lane the map does not name. For a named lane
+`run_lane.sh` replaces `LOOM_GITHUB_APP_ID`, `_INSTALLATION_ID` and `_KEY_SSM`
+with the mapped values, drops any `LOOM_GITHUB_APP_KEY_FILE`, and sets the
+git author and committer name and email, so the push, the pull request and
+every comment the run posts are the mapped App's. The lane's container needs
+the mapped key readable through the same SSM read as any other key. A lane the
+map does not name keeps the lanes App exactly as before. The leak scan, the
+scope checks and every refusal are unchanged. A failed mint parks the run
+`[transient]` before anything is posted, and a map that cannot be read stops
+every lane before it takes a brief: a lane never writes as another App in
+place of the one it was given. Changes to a pull request that another App
+opened (a fix round) push with the lane's own App, which needs access to the
+repo; the pull request's author stays as it was.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
