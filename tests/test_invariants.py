@@ -478,7 +478,7 @@ class StationTest(StationBase):
         for lane in ("anthropic", "anthropic-2"):
             self.assertIn("- %s: held by a limit since" % lane, filed["body"])
 
-def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
+    def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
         self.settings.no_topup = ["anthropic"]
         self.held_out_of_credit()
         self.assertEqual(self.breaches(), [])
