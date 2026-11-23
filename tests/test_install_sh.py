@@ -104,10 +104,11 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("launchctl bootout gui/%d/com.loom.zen" % os.getuid(), self.log.read_text())
         self.assertTrue((agents / "com.loom.codex.plist").exists())
         station = (agents / "com.loom.station.plist").read_text()
-        for key, value in (("LOOM_RUNNER_SLOTS", "zen"), ("LOOM_ZEN_KEY_SSM", "/x/zen"),
+        for key, value in (("LOOM_RUNNER_SLOTS", "zen"),
                            ("LOOM_LANES_GITHUB_APP_ID", "42"),
                            ("LOOM_LANES_GITHUB_APP_KEY_SSM", "/x/lanes-app")):
             self.assertIn("<key>%s</key><string>%s</string>" % (key, value), station)
+        self.assertNotIn("<key>LOOM_ZEN_KEY_SSM</key>", station)
         self.assertEqual(station.count("<key>LOOM_ZEN_MODEL</key>"), 1)
 
     def test_a_held_lock_is_waited_for_then_the_station_installs(self):
