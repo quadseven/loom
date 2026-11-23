@@ -18216,6 +18216,9 @@ class Station:
     def end_pass(self) -> None:
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
+        ticker = getattr(self, "_remote_ticker", None)
+        if ticker is not None:
+            ticker.stop()
         gh = self.gh
         kinds = ", ".join("%s %d" % (k, n) for k, n in
                           sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -18554,7 +18557,29 @@ class Station:
             if first:
                 _say("log capture: %s holds logs from %s" % (source.name, first))
 
+    def start_remote_check_ticker(self) -> None:
+        """Tend remote checks every minute beside the pass, so a run that
+        finished reaches its lane in minutes, not a pass later (loom#3499).
+        The thread has its own GitHub client; only a station on a real client
+        starts one."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        # A station built without a client (tests, a half-set-up pass) has no
+        # self.gh yet; it starts no ticker, as one on a fake client does not.
+        if not (isinstance(getattr(self, "gh", None), GitHub) and repo
+                and os.path.isdir(os.path.join(remote_checks.root(self.s.home), "req"))):
+            return
+        from .github import auth_from_env
+        gh = GitHub(auth_from_env())
+
+        def make() -> "remote_checks.RemoteChecks":
+            return remote_checks.RemoteChecks(gh, self.s.home, repo, self._public, _say,
+                                              actor=gh.app_login())
+
+        self._remote_ticker = remote_checks.Ticker(make, _say)
+        self._remote_ticker.start()
+
     def run_pass(self) -> None:
+        self.start_remote_check_ticker()
         self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
