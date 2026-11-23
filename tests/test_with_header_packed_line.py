@@ -58,6 +58,14 @@ class WithHeaderPackedLineTest(unittest.TestCase):
         self.assertIn("Deliverable: Explain Model: selection\n", result)
         self.assertNotIn("Model: selection\nDeliverable", result)
 
+    def test_replaces_packed_priority_after_deliverable(self):
+        for ending in ("", "\n\n## Why\nx\n"):
+            for deliverable in ("ship it", "Explain Model: selection"):
+                with self.subTest(ending=ending, deliverable=deliverable):
+                    body = "Deliverable: " + deliverable + " Priority: P3" + ending
+                    expected = "Deliverable: " + deliverable + "\nPriority: P0" + ending
+                    self.assertEqual(_with_header(body, "Priority", "P0"), expected)
+
     def test_packed_line_keeps_crlf_on_every_expanded_header(self):
         body = "Difficulty: medium Priority: P3\r\n\r\n## Why\r\nx\r\n"
         result = _with_header(body, "Difficulty", "easy")

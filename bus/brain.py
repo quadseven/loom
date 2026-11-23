@@ -5228,18 +5228,28 @@ def _split_packed_header_line(line: str) -> List[str]:
     if not positions:
         return [line]
     positions.sort()
-    # A Deliverable value is free prose: a header-shaped word inside it is not
-    # a new header, so nothing after the Deliverable key starts another one.
-    for i, (_pos, hk) in enumerate(positions):
-        if hk == "Deliverable":
-            positions = positions[: i + 1]
-            break
-    # Extract each header
+    # AI-REVIEW 2026-11-23 [automated PR review] 4662635821 (PR #3463):
+    # In free-form Deliverable text, resume at a header with a constrained,
+    # valid value. Model and Base values can look like ordinary prose words.
     result = []
-    for i, (pos, _hk) in enumerate(positions):
+    prose_start = None
+    for i, (pos, hk) in enumerate(positions):
         next_pos = positions[i + 1][0] if i + 1 < len(positions) else len(line)
-        header_text = line[pos:next_pos].rstrip()
-        result.append(header_text)
+        if prose_start is not None and hk in ("Model", "Base", "Deliverable"):
+            continue
+        if hk == "Deliverable" or prose_start is not None:
+            value = line[pos + len(hk) + 1:next_pos].strip()
+            valid, _ = tickets._HEADER_RULES[hk]
+            if not valid(value.lower() if hk == "Difficulty" else value):
+                if prose_start is None:
+                    prose_start = pos
+                continue
+        if prose_start is not None:
+            result.append(line[prose_start:pos].rstrip())
+            prose_start = None
+        result.append(line[pos:next_pos].rstrip())
+    if prose_start is not None:
+        result.append(line[prose_start:].rstrip())
     return result
 
 
@@ -5257,8 +5267,8 @@ def _expand_packed_headers(lines: List[str], header_end: int) -> Tuple[List[str]
         if len(split) > 1:
             # It's a packed line, expand each header
             ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
-            for h in split:
-                new_lines.append(h + ending)
+            new_lines.extend(h + (ending or "\n") for h in split[:-1])
+            new_lines.append(split[-1] + ending)
         else:
             new_lines.append(line)
     # Append the rest of the lines (non-header section)
