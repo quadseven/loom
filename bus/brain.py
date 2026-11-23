@@ -4235,6 +4235,32 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
 
+def _without_own_headers(body: str, written: Dict[str, Optional[str]]) -> str:
+    """Drop a leading header block from `body` when every line in it is a
+    header the tool is about to write, so the filed ticket holds one block.
+    A line that names a different value than the flag refuses, naming both.
+    A leading line the tool does not write leaves the body untouched."""
+    lines = body.splitlines(keepends=True)
+    end = 0
+    seen: List[Tuple[str, str]] = []
+    while end < len(lines):
+        m = HEADER_RE.fullmatch(lines[end].rstrip())
+        if not m:
+            break
+        seen.append((m.group(1), m.group(2).strip()))
+        end += 1
+    if not seen or any(not written.get(k) for k, _ in seen):
+        return body
+    for key, value in seen:
+        if value != written[key]:
+            raise ValueError("the body starts with %s: %s but the flag says %s: %s; "
+                             "make them agree or drop the line from the body"
+                             % (key, value, key, written[key]))
+    while end < len(lines) and not lines[end].strip():
+        end += 1
+    return "".join(lines[end:])
+
+
 _REPO_REF = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+")
 _REPO_NUMBER = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
@@ -4394,6 +4420,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
     repairs_incident = _repairs_header_for(gh, repo, body, repairs_incident, env)
+    body = _without_own_headers(body, {
+        "Difficulty": difficulty, "Priority": priority, "Model": model, "Base": base,
+        "After": after, "Not before": not_before,
+        "Repairs incident": "#%d" % repairs_incident if repairs_incident is not None else None,
+        "Foundational": "yes" if foundational else None})
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
                              repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
