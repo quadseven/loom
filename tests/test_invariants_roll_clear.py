@@ -300,6 +300,7 @@ class RollClearTest(unittest.TestCase):
         # The tracking issue should NOT be rewritten (shapes not read)
         updated = self.gh.issues[issue_number]
         self.assertEqual(updated["body"], original_body, "Tracking issue unchanged when shapes not read")
+        self.assertEqual(updated["state"], "open", "Tracking issue stays open when shapes not read")
         self.assertNotIn(invariants.ROLL_NONE, updated["body"])
 
 
