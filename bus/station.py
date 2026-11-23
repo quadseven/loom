@@ -18563,7 +18563,9 @@ class Station:
         The thread has its own GitHub client; only a station on a real client
         starts one."""
         repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
-        if not (isinstance(self.gh, GitHub) and repo
+        # A station built without a client (tests, a half-set-up pass) has no
+        # self.gh yet; it starts no ticker, as one on a fake client does not.
+        if not (isinstance(getattr(self, "gh", None), GitHub) and repo
                 and os.path.isdir(os.path.join(remote_checks.root(self.s.home), "req"))):
             return
         from .github import auth_from_env
