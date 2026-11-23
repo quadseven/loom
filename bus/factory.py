@@ -5488,6 +5488,11 @@ class Factory:
             return "%s is claimed by %s" % (ref, person)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
+        briefer_pr = self._briefer_refs_pr(repo, issue)
+        if briefer_pr:
+            reason = "an open pull request #%s names it" % briefer_pr
+            self._waiting(repo, issue["number"], reason)
+            return "%s waits: %s" % (ref, reason)
         held = self._queued_hold(repo, issue)
         if held:
             return "%s %s" % (ref, held)
@@ -5577,6 +5582,22 @@ class Factory:
             _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
             return True
         return False
+
+    def _briefer_refs_pr(self, repo: str, issue: Dict[str, Any]) -> Any:
+        """The number of an open same-repo pull request, opened by a
+        LOOM_TRUSTED_BRIEFERS login, that names this ticket with a bare Refs
+        line, else 0. The ticket stays queued under it: a lane would rebuild
+        work that is done. Only a briefer that is not a brief author counts
+        here; a brief author's pull request moves the ticket to loom:pr."""
+        number = int(issue["number"])
+        for pr in self._open_pull_requests(repo):
+            login = str((pr.get("user") or {}).get("login") or "").lower()
+            if (pr.get("state", "open") == "open" and login in self.briefers
+                    and login not in self.trusted
+                    and ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo
+                    and self._refs_ticket(str(pr.get("body") or ""), number)):
+                return pr.get("number", "?")
+        return 0
 
     def _open_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open pull requests, read once for queued ticket checks."""

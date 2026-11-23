@@ -94,7 +94,7 @@ The station's posted snapshots live in the same database too, so every
 dashboard replica serves the same ones and a restart keeps the last of each
 (loom#2530): the table `dashboard_snapshots`, created on first use, holds one
 row per key (`usage`, `chain`, `chain_seen`, `goal_caps`, `brain_holds`,
-`bench`) with the snapshot as JSONB and the writer's time; a write never
+`bench`, `workers`) with the snapshot as JSONB and the writer's time; a write never
 replaces a newer one. `POST /api/usage`, `/api/chain`, `/api/goal-caps` and
 `/api/brain-holds` answer 503 when the database refuses the write, so the
 station sends it again. A page read takes newer rows at most every 5 seconds,
@@ -379,6 +379,14 @@ only on its next pass. A hold whose until-time has passed is read as ended
 (loom#809): `/usage` counts that lane free and asks nothing about it, and
 `/lanes` says the hold ended and that no heartbeat has come since, instead of
 a past "until" read as a live hold.
+
+`/workers` (Workers and bots) lists cluster workers and goal bots, one row
+each: name, kind, state (`running`, `done`, `failed`), started time, last
+action and a link to the run or pull request. A feed beside the workers posts
+`{rows: [{kind, name, state, started, last_action, url}]}` to
+`POST /api/workers` with the upload token, at most 200 rows, `started` in
+epoch seconds, `url` an https link or empty. It is stored like the other
+snapshots, and the page says so when the feed last posted over 30 minutes ago.
 
 `/fleet` (Fleet timeline, loom#2280) draws every engine as a row over the
 last 24 hours and the next 2, one pixel a minute, from the snapshot the

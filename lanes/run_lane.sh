@@ -56,6 +56,7 @@
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_CHECK_SLOTS (check runs at once across all lanes on the host, default 3),
 # LOOM_CHECK_SLOT_WAIT (seconds a check waits for a slot, default 5400),
+# LOOM_REMOTE_CHECKS (1: a public repo's checks run on GitHub, not in a slot; docs/LANES.md, "Remote checks"),
 # LOOM_CHECK_LOAD_1M and LOOM_CHECK_LOAD_5M (a check takes a slot only while
 # the host's 1-minute and 5-minute load averages are at or under these,
 # defaults 24 and 18; 0 turns that limit off),
@@ -3041,6 +3042,55 @@ release_check_slot() {
   CHECK_SLOT_HELD=""
 }
 
+# LOOM_REMOTE_CHECKS=1 (off by default): on a PUBLIC repo a new run's final
+# check runs on a GitHub-hosted runner through this repo's remote-check.yml,
+# and a base check whose commit GitHub already passed is not run, so neither
+# takes a host check slot. The lanes' App cannot dispatch a workflow, so the
+# request goes to the station through files (bus/remote_checks.py). A private
+# repo, a fix round, a repo with no check contract, a lane on a cluster runner
+# (no station files) and any dispatch error or timeout keep the local slot
+# path. docs/LANES.md, "Remote checks".
+REMOTE_CHECKS="${LOOM_REMOTE_CHECKS:-0}"
+REMOTE_CHECK_WAIT="${LOOM_REMOTE_CHECK_WAIT:-1800}"
+REMOTE_CHECK_START_WAIT="${LOOM_REMOTE_CHECK_START_WAIT:-180}"
+REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-10}"
+[[ "$REMOTE_CHECK_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_WAIT=1800
+[[ "$REMOTE_CHECK_START_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_START_WAIT=180
+[[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=10
+remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && repo_is_public; }
+# Ask for the check of a pushed commit on GitHub and wait, bounded. Returns 0
+# green, 1 red (the failing test names are appended to the log as FAIL: lines,
+# the ones check_failures reads), 2 when the remote cannot answer: the caller
+# then runs the check on the host.
+wait_remote_checks() {  # sha
+  local spec out word name
+  local -a names
+  spec="$CHECK_HOME/remote-check.spec"
+  mkdir -p "$CHECK_HOME" 2>/dev/null || return 2
+  printf '%s\n%s\n%s\n%s\n' "$C_INTERP" "$C_SUBMODULES" "$C_SETUP" "$C_CHECK" > "$spec" || return 2
+  out="$(cd "$LOOM_ROOT" && LOOM_HOME="$LOOM_HOME" timeout "$((REMOTE_CHECK_WAIT + 60))" python3 -B -m bus remote-check \
+    wait "$REPO" "$1" "$spec" "$REMOTE_CHECK_START_WAIT" "$REMOTE_CHECK_WAIT" "$REMOTE_CHECK_POLL" 2>>"$LOG" | tail -n 1)"
+  rm -f "$spec"
+  word="${out%% *}"
+  case "$word" in
+    green) return 0 ;;
+    red)
+      IFS=' ' read -r -a names <<< "$out"
+      for name in "${names[@]:1}"; do printf 'FAIL: %s\n' "$name" >> "$LOG"; done
+      return 1 ;;
+  esac
+  echo "no remote check answer for ${1:0:12} (${out:-none}); running the check on the host" >> "$LOG"
+  return 2
+}
+# Remove the work branch this run pushed for its remote check, only while it
+# still points at the commit pushed (never a branch someone else moved), so a
+# retry of the ticket pushes a fresh one.
+drop_remote_branch() {  # sha
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    push -q origin ":refs/heads/$BRANCH" --force-with-lease="refs/heads/$BRANCH:$1" >> "$LOG" 2>&1 ||
+    echo "could not remove the remote check branch $BRANCH" >> "$LOG"
+}
+
 wait_for_agent() {
   [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] || return 0
   local requested="${1:-}" start=$SECONDS noted="" why left poll="$CHECK_SLOT_POLL"
@@ -3425,6 +3475,12 @@ prepare_validation() {
     changed=""
     echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
+  elif [ -z "$FIX_PR" ] && remote_checks_on && github_checks_green "$baseline_rev"; then
+    # A public repo's base that GitHub's checks already passed needs no run
+    # (and no slot) here; any other state runs the check on the host below.
+    cached_verdict=1 BASELINE_EXIT=0 changed=""
+    echo "base check not run: GitHub's checks passed on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
+    record baseline "$C_CHECK" 0 "$baseline_rev" true "GitHub checks green; no host check slot taken"
   else
     check_start="$(log_size)"
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -3655,8 +3711,17 @@ final_validation() {
     return 1
   fi
   output_offset="$(wc -c < "$LOG")"
-  contract_run "$C_CHECK"; rc=$?
-  if [ "$rc" -eq 0 ]; then
+  if [ -n "${REMOTE_FINAL:-}" ]; then
+    # The check runs on GitHub after the push (remote_final_gate), which comes
+    # after the leak scans. The base-test gate and the affected check are host
+    # runs that would take a slot, so they are left out of this pass; the
+    # host fallback in remote_final_gate runs them.
+    rc=0
+    echo "final check left to the remote check on the pushed branch" >> "$LOG"
+  else
+    contract_run "$C_CHECK"; rc=$?
+  fi
+  if [ "$rc" -eq 0 ] && [ -z "${REMOTE_FINAL:-}" ]; then
     final_base_tests "$rev"; gate_rc=$?
     # The agent answers a refusal once: one more turn, then the whole check
     # again. A second refusal ends the run as before.
@@ -3759,16 +3824,51 @@ final_validation() {
     *) [ -n "$VALIDATION_REASON" ] ||
          VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}")"
-  [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}" "${REMOTE_FINAL:+check left to the remote check after the push}")"
+  [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
-  [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  [ -z "${REMOTE_FINAL:-}" ] || VALIDATED="the check is left to the remote check at ${rev:0:12}"
+  [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
   assess_validation_paths
+}
+
+# A new run on a public repo with LOOM_REMOTE_CHECKS: the work branch is
+# pushed (after every pre-push gate), and a check on a GitHub-hosted runner
+# (remote-check.yml, through the station) stands in for the host check.
+# Green passes the run on to the pull request; red parks it with the failing
+# tests named, keeping the edits on a side branch and removing
+# the work branch; no answer, an error or a timeout runs the host check, with
+# its slot, as without the setting. Returns 1 when the run is parked.
+remote_final_gate() {
+  local rev rc offset failing
+  rev="$(safe_git rev-parse HEAD)"
+  offset="$(wc -c < "$LOG")"
+  wait_remote_checks "$rev"; rc=$?
+  case "$rc" in
+    0)
+      VALIDATED="the remote check passed at ${rev:0:12}; no host check slot taken"
+      record final "$C_CHECK" 0 "$rev" true "remote check green; no host check slot taken"
+      return 0 ;;
+    1)
+      failing="$(failing_summary "$offset")"
+      VALIDATION_REASON="validation failed: the remote check was red at ${rev:0:12}${failing:+ (failing: $failing)}"
+      record final "$C_CHECK" 1 "$rev" false "remote check red${failing:+; failing: $failing}"
+      park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); no pull request opened" ""
+      drop_remote_branch "$rev"
+      return 1 ;;
+  esac
+  REMOTE_FINAL=""
+  if ! final_validation; then
+    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); no pull request opened" "$PARK_CLASS"
+    drop_remote_branch "$rev"
+    return 1
+  fi
+  return 0
 }
 
 # A successful shell command proves its exit status, not which changed paths
@@ -4200,6 +4300,9 @@ trains_on_prompts() {
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
   case "$SLOT" in free-nvidia|free-kilo|free-groq|free-openrouter) return 0 ;; esac
+  # LOOM_PUBLIC_ONLY_SLOTS (bus/station.py public_only_slots): slots on a login
+  # shared outside the operator's own repos.
+  case " $(printf '%s' "${LOOM_PUBLIC_ONLY_SLOTS:-}" | tr ',' ' ' | tr -s '[:space:]' ' ') " in *" $SLOT "*) return 0 ;; esac
   return 1
 }
 
@@ -5013,7 +5116,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
-  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
+  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS="" REMOTE_FINAL=""
   UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
@@ -5449,6 +5552,10 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
+  REMOTE_FINAL=""
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && remote_checks_on; then
+    REMOTE_FINAL=1
+  fi
   if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
@@ -5683,6 +5790,9 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     # The station reads this marker, not the log, to say the round pushed.
     : > "$LOGDIR/$TICKET.pushed"
     note_answer_head "$(safe_git rev-parse HEAD 2>> "$LOG")"
+  fi
+  if [ -n "$REMOTE_FINAL" ]; then
+    remote_final_gate || continue
   fi
   # A fix round that leaves its pull request with no diff against the default
   # branch closes it (loom#1637): an empty pull request is never mergeable

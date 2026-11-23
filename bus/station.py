@@ -57,7 +57,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
-from . import lane_state, runners
+from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
 from . import shadow
@@ -93,6 +93,7 @@ from . import revert
 from . import spend
 from . import state_store
 from . import station_lease
+from . import event_inbox
 from . import status
 from . import usage
 from . import verify_data
@@ -2160,13 +2161,21 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def public_only_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The slots LOOM_PUBLIC_ONLY_SLOTS (space or comma separated) names: a
+    slot that runs on a login shared outside the operator's own repos takes
+    public repos only, whatever its provider. Empty by default."""
+    env = os.environ if env is None else env
+    return [n for n in re.split(r"[\s,]+", str(env.get("LOOM_PUBLIC_ONLY_SLOTS") or "").strip()) if n]
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
     to its provider: free-nvidia, free-kilo and free-groq are free provider
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
-    if lane in factory.PUBLIC_ONLY:
+    if lane in factory.PUBLIC_ONLY or lane in public_only_slots():
         return True
     # A cluster runner's inputs and logs live in this public repo's Actions
     # (bus/runners.py).
@@ -2442,6 +2451,9 @@ class Station:
         # This pass's repo scans: the repos due, what was read of each, and
         # which held a ticket in flight.
         self._due: Optional[List[str]] = None
+        # Repos the fleet inbox named this pass (LOOM_INBOX=1): scanned
+        # first, and now even when idle. Empty with the inbox off.
+        self.priority_repos: List[str] = []
         self._scans: Dict[str, Any] = {}
         self._seen: Dict[str, set] = {}
         # Compare answers kept across passes (_carries), read on first use.
@@ -2670,8 +2682,11 @@ class Station:
             saved = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
             self._scans = saved if isinstance(saved, dict) else {}
             local = self._inbox_repos()
-            self._due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
-                         and (r in local or self._scan_due(self._scans.get(r)))]
+            due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
+                   and (r in local or self._scan_due(self._scans.get(r)))]
+            first = [r for r in self.priority_repos
+                     if r in self.s.repos and tickets.REPO_RE.fullmatch(r)]
+            self._due = first + [r for r in due if r not in first]
         return self._due
 
     def _observe(self, repo: str, kind: str, busy: bool) -> None:
@@ -6000,6 +6015,7 @@ class Station:
 
     def _read_repo_pr_count(self, repo: str) -> int:
         trusted = {a.lower().removesuffix("[bot]") for a in (*self.s.authors, *self.s.briefers)}
+        authors = {a.lower().removesuffix("[bot]") for a in self.s.authors}
         counted = set()
         for page in range(1, 26):
             data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100&page=%d"
@@ -6007,7 +6023,7 @@ class Station:
             if not isinstance(data, list):
                 raise ValueError("open pull requests could not be read")
             for pr in data:
-                number = self._counted_pr_number(pr, trusted)
+                number = self._counted_pr_number(pr, trusted, authors)
                 if number is not None:
                     counted.add(number)
             if len(data) < 100:
@@ -6015,7 +6031,8 @@ class Station:
         raise ValueError("open pull request history exceeds the read budget")
 
     @staticmethod
-    def _counted_pr_number(pr: Any, trusted: set) -> Optional[int]:
+    def _counted_pr_number(pr: Any, trusted: set,
+                           authors: Optional[set] = None) -> Optional[int]:
         if isinstance(pr, dict) and pr.get("state") == "closed":
             return None
         if not isinstance(pr, dict) or not isinstance(pr.get("user"), dict):
@@ -6031,7 +6048,10 @@ class Station:
         if (not isinstance(head, dict) or not isinstance(head.get("ref"), str)
                 or not head["ref"]):
             raise ValueError("open pull request head could not be read")
-        is_agent = (user.get("type") == "Bot" or str(head.get("ref") or "").startswith("loom/")
+        # A Bot trusted only as a briefer (an operator's coding session) is
+        # not a Loom pull request unless its head or body says so (loom#3445).
+        bot = user.get("type") == "Bot" and (authors is None or login in authors)
+        is_agent = (bot or str(head.get("ref") or "").startswith("loom/")
                     or re.search(r"^Loom ticket .+, lane [A-Za-z0-9_.-]+, model \S+\.(?:\s|$)",
                                  str(pr.get("body") or ""), re.M))
         if not is_agent:
@@ -18507,6 +18527,12 @@ class Station:
                 raise
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
+            try:
+                self._timed(self.tend_remote_checks)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_remote_checks failed: %s" % err)
             self.report_outcomes()
             # A ticket left loom:running after its run ended counts as lane
             # load, so it is settled before queued tickets look for a lane.
@@ -18697,6 +18723,24 @@ class Station:
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
 
+    def tend_remote_checks(self) -> None:
+        """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
+        write back their results (bus/remote_checks.py). Nothing happens
+        without a request or a run in flight."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        directory = remote_checks.root(self.s.home)
+        if not (os.path.isdir(os.path.join(directory, "req")) and repo):
+            return
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for remote checks: %s" % err)
+            actor = None
+        remote_checks.RemoteChecks(self.gh, self.s.home, repo, self._public, _say,
+                                   actor=actor, now=self.now).tend()
+
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
@@ -18782,16 +18826,42 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
             return 1
         deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
-            return _locked_pass(settings, state, gh, hooks)
+            return _inbox_pass(settings, state, gh, hooks, lease)
         finally:
             _disarm_pass_deadline(deadline)
     finally:
         os.close(fd)
 
 
+def _inbox_pass(settings: Settings, state: str, gh: Optional[GitHub],
+                hooks: Dict[str, Any], lease: Optional[station_lease.StationLease]) -> int:
+    """The locked pass, as the fleet inbox's consumer when LOOM_INBOX=1
+    (bus/event_inbox.py): claim the due events under the inbox lease tied to
+    the station lease, read their repos first, and mark them done once the
+    pass ran. With the inbox off this is _locked_pass and nothing else."""
+    consumer = event_inbox.select(os.environ, lease, _say)
+    if consumer is None:
+        return _locked_pass(settings, state, gh, hooks)
+    try:
+        claimed = consumer.begin()
+        priority = event_inbox.priority_repos([c.subject for c in claimed], settings.repos)
+        if priority:
+            _say("inbox: reading first: %s" % " ".join(priority))
+        outcome: Dict[str, Any] = {}
+        code = _locked_pass(settings, state, gh, hooks, priority, outcome)
+        if outcome.get("passed"):
+            consumer.finish(event_inbox.run_ref(lease, time.time()))
+        return code
+    finally:
+        consumer.close()
+
+
 def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
-                 hooks: Dict[str, Any]) -> int:
-    """The pass run() starts once it holds the lock."""
+                 hooks: Dict[str, Any], priority: Sequence[str] = (),
+                 outcome: Optional[Dict[str, Any]] = None) -> int:
+    """The pass run() starts once it holds the lock. `priority` are the
+    repos the inbox named; `outcome["passed"]` is set once run_pass returned,
+    so the inbox marks its events done only after a pass that ran."""
     use_launchd = gh is None
     if gh is None:
         from .github import auth_from_env
@@ -18819,6 +18889,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
             return 0
         beat.stamp()
     st = Station(gh, settings, **hooks)
+    st.priority_repos = list(priority)
     try:
         if use_launchd:
             st._refresh_lane_jobs()
@@ -18828,6 +18899,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         if isinstance(writers, set):
             writers.update(settings.authors)
         st.run_pass()
+        if outcome is not None:
+            outcome["passed"] = True
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
     except (StateError, station_lease.LeaseLost) as err:
