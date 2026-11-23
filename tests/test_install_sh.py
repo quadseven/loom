@@ -47,6 +47,7 @@ class InstallScriptTest(unittest.TestCase):
         self.lock.write_text("%s\n" % pid)
 
     def run_install(self, *lanes, **env):
+        use_defaults = env.pop("_use_defaults", False)
         # The watched repos, status repo, login lists and App settings come
         # only from the test: an operator's own settings in the environment
         # would trip the owner check or the App check, or fill a list a test
@@ -63,9 +64,26 @@ class InstallScriptTest(unittest.TestCase):
                     LOOM_CODEX_MODEL="codex-test",
                     FAKE_LOG=str(self.log))
         full.update(env)
+        command = ["bash", str(self.checkout / "lanes" / "mac" / "install.sh")]
+        if lanes:
+            command.extend(lanes)
+        elif not use_defaults:
+            command.append("codex")
         return subprocess.run(
-            ["bash", str(self.checkout / "lanes" / "mac" / "install.sh"), *(lanes or ("codex",))],
+            command,
             env=full, capture_output=True, text=True, timeout=60)
+
+    def test_default_install_omits_cluster_moved_lanes(self):
+        result = self.run_install(_use_defaults=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        agents = self.home / "Library" / "LaunchAgents"
+        for lane in ("claude", "codex-2", "codex-16", "anthropic-2",
+                     "anthropic-8", "opencode-go-2", "opencode-go-4"):
+            with self.subTest(lane=lane):
+                self.assertFalse((agents / ("com.loom.%s.plist" % lane)).exists())
+        for lane in ("codex", "anthropic", "opencode-go", "agy"):
+            with self.subTest(lane=lane):
+                self.assertTrue((agents / ("com.loom.%s.plist" % lane)).exists())
 
     def test_a_runner_slot_gets_no_local_runner_and_the_station_gets_its_settings(self):
         # LOOM_RUNNER_SLOTS (docs/LANES.md, "Lanes on cluster runners"): the
