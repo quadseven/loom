@@ -142,7 +142,7 @@ def _with_installation(env: Dict[str, str], transport: Transport,
     if not app_id.isdigit():
         raise GitHubError("the GitHub App id must be a number")
     probe = AppToken(app_id, "0", _key_reader(env), sign=sign)
-    installations = _jwt_get(transport, probe.jwt(), "/app/installations?per_page=100")
+    installations = _jwt_pages(transport, probe.jwt(), "/app/installations")
     owners = {o.lower() for o in env.get("LOOM_REPO_OWNERS", "").replace(",", " ").split()}
     named = [i for i in installations if isinstance(i, dict)
              and str((i.get("account") or {}).get("login") or "").lower() in owners]
@@ -220,6 +220,18 @@ def _jwt_get(transport: Transport, jwt: str, path: str) -> Any:
     return data
 
 
+def _jwt_pages(transport: Transport, jwt: str, path: str) -> Any:
+    """Every page of a JWT-read list: follow pages until one comes back short."""
+    out: List[Any] = []
+    page = 1
+    while True:
+        batch = _jwt_get(transport, jwt, "%s?per_page=100&page=%d" % (path, page))
+        out.extend(batch)
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
 def _repos(app_id: str, inst_id: str, read_key: Callable[[], str],
            sign: Callable[[bytes, str], bytes], transport: Transport) -> List[str]:
     """The repos one installation covers, read with its own token."""
@@ -269,7 +281,7 @@ def ids(app_id: str, env: Optional[Dict[str, str]] = None,
     read_key = _key_reader(env)
     wanted = set(env.get("LOOM_REPOS", "").replace(",", " ").split())
     jwt = AppToken(app_id, "0", read_key, sign=sign).jwt()
-    installations = _jwt_get(transport, jwt, "/app/installations?per_page=100")
+    installations = _jwt_pages(transport, jwt, "/app/installations")
     if not installations:
         err.write("the App %s has no installations: install it on the repos in "
                   "LOOM_REPOS first\n" % app_id)

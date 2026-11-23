@@ -90,7 +90,8 @@ class Discover(unittest.TestCase):
         def transport(method, url, headers, body):
             self.calls.append((method, url))
             if method == "GET" and "/app/installations" in url:
-                return 200, {}, json.dumps(installations).encode()
+                page = int(url.split("&page=")[1]) if "&page=" in url else 1
+                return 200, {}, json.dumps(installations[(page - 1) * 100:page * 100]).encode()
             return 201, {}, json.dumps({"token": "ghs_luna", "expires_at": "2099-01-01T00:00:00Z"}).encode()
         return transport
 
@@ -106,6 +107,12 @@ class Discover(unittest.TestCase):
     def test_the_installation_of_the_repo_owner_is_used(self):
         got = self.token([{"id": 1, "account": {"login": "other"}}, {"id": 2, "account": {"login": "Acme"}}])
         self.assertEqual(got, (0, "ghs_luna\n"))
+        self.assertIn(("POST", "https://api.github.com/app/installations/2/access_tokens"), self.calls)
+
+    def test_an_installation_past_the_first_page_is_found(self):
+        many = [{"id": n + 10, "account": {"login": "o%d" % n}} for n in range(100)]
+        many.append({"id": 2, "account": {"login": "acme"}})
+        self.assertEqual(self.token(many), (0, "ghs_luna\n"))
         self.assertIn(("POST", "https://api.github.com/app/installations/2/access_tokens"), self.calls)
 
     def test_an_only_installation_is_used(self):
