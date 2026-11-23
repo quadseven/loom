@@ -18218,9 +18218,9 @@ class Station:
         return True
 
     def end_pass(self) -> None:
-        self.stop_remote_tender()
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
+        self.stop_remote_tender()
         gh = self.gh
         kinds = ", ".join("%s %d" % (k, n) for k, n in
                           sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -18800,10 +18800,12 @@ class Station:
         self._remote_thread.start()
 
     def stop_remote_tender(self) -> None:
-        stop = getattr(self, "_remote_stop", None)
-        if stop is not None:
-            stop.set()
-        self._remote_thread = None
+        thread = getattr(self, "_remote_thread", None)
+        if thread is not None:
+            self._remote_stop.set()
+            # Include the last tick's answers before saving the pass budget.
+            thread.join()
+            self._remote_thread = None
 
     def tend_remote_checks(self, now: Optional[float] = None) -> None:
         """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and

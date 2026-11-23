@@ -3049,10 +3049,9 @@ class BudgetTest(Base):
         seen = []
 
         class Watched(GitHub):
-            @property
-            def counted(self):
+            def _counted_locked(self):
                 seen.append(self._count_lock.locked())
-                return GitHub.counted.fget(self)
+                return super()._counted_locked()
 
         self.fake.events[12] = [{"id": i} for i in range(250)]
         gh = Watched("token", transport=self.fake, target=1)

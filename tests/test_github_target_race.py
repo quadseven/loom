@@ -4,6 +4,7 @@ so a pass on several reader threads ended one request over its target."""
 import json
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
 
 from bus import github
@@ -15,6 +16,31 @@ def transport(method, url, headers, body):
 
 
 class TargetRaceTest(unittest.TestCase):
+    def test_counted_reads_a_consistent_snapshot_during_a_304(self):
+        reading = threading.Event()
+        answered = threading.Event()
+        reader = threading.current_thread()
+
+        class Client(GitHub):
+            def __getattribute__(self, name):
+                if name == "not_modified" and threading.current_thread() is reader:
+                    reading.set()
+                    answered.wait(0.25)
+                return super().__getattribute__(name)
+
+        gh = Client("", transport=lambda *args: (304, {}, b""))
+
+        def read():
+            if reading.wait(5):
+                gh.rest("GET", "/repos/example/repo")
+                answered.set()
+
+        with ThreadPoolExecutor() as pool:
+            request = pool.submit(read)
+            self.assertEqual(gh.counted, 0)
+            request.result(timeout=5)
+        self.assertTrue(answered.is_set())
+
     def test_two_threads_at_one_under_the_target_send_one_read(self):
         gh = GitHub("token", transport=transport, target=1)
         # Both threads stop between the target check and the request; with

@@ -700,7 +700,7 @@ class GitHub:
         self.transport = transport or urllib_transport
         # Where GET answers are kept for conditional requests; None sends none.
         self.cache_dir = cache_dir
-        # Reads may run on several threads (brain.status): counts change under this lock.
+        # Reads may run on several threads: counts are read and changed under this lock.
         self._count_lock = threading.Lock()
         # A deferrable read's request, counted in the same lock hold as its
         # target check, so two threads cannot both pass the check one under
@@ -726,6 +726,10 @@ class GitHub:
 
     @property
     def counted(self) -> int:
+        with self._count_lock:
+            return self._counted_locked()
+
+    def _counted_locked(self) -> int:
         return self.requests - self.not_modified
 
     def _url(self, path: str) -> str:
@@ -1462,7 +1466,7 @@ class GitHub:
         with self._count_lock:
             target = self.target
             capped = isinstance(target, int) and not isinstance(target, bool)
-            over = capped and kind in DEFERRABLE_KINDS and self.counted >= target
+            over = capped and kind in DEFERRABLE_KINDS and self._counted_locked() >= target
             if over:
                 self.carried_over[kind] = self.carried_over.get(kind, 0) + 1
             elif capped and kind in DEFERRABLE_KINDS:
