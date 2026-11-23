@@ -79,7 +79,7 @@ class CodexLaneHomeTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_agent_cli(self, mode, **extra_env):
+    def run_agent_cli(self, mode, expect=0, **extra_env):
         script = (
             '. "$1"; MODEL="gpt-test"; AGENT_TIMEOUT=30; '
             'agent_cli codex %s "do the brief"' % mode
@@ -95,7 +95,9 @@ class CodexLaneHomeTest(unittest.TestCase):
             ["/bin/bash", "-c", script, "run", str(AGENT_CLI)],
             capture_output=True, text=True, env=env, timeout=60,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, expect, result.stderr)
+        if expect:
+            return result.stderr
         return dict(
             line.split("=", 1) for line in self.seen.read_text().splitlines()
             if "=" in line
@@ -108,6 +110,21 @@ class CodexLaneHomeTest(unittest.TestCase):
         self.assertIn("exec", seen["args"])
         self.assertIn("--sandbox workspace-write", seen["args"])
         self.assertIn("--model gpt-test", seen["args"])
+
+    def test_loom_codex_effort_sets_the_reasoning_effort_of_a_lane_run(self):
+        seen = self.run_agent_cli("lane", LOOM_CODEX_EFFORT="xhigh")
+        self.assertIn('-c model_reasoning_effort="xhigh"', seen["args"])
+        seen = self.run_agent_cli("lane")
+        self.assertNotIn("model_reasoning_effort", seen["args"])
+
+    def test_an_unknown_codex_effort_stops_the_run_before_codex_starts(self):
+        err = self.run_agent_cli("lane", expect=2, LOOM_CODEX_EFFORT='x" --dangerously')
+        self.assertIn("LOOM_CODEX_EFFORT must be", err)
+        self.assertFalse(self.seen.exists())
+
+    def test_a_brain_run_ignores_loom_codex_effort(self):
+        seen = self.run_agent_cli("brain", LOOM_CODEX_EFFORT="xhigh")
+        self.assertNotIn("model_reasoning_effort", seen["args"])
 
     def test_the_lane_home_holds_no_user_level_agents_file(self):
         seen = self.run_agent_cli("lane")

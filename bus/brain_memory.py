@@ -31,6 +31,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from . import handoff
 from .github import _OPENER, _NoRedirect
+from dashboard.brain_memory import (LINE_MAX, LIST_MAX, COMMITMENTS_MAX,
+                                    NAME_MAX, OUTCOMES, RULE_TEXT_MAX)
 
 # The lock step comes before the agent starts (brain.sh refreshes its
 # checkout in between), so a tick's step record may start this long before
@@ -40,11 +42,6 @@ WINDOW = 15 * 60
 # Clock slack between this machine and GitHub's comment times: a journal
 # this close to the agent's start or end belongs to its tick.
 GRACE = 60
-# The dashboard's caps on one body (dashboard/brain_memory.py).
-LINE_MAX = 500
-LIST_MAX = 50
-COMMITMENTS_MAX = 200
-RULE_TEXT_MAX = 20000
 # brain.sh's default holder, for a brain.json written before it named one.
 DEFAULT_HOLDER = "lane-machine"
 MODEL_MISSING = "not recorded"
@@ -81,7 +78,7 @@ def _line(text: Any) -> str:
 
 
 def _name(value: Any, default: str) -> str:
-    return value if isinstance(value, str) and value.strip() and len(value) <= 200 \
+    return value if isinstance(value, str) and value.strip() and len(value) <= NAME_MAX \
         and "\n" not in value else default
 
 
@@ -177,9 +174,12 @@ def tick_body(last: Dict[str, Any], record: Optional[Dict[str, Any]],
     started, ended = float(last["started"]), float(last["at"])
     begin, until = started - GRACE, ended + GRACE
     mine = _tick_journals(found, holder, begin, until)
+    outcome = last.get("outcome")
+    if outcome not in OUTCOMES:
+        outcome = "failed"
     return {"holder": holder, "lane": _name(last.get("lane"), "unknown"),
             "model": _name(last.get("model"), MODEL_MISSING),
-            "started": _utc(started), "ended": _utc(ended), "outcome": last.get("outcome"),
+            "started": _utc(started), "ended": _utc(ended), "outcome": outcome,
             "decided": (_notes(record, holder, started, ended)
                         + [_line("shipped " + v) for v in _values(mine, "Shipped")])[:LIST_MAX],
             "left_open": _left_open(mine, holder)[:LIST_MAX],

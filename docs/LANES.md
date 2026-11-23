@@ -363,6 +363,56 @@ unset variables.
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
 
+### Remote checks
+
+`LOOM_REMOTE_CHECKS=1` (off by default) lets a lane on a **public** repo run
+its final check on a GitHub-hosted runner (free for public repos) instead of
+waiting for a host check slot. A private repo, a fix round, a repo with no
+check contract and a lane on a cluster runner keep the local slot path.
+
+Public repos usually run their own CI only on a push to their default branch,
+so the lane does not wait for the repo's checks on a work branch. This repo's
+`.github/workflows/remote-check.yml` runs the check instead: a
+`workflow_dispatch` with the repo, the commit, and the check spec the lane
+already resolved for that repo (`.loom/validation.conf`: submodules, setup and
+check). It checks the public repo out at that commit, runs the same commands
+the host would, with no secrets and read-only contents, and uploads a small
+result artifact: the exit code and up to twenty failing test names.
+
+- **Who dispatches.** The lanes' GitHub App has no `actions: write` (only the
+  station's does, as for `lane.yml`), so the lane files a request under
+  `$LOOM_HOME/state/remote-checks/` and the station dispatches the workflow
+  with its own App (`bus/remote_checks.py`). The station follows only the run
+  id the dispatch returned and believes a run only when it ran
+  `remote-check.yml` on `main` as a `workflow_dispatch` triggered by the
+  station's own App, and its conclusion agrees with the artifact. Any other
+  run is ignored, and the lane runs the check on the host.
+- **Base check.** When the base commit's GitHub checks already passed (those
+  repos do run CI on a push to their default branch; the test
+  `github_checks_green` gives a host-only red), the base check is not run and
+  takes no slot. Any other state runs it on the host as before. The `setup`
+  step still runs on the host, since the agent works in that tree.
+- **Final check.** A new run does the pre-push gates, pushes its work branch
+  (fast-forward only, never the default branch, after the leak scans), then
+  asks for the remote check and waits, bounded: `LOOM_REMOTE_CHECK_WAIT`
+  (default 1800 seconds) overall, `LOOM_REMOTE_CHECK_START_WAIT` (default 180)
+  for the station to pick the request up, polling every
+  `LOOM_REMOTE_CHECK_POLL` seconds (default 10). No host slot is taken. The
+  host base-test gate and the affected check are left out of that pass, since
+  both are host runs.
+- **Green** opens the pull request as before: a pull request still opens only
+  after the checks pass.
+- **Red** parks the run as work with the failing test names as `FAIL:` lines in
+  the log, so the repair round sees them. The edits are kept on the usual
+  `-unvalidated-` side branch and the work branch is removed (only while it
+  still points at the pushed commit), so a retry pushes fresh.
+- **No answer.** A dispatch error, a run that is not the station's, an
+  unreadable artifact, a station that is down or a timeout falls back to the
+  full local check, gate included, with a slot.
+- The check runs on `ubuntu-latest`; a repo whose check needs another
+  platform or a host tool should leave `LOOM_REMOTE_CHECKS` off or expect the
+  fallback.
+
 ### Validation gaps
 
 When a lane pull request goes back for a fix round on a red CI job, the
@@ -2675,6 +2725,17 @@ no service account token, and its code is read-only and owned by root. The image
 python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
 CLI, plus this repo and the leak scanner at a pinned commit.
 
+Two settings serve a codex slot that runs on a login shared outside the
+operator's own repos. `LOOM_PUBLIC_ONLY_SLOTS` (space- or comma-separated, empty
+by default) names slots that take public repos only, whatever their provider:
+the station never claims a private repo's ticket for one
+(`station.needs_public_repo`), and the runner parks a brief for a private repo
+(`trains_on_prompts` in `lanes/run_lane.sh`), so the rule holds even when only
+the lane's container carries the setting. `LOOM_CODEX_EFFORT` (none, minimal,
+low, medium, high or xhigh) sets a codex lane run's reasoning effort with
+`-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
+config's own setting applies. A brain run ignores it.
+
 A long-lived lane pod takes no work from the station. Lane runs on the
 cluster go through ephemeral runners instead (next section).
 
@@ -2688,7 +2749,8 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
 tree, cache or session database stays anywhere. Claude Code runs with its
 long-lived OAuth token copied from SSM into a mode-600 file under the job home
-and exported only to the Claude CLI process. Codex uses its broker session
+and exported only to the Claude CLI process, run with `--permission-mode acceptEdits --allowedTools Bash`
+because a pod has no settings file allowing edits and print mode cannot answer a prompt. Codex uses its broker session
 file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
 provider slots and spark (both through the gateway). agy and anthropic stay
 local.

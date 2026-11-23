@@ -68,7 +68,17 @@ codex_lane_home() {
 }
 
 agent_cli() {
-  local uv_env=() uv_dir=() last=() codex_home=""
+  local uv_env=() uv_dir=() last=() codex_home="" effort=()
+  # LOOM_CODEX_EFFORT: the reasoning effort of a codex lane run, passed as
+  # `-c model_reasoning_effort=...` over the Codex home's config.toml (none,
+  # low, medium, high or xhigh; xhigh is the most the CLI offers). Unset: the
+  # config.toml's own setting.
+  if [ "$1:$2" = codex:lane ] && [ -n "${LOOM_CODEX_EFFORT:-}" ]; then
+    case "$LOOM_CODEX_EFFORT" in
+      none|minimal|low|medium|high|xhigh) effort=(-c "model_reasoning_effort=\"$LOOM_CODEX_EFFORT\"") ;;
+      *) echo "LOOM_CODEX_EFFORT must be none, minimal, low, medium, high or xhigh" >&2; return 2 ;;
+    esac
+  fi
   [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
   if [ "$1:$2" = codex:lane ] && [ -n "${AGENT_UV_DIR:-}" ]; then
     uv_env=("UV_CACHE_DIR=$AGENT_UV_DIR/cache" "UV_PYTHON_INSTALL_DIR=$AGENT_UV_PYTHON"
@@ -78,8 +88,13 @@ agent_cli() {
   case "$1:$2" in
     claude:lane)
       if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+        # A cluster pod has no operator settings file that allows edits, and
+        # print mode cannot answer a permission prompt: the CLI denied every
+        # Edit, Write and shell call, exited 0 and the run ended "agent made
+        # no commit". acceptEdits plus the shell tool lets it edit and run
+        # the tests; the pod is the isolation.
         CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-          claude -p --model "$MODEL" "$3" < /dev/null
+          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$3" < /dev/null
       else
         timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
       fi ;;
@@ -87,7 +102,7 @@ agent_cli() {
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) codex_home="$(codex_lane_home)" || return 2
       CODEX_HOME="$codex_home" timeout "$AGENT_TIMEOUT" env ${uv_env[@]+"${uv_env[@]}"} codex exec --sandbox workspace-write \
-      ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" ${last[@]+"${last[@]}"} "$3" < /dev/null ;;
+      ${uv_dir[@]+"${uv_dir[@]}"} --model "$MODEL" ${effort[@]+"${effort[@]}"} ${last[@]+"${last[@]}"} "$3" < /dev/null ;;
     codex:brain) timeout "$AGENT_TIMEOUT" codex exec --sandbox danger-full-access \
       --skip-git-repo-check --model "$MODEL" "$3" < /dev/null ;;
     *) echo "no agent CLI for lane $1 ($2)" >&2; return 2 ;;
