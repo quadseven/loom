@@ -71,12 +71,12 @@ agent_cli() {
   local uv_env=() uv_dir=() last=() codex_home="" effort=()
   # LOOM_CODEX_EFFORT: the reasoning effort of a codex lane run, passed as
   # `-c model_reasoning_effort=...` over the Codex home's config.toml (none,
-  # low, medium, high or xhigh; xhigh is the most the CLI offers). Unset: the
-  # config.toml's own setting.
+  # minimal, low, medium, high, xhigh or max; max is the most the model takes).
+  # Unset: the config.toml's own setting.
   if [ "$1:$2" = codex:lane ] && [ -n "${LOOM_CODEX_EFFORT:-}" ]; then
     case "$LOOM_CODEX_EFFORT" in
-      none|minimal|low|medium|high|xhigh) effort=(-c "model_reasoning_effort=\"$LOOM_CODEX_EFFORT\"") ;;
-      *) echo "LOOM_CODEX_EFFORT must be none, minimal, low, medium, high or xhigh" >&2; return 2 ;;
+      none|minimal|low|medium|high|xhigh|max) effort=(-c "model_reasoning_effort=\"$LOOM_CODEX_EFFORT\"") ;;
+      *) echo "LOOM_CODEX_EFFORT must be none, minimal, low, medium, high, xhigh or max" >&2; return 2 ;;
     esac
   fi
   [ "$1:$2" = codex:lane ] && [ -n "${AGENT_LAST_MESSAGE:-}" ] && last=(--output-last-message "$AGENT_LAST_MESSAGE")
