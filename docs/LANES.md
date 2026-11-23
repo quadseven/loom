@@ -2752,10 +2752,12 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
 tree, cache or session database stays anywhere. Claude Code runs with its
 long-lived OAuth token copied from SSM into a mode-600 file under the job home
-and exported only to the Claude CLI process. Codex uses its broker session
-file. API lanes include anthropic, opencode-go, zen, openrouter, zai,
-workersai, the free provider slots and spark (both through the gateway).
-The agy lane stays local.
+and exported only to the Claude CLI process. The Claude lane runs with
+`--permission-mode acceptEdits --allowedTools Bash` because a pod has no
+settings file allowing edits and print mode cannot answer a prompt. Codex
+uses its broker session file. API lanes include anthropic, opencode-go, zen,
+openrouter, zai, workersai, the free provider slots and spark (both through
+the gateway). The agy lane stays local.
 
 Enabling cluster runners also includes the tracked slots `anthropic-2`
 through `anthropic-8`. To move the base `anthropic` slot as well, include it

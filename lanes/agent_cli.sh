@@ -88,8 +88,13 @@ agent_cli() {
   case "$1:$2" in
     claude:lane)
       if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+        # A cluster pod has no operator settings file that allows edits, and
+        # print mode cannot answer a permission prompt: the CLI denied every
+        # Edit, Write and shell call, exited 0 and the run ended "agent made
+        # no commit". acceptEdits plus the shell tool lets it edit and run
+        # the tests; the pod is the isolation.
         CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-          claude -p --model "$MODEL" "$3" < /dev/null
+          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$3" < /dev/null
       else
         timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
       fi ;;
