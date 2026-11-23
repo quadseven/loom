@@ -5226,12 +5226,114 @@ def _with_priority(body: str, priority: str) -> str:
     return _with_header(body, "Priority", priority)
 
 
+def _packed_header_starts(line: str) -> List[Tuple[int, str]]:
+    """Find candidate header keys in the order they appear on the line."""
+    header_keys = (
+        "Difficulty",
+        "Priority",
+        "Foundational",
+        "Model",
+        "Base",
+        "Not before",
+        "After",
+        "Deliverable",
+        "Repairs incident",
+    )
+    positions = []
+    for hk in header_keys:
+        search = hk + ":"
+        start = 0
+        while True:
+            idx = line.find(search, start)
+            if idx == -1:
+                break
+            # Make sure it's at the start or preceded by whitespace
+            if idx == 0 or line[idx - 1].isspace():
+                positions.append((idx, hk))
+            start = idx + 1
+    positions.sort()
+    return positions
+
+
+def _packed_header_value_is_valid(line: str, positions: List[Tuple[int, str]],
+                                  index: int, end: int) -> bool:
+    """Check whether the candidate can stand apart from Deliverable prose."""
+    pos, key = positions[index]
+    value = line[pos + len(key) + 1:end].strip()
+    if key == "Difficulty":
+        value = value.lower()
+    valid, _ = tickets._HEADER_RULES[key]
+    if not valid(value):
+        return False
+    if key == "Deliverable" and index + 1 < len(positions):
+        # A following Model/Base with an invalid value is part of the prose.
+        next_pos, next_key = positions[index + 1]
+        if next_key in ("Model", "Base"):
+            next_end = positions[index + 2][0] if index + 2 < len(positions) else len(line)
+            next_value = line[next_pos + len(next_key) + 1:next_end].strip()
+            return tickets._HEADER_RULES[next_key][0](next_value)
+    return True
+
+
+def _split_packed_header_line(line: str) -> List[str]:
+    """Split a line containing multiple packed headers into separate header lines."""
+    positions = _packed_header_starts(line)
+    if not positions:
+        return [line]
+    # AI-REVIEW 2026-11-23 [automated PR review] 4662635821 (PR #3463):
+    # In free-form Deliverable text, resume at a header with a constrained,
+    # valid value. Model and Base values can look like ordinary prose words.
+    result = []
+    prose_start = None
+    for i, (pos, hk) in enumerate(positions):
+        next_pos = positions[i + 1][0] if i + 1 < len(positions) else len(line)
+        if prose_start is not None and hk in ("Model", "Base", "Deliverable"):
+            continue
+        if hk == "Deliverable" or prose_start is not None:
+            if not _packed_header_value_is_valid(line, positions, i, next_pos):
+                if prose_start is None:
+                    prose_start = pos
+                continue
+        if prose_start is not None:
+            result.append(line[prose_start:pos].rstrip())
+            prose_start = None
+        result.append(line[pos:next_pos].rstrip())
+    if prose_start is not None:
+        result.append(line[prose_start:].rstrip())
+    return result
+
+
+def _expand_packed_headers(lines: List[str], header_end: int) -> Tuple[List[str], int]:
+    """Expand any packed header lines in the header section.
+
+    Returns the new lines list and the new header_end index.
+    """
+    new_lines = []
+    for i in range(header_end):
+        line = lines[i]
+        stripped = line.rstrip("\r\n").rstrip()
+        # Check if it's a packed line by trying to split it
+        split = _split_packed_header_line(stripped)
+        if len(split) > 1:
+            # It's a packed line, expand each header
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            new_lines.extend(h + (ending or "\n") for h in split[:-1])
+            new_lines.append(split[-1] + ending)
+        else:
+            new_lines.append(line)
+    # Append the rest of the lines (non-header section)
+    new_lines.extend(lines[header_end:])
+    return new_lines, len(new_lines) - (len(lines) - header_end)
+
+
 def _with_header(body: str, key: str, value: str) -> str:
     """Set one leading header line without changing the remaining text."""
     lines = body.splitlines(keepends=True)
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
         header += 1
+    # Expand any packed header lines first
+    lines, header = _expand_packed_headers(lines, header)
     for index in range(header):
         if lines[index].startswith(key + ":"):
             ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
