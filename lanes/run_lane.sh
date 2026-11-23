@@ -5676,8 +5676,18 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
-  if [ -n "$FIX_PR" ] && ! fix_pr_open; then
-    park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
+  # The run may have outlived its installation token, so mint again first; a
+  # failed mint keeps the old token, and the open check says what it can.
+  # A check GitHub did not answer (FIX_REASON empty) is transient: the edits
+  # stay committed in the lane tree (loom#3465).
+  if [ -n "$FIX_PR" ]; then
+    fresh_app_token || true
+    if ! fix_pr_open; then
+      if [ -z "$FIX_REASON" ]; then
+        park "$BRIEF" "could not check pull request #$FIX_PR before pushing; the edits are committed in the lane tree" transient; continue
+      fi
+      park "$BRIEF" "$FIX_REASON"; continue
+    fi
   fi
   # A fix round that commits nothing leaves the checks it was asked to fix
   # failing on the very head CI failed them on: it is a failed round, not
