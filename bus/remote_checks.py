@@ -395,7 +395,8 @@ class Ticker(threading.Thread):
         try:
             self.make().tend()
         except RateLimited:
-            pass
+            # Visible, so a rate-limited station does not look idle; the next tick retries.
+            self.say("remote check tick skipped: GitHub rate limit; the next tick retries")
         except (GitHubError, OSError, runners.ReportError) as err:
             self.say("remote check tick failed: %s" % err)
 

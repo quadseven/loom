@@ -5,6 +5,8 @@ import io
 import json
 import re
 import tempfile
+import time
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -62,7 +64,7 @@ class Dispatch(unittest.TestCase):
 
 
 class Ticker(unittest.TestCase):
-    def test_a_request_filed_mid_pass_is_dispatched_and_written_back_on_ticks(self):
+    def test_a_request_filed_with_no_pass_running_is_dispatched_and_written_back_on_ticks(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
             zf.writestr("result.json", json.dumps({"exit": 0, "failing": []}))
@@ -109,6 +111,47 @@ class Ticker(unittest.TestCase):
                 remote_checks.RemoteChecks(GH(), home, "example/loom", lambda r: True,
                                            lambda m: None, actor="loom[bot]").tend()
             self.assertEqual(calls, [])
+
+
+class TickerLifecycle(unittest.TestCase):
+    def test_the_loop_ticks_until_stopped_and_then_ends(self):
+        ticks = []
+
+        class Fake:
+            def tend(self):
+                ticks.append(1)
+
+        ticker = remote_checks.Ticker(Fake, lambda m: None, interval=0.01)
+        ticker.start()
+        deadline = time.monotonic() + 5
+        while not ticks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        ticker.stop()
+        ticker.join(timeout=5)
+        self.assertTrue(ticks)
+        self.assertFalse(ticker.is_alive())
+
+    def test_a_rate_limited_tick_says_so_and_does_not_raise(self):
+        said = []
+
+        class Limited:
+            def tend(self):
+                raise remote_checks.RateLimited("limited", 429, "", 0)
+
+        remote_checks.Ticker(Limited, said.append).tick()
+        self.assertEqual(len(said), 1)
+        self.assertIn("rate limit", said[0])
+
+    def test_a_station_without_a_real_client_starts_no_ticker(self):
+        from bus import station
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, "state", "remote-checks", "req").mkdir(parents=True)
+            fake = types.SimpleNamespace(gh=object(), s=types.SimpleNamespace(home=home, self_repo="o/r"))
+            station.Station.start_remote_check_ticker(fake)
+            self.assertFalse(hasattr(fake, "_remote_ticker"))
+            bare = types.SimpleNamespace(s=types.SimpleNamespace(home=home, self_repo="o/r"))
+            station.Station.start_remote_check_ticker(bare)
+            self.assertFalse(hasattr(bare, "_remote_ticker"))
 
 
 class Workflow(unittest.TestCase):
