@@ -6458,7 +6458,10 @@ class Station:
                 return
         left: List[str] = []
         merged = target == "loom:merged"
-        if merged:
+        # A failed lane ticket is delivered only because its own work merged.
+        # Its failure state does not make the station judge the PR's criteria
+        # or send finished work back to the queue.
+        if merged and "loom:failed" not in labels:
             left = self._unbuilt_criteria(ticket, [pr, *landed])
             if left:
                 events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
@@ -6800,13 +6803,16 @@ class Station:
         note = ("Pull request #%d merged while this ticket was at %s, so it moved to "
                 "loom:merged." % (int(pr["number"]), was))
         branch = str((pr.get("head") or {}).get("ref") or "")
-        if not branch.startswith("loom/"):
+        if was == "loom:failed" or not branch.startswith("loom/"):
             self._drop_lane_label(repo, ticket)
-            note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
-                     "ticket no longer holds a lane." % (
-                         branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
-            _say("%s#%d merged from a non-lane branch: pull request #%d"
-                 % (repo, number, int(pr["number"])))
+            if was == "loom:failed":
+                note += " The failed ticket no longer holds a lane."
+            else:
+                note += (" It merged from branch %s, outside loom/ (merge commit %s), so the "
+                         "ticket no longer holds a lane." % (
+                             branch, str(pr.get("merge_commit_sha") or "")[:12] or "unknown"))
+                _say("%s#%d merged from a non-lane branch: pull request #%d"
+                     % (repo, number, int(pr["number"])))
         self._comment(repo, number, note, notify.MERGED)
 
     def _deliverable(self, repo: str, pr: Dict[str, Any],
@@ -6823,9 +6829,14 @@ class Station:
             return None
         labels = _label_names(ticket)
         was = next((s for s in UNLINKED_STATES if s in labels), "loom:queued")
-        if str(head.get("ref") or "").startswith("loom/") and was not in (
-                "loom:queued", "loom:briefed"):
-            return None
+        ref = str(head.get("ref") or "")
+        if ref.startswith("loom/") and was not in ("loom:queued", "loom:briefed"):
+            branch_ticket = re.match(r"loom/(\d+)(?:-|$)", ref)
+            body_refs = _refs_numbers(repo, str(pr.get("body") or ""))
+            if (was != "loom:failed" or
+                    (number not in body_refs and
+                     (branch_ticket is None or int(branch_ticket.group(1)) != number))):
+                return None
         if not self._deliver_trusted_author(repo, ticket, pr):
             return None
         events = self._paginate("/repos/%s/issues/%d/events" % (repo, number))
