@@ -1904,9 +1904,13 @@ REFUSED_BODY = (400, 413, 422)
 class UploadRefused(OSError):
     """The dashboard read the body and refused it (REFUSED_BODY)."""
 
-    def __init__(self, status: int) -> None:
-        super().__init__("the transcript upload answered %d" % status)
+    def __init__(self, status: int, error_text: str = "") -> None:
+        msg = "the transcript upload answered %d" % status
+        if error_text:
+            msg += ": %s" % error_text
+        super().__init__(msg)
         self.status = status
+        self.error_text = error_text
 
 
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
@@ -1921,13 +1925,28 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status = resp.status
+            if status in REFUSED_BODY:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    error_data = json.loads(raw)
+                    error_text = str(error_data.get("error", ""))
+                except ValueError:
+                    error_text = raw[:200]
+                raise UploadRefused(status, error_text)
     except urllib.error.HTTPError as err:
         status = err.code
+        if status in REFUSED_BODY:
+            raw = err.read().decode("utf-8", "replace")
+            try:
+                error_data = json.loads(raw)
+                error_text = str(error_data.get("error", ""))
+            except ValueError:
+                error_text = raw[:200]
+            err.close()
+            raise UploadRefused(status, error_text)
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
-    if status in REFUSED_BODY:
-        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -15387,8 +15406,11 @@ class Station:
             except UploadRefused as err:
                 # The dashboard is up and refused this body: give it up now and
                 # send the next, so one bad run never blocks the rest.
-                _say("the dashboard refused the transcript of %s (%d); given up"
-                     % (key, err.status))
+                msg = "the dashboard refused the transcript of %s (%d)" % (key, err.status)
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                msg += "; given up"
+                _say(msg)
                 self._record(ledger, key, tick, "refused")
                 _write_json(path, ledger)
                 continue
@@ -15482,7 +15504,11 @@ class Station:
             ledger["closings_safe"] = False
             ledger.pop("closings_cache", None)
         except UploadRefused as err:
-            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            msg = "the dashboard refused the brain tick of %s (%d)" % (when, err.status)
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; given up"
+            _say(msg)
             result = "refused"
         # Deliberately broad, as in upload_transcripts: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -15522,10 +15548,13 @@ class Station:
             ledger["closings_cache"] = [c for _, c in closings]
             if fails >= CLOSE_SAFE_AFTER:
                 ledger["closings_safe"] = True
-            _say("could not send the brain's done markers (UploadRefused status %d); "
-                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
-                                           "; safe mode on, caching locally"
-                                           if ledger.get("closings_safe") else ""))
+            msg = "could not send the brain's done markers (UploadRefused status %d)" % err.status
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; next in %d minutes%s" % (max(1, delay // 60),
+                                               "; safe mode on, caching locally"
+                                               if ledger.get("closings_safe") else "")
+            _say(msg)
             return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -18754,7 +18783,10 @@ class Station:
                 self.upload(url, token, records)
                 return
             except UploadRefused as err:
-                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                msg = "the dashboard refused the usage snapshot (%d)" % err.status
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                _say(msg)
                 return
             except Exception as err:  # noqa: BLE001
                 if attempt == 1:
