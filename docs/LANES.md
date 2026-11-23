@@ -2244,7 +2244,10 @@ the burn over the last 24 hours, and the balance projected at
 and named, not guessed. A new run republishes the comment on the next station
 pass. Under the floor (or with a budget setting that does not parse) each
 anthropic slot reports itself unavailable with that reason, and the station
-sends the anthropic slots nothing more.
+sends the anthropic slots nothing more. Ephemeral runners return their spend
+rows in the sealed report. The station appends them once per report to the
+same ledger and checks the shared balance before dispatching more Anthropic
+briefs.
 
 ## Skills on every lane
 
@@ -2749,10 +2752,21 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
 tree, cache or session database stays anywhere. Claude Code runs with its
 long-lived OAuth token copied from SSM into a mode-600 file under the job home
-and exported only to the Claude CLI process. Codex uses its broker session
-file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
-provider slots and spark (both through the gateway). agy and anthropic stay
-local.
+and exported only to the Claude CLI process. The Claude lane runs with
+`--permission-mode acceptEdits --allowedTools Bash` because a pod has no
+settings file allowing edits and print mode cannot answer a prompt. Codex
+uses its broker session file. API lanes include anthropic, opencode-go, zen,
+openrouter, zai, workersai, the free provider slots and spark (both through
+the gateway). The agy lane stays local.
+
+Enabling cluster runners also includes the tracked slots `anthropic-2`
+through `anthropic-8`. To move the base `anthropic` slot as well, include it
+in `LOOM_RUNNER_SLOTS`. Stop any local runner for a slot before taking its
+briefs on the cluster, and include the moved slots in `LOOM_RUNNER_SLOTS`
+when reinstalling to keep those local jobs disabled. The pods need the
+Claude CLI, access to the Anthropic API, and permission to read the shared
+`LOOM_ANTHROPIC_KEY_SSM` parameter. The API key uses the same staged SSM
+path as OpenCode Go.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125
@@ -2813,7 +2827,8 @@ The job, step by step (`lanes/k8s/lane_job.py`):
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
    line, the validation record, the `.image` fingerprint, the `.answered`
-   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   and `.verify` files, the transcripts, answers, the slot's heartbeat, and
+   the Anthropic spend rows if present. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both

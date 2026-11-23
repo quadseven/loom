@@ -1904,9 +1904,13 @@ REFUSED_BODY = (400, 413, 422)
 class UploadRefused(OSError):
     """The dashboard read the body and refused it (REFUSED_BODY)."""
 
-    def __init__(self, status: int) -> None:
-        super().__init__("the transcript upload answered %d" % status)
+    def __init__(self, status: int, error_text: str = "") -> None:
+        msg = "the transcript upload answered %d" % status
+        if error_text:
+            msg += ": %s" % error_text
+        super().__init__(msg)
         self.status = status
+        self.error_text = error_text
 
 
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
@@ -1921,13 +1925,28 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status = resp.status
+            if status in REFUSED_BODY:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    error_data = json.loads(raw)
+                    error_text = str(error_data.get("error", ""))
+                except ValueError:
+                    error_text = raw[:200]
+                raise UploadRefused(status, error_text)
     except urllib.error.HTTPError as err:
         status = err.code
+        if status in REFUSED_BODY:
+            raw = err.read().decode("utf-8", "replace")
+            try:
+                error_data = json.loads(raw)
+                error_text = str(error_data.get("error", ""))
+            except ValueError:
+                error_text = raw[:200]
+            err.close()
+            raise UploadRefused(status, error_text)
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
-    if status in REFUSED_BODY:
-        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -6430,6 +6449,22 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if "loom:failed" in labels and target != "loom:merged":
+            return
+        if target == "loom:merged" and "loom:failed" in labels:
+            states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
+            kept = self._drop_claim(name for name in labels
+                                    if name not in states and not name.startswith(("lane:", WAIT)))
+            kept.append("loom:merged")
+            self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                         {"labels": kept})
+            ticket["labels"] = [{"name": name} for name in kept]
+            self._routine(repo, int(number),
+                          "Pull request #%d merged, so this failed ticket moved to loom:merged."
+                          % int(pr["number"]))
+            _say("%s#%d: merged pull request #%d moved failed ticket to loom:merged"
+                 % (repo, number, int(pr["number"])))
+            return
         if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
                 self._status_texts(repo, int(number))):
             return
@@ -6539,6 +6574,11 @@ class Station:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
         open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        for issue in open_tickets:
+            if (isinstance(issue, dict) and "pull_request" not in issue
+                    and "loom:ticket" in _label_names(issue)
+                    and "loom:failed" in _label_names(issue)):
+                tickets_by_number.setdefault(int(issue["number"]), issue)
         self._open_work[repo] = {
             int(i["number"]) for i in open_tickets
             if isinstance(i, dict) and "pull_request" not in i and "number" in i
@@ -15387,8 +15427,11 @@ class Station:
             except UploadRefused as err:
                 # The dashboard is up and refused this body: give it up now and
                 # send the next, so one bad run never blocks the rest.
-                _say("the dashboard refused the transcript of %s (%d); given up"
-                     % (key, err.status))
+                msg = "the dashboard refused the transcript of %s (%d)" % (key, err.status)
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                msg += "; given up"
+                _say(msg)
                 self._record(ledger, key, tick, "refused")
                 _write_json(path, ledger)
                 continue
@@ -15482,7 +15525,11 @@ class Station:
             ledger["closings_safe"] = False
             ledger.pop("closings_cache", None)
         except UploadRefused as err:
-            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            msg = "the dashboard refused the brain tick of %s (%d)" % (when, err.status)
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; given up"
+            _say(msg)
             result = "refused"
         # Deliberately broad, as in upload_transcripts: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -15522,10 +15569,13 @@ class Station:
             ledger["closings_cache"] = [c for _, c in closings]
             if fails >= CLOSE_SAFE_AFTER:
                 ledger["closings_safe"] = True
-            _say("could not send the brain's done markers (UploadRefused status %d); "
-                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
-                                           "; safe mode on, caching locally"
-                                           if ledger.get("closings_safe") else ""))
+            msg = "could not send the brain's done markers (UploadRefused status %d)" % err.status
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; next in %d minutes%s" % (max(1, delay // 60),
+                                               "; safe mode on, caching locally"
+                                               if ledger.get("closings_safe") else "")
+            _say(msg)
             return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -18166,6 +18216,9 @@ class Station:
     def end_pass(self) -> None:
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
+        ticker = getattr(self, "_remote_ticker", None)
+        if ticker is not None:
+            ticker.stop()
         gh = self.gh
         kinds = ", ".join("%s %d" % (k, n) for k, n in
                           sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -18504,7 +18557,29 @@ class Station:
             if first:
                 _say("log capture: %s holds logs from %s" % (source.name, first))
 
+    def start_remote_check_ticker(self) -> None:
+        """Tend remote checks every minute beside the pass, so a run that
+        finished reaches its lane in minutes, not a pass later (loom#3499).
+        The thread has its own GitHub client; only a station on a real client
+        starts one."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        # A station built without a client (tests, a half-set-up pass) has no
+        # self.gh yet; it starts no ticker, as one on a fake client does not.
+        if not (isinstance(getattr(self, "gh", None), GitHub) and repo
+                and os.path.isdir(os.path.join(remote_checks.root(self.s.home), "req"))):
+            return
+        from .github import auth_from_env
+        gh = GitHub(auth_from_env())
+
+        def make() -> "remote_checks.RemoteChecks":
+            return remote_checks.RemoteChecks(gh, self.s.home, repo, self._public, _say,
+                                              actor=gh.app_login())
+
+        self._remote_ticker = remote_checks.Ticker(make, _say)
+        self._remote_ticker.start()
+
     def run_pass(self) -> None:
+        self.start_remote_check_ticker()
         self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
@@ -18754,7 +18829,10 @@ class Station:
                 self.upload(url, token, records)
                 return
             except UploadRefused as err:
-                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                msg = "the dashboard refused the usage snapshot (%d)" % err.status
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                _say(msg)
                 return
             except Exception as err:  # noqa: BLE001
                 if attempt == 1:

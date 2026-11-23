@@ -26,10 +26,11 @@ TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_creation_input_tokens",
               "cache_read_input_tokens")
 DAY = 86400
 DEFAULT_FLOOR = 5.0
+REPORT_PATH = "state/usage/spend.jsonl"
 
 
 def spend_path(home: str) -> str:
-    return os.path.join(home, "state", "usage", "spend.jsonl")
+    return os.path.join(home, REPORT_PATH)
 
 
 def _number(value: Any) -> Optional[float]:
@@ -97,11 +98,30 @@ def record(home: str, output: str, slot: str, ticket: str, model: str,
     sys.stdout.write(human_text(text, result))
     sys.stdout.flush()
     line = entry(result, slot, ticket, model, time.time() if now is None else now)
+    _append(home, [line])
+    return line
+
+
+def _append(home: str, rows: List[Dict[str, Any]]) -> None:
     path = spend_path(home)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(line) + "\n")
-    return line
+        fh.write("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def import_report(home: str, data: bytes, slot: str, ticket: str, run_id: str) -> None:
+    """Append this pod's spend once, even if the station replays its report."""
+    rows = []
+    for line in data.splitlines():
+        row = json.loads(line)
+        if (not isinstance(row, dict) or row.get("slot") != slot
+                or row.get("ticket") != ticket or _number(row.get("at")) is None
+                or "cost_usd" not in row
+                or (row["cost_usd"] is not None and _number(row["cost_usd"]) is None)):
+            raise ValueError("invalid spend row for this run")
+        rows.append(dict(row, run_id=run_id))
+    if rows and not any(row.get("run_id") == run_id for row in load(home)):
+        _append(home, rows)
 
 
 def load(home: str) -> List[Dict[str, Any]]:
