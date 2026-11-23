@@ -2168,9 +2168,11 @@ class Filer:
         for key, number in self._listing().items():
             if self.writes + 2 > WRITES_MAX:
                 return
+            kind = key.split("/", 1)[0]
             if (key in current or self._rolls.get(key) != number
                     or number in self._listed_closed or number in self._ticketed
-                    or key.split("/", 1)[0] not in self.read or key in self._unread_keys):
+                    or kind not in self.read
+                    or (kind in ("lane-pr-stalled", SCHEDULED_WORKFLOW_RED) and key in self._unread_keys)):
                 continue
             issue = self._issue(number)
             if (issue is None or issue.get("state") != "open"
@@ -2238,7 +2240,10 @@ class Filer:
     def _clear_roll(self, key: str, number: int, issue: Dict[str, Any]) -> bool:
         """A tracking issue with no violation this pass; left as it is when
         its facts were not read (an empty list would be a guess)."""
-        if key.split("/", 1)[0] not in self.read or key in self._unread_keys:
+        kind = key.split("/", 1)[0]
+        if kind not in self.read:
+            return True
+        if kind in ("lane-pr-stalled", SCHEDULED_WORKFLOW_RED) and key in self._unread_keys:
             return True
         return self._roll_clear(key, number, issue)
 
