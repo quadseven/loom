@@ -1770,10 +1770,27 @@ def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
 def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
                ) -> List[Tuple[datetime, Dict[str, Any]]]:
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
-    loom:verified instead, so it never appears."""
+    loom:verified instead, so it never appears. Tickets with a verify handoff
+    ticket (loom:verify-handoff) are skipped."""
+    # Find tickets that have a verify handoff ticket
+    handoff_tickets = set()
+    try:
+        search_query = "repo:%s label:loom:verify-handoff" % repo
+        result = gh.rest("GET", "/search/issues?q=%s" % search_query)
+        items = result.data.get("items", []) if result.data else []
+        for item in items:
+            body = str(item.get("body") or "")
+            import re
+            match = re.search(r"Verify handoff for #(\d+)", body)
+            if match:
+                handoff_tickets.add(int(match.group(1)))
+    except GitHubError:
+        pass
+    
     shipped = [issue for issue in tickets
                if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)
-               and WAIT_LIVE_EVENT not in _labels(issue)]
+               and WAIT_LIVE_EVENT not in _labels(issue)
+               and issue.get("number") not in handoff_tickets]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
     stamps = _read_each(lambda issue: _shipped_at(gh, repo, issue), shipped)

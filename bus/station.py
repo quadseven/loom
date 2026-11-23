@@ -776,6 +776,13 @@ VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# A shipped ticket whose live criterion has waited more than this many days
+# without a proof gets a verify handoff ticket (loom#3509): the lane-machine
+# tick cannot reach most live systems, so the backlog grows and every tick
+# reports verify as degraded. The handoff ticket reads the live system and
+# posts the proof or the observed failure.
+VERIFY_HANDOFF_DAYS = 14
+VERIFY_HANDOFF_LABEL = "loom:verify-handoff"
 VERIFY_PRIORITY_MEDIAN_H = 24.0
 VERIFY_PRIORITY_AFTER = 24 * 3600
 VERIFY_PRIORITY_EVERY = metrics.SHIPPED_STAMP_MAX_AGE
@@ -912,14 +919,18 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                refused: Optional[Dict[str, Any]] = None,
                adapter_tickets: Sequence[str] = (),
                missing: Optional[Dict[str, Any]] = None,
-               check_live: bool = True
+               check_live: bool = True,
+               handoff_tickets: Sequence[str] = ()
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
-    (`refused`: ticket -> reasons) is left to the brain."""
+    (`refused`: ticket -> reasons) is left to the brain. Tickets with a
+    verify handoff ticket are skipped."""
     due = []
     for repo, issue in issues:
         key = "%s#%s" % (repo, issue.get("number"))
+        if key in handoff_tickets:
+            continue
         if not _verify_candidate(issue, key in adapter_tickets or not check_live):
             continue
         last = attempts.get(key)
@@ -4101,18 +4112,20 @@ class Station:
                 held |= self._queued_lanes(repo, issues, counts)
             shipped += [(repo, i) for i in issues]
         shipped = [(repo, issue) for repo, issue in shipped
-                   if self._verify_criteria(repo, issue)]
+                    if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
-                           if self._adapter_can_verify(repo, issue)}
+                            if self._adapter_can_verify(repo, issue)}
         self._note_unsearchable(shipped, adapter_tickets)
         refused = self._verify_refused_ledger()
         missing = self._verify_missing_ledger()
+        # Find handoff tickets for this repo
+        handoff_tickets = self._find_verify_handoff_tickets()
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
-                                      missing, check_live=False):
+                                      missing, check_live=False, handoff_tickets=handoff_tickets):
             issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
             if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
                 continue
@@ -4123,7 +4136,7 @@ class Station:
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing, handoff_tickets=handoff_tickets), held
 
     @staticmethod
     def _note_unsearchable(shipped: Sequence[Tuple[str, Dict[str, Any]]],
@@ -5393,6 +5406,54 @@ class Station:
     def _verify_missing_ledger(self) -> Dict[str, Any]:
         data = _read_json(os.path.join(self.state, VERIFY_MISSING_FILE), {}, strict=False)
         return data if isinstance(data, dict) else {}
+
+    def _find_verify_handoff_tickets(self) -> set:
+        """Return a set of 'repo#number' keys for tickets that have a verify handoff ticket."""
+        handoff_tickets = set()
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            try:
+                search_query = "repo:%s label:%s" % (repo, VERIFY_HANDOFF_LABEL)
+                result = self.gh.rest("GET", "/search/issues?q=%s" % search_query)
+                items = result.data.get("items", []) if result.data else []
+                for item in items:
+                    body = str(item.get("body") or "")
+                    # Extract the original ticket number from the body
+                    import re
+                    match = re.search(r"Verify handoff for #(\d+)", body)
+                    if match:
+                        original_number = int(match.group(1))
+                        handoff_tickets.add("%s#%d" % (repo, original_number))
+            except GitHubError:
+                pass
+        return handoff_tickets
+
+    def _find_verify_handoff_candidates(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Find shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS.
+        Returns a list of (repo, issue) tuples. This is called during the reads
+        phase so that _create_verify_handoffs doesn't need to make additional
+        reads (loom#3509)."""
+        candidates = []
+        handoff_cutoff = self.now - (VERIFY_HANDOFF_DAYS * 24 * 3600)
+        for repo in self.s.repos:
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._tickets_open(repo)
+            for issue in issues:
+                names = _label_names(issue)
+                if (issue.get("state") != "open" or "loom:ticket" not in names
+                        or "loom:shipped" not in names or "loom:verified" in names
+                        or VERIFY_HANDOFF_LABEL in names):
+                    continue
+                body = str(issue.get("body") or "")
+                if not live_needles(body):
+                    continue
+                shipped_at = self._shipped_stamp(repo, issue)
+                if shipped_at is None or shipped_at >= handoff_cutoff:
+                    continue
+                candidates.append((repo, issue))
+        return candidates
 
     def _missing_handoff(self, repo: str, number: int, result: Any,
                          issue: Dict[str, Any], run: str) -> bool:
@@ -14733,6 +14794,7 @@ class Station:
             raise
         self._read_facts = facts
         self._unstick_lane_pulls(facts)
+        self._create_verify_handoffs(facts)
         breaches = invariants.check(facts, _say)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
@@ -14772,6 +14834,58 @@ class Station:
             if queued:
                 facts.lane_pulls[index] = pull._replace(fix_pending=True)
                 _say("invariants: queued a fix round for stalled pull request %s" % pull.pr.label)
+
+    def _create_verify_handoffs(self, facts: invariants.Facts) -> None:
+        """Create verify handoff tickets for shipped tickets with live criteria
+        older than VERIFY_HANDOFF_DAYS. The handoff ticket is a read-and-report
+        verify ticket assigned to a lane."""
+        if not self.s.repos:
+            return
+        # Use already-fetched handoff tickets and candidates from facts
+        existing_handoffs = facts.verify_handoff_tickets or set()
+        candidates = facts.verify_handoff_candidates or []
+        for repo, issue in candidates:
+            if "%s#%d" % (repo, int(issue["number"])) in existing_handoffs:
+                continue
+            # Create the handoff ticket
+            shipped_at = self._shipped_stamp(repo, issue)
+            if shipped_at is not None:
+                self._create_verify_handoff_ticket(repo, issue, shipped_at)
+
+    def _has_verify_handoff(self, repo: str, ticket_number: int) -> bool:
+        """Whether a verify handoff ticket already exists for this shipped ticket."""
+        search_query = "repo:%s label:%s \"Verify handoff for #%d\"" % (repo, VERIFY_HANDOFF_LABEL, ticket_number)
+        try:
+            result = self.gh.rest("GET", "/search/issues?q=%s" % search_query)
+            items = result.data.get("items", []) if result.data else []
+            return len(items) > 0
+        except GitHubError:
+            return False
+
+    def _create_verify_handoff_ticket(self, repo: str, issue: Dict[str, Any], shipped_at: float) -> None:
+        """Create a verify handoff ticket for a shipped ticket with an old live criterion."""
+        number = int(issue["number"])
+        title = "Verify handoff for #%d: %s" % (number, issue.get("title", ""))
+        body = ("Verify handoff for #%d\n\n"
+                "This ticket was created by the station because the live criterion on "
+                "#%d has waited more than %d days without a proof.\n\n"
+                "The verify lane should read the live system named in the Live box "
+                "and post the observed evidence or the observed failure.\n\n"
+                "Part of #%d\n"
+                "Original: %s#%d" % (number, number, VERIFY_HANDOFF_DAYS, self._invariant_goal()[1] if self._invariant_goal() else 0, repo, number))
+        labels = ["loom:ticket", VERIFY_HANDOFF_LABEL]
+        try:
+            result = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+                "title": title,
+                "body": body,
+                "labels": labels
+            })
+            if result.status == 201:
+                handoff_number = result.data["number"]
+                _say("created verify handoff ticket %s#%d for %s#%d (shipped %s ago)"
+                     % (repo, handoff_number, repo, number, time.strftime("%Y-%m-%d", time.gmtime(shipped_at))))
+        except GitHubError as err:
+            _say("could not create verify handoff ticket for %s#%d: %s" % (repo, number, err))
 
     @staticmethod
     def _invariant_ref_parts(ref: str) -> Optional[Tuple[str, int]]:
@@ -15080,6 +15194,14 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the lane pull requests: %s" % err)
+        # Verify handoff tickets (loom#3509): shipped tickets with live criteria
+        # older than VERIFY_HANDOFF_DAYS that have a read-and-report verify ticket.
+        facts.verify_handoff_tickets = self._find_verify_handoff_tickets()
+        # Find shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS
+        # (candidates for verify handoff tickets). This is done here during the
+        # reads phase so that _create_verify_handoffs doesn't need to make
+        # additional reads (loom#3509).
+        facts.verify_handoff_candidates = self._find_verify_handoff_candidates()
         if not isinstance(state.get("scheduled_workflows"), dict):
             state["scheduled_workflows"] = {}
         read_start = self._pass_counted()

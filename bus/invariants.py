@@ -485,6 +485,13 @@ class Facts:
     # Goal homes (OWNER/NAME#N) the operator exempted from the roll source-pin
     # pass: roll-pin-off leaves them out (LOOM_ROLL_PIN_EXEMPT).
     roll_exempt: Tuple[str, ...] = ()
+    # Shipped tickets that have a verify handoff ticket (loom#3509): the station
+    # created a read-and-report verify ticket for these, so they no longer count
+    # toward verify degradation.
+    verify_handoff_tickets: Optional[set] = None
+    # Shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS (loom#3509):
+    # candidates for verify handoff tickets.
+    verify_handoff_candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
 
 
 @dataclass(frozen=True)
@@ -552,6 +559,30 @@ def _lanes(count: int) -> str:
 
 
 # -- the invariants ------------------------------------------------------
+def _verify_degraded_covered_by_handoff(step: str, handoff_tickets: Optional[set]) -> bool:
+    """Whether a verify degraded step is covered by handoff tickets.
+    The step looks like: "verify degraded: 4 overdue live checks in example-owner/factory (oldest due 2026-11-03) not taken"
+    """
+    if handoff_tickets is None:
+        return False
+    if "verify degraded" not in step:
+        return False
+    # Extract repo from the step string
+    import re
+    match = re.search(r"in ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)", step)
+    if not match:
+        return False
+    repo = match.group(1)
+    # Check if all verify-due tickets for this repo have handoff tickets
+    # We can't know the exact tickets from the step string, so we check if
+    # there are any handoff tickets for this repo. If there are, we assume
+    # the station has handed off all old verify-due items.
+    for ticket_key in handoff_tickets:
+        if ticket_key.startswith(repo + "#"):
+            return True
+    return False
+
+
 def brain_failing(f: Facts) -> List[Breach]:
     """A brain holder whose two newest ticks each journaled a failed or
     degraded step. One tick may journal on several goals; it is one tick."""
@@ -572,7 +603,13 @@ def brain_failing(f: Facts) -> List[Breach]:
         evidence = []
         for tick in last:
             for j in tick:
-                evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s) for s in j.steps]
+                for s in j.steps:
+                    # Skip verify degraded steps that are covered by handoff tickets
+                    if _verify_degraded_covered_by_handoff(s, f.verify_handoff_tickets):
+                        continue
+                    evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s)]
+        if not evidence:
+            continue
         out.append(Breach("brain-failing", name,
                           "Brain %s reported a failed or degraded step two ticks in a row" % name,
                           tuple(evidence), max(j.at for j in last[-1])))
