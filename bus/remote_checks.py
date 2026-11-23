@@ -24,11 +24,13 @@ unreadable run. The lane also gives up on its own bound (docs/LANES.md,
 """
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
 import zipfile
@@ -217,6 +219,18 @@ class RemoteChecks:
 
     # -- the pass -----------------------------------------------------------
     def tend(self) -> None:
+        """One tending, under a lock on the ledger: the pass's own call and the
+        Ticker's never run at once, and one that finds the other running
+        leaves the work to it."""
+        os.makedirs(root(self.home), exist_ok=True)
+        with open(os.path.join(root(self.home), ".tend.lock"), "a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return
+            self._tend()
+
+    def _tend(self) -> None:
         directory = os.path.join(root(self.home), "req")
         try:
             names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
@@ -357,6 +371,42 @@ class RemoteChecks:
                     except OSError:
                         pass
                 del ledger["runs"][rid]
+
+
+TICK_SECONDS = 60
+
+
+class Ticker(threading.Thread):
+    """Tends remote checks on their own cadence, whatever step the station's
+    pass is in, so a finished run reaches its lane within a tick and not a
+    pass later. `make` returns a fresh RemoteChecks (its own GitHub client:
+    the pass's is not shared across threads). Every rule stays in
+    RemoteChecks.tend; a failed tick is logged and the next one retries."""
+
+    def __init__(self, make: Callable[[], "RemoteChecks"], say: Callable[[str], None],
+                 interval: float = TICK_SECONDS) -> None:
+        super().__init__(name="remote-checks", daemon=True)
+        self.make = make
+        self.say = say
+        self.interval = interval
+        self.stopped = threading.Event()
+
+    def tick(self) -> None:
+        try:
+            self.make().tend()
+        except RateLimited:
+            # Visible, so a rate-limited station does not look idle; the next tick retries.
+            self.say("remote check tick skipped: GitHub rate limit; the next tick retries")
+        except (GitHubError, OSError, runners.ReportError) as err:
+            self.say("remote check tick failed: %s" % err)
+
+    def run(self) -> None:
+        while not self.stopped.is_set():
+            self.tick()
+            self.stopped.wait(self.interval)
+
+    def stop(self) -> None:
+        self.stopped.set()
 
 
 def main(argv: List[str], home: str, env: Optional[Dict[str, str]] = None) -> int:

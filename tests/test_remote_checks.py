@@ -5,6 +5,8 @@ import io
 import json
 import re
 import tempfile
+import time
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -59,6 +61,97 @@ class Dispatch(unittest.TestCase):
                                        actor="loom[bot]").tend()
             self.assertEqual(calls, [])
             self.assertEqual(remote_checks.read_result(home, rid)["state"], "error")
+
+
+class Ticker(unittest.TestCase):
+    def test_a_request_filed_with_no_pass_running_is_dispatched_and_written_back_on_ticks(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("result.json", json.dumps({"exit": 0, "failing": []}))
+        state = {"done": False}
+        run = {"head_branch": "main", "path": ".github/workflows/remote-check.yml@refs/heads/main",
+               "event": "workflow_dispatch", "triggering_actor": {"login": "loom[bot]"}}
+
+        class GH:
+            def rest(self, method, path, body=None, ok=None):
+                if method == "POST":
+                    return Response(200, {"workflow_run_id": 7})
+                if path.endswith("/runs/7"):
+                    return Response(200, dict(run, status="completed" if state["done"] else "queued",
+                                              conclusion="success"))
+                if path.endswith("/artifacts"):
+                    return Response(200, {"artifacts": [{"id": 9, "name": "remote-check-result-" + rid}]})
+                return Response(302, {}, headers={"location": "https://x/zip"})
+
+        with tempfile.TemporaryDirectory() as home:
+            rid = remote_checks.submit(home, "example/repo", SHA, "", "no", "", "true")
+            make = lambda: remote_checks.RemoteChecks(
+                GH(), home, "example/loom", lambda r: True, lambda m: None,
+                actor="loom[bot]", fetch=lambda url: buf.getvalue())
+            ticker = remote_checks.Ticker(make, lambda m: None)
+            ticker.tick()                      # no pass step runs: only the ticker
+            self.assertIsNone(remote_checks.read_result(home, rid))
+            state["done"] = True
+            ticker.tick()
+            self.assertEqual(remote_checks.read_result(home, rid)["state"], "done")
+
+    def test_a_tending_that_finds_another_running_does_nothing(self):
+        calls = []
+
+        class GH:
+            def rest(self, *a, **kw):
+                calls.append(a)
+                return Response(200, {})
+
+        with tempfile.TemporaryDirectory() as home:
+            remote_checks.submit(home, "example/repo", SHA, "", "no", "", "true")
+            import fcntl
+            with open(Path(home) / "state" / "remote-checks" / ".tend.lock", "a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                remote_checks.RemoteChecks(GH(), home, "example/loom", lambda r: True,
+                                           lambda m: None, actor="loom[bot]").tend()
+            self.assertEqual(calls, [])
+
+
+class TickerLifecycle(unittest.TestCase):
+    def test_the_loop_ticks_until_stopped_and_then_ends(self):
+        ticks = []
+
+        class Fake:
+            def tend(self):
+                ticks.append(1)
+
+        ticker = remote_checks.Ticker(Fake, lambda m: None, interval=0.01)
+        ticker.start()
+        deadline = time.monotonic() + 5
+        while not ticks and time.monotonic() < deadline:
+            time.sleep(0.01)
+        ticker.stop()
+        ticker.join(timeout=5)
+        self.assertTrue(ticks)
+        self.assertFalse(ticker.is_alive())
+
+    def test_a_rate_limited_tick_says_so_and_does_not_raise(self):
+        said = []
+
+        class Limited:
+            def tend(self):
+                raise remote_checks.RateLimited("limited", 429, "", 0)
+
+        remote_checks.Ticker(Limited, said.append).tick()
+        self.assertEqual(len(said), 1)
+        self.assertIn("rate limit", said[0])
+
+    def test_a_station_without_a_real_client_starts_no_ticker(self):
+        from bus import station
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, "state", "remote-checks", "req").mkdir(parents=True)
+            fake = types.SimpleNamespace(gh=object(), s=types.SimpleNamespace(home=home, self_repo="o/r"))
+            station.Station.start_remote_check_ticker(fake)
+            self.assertFalse(hasattr(fake, "_remote_ticker"))
+            bare = types.SimpleNamespace(s=types.SimpleNamespace(home=home, self_repo="o/r"))
+            station.Station.start_remote_check_ticker(bare)
+            self.assertFalse(hasattr(bare, "_remote_ticker"))
 
 
 class Workflow(unittest.TestCase):
