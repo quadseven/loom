@@ -89,6 +89,9 @@ RUNNER_LANES = ("codex", "claude", "anthropic", "opencode-go", "zen", "openroute
 # lane they will replace (docs/LANE_RUNNERS_PLAN.md).
 TRACKED_SLOTS = {
     "free-openrouter": {"LOOM_FREE_OPENROUTER_MODEL": "free/openrouter"},
+    "zai": {"LOOM_ZAI_MODEL": "zai/glm-4.7-flash",
+            "LOOM_ZAI_URL": "https://api.z.ai/free-public/zai/v1"},
+    "zen": {},
     "workersai": {"LOOM_WORKERSAI_MODEL": "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b"},
     "opencode-go-1": {"LOOM_OPENCODE_GO_1_MODEL": "opencode-go/mimo-v2.6-flash"},
     "opencode-go-2": {"LOOM_OPENCODE_GO_2_MODEL": "opencode-go/beam-free"},
@@ -251,6 +254,8 @@ def lane_settings(slot: str, env: Dict[str, str]) -> Dict[str, str]:
         if name.startswith("LOOM_GITHUB_APP_"):
             continue
         name = LANES_APP.get(name, name)
+        if provider(slot) == "zai" and name.endswith("_KEY_SSM"):
+            continue
         if setting_allowed(slot, name) and VALUE_RE.fullmatch(str(value)) and str(value):
             out[name] = str(value)
     key = _api_key_setting(slot)
@@ -1294,7 +1299,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
             out[name] = env[name]
     for slot in TRACKED_SLOTS:
         lane = provider(slot)
-        if lane == "free":
+        if lane in ("free", "zai", "zen"):
             continue
         name = _prefix(lane) + "KEY_SSM"
         value = env.get(name, "")
@@ -1304,6 +1309,7 @@ def station_env(env: Dict[str, str]) -> Dict[str, str]:
         for name, value in env.items():
             if (setting_allowed(slot, name) and not name.startswith("LOOM_GITHUB_APP_")
                     and name not in STATION_OWN and not name.endswith(("_MODEL", "_MODELS"))
+                    and not (provider(slot) in ("zai", "zen") and name.endswith("_KEY_SSM"))
                     and value and VALUE_RE.fullmatch(value)):
                 out[name] = value
     return dict(sorted(out.items()))
