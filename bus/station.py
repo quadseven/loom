@@ -711,8 +711,8 @@ PASS_REQUEST_TARGET = 500
 # spend. Past it, its deferrable reads carry over to the next pass, so the
 # step rotation keeps room: on 2026-11-11 claim_new spent about 1000 requests
 # a pass, the rotation ran a step or two, and a full turn took four hours
-# (loom#3014).
-CLAIM_REQUEST_SHARE = 2 / 3
+# (loom#3014). It is half, so the loop keeps at least half (loom#3119).
+CLAIM_REQUEST_SHARE = 1 / 2
 # Requests the invariant filer may spend past the pass target once the
 # check's reads are done (loom#2505). The reads cost 70 to 480 counted
 # requests (warm or cold cache) and end in check-run and pull request
