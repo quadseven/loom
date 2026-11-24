@@ -6029,9 +6029,11 @@ class ClaimTest(Base):
                     "resets_at": stamp(now + reset_in), "observed_at": stamp(now - age)}
 
         weekly = reading("weekly", 49, 3600)
+        short_at_limit = reading("5-hour", 100, 1800)
+        short_at_limit["as_of"] = short_at_limit.pop("observed_at")
         for number, (difficulty, rows, available, chosen) in enumerate((
                 ("medium", [weekly], True, "codex"),
-                ("medium", [weekly, reading("5-hour", 100, 1800)], True, "spark"),
+                ("medium", [weekly, short_at_limit], True, "spark"),
                 ("medium", [weekly], False, "spark"),
                 ("medium", [reading("weekly", 50, 3600)], True, "spark"),
                 ("medium", [reading("weekly", 49, 86400)], True, "spark"),

@@ -629,7 +629,7 @@ def preferred_weekly_lanes(rows: List[Dict[str, Any]], now: float) -> set[str]:
     preferred, limited = set(), set()
     for row in rows:
         used = row.get("used_pct")
-        observed = _parse(row.get("observed_at"))
+        observed = _parse(row.get("observed_at", row.get("as_of")))
         reset = _parse(row.get("resets_at"))
         lanes = row.get("lanes")
         if (not isinstance(used, (int, float)) or isinstance(used, bool)

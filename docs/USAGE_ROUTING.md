@@ -42,8 +42,8 @@ The station collects one reading per provider window each pass
 Each reading names the machine that collected it (`host`).
 
 - codex: the newest reading for each of the 5-hour and weekly windows from
-  recent local session logs (`~/.codex/sessions`). A machine where codex
-  never ran says "no codex session logs on this machine."
+  recent local session logs, configurable with `LOOM_CODEX_SESSIONS`.
+  A machine where codex never ran says "no codex session logs on this machine."
 - claude: 5-hour and weekly readings from rate-limit events in ordinary
   lane runs. The lane saves the figures and reset times in its CLI meter.
 - opencode-go: rolling, weekly, and monthly readings from the plan check
