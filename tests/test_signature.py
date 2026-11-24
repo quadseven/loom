@@ -80,9 +80,9 @@ class SignatureLineTest(unittest.TestCase):
         self.assertEqual(signature.sign(twice, "spark", "model-b"), twice)
 
     def test_the_line_is_ascii_with_no_dash_characters(self):
-        text = signature.sign("Body.", "spark", "model—x–y\nz")
+        text = signature.sign("Body.", "spark", "model\u2014x\u2013y\nz")
         self.assertTrue(text.isascii())
-        self.assertNotIn("—", text)
+        self.assertNotIn("\u2014", text)
         self.assertEqual(text.splitlines()[-1], "Signed: lane-spark, model model-x-y z")
 
     def test_a_marker_after_the_signature_is_kept_and_the_line_is_not_doubled(self):

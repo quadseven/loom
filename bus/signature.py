@@ -39,7 +39,7 @@ def lane_name(slot: str) -> str:
 def _clean(value: str) -> str:
     """One ASCII line: no line breaks and no em or en dashes."""
     text = re.sub(r"\s+", " ", str(value or "")).strip()
-    text = text.replace("—", "-").replace("–", "-")
+    text = text.replace("\u2014", "-").replace("\u2013", "-")
     return text.encode("ascii", "replace").decode("ascii")
 
 
