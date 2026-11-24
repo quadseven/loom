@@ -93,7 +93,7 @@
     }
   });
 
-  window.loomPoll = function poll(url, every, onData) {
+  window.loomPoll = function poll(url, every, onData, immediate = true) {
     let timer = null;
     let stopped = false;
     let running = false;
@@ -114,21 +114,22 @@
       }
     }
 
-    function schedule() {
+    function schedule(runNow) {
       if (timer) clearInterval(timer);
       timer = null;
       if (!stopped && !document.hidden) {
-        tick();
+        if (runNow) tick();
         timer = setInterval(tick, delay);
       }
     }
 
-    document.addEventListener('visibilitychange', schedule);
-    schedule();
+    const onVisibility = () => schedule(true);
+    document.addEventListener('visibilitychange', onVisibility);
+    schedule(immediate);
     return () => {
       stopped = true;
       if (timer) clearInterval(timer);
-      document.removeEventListener('visibilitychange', schedule);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   };
 
@@ -198,7 +199,7 @@
           slot.innerHTML = payload[name]; // nosemgrep: elder-js-unescaped-html-sink
         }
       });
-    });
+    }, false);
   }
 
   // Needs you (loom#1777): one-tap answers. The answer token and the

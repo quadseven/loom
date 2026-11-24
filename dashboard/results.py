@@ -119,6 +119,94 @@ def _read_note(payload: Dict[str, Any], read_at: Dict[str, Any]) -> str:
     return "%s: %s." % ("; ".join(parts), payload.get("stale_reason") or "GitHub could not refresh them")
 
 
+def _bump_windows(bucket: Dict[str, int], at: datetime, week_s: datetime, day_s: datetime) -> bool:
+    """Increment month/week/day counts for a timestamp >= month_s; return True if in week."""
+    bucket["month"] += 1
+    if at < week_s:
+        return False
+    bucket["week"] += 1
+    if at >= day_s:
+        bucket["day"] += 1
+    return True
+
+
+def _tally_prs(prs: List[Dict[str, Any]], starts: Dict[str, datetime]):
+    """Single-pass PR counts for all windows plus weekly lane merges by repo."""
+    lane_merged = {key: 0 for key in starts}
+    other_merged = {key: 0 for key in starts}
+    lane_unmerged = {key: 0 for key in starts}
+    by_repo: Dict[str, Dict[str, int]] = {}
+    day_s, week_s, month_s = starts["day"], starts["week"], starts["month"]
+    for pr in prs:
+        merged_raw = pr.get("merged_at")
+        lane = _is_lane_pr(pr)
+        if merged_raw:
+            at = _when(merged_raw)
+            if at and at >= month_s:
+                in_week = _bump_windows(lane_merged if lane else other_merged, at, week_s, day_s)
+                if in_week and lane:
+                    repo = _repo_of(pr)
+                    if repo:
+                        by_repo.setdefault(repo, {"merged": 0, "failed": 0})["merged"] += 1
+        elif lane:
+            at = _when(pr.get("closed_at"))
+            if at and at >= month_s:
+                _bump_windows(lane_unmerged, at, week_s, day_s)
+    return lane_merged, other_merged, lane_unmerged, by_repo
+
+
+def _tally_tickets(tickets: List[Dict[str, Any]], starts: Dict[str, datetime]):
+    """Single-pass closed ticket counts for all windows."""
+    completed = {key: 0 for key in starts}
+    not_planned = {key: 0 for key in starts}
+    day_s, week_s, month_s = starts["day"], starts["week"], starts["month"]
+    for t in tickets:
+        at = _when(t.get("closed_at"))
+        if not at or at < month_s:
+            continue
+        reason = t.get("state_reason") or "completed"
+        if reason not in ("completed", "not_planned"):
+            continue
+        body = t.get("body") or ""
+        if ROLL_MARKER in body and ROLL_MARKER in body.splitlines():
+            continue
+        bucket = completed if reason == "completed" else not_planned
+        bucket["month"] += 1
+        if at >= week_s:
+            bucket["week"] += 1
+            if at >= day_s:
+                bucket["day"] += 1
+    return completed, not_planned
+
+
+def _tally_comments(comments: List[Dict[str, Any]], starts: Dict[str, datetime], by_repo: Dict[str, Dict[str, int]]):
+    """Single-pass proof and work-failure counts for day and week windows."""
+    proofs = {"day": 0, "week": 0, "month": None}
+    failures = {"day": 0, "week": 0, "month": None}
+    day_s, week_s = starts["day"], starts["week"]
+    for c in comments:
+        body = str(c.get("body") or "")
+        is_proof = _is_proof(body)
+        is_fail = not is_proof and _work_failure(body)
+        if not is_proof and not is_fail:
+            continue
+        at = _when(c.get("created_at"))
+        if not at or at < week_s:
+            continue
+        if is_proof:
+            proofs["week"] += 1
+            if at >= day_s:
+                proofs["day"] += 1
+        else:
+            failures["week"] += 1
+            if at >= day_s:
+                failures["day"] += 1
+            repo = str(c.get("repo") or "")
+            if repo:
+                by_repo.setdefault(repo, {"merged": 0, "failed": 0})["failed"] += 1
+    return proofs, failures
+
+
 def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """Counts per window, and the week's counts per repo."""
     prs = [pr for pr in payload.get("pull_requests") or [] if isinstance(pr, dict)]
@@ -139,32 +227,27 @@ def build_results(payload: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     reason = "" if comments_read else (payload.get("hot_spots_error") or "issue comments were not read")
     pr_reason = "" if prs_read else "the dashboard has not read them since it started%s" % (
         "; " + str((payload.get("dashboard_errors") or [""])[0]) if payload.get("dashboard_errors") else "")
-
-    def comment_count(delta, test):
-        # None is "not looked": unread, or older than the comment window.
-        if not comments_read or delta > COMMENT_REACH:
-            return None
-        return _count_comments(comments, now - delta, test)
-
-    def pr_count(delta, lane, merged):
-        return _count_prs(prs, now - delta, lane, merged) if prs_read else None
-
+    starts = {key: now - delta for key, _, delta in WINDOWS}
+    none_vals = {key: None for key, _, _ in WINDOWS}
+    lane_merged, other_merged, lane_unmerged, by_repo = _tally_prs(prs, starts)
+    completed, not_planned = _tally_tickets(tickets, starts)
+    proofs, failures = _tally_comments(comments, starts, by_repo)
     reach = "issue comments are read back %d days only" % COMMENT_REACH.days
     pr_row = {"source": "pull requests", "reason": pr_reason, "unread": not prs_read}
     comment_row = {"source": "issue comments", "reason": reason or reach, "unread": False}
     ticket_row = {"source": "tickets", "reason": "", "unread": False}
     rows = [
-        ("Lane pull requests merged", pr_row, lambda d: pr_count(d, True, True)),
-        ("Pull requests merged outside the lanes", pr_row, lambda d: pr_count(d, False, True)),
-        ("Tickets closed as done", ticket_row, lambda d: _count_closed(tickets, now - d, "completed")),
-        ("Tickets closed as not planned", ticket_row, lambda d: _count_closed(tickets, now - d, "not_planned")),
-        ("Live proofs posted", comment_row, lambda d: comment_count(d, _is_proof)),
-        ("Lane runs failed at the work", comment_row, lambda d: comment_count(d, _work_failure)),
-        ("Lane pull requests closed unmerged", pr_row, lambda d: pr_count(d, True, False)),
+        ("Lane pull requests merged", pr_row, lane_merged if prs_read else none_vals),
+        ("Pull requests merged outside the lanes", pr_row, other_merged if prs_read else none_vals),
+        ("Tickets closed as done", ticket_row, completed),
+        ("Tickets closed as not planned", ticket_row, not_planned),
+        ("Live proofs posted", comment_row, proofs if comments_read else none_vals),
+        ("Lane runs failed at the work", comment_row, failures if comments_read else none_vals),
+        ("Lane pull requests closed unmerged", pr_row, lane_unmerged if prs_read else none_vals),
     ]
-    table = [dict(meta, name=name, values={key: fn(delta) for key, _, delta in WINDOWS})
-             for name, meta, fn in rows]
-    return {"rows": table, "repos": _week_by_repo(prs, comments, now - timedelta(days=7)),
+    table = [dict(meta, name=name, values=dict(vals)) for name, meta, vals in rows]
+    repos_sorted = sorted(by_repo.items(), key=lambda kv: (-kv[1]["merged"], kv[0]))
+    return {"rows": table, "repos": repos_sorted,
             "comments_reason": reason, "comment_reach_days": COMMENT_REACH.days,
             "prs_read": prs_read, "pr_reason": pr_reason, "comments_read": comments_read,
             "read_note": _read_note(payload, read_at)}
