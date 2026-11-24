@@ -23,8 +23,10 @@ from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
-from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
-from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
+from .labels import (HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES,
+                     needs_human)
+from .tickets import (FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket,
+                      verify_handoff_source)
 from . import lane_markers, lane_state, tick_clock
 from . import brief_check, home_repo, incident_probe, state_store
 
@@ -1773,10 +1775,16 @@ def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
 def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
                ) -> List[Tuple[datetime, Dict[str, Any]]]:
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
-    loom:verified instead, so it never appears."""
+    loom:verified instead, so it never appears. A ticket carrying the
+    verify-handoff label is itself a lane verify ticket. Its body links the
+    source ticket, which is omitted from this list while that handoff is open."""
+    handoff_sources = {source for issue in tickets
+                       for source in [verify_handoff_source(issue)] if source is not None}
     shipped = [issue for issue in tickets
                if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)
-               and WAIT_LIVE_EVENT not in _labels(issue)]
+               and WAIT_LIVE_EVENT not in _labels(issue)
+               and verify_handoff_source(issue) is None
+               and int(issue.get("number") or 0) not in handoff_sources]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
     stamps = _read_each(lambda issue: _shipped_at(gh, repo, issue), shipped)
