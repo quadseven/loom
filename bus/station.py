@@ -721,6 +721,15 @@ CLAIM_REQUEST_SHARE = 1 / 2
 # 35 pull request state reads for the settle step, five writes, the
 # listing. The budget floor still stops writing outright.
 INVARIANT_WRITE_RESERVE = 100
+# Requests the factory (run_factory: merge ready lane pull requests, bring
+# behind ones up to date, send conflicts and change requests back as fix
+# rounds) may spend past the pass target. It runs after the claim pass on
+# every pass, not as a loop step: on 2026-11-24 the steps before the loop
+# spent the target pass after pass, the loop broke at its first step, and the
+# factory ran a few times a day while approved, green lane pull requests
+# filled their repos' open pull request caps (loom#3534). The factory is due
+# every factory.FACTORY_CHECK seconds, and the budget floor still skips it.
+FACTORY_REQUEST_RESERVE = 250
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -828,6 +837,9 @@ STEP_ROTATION_FILE = "step-rotation.json"
 # pause needs no reload. A bulk cleanup holds triage, rewrite and the
 # outside-epic move this way, so its relabels draw no bot comments.
 PAUSED_STEPS_FILE = "paused_steps.txt"
+# Steps that run on every pass outside the step loop, which LOOM_PAUSED_STEPS
+# can still hold (loom#3534).
+EVERY_PASS_STEPS = ("run_factory",)
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
@@ -7083,7 +7095,7 @@ class Station:
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.watch_deploys, self.score_lanes,
-                     self.refresh_bench, self.run_factory, self.lift_brain_holds,
+                     self.refresh_bench, self.lift_brain_holds,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
@@ -7149,7 +7161,17 @@ class Station:
         """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
         pass, read again each pass so a pause or its removal needs no reload.
         An unreadable file pauses nothing; an unknown name is logged and
-        ignored, never raised."""
+        ignored, never raised. The steps run outside the loop on every pass
+        (EVERY_PASS_STEPS) are known names too."""
+        names = self._paused_names()
+        known = {step.__name__ for step in steps} | set(EVERY_PASS_STEPS)
+        for name in sorted(names - known):
+            _say("unknown paused step %s, ignored" % name)
+        return names & known
+
+    def _paused_names(self) -> Set[str]:
+        """Every name LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this pass,
+        known or not."""
         names = os.environ.get("LOOM_PAUSED_STEPS", "").split()
         try:
             with open(os.path.join(self.state, PAUSED_STEPS_FILE)) as fh:
@@ -7158,10 +7180,31 @@ class Station:
             pass
         except (OSError, UnicodeDecodeError) as err:
             _say("could not read %s: %s" % (PAUSED_STEPS_FILE, err))
-        known = {step.__name__ for step in steps}
-        for name in sorted(set(names) - known):
-            _say("unknown paused step %s, ignored" % name)
-        return set(names) & known
+        return set(names)
+
+    def _run_factory_every_pass(self) -> None:
+        """Run the factory (run_factory) once a pass, past the pass target
+        by FACTORY_REQUEST_RESERVE at most (loom#3534). The budget floor and
+        LOOM_PAUSED_STEPS still skip it. A read carried over at the reserve,
+        or a GitHub or disk failure, is logged and the pass goes on."""
+        if self.budget_low() is not None:
+            return
+        if "run_factory" in self._paused_names():
+            _say("step run_factory paused (LOOM_PAUSED_STEPS)")
+            return
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if has_target:
+            self.gh.target = max(target, self._pass_counted()) + FACTORY_REQUEST_RESERVE
+        try:
+            self._timed(self.run_factory)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("run_factory failed: %s" % err)
+        finally:
+            if has_target:
+                self.gh.target = target
 
     def _note_every_pass(self) -> None:
         """The missing-evidence note pass, run every pass ahead of the step
@@ -18915,6 +18958,10 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
+            # Lane pull requests land, catch up with base and go back for fix
+            # rounds every pass the factory is due: after the claims, so they
+            # keep their share, and past the target by its reserve.
+            self._run_factory_every_pass()
             # Again after the claims, for a ticket claimed in this pass.
             self._feed_lanes()
             try:
