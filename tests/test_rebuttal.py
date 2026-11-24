@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from bus import brain, rebuttal, text  # noqa: E402
 from bus.github import GitHub, RateLimited  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 
 REPO = "example-owner/example-repo"
 NUMBER = 8
@@ -152,6 +153,7 @@ def details(answer, finding=DEAD, resolved=True, last_author=STATION_APP):
         "latest": {"nodes": [{"author": last_author, "body": body}]}}]}}
 
 
+@head_approved
 class BrainMergeGate(unittest.TestCase):
     """The brain refuses a merge whose bot thread was resolved on an answer
     that does not hold on the head, and reopens that thread."""

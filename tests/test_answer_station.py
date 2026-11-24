@@ -21,6 +21,7 @@ from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, ME, REPO, iso  # noqa: E402
 from test_operator_hold import BRAIN_REPO, PLAIN_BODY, PR_BODY, Route, brain_routes  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 
 OP = ME["login"]  # the factory tests' one trusted login, a person: the operator
 BOT = "loom-app[bot]"
@@ -196,6 +197,7 @@ class FactoryVerdict(Base):
         self.assertEqual(len(self.humans), 2)  # held again, asked again
 
 
+@head_approved
 class BrainVerdict(unittest.TestCase):
     """bus.brain merge, the merge path the factory calls, reads the same
     answer from the ticket's comments."""

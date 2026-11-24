@@ -21,6 +21,7 @@ from bus import brain, factory, merge_tier, operator_hold, ship_paths  # noqa: E
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, FakeGitHub, NOW, REPO as FACTORY_REPO  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 
 PR_BODY = """## Intent
 Class: logic
@@ -444,6 +445,7 @@ def brain_routes(body, files, patches):
     }
 
 
+@head_approved
 class BrainMerge(unittest.TestCase):
     def merge(self, body, files=("bus/a.py",), patches=None):
         fake = Route(brain_routes(body, list(files), patches or {}))
