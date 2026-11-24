@@ -85,7 +85,7 @@ claude_lane_cli() {
     return $?
   fi
   claude_lane_print --output-format stream-json --verbose "$1" |
-    (unset CLAUDE_CODE_OAUTH_TOKEN; PYTHONPATH="$root" python3 -B -m bus.meter \
+    (unset CLAUDE_CODE_OAUTH_TOKEN; cd "$root" && python3 -EsB -m bus.meter \
       --claude-stream "$LOOM_HOME/state/usage/$slot.meter.json")
   return "${PIPESTATUS[0]}"
 }

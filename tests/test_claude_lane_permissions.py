@@ -65,7 +65,7 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
         if auth_file:
             env["LOOM_CLAUDE_AUTH_FILE"] = str(self.token)
         result = subprocess.run(["/bin/bash", "-c", script, "run", str(AGENT_CLI)],
-                                capture_output=True, text=True, env=env, timeout=60)
+                                cwd=self.tree, capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(result.returncode, status, result.stderr)
         return result.stdout
 
@@ -77,6 +77,8 @@ class ClaudeLanePermissionsTest(unittest.TestCase):
         self.assertNotIn("haven't granted", self.run_lane())
 
     def test_a_regular_run_feeds_short_and_weekly_windows_to_the_usage_board(self):
+        (self.tree / "bus").mkdir()
+        (self.tree / "bus" / "__init__.py").touch()
         stdout = self.run_lane(auth_file=False, status=7)
         self.assertIn("finished", stdout)
         now = time.time()
