@@ -27,6 +27,7 @@ from bus import brain, factory, merge_tier, status  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from test_bus_factory import Base, REPO as REPO_F  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 
 REPO = "example-owner/example-repo"
 BOT = "grug-tribe"
@@ -394,6 +395,7 @@ def routes(files, conclusion="success", threads=(), merged_last_hour=0, ticket_l
     }
 
 
+@head_approved
 class BrainMerge(unittest.TestCase):
     ENV = {"LOOM_MERGE_SETTLE_SECONDS": "0", "LOOM_REVIEW_BOT": BOT,
            "LOOM_BRIEF_AUTHORS": "loom-station[bot] loom-lanes[bot]"}
@@ -507,6 +509,7 @@ class BrainMerge(unittest.TestCase):
         self.assertFalse(self.merged(fake))
 
 
+@head_approved
 class Unreadable(unittest.TestCase):
     def test_a_file_list_github_will_not_send_refuses_the_merge(self):
         # Review finding: the read raised out of the gate unexplained.
@@ -821,6 +824,7 @@ class RuffRun(unittest.TestCase):
             self.assertIs(merge_tier.run_ruff("s110", "a.py", "x"), None)
 
 
+@head_approved
 class ReviewBodyGate(BrainMerge):
     """loom#1933 criteria 1, 2 and 4, through brain.merge itself."""
 

@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, lock, shadow, station, watch  # noqa: E402
 from bus.github import GitHub, GitHubError, Response, ShadowHeld  # noqa: E402
+from head_approved import head_approved  # noqa: E402
 
 import test_bus_brain as tbb  # noqa: E402
 import test_bus_station as tbs  # noqa: E402
@@ -370,6 +371,7 @@ class LedgerFailureTest(ShadowCase):
         self.assertEqual(fake.sent, [])
 
 
+@head_approved
 class CallSiteTest(ShadowCase):
     """The real merge and close paths, end to end on a fake GitHub."""
 

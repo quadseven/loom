@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bus import deploy_watch, station  # noqa: E402
 from bus.github import GitHub  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 
 REPO = "example-owner/example-deploy"
 NOW = 2_000_000_000.0
@@ -274,6 +275,7 @@ class FailClosed(Base):
         self.assertEqual(deploy_watch.window({"LOOM_POST_MERGE_WATCH": "soon"}), 3600)
 
 
+@head_approved
 class Revert(Base):
     def setUp(self):
         super().setUp()

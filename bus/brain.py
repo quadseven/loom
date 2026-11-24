@@ -5674,6 +5674,86 @@ def _refuse_person_change_request(details: Dict[str, Any]) -> None:
         raise ValueError("blocked: " + ", ".join(blockers))
 
 
+# The approval a merge needs on the current head (loom#3543), the merge
+# gate's independent-review row (scripts/pr-merge-gated.sh): a review check
+# that concluded success, neutral or skipped proves nothing about the code.
+REVIEW_MARKER = re.compile(r"^<!-- fleet:review v1 verdict=(APPROVE|REQUEST_CHANGES) "
+                           r"head=([0-9a-f]{40}) -->[ \t]*$", re.M)
+MARKER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+REVIEW_DECIDES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
+
+
+def _bare_login(login: str) -> str:
+    login = login.strip().lower()
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
+
+
+def _is_app(user: Dict[str, Any]) -> bool:
+    return (str(user.get("login") or "").lower().endswith("[bot]")
+            or user.get("type") == "Bot")
+
+
+def head_approval(reviews: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]],
+                  head: str, author: str, bot: str) -> str:
+    """"" when the head is approved, else the blocker. Approved means the
+    review bot App's latest approve-or-reject review is APPROVED on `head`,
+    or a human whose author_association is OWNER, MEMBER or COLLABORATOR,
+    and who is not the author, posted a fleet:review marker comment for
+    `head` directly (not through a GitHub App) as their latest marker. The
+    bot App's standing CHANGES_REQUESTED on `head` refuses whatever else
+    approved. No other App, and no formal human review, counts."""
+    me, bot = _bare_login(author), _bare_login(bot)
+    standing: Optional[Tuple[str, str]] = None
+    for review in reviews:
+        user = review.get("user") or {}
+        if (_is_app(user) and _bare_login(str(user.get("login") or "")) == bot
+                and review.get("state") in REVIEW_DECIDES):
+            standing = (str(review["state"]), str(review.get("commit_id") or ""))
+    if standing == ("CHANGES_REQUESTED", head):
+        return "%s[bot] requested changes on head %s" % (bot, head[:10])
+    if standing == ("APPROVED", head) and bot != me:
+        return ""
+    marks: Dict[str, Tuple[str, str]] = {}
+    for comment in comments:
+        user = comment.get("user") or {}
+        found = REVIEW_MARKER.findall(str(comment.get("body") or ""))
+        who = _bare_login(str(user.get("login") or ""))
+        if (not found or not who or _is_app(user) or who == me
+                or comment.get("performed_via_github_app")
+                or comment.get("author_association") not in MARKER_ASSOCIATIONS):
+            continue
+        marks[who] = found[-1]
+    if ("APPROVE", head) in marks.values():
+        return ""
+    stale = " (an approval on an older head is stale)" if standing and standing[0] == "APPROVED" \
+        else ""
+    return ("no approval on head %s: needs a %s[bot] APPROVE review on it, or a fleet:review "
+            "marker comment for it from a trusted human who is not the author%s"
+            % (head[:10], bot, stale))
+
+
+def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                            details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
+    """Refuse the merge unless head_approval approves the current head. A
+    review or comment list that cannot be read refuses."""
+    from . import factory  # factory imports this module
+    bot = ((os.environ if env is None else env).get("LOOM_REVIEW_BOT", "").strip()
+           or factory.DEFAULT_REVIEW_BOT)
+    head = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    try:
+        reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request reviews unreadable, so no approval on "
+                         "the head can be shown (%s)" % err) from err
+    comments = _read_comments(gh, repo, number)
+    why = head_approval(reviews, comments, head, _pr_author(pr), bot) if head \
+        else "pull request has no head SHA"
+    if why:
+        raise ValueError("blocked: " + why)
+
+
 def merge_completed(err: Exception) -> bool:
     """Whether merge raised this after GitHub had merged: settling failed,
     the merge did not."""
@@ -5800,11 +5880,13 @@ def merge(gh: GitHub, repo: str, number: int,
         _check_written_text(ADOPT_COMMENT)
         _validate_adopt_pr(gh, repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
