@@ -38,6 +38,7 @@ class LaneFeedOrder(unittest.TestCase):
                    mock.patch.object(st, "budget_low", return_value=None),
                    mock.patch.object(st, "_end_pass_locally"),
                    mock.patch.object(st, "_run_steps"),
+                   mock.patch.object(st, "_run_factory_every_pass"),
                    mock.patch.object(st, "post_metrics"),
                    mock.patch.object(st, "watch_logs"),
                    mock.patch.object(st, "report_outcomes"),
