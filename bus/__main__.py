@@ -74,6 +74,11 @@ def _parser() -> argparse.ArgumentParser:
                    "LOOM_SELF_REPO, else this checkout's origin); "
                    "the holder's step times go in the journal")
     sub.add_parser("station", help="one station pass: claim briefed tickets, report outcomes")
+    sub.add_parser("station-wait", help="wait for the next station pass: LOOM_STATION_INTERVAL "
+                   "seconds, or less when LOOM_INBOX=1 and an inbox event arrives")
+    s = sub.add_parser("remote-check", help="a lane's request for a check on GitHub's runners "
+                       "(bus/remote_checks.py): wait REPO SHA SPEC_FILE START WAIT POLL")
+    s.add_argument("rest", nargs=argparse.REMAINDER)
     s = sub.add_parser("state-import", help="copy the file ledgers into the shared state backend, once")
     s.add_argument("--dry-run", action="store_true", help="print counts per ledger, write nothing")
     s.add_argument("--overwrite", action="store_true",
@@ -92,6 +97,9 @@ def _parser() -> argparse.ArgumentParser:
                    help="which writer's App: only the station's may dispatch workflow runs")
     app_sub.add_parser("token", help="print the installation token of the App the "
                        "LOOM_GITHUB_APP_* settings name, for gh and git (loom#1142)")
+    a = app_sub.add_parser("lane-identity", help="print the App identity LOOM_LANE_APPS gives a lane "
+                           "(five lines), nothing for an unmapped lane")
+    a.add_argument("slot")
     app_sub.add_parser("login", help="print the \"<slug>[bot]\" login of the App the "
                        "LOOM_GITHUB_APP_* settings name, for the brain's journal")
     a = app_sub.add_parser("ids", help="list the App's installations and print its id settings")
@@ -201,6 +209,8 @@ def _app(args: argparse.Namespace, transport: Optional[Transport],
     try:
         if args.app_command == "token":
             return app.print_token(sys.stdout, transport=transport, sign=sign or openssl_sign)
+        if args.app_command == "lane-identity":
+            return app.print_lane_identity(args.slot, sys.stdout, sys.stderr)
         if args.app_command == "login":
             return app.print_login(sys.stdout, transport=transport, sign=sign or openssl_sign)
         return app.ids(args.app_id, transport=transport, sign=sign or openssl_sign, role=args.role)
@@ -216,9 +226,17 @@ def main(argv: Optional[List[str]] = None, gh: Optional[GitHub] = None,
     if args.command == "app":
         # No personal token: the manifest needs none, and ids signs as the App.
         return _app(args, app_transport, app_sign)
+    if args.command == "remote-check":
+        from . import remote_checks
+        home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+        return remote_checks.main(args.rest, home)
     if args.command == "state-import":
         from . import state_import
         return state_import.main(os.environ, args.dry_run, args.overwrite, tuple(args.skip))
+    if args.command == "station-wait":
+        from . import event_inbox
+        print("station-wait: %s" % event_inbox.wait(os.environ, station._say))
+        return 0
     if args.command == "station":
         try:
             return station.run(station.Settings.from_env(), gh)

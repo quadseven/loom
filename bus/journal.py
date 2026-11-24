@@ -531,6 +531,11 @@ def check_report(text: str) -> None:
             "put the count on its own line after it, \"Waiting on you: N open needs:human (...)\" "
             "or \"Waiting on you: nothing\" (docs/MUSE.md)" % says)
     waiting = _WAITING.findall(body)
+    if waiting and not waiting[-1].strip():
+        raise ReportInvalid(
+            "the \"Waiting on you:\" line is blank, so the owner cannot tell \"nothing waits\" "
+            "from a list that failed to render; paste the line `status` prints under "
+            "\"## Waiting on you\", or write \"Waiting on you: nothing\" (loom#3506)")
     if waiting and _NOTHING.match(waiting[-1].strip()) and re.search(r"\d", waiting[-1]):
         raise ReportInvalid(
             "the \"Waiting on you:\" line says nothing next to a count; write "

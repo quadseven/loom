@@ -480,8 +480,10 @@ class StationTest(StationBase):
         self.settings.no_topup = ["anthropic"]
         self.held_out_of_credit()
         self.assertEqual(self.breaches(), [])
-        # Nothing to file, so the queued tickets are not even read.
-        self.assertFalse(any("/issues?labels=loom:ticket" in c[1] for c in self.gh.calls))
+        # Verify-handoff coverage reads the open ticket list once per repo.
+        ticket_reads = [path for _, path in self.gh.calls
+                        if "/issues?labels=loom:ticket&state=open" in path]
+        self.assertEqual(len(ticket_reads), 2 * len(self.settings.repos))
 
     def test_no_topup_still_files_a_lane_of_that_account_held_by_another_limit(self):
         self.settings.no_topup = ["anthropic"]
@@ -763,8 +765,9 @@ class StationTest(StationBase):
         self.gh.search_items = [dict(ticket(70, "closed"), body="Why.\n\nPart of #46\n")]
         self.run_at(T0)
         searches = [path for _, path in self.gh.calls if path.startswith("/search/issues?")]
-        self.assertEqual(len(searches), 1, searches)
-        self.assertIn("no%3Aparent-issue", searches[0])
+        goal_searches = [path for path in searches if "no%3Aparent-issue" in path]
+        self.assertEqual(len(goal_searches), 1, searches)
+        self.assertIn("no%3Aparent-issue", goal_searches[0])
 
     def test_a_check_a_rate_limit_stopped_waits_like_any_other(self):
         """loom#2321: checked was saved only after the reads, so a stopped
@@ -1508,6 +1511,30 @@ class InvariantTest(unittest.TestCase):
         f = Facts(T0, journals=[self.j(T0 - 600), Journal(T0 - 590, other, "muse", stamp(T0 - 600),
                                                            ("merge degraded",))])
         self.assertEqual(invariants.brain_failing(f), [])
+
+    def test_handed_off_verify_steps_do_not_make_brain_failing(self):
+        step = "verify degraded: only 1 of 26 verify-due items attempted"
+        journals = [self.j(T0 - 3600, steps=(step,)), self.j(T0 - 600, steps=(step,))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=True)
+        self.assertEqual(invariants.brain_failing(facts), [])
+
+    def test_unhanded_verify_items_keep_brain_failing_visible(self):
+        step = "verify degraded: only 1 of 26 verify-due items attempted"
+        journals = [self.j(T0 - 3600, steps=(step,)), self.j(T0 - 600, steps=(step,))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=False)
+        self.assertEqual([breach.invariant for breach in invariants.brain_failing(facts)],
+                         ["brain-failing"])
+
+    def test_handoff_coverage_does_not_hide_other_failed_steps(self):
+        verify = "verify degraded: only 1 of 26 verify-due items attempted"
+        status = "status failed: GitHub answered 502"
+        journals = [self.j(T0 - 3600, steps=(verify, status)),
+                    self.j(T0 - 600, steps=(verify, status))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=True)
+        [breach] = invariants.brain_failing(facts)
+        self.assertEqual(breach.evidence, ("Tick %s on %s: %s" % (
+            stamp(T0 - 3600), "#%d" % GOAL, status),
+            "Tick %s on %s: %s" % (stamp(T0 - 600), "#%d" % GOAL, status)))
 
     def test_failed_steps_reads_the_step_lines_only(self):
         body = journal(T0) + "\n- Waiting: #12 failed on lane codex\n- Brief step: degraded, cap reached"

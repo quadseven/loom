@@ -23,8 +23,10 @@ from .merge_verdict import by_bot, head_commit as _head_commit
 from .status import (add as add_status_event, is_status as is_status_comment,
                      parse as parse_status_events, resort as resort_events,
                      strip_body as strip_status_body)
-from .labels import HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES, needs_human
-from .tickets import FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket
+from .labels import (HANDOFF, HUMAN_LABELS, LANES, NEEDS_HUMAN, REMOTE_LANES,
+                     needs_human)
+from .tickets import (FIX_MARKER, HEADER_RE, MODEL_RE, parse as parse_ticket,
+                      verify_handoff_source)
 from . import lane_markers, lane_state, tick_clock
 from . import brief_check, home_repo, incident_probe, state_store
 
@@ -506,13 +508,16 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
         comments = (node.get("comments") or {}).get("nodes") or []
+        backlog = naming.is_backlog_home(issue)
+        report_status = ("no report owed" if backlog else
+                         "report %s (due %s)" % (led["state"], led["due"] or "unknown"))
         still: Optional[quiet.Quiet] = None
         lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
-                     " - report %s (due %s)" % (
+                     " - %s" % (
                          issue["number"], issue.get("title", ""),
                          led.get("journal", "none"), led.get("report", "none"),
                          led.get("measure", "none"), led.get("action", "none"),
-                         led["state"], led["due"] or "unknown"))
+                         report_status))
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
@@ -543,7 +548,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                                 goal_breaches(issues, int(issue["number"])), now, authors)
             lines += _quiet_lines(still)
             lines.extend("  - " + reason for reason in quiet.stuck_triage(children, now))
-        if naming.is_backlog_home(issue):
+        if backlog:
             # A backlog goal posts no report on GitHub: its line is in the
             # station's twice-daily Discord digest (2026-10-25).
             lines.append("  - backlog goal: no report owed; its status is one line in the "
@@ -1770,10 +1775,16 @@ def _live_check_rows(gh: GitHub, repo: str, tickets: List[Dict[str, Any]]
 def verify_due(gh: GitHub, repo: str, tickets: List[Dict[str, Any]], now: datetime
                ) -> List[Tuple[datetime, Dict[str, Any]]]:
     """Open loom:shipped tickets, oldest ship first. A verified ticket carries
-    loom:verified instead, so it never appears."""
+    loom:verified instead, so it never appears. A ticket carrying the
+    verify-handoff label is itself a lane verify ticket. Its body links the
+    source ticket, which is omitted from this list while that handoff is open."""
+    handoff_sources = {source for issue in tickets
+                       for source in [verify_handoff_source(issue)] if source is not None}
     shipped = [issue for issue in tickets
                if "loom:shipped" in _labels(issue) and "loom:verified" not in _labels(issue)
-               and WAIT_LIVE_EVENT not in _labels(issue)]
+               and WAIT_LIVE_EVENT not in _labels(issue)
+               and verify_handoff_source(issue) is None
+               and int(issue.get("number") or 0) not in handoff_sources]
     # One events read per ticket, in parallel: 93 in a row took 36 s of a
     # 68 s status on 2026-10-15.
     stamps = _read_each(lambda issue: _shipped_at(gh, repo, issue), shipped)
@@ -4235,6 +4246,32 @@ def _ticket_body(body: str, difficulty: Optional[str], model: Optional[str],
     return ("\n".join(headers) + "\n\n" if headers else "") + body
 
 
+def _without_own_headers(body: str, written: Dict[str, Optional[str]]) -> str:
+    """Drop a leading header block from `body` when every line in it is a
+    header the tool is about to write, so the filed ticket holds one block.
+    A line that names a different value than the flag refuses, naming both.
+    A leading line the tool does not write leaves the body untouched."""
+    lines = body.splitlines(keepends=True)
+    end = 0
+    seen: List[Tuple[str, str]] = []
+    while end < len(lines):
+        m = HEADER_RE.fullmatch(lines[end].rstrip())
+        if not m:
+            break
+        seen.append((m.group(1), m.group(2).strip()))
+        end += 1
+    if not seen or any(not written.get(k) for k, _ in seen):
+        return body
+    for key, value in seen:
+        if value != written[key]:
+            raise ValueError("the body starts with %s: %s but the flag says %s: %s; "
+                             "make them agree or drop the line from the body"
+                             % (key, value, key, written[key]))
+    while end < len(lines) and not lines[end].strip():
+        end += 1
+    return "".join(lines[end:])
+
+
 _REPO_REF = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#\d+")
 _REPO_NUMBER = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)")
 
@@ -4394,6 +4431,11 @@ def brief(gh: GitHub, repo: str, epic: Optional[int], title: str, body: str,
         base = _brief_base(gh, repo, body, goal_issue, env)
     body = hunt_plan.with_size_letter(body)
     repairs_incident = _repairs_header_for(gh, repo, body, repairs_incident, env)
+    body = _without_own_headers(body, {
+        "Difficulty": difficulty, "Priority": priority, "Model": model, "Base": base,
+        "After": after, "Not before": not_before,
+        "Repairs incident": "#%d" % repairs_incident if repairs_incident is not None else None,
+        "Foundational": "yes" if foundational else None})
     full_body = _ticket_body(body, difficulty, model, base, not_before, after, priority,
                              repairs_incident, foundational)
     _check_ticket_headers(full_body, {"Difficulty": difficulty, "Priority": priority,
@@ -5195,12 +5237,114 @@ def _with_priority(body: str, priority: str) -> str:
     return _with_header(body, "Priority", priority)
 
 
+def _packed_header_starts(line: str) -> List[Tuple[int, str]]:
+    """Find candidate header keys in the order they appear on the line."""
+    header_keys = (
+        "Difficulty",
+        "Priority",
+        "Foundational",
+        "Model",
+        "Base",
+        "Not before",
+        "After",
+        "Deliverable",
+        "Repairs incident",
+    )
+    positions = []
+    for hk in header_keys:
+        search = hk + ":"
+        start = 0
+        while True:
+            idx = line.find(search, start)
+            if idx == -1:
+                break
+            # Make sure it's at the start or preceded by whitespace
+            if idx == 0 or line[idx - 1].isspace():
+                positions.append((idx, hk))
+            start = idx + 1
+    positions.sort()
+    return positions
+
+
+def _packed_header_value_is_valid(line: str, positions: List[Tuple[int, str]],
+                                  index: int, end: int) -> bool:
+    """Check whether the candidate can stand apart from Deliverable prose."""
+    pos, key = positions[index]
+    value = line[pos + len(key) + 1:end].strip()
+    if key == "Difficulty":
+        value = value.lower()
+    valid, _ = tickets._HEADER_RULES[key]
+    if not valid(value):
+        return False
+    if key == "Deliverable" and index + 1 < len(positions):
+        # A following Model/Base with an invalid value is part of the prose.
+        next_pos, next_key = positions[index + 1]
+        if next_key in ("Model", "Base"):
+            next_end = positions[index + 2][0] if index + 2 < len(positions) else len(line)
+            next_value = line[next_pos + len(next_key) + 1:next_end].strip()
+            return tickets._HEADER_RULES[next_key][0](next_value)
+    return True
+
+
+def _split_packed_header_line(line: str) -> List[str]:
+    """Split a line containing multiple packed headers into separate header lines."""
+    positions = _packed_header_starts(line)
+    if not positions:
+        return [line]
+    # AI-REVIEW 2026-11-23 [automated PR review] 4662635821 (PR #3463):
+    # In free-form Deliverable text, resume at a header with a constrained,
+    # valid value. Model and Base values can look like ordinary prose words.
+    result = []
+    prose_start = None
+    for i, (pos, hk) in enumerate(positions):
+        next_pos = positions[i + 1][0] if i + 1 < len(positions) else len(line)
+        if prose_start is not None and hk in ("Model", "Base", "Deliverable"):
+            continue
+        if hk == "Deliverable" or prose_start is not None:
+            if not _packed_header_value_is_valid(line, positions, i, next_pos):
+                if prose_start is None:
+                    prose_start = pos
+                continue
+        if prose_start is not None:
+            result.append(line[prose_start:pos].rstrip())
+            prose_start = None
+        result.append(line[pos:next_pos].rstrip())
+    if prose_start is not None:
+        result.append(line[prose_start:].rstrip())
+    return result
+
+
+def _expand_packed_headers(lines: List[str], header_end: int) -> Tuple[List[str], int]:
+    """Expand any packed header lines in the header section.
+
+    Returns the new lines list and the new header_end index.
+    """
+    new_lines = []
+    for i in range(header_end):
+        line = lines[i]
+        stripped = line.rstrip("\r\n").rstrip()
+        # Check if it's a packed line by trying to split it
+        split = _split_packed_header_line(stripped)
+        if len(split) > 1:
+            # It's a packed line, expand each header
+            ending = "\r\n" if line.endswith("\r\n") else "\n" if line.endswith("\n") else ""
+            new_lines.extend(h + (ending or "\n") for h in split[:-1])
+            new_lines.append(split[-1] + ending)
+        else:
+            new_lines.append(line)
+    # Append the rest of the lines (non-header section)
+    new_lines.extend(lines[header_end:])
+    return new_lines, len(new_lines) - (len(lines) - header_end)
+
+
 def _with_header(body: str, key: str, value: str) -> str:
     """Set one leading header line without changing the remaining text."""
     lines = body.splitlines(keepends=True)
     header = 0
     while header < len(lines) and HEADER_RE.fullmatch(lines[header].rstrip("\r\n").rstrip()):
         header += 1
+    # Expand any packed header lines first
+    lines, header = _expand_packed_headers(lines, header)
     for index in range(header):
         if lines[index].startswith(key + ":"):
             ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
@@ -8711,7 +8855,7 @@ class History:
 
     def __init__(self, failed: int, fixes: int, tried: List[str],
                  reasons: List[str], rung: Optional[int], rungs: Optional[set] = None,
-                 held: Sequence[tickets.After] = ()) -> None:
+                 held: Sequence[tickets.After] = (), rung_wait: str = "") -> None:
         self.failed = failed
         self.fixes = fixes
         self.tried = tried
@@ -8723,6 +8867,7 @@ class History:
         # The tickets it builds on that are not merged yet; a held ticket is
         # never late, so no rung of the ladder is the answer for it.
         self.held = list(held)
+        self.rung_wait = rung_wait
 
     @property
     def attempts(self) -> int:
@@ -8861,8 +9006,9 @@ def _history(gh: GitHub, repo: str, issue: Dict[str, Any], now: datetime,
     tried = _tried_models(_first_model(issue, bodies), bodies, footer)
     reasons = _stuck_reasons(issue, labelled, failed, fixes, _claim_times(bodies), now, held)
     rungs = read.tried_rungs
-    return History(failed, fixes, tried, reasons, _lowest_untried(tried, rungs),
-                   rungs, held)
+    rung = _lowest_untried(tried, rungs)
+    wait = _rung_wait(issue, rung) if not held and rung is not None else ""
+    return History(failed, fixes, tried, reasons, rung, rungs, held, wait)
 
 
 def _claim_times(bodies: List[Tuple[str, Any]]) -> List[Any]:
@@ -8884,6 +9030,23 @@ def _lowest_untried(tried: List[str], rungs: Optional[set] = None) -> Optional[i
     return left[0] - 1 if left else None
 
 
+def _rung_wait(issue: Dict[str, Any], rung: int) -> str:
+    """Describe a pending assignment to this rung, indexed from zero."""
+    from . import factory  # factory imports this module
+    lanes, model = factory.CLIMB[rung]
+    lane = factory._lane(issue)
+    if (factory._state(issue) in ("briefed", "queued")
+            and lane in lanes and factory.issue_model(issue) == model):
+        return "waiting for lane %s on rung %d %s" % (lane, rung + 1, model)
+    return ""
+
+
+def _has_stuck_history(issue: Dict[str, Any]) -> bool:
+    names = _labels(issue)
+    return (any("loom:" + state in names for state in STUCK_STATES)
+            or ("loom:queued" in names and any(name.startswith("lane:") for name in names)))
+
+
 def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime,
                authors: Sequence[str] = (),
                held: Optional[Dict[int, List[tickets.After]]] = None
@@ -8891,7 +9054,7 @@ def _histories(gh: GitHub, repo: str, found: List[Dict[str, Any]], now: datetime
     """The histories of stuck-state tickets, and the numbers it skipped. Each
     history is two paginated reads, so status reads at most STATUS_HISTORY_MAX
     per repo, the least recently updated first (the likeliest to be stuck)."""
-    candidates = sorted((i for i in found if any("loom:" + x in _labels(i) for x in STUCK_STATES)
+    candidates = sorted((i for i in found if _has_stuck_history(i)
                          and owned_elsewhere(i) is None and not tickets.claimed_by(i)),
                         key=lambda i: str(i.get("updated_at") or ""))
     waiting = held or {}
@@ -8908,19 +9071,20 @@ def person_claims(found: Sequence[Dict[str, Any]]) -> Dict[int, str]:
     person's work, not lane work: status never marks it stuck and escalate
     never moves it (loom#2003)."""
     return {int(i["number"]): tickets.claimed_by(i)[0] for i in found
-            if tickets.claimed_by(i) and any("loom:" + x in _labels(i) for x in STUCK_STATES)}
+            if tickets.claimed_by(i) and _has_stuck_history(i)}
 
 
 def _stuck_marks(histories: Dict[int, History], skipped: List[int],
                  claimed: Optional[Dict[int, str]] = None) -> Dict[int, str]:
-    """Marks for repeatedly stuck tickets, for those status skipped, and for
-    those a person claimed (person_claims), which carry no next rung."""
+    """Marks for stuck tickets, rung waits, skipped histories and claims."""
     marks: Dict[int, str] = {n: " - claimed by %s" % login
                              for n, login in (claimed or {}).items()}
     for number in skipped:
         marks[number] = " - not checked for stuck (status reads %d histories)" % STATUS_HISTORY_MAX
     for number, history in histories.items():
-        if history.reasons:
+        if history.rung_wait:
+            marks[number] = " - " + history.rung_wait
+        elif history.reasons:
             marks[number] = " - REPEATEDLY STUCK (%s; attempts %d; tried %s; %s)" % (
                 ", ".join(history.reasons), history.attempts,
                 ", ".join(history.tried) or "none", history.next_text())
@@ -9162,11 +9326,6 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
     if not history.reasons:
         raise ValueError("ticket is not repeatedly stuck")
     open_pr = int(found_pr["number"]) if found_pr is not None else None
-    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
-                                    trusted_authors())
-    if past_move_cap(moves):
-        hold_unclaimed(gh, repo, number, names, moves)
-        return "needs-brain"
     pending_brain_fix = open_pr is not None and _pending_brain_fix(
         gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)), trusted_authors(),
         station_login=writer_login(gh))
@@ -9190,6 +9349,22 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
 
     left = [n for n in factory.climb_rungs(_done_rungs(history.tried, history.rungs),
                                            max(history.rungs or {0})) if rung_lanes(n)]
+    choice = skipped_load = None
+    load = {}
+    if left:
+        free = _available_lanes(gh, lanes_repo)
+        load = _lane_load(gh, repo)
+        choice, skipped_load = _rung_by_load(
+            left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
+        if choice is not None:
+            wait = _rung_wait(issue, choice[0] - 1)
+            if wait:
+                return "not escalated: " + wait
+    moves = factory.unclaimed_moves(gh.paginate("/repos/%s/issues/%d/comments" % (repo, number)),
+                                    trusted_authors())
+    if past_move_cap(moves):
+        hold_unclaimed(gh, repo, number, names, moves)
+        return "needs-brain"
     if not left:
         gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
                 {"labels": sorted(set(names) | {"needs-brain", RUNAWAY})})
@@ -9198,10 +9373,6 @@ def escalate(gh: GitHub, repo: str, number: int, notes: str = "",
                     "(tried %s); %s. The ticket is held for brain review." % (
                         ", ".join(history.tried), "; ".join(history.reasons)), notify.RUNAWAY)
         return "needs-brain"
-    free = _available_lanes(gh, lanes_repo)
-    load = _lane_load(gh, repo)
-    choice, skipped_load = _rung_by_load(
-        left, lambda n: tuple(x for x in rung_lanes(n) if x in free), load)
     if choice is None:
         raise ValueError("no untried rung has an available lane")
     rung, lane = choice[0] - 1, choice[1]

@@ -15,6 +15,7 @@ TARGETS = (
     ("bus/brain.py", "fleet_hold"),
     # PR 2433's review finding (loom#2415).
     ("bus/brain.py", "_status_pass"),
+    ("bus/brain.py", "_split_packed_header_line"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
     # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription] 3026-Elder-complexity (PR #3026):
@@ -42,6 +43,10 @@ TARGETS = (
     # AI-REVIEW 2026-11-18 [automated review summary] station complexity (PR #3237):
     # Keep environment parsing below the cap as new settings are added.
     ("bus/station.py", "Settings.from_env"),
+    # PR #3523 complexity findings: 9128eb7b, 27729029, cb2b22bf.
+    ("bus/invariants.py", "brain_failing"),
+    ("bus/station.py", "Station._verify_pool"),
+    ("bus/station.py", "Station._invariant_facts"),
 )
 
 

@@ -29,7 +29,7 @@ from . import usage as usage_store
 
 LOG = logging.getLogger(__name__)
 
-KEYS = ("usage", "chain", "chain_seen", "goal_caps", "brain_holds", "bench")
+KEYS = ("usage", "chain", "chain_seen", "goal_caps", "brain_holds", "bench", "workers")
 # A page read refreshes from the database at most this often; after a failed
 # read it waits RETRY_AFTER instead, so a database outage costs one slow
 # request a minute rather than every request.
@@ -67,20 +67,43 @@ class PostgresBackend:
     def __init__(self, module):
         self.dbapi = module
         self.ready = False
+        self._conn = None
+        self._lock = threading.Lock()
+
+    def _close_conn(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as exc:  # noqa: BLE001
+                LOG.debug("closing stale station_state connection: %s", type(exc).__name__)
+
+    def _connect(self):
+        if self._conn is None:
+            self._conn = transcripts.connect(self.dbapi)
+        return self._conn
+
+    def _run_once(self, work):
+        conn = self._connect()
+        cur = conn.cursor()
+        if not self.ready:
+            cur.execute(_SCHEMA)
+            conn.commit()
+            self.ready = True
+        result = work(cur)
+        conn.commit()
+        return result
 
     def _run(self, work):
-        conn = transcripts.connect(self.dbapi)
-        try:
-            cur = conn.cursor()
-            if not self.ready:
-                cur.execute(_SCHEMA)
-                conn.commit()
-                self.ready = True
-            result = work(cur)
-            conn.commit()
-            return result
-        finally:
-            conn.close()
+        with self._lock:
+            had_conn = self._conn is not None
+            try:
+                return self._run_once(work)
+            except Exception:
+                self._close_conn()
+                if not had_conn:
+                    raise
+                return self._run_once(work)
 
     def put(self, key: str, value: Any, at: float) -> None:
         self._run(lambda cur: cur.execute(_PUT, (key, json.dumps(value), float(at))))
@@ -99,6 +122,7 @@ class PostgresBackend:
 class Store:
     def __init__(self, backend):
         self.backend = backend
+        self._sync_lock = threading.Lock()
 
     def put(self, key: str, value: Any, at: Optional[float] = None) -> None:
         if key not in KEYS:
@@ -181,18 +205,45 @@ def sync(state: Any, force: bool = False, now: Optional[float] = None) -> None:
     now = time.monotonic() if now is None else now
     if not force and now < getattr(state, "_station_state_next", 0.0):
         return
+    lock = getattr(store, "_sync_lock", None)
+    if lock is not None:
+        lock.acquire()
     try:
-        rows = store.all()
-    except errors() as exc:
-        state._station_state_next = now + RETRY_AFTER
-        LOG.warning("station snapshots not read: %s", type(exc).__name__)
-        return
-    state._station_state_next = now + SYNC_EVERY
-    seen = _seen(state)
-    for key, row in rows.items():
-        if row["at"] > seen.get(key, float("-inf")):
-            _apply(state, key, row["value"])
-            seen[key] = row["at"]
+        if not force and now < getattr(state, "_station_state_next", 0.0):
+            return
+        try:
+            rows = store.all()
+        except errors() as exc:
+            state._station_state_next = now + RETRY_AFTER
+            LOG.warning("station snapshots not read: %s", type(exc).__name__)
+            return
+        state._station_state_next = now + SYNC_EVERY
+        seen = _seen(state)
+        for key, row in rows.items():
+            if row["at"] > seen.get(key, float("-inf")):
+                _apply(state, key, row["value"])
+                seen[key] = row["at"]
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def start_background_sync(state: Any, stop_event: threading.Event) -> Optional[threading.Thread]:
+    """Poll station snapshots on a daemon thread so GET requests never block
+    on the database."""
+    if getattr(state, "station_state", None) is None:
+        return None
+    state._station_state_bg = True
+
+    def run() -> None:
+        while not stop_event.is_set():
+            sync(state)
+            wait = max(0.5, getattr(state, "_station_state_next", 0.0) - time.monotonic())
+            stop_event.wait(min(wait, SYNC_EVERY))
+
+    thread = threading.Thread(target=run, daemon=True, name="station-state-sync")
+    thread.start()
+    return thread
 
 
 def publish(state: Any, key: str, value: Any, at: Optional[float] = None) -> None:

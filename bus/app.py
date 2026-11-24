@@ -21,6 +21,7 @@ import os
 import sys
 from typing import Any, Callable, Dict, List, Optional, TextIO, Tuple
 
+from . import lane_apps
 from .github import (APP_KEY_FILE, DEFAULT_API, AppToken, GitHub, GitHubError,
                      Transport, openssl_sign, read_key_file, read_ssm,
                      urllib_transport)
@@ -115,6 +116,8 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
     those settings it prints nothing and fails: a writer that should post as
     its App never falls back to the operator's personal token."""
     env = os.environ if env is None else env
+    transport = transport or urllib_transport
+    env = _with_installation(env, transport, sign)
     found = AppToken.from_env(env)
     if found is None:
         print("error: LOOM_GITHUB_APP_ID, LOOM_GITHUB_APP_INSTALLATION_ID and "
@@ -122,8 +125,47 @@ def print_token(out: TextIO, env: Optional[Dict[str, str]] = None,
               file=sys.stderr)
         return 2
     gh = GitHub(AppToken(found.app_id, found.installation_id, _key_reader(env), sign=sign),
-                transport=transport or urllib_transport)
+                transport=transport)
     out.write(gh.app_token() + "\n")
+    return 0
+
+
+def _with_installation(env: Dict[str, str], transport: Transport,
+                       sign: Callable[[bytes, str], bytes]) -> Dict[str, str]:
+    """`env`, with the installation id found when it reads "discover" (a lane
+    App from LOOM_LANE_APPS that names none). The installation is the one whose
+    account is a LOOM_REPO_OWNERS owner, else the App's only one; an App with
+    several and no owner match is an error, never a guess."""
+    if env.get("LOOM_GITHUB_APP_INSTALLATION_ID", "").strip() != lane_apps.DISCOVER:
+        return env
+    app_id = env.get("LOOM_GITHUB_APP_ID", "").strip()
+    if not app_id.isdigit():
+        raise GitHubError("the GitHub App id must be a number")
+    probe = AppToken(app_id, "0", _key_reader(env), sign=sign)
+    installations = _jwt_pages(transport, probe.jwt(), "/app/installations")
+    owners = {o.lower() for o in env.get("LOOM_REPO_OWNERS", "").replace(",", " ").split()}
+    named = [i for i in installations if isinstance(i, dict)
+             and str((i.get("account") or {}).get("login") or "").lower() in owners]
+    found = named or (installations if len(installations) == 1 else [])
+    if len(found) != 1 or not str(found[0].get("id") or "").isdigit():
+        raise GitHubError("cannot tell which installation of App %s to use: set the "
+                          "installation_id in %s" % (app_id, lane_apps.SETTING))
+    return dict(env, LOOM_GITHUB_APP_INSTALLATION_ID=str(found[0]["id"]))
+
+
+def print_lane_identity(slot: str, out: TextIO, err: TextIO,
+                        env: Optional[Dict[str, str]] = None) -> int:
+    """Print the identity LOOM_LANE_APPS gives `slot`, one value per line in
+    lane_apps.FIELDS order, for run_lane.sh. Nothing and 0 for an unmapped
+    lane; 3 for a map that cannot be read."""
+    env = os.environ if env is None else env
+    try:
+        found = lane_apps.resolve(slot, env)
+    except lane_apps.LaneAppError as err_:
+        err.write("error: %s\n" % err_)
+        return 3
+    if found:
+        out.write("".join(v + "\n" for v in found))
     return 0
 
 
@@ -178,6 +220,18 @@ def _jwt_get(transport: Transport, jwt: str, path: str) -> Any:
     return data
 
 
+def _jwt_pages(transport: Transport, jwt: str, path: str) -> Any:
+    """Every page of a JWT-read list: follow pages until one comes back short."""
+    out: List[Any] = []
+    page = 1
+    while True:
+        batch = _jwt_get(transport, jwt, "%s?per_page=100&page=%d" % (path, page))
+        out.extend(batch)
+        if len(batch) < 100:
+            return out
+        page += 1
+
+
 def _repos(app_id: str, inst_id: str, read_key: Callable[[], str],
            sign: Callable[[bytes, str], bytes], transport: Transport) -> List[str]:
     """The repos one installation covers, read with its own token."""
@@ -227,7 +281,7 @@ def ids(app_id: str, env: Optional[Dict[str, str]] = None,
     read_key = _key_reader(env)
     wanted = set(env.get("LOOM_REPOS", "").replace(",", " ").split())
     jwt = AppToken(app_id, "0", read_key, sign=sign).jwt()
-    installations = _jwt_get(transport, jwt, "/app/installations?per_page=100")
+    installations = _jwt_pages(transport, jwt, "/app/installations")
     if not installations:
         err.write("the App %s has no installations: install it on the repos in "
                   "LOOM_REPOS first\n" % app_id)

@@ -4092,7 +4092,9 @@ class EscalateTests(unittest.TestCase):
     def test_status_marks_each_kind_of_repeatedly_stuck_ticket(self):
         for name, (events, comments, state) in self.stuck_cases().items():
             with self.subTest(name):
-                routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [stuck_ticket(state)]),
+                issue = (stuck_ticket(state, body=BODY) if state == "briefed"
+                         else stuck_ticket(state))
+                routes = {("GET", "/repos/%s/issues" % REPO): reply(200, [issue]),
                     ("GET", "/issues/9/events"): reply(200, events),
                     ("GET", "/issues/9/comments"): reply(200, comments)}
                 routes.update(lanes_routes(()))
