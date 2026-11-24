@@ -5751,6 +5751,27 @@ class BranchHygiene(Base):
         self.go()
         self.assertEqual(self.updates(), ["/repos/%s/pulls/60/update-branch" % REPO])
 
+    def test_a_ready_pull_request_waits_for_the_external_hold_box_to_be_ticked(self):
+        hold = ("## Acceptance criteria\n"
+                "- [ ] Hold: do not merge. External precondition: service recovery. "
+                "Evidence to lift: HTTP 200.\n")
+        self.gh.ticket(5, "pr", body=hold)
+        self.gh.pull(50, 5)
+        self.gh.behind[50] = 3
+        self.gh.ticket(6, "pr")
+        self.gh.pull(60, 6, runs=self.WAITING, files=("bus/b.py", "tests/test_b.py"))
+        self.gh.behind[60] = 3
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/60/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
+        self.gh.behind[60] = 0
+        self.gh.issues[5]["body"] = hold.replace("[ ]", "[x]")
+        self.go()
+        self.assertEqual(self.updates(), ["/repos/%s/pulls/60/update-branch" % REPO,
+                                          "/repos/%s/pulls/50/update-branch" % REPO])
+        self.assertEqual((self.merged, self.fixed), ([], []))
+
     def test_a_behind_conflict_free_pull_request_at_briefed_is_updated(self):
         self.gh.ticket(5, "briefed")
         self.gh.pull(50, 5, created=7200, runs=self.WAITING)

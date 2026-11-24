@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from .github import GitHubError
 
 Ticket = Tuple[str, int]
+EXTERNAL_HOLD_PREFIX = "Hold: do not merge. External precondition: "
 
 _TICKET = r"(?:[\w.-]+/[\w.-]+)?#\d+"
 _TICKET_REFS = re.compile(r"\b(?:refs|part of)\s+({0}(?:\s*,\s*{0})*)".format(_TICKET), re.I)
