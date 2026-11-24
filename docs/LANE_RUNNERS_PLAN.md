@@ -28,9 +28,7 @@ when the job ends.
   route. The agent gets a URL and no key. Free routes refuse every paid model
   at the gateway. This is the only path that keeps every credential out of
   the agent.
-- Sign-in or key under a CLI: anthropic's CLI takes an exported key from SSM
-  and copilot an exported token. Both stay on the Mac with the sign-in lanes
-  by operator decision.
+- Exported token under a CLI: copilot stays on the Mac.
 - Exported key: the job copies the `LOOM_<LANE>_KEY_SSM` value under HOME
   through the OIDC role `loom-lane`, and `api_agent` exports it to the agent.
   bwrap hides the file, but the agent can read its own environment. This path
@@ -53,7 +51,7 @@ when the job ends.
 | workersai | runner | exported key | no gateway provider yet | Later, needs a gateway route |
 | codex, -2 to -8 | stays on the Mac | CLI sign-in | none yet | Design only |
 | claude | stays on the Mac | CLI sign-in | none yet | Design only |
-| anthropic, -2 to -8 | stays on the Mac | exported key under the CLI | none yet | Design only |
+| anthropic, -2 to -8 | runner | exported key under the CLI | exported key from SSM | Numbered slots tracked, base slot opt-in |
 | copilot | stays on the Mac | exported token under the CLI | none yet | Design only |
 | agy | stays on the Mac | a separate lane user's sign-in | none | Cannot move |
 | station | stays on the Mac | App keys, launchd | none | Not a lane |
@@ -65,9 +63,8 @@ codex-4 to codex-16 and spark-2 to spark-4 are installed but not loaded.
 
 ## What cannot move yet
 
-- Subscription CLI lanes (codex, claude, anthropic, copilot). codex and claude
-  sign in from a Mac home directory. anthropic and copilot take an exported
-  key, which a run on a shared pool could read. The design below is not built.
+- The copilot CLI takes an exported token, which a run on a shared pool could
+  read. The design below is for CLI sign-in.
 - agy. It signs in as a separate user and needs that user's keychain. No
   design moves it.
 - Any private repo. A run's inputs and logs live in this public repository's

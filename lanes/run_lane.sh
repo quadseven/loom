@@ -56,6 +56,7 @@
 # load_contract for the repo's .loom/validation.conf),
 # LOOM_CHECK_SLOTS (check runs at once across all lanes on the host, default 3),
 # LOOM_CHECK_SLOT_WAIT (seconds a check waits for a slot, default 5400),
+# LOOM_REMOTE_CHECKS (1: a public repo's checks run on GitHub, not in a slot; docs/LANES.md, "Remote checks"),
 # LOOM_CHECK_LOAD_1M and LOOM_CHECK_LOAD_5M (a check takes a slot only while
 # the host's 1-minute and 5-minute load averages are at or under these,
 # defaults 24 and 18; 0 turns that limit off),
@@ -75,7 +76,8 @@
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
-# http://your-spark.internal:8000/v1; no key).
+# http://your-spark.internal:8000/v1), with LOOM_SPARK_KEY_SSM naming the
+# spark-gateway caller token when the URL is the gateway (unset: no key).
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -337,6 +339,30 @@ CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
 # shellcheck source=lanes/build_jobs.sh
 . "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
+# A lane LOOM_LANE_APPS names writes as that App instead (bus/lane_apps.py):
+# its push, its pull request, its comments and its commits all carry the
+# mapped App's identity. The App's settings replace the lanes App's, and a key
+# file of the lanes App is dropped so the mapped key is the one read. An
+# unmapped lane keeps the lanes App unchanged. A map that cannot be read, or an
+# App the lane cannot mint a token for, stops the lane: it never writes as
+# another App instead.
+if [ -n "${LOOM_LANE_APPS:-}" ]; then
+  LANE_IDENTITY="$(cd "$LOOM_ROOT" && python3 -B -m bus app lane-identity "$SLOT")" || {
+    echo "lane $SLOT: LOOM_LANE_APPS cannot be read; the lane does not run" >&2
+    exit 1
+  }
+  if [ -n "$LANE_IDENTITY" ]; then
+    {
+      IFS= read -r LANE_APP_ID && IFS= read -r LANE_APP_INSTALLATION &&
+        IFS= read -r LANE_APP_KEY_SSM && IFS= read -r LANE_GIT_NAME && IFS= read -r LANE_GIT_EMAIL
+    } <<< "$LANE_IDENTITY" || { echo "lane $SLOT: LOOM_LANE_APPS gave an unreadable identity" >&2; exit 1; }
+    export LOOM_GITHUB_APP_ID="$LANE_APP_ID" LOOM_GITHUB_APP_INSTALLATION_ID="$LANE_APP_INSTALLATION" \
+      LOOM_GITHUB_APP_KEY_SSM="$LANE_APP_KEY_SSM" \
+      GIT_AUTHOR_NAME="$LANE_GIT_NAME" GIT_COMMITTER_NAME="$LANE_GIT_NAME" \
+      GIT_AUTHOR_EMAIL="$LANE_GIT_EMAIL" GIT_COMMITTER_EMAIL="$LANE_GIT_EMAIL"
+    unset LOOM_GITHUB_APP_KEY_FILE
+  fi
+fi
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
@@ -559,10 +585,10 @@ EOF
     safe_git reset -q --soft "$BASE" || return 1
     safe_git add -A || return 1
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "${TITLE:-$TICKET}" || return 1
+    safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}")" || return 1
   else
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "Drop agent scratch files: ${dropped//$'\n'/, }" || return 1
+    safe_git commit -qm "$(commit_msg "Drop agent scratch files: ${dropped//$'\n'/, }")" || return 1
   fi
 }
 
@@ -913,10 +939,14 @@ upsert_sticky_comment() {
         --jq .body > "$old_file" 2>> "$LOG"; then
     rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
+  # The old body's signature comes off first so the merge never reads it as
+  # part of an entry; the new body is signed once.
+  PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature strip "$old_file" 2>> "$LOG" || true
   if ! PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.sticky "$mode" --marker "$marker" \
         --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$input_file" > "$new_file" 2>> "$LOG"; then
     rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
+  signed "$(cat "$new_file")" > "$new_file.signed" && mv "$new_file.signed" "$new_file"
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
       -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
@@ -987,7 +1017,7 @@ round_changed() {
 # A reply the thread already holds is not posted again, so a re-sent round
 # never duplicates one. A reason with no commit goes in .loom-answers instead.
 post_replies() {
-  local entry thread body resolve node owner text_file
+  local entry thread body plain resolve node owner text_file
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
   while IFS= read -r entry; do
     thread="$(jq -r '.thread' <<< "$entry")"
@@ -1009,7 +1039,10 @@ post_replies() {
       continue
     fi
     rm -f "$text_file"
-    if jq -e --arg body "$body" 'any(.data.node.comments.nodes[]?; .body == $body)' <<< "$node" > /dev/null 2>> "$LOG"; then
+    plain="$body"
+    body="$(signed "$body")"
+    # A reply posted before lanes signed holds the plain text: it counts too.
+    if jq -e --arg body "$body" --arg plain "$plain" 'any(.data.node.comments.nodes[]?; .body == $body or .body == $plain)' <<< "$node" > /dev/null 2>> "$LOG"; then
       echo "review thread $thread already holds this reply; it was not posted again" >> "$LOG"
     elif ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
@@ -1212,7 +1245,7 @@ post_no_change() {
     echo "answer could not be written"; return 1
   fi
   if ! [[ "$ISSUE_REF" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]]; then
-    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$NO_CHANGE_TEXT")" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
     if ! mark_answered; then
@@ -1570,10 +1603,16 @@ AUTH_WHY_PREFIX="API key expired: renew"
 spark_probe() {
   local response code status retry_after
   LIMIT_RETRY_AFTER=""
-  response="$(curl -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  # A caller token (spark_key) reaches curl on stdin as a config line, never
+  # in argv; with none, stdin is empty and curl reads no config.
+  response="$(spark_curl_config | curl -K - -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
   code="${response##*$'\n'}"
   if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
+  if [ "$status" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+    READY_REASON="the $LANE endpoint refused the caller (HTTP $code); check $(lane_var KEY_SSM)"
+    return 2
+  fi
   if [ "$code" = 503 ]; then
     retry_after="$(printf '%s\n' "$response" | awk '
       tolower($1) == "retry-after:" {
@@ -1635,9 +1674,37 @@ beat_hold_from_file() {
   grep -q '"from_limit_file": true' "$BEAT" 2> /dev/null
 }
 
+# The spark-gateway caller token for a spark or free lane: read
+# from LOOM_<SLOT>_KEY_SSM into API_KEY when that is set. Unset keeps the
+# keyless endpoint (a vLLM box reached directly). A token that could break the
+# curl config line or the opencode config is refused.
+spark_key() {
+  local key_ssm
+  API_KEY=""
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || return 0
+  API_KEY="$(ssm_value "$key_ssm")"
+  [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+  [[ "$API_KEY" =~ ^[A-Za-z0-9._~+/=-]+$ ]] ||
+    { API_KEY=""; READY_REASON="the key at $(lane_var KEY_SSM) has characters outside A-Za-z0-9._~+/=-"; return 1; }
+}
+
+# The curl config for the probe: the caller token as a header, or nothing.
+# printf is a builtin, so the token reaches no process's argv.
+spark_curl_config() {
+  [ -z "${API_KEY:-}" ] || printf 'header = "Authorization: Bearer %s"\n' "$API_KEY"
+}
+
+# The variable the agent's provider reads its key from: SPARK_API_KEY with a
+# caller token, "-" (no key) without one.
+spark_key_var() {
+  if [ -n "${API_KEY:-}" ]; then printf 'SPARK_API_KEY'; else printf -- '-'; fi
+}
+
 spark_ready() {
   [[ "$SPARK_URL" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] ||
     { READY_REASON="LOOM_SPARK_URL is not set to an http(s) base URL"; return 1; }
+  spark_key || return 1
   limit_held && return 1
   spark_probe
   case $? in
@@ -2084,8 +2151,8 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs:human --body "$body" 2>>"$LOG" ||
-           gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
+             --label needs:human --body "$(signed "$body")" 2>>"$LOG" ||
+           gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$(signed "$body")" 2>>"$LOG")"
   number="${number##*/}"
   case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
@@ -2364,6 +2431,29 @@ opencode_has_no_work() {
 # a shell function, so the push spells the same options out.)
 safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# Every lane shares one GitHub App identity, so each lane signs what it writes
+# (bus/signature.py): a final "Signed: lane-<slot>, model <model>" line on each
+# pull request body and comment, and Loom-Lane and Loom-Model trailers on each
+# commit. The model is the run's own ($MODEL), else LOOM_<SLOT>_MODEL.
+# signed prints $1 with exactly one signature line; commit_msg prints $1 with
+# the trailers. Both fall back to the plain text when python is unavailable, so
+# a signing fault never costs the run its comment or commit.
+signed() {
+  local out
+  out="$(printf '%s' "$1" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature sign \
+    --lane "$SLOT" --model "${MODEL:-}" 2>> "${LOG:-/dev/null}")" || out="$1"
+  printf '%s' "$out"
+}
+# sign_tail prints the signature on its own paragraph, to end a message whose
+# leading words must stay literal (a close comment states its reason first).
+sign_tail() { printf '\n\n%s' "$(signed "")"; }
+commit_msg() {
+  local out
+  out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
+    --lane "$SLOT" --model "${MODEL:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+  printf '%s' "$out"
 }
 
 # The repo's validation contract: .loom/validation.conf, the same interpreter,
@@ -2783,7 +2873,7 @@ resolve_factory_incidents() {
       # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
       # factory incident's close through; anything else it records and holds.
       PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD"         issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
-      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text" >>"$LOG" 2>&1 || continue
+      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text$(sign_tail)" >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
@@ -2882,10 +2972,10 @@ file_factory_incident() {  # kind, detail
       --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
     if ! number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" --label loom:factory 2>"$err")"; then
+      --body "$(signed "$body")" --label loom:factory 2>"$err")"; then
       cat "$err" >> "$LOG" 2>/dev/null
       number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-        --body "$body" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
+        --body "$(signed "$body")" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
     fi
     number="${number##*/}"
     case "$number" in ''|*[!0-9]*) number="" ;; esac
@@ -3039,6 +3129,55 @@ acquire_check_slot() {
 release_check_slot() {
   [ -z "$CHECK_SLOT_HELD" ] || rm -rf "$CHECK_SLOT_HELD"
   CHECK_SLOT_HELD=""
+}
+
+# LOOM_REMOTE_CHECKS=1 (off by default): on a PUBLIC repo a new run's final
+# check runs on a GitHub-hosted runner through this repo's remote-check.yml,
+# and a base check whose commit GitHub already passed is not run, so neither
+# takes a host check slot. The lanes' App cannot dispatch a workflow, so the
+# request goes to the station through files (bus/remote_checks.py). A private
+# repo, a fix round, a repo with no check contract, a lane on a cluster runner
+# (no station files) and any dispatch error or timeout keep the local slot
+# path. docs/LANES.md, "Remote checks".
+REMOTE_CHECKS="${LOOM_REMOTE_CHECKS:-0}"
+REMOTE_CHECK_WAIT="${LOOM_REMOTE_CHECK_WAIT:-1800}"
+REMOTE_CHECK_START_WAIT="${LOOM_REMOTE_CHECK_START_WAIT:-180}"
+REMOTE_CHECK_POLL="${LOOM_REMOTE_CHECK_POLL:-10}"
+[[ "$REMOTE_CHECK_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_WAIT=1800
+[[ "$REMOTE_CHECK_START_WAIT" =~ ^[0-9]+$ ]] || REMOTE_CHECK_START_WAIT=180
+[[ "$REMOTE_CHECK_POLL" =~ ^[0-9]+(\.[0-9]+)?$ ]] || REMOTE_CHECK_POLL=10
+remote_checks_on() { [ "$REMOTE_CHECKS" = 1 ] && [ "${LOOM_CLUSTER_RUNNER:-}" != 1 ] && repo_is_public; }
+# Ask for the check of a pushed commit on GitHub and wait, bounded. Returns 0
+# green, 1 red (the failing test names are appended to the log as FAIL: lines,
+# the ones check_failures reads), 2 when the remote cannot answer: the caller
+# then runs the check on the host.
+wait_remote_checks() {  # sha
+  local spec out word name
+  local -a names
+  spec="$CHECK_HOME/remote-check.spec"
+  mkdir -p "$CHECK_HOME" 2>/dev/null || return 2
+  printf '%s\n%s\n%s\n%s\n' "$C_INTERP" "$C_SUBMODULES" "$C_SETUP" "$C_CHECK" > "$spec" || return 2
+  out="$(cd "$LOOM_ROOT" && LOOM_HOME="$LOOM_HOME" timeout "$((REMOTE_CHECK_WAIT + 60))" python3 -B -m bus remote-check \
+    wait "$REPO" "$1" "$spec" "$REMOTE_CHECK_START_WAIT" "$REMOTE_CHECK_WAIT" "$REMOTE_CHECK_POLL" 2>>"$LOG" | tail -n 1)"
+  rm -f "$spec"
+  word="${out%% *}"
+  case "$word" in
+    green) return 0 ;;
+    red)
+      IFS=' ' read -r -a names <<< "$out"
+      for name in "${names[@]:1}"; do printf 'FAIL: %s\n' "$name" >> "$LOG"; done
+      return 1 ;;
+  esac
+  echo "no remote check answer for ${1:0:12} (${out:-none}); running the check on the host" >> "$LOG"
+  return 2
+}
+# Remove the work branch this run pushed for its remote check, only while it
+# still points at the commit pushed (never a branch someone else moved), so a
+# retry of the ticket pushes a fresh one.
+drop_remote_branch() {  # sha
+  timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+    push -q origin ":refs/heads/$BRANCH" --force-with-lease="refs/heads/$BRANCH:$1" >> "$LOG" 2>&1 ||
+    echo "could not remove the remote check branch $BRANCH" >> "$LOG"
 }
 
 wait_for_agent() {
@@ -3425,6 +3564,12 @@ prepare_validation() {
     changed=""
     echo "base check reused cached verdict for $baseline_rev" >> "$LOG"
     record baseline "$C_CHECK" "$BASELINE_EXIT" "$baseline_rev" "$([ "$BASELINE_EXIT" -eq 0 ] && echo true || echo false)" "cached verdict"
+  elif [ -z "$FIX_PR" ] && remote_checks_on && github_checks_green "$baseline_rev"; then
+    # A public repo's base that GitHub's checks already passed needs no run
+    # (and no slot) here; any other state runs the check on the host below.
+    cached_verdict=1 BASELINE_EXIT=0 changed=""
+    echo "base check not run: GitHub's checks passed on $baseline_rev (LOOM_REMOTE_CHECKS)" >> "$LOG"
+    record baseline "$C_CHECK" 0 "$baseline_rev" true "GitHub checks green; no host check slot taken"
   else
     check_start="$(log_size)"
     contract_run "$C_CHECK"; BASELINE_EXIT=$?
@@ -3617,7 +3762,7 @@ format_changed_files() {
   contract_run "$prefix format$paths" || { safe_git checkout -q -- $paths >> "$LOG" 2>&1; return 0; }
   safe_git add -- $paths >> "$LOG" 2>&1 || return 0
   safe_git diff --cached --quiet && return 0
-  safe_git commit -qm "format: apply ruff format to the lane's changed files" >> "$LOG" 2>&1 || return 0
+  safe_git commit -qm "$(commit_msg "format: apply ruff format to the lane's changed files")" >> "$LOG" 2>&1 || return 0
   echo "formatted $n files the change touched before the second run" >> "$LOG"
   return 0
 }
@@ -3635,8 +3780,15 @@ base_retry_turn() {
   } > "$brief" || return 1
   ( cd "$TREE" && unset GH_TOKEN GITHUB_TOKEN LOOM_GITHUB_TOKEN "${!LOOM_GITHUB_APP_@}" "${!GIT_CONFIG_@}" &&
     run_agent "$brief" ) >> "$LOG" 2>&1 || true
+  # The Intent summary and the replies file are runner metadata, as on the main
+  # path: keep them out of the commit this turn makes.
+  rm -f "$TREE/.loom/replies.json"
+  if [ -f "$TREE/$SUMMARY_FILE" ] && [ ! -L "$TREE/$SUMMARY_FILE" ]; then
+    cp "$TREE/$SUMMARY_FILE" "$WORKDIR/$TICKET.summary.md" 2>> "$LOG" || return 1
+  fi
+  rm -f "$TREE/$SUMMARY_FILE"
   if [ -n "$(safe_git status --porcelain)" ]; then
-    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
+    safe_git add -A && safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}: make the changed tests fail on base")" >> "$LOG" 2>&1 || return 1
   fi
 }
 
@@ -3655,8 +3807,17 @@ final_validation() {
     return 1
   fi
   output_offset="$(wc -c < "$LOG")"
-  contract_run "$C_CHECK"; rc=$?
-  if [ "$rc" -eq 0 ]; then
+  if [ -n "${REMOTE_FINAL:-}" ]; then
+    # The check runs on GitHub after the push (remote_final_gate), which comes
+    # after the leak scans. The base-test gate and the affected check are host
+    # runs that would take a slot, so they are left out of this pass; the
+    # host fallback in remote_final_gate runs them.
+    rc=0
+    echo "final check left to the remote check on the pushed branch" >> "$LOG"
+  else
+    contract_run "$C_CHECK"; rc=$?
+  fi
+  if [ "$rc" -eq 0 ] && [ -z "${REMOTE_FINAL:-}" ]; then
     final_base_tests "$rev"; gate_rc=$?
     # The agent answers a refusal once: one more turn, then the whole check
     # again. A second refusal ends the run as before.
@@ -3759,16 +3920,51 @@ final_validation() {
     *) [ -n "$VALIDATION_REASON" ] ||
          VALIDATION_REASON="validation failed: the check exited $rc${failing:+ (failing: $failing)}" ;;
   esac
-  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}")"
-  [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || final_affected "$rev" || ok=false
+  record final "$C_CHECK" "$rc" "$rev" "$ok" "$(join_detail "${first_exit:+second run after exit $first_exit}" "${changed:+changed tracked files: $changed}" "$host_red" "${failing:+failing: $failing}" "${REMOTE_FINAL:+check left to the remote check after the push}")"
+  [ "$ok" != true ] || [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || final_affected "$rev" || ok=false
   # The last check of this brief has run; the next one starts a fresh home.
   drop_check_home
   [ "$ok" = true ] || { VALIDATION_REASON="$VALIDATION_REASON at ${rev:0:12} (base check exited $BASELINE_EXIT)"; return 1; }
   VALIDATED="check exited 0 at ${rev:0:12}"
   [ -z "$first_exit" ] || VALIDATED="final check passed on a second run at ${rev:0:12}"
   [ -z "$host_red" ] || VALIDATED="final check $host_red at ${rev:0:12}; GitHub's checks passed on the base"
-  [ -z "${C_AFFECTED:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
+  [ -z "${REMOTE_FINAL:-}" ] || VALIDATED="the check is left to the remote check at ${rev:0:12}"
+  [ -z "${C_AFFECTED:-}" ] || [ -n "${REMOTE_FINAL:-}" ] || VALIDATED="$VALIDATED; affected check exited 0"
   assess_validation_paths
+}
+
+# A new run on a public repo with LOOM_REMOTE_CHECKS: the work branch is
+# pushed (after every pre-push gate), and a check on a GitHub-hosted runner
+# (remote-check.yml, through the station) stands in for the host check.
+# Green passes the run on to the pull request; red parks it with the failing
+# tests named, keeping the edits on a side branch and removing
+# the work branch; no answer, an error or a timeout runs the host check, with
+# its slot, as without the setting. Returns 1 when the run is parked.
+remote_final_gate() {
+  local rev rc offset failing
+  rev="$(safe_git rev-parse HEAD)"
+  offset="$(wc -c < "$LOG")"
+  wait_remote_checks "$rev"; rc=$?
+  case "$rc" in
+    0)
+      VALIDATED="the remote check passed at ${rev:0:12}; no host check slot taken"
+      record final "$C_CHECK" 0 "$rev" true "remote check green; no host check slot taken"
+      return 0 ;;
+    1)
+      failing="$(failing_summary "$offset")"
+      VALIDATION_REASON="validation failed: the remote check was red at ${rev:0:12}${failing:+ (failing: $failing)}"
+      record final "$C_CHECK" 1 "$rev" false "remote check red${failing:+; failing: $failing}"
+      park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); no pull request opened" ""
+      drop_remote_branch "$rev"
+      return 1 ;;
+  esac
+  REMOTE_FINAL=""
+  if ! final_validation; then
+    park "$BRIEF" "$VALIDATION_REASON; $(preserve_unvalidated); no pull request opened" "$PARK_CLASS"
+    drop_remote_branch "$rev"
+    return 1
+  fi
+  return 0
 }
 
 # A successful shell command proves its exit status, not which changed paths
@@ -3999,7 +4195,7 @@ preserve_timedout() {
     return 1
   fi
   if [ -n "$tree_status" ] &&
-     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+     ! { safe_git add -A && safe_git commit -qm "$(commit_msg "$TICKET: edits before the timeout")"; } >> "$LOG" 2>&1; then
     printf 'the edits could not be committed in the lane tree'
     return 1
   fi
@@ -4031,7 +4227,7 @@ drop_stray_from_kept() {
   done <<EOF
 $STRAY_FILES
 EOF
-  if ! safe_git commit -qm "$TICKET: leave out files outside the brief's paths"; then
+  if ! safe_git commit -qm "$(commit_msg "$TICKET: leave out files outside the brief's paths")"; then
     echo "[$stamp] $TICKET: could not commit the removal of $(stray_list) from the kept edits"
     return 1
   fi
@@ -4054,7 +4250,7 @@ drop_stray_files() {
   done <<EOF
 $STRAY_FILES
 EOF
-  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+  if ! safe_git commit -qm "$(commit_msg "Drop files outside the brief's paths: $(stray_list)")"; then
     echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
     return 1
   fi
@@ -4200,6 +4396,9 @@ trains_on_prompts() {
   # Free provider slots that may train on prompts (bus/factory.py PUBLIC_ONLY;
   # tests/test_bus_station.py keeps the two lists equal).
   case "$SLOT" in free-nvidia|free-kilo|free-groq|free-openrouter) return 0 ;; esac
+  # LOOM_PUBLIC_ONLY_SLOTS (bus/station.py public_only_slots): slots on a login
+  # shared outside the operator's own repos.
+  case " $(printf '%s' "${LOOM_PUBLIC_ONLY_SLOTS:-}" | tr ',' ' ' | tr -s '[:space:]' ' ') " in *" $SLOT "*) return 0 ;; esac
   return 1
 }
 
@@ -4257,7 +4456,7 @@ update_fix_branch() {
     UPDATE_REASON="could not read origin/$default"; return 1
   fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+       merge --no-edit -m "$(commit_msg "Merge origin/$default into $BRANCH")" "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
     return 0
   fi
@@ -4293,7 +4492,7 @@ resume_earlier_attempt() {
   fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q origin "+refs/heads/$side:refs/remotes/origin/$side" >> "$LOG" 2>&1 &&
-     safe_git merge --no-edit "origin/$side" >> "$LOG" 2>&1; then
+     safe_git merge --no-edit -m "$(commit_msg "Merge $side into $BRANCH")" "origin/$side" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged the earlier attempt's branch $side" >> "$LOG"
     return 0
   fi
@@ -4422,8 +4621,8 @@ Do not search the whole filesystem (for example, find /). Search within the chec
     openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
     opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
     zen) opencode_agent_continuing - text "$brief_text" ;;
-    spark) opencode_agent_continuing - raw "$brief_text" ;;
-    free) opencode_agent_continuing - text "$brief_text" ;;
+    spark) opencode_agent_continuing "$(spark_key_var)" raw "$brief_text" ;;
+    free) opencode_agent_continuing "$(spark_key_var)" text "$brief_text" ;;
     zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
@@ -5013,7 +5212,7 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   RECORD="$LOGDIR/$TICKET.validation.jsonl"
   rm -f "$RECORD"
-  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS=""
+  HAS_CONTRACT="" BASELINE_EXIT="" VALIDATED="" PARK_CLASS="" REMOTE_FINAL=""
   UNVALIDATED_PATHS="" COVERAGE_UNKNOWN=""
   RUN_BRIEF="$BRIEF"
   CONFLICTS=""
@@ -5342,7 +5541,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "answer refused: $REASON"; continue
     fi
     rm -f "$LOGDIR/$TICKET.answer-error"
-    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$ANSWER_TEXT")" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
     if ! mark_answered; then
@@ -5379,7 +5578,7 @@ for BRIEF in "$INBOX"/*.md; do
   # completes the merge.
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
     if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
-           safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
+           safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}")"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes" transient; continue
     fi
   fi
@@ -5449,6 +5648,10 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # An agent's exit code is not evidence: only a passing check on the
   # committed head hands the work on.
+  REMOTE_FINAL=""
+  if [ -n "$HAS_CONTRACT" ] && [ -z "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && remote_checks_on; then
+    REMOTE_FINAL=1
+  fi
   if [ -n "$HAS_CONTRACT" ] && ! final_validation; then
     HANDOFF="no pull request opened"
     [ -n "$FIX_PR" ] && HANDOFF="nothing pushed to #$FIX_PR"
@@ -5569,8 +5772,18 @@ for BRIEF in "$INBOX"/*.md; do
   fi
   # A PR closed or merged during the run gets nothing pushed: a push would
   # bring its deleted branch back.
-  if [ -n "$FIX_PR" ] && ! fix_pr_open; then
-    park "$BRIEF" "${FIX_REASON:-could not check pull request #$FIX_PR before pushing}"; continue
+  # The run may have outlived its installation token, so mint again first; a
+  # failed mint keeps the old token, and the open check says what it can.
+  # A check GitHub did not answer (FIX_REASON empty) is transient: the edits
+  # stay committed in the lane tree (loom#3465).
+  if [ -n "$FIX_PR" ]; then
+    fresh_app_token || true
+    if ! fix_pr_open; then
+      if [ -z "$FIX_REASON" ]; then
+        park "$BRIEF" "could not check pull request #$FIX_PR before pushing; the edits are committed in the lane tree" transient; continue
+      fi
+      park "$BRIEF" "$FIX_REASON"; continue
+    fi
   fi
   # A fix round that commits nothing leaves the checks it was asked to fix
   # failing on the very head CI failed them on: it is a failed round, not
@@ -5684,6 +5897,9 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
     : > "$LOGDIR/$TICKET.pushed"
     note_answer_head "$(safe_git rev-parse HEAD 2>> "$LOG")"
   fi
+  if [ -n "$REMOTE_FINAL" ]; then
+    remote_final_gate || continue
+  fi
   # A fix round that leaves its pull request with no diff against the default
   # branch closes it (loom#1637): an empty pull request is never mergeable
   # work. The push goes first, so the closed pull request shows the round
@@ -5691,7 +5907,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
   if [ -n "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
     EMPTY_WHY="no change to push: #$FIX_PR has no diff against ${FIX_DEFAULT:-its base} after this round"
     if ! timeout "$NET_TIMEOUT" gh pr close "$FIX_PR" -R "$REPO" \
-         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge." >> "$LOG" 2>&1; then
+         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge.$(sign_tail)" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: could not close the empty pull request #$FIX_PR" >> "$LOG"
       EMPTY_WHY="$EMPTY_WHY; closing it failed"
     fi
@@ -5757,6 +5973,9 @@ Review threads this round left without a reply: $UNANSWERED"
   # when the brief cannot fill it.
   [ -n "${PR_BODY:-}" ] || compose_pr_body
   [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
+  # The signature is the last line a reader sees; the plan-hold marker is an
+  # HTML comment, so it goes after it (bus/signature.py reads past it).
+  PR_BODY="$(signed "$PR_BODY")"
   [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then

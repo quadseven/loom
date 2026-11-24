@@ -11,7 +11,12 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   default is the remote's default branch.
 - Every run passes an explicit model: the brief's `Model:` line, else the
   lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
-  model. A model outside the lane's family is refused; the `openrouter`,
+  model.
+- Every lane shares one GitHub App identity, so each lane signs what it
+  writes (`bus/signature.py`): the last line of each pull request body and
+  comment is `Signed: lane-<slot>, model <model id>`, and each commit carries
+  `Loom-Lane` and `Loom-Model` trailers. The model is the run's own, else
+  `LOOM_<SLOT>_MODEL`; signing twice leaves one line. A model outside the lane's family is refused; the `openrouter`,
   `zen` and `zai` lanes run free models only.
 - A lane may set LOOM_<SLOT>_MODELS to an ordered, space-separated model
   list. Unpinned briefs use the first model not currently limited. A provider
@@ -363,6 +368,56 @@ unset variables.
   revisions).
 - A repo without the file is not validated by the runner; CI still is.
 
+### Remote checks
+
+`LOOM_REMOTE_CHECKS=1` (off by default) lets a lane on a **public** repo run
+its final check on a GitHub-hosted runner (free for public repos) instead of
+waiting for a host check slot. A private repo, a fix round, a repo with no
+check contract and a lane on a cluster runner keep the local slot path.
+
+Public repos usually run their own CI only on a push to their default branch,
+so the lane does not wait for the repo's checks on a work branch. This repo's
+`.github/workflows/remote-check.yml` runs the check instead: a
+`workflow_dispatch` with the repo, the commit, and the check spec the lane
+already resolved for that repo (`.loom/validation.conf`: submodules, setup and
+check). It checks the public repo out at that commit, runs the same commands
+the host would, with no secrets and read-only contents, and uploads a small
+result artifact: the exit code and up to twenty failing test names.
+
+- **Who dispatches.** The lanes' GitHub App has no `actions: write` (only the
+  station's does, as for `lane.yml`), so the lane files a request under
+  `$LOOM_HOME/state/remote-checks/` and the station dispatches the workflow
+  with its own App (`bus/remote_checks.py`). The station follows only the run
+  id the dispatch returned and believes a run only when it ran
+  `remote-check.yml` on `main` as a `workflow_dispatch` triggered by the
+  station's own App, and its conclusion agrees with the artifact. Any other
+  run is ignored, and the lane runs the check on the host.
+- **Base check.** When the base commit's GitHub checks already passed (those
+  repos do run CI on a push to their default branch; the test
+  `github_checks_green` gives a host-only red), the base check is not run and
+  takes no slot. Any other state runs it on the host as before. The `setup`
+  step still runs on the host, since the agent works in that tree.
+- **Final check.** A new run does the pre-push gates, pushes its work branch
+  (fast-forward only, never the default branch, after the leak scans), then
+  asks for the remote check and waits, bounded: `LOOM_REMOTE_CHECK_WAIT`
+  (default 1800 seconds) overall, `LOOM_REMOTE_CHECK_START_WAIT` (default 180)
+  for the station to pick the request up, polling every
+  `LOOM_REMOTE_CHECK_POLL` seconds (default 10). No host slot is taken. The
+  host base-test gate and the affected check are left out of that pass, since
+  both are host runs.
+- **Green** opens the pull request as before: a pull request still opens only
+  after the checks pass.
+- **Red** parks the run as work with the failing test names as `FAIL:` lines in
+  the log, so the repair round sees them. The edits are kept on the usual
+  `-unvalidated-` side branch and the work branch is removed (only while it
+  still points at the pushed commit), so a retry pushes fresh.
+- **No answer.** A dispatch error, a run that is not the station's, an
+  unreadable artifact, a station that is down or a timeout falls back to the
+  full local check, gate included, with a slot.
+- The check runs on `ubuntu-latest`; a repo whose check needs another
+  platform or a host tool should leave `LOOM_REMOTE_CHECKS` off or expect the
+  fallback.
+
 ### Validation gaps
 
 When a lane pull request goes back for a fix round on a red CI job, the
@@ -670,6 +725,28 @@ admit the lanes' login for lane pull requests to run.
 A new App is easiest made from
 `https://github.com/settings/apps/new?name=NAME&url=URL&public=false&webhook_active=false&contents=write&issues=write&pull_requests=write&checks=read&actions=write`.
 
+A lane can write as its own App instead of the lanes App. `LOOM_LANE_APPS` is
+one JSON object; each key is a comma-separated list of lanes (`codex`, every
+slot of that lane) or slots (`codex-2`), and a slot's own key wins over its
+lane's. Each value gives `app_id`, `key_ssm` (the SSM parameter of the App's
+private key), `git_name` and `git_email`, and optionally `installation_id`;
+without it the lane's token command uses the App's installation for the
+`LOOM_REPO_OWNERS` owner, or its only one, and fails when it cannot tell.
+`python3 -m bus app lane-identity SLOT` prints the five values for
+`run_lane.sh`, and nothing for a lane the map does not name. For a named lane
+`run_lane.sh` replaces `LOOM_GITHUB_APP_ID`, `_INSTALLATION_ID` and `_KEY_SSM`
+with the mapped values, drops any `LOOM_GITHUB_APP_KEY_FILE`, and sets the
+git author and committer name and email, so the push, the pull request and
+every comment the run posts are the mapped App's. The lane's container needs
+the mapped key readable through the same SSM read as any other key. A lane the
+map does not name keeps the lanes App exactly as before. The leak scan, the
+scope checks and every refusal are unchanged. A failed mint parks the run
+`[transient]` before anything is posted, and a map that cannot be read stops
+every lane before it takes a brief: a lane never writes as another App in
+place of the one it was given. Changes to a pull request that another App
+opened (a fix round) push with the lane's own App, which needs access to the
+repo; the pull request's author stays as it was.
+
 After claims on every pass, the station gives `loom:queued` tickets, in
 priority order (P0 first, then the oldest), free lanes in their Difficulty tier and moves them to `loom:briefed`.
 A free lane takes work: not at a limit, its heartbeat says available, and not
@@ -713,7 +790,8 @@ status event with its age.
 The factory skips future `Not before:` times and tickets without a readable Difficulty.
 The latter appear in their goal's next station standup. A pass that gives no
 queued ticket a lane logs `assigned 0 of N queued: <reason>`, the reason
-being the first ticket's in that order.
+being the first ticket's in that order, followed by `(by reason: N x ...)`
+counting the queued tickets' waits for the six most common reasons, since each ticket is judged on its own.
 
 Lane status: every pass the station reads each lane's heartbeat and evaluates
 whether it is serving, limited, parked, or off. Local heartbeats are usable
@@ -1221,6 +1299,12 @@ verify takes an eligible ticket shipped at least 24 hours ago before new build
 work; queued build work does not hold that priority drain. The median is read
 from the same wait rows as the Hot spots page, cached for 30 minutes, and a
 failed read leaves the usual claim order in place.
+After 14 days without proof, the station creates one open `loom:verify-handoff`
+ticket under the same goal, carrying the source ticket's acceptance criteria.
+The source link in that ticket keeps the brain from listing the source under
+Verify due. The station sends the new ticket through this same verify flow,
+reads merged pull requests from the source ticket, and applies any proof to the
+source; a missing read leaves the handoff ticket open for retry.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in
@@ -1612,6 +1696,39 @@ driver stops with a message instead of using files.
   host, so a standby station on another host sees that host's lanes as it does
   today: not at all, until the lane posts its status itself.
 - With the database down a pass stops with a state error and writes nothing.
+
+### Fleet event inbox
+
+With `LOOM_INBOX=1` the station is the consumer of one inbox in a fleet event
+table (`bus/event_inbox.py`): a webhook receiver or a scheduler appends rows
+to `inbox_event` and sends `NOTIFY fleet_inbox, '<inbox>'`. It is off by
+default. With it off nothing connects, and `python3 -m bus station-wait`
+sleeps exactly `LOOM_STATION_INTERVAL` seconds.
+
+- Events are hints and the pass stays the truth. A pass claims its due events
+  and moves the watched repos their subjects name to the front of
+  `scan_repos`, scanning an idle one now. It never reads an event's payload,
+  and a subject outside `LOOM_REPOS` is dropped.
+- The inbox lease (`inbox_lease`, row `LOOM_INBOX_NAME`, default
+  `loom-station`) is tied to the station lease. It needs `LOOM_STATION_LEASE=1`
+  and is taken only after the station lease is checked, under the same holder
+  and TTL. A pass that ran marks its events `done` with the pass id as
+  `run_ref`, after it checks the station lease again. Every write is fenced by
+  the inbox lease's epoch. The pass then gives the inbox lease up.
+- A pass that stops early marks nothing done, and the next pass claims those
+  events again. A pass that dies leaves the inbox lease to expire with its TTL.
+  An event claimed 5 times without finishing is `dead`.
+- Between passes, `python3 -m bus station-wait` LISTENs for up to
+  `LOOM_STATION_INTERVAL` seconds. A NOTIFY for this inbox ends the wait
+  `LOOM_INBOX_DEBOUNCE` seconds (default 15) after the first pending event, so
+  a burst becomes one pass. A wait that cannot reach the database sleeps out
+  the interval.
+- Settings: `LOOM_INBOX_DB_HOST`, `LOOM_INBOX_DB_NAME`, `LOOM_INBOX_DB_USER`,
+  `LOOM_INBOX_DB_PASSWORD` (a role of its own, not `LOOM_DB_*`) and
+  `LOOM_INBOX_INSTANCE`. A missing setting logs a line and leaves the inbox
+  off. An inbox failure never stops a pass.
+- The launchd schedule starts passes on its own interval, so only a station
+  whose loop calls `station-wait` between passes starts early.
 
 ### Moving file ledgers into the shared backend
 
@@ -2161,7 +2278,10 @@ the burn over the last 24 hours, and the balance projected at
 and named, not guessed. A new run republishes the comment on the next station
 pass. Under the floor (or with a budget setting that does not parse) each
 anthropic slot reports itself unavailable with that reason, and the station
-sends the anthropic slots nothing more.
+sends the anthropic slots nothing more. Ephemeral runners return their spend
+rows in the sealed report. The station appends them once per report to the
+same ledger and checks the shared balance before dispatching more Anthropic
+briefs.
 
 ## Skills on every lane
 
@@ -2642,6 +2762,17 @@ no service account token, and its code is read-only and owned by root. The image
 python3, uv, rsync, openssl, netcat, procps, bubblewrap and the opencode
 CLI, plus this repo and the leak scanner at a pinned commit.
 
+Two settings serve a codex slot that runs on a login shared outside the
+operator's own repos. `LOOM_PUBLIC_ONLY_SLOTS` (space- or comma-separated, empty
+by default) names slots that take public repos only, whatever their provider:
+the station never claims a private repo's ticket for one
+(`station.needs_public_repo`), and the runner parks a brief for a private repo
+(`trains_on_prompts` in `lanes/run_lane.sh`), so the rule holds even when only
+the lane's container carries the setting. `LOOM_CODEX_EFFORT` (none, minimal,
+low, medium, high, xhigh or max) sets a codex lane run's reasoning effort with
+`-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
+config's own setting applies. A brain run ignores it.
+
 A long-lived lane pod takes no work from the station. Lane runs on the
 cluster go through ephemeral runners instead (next section).
 
@@ -2655,10 +2786,21 @@ brief on an ephemeral self-hosted runner, with `LOOM_SANDBOX=bwrap` and
 `LOOM_DROP_TREES=1`. The runner pod and its disk go when the job ends, so no
 tree, cache or session database stays anywhere. Claude Code runs with its
 long-lived OAuth token copied from SSM into a mode-600 file under the job home
-and exported only to the Claude CLI process. Codex uses its broker session
-file. API lanes include opencode-go, zen, openrouter, zai, workersai, the free
-provider slots and spark (both through the gateway). agy and anthropic stay
-local.
+and exported only to the Claude CLI process. The Claude lane runs with
+`--permission-mode acceptEdits --allowedTools Bash` because a pod has no
+settings file allowing edits and print mode cannot answer a prompt. Codex
+uses its broker session file. API lanes include anthropic, opencode-go, zen,
+openrouter, zai, workersai, the free provider slots and spark (both through
+the gateway). The agy lane stays local.
+
+Enabling cluster runners also includes the tracked slots `anthropic-2`
+through `anthropic-8`. To move the base `anthropic` slot as well, include it
+in `LOOM_RUNNER_SLOTS`. Stop any local runner for a slot before taking its
+briefs on the cluster, and include the moved slots in `LOOM_RUNNER_SLOTS`
+when reinstalling to keep those local jobs disabled. The pods need the
+Claude CLI, access to the Anthropic API, and permission to read the shared
+`LOOM_ANTHROPIC_KEY_SSM` parameter. The API key uses the same staged SSM
+path as OpenCode Go.
 
 The runner image carries the lane runner's tools, not every tool a repo's
 check calls. A base check that fails there before the agent runs (exit 125
@@ -2719,7 +2861,8 @@ The job, step by step (`lanes/k8s/lane_job.py`):
 5. Seals a report of exactly what the station reads for the run: the
    brief's `done/` or `failed/` move, the run log with its failure class
    line, the validation record, the `.image` fingerprint, the `.answered`
-   and `.verify` files, the transcripts, answers and the slot's heartbeat. It is a tar.gz encrypted with a random key, the
+   and `.verify` files, the transcripts, answers, the slot's heartbeat, and
+   the Anthropic spend rows if present. It is a tar.gz encrypted with a random key, the
    key is RSA-OAEP encrypted to the station's own key
    (`state/runners/report-key.pem`, made on first use), because a public
    repository's artifacts can be downloaded by anyone signed in, and both

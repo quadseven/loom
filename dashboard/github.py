@@ -19,7 +19,8 @@ from bus import answer, brain, fixrounds, handoff, labels, status, tickets
 from bus.github import DEFAULT_API, AppToken, GitHub, GitHubError, _next_link
 from bus.metrics import waits_for_repos
 from .hot_spots import WINDOW as HOT_SPOT_WINDOW
-from . import bench_store, free_view, goals, needs_you, operators, station_state, tiers_sources, transcripts, views
+from . import (bench_store, floor_lanes, free_view, goals, needs_you, operators,
+               station_state, tickets_table, tiers_sources, transcripts, views)
 
 
 READ_WORKERS = 8
@@ -314,11 +315,13 @@ class TicketStore:
         self.operator_error = "LOOM_REPOS is not set" if not self.repos else ""
         self.auth = "app" if getattr(gh, "auth", "") == "app" else "token" if token else "none"
         self._snapshot_lock = threading.Lock()
+        self._version = 0
         self._stage, self._stage_since = "waiting", time.monotonic()
         self._pass_begun: Optional[float] = None
         self._refresh_lock = threading.Lock()
         self._stop = threading.Event()
         self._refresh_thread: Optional[threading.Thread] = None
+        self._sync_thread: Optional[threading.Thread] = None
         self._last_remaining: Optional[int] = None
         self._reset_at = 0
         self.waits = {}
@@ -404,6 +407,14 @@ class TicketStore:
 
         self._refresh_thread = threading.Thread(target=run, daemon=True)
         self._refresh_thread.start()
+        if self._sync_thread is None:
+            self._sync_thread = station_state.start_background_sync(self, self._stop)
+
+    def _publish_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        with self._snapshot_lock:
+            self._version += 1
+            snapshot["_version"] = self._version
+            self._snapshot = snapshot
 
     def _mark_refresh_failed(self, exc: Exception) -> None:
         """Keep the last snapshot but mark it stale, so every page says the
@@ -413,6 +424,8 @@ class TicketStore:
             snapshot["stale"] = True
             snapshot["stale_reason"] = "the dashboard refresh failed (%s)" % type(exc).__name__
             snapshot["next_refresh_at"] = int(time.time()) + _refresh_interval()
+            self._version += 1
+            snapshot["_version"] = self._version
             self._snapshot = snapshot
 
     def backlog_cached(self, source: str) -> Optional[bytes]:
@@ -442,6 +455,8 @@ class TicketStore:
         self._stop.set()
         if self._refresh_thread is not None:
             self._refresh_thread.join(timeout=2)
+        if self._sync_thread is not None:
+            self._sync_thread.join(timeout=2)
 
     def _below_floor(self) -> bool:
         """Whether the last reading was under the floor and GitHub has not yet
@@ -660,12 +675,12 @@ class TicketStore:
         data["lanes"] = lanes
         data["pull_requests"] = prs
         # One pass at refresh, not per page (server.footer_models).
-        data["footer_models"] = views.footer_models(prs)
-        data["footer_runs"] = views.footer_runs(prs)
+        data["footer_models"], data["footer_runs"], data["newest_lane_models"] = views.parse_pr_footers(prs)
         data["dashboard_errors"] = errors
         data["brain_step"], data["brain_step_error"] = self._read_brain_step(status_home)
         data["workhorse"] = self._read_workhorse(errors)
         self._read_hot_spot_comments(data)
+        data["fix_round_refs"] = floor_lanes.fix_round_refs(data.get("issue_comments") or [])
         self._read_goal_context(data, homes, reports, metric_comments)
         now = int(time.time())
         data["source_read_at"], data["sources_carried"] = {source: now for source in VIEW_SOURCES}, []
@@ -1283,8 +1298,7 @@ class TicketStore:
                 # that now: the stages below (pull requests, waits, claims)
                 # took 19 minutes on an empty cache, and a replica answered
                 # 503 for all of it while the pages already had their data.
-                with self._snapshot_lock:
-                    self._snapshot = dict(current, **snapshot)
+                self._publish_snapshot(dict(current, **snapshot))
             self._enter_stage("reading dashboard sources")
             if self._below_floor():
                 snapshot["repeated_failures"] = self._snapshot.get("repeated_failures", [])
@@ -1319,13 +1333,30 @@ class TicketStore:
                                   "needs_you_reason": ask_error,
                                   "waits_error": self.waits_error})
             snapshot["floor_context"] = floor_context
+            self._resolve_snapshot_tickets(snapshot)
             self._enter_stage("publishing")
-            with self._snapshot_lock:
-                self._snapshot = snapshot
+            self._publish_snapshot(snapshot)
             self._log_requests(now)
             self._prune_cache(now)
             if snapshot["ready"] and not current["ready"]:
                 LOG.info("first dashboard snapshot ready in %.1fs", time.monotonic() - started)
+
+    @staticmethod
+    def _resolve_snapshot_tickets(snapshot: Dict[str, Any]) -> None:
+        """Resolve per-ticket models once per refresh so page requests do not
+        re-scan all issue comments on every GET."""
+        rows = [row for found in (snapshot.get("tickets") or {}).values() if found for row in found]
+        models = snapshot.get("footer_models") or {}
+        for row in rows:
+            if not row.get("model"):
+                model = models.get("%s#%s" % (row.get("repo"), row.get("number")))
+                if model:
+                    row["model"] = model
+        tickets_table.resolve_models(rows, footer_runs=snapshot.get("footer_runs") or {},
+                                     latest=snapshot.get("latest_runs") or {},
+                                     comments=snapshot.get("issue_comments") or [])
+        snapshot["all_tickets"] = rows
+        snapshot["models_resolved"] = True
 
     def _prune_cache(self, now: float) -> None:
         """Remove kept GitHub answers no pass used for CACHE_KEEP: the
@@ -1386,6 +1417,11 @@ class TicketStore:
                 "pull_requests": snapshot.get("pull_requests", []),
                 "footer_models": snapshot.get("footer_models"),
                 "footer_runs": snapshot.get("footer_runs"),
+                "newest_lane_models": snapshot.get("newest_lane_models"),
+                "fix_round_refs": snapshot.get("fix_round_refs"),
+                "all_tickets": snapshot.get("all_tickets"),
+                "models_resolved": bool(snapshot.get("models_resolved")),
+                "_version": snapshot.get("_version"),
                 "latest_runs": snapshot.get("latest_runs", {}),
                 "state_entered": snapshot.get("state_entered", {}),
                 "wait_rows": snapshot.get("wait_rows", []),

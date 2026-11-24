@@ -140,16 +140,32 @@ class RunnersTest(unittest.TestCase):
     def test_no_slot_is_a_runner_slot_by_default(self):
         self.assertEqual(runners.runner_slots({}), [])
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "codex claude zen, free-kilo"}),
-                         ["claude", "zen", "free-kilo", "free-openrouter", "workersai",
-                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4"])
+                         ["claude", "zen", "free-kilo", "free-openrouter", "zai", "workersai",
+                          "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
+
+    def test_copilot_can_be_configured_as_a_runner_slot(self):
+        self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "copilot"}),
+                         ["copilot", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
 
     def test_a_station_with_runner_slots_also_runs_the_tracked_slots(self):
         # A plist changes only by reinstalling, which also replaces every
         # lane; a tracked slot deploys by merge, beside the Mac lane it will
         # replace (loom#2413).
         self.assertEqual(runners.runner_slots({"LOOM_RUNNER_SLOTS": "free-gemma"}),
-                         ["free-gemma", "free-openrouter", "workersai", "opencode-go-1",
-                          "opencode-go-2", "opencode-go-3", "opencode-go-4"])
+                         ["free-gemma", "free-openrouter", "zai", "zen", "workersai", "opencode-go-1",
+                          "opencode-go-2", "opencode-go-3", "opencode-go-4",
+                          "anthropic-2", "anthropic-3", "anthropic-4", "anthropic-5",
+                          "anthropic-6", "anthropic-7", "anthropic-8"])
+
+    def test_the_base_anthropic_slot_can_be_selected_explicitly(self):
+        slots = runners.runner_slots({"LOOM_RUNNER_SLOTS": "anthropic, free-gemma"})
+        self.assertEqual(slots[:2], ["anthropic", "free-gemma"])
+        self.assertEqual(slots[-7:], ["anthropic-%d" % n for n in range(2, 9)])
 
     def test_workersai_is_a_tracked_slot_with_its_account_parameter(self):
         settings = runners.lane_settings("workersai", {
@@ -159,6 +175,23 @@ class RunnersTest(unittest.TestCase):
         self.assertEqual(settings["LOOM_WORKERSAI_MODEL"],
                          "cloudflare-workers-ai/@cf/qwen/qwen3.8-27b")
         self.assertEqual(settings["LOOM_WORKERSAI_ACCOUNT_SSM"], "/workersai/account")
+
+    def test_zai_and_zen_are_tracked_and_zai_uses_the_gateway_without_a_key_setting(self):
+        self.assertIn("zai", runners.TRACKED_SLOTS)
+        self.assertIn("zen", runners.TRACKED_SLOTS)
+        settings = runners.lane_settings("zai", {
+            "LOOM_ZAI_KEY_SSM": "/zai/key",
+            "LOOM_ZAI_URL": "https://api.z.ai/free-public/zai/v1",
+        })
+        self.assertEqual(settings["LOOM_ZAI_URL"], "https://api.z.ai/free-public/zai/v1")
+        self.assertFalse([name for name in settings if name.endswith("_KEY_SSM")])
+
+    def test_zai_endpoint_moves_to_the_runner_gateway(self):
+        job = load_job()
+        self.assertEqual(job.rebase_gateway(
+            "zai", {"LOOM_ZAI_URL": "https://api.z.ai/free-public/zai/v1"},
+            "http://gateway.example.invalid:8080"),
+            {"LOOM_ZAI_URL": "http://gateway.example.invalid:8080/free-public/zai/v1"})
 
     def test_a_tracked_slot_is_sent_its_own_model_and_no_key_setting(self):
         settings = runners.lane_settings("free-openrouter", {"LOOM_OPENROUTER_KEY_SSM": "/x/or",
@@ -332,7 +365,7 @@ class RunnersTest(unittest.TestCase):
         self.mac_key = inputs["report_mac_key"]
         return self.gh.next_run, inputs["run_id"]
 
-    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET):
+    def seal(self, run_id, files, beat=None, mac_key=None, ticket=TICKET, slot="opencode-go-2"):
         """A report artifact as the lane job seals it: `files` written under a
         job's loom home, then lane_job.py report."""
         job = load_job()
@@ -344,8 +377,8 @@ class RunnersTest(unittest.TestCase):
             (home / rel).write_text(text)
         if beat is not None:
             (home / "state" / "usage").mkdir(parents=True, exist_ok=True)
-            (home / "state" / "usage" / "opencode-go-2.json").write_text(json.dumps(beat))
-        (jobdir / "inputs.json").write_text(json.dumps({"slot": "opencode-go-2", "ticket": ticket,
+            (home / "state" / "usage" / (slot + ".json")).write_text(json.dumps(beat))
+        (jobdir / "inputs.json").write_text(json.dumps({"slot": slot, "ticket": ticket,
                                                         "run_id": run_id}))
         key = self.home / "state" / "runners" / "report-key.pem.pub"
         shutil.copy(key, jobdir / "report-key.pem")
@@ -364,6 +397,49 @@ class RunnersTest(unittest.TestCase):
         if artifact is not None:
             self.gh.artifacts[run] = [{"id": 77, "name": "lane-report-%s" % run_id, "expired": False}]
             self.gh.zips[77] = artifact
+
+    def test_anthropic_report_records_cost_once_and_holds_the_next_brief_under_the_floor(self):
+        self.check_anthropic_report("anthropic-2")
+
+    def test_base_anthropic_slot_report_records_cost_once_and_holds_the_next_brief(self):
+        self.check_anthropic_report("anthropic")
+
+    def check_anthropic_report(self, slot):
+        self.env.update(LOOM_ANTHROPIC_KEY_SSM="/example/anthropic",
+                        LOOM_ANTHROPIC_BUDGET_USD="5.25")
+        self.inbox = self.home / "briefs" / slot
+        self.inbox.mkdir(exist_ok=True)
+        runner = self.runner()
+        runner.slots = [slot]
+        self.drop_brief(BRIEF.replace("opencode-go", slot))
+        runner.tend()
+        inputs = self.gh.posts("/dispatches")[0][2]["inputs"]
+        self.assertIn("LOOM_ANTHROPIC_KEY_SSM=/example/anthropic\n", inputs["settings"])
+        run_id = inputs["run_id"]
+        self.mac_key = inputs["report_mac_key"]
+        path = "state/usage/spend.jsonl"
+        ledger = self.home / path
+        ledger.write_text(json.dumps({"slot": "anthropic", "at": self.now, "cost_usd": 0.1}) + "\n")
+        row = {"at": self.now, "slot": slot, "ticket": TICKET,
+               "model": "claude-sonnet-5-5", "cost_usd": 0.2}
+        artifact = self.seal(run_id, {
+            "briefs/%s/done/%s.md" % (slot, TICKET): BRIEF,
+            path: json.dumps(row) + "\n",
+        }, slot=slot)
+        self.finish(self.gh.next_run, run_id, artifact)
+        self.drop_brief(name="owner.app-8")
+        dispatched = runner.load()
+        runner.tend()
+        runner.save(dispatched)
+        runner.tend()
+        rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+        self.assertEqual([(r["slot"], r["cost_usd"]) for r in rows],
+                         [("anthropic", 0.1), (slot, 0.2)])
+        self.assertEqual(len(self.gh.posts("/dispatches")), 1)
+        self.assertTrue((self.inbox / "owner.app-8.md").exists())
+        beat = json.loads((ledger.parent / (slot + ".json")).read_text())
+        self.assertFalse(beat["available"])
+        self.assertIn("under the floor", beat["reason"])
 
     def test_a_finished_run_writes_its_report_where_a_local_runner_writes(self):
         run, run_id = self.dispatched()

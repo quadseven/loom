@@ -3650,6 +3650,28 @@ class Queued(Base):
                 self.assign(available=["codex"])
                 self.assertEqual(self.lane(7), "codex")
 
+    def test_a_pass_that_assigns_none_counts_the_waits_by_reason(self):
+        # The line names the first wait only; each ticket is judged on its own,
+        # so the counts show the rest are not that one ticket's wait.
+        self.queued(7, age=600)
+        self.queued(8, age=60)
+        self.queued(9, age=30)
+        with mock.patch("bus.factory._say") as say:
+            self.assign(available=[])
+        say.assert_called_once_with(
+            "assigned 0 of 3 queued: %s#7 waits: no free lane in tier medium"
+            " (by reason: 3 x no free lane in tier medium)" % REPO)
+
+    def test_wait_summary_groups_reasons_across_tickets(self):
+        waits = ["a/b#1 waits for a/b#9 to merge (After:)", "a/b#2 waits for a/b#8 to merge (After:)",
+                 "c/d#3 waits: its repo is at its open pull request cap",
+                 "c/d#4 waits: its repo is at its open pull request cap",
+                 "c/d#5 waits: its repo is at its open pull request cap"]
+        self.assertEqual(factory.wait_summary(waits),
+                         " (by reason: 3 x its repo is at its open pull request cap;"
+                         " 2 x for another ticket to merge (After:))")
+        self.assertEqual(factory.wait_summary(waits[:1]), "")
+
     def test_a_pass_that_assigns_a_queued_ticket_says_no_count(self):
         self.queued(7, age=600)
         self.queued(8, age=60)

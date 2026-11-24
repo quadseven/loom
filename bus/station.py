@@ -57,7 +57,7 @@ from . import fixrounds
 from . import logrotate
 from . import flake
 from . import rebuttal
-from . import lane_state, runners
+from . import lane_state, remote_checks, runners
 from . import station_beat
 from . import scope_fit
 from . import shadow
@@ -93,6 +93,7 @@ from . import revert
 from . import spend
 from . import state_store
 from . import station_lease
+from . import event_inbox
 from . import status
 from . import usage
 from . import verify_data
@@ -775,6 +776,13 @@ VERIFY_MISSING_MARKER = "<!-- loom:verify-missing v1 -->"
 VERIFY_RESERVE_AFTER = 2 * 3600
 VERIFY_RESERVE_EVERY = 1800
 VERIFY_RESERVE_FILE = "verify-reserve.json"
+# A shipped ticket whose live criterion has waited more than this many days
+# without a proof gets a verify handoff ticket (loom#3509): the lane-machine
+# tick cannot reach most live systems, so the backlog grows and every tick
+# reports verify as degraded. The handoff ticket reads the live system and
+# posts the proof or the observed failure.
+VERIFY_HANDOFF_DAYS = 14
+VERIFY_HANDOFF_LABEL = tickets.VERIFY_HANDOFF_LABEL
 VERIFY_PRIORITY_MEDIAN_H = 24.0
 VERIFY_PRIORITY_AFTER = 24 * 3600
 VERIFY_PRIORITY_EVERY = metrics.SHIPPED_STAMP_MAX_AGE
@@ -911,14 +919,20 @@ def verify_due(issues: Sequence[Tuple[str, Dict[str, Any]]],
                refused: Optional[Dict[str, Any]] = None,
                adapter_tickets: Sequence[str] = (),
                missing: Optional[Dict[str, Any]] = None,
-               check_live: bool = True
+               check_live: bool = True,
+               handoff_tickets: Sequence[str] = ()
                ) -> List[Tuple[str, Dict[str, Any]]]:
     """Shipped tickets without a proof, oldest ship event first, outside
     cooldown. A ticket whose proof was refused VERIFY_REFUSAL_CAP times
-    (`refused`: ticket -> reasons) is left to the brain."""
+    (`refused`: ticket -> reasons) is left to the brain. Tickets with a
+    verify handoff ticket are skipped."""
     due = []
     for repo, issue in issues:
         key = "%s#%s" % (repo, issue.get("number"))
+        # The linked source key keeps the original ticket out of the pool;
+        # the handoff ticket itself remains eligible for this lane run.
+        if key in handoff_tickets:
+            continue
         if not _verify_candidate(issue, key in adapter_tickets or not check_live):
             continue
         last = attempts.get(key)
@@ -1903,9 +1917,13 @@ REFUSED_BODY = (400, 413, 422)
 class UploadRefused(OSError):
     """The dashboard read the body and refused it (REFUSED_BODY)."""
 
-    def __init__(self, status: int) -> None:
-        super().__init__("the transcript upload answered %d" % status)
+    def __init__(self, status: int, error_text: str = "") -> None:
+        msg = "the transcript upload answered %d" % status
+        if error_text:
+            msg += ": %s" % error_text
+        super().__init__(msg)
         self.status = status
+        self.error_text = error_text
 
 
 def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
@@ -1920,13 +1938,28 @@ def post_transcript(url: str, token: str, body: Dict[str, Any]) -> None:
     try:
         with _OPENER.open(req, timeout=POST_TIMEOUT) as resp:  # noqa: S310
             status = resp.status
+            if status in REFUSED_BODY:
+                raw = resp.read().decode("utf-8", "replace")
+                try:
+                    error_data = json.loads(raw)
+                    error_text = str(error_data.get("error", ""))
+                except ValueError:
+                    error_text = raw[:200]
+                raise UploadRefused(status, error_text)
     except urllib.error.HTTPError as err:
         status = err.code
+        if status in REFUSED_BODY:
+            raw = err.read().decode("utf-8", "replace")
+            try:
+                error_data = json.loads(raw)
+                error_text = str(error_data.get("error", ""))
+            except ValueError:
+                error_text = raw[:200]
+            err.close()
+            raise UploadRefused(status, error_text)
         err.close()
     except (urllib.error.URLError, OSError):
         raise OSError("the transcript upload failed to connect") from None
-    if status in REFUSED_BODY:
-        raise UploadRefused(status)
     if not 200 <= status < 300:
         raise OSError("the transcript upload answered %d" % status)
 
@@ -2160,13 +2193,21 @@ def remote_beat_fresh(lane: str, at: Optional[float], now: float) -> bool:
     return at is not None and beat_fresh(at, now, window)
 
 
+def public_only_slots(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """The slots LOOM_PUBLIC_ONLY_SLOTS (space or comma separated) names: a
+    slot that runs on a login shared outside the operator's own repos takes
+    public repos only, whatever its provider. Empty by default."""
+    env = os.environ if env is None else env
+    return [n for n in re.split(r"[\s,]+", str(env.get("LOOM_PUBLIC_ONLY_SLOTS") or "").strip()) if n]
+
+
 def needs_public_repo(lane: str, model: str) -> bool:
     """Free lanes, and lanes whose provider trains on prompts, take public
     repos only. A slot named in factory.PUBLIC_ONLY counts before it is mapped
     to its provider: free-nvidia, free-kilo and free-groq are free provider
     slots that may train (infra#5617), while free-ollama and free-gemma may
     take private repos."""
-    if lane in factory.PUBLIC_ONLY:
+    if lane in factory.PUBLIC_ONLY or lane in public_only_slots():
         return True
     # A cluster runner's inputs and logs live in this public repo's Actions
     # (bus/runners.py).
@@ -2442,6 +2483,9 @@ class Station:
         # This pass's repo scans: the repos due, what was read of each, and
         # which held a ticket in flight.
         self._due: Optional[List[str]] = None
+        # Repos the fleet inbox named this pass (LOOM_INBOX=1): scanned
+        # first, and now even when idle. Empty with the inbox off.
+        self.priority_repos: List[str] = []
         self._scans: Dict[str, Any] = {}
         self._seen: Dict[str, set] = {}
         # Compare answers kept across passes (_carries), read on first use.
@@ -2670,8 +2714,11 @@ class Station:
             saved = _read_json(os.path.join(self.state, "scans.json"), {}, strict=False)
             self._scans = saved if isinstance(saved, dict) else {}
             local = self._inbox_repos()
-            self._due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
-                         and (r in local or self._scan_due(self._scans.get(r)))]
+            due = [r for r in self.s.repos if tickets.REPO_RE.fullmatch(r)
+                   and (r in local or self._scan_due(self._scans.get(r)))]
+            first = [r for r in self.priority_repos
+                     if r in self.s.repos and tickets.REPO_RE.fullmatch(r)]
+            self._due = first + [r for r in due if r not in first]
         return self._due
 
     def _observe(self, repo: str, kind: str, busy: bool) -> None:
@@ -4052,6 +4099,18 @@ class Station:
     def _verify_repos(self) -> List[str]:
         return [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)]
 
+    def _verify_pool_issues(self, repo: str, issues: Iterable[Dict[str, Any]]
+                            ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        """Settle stale handoffs and carry the source's ship date on open ones."""
+        for issue in issues:
+            source = self._verify_source_issue(repo, issue)
+            if source is not issue:
+                if not _verify_active(source):
+                    self._settle_verify_handoff(repo, int(issue["number"]), source)
+                    continue
+                issue["shipped_at"] = self._shipped_stamp(repo, source)
+            yield repo, issue
+
     def _verify_pool(self, attempts: Dict[str, Any], queued_holds: bool = True
                      ) -> Tuple[List[Tuple[str, Dict[str, Any]]], set]:
         """(the tickets due a verify run, oldest ship first; the lanes queued
@@ -4065,31 +4124,37 @@ class Station:
             issues = self._tickets_open(repo)
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
-            shipped += [(repo, i) for i in issues]
+            shipped.extend(self._verify_pool_issues(repo, issues))
         shipped = [(repo, issue) for repo, issue in shipped
-                   if self._verify_criteria(repo, issue)]
+                    if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
-                           if self._adapter_can_verify(repo, issue)}
+                            if self._adapter_can_verify(repo, issue)}
         self._note_unsearchable(shipped, adapter_tickets)
         refused = self._verify_refused_ledger()
         missing = self._verify_missing_ledger()
+        handoff_tickets = set()
+        for repo, issue in shipped:
+            source_number = tickets.verify_handoff_source(issue)
+            if source_number is not None:
+                handoff_tickets.add("%s#%d" % (repo, source_number))
         # The cheap filters first: the events and comments of a ticket are
         # read only when its cooldown is over.
         found = []
         reads: Dict[str, Any] = {"searches": UNMEETABLE_SEARCHES, "big": {}}
         for repo, issue in verify_due(shipped, attempts, self.now, refused, adapter_tickets,
-                                      missing, check_live=False):
-            issue["has_proof"] = self._verify_proof_state(repo, int(issue["number"]))
+                                      missing, check_live=False, handoff_tickets=handoff_tickets):
+            source = self._verify_source_issue(repo, issue)
+            issue["has_proof"] = self._verify_proof_state(repo, int(source["number"]))
             if issue["has_proof"] is not False or not self._verify_has_merge(repo, issue):
                 continue
             if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
-                    and self._unmeetable_live(repo, issue, reads)):
+                    and self._unmeetable_live(repo, source, reads)):
                 continue
-            issue["shipped_at"] = self._shipped_stamp(repo, issue)
+            issue["shipped_at"] = self._shipped_stamp(repo, source)
             issue["health_proof"] = health.proof_of(self._paginate(
-                "/repos/%s/issues/%d/comments" % (repo, int(issue["number"]))), self.s.authors)
+                "/repos/%s/issues/%d/comments" % (repo, int(source["number"]))), self.s.authors)
             found.append((repo, issue))
-        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing), held
+        return verify_due(found, attempts, self.now, refused, adapter_tickets, missing, handoff_tickets=handoff_tickets), held
 
     @staticmethod
     def _note_unsearchable(shipped: Sequence[Tuple[str, Dict[str, Any]]],
@@ -4148,7 +4213,8 @@ class Station:
 
     def _verify_has_merge(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Unknown or truncated GitHub reads never prove that no PR merged."""
-        _, pulls, error = self._merged_pull_facts(repo, issue, files=False)
+        source = self._verify_source_issue(repo, issue)
+        _, pulls, error = self._merged_pull_facts(repo, source, files=False)
         if error:
             return False
         if pulls:
@@ -4856,11 +4922,17 @@ class Station:
         station reads the ticket's merged pull requests, linked the way
         reconcile links them, with their checks, files and added tests. A
         GitHub failure is one line in the section, never a lost brief."""
-        branch, pulls, error = self._merged_pull_facts(repo, issue)
+        source = self._verify_source_issue(repo, issue)
+        branch, pulls, error = self._merged_pull_facts(repo, source)
         if error:
             _say("could not read GitHub data for the verify brief of %s#%s: %s"
-                 % (repo, issue.get("number"), error))
-        return verify_data.section(branch, str(issue.get("body") or ""), pulls, error)
+                 % (repo, source.get("number"), error))
+        return verify_data.section(branch, str(source.get("body") or ""), pulls, error)
+
+    def _verify_source_issue(self, repo: str, issue: Dict[str, Any]) -> Dict[str, Any]:
+        """The original shipped issue for a handoff ticket, else the issue itself."""
+        source_number = tickets.verify_handoff_source(issue)
+        return (self._issue(repo, source_number) if source_number is not None else issue)
 
     def _pulls_for_facts(self, repo: str, issue: Dict[str, Any],
                          from_ticket: bool) -> List[Dict[str, Any]]:
@@ -5104,29 +5176,65 @@ class Station:
             return self._report_verify_failed(lane, repo, number, name)
         self._verify_clear(lane)
         result, why = self._read_verify(lane, name)
-        issue = self._issue(repo, number)
-        if not _verify_active(issue) or self._missing_handoff(repo, number, result, issue, lane + "/" + name):
+        handoff = self._issue(repo, number)
+        issue = self._verify_source_issue(repo, handoff)
+        source_number = int(issue["number"])
+        if (not _verify_active(issue)
+                or self._missing_handoff(repo, source_number, result, issue, lane + "/" + name)):
+            self._settle_verify_handoff(repo, number, issue)
             return True
         if self._adapter_can_verify(repo, issue) and not (
                 isinstance(result, dict) and set(result) == {"adapter_step"}):
             reason = result.get("missing") if isinstance(result, dict) else why
-            self._adapter_verify_gap(repo, number, "no adapter_step was returned",
+            self._adapter_verify_gap(repo, source_number, "no adapter_step was returned",
                                     reason or "the verify answer did not contain a step")
+            self._settle_verify_handoff(repo, number, issue)
             return True
         if result is not None and set(result) == {"adapter_step"}:
-            self._apply_adapter_verify(repo, number, result["adapter_step"])
+            self._apply_adapter_verify(repo, source_number, result["adapter_step"])
+            self._settle_verify_handoff(repo, number, issue)
             return True
         if result is None:
-            self._verify_note(repo, number, lane, why)
+            self._verify_note(repo, source_number, lane, why)
         elif set(result) == {"missing"}:
-            self._verify_note(repo, number, lane, "Missing evidence: %s" % self._note_text(
+            self._verify_note(repo, source_number, lane, "Missing evidence: %s" % self._note_text(
                 result["missing"]))
-            self._await_evidence(repo, number, result["missing"])
+            self._await_evidence(repo, source_number, result["missing"])
         elif set(result) == {"unmet"}:
-            self._refute_merged(lane, repo, number, result["unmet"])
+            self._refute_merged(lane, repo, source_number, result["unmet"])
         else:
-            self._apply_proof(lane, repo, number, result, self._verify_model(lane, name))
+            self._apply_proof(lane, repo, source_number, result, self._verify_model(lane, name))
+        self._settle_verify_handoff(repo, number, issue)
         return True
+
+    def _settle_verify_handoff(self, repo: str, handoff_number: int,
+                               source: Dict[str, Any]) -> None:
+        """Close the lane ticket once its source no longer needs verification."""
+        if _verify_active(source):
+            return
+        try:
+            handoff = self._issue(repo, handoff_number)
+            if (tickets.verify_handoff_source(handoff) is None
+                    or handoff.get("state") != "open"):
+                return
+            source_verified = "loom:verified" in _label_names(source)
+            reason = ("The source ticket is verified, so this lane handoff is complete."
+                      if source_verified else
+                      "The source ticket no longer needs verification, so this lane handoff is closed.")
+            closing.close(self.gh, repo, handoff_number, reason,
+                          "completed" if source_verified else "not_planned")
+            labels = [name for name in _label_names(handoff)
+                      if name not in ticket_move.STATE_LABELS]
+            if source_verified:
+                labels.append("loom:verified")
+            self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, handoff_number),
+                         {"labels": labels})
+            _say("closed verify handoff %s#%d after source #%s left verification"
+                 % (repo, handoff_number, source.get("number")))
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("could not close verify handoff %s#%d: %s" % (repo, handoff_number, err))
 
     def _report_verify_failed(self, lane: str, repo: str, number: int, name: str) -> bool:
         klass = failure_class(self._failure_reason(lane, name))
@@ -5359,6 +5467,84 @@ class Station:
     def _verify_missing_ledger(self) -> Dict[str, Any]:
         data = _read_json(os.path.join(self.state, VERIFY_MISSING_FILE), {}, strict=False)
         return data if isinstance(data, dict) else {}
+
+    def _find_verify_handoff_candidates(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Find stale shipped tickets and record current handoff coverage."""
+        candidates = []
+        handoff_cutoff = self.now - (VERIFY_HANDOFF_DAYS * 24 * 3600)
+        due_tickets = set()
+        handoff_tickets = set()
+        for repo in self._verify_repos():
+            if not tickets.REPO_RE.fullmatch(repo):
+                continue
+            issues = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+            handoff_tickets.update(
+                "%s#%d" % (repo, source_number)
+                for issue in issues if isinstance(issue, dict)
+                and "pull_request" not in issue
+                for source_number in [tickets.verify_handoff_source(issue)]
+                if source_number is not None
+            )
+            for issue in issues:
+                if not isinstance(issue, dict) or "pull_request" in issue:
+                    continue
+                candidate = self._verify_handoff_candidate(
+                    repo, issue, handoff_cutoff, handoff_tickets, due_tickets)
+                if candidate is not None:
+                    candidates.append(candidate)
+        self._verify_handoff_tickets = handoff_tickets
+        self._verify_due_tickets = due_tickets
+        return candidates
+
+    @staticmethod
+    def _verify_handoff_open(issue: Dict[str, Any]) -> bool:
+        """An open shipped ticket, unproven, unclaimed, and not itself a handoff."""
+        names = set(_label_names(issue))
+        if (issue.get("state") != "open" or "loom:ticket" not in names
+                or "loom:shipped" not in names or "loom:verified" in names
+                or brain.WAIT_LIVE_EVENT in names
+                or tickets.verify_handoff_source(issue) is not None):
+            return False
+        return not (issue.get("assignees")
+                    or any(name.lower().startswith("claim:") for name in names))
+
+    def _verify_handoff_provable(self, issue: Dict[str, Any], body: str) -> bool:
+        """The ticket names provable criteria and a trusted, unowned brief."""
+        return not (criteria_gate.open_operator_criteria(body) or not proof.criteria(body)
+                    or _ticket_goal(issue) is None
+                    or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                    or tickets.owned_elsewhere(issue, self.s.authors,
+                                               self.s.briefers) is not None)
+
+    def _verify_handoff_candidate(self, repo: str, issue: Dict[str, Any], cutoff: float,
+                                  handoff_tickets: set,
+                                  due_tickets: set) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Track an active verify item and return an eligible stale Live item."""
+        if not self._verify_handoff_open(issue):
+            return None
+        body = str(issue.get("body") or "")
+        key = "%s#%d" % (repo, int(issue["number"]))
+        due_tickets.add(key)
+        if key in handoff_tickets:
+            return None
+        live = any(kind == criteria_gate.LIVE
+                   for kind, _ in criteria_gate.needing_evidence(body))
+        if not live:
+            return None
+        shipped_at = self._shipped_stamp(repo, issue)
+        if shipped_at >= cutoff or self._proven(repo, int(issue["number"])):
+            return None
+        if not self._verify_handoff_provable(issue, body):
+            return None
+        issue["_verify_handoff_shipped_at"] = shipped_at
+        return repo, issue
+
+    def _verify_handoff_coverage(self, tickets_with_handoffs: set,
+                                 verify_due_tickets: Optional[set]) -> Optional[bool]:
+        """Whether every current verify-due item has an open lane verify ticket."""
+        if verify_due_tickets is None:
+            return None
+        return verify_due_tickets.issubset(tickets_with_handoffs)
 
     def _missing_handoff(self, repo: str, number: int, result: Any,
                          issue: Dict[str, Any], run: str) -> bool:
@@ -6000,6 +6186,7 @@ class Station:
 
     def _read_repo_pr_count(self, repo: str) -> int:
         trusted = {a.lower().removesuffix("[bot]") for a in (*self.s.authors, *self.s.briefers)}
+        authors = {a.lower().removesuffix("[bot]") for a in self.s.authors}
         counted = set()
         for page in range(1, 26):
             data = self.gh.rest("GET", "/repos/%s/pulls?state=open&per_page=100&page=%d"
@@ -6007,7 +6194,7 @@ class Station:
             if not isinstance(data, list):
                 raise ValueError("open pull requests could not be read")
             for pr in data:
-                number = self._counted_pr_number(pr, trusted)
+                number = self._counted_pr_number(pr, trusted, authors)
                 if number is not None:
                     counted.add(number)
             if len(data) < 100:
@@ -6015,7 +6202,8 @@ class Station:
         raise ValueError("open pull request history exceeds the read budget")
 
     @staticmethod
-    def _counted_pr_number(pr: Any, trusted: set) -> Optional[int]:
+    def _counted_pr_number(pr: Any, trusted: set,
+                           authors: Optional[set] = None) -> Optional[int]:
         if isinstance(pr, dict) and pr.get("state") == "closed":
             return None
         if not isinstance(pr, dict) or not isinstance(pr.get("user"), dict):
@@ -6031,7 +6219,10 @@ class Station:
         if (not isinstance(head, dict) or not isinstance(head.get("ref"), str)
                 or not head["ref"]):
             raise ValueError("open pull request head could not be read")
-        is_agent = (user.get("type") == "Bot" or str(head.get("ref") or "").startswith("loom/")
+        # A Bot trusted only as a briefer (an operator's coding session) is
+        # not a Loom pull request unless its head or body says so (loom#3445).
+        bot = user.get("type") == "Bot" and (authors is None or login in authors)
+        is_agent = (bot or str(head.get("ref") or "").startswith("loom/")
                     or re.search(r"^Loom ticket .+, lane [A-Za-z0-9_.-]+, model \S+\.(?:\s|$)",
                                  str(pr.get("body") or ""), re.M))
         if not is_agent:
@@ -6410,6 +6601,22 @@ class Station:
         target = self._terminal_label(pr)
         if target is None or target in labels:
             return
+        if "loom:failed" in labels and target != "loom:merged":
+            return
+        if target == "loom:merged" and "loom:failed" in labels:
+            states = {"loom:" + state for state in brain.STATES + tickets.TICKET_STATES}
+            kept = self._drop_claim(name for name in labels
+                                    if name not in states and not name.startswith(("lane:", WAIT)))
+            kept.append("loom:merged")
+            self.gh.rest("PUT", "/repos/%s/issues/%s/labels" % (repo, ticket["number"]),
+                         {"labels": kept})
+            ticket["labels"] = [{"name": name} for name in kept]
+            self._routine(repo, int(number),
+                          "Pull request #%d merged, so this failed ticket moved to loom:merged."
+                          % int(pr["number"]))
+            _say("%s#%d: merged pull request #%d moved failed ticket to loom:merged"
+                 % (repo, number, int(pr["number"])))
+            return
         if target == "loom:merged" and pr.get("number") in tickets.rejected_pulls(
                 self._status_texts(repo, int(number))):
             return
@@ -6519,6 +6726,11 @@ class Station:
         tickets_by_number = {int(i["number"]): i for i in self._pr_tickets(repo)
                              if "loom:ticket" in _label_names(i)}
         open_tickets = self._paginate("/repos/%s/issues?labels=loom:ticket&state=open" % repo)
+        for issue in open_tickets:
+            if (isinstance(issue, dict) and "pull_request" not in issue
+                    and "loom:ticket" in _label_names(issue)
+                    and "loom:failed" in _label_names(issue)):
+                tickets_by_number.setdefault(int(issue["number"]), issue)
         self._open_work[repo] = {
             int(i["number"]) for i in open_tickets
             if isinstance(i, dict) and "pull_request" not in i and "number" in i
@@ -14673,6 +14885,7 @@ class Station:
             raise
         self._read_facts = facts
         self._unstick_lane_pulls(facts)
+        self._create_verify_handoffs(facts)
         breaches = invariants.check(facts, _say)
         if breaches and goal is None:
             _say("invariants: %d broken, but no goal home to file them on; set "
@@ -14712,6 +14925,84 @@ class Station:
             if queued:
                 facts.lane_pulls[index] = pull._replace(fix_pending=True)
                 _say("invariants: queued a fix round for stalled pull request %s" % pull.pr.label)
+
+    def _create_verify_handoffs(self, facts: invariants.Facts) -> None:
+        """Create verify handoff tickets for shipped tickets with live criteria
+        older than VERIFY_HANDOFF_DAYS. The handoff ticket is a read-and-report
+        verify ticket assigned to a lane."""
+        if not self.s.repos:
+            return
+        # Use already-fetched handoff tickets and candidates from facts
+        existing_handoffs = facts.verify_handoff_tickets or set()
+        candidates = facts.verify_handoff_candidates or []
+        for repo, issue in candidates:
+            number = int(issue["number"])
+            key = "%s#%d" % (repo, number)
+            if key in existing_handoffs:
+                continue
+            # Create the handoff ticket
+            shipped_at = issue.get("_verify_handoff_shipped_at")
+            if shipped_at is None:
+                shipped_at = self._shipped_stamp(repo, issue)
+            if self._create_verify_handoff_ticket(repo, issue, shipped_at):
+                existing_handoffs.add(key)
+        facts.verify_handoff_tickets = existing_handoffs
+        facts.verify_handoff_coverage = self._verify_handoff_coverage(
+            existing_handoffs, facts.verify_due_tickets)
+
+    def _create_verify_handoff_ticket(self, repo: str, issue: Dict[str, Any],
+                                      shipped_at: float) -> bool:
+        """Create a shipped verify ticket the station can assign to a lane."""
+        number = int(issue["number"])
+        parent = _ticket_goal(issue)
+        criteria = proof.criteria(str(issue.get("body") or ""))
+        if parent is None or not criteria:
+            _say("could not create verify handoff for %s#%d: no goal parent or acceptance criteria"
+                 % (repo, number))
+            return False
+        title = "Verify shipped ticket #%d" % number
+        body = ("Verify handoff for #%d\n\n"
+                "Part of #%d\n\n"
+                "## Why\n"
+                "The shipped ticket's live check has waited more than %d days without proof.\n\n"
+                "## What\n"
+                "Read the source ticket's criteria with the station-provided evidence. "
+                "Report observed evidence or the observed failure.\n\n"
+                "## Acceptance criteria\n%s\n\n"
+                "## Size\nS\n" % (
+                    number, parent, VERIFY_HANDOFF_DAYS,
+                    "\n".join("- [ ] %s" % text for _, text in criteria)))
+        try:
+            _text.check(title + "\n" + body)
+            if not body.isascii():
+                raise ValueError("ticket text is not ASCII")
+            if (_text.SECRET_RE.search(title + "\n" + body)
+                    or evidence.IP_RE.search(body)
+                    or re.search(r"\b[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+\b", body)):
+                raise ValueError("ticket text contains a value that cannot be copied safely")
+        except ValueError as err:
+            _say("could not create verify handoff for %s#%d: %s" % (repo, number, err))
+            return False
+        labels = ["loom:ticket", "loom:shipped", VERIFY_HANDOFF_LABEL]
+        try:
+            result = self.gh.rest("POST", "/repos/%s/issues" % repo, {
+                "title": title,
+                "body": body,
+                "labels": labels
+            })
+            if result.status != 201 or not isinstance(result.data, dict) or not result.data.get("number"):
+                _say("could not create verify handoff for %s#%d: GitHub returned no issue number"
+                     % (repo, number))
+                return False
+            _say("created verify handoff ticket %s#%s for %s#%d (shipped %s)"
+                 % (repo, result.data["number"], repo, number,
+                    time.strftime("%Y-%m-%d", time.gmtime(shipped_at))))
+            return True
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not create verify handoff ticket for %s#%d: %s" % (repo, number, err))
+        return False
 
     @staticmethod
     def _invariant_ref_parts(ref: str) -> Optional[Tuple[str, int]]:
@@ -14999,6 +15290,11 @@ class Station:
                      default=None)
         if newest is not None:
             facts.brain_seen = state["brain_seen"] = newest
+        self._invariant_ticket_facts(facts)
+        self._invariant_scheduled_facts(facts, state)
+        return facts
+
+    def _invariant_ticket_facts(self, facts: invariants.Facts) -> None:
         if any(self.now - since > invariants.HELD_MAX and lane not in facts.no_topup
                for lane, since in facts.held.items()):
             try:
@@ -15020,6 +15316,22 @@ class Station:
             raise
         except (GitHubError, OSError) as err:
             _say("invariants: could not read the lane pull requests: %s" % err)
+        try:
+            facts.verify_handoff_candidates = self._find_verify_handoff_candidates()
+            facts.verify_handoff_tickets = getattr(self, "_verify_handoff_tickets", None)
+            facts.verify_due_tickets = getattr(self, "_verify_due_tickets", None)
+            facts.verify_handoff_coverage = self._verify_handoff_coverage(
+                facts.verify_handoff_tickets, facts.verify_due_tickets)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError) as err:
+            _say("invariants: could not read verify handoff tickets: %s" % err)
+            facts.verify_handoff_tickets = None
+            facts.verify_handoff_candidates = None
+            facts.verify_due_tickets = None
+            facts.verify_handoff_coverage = None
+
+    def _invariant_scheduled_facts(self, facts: invariants.Facts, state: Dict[str, Any]) -> None:
         if not isinstance(state.get("scheduled_workflows"), dict):
             state["scheduled_workflows"] = {}
         read_start = self._pass_counted()
@@ -15029,7 +15341,6 @@ class Station:
             lambda: (self._pass_counted() - read_start >= invariants.SCHEDULED_READ_MAX
                      or self._deferred()), _say)
         facts.unread = {**(facts.unread or {}), invariants.SCHEDULED_WORKFLOW_RED: unread}
-        return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:
         """Each lane run that ended in the last day, timed by its log (the
@@ -15367,8 +15678,11 @@ class Station:
             except UploadRefused as err:
                 # The dashboard is up and refused this body: give it up now and
                 # send the next, so one bad run never blocks the rest.
-                _say("the dashboard refused the transcript of %s (%d); given up"
-                     % (key, err.status))
+                msg = "the dashboard refused the transcript of %s (%d)" % (key, err.status)
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                msg += "; given up"
+                _say(msg)
                 self._record(ledger, key, tick, "refused")
                 _write_json(path, ledger)
                 continue
@@ -15462,7 +15776,11 @@ class Station:
             ledger["closings_safe"] = False
             ledger.pop("closings_cache", None)
         except UploadRefused as err:
-            _say("the dashboard refused the brain tick of %s (%d); given up" % (when, err.status))
+            msg = "the dashboard refused the brain tick of %s (%d)" % (when, err.status)
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; given up"
+            _say(msg)
             result = "refused"
         # Deliberately broad, as in upload_transcripts: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -15502,10 +15820,13 @@ class Station:
             ledger["closings_cache"] = [c for _, c in closings]
             if fails >= CLOSE_SAFE_AFTER:
                 ledger["closings_safe"] = True
-            _say("could not send the brain's done markers (UploadRefused status %d); "
-                 "next in %d minutes%s" % (err.status, max(1, delay // 60),
-                                           "; safe mode on, caching locally"
-                                           if ledger.get("closings_safe") else ""))
+            msg = "could not send the brain's done markers (UploadRefused status %d)" % err.status
+            if err.error_text:
+                msg += ": %s" % err.error_text
+            msg += "; next in %d minutes%s" % (max(1, delay // 60),
+                                               "; safe mode on, caching locally"
+                                               if ledger.get("closings_safe") else "")
+            _say(msg)
             return
         # Deliberately broad, as above: only the type is logged.
         except Exception as err:  # noqa: BLE001
@@ -18146,6 +18467,9 @@ class Station:
     def end_pass(self) -> None:
         """Log this pass's requests, keep the rate limits for the next pass,
         and remove conditional-request answers nothing uses any more."""
+        ticker = getattr(self, "_remote_ticker", None)
+        if ticker is not None:
+            ticker.stop()
         gh = self.gh
         kinds = ", ".join("%s %d" % (k, n) for k, n in
                           sorted(gh.kinds.items(), key=lambda kv: (-kv[1], kv[0])))
@@ -18484,7 +18808,29 @@ class Station:
             if first:
                 _say("log capture: %s holds logs from %s" % (source.name, first))
 
+    def start_remote_check_ticker(self) -> None:
+        """Tend remote checks every minute beside the pass, so a run that
+        finished reaches its lane in minutes, not a pass later (loom#3499).
+        The thread has its own GitHub client; only a station on a real client
+        starts one."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        # A station built without a client (tests, a half-set-up pass) has no
+        # self.gh yet; it starts no ticker, as one on a fake client does not.
+        if not (isinstance(getattr(self, "gh", None), GitHub) and repo
+                and os.path.isdir(os.path.join(remote_checks.root(self.s.home), "req"))):
+            return
+        from .github import auth_from_env
+        gh = GitHub(auth_from_env())
+
+        def make() -> "remote_checks.RemoteChecks":
+            return remote_checks.RemoteChecks(gh, self.s.home, repo, self._public, _say,
+                                              actor=gh.app_login())
+
+        self._remote_ticker = remote_checks.Ticker(make, _say)
+        self._remote_ticker.start()
+
     def run_pass(self) -> None:
+        self.start_remote_check_ticker()
         self.capture_pod_logs()
         self.sample_operator_budget()
         if self._budget_exhausted():
@@ -18507,6 +18853,12 @@ class Station:
                 raise
             except (GitHubError, OSError, runners.ReportError) as err:
                 _say("tend_runners failed: %s" % err)
+            try:
+                self._timed(self.tend_remote_checks)
+            except RateLimited:
+                raise
+            except (GitHubError, OSError, runners.ReportError) as err:
+                _say("tend_remote_checks failed: %s" % err)
             self.report_outcomes()
             # A ticket left loom:running after its run ended counts as lane
             # load, so it is settled before queued tickets look for a lane.
@@ -18697,6 +19049,24 @@ class Station:
         runners.Runners(self.gh, self.s.home, repo, slots, dict(os.environ), self._public, _say,
                         actor=actor, now=self.now).tend()
 
+    def tend_remote_checks(self) -> None:
+        """Dispatch the check requests lanes filed under LOOM_REMOTE_CHECKS and
+        write back their results (bus/remote_checks.py). Nothing happens
+        without a request or a run in flight."""
+        repo = os.environ.get("LOOM_RUNNER_REPO", "").strip() or self.s.self_repo
+        directory = remote_checks.root(self.s.home)
+        if not (os.path.isdir(os.path.join(directory, "req")) and repo):
+            return
+        try:
+            actor = self.gh.app_login()
+        except RateLimited:
+            raise
+        except GitHubError as err:
+            _say("could not read the station App's login for remote checks: %s" % err)
+            actor = None
+        remote_checks.RemoteChecks(self.gh, self.s.home, repo, self._public, _say,
+                                   actor=actor, now=self.now).tend()
+
     def upload_usage_limits(self, records: List[Dict[str, Any]]) -> None:
         """Send the current limits snapshot using the transcript upload token."""
         if not (self.s.transcript_url and self.s.transcript_token_ssm):
@@ -18710,7 +19080,10 @@ class Station:
                 self.upload(url, token, records)
                 return
             except UploadRefused as err:
-                _say("the dashboard refused the usage snapshot (%d)" % err.status)
+                msg = "the dashboard refused the usage snapshot (%d)" % err.status
+                if err.error_text:
+                    msg += ": %s" % err.error_text
+                _say(msg)
                 return
             except Exception as err:  # noqa: BLE001
                 if attempt == 1:
@@ -18782,16 +19155,42 @@ def run(settings: Settings, gh: Optional[GitHub] = None, **hooks: Any) -> int:
             return 1
         deadline = _try_arm_pass_deadline(state, settings.pass_deadline, time.time())
         try:
-            return _locked_pass(settings, state, gh, hooks)
+            return _inbox_pass(settings, state, gh, hooks, lease)
         finally:
             _disarm_pass_deadline(deadline)
     finally:
         os.close(fd)
 
 
+def _inbox_pass(settings: Settings, state: str, gh: Optional[GitHub],
+                hooks: Dict[str, Any], lease: Optional[station_lease.StationLease]) -> int:
+    """The locked pass, as the fleet inbox's consumer when LOOM_INBOX=1
+    (bus/event_inbox.py): claim the due events under the inbox lease tied to
+    the station lease, read their repos first, and mark them done once the
+    pass ran. With the inbox off this is _locked_pass and nothing else."""
+    consumer = event_inbox.select(os.environ, lease, _say)
+    if consumer is None:
+        return _locked_pass(settings, state, gh, hooks)
+    try:
+        claimed = consumer.begin()
+        priority = event_inbox.priority_repos([c.subject for c in claimed], settings.repos)
+        if priority:
+            _say("inbox: reading first: %s" % " ".join(priority))
+        outcome: Dict[str, Any] = {}
+        code = _locked_pass(settings, state, gh, hooks, priority, outcome)
+        if outcome.get("passed"):
+            consumer.finish(event_inbox.run_ref(lease, time.time()))
+        return code
+    finally:
+        consumer.close()
+
+
 def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
-                 hooks: Dict[str, Any]) -> int:
-    """The pass run() starts once it holds the lock."""
+                 hooks: Dict[str, Any], priority: Sequence[str] = (),
+                 outcome: Optional[Dict[str, Any]] = None) -> int:
+    """The pass run() starts once it holds the lock. `priority` are the
+    repos the inbox named; `outcome["passed"]` is set once run_pass returned,
+    so the inbox marks its events done only after a pass that ran."""
     use_launchd = gh is None
     if gh is None:
         from .github import auth_from_env
@@ -18819,6 +19218,7 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
             return 0
         beat.stamp()
     st = Station(gh, settings, **hooks)
+    st.priority_repos = list(priority)
     try:
         if use_launchd:
             st._refresh_lane_jobs()
@@ -18828,6 +19228,8 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
         if isinstance(writers, set):
             writers.update(settings.authors)
         st.run_pass()
+        if outcome is not None:
+            outcome["passed"] = True
     except (RateLimited, TargetReached) as err:
         _say("%s; the pass stopped there" % err)
     except (StateError, station_lease.LeaseLost) as err:

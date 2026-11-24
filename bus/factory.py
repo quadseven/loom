@@ -463,6 +463,24 @@ LANE_KINDS: Dict[str, str] = {
 }
 
 
+def wait_summary(waits: Sequence[str]) -> str:
+    """" (by reason: 3 x its repo is at its open pull request cap, ...)" for a
+    pass that gave every queued ticket no lane, or "" for one ticket: the line
+    names only the first wait, so a reader took it for what stopped the whole
+    pass when each ticket is judged on its own. A reason is the wait with its
+    leading ticket reference and, for After: waits, the blocker removed."""
+    if len(waits) < 2:
+        return ""
+    counts: Dict[str, int] = {}
+    for wait in waits:
+        reason = re.sub(r"^\S+#\d+ (?:waits: |waits )?", "", wait)
+        reason = re.sub(r"^for \S+ to merge", "for another ticket to merge", reason)
+        reason = re.sub(r"#\d+", "#N", reason)
+        counts[reason] = counts.get(reason, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return " (by reason: %s)" % "; ".join("%d x %s" % (n, r) for r, n in ranked[:6])
+
+
 def lane_kind(lane: str) -> Optional[str]:
     """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
     anthropic slot, labels.base_lane); None for a lane it does not know."""
@@ -5438,7 +5456,7 @@ class Factory:
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
         if waits and all(waits) and MODEL_WAIT not in waits[0]:
-            _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+            _say("assigned 0 of %d queued: %s%s" % (len(waits), waits[0], wait_summary(waits)))
         self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
         self.settled.update(ref for ref, reason in self.known_waits.items()
@@ -5486,8 +5504,16 @@ class Factory:
         person = self._human_holder(repo, issue)
         if person:
             return "%s is claimed by %s" % (ref, person)
+        label_claim = person_claim(issue)
+        if label_claim:
+            return "%s is claimed by the claim:%s label" % (ref, label_claim)
         if self._move_queued_refs_pr(repo, issue):
             return "%s has an open trusted pull request" % ref
+        briefer_pr = self._briefer_refs_pr(repo, issue)
+        if briefer_pr:
+            reason = "an open pull request #%s names it" % briefer_pr
+            self._waiting(repo, issue["number"], reason)
+            return "%s waits: %s" % (ref, reason)
         held = self._queued_hold(repo, issue)
         if held:
             return "%s %s" % (ref, held)
@@ -5577,6 +5603,22 @@ class Factory:
             _say("%s: linked pull request #%s is open" % (ref, pr.get("number", "?")))
             return True
         return False
+
+    def _briefer_refs_pr(self, repo: str, issue: Dict[str, Any]) -> Any:
+        """The number of an open same-repo pull request, opened by a
+        LOOM_TRUSTED_BRIEFERS login, that names this ticket with a bare Refs
+        line, else 0. The ticket stays queued under it: a lane would rebuild
+        work that is done. Only a briefer that is not a brief author counts
+        here; a brief author's pull request moves the ticket to loom:pr."""
+        number = int(issue["number"])
+        for pr in self._open_pull_requests(repo):
+            login = str((pr.get("user") or {}).get("login") or "").lower()
+            if (pr.get("state", "open") == "open" and login in self.briefers
+                    and login not in self.trusted
+                    and ((pr.get("head") or {}).get("repo") or {}).get("full_name") == repo
+                    and self._refs_ticket(str(pr.get("body") or ""), number)):
+                return pr.get("number", "?")
+        return 0
 
     def _open_pull_requests(self, repo: str) -> List[Dict[str, Any]]:
         """The repo's open pull requests, read once for queued ticket checks."""
