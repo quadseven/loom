@@ -1,189 +1,188 @@
-"""Tests for the 14-day verify handoff (loom#3509)."""
+"""The station hands stale live verification to a lane ticket."""
 from __future__ import annotations
 
-import json
 import os
+import re
+import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
 
-import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bus import brain, invariants, station, tickets  # noqa: E402
-from bus.github import GitHubError, RateLimited, Response  # noqa: E402
-from bus.invariants import Facts, Journal, Ref  # noqa: E402
-from tests.test_invariants import FakeGH, stamp as stamp_orig, journal as journal_orig  # noqa: E402,F401
+from bus.github import Response  # noqa: E402
+from tests.test_invariants import AUTHOR, FakeGH, GOAL, REPO, stamp  # noqa: E402
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
 
-REPO = "example-owner/factory"
-OTHER = "example-owner/hidden"
-GOAL = 30
-AUTHOR = "trusted-example"
 T0 = 1_800_000_000.0
-DAY_S = 24 * 3600
+DAY = 24 * 60 * 60
 
 
-def stamp(at):
-    return stamp_orig(at)
-
-
-def journal(at, holder="lane-machine", step="- Step verify: degraded (4 overdue live checks in example-owner/factory (oldest due 2026-11-03) not taken)"):
-    return journal_orig(at, holder, step)
-
-
-class HandoffTest(unittest.TestCase):
+class VerifyHandoffTest(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.home = tmp.name
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
         self.gh = FakeGH()
-        # Add handler for events endpoint
-        orig_paginate = self.gh.paginate
-        def patched_paginate(path):
-            if "/events" in path:
-                # Return a labeled event for loom:shipped
-                import re
-                m = re.match(r"/repos/([^/]+/[^/]+)/issues/(\d+)/events", path)
-                if m:
-                    repo, number = m.group(1), int(m.group(2))
-                    issue = self.gh.issues.get(number)
-                    if issue and "loom:shipped" in [l.get("name") for l in issue.get("labels", [])]:
-                        shipped_at = issue.get("updated_at")
-                        if shipped_at:
-                            return [{"event": "labeled", "label": {"name": "loom:shipped"}, "created_at": shipped_at}]
+        self.gh.api = "https://api.github.com"
+        self.home = temp.name
+        self.settings = station.Settings(
+            self.home, [REPO], [AUTHOR], ["example-owner"],
+            invariant_goal="%s#%d" % (REPO, GOAL), self_repo=REPO)
+        self.source = self.shipped_ticket(100, 15 * DAY)
+        original_paginate = self.gh.paginate
+        original_rest = self.gh.rest
+
+        def paginate(path):
+            if re.search(r"/issues/\d+/events$", path):
                 return []
-            return orig_paginate(path)
-        self.gh.paginate = patched_paginate
+            return original_paginate(path)
 
-        self.said = []
-        self.settings = station.Settings(self.home, [REPO, OTHER], [AUTHOR], ["example-owner"],
-                                         invariant_goal="%s#%d" % (REPO, GOAL), self_repo=REPO)
+        self.gh.paginate = paginate
 
-    def shipped_ticket(self, number, shipped_hours_ago, body=None):
-        """A shipped ticket with a live criterion, shipped `shipped_hours_ago` hours ago."""
-        shipped_at = T0 - shipped_hours_ago * 3600
-        if body is None:
-            body = "Why.\n\n- [ ] Live check the deploy for `success`\n"
-        self.gh.issues[number] = {"number": number, "state": "open", "body": body,
-                                  "labels": [{"name": n} for n in ["loom:ticket", "loom:shipped"]],
-                                  "created_at": stamp(shipped_at - 3600),
-                                  "updated_at": stamp(shipped_at),
-                                  "user": {"login": AUTHOR}}
-        # Add a shipped event
-        self.gh.comments.setdefault((REPO, number), []).append(
-            {"body": "<!-- loom:shipped v1 -->\nShipped at %s" % stamp(shipped_at),
-             "created_at": stamp(shipped_at), "user": {"login": AUTHOR}})
-        self.gh.tickets.setdefault(REPO, []).append(self.gh.issues[number])
+        def rest(method, path, body=None):
+            labels = re.fullmatch(r"/repos/[^/]+/[^/]+/issues/(\d+)/labels", path)
+            if method == "PUT" and labels:
+                self.gh.calls.append((method, path))
+                self.gh.writes.append((method, path, body))
+                issue = self.gh.issues[int(labels.group(1))]
+                issue["labels"] = [{"name": name} for name in body["labels"]]
+                return Response(200, issue["labels"])
+            result = original_rest(method, path, body)
+            if method == "POST" and path == "/repos/%s/issues" % REPO:
+                created = self.gh.issues[result.data["number"]]
+                created["labels"] = [{"name": name} if isinstance(name, str) else name
+                                      for name in created.get("labels", [])]
+                self.gh.tickets.setdefault(REPO, []).append(created)
+                self.gh.search_items.append(dict(created, repository={"full_name": REPO}))
+            return result
 
-    def verify_handoff_ticket(self, number, linked_ticket):
-        """A verify handoff ticket linking to the original shipped ticket."""
-        self.gh.issues[number] = {"number": number, "state": "open", "body": "Verify handoff for #%d\n\nPart of #%d" % (linked_ticket, GOAL),
-                                  "labels": [{"name": n} for n in ["loom:ticket", "loom:verify-handoff"]],
-                                  "created_at": stamp(T0)}
-        self.gh.tickets.setdefault(REPO, []).append(self.gh.issues[number])
+        self.gh.rest = rest
+        self.station = station.Station(self.gh, self.settings, now=T0)
+        self.station._tickets_open = lambda repo: [self.source]
+        self.shipped_at = T0 - 15 * DAY
+        self.station._shipped_stamp = lambda repo, issue: self.shipped_at
+        self.station._proven = lambda repo, number: False
 
-    def run_station(self, now=T0):
-        # Add search items for handoff tickets
-        for issue in self.gh.issues.values():
-            if isinstance(issue, dict):
-                labels = issue.get("labels", [])
-                label_names = [l.get("name") if isinstance(l, dict) else l for l in labels]
-                if "loom:verify-handoff" in label_names:
-                    body = issue.get("body", "")
-                    import re
-                    match = re.search(r"Original: ([^#]+)#(\d+)", body)
-                    if match:
-                        repo, orig_num = match.group(1), int(match.group(2))
-                        self.gh.search_items.append({"number": issue["number"], "repository": {"full_name": repo}, "body": body})
-        
-        st = station.Station(self.gh, self.settings, now=now)
-        orig_say = station._say
-        station._say = orig_say
-        try:
-            st.check_invariants()
-        finally:
-            station._say = orig_say
-        return st
+    def shipped_ticket(self, number, shipped_at):
+        body = ("## Why\nThe deployed change needs a live read.\n\n"
+                "## Acceptance criteria\n"
+                "- [ ] The deployed behavior is present.\n"
+                "- [ ] Live: the service reports `ready` during the current window.\n\n"
+                "## Size\nS\n\nPart of #%d\n" % GOAL)
+        issue = {"number": number, "state": "open", "body": body,
+                 "title": "Check deployed behavior", "user": {"login": AUTHOR},
+                 "labels": [{"name": name} for name in ("loom:ticket", "loom:shipped")],
+                 "created_at": stamp(shipped_at), "updated_at": stamp(shipped_at)}
+        self.gh.issues[number] = issue
+        self.gh.tickets.setdefault(REPO, []).append(issue)
+        return issue
 
-    def count_handoffs(self):
-        return len([i for i in self.gh.issues.values() if isinstance(i, dict)
-                    and "loom:verify-handoff" in [l.get("name") if isinstance(l, dict) else l for l in i.get("labels", [])]])
+    def handoffs(self):
+        return [issue for issue in self.gh.issues.values()
+                if tickets.verify_handoff_source(issue) is not None
+                and "loom:verify-handoff" in self.label_names(issue)]
 
-    def breaches(self):
-        return [i for i in self.gh.issues.values() if isinstance(i, dict)
-                and "loom:invariant" in [l.get("name") if isinstance(l, dict) else l for l in i.get("labels", [])]]
+    @staticmethod
+    def label_names(issue):
+        return [label.get("name") if isinstance(label, dict) else label
+                for label in issue.get("labels", [])]
 
-    def test_verify_handoff_after_14_days(self):
-        """A shipped ticket with a live criterion older than 14 days gets a verify handoff ticket."""
-        # Ship a ticket 15 days ago with a live criterion
-        self.shipped_ticket(100, 15 * 24)
+    def test_handoff_candidates_start_only_after_fourteen_days(self):
+        self.station._shipped_stamp = lambda repo, issue: T0 - 14 * DAY
+        self.assertEqual(self.station._find_verify_handoff_candidates(), [])
+        self.station._shipped_stamp = lambda repo, issue: T0 - 14 * DAY - 1
+        candidates = self.station._find_verify_handoff_candidates()
+        self.assertEqual([(repo, issue["number"]) for repo, issue in candidates],
+                         [(REPO, 100)])
 
-        # Run the station
-        self.run_station()
+    def test_a_proven_live_ticket_is_not_handed_off(self):
+        self.station._proven = lambda repo, number: True
+        self.assertEqual(self.station._find_verify_handoff_candidates(), [])
 
-        # Check that a verify handoff ticket was created
-        handoff_tickets = [i for i in self.gh.issues.values() if isinstance(i, dict)
-                          and "loom:verify-handoff" in [l.get("name") if isinstance(l, dict) else l for l in i.get("labels", [])]]
-        self.assertEqual(len(handoff_tickets), 1)
-        self.assertIn("#100", handoff_tickets[0]["body"])
+    def test_old_live_ticket_gets_one_linked_lane_verify_ticket(self):
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
 
-    def test_no_duplicate_handoff_on_next_pass(self):
-        """Running the station again does not create a duplicate verify handoff ticket."""
-        self.shipped_ticket(100, 15 * 24)
+        (handoff,) = self.handoffs()
+        self.assertEqual(handoff["state"], "open")
+        self.assertIn("loom:shipped", self.label_names(handoff))
+        self.assertIn("Verify handoff for #100", handoff["body"])
+        self.assertIn("Part of #%d" % GOAL, handoff["body"])
+        self.assertIn("loom:verify-handoff", self.label_names(handoff))
+        self.assertNotIn("loom:verify-handoff", self.label_names(self.source))
 
-        # First pass
-        self.run_station(T0)
-        handoff_count_1 = self.count_handoffs()
+    def test_next_pass_does_not_create_a_duplicate_and_resume_omits_both_tickets(self):
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        candidates = self.station._find_verify_handoff_candidates()
+        existing = self.station._verify_handoff_tickets
+        self.assertEqual(existing, {"%s#%d" % (REPO, self.source["number"])})
+        self.assertEqual(self.station._verify_due_tickets, existing)
+        self.assertTrue(self.station._verify_handoff_coverage(
+            existing, self.station._verify_due_tickets))
+        self.assertFalse(self.station._verify_handoff_coverage(
+            existing, existing | {"%s#101" % REPO}))
+        self.station._create_verify_handoffs(invariants.Facts(T0,
+            verify_handoff_tickets=existing, verify_handoff_candidates=candidates,
+            verify_due_tickets=self.station._verify_due_tickets))
+        self.assertTrue(self.station._verify_handoff_coverage(
+            existing, self.station._verify_due_tickets))
 
-        # Second pass
-        self.run_station(T0 + 3600)
-        handoff_count_2 = self.count_handoffs()
+        self.assertEqual(len(self.handoffs()), 1)
+        due = brain.verify_due(self.gh, REPO, [self.source, self.handoffs()[0]],
+                               brain._stamp(stamp(T0)))
+        self.assertEqual(due, [])
+        station_due = station.verify_due(
+            [(REPO, self.source), (REPO, self.handoffs()[0])], {}, T0,
+            check_live=False, handoff_tickets={"%s#%d" % (REPO, self.source["number"])})
+        self.assertEqual([issue["number"] for _, issue in station_due],
+                         [self.handoffs()[0]["number"]])
 
-        self.assertEqual(handoff_count_1, handoff_count_2)
-        self.assertEqual(handoff_count_1, 1)
+    def test_stale_source_marker_does_not_hide_a_ticket_without_a_routable_child(self):
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        handoff = self.handoffs()[0]
+        self.source["labels"].append({"name": "loom:verify-handoff"})
+        handoff["labels"] = [label for label in handoff["labels"]
+                             if label["name"] != "loom:shipped"]
 
-    def test_brain_failing_does_not_count_verify_degraded_when_handoff_exists(self):
-        """The brain-failing invariant does not count verify as degraded when all verify-due items have handoff tickets."""
-        # Create a journal with verify degraded step
-        self.gh.comments[GOAL] = [{"body": journal(T0 - 3600), "created_at": stamp(T0 - 3600),
-                                   "user": {"login": "lane-machine"}}]
-        self.gh.comments[GOAL].append({"body": journal(T0 - 600), "created_at": stamp(T0 - 600),
-                                       "user": {"login": "lane-machine"}})
+        due = brain.verify_due(self.gh, REPO, [self.source, handoff], brain._stamp(stamp(T0)))
+        self.assertEqual([issue["number"] for _, issue in due], [self.source["number"]])
+        station_due = station.verify_due(
+            [(REPO, self.source), (REPO, handoff)], {}, T0, check_live=False)
+        self.assertEqual([issue["number"] for _, issue in station_due],
+                         [self.source["number"]])
 
-        # Create a shipped ticket older than 14 days with a handoff ticket
-        self.shipped_ticket(100, 15 * 24)
-        self.verify_handoff_ticket(200, 100)
+    def test_station_verify_pool_dispatches_the_child_and_not_its_source(self):
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        handoff = self.handoffs()[0]
+        self.station._tickets_open = lambda repo: [self.source, handoff]
+        self.station._issue = lambda repo, number: (
+            self.source if number == self.source["number"] else handoff)
+        self.station._audit_holds = lambda: set()
+        self.station._verify_refused_ledger = lambda: {}
+        self.station._verify_missing_ledger = lambda: {}
+        self.station._verify_proof_state = lambda repo, number: False
+        self.station._verify_has_merge = lambda repo, issue: True
+        self.station._unmeetable_live = lambda repo, issue, reads: False
+        self.station._paginate = lambda path: []
 
-        # Run the station
-        self.run_station()
+        pool, _ = self.station._verify_pool({}, queued_holds=False)
+        self.assertEqual([issue["number"] for _, issue in pool], [handoff["number"]])
 
-        # The brain-failing invariant should not fire for the verify step
-        # because the verify-due item has a handoff ticket
-        brain_failing_breaches = [b for b in self.breaches()
-                                  if isinstance(b, dict) and "brain-failing" in [l.get("name") if isinstance(l, dict) else l for l in b.get("labels", [])]]
-        # The verify step should not be in the evidence
-        for breach in brain_failing_breaches:
-            for evidence in breach.get("body", "").split("\n"):
-                if "verify" in evidence.lower() and "degraded" in evidence.lower():
-                    self.fail("verify degraded should not be reported when handoff exists: %s" % evidence)
+    def test_lane_proof_is_applied_to_the_source_ticket(self):
+        self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        handoff = self.handoffs()[0]
+        applied = []
+        self.station._issue = lambda repo, number: (
+            self.source if number == self.source["number"] else handoff)
+        self.station._verify_clear = lambda lane: None
+        self.station._read_verify = lambda lane, name: ({"criteria": []}, "")
+        self.station._verify_model = lambda lane, name: "example-model"
+        self.station._adapter_can_verify = lambda repo, issue: False
+        self.station._apply_proof = lambda lane, repo, number, result, model: applied.append(number)
+        self.station._settle_verify_handoff = lambda repo, number, source: None
 
-
-class VerifyHandoffInvariantTest(unittest.TestCase):
-    """Tests for the brain_failing invariant with verify handoff."""
-
-    def setUp(self):
-        self.goal = Ref("%s#%d" % (REPO, GOAL), "#%d" % GOAL)
-
-    def j(self, at, holder="lane-machine", steps=()):
-        return Journal(at, self.goal, holder, stamp(at), tuple(steps))
-
-    def test_verify_degraded_not_counted_when_handoff_exists(self):
-        """verify degraded step is not counted when all verify-due items have handoff tickets."""
-        # This test will be updated once the Facts structure includes handoff info
-        pass
+        self.station._report_verify("codex", "done", REPO, handoff["number"], "verify-run")
+        self.assertEqual(applied, [self.source["number"]])
 
 
 if __name__ == "__main__":

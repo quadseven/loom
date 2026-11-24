@@ -159,13 +159,12 @@ class HourlyMergeCapStatusTests(unittest.TestCase):
         routes[("GET", "/issues")] = reply(200, [])
         routes[("GET", "/pulls")] = reply(200, [pr8, pr9])
 
-        transport = StubTransport(routes, search_counts={"repo:": 0, "user:": 4, "label:loom:verify-handoff": 0})
+        transport = StubTransport(routes, search_counts={"repo:": 0, "user:": 4})
         gh = GitHub("t", transport=transport)
         env = {"LOOM_BRIEF_AUTHORS": "example-brain", "LOOM_AUTO_MERGE_TIERS": "docs-tests,app-code"}
         report = brain.status(gh, [REPO], REPO, env=env, now=NOW)
         search_calls = [c for c in transport.calls if c[1].startswith("/search/issues")]
-        # 2 merge cap searches + 1 verify handoff search (loom#3509)
-        self.assertEqual(len(search_calls), 3)
+        self.assertEqual(len(search_calls), 2)
         self.assertIn("- #8 Work 8 - blocked: held by the hourly merge cap", report)
         self.assertIn("- #9 Work - blocked: held by the hourly merge cap", report)
 

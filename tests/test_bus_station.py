@@ -5161,8 +5161,9 @@ class CorruptStateTest(Base):
         # The last-pass shipped wait stamp adds one canonical all-repo read,
         # and the ended-run sweep one read of the running tickets (loom#3134).
         # The invariant pass also reads the completed scheduled workflow runs.
-        # The invariant pass also searches for verify handoff tickets (loom#3509).
-        self.assertEqual(self.run_pass().requests, 25)
+        # The invariant pass reads open tickets for verify handoff coverage
+        # and stale live checks (loom#3509).
+        self.assertEqual(self.run_pass().requests, 24)
 
 
 class TicketsTest(unittest.TestCase):

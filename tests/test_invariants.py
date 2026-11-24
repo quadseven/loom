@@ -244,7 +244,6 @@ class StationBase(unittest.TestCase):
 
 
 class AcceptanceTest(StationBase):
-
     def test_event_log_hashes_inputs_and_ignores_untrusted_rows(self):
         st = station.Station(self.gh, self.settings, now=T0)
         private_value = "private-host.example.invalid"
@@ -388,7 +387,6 @@ class AcceptanceTest(StationBase):
 
 
 class StationTest(StationBase):
-
     def test_nothing_broken_files_nothing_and_checks_at_most_every_few_minutes(self):
         self.run_at(T0)
         self.assertEqual(self.gh.writes, [])
@@ -478,15 +476,26 @@ class StationTest(StationBase):
         for lane in ("anthropic", "anthropic-2"):
             self.assertIn("- %s: held by a limit since" % lane, filed["body"])
 
-def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
+    def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
         self.settings.no_topup = ["anthropic"]
         self.held_out_of_credit()
         self.assertEqual(self.breaches(), [])
-        # Nothing to file for lane-held, so the queued tickets are not read for
-        # that invariant. But the verify handoff logic (loom#3509) still reads
-        # tickets to find candidates for handoff tickets. Two passes, two repos.
-        ticket_reads = [c for c in self.gh.calls if "/issues?labels=loom:ticket" in c[1]]
-        self.assertEqual(len(ticket_reads), 4)
+        # Verify-handoff coverage reads the open ticket list once per repo.
+        ticket_reads = [path for _, path in self.gh.calls
+                        if "/issues?labels=loom:ticket&state=open" in path]
+        self.assertEqual(len(ticket_reads), 2 * len(self.settings.repos))
+
+    def test_no_topup_still_files_a_lane_of_that_account_held_by_another_limit(self):
+        self.settings.no_topup = ["anthropic"]
+        self.queued_ticket(653, "loom:queued")
+        usage = os.path.join(self.home, "state", "usage", "anthropic-3.json")
+        for at in (T0, T0 + 3 * 3600):
+            self.write(usage, json.dumps({"lane": "anthropic-3", "at": at, "available": False,
+                                          "reason": "limit: rate limited"}))
+            self.run_at(at)
+        (filed,) = self.breaches()
+        self.assertIn("1 lane held by a limit", filed["title"])
+        self.assertIn("- anthropic-3: held by a limit since", filed["body"])
 
     def test_a_lane_whose_limit_hold_expired_is_not_held(self):
         # A hold whose time has passed is no hold: the lane is free again and
@@ -756,10 +765,9 @@ def test_no_topup_skips_lanes_held_out_of_credit_on_that_account(self):
         self.gh.search_items = [dict(ticket(70, "closed"), body="Why.\n\nPart of #46\n")]
         self.run_at(T0)
         searches = [path for _, path in self.gh.calls if path.startswith("/search/issues?")]
-        # Filter out verify handoff searches (loom#3509)
-        part_of_searches = [s for s in searches if "no%3Aparent-issue" in s or "in%3Abody%20%22Part%20of" in s]
-        self.assertEqual(len(part_of_searches), 1, searches)
-        self.assertIn("no%3Aparent-issue", part_of_searches[0])
+        goal_searches = [path for path in searches if "no%3Aparent-issue" in path]
+        self.assertEqual(len(goal_searches), 1, searches)
+        self.assertIn("no%3Aparent-issue", goal_searches[0])
 
     def test_a_check_a_rate_limit_stopped_waits_like_any_other(self):
         """loom#2321: checked was saved only after the reads, so a stopped
@@ -1504,6 +1512,19 @@ class InvariantTest(unittest.TestCase):
                                                            ("merge degraded",))])
         self.assertEqual(invariants.brain_failing(f), [])
 
+    def test_handed_off_verify_steps_do_not_make_brain_failing(self):
+        step = "verify degraded: only 1 of 26 verify-due items attempted"
+        journals = [self.j(T0 - 3600, steps=(step,)), self.j(T0 - 600, steps=(step,))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=True)
+        self.assertEqual(invariants.brain_failing(facts), [])
+
+    def test_unhanded_verify_items_keep_brain_failing_visible(self):
+        step = "verify degraded: only 1 of 26 verify-due items attempted"
+        journals = [self.j(T0 - 3600, steps=(step,)), self.j(T0 - 600, steps=(step,))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=False)
+        self.assertEqual([breach.invariant for breach in invariants.brain_failing(facts)],
+                         ["brain-failing"])
+
     def test_failed_steps_reads_the_step_lines_only(self):
         body = journal(T0) + "\n- Waiting: #12 failed on lane codex\n- Brief step: degraded, cap reached"
         self.assertEqual(invariants.failed_steps(body),
@@ -2130,7 +2151,6 @@ class EpicTitleSharedTest(unittest.TestCase):
 
 
 class StandingEpicTest(unittest.TestCase):
-
     def test_the_repairs_epic_is_exempt_from_both_caps(self):
         goal = Ref("%s#%d" % (REPO, GOAL), "#30")
         epics = tuple(invariants.EpicShape(Ref("%s#%d" % (REPO, n), "#%d" % n), True, 1, ())
@@ -2329,13 +2349,8 @@ class PassTargetWriteGateTest(StationBase):
         self.assertEqual(self.gh.calls.count(("GET", "/repos/%s/pulls?state=open&per_page=100"
                                               % REPO)), 1)
         # After the reads the filer spends nothing more on a settled report,
-        # within its reserve, and the pass target comes back. The verify handoff
-        # step (loom#3509) may create read-and-report tickets after the reads.
-        post_reads = self.gh.counted - self.after_reads
-        # Allow POST requests for verify handoff tickets (loom#3509)
-        handoff_posts = sum(1 for c in self.gh.calls[self.gh.calls.index(("POST", "/repos/%s/issues/90/comments" % REPO)) + 1:]
-                            if c[0] == "POST" and c[1] == "/repos/%s/issues" % REPO)
-        self.assertEqual(post_reads - handoff_posts, 0, self.gh.calls[-3:])
+        # within its reserve, and the pass target comes back.
+        self.assertEqual(self.gh.counted - self.after_reads, 0, self.gh.calls[-3:])
         self.assertEqual(self.gh.target, station.PASS_REQUEST_TARGET)
 
     def test_a_check_whose_reads_carry_over_at_the_target_still_settles_and_says_so(self):

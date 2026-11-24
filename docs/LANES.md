@@ -1272,6 +1272,12 @@ verify takes an eligible ticket shipped at least 24 hours ago before new build
 work; queued build work does not hold that priority drain. The median is read
 from the same wait rows as the Hot spots page, cached for 30 minutes, and a
 failed read leaves the usual claim order in place.
+After 14 days without proof, the station creates one open `loom:verify-handoff`
+ticket under the same goal, carrying the source ticket's acceptance criteria.
+The source link in that ticket keeps the brain from listing the source under
+Verify due. The station sends the new ticket through this same verify flow,
+reads merged pull requests from the source ticket, and applies any proof to the
+source; a missing read leaves the handoff ticket open for retry.
 When `LOOM_EVIDENCE_CMDS` is set in the station plist, it is a JSON map from
 `owner/repo` to a read-only shell command. The command receives each eligible
 backticked string from the ticket's Live criterion in

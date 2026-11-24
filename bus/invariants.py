@@ -492,6 +492,12 @@ class Facts:
     # Shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS (loom#3509):
     # candidates for verify handoff tickets.
     verify_handoff_candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+    # Whether every currently verify-due shipped ticket has an open lane
+    # verify ticket. Unknown stays None and never suppresses a breach.
+    verify_handoff_coverage: Optional[bool] = None
+    # The current verify-due source keys, used to include tickets handed off
+    # during this same station pass in the coverage decision.
+    verify_due_tickets: Optional[set] = None
 
 
 @dataclass(frozen=True)
@@ -559,28 +565,9 @@ def _lanes(count: int) -> str:
 
 
 # -- the invariants ------------------------------------------------------
-def _verify_degraded_covered_by_handoff(step: str, handoff_tickets: Optional[set]) -> bool:
-    """Whether a verify degraded step is covered by handoff tickets.
-    The step looks like: "verify degraded: 4 overdue live checks in example-owner/factory (oldest due 2026-11-03) not taken"
-    """
-    if handoff_tickets is None:
-        return False
-    if "verify degraded" not in step:
-        return False
-    # Extract repo from the step string
-    import re
-    match = re.search(r"in ([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)", step)
-    if not match:
-        return False
-    repo = match.group(1)
-    # Check if all verify-due tickets for this repo have handoff tickets
-    # We can't know the exact tickets from the step string, so we check if
-    # there are any handoff tickets for this repo. If there are, we assume
-    # the station has handed off all old verify-due items.
-    for ticket_key in handoff_tickets:
-        if ticket_key.startswith(repo + "#"):
-            return True
-    return False
+def _verify_degraded_covered_by_handoff(step: str, coverage: Optional[bool]) -> bool:
+    """Whether all current verify-due tickets have open lane verify tickets."""
+    return coverage is True and "verify degraded" in step
 
 
 def brain_failing(f: Facts) -> List[Breach]:
@@ -604,8 +591,7 @@ def brain_failing(f: Facts) -> List[Breach]:
         for tick in last:
             for j in tick:
                 for s in j.steps:
-                    # Skip verify degraded steps that are covered by handoff tickets
-                    if _verify_degraded_covered_by_handoff(s, f.verify_handoff_tickets):
+                    if _verify_degraded_covered_by_handoff(s, f.verify_handoff_coverage):
                         continue
                     evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s)]
         if not evidence:

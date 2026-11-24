@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 from .github import GitHub
 from .stale_claims import OVERFLOW_CLAIM
+from .tickets import VERIFY_HANDOFF_LABEL
 
 # The hand-off pool: a ticket no lane of this Loom takes (bus/factory.py
 # NO_LANE_HANDOFF) carries it, leaves its goal's in-flight count, and waits
@@ -95,6 +96,7 @@ LABELS: Dict[str, Dict[str, str]] = {
     "loom:closed-unmerged": {"color": "d93f0b", "description": "Linked pull request closed without merging"},
     "loom:shipped": {"color": "2ea44f", "description": "Deployed by the project's ship owner"},
     "loom:verified": {"color": "006b75", "description": "Verified live"},
+    VERIFY_HANDOFF_LABEL: {"color": "5319e7", "description": "A lane verify ticket for an older shipped ticket"},
     "loom:awaiting-evidence": {"color": "c2e0c6", "description": "Checked by a verifier: live evidence not yet seen; it does not hold the unproven limit"},
     "loom:audit-failed": {"color": "d93f0b", "description": "A lane proof failed the brain's audit; holds that lane's verify runs a day"},
     "loom:triage": {"color": "f9d0c4", "description": "Open issue not yet a ticket; the brain rewrites it"},
