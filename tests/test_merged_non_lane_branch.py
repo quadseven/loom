@@ -51,6 +51,15 @@ class MergedNonLaneBranchTest(Base):
         self.assertIn("loom:queued", self.fake.names(5))
         self.assertNotIn("loom:merged", self.fake.names(5))
 
+    def test_an_untrusted_merge_before_requeue_does_not_deliver_the_ticket(self):
+        self.fake.add(5, state="queued")
+        self.fake.events[5].append({"event": "labeled", "label": {"name": "loom:queued"},
+                                    "actor": {"login": "alice-example"},
+                                    "created_at": "2030-01-03T00:00:00Z"})
+        self.fake.pulls = [self.merged(author="stranger")]
+        self.reconcile()
+        self.assertIn("loom:queued", self.fake.names(5))
+
     def test_a_refs_line_naming_another_repo_moves_no_ticket_here(self):
         self.fake.add(5, state="queued")
         self.fake.pulls = [self.merged(refs="other-owner/other-repo#5")]  # leak-guard-allow

@@ -6101,10 +6101,10 @@ class Station:
 
     def _move_queued_merged(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Move one queued or briefed ticket to loom:merged when a merged
-        pull request referencing it (a Refs line or a loom/<number> branch,
-        merged into the default branch) already carries its work; True when
-        it moved. Reconcile calls this for every waiting ticket it already
-        read, before the claim pass can hand the ticket to a lane: a merge
+        pull request from an author allowed to deliver it references it (a
+        Refs line or a loom/<number> branch merged into the default branch).
+        True when it moved. Reconcile tries normal delivery first, then
+        checks the remaining waiting tickets before the claim pass: a merge
         made outside `bus.brain merge` settles nothing itself, and
         _deliver_unlinked's stricter rules (a trusted same-repo branch, no
         queued or briefed label event after the merge) leave a ticket whose
@@ -6136,7 +6136,9 @@ class Station:
                  and pr["number"] not in judged]
         if not fresh:
             return False
-        pr = fresh[0]
+        pr = next((pr for pr in fresh if self._deliver_trusted_author(repo, issue, pr)), None)
+        if pr is None:
+            return False
         states = {"loom:" + state for state in brain.STATES}
         labels = [n for n in names if n not in states and not n.startswith(WAIT)]
         labels.append("loom:merged")
@@ -6870,12 +6872,6 @@ class Station:
         unlinked = self._unlinked_tickets(repo, tickets_by_number, open_tickets)
         if not tickets_by_number and not unlinked:
             return
-        # A queued or briefed ticket whose referencing pull request already
-        # merged leaves the queue here, before any lane claim (loom#3547):
-        # _deliver_unlinked below only delivers under stricter rules.
-        for number in list(unlinked):
-            if self._move_queued_merged(repo, unlinked[number]):
-                del unlinked[number]
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         # Fetch ALL closed PRs (paginated). The reconcile window uses only the
@@ -6894,6 +6890,10 @@ class Station:
                 self._reconcile_pr_ticket(repo, pr, pool, landed)
                 if merged:
                     self._deliver_unlinked(repo, pr, unlinked)
+        # Check the remaining queued or briefed tickets for an earlier
+        # merge before any lane can claim them (loom#3547).
+        for ticket in unlinked.values():
+            self._move_queued_merged(repo, ticket)
         for number, ticket in tickets_by_number.items():
             self._clear_pull_gone(repo, number, ticket, open_prs, all_closed)
 

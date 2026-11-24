@@ -9803,7 +9803,10 @@ class VerifyBeforeBuildTest(Base):
 
     def test_a_queued_ticket_with_a_merged_refs_pull_request_is_not_claimed(self):
         self.fake.add(12, state="queued")
-        self.merged()
+        self.fake.events[12].append(dict(labeled("loom:queued", AUTHORS[0]),
+                                         created_at="2030-01-02T00:00:00Z"))
+        self.merged(user={"login": AUTHORS[0]},
+                    head={"ref": "a-fix", "repo": {"full_name": REPO}})
         with mock.patch("bus.station._say") as say:
             self.run_pass()
         self.assertIn("loom:merged", self.fake.names(12))
