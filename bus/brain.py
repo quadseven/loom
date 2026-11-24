@@ -5471,6 +5471,61 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
 
+def _add_hold_criterion(body: str, criterion: str) -> str:
+    heading = re.search(r"(?m)^## Acceptance criteria[ \t]*(?=\r?$)", body)
+    newline = "\r\n" if "\r\n" in body else "\n"
+    box = "- [ ] " + criterion
+    if heading is None:
+        return body + newline * 2 + "## Acceptance criteria" + newline * 2 + box + newline
+    end = heading.end()
+    return body[:end] + newline * 2 + box + (body[end:] or newline)
+
+
+def _external_hold_criterion(body: str, precondition: str, evidence: str) -> Tuple[str, bool]:
+    """Return the criterion to journal and whether it needs to be added."""
+    condition = hold_boxes.EXTERNAL_HOLD_PREFIX + precondition + ". Evidence to lift: "
+    boxes = proof.criteria(body)
+    for checked, line in boxes:
+        if not checked and line.startswith(hold_boxes.EXTERNAL_HOLD_PREFIX):
+            return line, False
+    if any(checked and line.startswith(condition) for checked, line in boxes):
+        return "", False
+    return condition + evidence + ".", True
+
+
+def external_hold(gh: GitHub, repo: str, number: int, precondition: str, evidence: str) -> str:
+    """Hold the ticket's open pull request and journal the decision once."""
+    precondition, evidence = (" ".join(value.split()).rstrip(".")
+                              for value in (precondition, evidence))
+    if not all(text.has_reason(value) for value in (precondition, evidence)):
+        raise ValueError("an external hold needs a precondition and evidence that lifts it")
+    path = "/repos/%s/issues/%d" % (repo, number)
+    issue = _open_issue(gh, repo, number)
+    if "loom:ticket" not in _labels(issue):
+        raise ValueError("an external hold requires a Loom ticket")
+    pull = _ticket_prs(repo, gh.paginate("/repos/%s/pulls?state=open" % repo)).get(number)
+    if pull is None:
+        return ""
+
+    body = str(issue.get("body") or "")
+    criterion, add_box = _external_hold_criterion(body, precondition, evidence)
+    if not criterion:
+        return ""
+    link = "https://github.com/%s/pull/%d" % (repo, pull["number"])
+    detail = criterion.removeprefix("Hold: do not merge. ")
+    note = "External hold stands for %s. %s" % (link, detail)
+    _check_written_text(note)
+    _check_decision_claim(gh, repo, number, note)
+    if add_box:
+        gh.rest("PATCH", path, {"body": _add_hold_criterion(body, criterion)})
+    # Write the guard first. If posting fails, the next tick can journal the
+    # existing box without editing the ticket again.
+    if any(comment.get("body") == note for comment in gh.paginate(path + "/comments")):
+        return ""
+    posted = notify.post(gh, repo, number, note, notify.NOTE).data or {}
+    return str(posted.get("body") or "")
+
+
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                model: str) -> None:
     """Rewrite the ticket body's Model: line; done before the labels change so
@@ -9431,6 +9486,10 @@ def parser() -> argparse.ArgumentParser:
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
     lv = sub.add_parser("live"); lv.add_argument("ticket"); lv.add_argument("--text", required=True)
+    eh = sub.add_parser("external-hold", help="record an external hold on a ticket's open pull request")
+    eh.add_argument("ticket")
+    eh.add_argument("--precondition", required=True)
+    eh.add_argument("--evidence", required=True)
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
@@ -9532,6 +9591,13 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_live(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     restate_live(gh, repo, number, args.text)
+
+
+def _cmd_external_hold(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    note = external_hold(gh, repo, number, args.precondition, args.evidence)
+    if note:
+        print(note)
 
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
@@ -9644,7 +9710,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
-            "prioritize": _cmd_prioritize, "live": _cmd_live,
+            "prioritize": _cmd_prioritize, "live": _cmd_live, "external-hold": _cmd_external_hold,
             "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
             "proof": _cmd_proof,
             "merge": _cmd_merge, "reply": _cmd_reply,
