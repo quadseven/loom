@@ -422,7 +422,7 @@ if [ "${1:-}" = models ]; then
 fi
 args="$*"; args="${args//$'\\n'/ }"
 keyvar=none; key=none
-for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY; do
+for v in OPENROUTER_API_KEY OPENCODE_API_KEY ANTHROPIC_API_KEY ZHIPU_API_KEY CLOUDFLARE_API_KEY SPARK_API_KEY; do
   if [ -n "${!v:-}" ]; then keyvar="$v"; key="${!v}"; fi
 done
 real_home="$(cd ../../.. && pwd)"
@@ -527,6 +527,9 @@ printf '%s\\n' "$val"
 # exit 7, or "timeout", curl exit 28); the last answer repeats. Every call is appended to $FAKE_LOG.
 FAKE_CURL = """#!/usr/bin/env bash
 printf 'curl %s\\n' "$*" >> "$FAKE_LOG"
+# A config read from stdin (-K -) is logged on its own line, so a test can
+# see a header that was kept out of argv.
+case " $* " in *" -K - "*) while IFS= read -r line; do printf 'curlconfig %s\\n' "$line" >> "$FAKE_LOG"; done ;; esac
 n="$(grep -c '^curl ' "$FAKE_LOG")"
 header_dump=""
 while [ "$#" -gt 0 ]; do
@@ -5588,6 +5591,50 @@ fi
         self.assertIn("lane spark, model spark/coder-test", self.body.read_text())
         self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
         self.assertTrue(self.spark_beat()["available"])
+
+    @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
+    def test_spark_lane_sends_its_gateway_caller_token_outside_argv(self):
+        # The cluster lanes reach the Sparks only through spark-gateway, which
+        # needs a caller token on every API route (quadseven/loom#3517).
+        inbox, result = self.api_lane("spark", LOOM_SPARK_KEY_SSM="/k/spark",
+                                      FAKE_SECRET__k_spark="gw-token-123", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        probes = [c for c in calls if c.startswith("curl ")]
+        self.assertTrue(probes, calls)
+        self.assertFalse(any("gw-token-123" in c for c in probes), probes)
+        self.assertIn('curlconfig header = "Authorization: Bearer gw-token-123"', calls)
+        agent = [c for c in calls if c.startswith("opencode ")]
+        self.assertEqual(len(agent), 1, calls)
+        self.assertIn("keyvar=SPARK_API_KEY key=gw-token-123", agent[0])
+        config = json.loads(next(c for c in calls if c.startswith("config="))[len("config="):])
+        self.assertEqual(config["provider"]["spark"]["options"],
+                         {"baseURL": "http://spark.example.invalid:8000/v1",
+                          "apiKey": "{env:SPARK_API_KEY}"})
+        self.assertNotIn("gw-token-123", json.dumps(config))
+        self.assertNotIn("gw-token-123", self.spark_log())
+        self.assertTrue((inbox / "done" / "T042-fix-the-thing.md").exists())
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_with_an_unreadable_caller_token_is_unavailable(self):
+        inbox, result = self.api_lane("spark", LOOM_SPARK_KEY_SSM="/k/missing", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertIn("LOOM_SPARK_KEY_SSM", beat["reason"])
+
+    @unittest.skipUnless(shutil.which("sandbox-exec"), "API lanes run under macOS sandbox-exec")
+    def test_spark_lane_refused_by_the_gateway_says_so_and_is_no_limit(self):
+        inbox, result = self.api_lane("spark", FAKE_CURL="401", **self.SPARK)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((inbox / "T042-fix-the-thing.md").exists())
+        self.assertFalse(any(c.startswith("opencode ") for c in self.calls()))
+        beat = self.spark_beat()
+        self.assertFalse(beat["available"])
+        self.assertIn("refused the caller (HTTP 401)", beat["reason"])
+        self.assertFalse((self.loom / "state" / "usage" / "spark.limit").exists())
 
     @unittest.skipUnless(sandbox_caps.NESTED_SANDBOX, sandbox_caps.NO_NESTED_SANDBOX)
     def test_the_spark_2_slot_runs_against_its_own_box(self):
