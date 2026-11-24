@@ -57,6 +57,9 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
             break
     if not isinstance(limits, dict):
         return {}
+    observed = _observed(item)
+    observed_at = _parse(observed)
+    anchor = now if observed_at is None else observed_at
     found = {}
     for key, label in (("primary", "5-hour"), ("secondary", "weekly")):
         window = limits.get(key)
@@ -68,11 +71,9 @@ def _codex_limits(item: Any, now: float) -> Dict[str, Dict[str, Any]]:
             relative = reset is None
             if reset is None:
                 reset = window.get("resets_in_seconds")
-            if reset is None and isinstance(window.get("window_minutes"), (int, float)):
-                reset = window["window_minutes"] * 60
-            found[label] = {"used": float(used), "reset": _utc_epoch(reset, now, relative),
+            found[label] = {"used": float(used), "reset": _utc_epoch(reset, anchor, relative),
                             "minutes": _minutes(window.get("window_minutes")),
-                            "observed": _observed(item)}
+                            "observed": observed}
     return found
 
 
@@ -126,8 +127,8 @@ def _tail_lines(path: Path) -> List[str]:
 
 
 def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]]:
-    """The rate-limit windows of the newest line that carries any, looking at
-    the newest SESSION_FILES files, newest first, and only their tails."""
+    """The newest reading of each window from the bounded session tails."""
+    readings = {}
     for path in _newest_sessions(sessions):
         try:
             lines = _tail_lines(path)
@@ -138,9 +139,11 @@ def _read_codex_sessions(sessions: Path, now: float) -> Dict[str, Dict[str, Any]
                 found = _codex_limits(json.loads(line), now)
             except ValueError:
                 continue
-            if found:
-                return found
-    return {}
+            for window, reading in found.items():
+                readings.setdefault(window, reading)
+            if len(readings) == 2:
+                return readings
+    return readings
 
 
 def codex_records(lanes: List[str], sessions: Path, now: float) -> List[Dict[str, Any]]:

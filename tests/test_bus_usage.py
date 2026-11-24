@@ -33,6 +33,26 @@ class UsageTests(unittest.TestCase):
         self.assertEqual([row["resets_at"] for row in rows], [
             "1970-01-01T00:46:40+00:00", "1970-01-01T02:16:40+00:00"])
 
+    def test_codex_keeps_weekly_reading_when_a_newer_event_has_only_the_short_window(self):
+        sessions = Path(self.home) / "sessions"
+        sessions.mkdir()
+        (sessions / "sample.jsonl").write_text(
+            '{"timestamp":"2027-01-15T05:00:00Z","type":"event_msg","payload":'
+            '{"type":"token_count","rate_limits":{"primary":{"used_percent":12},'
+            '"secondary":{"used_percent":37,"window_minutes":10080,"resets_in_seconds":18000}}}}\n'
+            '{"timestamp":"2027-01-15T07:50:00Z","type":"event_msg","payload":'
+            '{"type":"token_count","rate_limits":{"primary":{"used_percent":19,'
+            '"window_minutes":300,"resets_at":1800003600},"secondary":null}}}\n')
+        now = 1_800_000_000
+        rows = usage.codex_records(["codex"], sessions, now)
+        by_window = {row["window"]: row for row in rows}
+        self.assertEqual(set(by_window), {"5-hour", "weekly"})
+        self.assertEqual(by_window["5-hour"]["used_pct"], 19)
+        weekly = by_window["weekly"]
+        self.assertEqual(weekly["used_pct"], 37)
+        self.assertEqual(weekly["resets_at"], "2027-01-15T10:00:00+00:00")
+        self.assertEqual(usage.stale_reason(weekly, now), "read 3h ago")
+
     def _limit_line(self, used):
         return json.dumps({"type": "event_msg", "payload": {"rate_limits": {
             "primary": {"used_percent": used, "window_minutes": 300, "resets_in_seconds": 60}}}})
@@ -47,7 +67,10 @@ class UsageTests(unittest.TestCase):
         os.utime(old, (1000, 1000))
         new = sessions / "new.jsonl"
         filler = ("x" * 1000 + "\n") * 2000  # 2 MB of lines before the reading
-        new.write_text(self._limit_line(40) + "\n" + filler + self._limit_line(55) + "\n")
+        complete = json.loads(self._limit_line(55))
+        complete["payload"]["rate_limits"]["secondary"] = {
+            "used_percent": 32, "window_minutes": 10080, "resets_at": 5000}
+        new.write_text(self._limit_line(40) + "\n" + filler + json.dumps(complete) + "\n")
         os.utime(new, (2000, 2000))
         opened = []
         real_open = Path.open
@@ -58,7 +81,7 @@ class UsageTests(unittest.TestCase):
 
         with mock.patch.object(Path, "open", counting_open):
             rows = usage.codex_records(["codex"], sessions, 1000)
-        self.assertEqual([row["used_pct"] for row in rows], [55])
+        self.assertEqual([row["used_pct"] for row in rows], [55, 32])
         self.assertEqual(opened, ["new.jsonl"])  # the older file is never opened
 
     def test_codex_falls_back_to_an_older_file_when_the_newest_has_no_reading(self):
