@@ -637,7 +637,15 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    Read its latest run log tail and record one decision on the ticket: factory
    fault (file a factory ticket and keep the runaway hold), brief problem
    (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
-   once with the reason, then clear `loom:runaway`). Do not clear a factory
+   once with the reason, then clear `loom:runaway`), or external hold (an
+   unmet precondition that no lane can fix). For an external hold with an
+   open pull request, run `python3 -m bus.brain external-hold OWNER/NAME#N
+   --precondition TEXT --evidence TEXT`. Give the unmet precondition and the
+   concrete evidence that would lift the hold. The command adds one unticked
+   merge hold box and posts the decision with the pull request link on the
+   ticket. Include the printed decision in the tick journal. If there is no
+   open pull request, record the decision on the ticket as usual. Keep
+   `loom:runaway` while the external hold stands. Do not clear a factory
    fault hold until its fix ships. A held ticket is `loom:failed`, never a
    live claim: its last run has ended, and once the hold is cleared the
    factory moves it up the model ladder.
@@ -717,6 +725,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE --model MODEL --note TEXT`
    (lane and model by Lane choice), where TEXT starts with the line
    `<!-- loom:rung 0 -->`, which starts its ladder again.
+   If a failed ticket waits on an external precondition, record the hold
+   as in step 2 and leave the pull request open.
    Re-brief any other failed ticket with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with

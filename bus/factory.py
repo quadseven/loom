@@ -1561,7 +1561,8 @@ def missing_criteria(ticket_body: str, pull_body: str) -> List[str]:
     missing = []
     for criterion in ticket:
         _, _, text = criterion.partition(" ")
-        if criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE:
+        if (text.startswith(hold_boxes.EXTERNAL_HOLD_PREFIX)
+                or criteria_gate.kind(NOT_BUILT_RE.sub("", text)) != criteria_gate.CODE):
             continue
         checked, not_built = states.get(criterion_key(text), (False, False))
         if not checked and not not_built:
@@ -3181,6 +3182,8 @@ class Factory:
         if issue is None:
             return
         number = int(pr["number"])
+        if self._ticket_hold_stands(repo, number, issue):
+            return
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         # AI-REVIEW 2026-11-11 [gpt-6-luna/subscription] 2956-Q-pull:
         # Separate advisory linking and reversible waits from review judgment.
@@ -3208,6 +3211,14 @@ class Factory:
                 and self.now - ended <= REVIEW_GRACE):
             return  # the review the lane asked for has not answered yet
         self._judge(repo, number, full, issue, comments, review, sensitive)
+
+    def _ticket_hold_stands(self, repo: str, number: int, issue: Dict[str, Any]) -> bool:
+        """Leave a pull request's branch alone while its ticket has a merge hold."""
+        if not hold_boxes.hold_box_reason(str(issue.get("body") or "")):
+            return False
+        if self._lock(repo) == number:
+            self._unlock(repo, number)
+        return True
 
     def _link_stack_advisory(self, repo: str, number: int, full: Dict[str, Any],
                              issue: Dict[str, Any]) -> None:
@@ -3841,7 +3852,7 @@ class Factory:
         if association is None:
             return  # no ticket in this repo: not a lane pull request to maintain
         issue = self._hygiene_issue(repo, association, tickets)
-        if issue is None:
+        if issue is None or self._ticket_hold_stands(repo, number, issue):
             return
         full = self.gh.rest("GET", "/repos/%s/pulls/%d" % (repo, number)).data or {}
         sha = str((full.get("head") or {}).get("sha") or "")
@@ -4067,8 +4078,6 @@ class Factory:
             return
         if self.now - _KEPT_AT.get((repo, number), float("-inf")) < KEEP_CURRENT_COOLDOWN:
             return  # brought up to date less than the cooldown ago
-        if hold_boxes.hold_box_reason(str(issue.get("body") or "")):
-            return  # an unticked hold box: the ticket's pull request is not touched
         if self._hold_stands(repo, number, sha, _author(full)):
             return
         done = self.gh.rest("PUT", "/repos/%s/pulls/%d/update-branch" % (repo, number),

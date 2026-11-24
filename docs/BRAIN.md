@@ -447,6 +447,12 @@ and the box (`blocked: OWNER/NAME#N unticked hold-before-merge box '...'`),
 and `bus.brain status` shows the same blocker instead of READY. Tick the box
 once its proof is in, then merge.
 
+When a brain records an external hold, `bus.brain external-hold` adds the
+box to the ticket and posts the decision with a link to its open pull
+request. The factory skips judging and branch hygiene for a pull request
+while its own ticket has an unticked hold box. It releases any landing lock
+that pull request holds.
+
 ## Onboarding a repo
 
 `python3 -m bus.brain onboard <owner/name> [--review-check NAME] [--operator LOGIN]` readies a

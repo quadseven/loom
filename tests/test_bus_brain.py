@@ -134,6 +134,45 @@ def merge_takes(ticket=4):
 
 
 class BrainTests(unittest.TestCase):
+    def test_external_hold_tick_records_one_box_and_links_the_open_pull_request(self):
+        issue = {"state": "open", "body": BODY,
+                 "labels": [{"name": "loom:ticket"}, {"name": "loom:failed"},
+                            {"name": "loom:runaway"}]}
+        expected = BODY.replace("## Acceptance criteria\n", "## Acceptance criteria\n\n"
+                                "- [ ] Hold: do not merge. External precondition: service recovery. "
+                                "Evidence to lift: the health check returns HTTP 200.\n")
+        pulls = [{"number": 50, "head": {"ref": "loom/8-service"}}]
+        link = "https://github.com/%s/pull/50" % REPO
+        comment = ("External hold stands for %s. External precondition: service recovery. "
+                   "Evidence to lift: the health check returns HTTP 200." % link)
+        fake = Fake(reply(200, issue), reply(200, pulls), reply(200, {}),
+                    reply(200, []), reply(201, {"body": comment}),
+                    reply(200, dict(issue, body=expected)), reply(200, pulls),
+                    reply(200, [{"body": comment}]),
+                    reply(200, dict(issue, body=expected.replace("[ ] Hold:", "[x] Hold:"))),
+                    reply(200, pulls))
+        gh = GitHub("t", transport=fake)
+        args = ["external-hold", "%s#8" % REPO, "--precondition", "service recovery",
+                "--evidence", "the health check returns HTTP 200"]
+        with unittest.mock.patch.object(brain, "GitHub", return_value=gh), \
+                unittest.mock.patch.object(brain, "auth_from_env", return_value="t"), \
+                unittest.mock.patch.object(brain, "lock_repo_default", return_value=REPO), \
+                unittest.mock.patch.object(brain, "check_acting_brain"), \
+                contextlib.redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.assertEqual(brain.main(args), 0)
+            args[-1] = "a successful health check"
+            self.assertEqual(brain.main(args), 0)
+            self.assertEqual(brain.main(args), 0)
+        writes = [(m, url.rsplit("api.github.com", 1)[-1], data)
+                  for m, url, data in fake.calls if m != "GET"]
+        self.assertEqual(writes, [
+            ("PATCH", "/repos/%s/issues/8" % REPO, {"body": expected}),
+            ("POST", "/repos/%s/issues/8/comments" % REPO, {"body": comment}),
+        ])
+        self.assertEqual(output.getvalue().splitlines(), [comment])
+        self.assertTrue(hold_boxes.hold_box_reason(expected))
+        fake.assert_all_used()
+
     def test_prioritize_sets_and_replaces_priority_without_changing_body_content(self):
         original = "Difficulty: medium\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
         changed = "Difficulty: medium\nPriority: P1\n\n## Why\nExact text.  \n\n## What\nKeep this.\n"
