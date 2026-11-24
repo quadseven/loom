@@ -339,6 +339,30 @@ CHECK_WORKERS="${LOOM_CHECK_WORKERS:-2}"
 # shellcheck source=lanes/build_jobs.sh
 . "$LOOM_ROOT/lanes/build_jobs.sh" || exit 1
 REPO_OWNERS=" ${LOOM_REPO_OWNERS:-} "
+# A lane LOOM_LANE_APPS names writes as that App instead (bus/lane_apps.py):
+# its push, its pull request, its comments and its commits all carry the
+# mapped App's identity. The App's settings replace the lanes App's, and a key
+# file of the lanes App is dropped so the mapped key is the one read. An
+# unmapped lane keeps the lanes App unchanged. A map that cannot be read, or an
+# App the lane cannot mint a token for, stops the lane: it never writes as
+# another App instead.
+if [ -n "${LOOM_LANE_APPS:-}" ]; then
+  LANE_IDENTITY="$(cd "$LOOM_ROOT" && python3 -B -m bus app lane-identity "$SLOT")" || {
+    echo "lane $SLOT: LOOM_LANE_APPS cannot be read; the lane does not run" >&2
+    exit 1
+  }
+  if [ -n "$LANE_IDENTITY" ]; then
+    {
+      IFS= read -r LANE_APP_ID && IFS= read -r LANE_APP_INSTALLATION &&
+        IFS= read -r LANE_APP_KEY_SSM && IFS= read -r LANE_GIT_NAME && IFS= read -r LANE_GIT_EMAIL
+    } <<< "$LANE_IDENTITY" || { echo "lane $SLOT: LOOM_LANE_APPS gave an unreadable identity" >&2; exit 1; }
+    export LOOM_GITHUB_APP_ID="$LANE_APP_ID" LOOM_GITHUB_APP_INSTALLATION_ID="$LANE_APP_INSTALLATION" \
+      LOOM_GITHUB_APP_KEY_SSM="$LANE_APP_KEY_SSM" \
+      GIT_AUTHOR_NAME="$LANE_GIT_NAME" GIT_COMMITTER_NAME="$LANE_GIT_NAME" \
+      GIT_AUTHOR_EMAIL="$LANE_GIT_EMAIL" GIT_COMMITTER_EMAIL="$LANE_GIT_EMAIL"
+    unset LOOM_GITHUB_APP_KEY_FILE
+  fi
+fi
 # A lane with GitHub App settings (LOOM_GITHUB_APP_*, the Loom Lanes App)
 # writes as that App, never as the operator (loom#1142): lanes opened 58 pull
 # requests as the operator in a day. It clones over https, and each run mints
