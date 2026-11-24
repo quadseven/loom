@@ -100,8 +100,38 @@ class VerifyHandoffTest(unittest.TestCase):
         self.station._proven = lambda repo, number: True
         self.assertEqual(self.station._find_verify_handoff_candidates(), [])
 
-    def test_old_live_ticket_gets_one_linked_lane_verify_ticket(self):
+    def test_prose_live_box_without_search_needles_is_handed_off(self):
+        self.source["body"] = self.source["body"].replace("`ready`", "ready")
+        candidates = self.station._find_verify_handoff_candidates()
+        self.assertEqual([(repo, issue["number"]) for repo, issue in candidates],
+                         [(REPO, 100)])
+
+    def test_coverage_stays_false_while_newer_verify_items_remain(self):
+        self.shipped_ticket(101, DAY)
+        self.station._shipped_stamp = lambda repo, issue: (
+            T0 - (15 if issue["number"] == 100 else 1) * DAY)
         self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)
+        self.station._find_verify_handoff_candidates()
+
+        existing = self.station._verify_handoff_tickets
+        self.assertEqual(existing, {"%s#100" % REPO})
+        self.assertEqual(self.station._verify_due_tickets, existing | {"%s#101" % REPO})
+        self.assertFalse(self.station._verify_handoff_coverage(
+            existing, self.station._verify_due_tickets))
+
+    def test_unhanded_stale_live_item_keeps_coverage_false(self):
+        self.station._find_verify_handoff_candidates()
+        self.assertEqual(self.station._verify_due_tickets, {"%s#100" % REPO})
+        self.assertFalse(self.station._verify_handoff_coverage(
+            self.station._verify_handoff_tickets, self.station._verify_due_tickets))
+
+    def test_old_live_ticket_gets_one_linked_lane_verify_ticket(self):
+        candidates = self.station._find_verify_handoff_candidates()
+        facts = invariants.Facts(
+            T0, verify_handoff_tickets=self.station._verify_handoff_tickets,
+            verify_handoff_candidates=candidates,
+            verify_due_tickets=self.station._verify_due_tickets)
+        self.station._create_verify_handoffs(facts)
 
         (handoff,) = self.handoffs()
         self.assertEqual(handoff["state"], "open")
@@ -110,6 +140,7 @@ class VerifyHandoffTest(unittest.TestCase):
         self.assertIn("Part of #%d" % GOAL, handoff["body"])
         self.assertIn("loom:verify-handoff", self.label_names(handoff))
         self.assertNotIn("loom:verify-handoff", self.label_names(self.source))
+        self.assertTrue(facts.verify_handoff_coverage)
 
     def test_next_pass_does_not_create_a_duplicate_and_resume_omits_both_tickets(self):
         self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)

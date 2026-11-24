@@ -5486,34 +5486,49 @@ class Station:
             for issue in issues:
                 if not isinstance(issue, dict) or "pull_request" in issue:
                     continue
-                names = _label_names(issue)
-                if (issue.get("state") != "open" or "loom:shipped" not in names
-                        or "loom:verified" in names or brain.WAIT_LIVE_EVENT in names
-                        or tickets.verify_handoff_source(issue) is not None):
-                    continue
-                key = "%s#%s" % (repo, issue.get("number"))
-                due_tickets.add(key)
-                if key in handoff_tickets:
-                    continue
-                if (not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
-                        or tickets.owned_elsewhere(issue, self.s.authors,
-                                                   self.s.briefers) is not None):
-                    continue
-                body = str(issue.get("body") or "")
-                if not (live_needles(body) or self._adapter_can_verify(repo, issue)):
-                    continue
-                shipped_at = self._shipped_stamp(repo, issue)
-                if shipped_at >= handoff_cutoff or self._proven(repo, int(issue["number"])):
-                    continue
-                issue["_verify_handoff_shipped_at"] = shipped_at
-                candidates.append((repo, issue))
+                candidate = self._verify_handoff_candidate(
+                    repo, issue, handoff_cutoff, handoff_tickets, due_tickets)
+                if candidate is not None:
+                    candidates.append(candidate)
         self._verify_handoff_tickets = handoff_tickets
         self._verify_due_tickets = due_tickets
         return candidates
 
+    def _verify_handoff_candidate(self, repo: str, issue: Dict[str, Any], cutoff: float,
+                                  handoff_tickets: set,
+                                  due_tickets: set) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Track an active verify item and return an eligible stale Live item."""
+        names = set(_label_names(issue))
+        if (issue.get("state") != "open" or "loom:ticket" not in names
+                or "loom:shipped" not in names or "loom:verified" in names
+                or brain.WAIT_LIVE_EVENT in names
+                or tickets.verify_handoff_source(issue) is not None):
+            return None
+        if issue.get("assignees") or any(name.lower().startswith("claim:") for name in names):
+            return None
+        body = str(issue.get("body") or "")
+        key = "%s#%d" % (repo, int(issue["number"]))
+        due_tickets.add(key)
+        if key in handoff_tickets:
+            return None
+        live = any(kind == criteria_gate.LIVE
+                   for kind, _ in criteria_gate.needing_evidence(body))
+        if not live:
+            return None
+        shipped_at = self._shipped_stamp(repo, issue)
+        if shipped_at >= cutoff or self._proven(repo, int(issue["number"])):
+            return None
+        if (criteria_gate.open_operator_criteria(body) or not proof.criteria(body)
+                or _ticket_goal(issue) is None
+                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers) is not None):
+            return None
+        issue["_verify_handoff_shipped_at"] = shipped_at
+        return repo, issue
+
     def _verify_handoff_coverage(self, tickets_with_handoffs: set,
                                  verify_due_tickets: Optional[set]) -> Optional[bool]:
-        """Whether each currently due source has an open lane verify ticket."""
+        """Whether every current verify-due item has an open lane verify ticket."""
         if verify_due_tickets is None:
             return None
         return verify_due_tickets.issubset(tickets_with_handoffs)

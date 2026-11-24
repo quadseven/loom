@@ -492,11 +492,10 @@ class Facts:
     # Shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS (loom#3509):
     # candidates for verify handoff tickets.
     verify_handoff_candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
-    # Whether every currently verify-due shipped ticket has an open lane
-    # verify ticket. Unknown stays None and never suppresses a breach.
+    # Whether every current verify-due source has an open lane verify ticket.
+    # Unknown stays None and never suppresses a breach.
     verify_handoff_coverage: Optional[bool] = None
-    # The current verify-due source keys, used to include tickets handed off
-    # during this same station pass in the coverage decision.
+    # Current verify-due source keys for the handoff coverage decision.
     verify_due_tickets: Optional[set] = None
 
 

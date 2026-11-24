@@ -1525,6 +1525,17 @@ class InvariantTest(unittest.TestCase):
         self.assertEqual([breach.invariant for breach in invariants.brain_failing(facts)],
                          ["brain-failing"])
 
+    def test_handoff_coverage_does_not_hide_other_failed_steps(self):
+        verify = "verify degraded: only 1 of 26 verify-due items attempted"
+        status = "status failed: GitHub answered 502"
+        journals = [self.j(T0 - 3600, steps=(verify, status)),
+                    self.j(T0 - 600, steps=(verify, status))]
+        facts = Facts(T0, journals=journals, verify_handoff_coverage=True)
+        [breach] = invariants.brain_failing(facts)
+        self.assertEqual(breach.evidence, ("Tick %s on %s: %s" % (
+            stamp(T0 - 3600), "#%d" % GOAL, status),
+            "Tick %s on %s: %s" % (stamp(T0 - 600), "#%d" % GOAL, status)))
+
     def test_failed_steps_reads_the_step_lines_only(self):
         body = journal(T0) + "\n- Waiting: #12 failed on lane codex\n- Brief step: degraded, cap reached"
         self.assertEqual(invariants.failed_steps(body),
