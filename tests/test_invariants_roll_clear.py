@@ -238,7 +238,18 @@ class RollClearTest(unittest.TestCase):
             epic(42)
         ]
         # Run again with shapes read - the tracking issue should be rewritten to "none"
-        self.run_at(T0 + invariants.CHECK_EVERY)
+        def other_breaches(facts, say):
+            self.assertIsNotNone(facts.shapes)
+            shape = next(shape for shape in facts.shapes if shape.goal.key ==
+                         "%s#%d" % (TARGET_REPO, GOAL))
+            self.assertEqual([item.title for item in shape.epics],
+                             ["Epic: first batch", "Epic: second batch", "Epic: part 42"])
+            return [invariants.Breach("budget-probe", "budget-probe-%d" % n,
+                                      "Budget probe %d" % n, (), T0)
+                    for n in range(invariants.WRITES_MAX)]
+
+        with mock.patch.object(invariants, "check", side_effect=other_breaches):
+            self.run_at(T0 + invariants.CHECK_EVERY)
         # The issue should still exist but its body should now say "none"
         updated = self.gh.issues[issue_number]
         self.assertEqual(updated["state"], "open")
@@ -269,6 +280,8 @@ class RollClearTest(unittest.TestCase):
         # After CLEAR_AFTER: closes
         self.run_at(T0 + invariants.CHECK_EVERY + invariants.CLEAR_AFTER)
         self.assertEqual(self.gh.issues[issue_number]["state"], "closed", self.said)
+        notes = self.gh.comments[(FACTORY_REPO, issue_number)]
+        self.assertTrue(any(invariants.CLEARED_TEXT in note["body"] for note in notes), notes)
 
     def test_epic_title_shared_tracking_issue_stays_open_when_shapes_not_read(self):
         """When shapes are NOT read (facts.shapes is None), the tracking issue
