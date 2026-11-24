@@ -222,32 +222,46 @@ def _build_brain_cards(record, journals, now):
     return brains
 
 
+_CLAIM_LINE_RE = re.compile(r"Claimed for lane (\S+)")
+_ISSUE_NUM_RE = re.compile(r"/issues/(\d+)$")
+_LANE_PR_RE = re.compile(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(\d+)", re.M)
+
+
+def _matching_lane_prs(pull_requests, wanted_refs):
+    """Return {ref: pr} for the first PR matching each wanted (repo, number) ref."""
+    if not wanted_refs:
+        return {}
+    pr_by_ref = {}
+    for pr in pull_requests or []:
+        parsed = _lane_pr_ticket(pr)
+        if parsed and parsed in wanted_refs and parsed not in pr_by_ref:
+            pr_by_ref[parsed] = pr
+            if len(pr_by_ref) == len(wanted_refs):
+                break
+    return pr_by_ref
+
+
 def _build_lane_cards(lanes, tickets, pull_requests, comments, now):
-    ticket_by_lane = {}
-    for ticket in tickets or []:
-        if ticket.get("lane") and ticket.get("state") in ("running", "pr"):
-            ticket_by_lane[ticket["lane"]] = ticket
+    ticket_by_lane = {t["lane"]: t for t in tickets or []
+                      if t.get("lane") and t.get("state") in ("running", "pr")}
     claim_times = _claim_times(comments)
     lane_cards = []
+    wanted_refs = set()
     for lane in lanes or []:
         name = lane.get("lane")
         ticket = ticket_by_lane.get(name)
+        if ticket:
+            wanted_refs.add((ticket.get("repo"), str(ticket.get("number"))))
+        claim = next((lbl for lbl in (ticket or {}).get("labels", []) if str(lbl).startswith("claim:")), None)
         lane_cards.append({"lane": name, "holder": "muse" if name == "muse" else "lane machine",
                            "heartbeat": lane.get("heartbeat"), "ticket": ticket,
                            "state": lane.get("state"), "reason": lane.get("reason"),
                            "age": _age(lane.get("heartbeat"), now),
-                           "run_started": claim_times.get(_ticket_key(ticket)),
-                           "claim": next((label for label in (ticket or {}).get("labels", [])
-                                          if str(label).startswith("claim:")), None)})
-    prs = []
-    for pr in pull_requests or []:
-        parsed = _lane_pr_ticket(pr)
-        if parsed:
-            prs.append((parsed, pr))
+                           "run_started": claim_times.get(_ticket_key(ticket)), "claim": claim})
+    pr_by_ref = _matching_lane_prs(pull_requests, wanted_refs)
     for lane in lane_cards:
         ticket = lane["ticket"]
-        lane["pull_request"] = next((pr for ref, pr in prs if ticket and ref ==
-                                      (ticket.get("repo"), str(ticket.get("number")))), None)
+        lane["pull_request"] = pr_by_ref.get((ticket.get("repo"), str(ticket.get("number")))) if ticket else None
     return lane_cards
 
 
@@ -260,9 +274,11 @@ def _ticket_key(ticket):
 def _claim_times(comments):
     claims = {}
     for comment in comments or []:
-        body = str(comment.get("body") or "")
-        match = re.match(r"Claimed for lane (\S+)", body)
-        issue = re.search(r"/issues/(\d+)$", str(comment.get("issue_url") or ""))
+        body = comment.get("body")
+        if not body or not isinstance(body, str) or not body.startswith("Claimed for lane "):
+            continue
+        match = _CLAIM_LINE_RE.match(body)
+        issue = _ISSUE_NUM_RE.search(str(comment.get("issue_url") or ""))
         if match and issue and comment.get("repo"):
             key = str(comment["repo"]) + "#" + issue.group(1)
             claims[key] = comment.get("created_at")
@@ -270,8 +286,10 @@ def _claim_times(comments):
 
 
 def _lane_pr_ticket(pr):
-    match = re.search(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(\d+)",
-                      str(pr.get("body") or ""), re.M)
+    body = pr.get("body")
+    if not body or not isinstance(body, str) or "Loom ticket " not in body:
+        return None
+    match = _LANE_PR_RE.search(body)
     return (match.group(1) + "/" + match.group(2), match.group(3)) if match else None
 
 
