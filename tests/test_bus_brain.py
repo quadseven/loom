@@ -3027,6 +3027,8 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.reviews = [self.grug("APPROVED", HEAD)]
         self.pr_comments = []
         self.merges = []
+        self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
+                         "committer": {"login": "web-flow"}}]
 
     @staticmethod
     def grug(state, commit):
@@ -3038,7 +3040,7 @@ class HeadApprovalMergeTests(unittest.TestCase):
     def marker(login, head=HEAD, association="OWNER", app=None, verdict="APPROVE"):
         return {"id": 11, "user": {"login": login, "type": "User"},
                 "author_association": association, "performed_via_github_app": app,
-                "created_at": "2030-01-01T13:00:00Z",
+                "created_at": "2030-01-01T13:00:00Z", "updated_at": "2030-01-01T13:00:00Z",
                 "body": "Reviewed.\n<!-- fleet:review v1 verdict=%s head=%s -->\n" % (verdict, head)}
 
     def transport(self, method, url, headers, body):
@@ -3074,6 +3076,8 @@ class HeadApprovalMergeTests(unittest.TestCase):
             return reply(200, {"state": "success", "total_count": 0, "statuses": []})
         if method == "GET" and path.startswith("/repos/%s/pulls/8/reviews" % REPO):
             return reply(200, self.reviews)
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/commits" % REPO):
+            return reply(200, self.commits)
         if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
             return reply(200, self.pr_comments)
         if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
@@ -3169,6 +3173,72 @@ class HeadApprovalMergeTests(unittest.TestCase):
         self.pr_comments = [self.marker("example-owner"),
                             self.marker("example-owner", verdict="REQUEST_CHANGES")]
         self.refused("no approval on head")
+
+    def test_an_edited_marker_does_not_merge(self):
+        # A marker edited after posting could carry a head its author never
+        # reviewed: only an unedited marker counts.
+        self.reviews = []
+        edited = self.marker("example-owner")
+        edited["updated_at"] = "2030-01-01T14:00:00Z"
+        self.pr_comments = [edited]
+        self.refused("no approval on head")
+
+    def test_a_marker_from_a_fleet_or_automation_login_does_not_merge(self):
+        # The merging client (LOOM_GITHUB_LOGIN), this Loom's own logins
+        # (LOOM_BRIEF_AUTHORS, LOOM_TRUSTED_BRIEFERS), a fleet agent login and
+        # a check bot are automation, never an independent reviewer, even
+        # when GitHub reads them as a person with an OWNER association.
+        self.reviews = []
+        for login in ("example-station", "example-brain", "example-briefer",
+                      "agent-openai-dot", "github-actions"):
+            self.pr_comments = [self.marker(login)]
+            with self.subTest(login=login):
+                with self.assertRaisesRegex(ValueError, "no approval on head"):
+                    brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
+                                env=dict(self.ENV, LOOM_TRUSTED_BRIEFERS="example-briefer"))
+        self.assertEqual(self.merges, [])
+
+    def test_a_marker_from_a_commit_author_or_committer_does_not_merge(self):
+        # Whoever wrote or pushed a commit on the pull request cannot review it.
+        self.reviews = []
+        self.commits.append({"sha": "c" * 40, "author": {"login": "example-owner"},
+                             "committer": {"login": "web-flow"}})
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+        self.commits[-1] = {"sha": "c" * 40, "author": {"login": "example-lane"},
+                            "committer": {"login": "example-owner"}}
+        self.refused("no approval on head")
+
+    def test_a_review_bot_approval_does_not_count_when_it_committed(self):
+        self.commits.append({"sha": "c" * 40, "author": {"login": "grug-tribe[bot]"},
+                             "committer": {"login": "web-flow"}})
+        self.refused("no approval on head")
+
+    def test_a_commit_with_no_github_login_refuses_the_merge(self):
+        # Commit author and committer are client-set: a commit no GitHub
+        # login is tied to has an unknown writer, who may be the approver.
+        for role in ("author", "committer"):
+            self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
+                             "committer": {"login": "web-flow"}}]
+            self.commits[0][role] = None
+            with self.subTest(role=role):
+                self.refused("unknown writer")
+
+    def test_a_truncated_commit_list_refuses_the_merge(self):
+        # GitHub lists at most 250 commits of a pull request.
+        self.commits = [{"sha": "%040x" % n, "author": {"login": "example-lane"},
+                         "committer": {"login": "web-flow"}} for n in range(250)]
+        self.refused("250 or more commits")
+
+    def test_unreadable_commits_refuse_the_merge(self):
+        inner = self.transport
+
+        def failing(method, url, headers, body):
+            if "/pulls/8/commits" in url:
+                return reply(500, {"message": "boom"})
+            return inner(method, url, headers, body)
+        self.transport = failing
+        self.refused("commits unreadable")
 
     def test_unreadable_reviews_refuse_the_merge(self):
         inner = self.transport

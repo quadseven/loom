@@ -1977,13 +1977,21 @@ re-reading the review list. `bus.brain merge` keeps its own checks.
 current head (loom#3543), the merge gate's `independent-review` row: the
 review bot app's newest approve-or-reject review is `APPROVED` with the head
 as its commit, or a person whose author association is `OWNER`, `MEMBER` or
-`COLLABORATOR`, who is not the pull request author, posted an issue comment
-directly (not through a GitHub App) whose newest marker line is
-`<!-- fleet:review v1 verdict=APPROVE head=<40-hex head sha> -->` for the
-head. A review check that concluded success, neutral or skipped is no
-approval, an approval on an older head is stale, and the review bot's
-standing `CHANGES_REQUESTED` on the head refuses whatever else approved. A
-review or comment list that cannot be read refuses. The refusal reads
+`COLLABORATOR` posted an issue comment directly (not through a GitHub App),
+never edited it (`updated_at` equals `created_at`), and its newest marker
+line is `<!-- fleet:review v1 verdict=APPROVE head=<40-hex head sha> -->`
+for the head. Nobody who opened the pull request or authored or committed
+any of its commits approves it, the review bot included. Commit author and
+committer are client-set, so a commit whose author or committer has no
+GitHub login (an unknown writer) refuses, and so does a pull request of 250
+or more commits, past what GitHub lists. No automation login
+approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+`LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
+(github-actions, copilot, dependabot, renovate). A review check that
+concluded success, neutral or skipped is no approval, an approval on an
+older head is stale, and the review bot's standing `CHANGES_REQUESTED` on
+the head refuses whatever else approved. A review, comment or commit list
+that cannot be read refuses. The refusal reads
 `blocked: no approval on head ...` or `blocked: grug-tribe[bot] requested
 changes on head ...`.
 When a trusted brain fix is still pending on the linked ticket, status adds
