@@ -67,6 +67,29 @@ codex_lane_home() {
   printf '%s\n' "$dest"
 }
 
+claude_lane_print() {
+  if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
+    # A cluster pod has no operator settings file. In print mode the CLI
+    # needs permission to edit and run tests. The pod is the isolation.
+    CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+      claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$@" < /dev/null
+  else
+    timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$@" < /dev/null
+  fi
+}
+
+claude_lane_cli() {
+  local slot="${SLOT:-claude}" root="${LOOM_ROOT:-}"
+  if [ -z "${LOOM_HOME:-}" ] || [ -z "$root" ]; then
+    claude_lane_print "$1"
+    return $?
+  fi
+  claude_lane_print --output-format stream-json --verbose "$1" |
+    (unset CLAUDE_CODE_OAUTH_TOKEN; PYTHONPATH="$root" python3 -B -m bus.meter \
+      --claude-stream "$LOOM_HOME/state/usage/$slot.meter.json")
+  return "${PIPESTATUS[0]}"
+}
+
 agent_cli() {
   local uv_env=() uv_dir=() last=() codex_home="" effort=()
   # LOOM_CODEX_EFFORT: the reasoning effort of a codex lane run, passed as
@@ -86,18 +109,7 @@ agent_cli() {
     uv_dir=(--add-dir "$AGENT_UV_DIR")
   fi
   case "$1:$2" in
-    claude:lane)
-      if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
-        # A cluster pod has no operator settings file that allows edits, and
-        # print mode cannot answer a permission prompt: the CLI denied every
-        # Edit, Write and shell call, exited 0 and the run ended "agent made
-        # no commit". acceptEdits plus the shell tool lets it edit and run
-        # the tests; the pod is the isolation.
-        CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-          claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$3" < /dev/null
-      else
-        timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$3" < /dev/null
-      fi ;;
+    claude:lane) claude_lane_cli "$3" ;;
     claude:brain) timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" \
       --permission-mode bypassPermissions "$3" < /dev/null ;;
     codex:lane) codex_home="$(codex_lane_home)" || return 2

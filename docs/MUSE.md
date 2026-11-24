@@ -890,7 +890,9 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    and stays to its resume items, and `journal` refuses it. With `--holder`,
    `journal` also puts the station's `- Steps:` line last: each step's
    minutes from the tick record and the elapsed line; write no such line
-   yourself. It states the goal's metrics against the last journal,
+   yourself. From a remote machine, add the `- Fuel:` line printed by
+   `python3 -m bus.usage --live` when it has weekly readings. State the
+   goal's metrics against the last journal,
    any regression and what was done about it, and the top problem by the
    goal's measure, then the defer and done lines (Handing off stage work).
    A `- Decided: <one line>` line and a `- Model: <model>` line give the

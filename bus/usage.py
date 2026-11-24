@@ -204,9 +204,8 @@ def anthropic_records(home: str, lanes: List[str], env: Dict[str, str], now: flo
 # The runner writes each lane's heartbeat (state/usage/<lane>.json): a lane
 # held at a limit says "limit: <why>; ... until <time>" with retry_at, the
 # reset its CLI printed (lanes/agent_cli.sh classify_failure). That is the
-# only usage state the claude and agy CLIs leave: neither writes a usage
-# figure on disk. The last hold seen is kept beside the heartbeat, so the
-# Usage view still says when a lane was last limited after the hold lifts.
+# fallback when no CLI usage meter is available. The last hold seen is kept
+# beside the heartbeat so the Usage view can show it after the hold lifts.
 HOLD_UNTIL = re.compile(r";\s*(?:lane waits|unavailable) until \S+")
 
 
@@ -387,7 +386,7 @@ def _meter_records(provider: str, home: str, slots: List[str], now: float) -> Li
                          _utc_epoch(window.get("resets_at"), now, relative=False),
                          source, now, _meter_note(window))
         record["window_minutes"] = window.get("window_minutes")
-        record["observed_at"] = observed
+        record["observed_at"] = _utc_epoch(window.get("at"), now, relative=False) or observed
         records.append(record)
     if records:
         return records
@@ -544,13 +543,14 @@ def _opencode_records(home: str, slots: List[str], _env: Dict[str, str], now: fl
             samples.append(row)
         except (OSError, ValueError):
             pass
-    if not samples:
-        return [_record("opencode-go", slots, "all", None, None, None, None,
-                        "lane probe", now, "not exposed")]
-    row = max(samples, key=lambda x: x.get("at", 0))
-    return [_record("opencode-go", slots, "last 429", None, None, None,
-                    _utc_epoch(row.get("retry_after"), now), "lane probe", now,
-                    "limitName: %s" % row.get("limit_name", "unknown"))]
+    records = _meter_records("opencode-go", home, slots, now) if _newest_meter(home, slots) else []
+    if samples:
+        row = max(samples, key=lambda x: x.get("at", 0))
+        records.append(_record("opencode-go", slots, "last 429", None, None, None,
+                               _utc_epoch(row.get("retry_after"), now), "lane probe", now,
+                               "limitName: %s" % row.get("limit_name", "unknown")))
+    return records or [_record("opencode-go", slots, "all", None, None, None, None,
+                               "lane probe", now, "not exposed")]
 
 
 def _spark_records(home: str, slots: List[str], _env: Dict[str, str], now: float) -> List[Dict[str, Any]]:

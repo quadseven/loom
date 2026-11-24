@@ -30,9 +30,8 @@ table shared by `bus.brain status` and the dashboard. A ready lane is
 
 - OpenRouter: `GET /api/v1/key` - exact quota and reset times.
 - Sparks: `nvidia-smi` - GPU load directly.
-- Codex subscriptions: usage comes from its local session log. Claude and
-  agy lane usage can be supplied by the lane's own CLI meter file; no
-  provider API credentials are added to the station.
+- Subscription usage comes from Codex session logs, Claude CLI events,
+  OpenCode Go's plan check, and agy CLI meter files where available.
 - Everywhere else: self-reported burn from worker session logs, plus
  explicit rate-limit signals from the workers themselves.
 
@@ -42,15 +41,16 @@ The station collects one reading per provider window each pass
 (`state/usage/limits.json`) and uploads it to the dashboard's `/usage` page.
 Each reading names the machine that collected it (`host`).
 
-- codex: the 5-hour and weekly windows from the newest codex session log on
-  the collecting machine (`~/.codex/sessions`). A machine where codex never
-  ran says "no codex session logs on this machine"; a figure read over two
-  hours ago, or from a window that has reset since, is marked stale.
-- claude and agy: the newest lane CLI meter in
-  `state/usage/<lane>.meter.json`, when present. The reading carries the
-  CLI's observation time, used percentage, remaining amount, and reset. Until
-  the lane reports one, the board says no CLI `/usage` reading is available
-  and continues to show limit holds from its heartbeat.
+- codex: the newest reading for each of the 5-hour and weekly windows from
+  recent local session logs (`~/.codex/sessions`). A machine where codex
+  never ran says "no codex session logs on this machine."
+- claude: 5-hour and weekly readings from rate-limit events in ordinary
+  lane runs. The lane saves the figures and reset times in its CLI meter.
+- opencode-go: rolling, weekly, and monthly readings from the plan check
+  the model picker already uses before a paid run.
+- agy: the newest CLI meter when the lane supplies one.
+  Without a CLI meter, the board still shows the Claude and agy limit holds
+  from their heartbeats.
 - muse: the remote lane reports only a heartbeat, so its reading says no
   usage or limit reaches Loom and how old the heartbeat is.
 - anthropic: spend from `state/usage/spend.jsonl` against
@@ -60,6 +60,11 @@ Each reading names the machine that collected it (`host`).
   console's balance. Unset, the reading names both settings and the spend
   recorded; when every anthropic slot reports "out of credit", the credit
   reads as used up.
+
+Subscription meters in `state/usage/<lane>.meter.json` carry the observed
+time, percent used, and reset time when the provider supplies them. A
+figure over two hours old or from a window that has reset is marked stale.
+The Usage board shows the reset time and countdown for each window.
 
 `python3 -m bus.usage` collects on the lane machine only: on a machine with
 no lane heartbeat in the last 10 minutes it says so and prints no figures,

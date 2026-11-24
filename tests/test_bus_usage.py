@@ -382,6 +382,8 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(seen, [("https://dashboard.example.com/api/usage", "YOUR_HANDOFF_TOKEN_HERE")])
         self.assertIn("uploaded at 2027-01-15T07:55:00+00:00 (5m ago)", out.getvalue())
         self.assertIn("\t40.0%\t", out.getvalue())
+        self.assertIn("- Fuel: codex weekly 40% used, resets 2027-01-20T00:00:00Z", out.getvalue())
+        self.assertNotIn("YOUR_HANDOFF_TOKEN_HERE", out.getvalue())
 
     def test_live_without_the_dashboard_settings_names_them(self):
         err = io.StringIO()
