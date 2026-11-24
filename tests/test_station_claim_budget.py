@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sys
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -70,3 +71,10 @@ class ClaimBudgetTest(Base):
                 mock.patch.object(station.Station, "score_lanes", refresh):
             self.run_pass()
         refresh.assert_not_called()
+
+
+class ClaimShareTest(unittest.TestCase):
+    def test_the_claim_pass_share_leaves_at_least_half_the_target(self):
+        self.assertLessEqual(station.CLAIM_REQUEST_SHARE, 0.5)
+        self.assertEqual(int(station.PASS_REQUEST_TARGET * station.CLAIM_REQUEST_SHARE)
+                         + station.PASS_REQUEST_TARGET // 2, station.PASS_REQUEST_TARGET)

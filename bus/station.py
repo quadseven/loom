@@ -711,8 +711,8 @@ PASS_REQUEST_TARGET = 500
 # spend. Past it, its deferrable reads carry over to the next pass, so the
 # step rotation keeps room: on 2026-11-11 claim_new spent about 1000 requests
 # a pass, the rotation ran a step or two, and a full turn took four hours
-# (loom#3014).
-CLAIM_REQUEST_SHARE = 2 / 3
+# (loom#3014). It is half, so the loop keeps at least half (loom#3119).
+CLAIM_REQUEST_SHARE = 1 / 2
 # Requests the invariant filer may spend past the pass target once the
 # check's reads are done (loom#2505). The reads cost 70 to 480 counted
 # requests (warm or cold cache) and end in check-run and pull request
@@ -8682,6 +8682,10 @@ class Station:
         ledger = {ref: entry for ref, entry in (ledger.items() if isinstance(ledger, dict) else ())
                   if ref in by_ref and isinstance(entry, dict)}
         every = incident_probe.PROBE_EVERY
+        # One probe per repo per pass: a brief is named <repo>-base-check-<now>,
+        # so two incidents of one repo probed together shared a name and a
+        # worktree, and the two lanes failed each other's clone (loom#3532).
+        probed = set()
         for ref, keys in by_ref.items():
             entry = ledger.setdefault(ref, {})
             checked = entry.get("checked")
@@ -8693,6 +8697,8 @@ class Station:
             if not entry.get("open") or (self._num(at) and 0 <= self.now - at < every):
                 continue
             repo = keys[0].rpartition("#")[0]
+            if repo in probed:
+                continue
             # A probe on the head the last one failed on can only fail again.
             head = self._default_head(repo)
             if head and head == entry.get("base"):
@@ -8705,6 +8711,7 @@ class Station:
             os.replace(claiming, claiming[:-len(".claiming")] + ".md")
             entry["at"] = self.now
             entry["base"] = head
+            probed.add(repo)
             free = [x for x in free if x != lane]
             _say("handed lane %s a base check of %s for factory incident %s"
                  % (lane, keys[0].rpartition("#")[0], ref))
