@@ -2207,7 +2207,8 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
         result = self.run_lane()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.body.read_text().rstrip("\n").endswith(
-            "lane codex, model gpt-test-default.\nRefs example/repo" "#42"))
+            "lane codex, model gpt-test-default.\nRefs example/repo" "#42"
+            "\n\nSigned: lane-codex, model gpt-test-default"))
 
     def test_pr_body_writes_a_word_size_as_the_review_bots_letter(self):
         # Chief accepts only XS, S, M, L: "Size: Medium" held five lane PRs
@@ -3155,7 +3156,7 @@ printf '{"items":[{"metadata":{"labels":{"tier":"web"}},"status":{"conditions":[
 
     def kept_branch_with_failing_git(self, refuse):
         self.write_tool(self.bin / "git", """#!/usr/bin/env bash
-if [[ " $* " == *" %s "* ]]; then echo 'refused' >&2; exit 1; fi
+if [[ " $* " == *" %s"* ]]; then echo 'refused' >&2; exit 1; fi
 exec /usr/bin/git "$@"
 """ % refuse)
         self.drop_brief("T042-fix-the-thing.md", BRIEF)
@@ -7046,8 +7047,8 @@ exit %d
                   'KEY_REPEAT_MARKER="<!-- loom:key-repeat v1 -->"\n'
                   'LANE=agy SLOT=agy LOG=/dev/null NET_TIMEOUT=30 LOOM_ROOT="%s"\n'
                   'AGY_USER=loom AGY_HOME=/opt/lane AGY_BIN=/opt/lane/.local/bin/agy\n' % RUNNER.parent.parent
-                  + self.source_functions("open_issue", "upsert_sticky_comment", "file_ask",
-                                         "ask_sign_in") +
+                  + self.source_functions("signed", "open_issue", "upsert_sticky_comment",
+                                         "file_ask", "ask_sign_in") +
                   'ask_sign_in "sign-in lapsed: sign in the agy lane CLI again"\n')
         result = subprocess.run(["bash", "-c", script, "bash"], env=self.lane_env(),
                                 capture_output=True, text=True)

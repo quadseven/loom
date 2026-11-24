@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote
 
 from . import (brain, brief_check, change_class, hunt_plan, lane_markers, notify, pr_repair,
-               risk_line, tickets)
+               risk_line, signature, tickets)
 from .github import GitHub, GitHubError, RateLimited, auth_from_env
 from .labels import REMOTE_LANES
 
@@ -86,7 +86,7 @@ def _claims(comments: Sequence[Dict[str, Any]], lane: str) -> List[Tuple[int, fl
 
 
 def _claim_body(lane: str, number: int, beat: float, first: Optional[float] = None) -> str:
-    return lane_markers.claim_body(lane, number, beat, first)
+    return signature.sign(lane_markers.claim_body(lane, number, beat, first), lane)
 
 
 def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
@@ -95,7 +95,8 @@ def _hand_back(gh: GitHub, repo: str, issue: Dict[str, Any], lane: str,
     labels = [x for x in _names(issue) if x not in ("loom:running", "lane:" + lane)]
     labels.append("loom:queued")
     gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number), {"labels": labels})
-    notify.post(gh, repo, number, "[transient] %s" % reason, notify.FAILURE)
+    notify.post(gh, repo, number, signature.sign("[transient] %s" % reason, lane),
+                notify.FAILURE)
 
 
 def _pull_for(gh: GitHub, repo: str, branch: str) -> Optional[Dict[str, Any]]:
@@ -390,7 +391,7 @@ def lane_heartbeat(gh: GitHub, repo: str, lane: str = "muse",
             "body": "The station keeps lane status current here."}).data
     if not isinstance(issue, dict) or "number" not in issue:
         raise ValueError("could not locate the lane status issue")
-    body = lane_markers.heartbeat_body(lane, now)
+    body = signature.sign(lane_markers.heartbeat_body(lane, now), lane)
     # One comment per lane, edited in place: a heartbeat every tick must not
     # grow the status issue by a comment each time.
     for comment in _comments(gh, repo, int(issue["number"])):
@@ -553,6 +554,7 @@ def pr_body(repo: str, issue: Dict[str, Any], kind: str, counts: Dict[str, int],
     intent = change_class.render_intent(kind, change_class.behavior_lines(
         "", _what(str(issue.get("body") or ""))), counts)
     body = change_class.with_intent(body, risk_line.with_risk(intent, risk_text))
+    body = signature.sign(body, lane)
     found = hunt_plan.problems(body)
     if found:
         raise ValueError("the pull request body would fail the review bot's plan checks: "

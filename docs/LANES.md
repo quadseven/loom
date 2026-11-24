@@ -11,7 +11,12 @@ never merges. Heartbeats usage + model catalog to `state/usage/<lane>.json`.
   default is the remote's default branch.
 - Every run passes an explicit model: the brief's `Model:` line, else the
   lane default (`LOOM_<LANE>_MODEL`). The PR footer names the lane and the
-  model. A model outside the lane's family is refused; the `openrouter`,
+  model.
+- Every lane shares one GitHub App identity, so each lane signs what it
+  writes (`bus/signature.py`): the last line of each pull request body and
+  comment is `Signed: lane-<slot>, model <model id>`, and each commit carries
+  `Loom-Lane` and `Loom-Model` trailers. The model is the run's own, else
+  `LOOM_<SLOT>_MODEL`; signing twice leaves one line. A model outside the lane's family is refused; the `openrouter`,
   `zen` and `zai` lanes run free models only.
 - A lane may set LOOM_<SLOT>_MODELS to an ordered, space-separated model
   list. Unpinned briefs use the first model not currently limited. A provider

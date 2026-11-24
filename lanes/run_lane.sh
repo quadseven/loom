@@ -560,10 +560,10 @@ EOF
     safe_git reset -q --soft "$BASE" || return 1
     safe_git add -A || return 1
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "${TITLE:-$TICKET}" || return 1
+    safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}")" || return 1
   else
     safe_git diff --cached --quiet && return 0
-    safe_git commit -qm "Drop agent scratch files: ${dropped//$'\n'/, }" || return 1
+    safe_git commit -qm "$(commit_msg "Drop agent scratch files: ${dropped//$'\n'/, }")" || return 1
   fi
 }
 
@@ -914,10 +914,14 @@ upsert_sticky_comment() {
         --jq .body > "$old_file" 2>> "$LOG"; then
     rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
+  # The old body's signature comes off first so the merge never reads it as
+  # part of an entry; the new body is signed once.
+  PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature strip "$old_file" 2>> "$LOG" || true
   if ! PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.sticky "$mode" --marker "$marker" \
         --now "$(date -u +%FT%TZ)" --old "$old_file" "$@" < "$input_file" > "$new_file" 2>> "$LOG"; then
     rm -f "$old_file" "$input_file" "$new_file"; return 1
   fi
+  signed "$(cat "$new_file")" > "$new_file.signed" && mv "$new_file.signed" "$new_file"
   if [ -n "$id" ]; then
     timeout "$NET_TIMEOUT" gh api -X PATCH "repos/$repo/issues/comments/$id" \
       -F "body=@$new_file" > /dev/null 2>> "$LOG" || ok=1
@@ -988,7 +992,7 @@ round_changed() {
 # A reply the thread already holds is not posted again, so a re-sent round
 # never duplicates one. A reason with no commit goes in .loom-answers instead.
 post_replies() {
-  local entry thread body resolve node owner text_file
+  local entry thread body plain resolve node owner text_file
   [ -n "$REPLIES_FILE" ] && [ -f "$REPLIES_FILE" ] || return 0
   while IFS= read -r entry; do
     thread="$(jq -r '.thread' <<< "$entry")"
@@ -1010,7 +1014,10 @@ post_replies() {
       continue
     fi
     rm -f "$text_file"
-    if jq -e --arg body "$body" 'any(.data.node.comments.nodes[]?; .body == $body)' <<< "$node" > /dev/null 2>> "$LOG"; then
+    plain="$body"
+    body="$(signed "$body")"
+    # A reply posted before lanes signed holds the plain text: it counts too.
+    if jq -e --arg body "$body" --arg plain "$plain" 'any(.data.node.comments.nodes[]?; .body == $body or .body == $plain)' <<< "$node" > /dev/null 2>> "$LOG"; then
       echo "review thread $thread already holds this reply; it was not posted again" >> "$LOG"
     elif ! timeout "$NET_TIMEOUT" gh api graphql \
          -f 'query=mutation($threadId:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$threadId,body:$body}){comment{id}}}' \
@@ -1213,7 +1220,7 @@ post_no_change() {
     echo "answer could not be written"; return 1
   fi
   if ! [[ "$ISSUE_REF" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[0-9]+$ ]]; then
-    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$NO_CHANGE_TEXT" >> "$LOG" 2>&1; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$NO_CHANGE_TEXT")" >> "$LOG" 2>&1; then
       echo "answer comment failed"; return 1
     fi
     if ! mark_answered; then
@@ -2085,8 +2092,8 @@ file_ask() {
     return 0
   fi
   number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-             --label needs:human --body "$body" 2>>"$LOG" ||
-           gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$body" 2>>"$LOG")"
+             --label needs:human --body "$(signed "$body")" 2>>"$LOG" ||
+           gh issue create --repo "$FACTORY_REPO" --title "$title" --body "$(signed "$body")" 2>>"$LOG")"
   number="${number##*/}"
   case "$number" in ''|*[!0-9]*) echo "needs:human ask filing failed" >> "$LOG" ;; esac
   return 0
@@ -2365,6 +2372,29 @@ opencode_has_no_work() {
 # a shell function, so the push spells the same options out.)
 safe_git() {
   git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# Every lane shares one GitHub App identity, so each lane signs what it writes
+# (bus/signature.py): a final "Signed: lane-<slot>, model <model>" line on each
+# pull request body and comment, and Loom-Lane and Loom-Model trailers on each
+# commit. The model is the run's own ($MODEL), else LOOM_<SLOT>_MODEL.
+# signed prints $1 with exactly one signature line; commit_msg prints $1 with
+# the trailers. Both fall back to the plain text when python is unavailable, so
+# a signing fault never costs the run its comment or commit.
+signed() {
+  local out
+  out="$(printf '%s' "$1" | PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature sign \
+    --lane "$SLOT" --model "${MODEL:-}" 2>> "${LOG:-/dev/null}")" || out="$1"
+  printf '%s' "$out"
+}
+# sign_tail prints the signature on its own paragraph, to end a message whose
+# leading words must stay literal (a close comment states its reason first).
+sign_tail() { printf '\n\n%s' "$(signed "")"; }
+commit_msg() {
+  local out
+  out="$(PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.signature message \
+    --lane "$SLOT" --model "${MODEL:-}" "$1" 2>> "${LOG:-/dev/null}")" || out="$1"
+  printf '%s' "$out"
 }
 
 # The repo's validation contract: .loom/validation.conf, the same interpreter,
@@ -2784,7 +2814,7 @@ resolve_factory_incidents() {
       # Shadow mode (bus/shadow.py): the guard reads the issue and lets a
       # factory incident's close through; anything else it records and holds.
       PYTHONPATH="$LOOM_ROOT" python3 -B -m bus.shadow gh-guard --lane "$PWD"         issue close --repo "$FACTORY_REPO" "$number" >>"$LOG" 2>&1 || continue
-      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text" >>"$LOG" 2>&1 || continue
+      gh issue close --repo "$FACTORY_REPO" "$number" --comment "Cleared: $text$(sign_tail)" >>"$LOG" 2>&1 || continue
     fi
     rm -f "$file"
   done
@@ -2883,10 +2913,10 @@ file_factory_incident() {  # kind, detail
       --headline "Still failing" --items-label "Tickets seen" --item "$ticket" || true
   else
     if ! number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-      --body "$body" --label loom:factory 2>"$err")"; then
+      --body "$(signed "$body")" --label loom:factory 2>"$err")"; then
       cat "$err" >> "$LOG" 2>/dev/null
       number="$(gh issue create --repo "$FACTORY_REPO" --title "$title" \
-        --body "$body" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
+        --body "$(signed "$body")" 2>"$err")" || cat "$err" >> "$LOG" 2>/dev/null
     fi
     number="${number##*/}"
     case "$number" in ''|*[!0-9]*) number="" ;; esac
@@ -3673,7 +3703,7 @@ format_changed_files() {
   contract_run "$prefix format$paths" || { safe_git checkout -q -- $paths >> "$LOG" 2>&1; return 0; }
   safe_git add -- $paths >> "$LOG" 2>&1 || return 0
   safe_git diff --cached --quiet && return 0
-  safe_git commit -qm "format: apply ruff format to the lane's changed files" >> "$LOG" 2>&1 || return 0
+  safe_git commit -qm "$(commit_msg "format: apply ruff format to the lane's changed files")" >> "$LOG" 2>&1 || return 0
   echo "formatted $n files the change touched before the second run" >> "$LOG"
   return 0
 }
@@ -3699,7 +3729,7 @@ base_retry_turn() {
   fi
   rm -f "$TREE/$SUMMARY_FILE"
   if [ -n "$(safe_git status --porcelain)" ]; then
-    safe_git add -A && safe_git commit -qm "${TITLE:-$TICKET}: make the changed tests fail on base" >> "$LOG" 2>&1 || return 1
+    safe_git add -A && safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}: make the changed tests fail on base")" >> "$LOG" 2>&1 || return 1
   fi
 }
 
@@ -4106,7 +4136,7 @@ preserve_timedout() {
     return 1
   fi
   if [ -n "$tree_status" ] &&
-     ! { safe_git add -A && safe_git commit -qm "$TICKET: edits before the timeout"; } >> "$LOG" 2>&1; then
+     ! { safe_git add -A && safe_git commit -qm "$(commit_msg "$TICKET: edits before the timeout")"; } >> "$LOG" 2>&1; then
     printf 'the edits could not be committed in the lane tree'
     return 1
   fi
@@ -4138,7 +4168,7 @@ drop_stray_from_kept() {
   done <<EOF
 $STRAY_FILES
 EOF
-  if ! safe_git commit -qm "$TICKET: leave out files outside the brief's paths"; then
+  if ! safe_git commit -qm "$(commit_msg "$TICKET: leave out files outside the brief's paths")"; then
     echo "[$stamp] $TICKET: could not commit the removal of $(stray_list) from the kept edits"
     return 1
   fi
@@ -4161,7 +4191,7 @@ drop_stray_files() {
   done <<EOF
 $STRAY_FILES
 EOF
-  if ! safe_git commit -qm "Drop files outside the brief's paths: $(stray_list)"; then
+  if ! safe_git commit -qm "$(commit_msg "Drop files outside the brief's paths: $(stray_list)")"; then
     echo "[$stamp] $TICKET: could not commit the removal of $(stray_list)"
     return 1
   fi
@@ -4367,7 +4397,7 @@ update_fix_branch() {
     UPDATE_REASON="could not read origin/$default"; return 1
   fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
-       merge --no-edit "origin/$default" >> "$LOG" 2>&1; then
+       merge --no-edit -m "$(commit_msg "Merge origin/$default into $BRANCH")" "origin/$default" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged $default into $BRANCH" >> "$LOG"
     return 0
   fi
@@ -4403,7 +4433,7 @@ resume_earlier_attempt() {
   fi
   if timeout "$NET_TIMEOUT" git -C "$TREE" -c core.hooksPath=/dev/null -c core.fsmonitor=false \
        fetch -q origin "+refs/heads/$side:refs/remotes/origin/$side" >> "$LOG" 2>&1 &&
-     safe_git merge --no-edit "origin/$side" >> "$LOG" 2>&1; then
+     safe_git merge --no-edit -m "$(commit_msg "Merge $side into $BRANCH")" "origin/$side" >> "$LOG" 2>&1; then
     echo "[$(date -u +%FT%TZ)] $TICKET: merged the earlier attempt's branch $side" >> "$LOG"
     return 0
   fi
@@ -5452,7 +5482,7 @@ for BRIEF in "$INBOX"/*.md; do
       park "$BRIEF" "answer refused: $REASON"; continue
     fi
     rm -f "$LOGDIR/$TICKET.answer-error"
-    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$ANSWER_TEXT" >> "$LOG" 2>&1; then
+    if ! timeout "$NET_TIMEOUT" gh issue comment "$ISSUE_NUMBER" -R "$REPO" --body "$(signed "$ANSWER_TEXT")" >> "$LOG" 2>&1; then
       park "$BRIEF" "answer comment failed" transient; continue
     fi
     if ! mark_answered; then
@@ -5489,7 +5519,7 @@ for BRIEF in "$INBOX"/*.md; do
   # completes the merge.
   if [ -n "$(safe_git status --porcelain)" ] || [ -n "$CONFLICTS" ]; then
     if ! { { [ -n "$CONFLICTS" ] || safe_git checkout -q "$BRANCH"; } && safe_git add -A &&
-           safe_git commit -qm "${TITLE:-$TICKET}"; } >> "$LOG" 2>&1; then
+           safe_git commit -qm "$(commit_msg "${TITLE:-$TICKET}")"; } >> "$LOG" 2>&1; then
       park "$BRIEF" "could not commit the agent's changes" transient; continue
     fi
   fi
@@ -5818,7 +5848,7 @@ Grant the lanes' GitHub App the workflows permission (read and write), or land t
   if [ -n "$FIX_PR" ] && [ "$COMMITTED" -eq 1 ] && lane_diff_empty; then
     EMPTY_WHY="no change to push: #$FIX_PR has no diff against ${FIX_DEFAULT:-its base} after this round"
     if ! timeout "$NET_TIMEOUT" gh pr close "$FIX_PR" -R "$REPO" \
-         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge." >> "$LOG" 2>&1; then
+         --comment "Lane $SLOT closed this pull request: $EMPTY_WHY, so there is nothing to review or merge.$(sign_tail)" >> "$LOG" 2>&1; then
       echo "[$(date -u +%FT%TZ)] $TICKET: could not close the empty pull request #$FIX_PR" >> "$LOG"
       EMPTY_WHY="$EMPTY_WHY; closing it failed"
     fi
@@ -5884,6 +5914,9 @@ Review threads this round left without a reply: $UNANSWERED"
   # when the brief cannot fill it.
   [ -n "${PR_BODY:-}" ] || compose_pr_body
   [ -z "$LIVE_NOTES" ] || PR_BODY="$PR_BODY"$'\n\n'"$LIVE_NOTES"
+  # The signature is the last line a reader sees; the plan-hold marker is an
+  # HTML comment, so it goes after it (bus/signature.py reads past it).
+  PR_BODY="$(signed "$PR_BODY")"
   [ -z "$PLAN_GAPS" ] || PR_BODY="$PR_BODY"$'\n\n'"$PLAN_HOLD_MARKER"
   if ! PR_URL="$(timeout "$NET_TIMEOUT" gh pr create -R "$REPO" ${PR_BASE_ARGS[@]+"${PR_BASE_ARGS[@]}"} --head "$BRANCH" --title "${TITLE:-$TICKET}" \
        --body "$PR_BODY" 2>> "$LOG")"; then
