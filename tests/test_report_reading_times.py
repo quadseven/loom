@@ -54,10 +54,17 @@ class BacklogStatusTest(unittest.TestCase):
         owed = report.split("### Reports owed before unlock")[1].split("###")[0]
         self.assertEqual(owed.strip(), "- none")
         self.assertIn("backlog goal: no report owed", report)
+        backlog_line = next(line for line in report.splitlines()
+                            if line.startswith("- #%d " % tq.GOAL))
+        self.assertNotIn("report due", backlog_line)
+        self.assertNotIn("report overdue", backlog_line)
         # The same goal without the label is owed its report.
         report = brain.status(GitHub("t", transport=tq.GoalHome(comments, children)), [tq.REPO],
                               tq.REPO, env={"LOOM_BRIEF_AUTHORS": tq.ME}, now=tq.NOW,
                               authors=[tq.ME])
+        regular_line = next(line for line in report.splitlines()
+                            if line.startswith("- #%d " % tq.GOAL))
+        self.assertIn(" - report overdue (due ", regular_line)
         self.assertIn("#%d report OVERDUE since" % tq.GOAL,
                       report.split("### Reports owed before unlock")[1])
 

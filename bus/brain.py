@@ -506,13 +506,16 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         node = data["goals"].get(int(issue["number"])) or {}
         led = goal_ledger(issue, node, now, authors)
         comments = (node.get("comments") or {}).get("nodes") or []
+        backlog = naming.is_backlog_home(issue)
+        report_status = ("no report owed" if backlog else
+                         "report %s (due %s)" % (led["state"], led["due"] or "unknown"))
         still: Optional[quiet.Quiet] = None
         lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
-                     " - report %s (due %s)" % (
+                     " - %s" % (
                          issue["number"], issue.get("title", ""),
                          led.get("journal", "none"), led.get("report", "none"),
                          led.get("measure", "none"), led.get("action", "none"),
-                         led["state"], led["due"] or "unknown"))
+                         report_status))
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.
@@ -543,7 +546,7 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
                                 goal_breaches(issues, int(issue["number"])), now, authors)
             lines += _quiet_lines(still)
             lines.extend("  - " + reason for reason in quiet.stuck_triage(children, now))
-        if naming.is_backlog_home(issue):
+        if backlog:
             # A backlog goal posts no report on GitHub: its line is in the
             # station's twice-daily Discord digest (2026-10-25).
             lines.append("  - backlog goal: no report owed; its status is one line in the "
