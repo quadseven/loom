@@ -255,6 +255,19 @@ def _claude_windows(info: Dict[str, Any], now: float) -> Dict[str, Dict[str, Any
     return windows
 
 
+# AI-REVIEW 2026-11-24 [automated review] 4685384543 (PR #3539):
+# Separate result output from the stream loop to reduce branching there.
+def _print_claude_result(event: Dict[str, Any]) -> None:
+    result = event.get("result")
+    if isinstance(result, str):
+        print(result, flush=True)
+    errors = event.get("errors")
+    if isinstance(errors, list):
+        for error in errors:
+            if isinstance(error, str):
+                print(error, flush=True)
+
+
 def _claude_stream(path: str, stdin: Any, now: Callable[[], float]) -> None:
     """Keep only allowance figures, forwarding the result as normal CLI text."""
     windows: Dict[str, Dict[str, Any]] = {}
@@ -267,14 +280,7 @@ def _claude_stream(path: str, stdin: Any, now: Callable[[], float]) -> None:
         if not isinstance(event, dict):
             continue
         if event.get("type") == "result":
-            result = event.get("result")
-            if isinstance(result, str):
-                print(result, flush=True)
-            errors = event.get("errors")
-            if isinstance(errors, list):
-                for error in errors:
-                    if isinstance(error, str):
-                        print(error, flush=True)
+            _print_claude_result(event)
         info = event.get("rate_limit_info")
         if event.get("type") != "rate_limit_event" or not isinstance(info, dict):
             continue
