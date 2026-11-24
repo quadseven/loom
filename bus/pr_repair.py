@@ -22,7 +22,7 @@ import sys
 import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import bug_refs, hunt_plan, text
+from . import bug_refs, hunt_plan, signature, text
 
 # Headings the runner injects into the PR body, in order.
 GENERATED_HEADINGS = ("## Why", "## Summary", "## Acceptance criteria",
@@ -287,7 +287,9 @@ def _generated_start(body: str) -> int:
 
 
 def _hash_generated(body: str) -> str:
-    body = _normalise(body)
+    # The signature is not a generated section: a body that differs only by
+    # its signature is not stale, and is not edited for that alone.
+    body = signature.strip(_normalise(body))
     start = _generated_start(body)
     if start < 0:
         raise ValueError("generated headings missing")
@@ -303,7 +305,7 @@ def _split_current(body: str) -> Tuple[str, str, str]:
     generated is from ## Why through the footer rule line.
     suffix is reviewer text after the generated footer, if any.
     """
-    body = _normalise(body)
+    body = signature.strip(_normalise(body))
     start = _generated_start(body)
     if start < 0:
         raise ValueError("generated headings missing")
@@ -413,7 +415,7 @@ def reconcile_text(brief: str, current_title: str, current_body: str,
         # every round (loom#2386).
         if public and repo:
             desired_generated = public_refs(desired_generated, repo)
-        new_hash = _sha12(_normalise(desired_generated))
+        new_hash = _sha12(signature.strip(_normalise(desired_generated)))
         result["new_hash"] = new_hash
         old_hash = _hash_generated(current_body)
         result["old_hash"] = old_hash
@@ -433,11 +435,13 @@ def reconcile_text(brief: str, current_title: str, current_body: str,
         result["reason"] = "cannot split current PR body: %s" % err
         return result
 
-    new_body = desired_generated
+    new_body = signature.strip(desired_generated)
     if prefix:
         new_body = prefix + "\n\n" + new_body
     if suffix:
         new_body = new_body + "\n" + suffix
+    # The signature stays the body's last line, after any reviewer suffix.
+    new_body = signature.sign(new_body, lane, model)
 
     # A path the ticket itself names (a server path in a private repo's
     # ticket) reached the first pull request body with it; refusing it here

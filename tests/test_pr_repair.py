@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bus import hunt_plan, pr_repair, text  # noqa: E402
+from bus import hunt_plan, pr_repair, signature, text  # noqa: E402
 
 
 BRIEF = """# Brief: example-owner.example-repo-42
@@ -328,7 +328,7 @@ class ReconcileTest(unittest.TestCase):
         self.write_brief(BRIEF)
         result = pr_repair.reconcile(self.brief, "Fix the thing", old, "codex", "gpt-test", "T42")
         self.assertEqual(result["reason"], "")
-        self.assertEqual(result["body"], RUNNER_BODY)
+        self.assertEqual(result["body"], RUNNER_BODY + "\n\n" + signature.line("codex", "gpt-test"))
 
     def test_refuses_body_with_footer_rule_before_generated_sections(self):
         # A leading rule line is not a footer for the generated sections.

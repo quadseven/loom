@@ -14,6 +14,7 @@ TREE="$ROOT/tree"; WORKDIR="$ROOT/work"; TICKET=t1; TITLE=t; LOG="$ROOT/run.log"
 SUMMARY_FILE=.loom/summary.md; RUN_BRIEF="$ROOT/brief"
 mkdir -p "$TREE" "$WORKDIR"; : > "$LOG"; printf 'Build it.\n' > "$RUN_BRIEF"
 safe_git() { git -C "$TREE" "$@"; }
+commit_msg() { printf '%s' "$1"; }
 git init -q "$TREE"
 safe_git config user.email t@example.com; safe_git config user.name t
 echo one > "$TREE/a.txt"; safe_git add -A; safe_git commit -qm base
