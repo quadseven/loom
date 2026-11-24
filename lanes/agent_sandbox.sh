@@ -488,7 +488,9 @@ opencode_config() {
   case "$MODEL" in *'"'*|*'\'*) echo "refusing model with a quote or backslash" >&2; return 1 ;; esac
   # The spark lane's provider is the local endpoint, declared here: an
   # OpenAI-compatible provider named spark at LOOM_SPARK_URL (checked in
-  # spark_ready), serving the one model after "spark/". No key.
+  # spark_ready), serving the one model after "spark/". With a gateway caller
+  # token (spark_key) the provider reads it from SPARK_API_KEY, which api_agent
+  # exports only into the agent's own environment; without one, no key.
   # The free lane (a free provider's route on the spark-gateway) is declared the
   # same way, as provider free serving the model after "free/".
   local provider="" id="${MODEL#*/}" permission="${OPENCODE_PERMISSION:-}" zai_url
@@ -511,8 +513,10 @@ opencode_config() {
   fi
   [[ "$ctx" =~ ^[1-9][0-9]{3,6}$ ]] || ctx=32768
   [[ "$out" =~ ^[1-9][0-9]{2,5}$ ]] || out=4096
-  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
-  [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  local key_opt=""
+  [ -z "${API_KEY:-}" ] || ! { [ "$LANE" = spark ] || [ "$LANE" = free ]; } || key_opt=", \"apiKey\": \"{env:SPARK_API_KEY}\""
+  [ "$LANE" = spark ] && provider=", \"provider\": {\"spark\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Spark vLLM\", \"options\": {\"baseURL\": \"$SPARK_URL\"$key_opt}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
+  [ "$LANE" = free ] && provider=", \"provider\": {\"free\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Free provider pool\", \"options\": {\"baseURL\": \"$SPARK_URL\"$key_opt}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
   if [ "$LANE" = zai ]; then
     zai_url="$(lane_setting URL)"
     [ -z "$zai_url" ] || provider=", \"provider\": {\"zai\": {\"npm\": \"@ai-sdk/openai-compatible\", \"name\": \"Z.ai gateway\", \"options\": {\"baseURL\": \"$zai_url\"}, \"models\": {\"$id\": {\"name\": \"$id\", \"limit\": {\"context\": $ctx, \"output\": $out}}}}}"
