@@ -6075,6 +6075,10 @@ class Station:
         texts = self._status_texts(repo, number)
         if any(t.startswith(tickets.FIX_MARKER) for t in texts):
             return False
+        if any(no_change.MARKER in t for t in texts):
+            # A no-change answer already judged this ticket's boxes
+            # unproven and sent it back for them: that judgment stands.
+            return False
         judged = set(tickets.judged_pulls(texts))
         fresh = [pr for pr in merged if isinstance(pr.get("number"), int)
                  and pr["number"] not in judged]
@@ -6093,6 +6097,56 @@ class Station:
             self._add_label(repo, number, "needs-brain")
         _say("%s#%d: merged pull request #%d may already do its work; verifying before any build"
              % (repo, number, int(pr["number"])))
+        return True
+
+    def _move_queued_merged(self, repo: str, issue: Dict[str, Any]) -> bool:
+        """Move one queued or briefed ticket to loom:merged when a merged
+        pull request referencing it (a Refs line or a loom/<number> branch,
+        merged into the default branch) already carries its work; True when
+        it moved. Reconcile calls this for every waiting ticket it already
+        read, before the claim pass can hand the ticket to a lane: a merge
+        made outside `bus.brain merge` settles nothing itself, and
+        _deliver_unlinked's stricter rules (a trusted same-repo branch, no
+        queued or briefed label event after the merge) leave a ticket whose
+        label changed during the run at loom:queued, so a lane claimed it
+        again and opened a duplicate pull request (loom#3547).
+
+        Left alone: a regression or revert ticket (its merged pull request
+        is the fault it repairs), a ticket with an open fix round, and a
+        ticket whose merged pull request the station already judged (sent
+        back for unbuilt criteria, or found wanting by a verify run): those
+        merges are spent and the ticket is queued for the rest."""
+        names = _label_names(issue)
+        if not set(names) & {"loom:queued", "loom:briefed"} \
+                or set(names) & {REGRESSION, factory.REVERT_LABEL}:
+            return False
+        if self._owned_elsewhere(repo, issue):
+            return False
+        merged = self._merged_linked(repo, issue)
+        if not merged:
+            return False
+        number = int(issue["number"])
+        texts = self._status_texts(repo, number)
+        if any(t.startswith(tickets.FIX_MARKER) for t in texts):
+            return False
+        if any(no_change.MARKER in t for t in texts):
+            return False
+        judged = set(tickets.judged_pulls(texts)) | set(tickets.rejected_pulls(texts))
+        fresh = [pr for pr in merged if isinstance(pr.get("number"), int)
+                 and pr["number"] not in judged]
+        if not fresh:
+            return False
+        pr = fresh[0]
+        states = {"loom:" + state for state in brain.STATES}
+        labels = [n for n in names if n not in states and not n.startswith(WAIT)]
+        labels.append("loom:merged")
+        self.gh.rest("PUT", "/repos/%s/issues/%d/labels" % (repo, number),
+                     {"labels": labels})
+        issue["labels"] = [{"name": n} for n in labels]
+        self._routine(repo, number, tickets.MERGED_FIRST_NOTE % (
+            int(pr["number"]), pr.get("merged_at"), str(pr["merge_commit_sha"])[:12]))
+        _say("%s#%d: merged pull request #%d references this queued ticket; "
+             "moved to loom:merged, not claimed" % (repo, number, int(pr["number"])))
         return True
 
     def _live_fix(self, repo: str, number: int, found: Optional[Tuple[tickets.Fix, Any]]
@@ -6816,6 +6870,12 @@ class Station:
         unlinked = self._unlinked_tickets(repo, tickets_by_number, open_tickets)
         if not tickets_by_number and not unlinked:
             return
+        # A queued or briefed ticket whose referencing pull request already
+        # merged leaves the queue here, before any lane claim (loom#3547):
+        # _deliver_unlinked below only delivers under stricter rules.
+        for number in list(unlinked):
+            if self._move_queued_merged(repo, unlinked[number]):
+                del unlinked[number]
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         # Fetch ALL closed PRs (paginated). The reconcile window uses only the

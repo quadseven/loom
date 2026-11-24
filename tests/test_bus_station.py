@@ -9801,6 +9801,20 @@ class VerifyBeforeBuildTest(Base):
                       % ("%040x" % 77)[:12], events[0])
         self.assertIn("verify run before any build", events[0])
 
+    def test_a_queued_ticket_with_a_merged_refs_pull_request_is_not_claimed(self):
+        self.fake.add(12, state="queued")
+        self.merged()
+        with mock.patch("bus.station._say") as say:
+            self.run_pass()
+        self.assertIn("loom:merged", self.fake.names(12))
+        self.assertNotIn("loom:queued", self.fake.names(12))
+        self.assertNotIn("loom:briefed", self.fake.names(12))
+        self.assertNotIn("loom:running", self.fake.names(12))
+        self.assertFalse(self.built())
+        said = [str(call.args[0]) for call in say.call_args_list if call.args]
+        self.assertTrue(any("#12" in line and "merged pull request #77" in line
+                            for line in said), said)
+
     def test_a_pull_request_that_merged_before_the_ticket_was_written_counts(self):
         self.fake.add(12, state="briefed", created="2030-03-01T00:00:00Z")
         self.fake.events[12] = [dict(labeled("loom:briefed", "alice-example"),
