@@ -76,7 +76,8 @@
 # LOOM_ANTHROPIC_BUDGET_USD, _BUDGET_SINCE, _BUDGET_EXPIRES and _FLOOR_USD
 # (docs/LANES.md, "Anthropic spend"), and for the spark lane LOOM_SPARK_URL
 # (the OpenAI-compatible base URL of the local vLLM coder, e.g.
-# http://your-spark.internal:8000/v1; no key).
+# http://your-spark.internal:8000/v1), with LOOM_SPARK_KEY_SSM naming the
+# spark-gateway caller token when the URL is the gateway (unset: no key).
 set -uo pipefail
 
 SLOT="${1:?usage: run_lane.sh <lane>}"
@@ -1571,10 +1572,16 @@ AUTH_WHY_PREFIX="API key expired: renew"
 spark_probe() {
   local response code status retry_after
   LIMIT_RETRY_AFTER=""
-  response="$(curl -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
+  # A caller token (spark_key) reaches curl on stdin as a config line, never
+  # in argv; with none, stdin is empty and curl reads no config.
+  response="$(spark_curl_config | curl -K - -s -D - -o /dev/null -w '\n%{http_code}' --max-time "$SPARK_PROBE_TIMEOUT" "${SPARK_URL%/}/models" 2>/dev/null)"
   status=$?
   code="${response##*$'\n'}"
   if [ "$status" -eq 7 ]; then LIMIT_WHY="the $LANE endpoint refused the connection"; return 1; fi
+  if [ "$status" -eq 0 ] && { [ "$code" = 401 ] || [ "$code" = 403 ]; }; then
+    READY_REASON="the $LANE endpoint refused the caller (HTTP $code); check $(lane_var KEY_SSM)"
+    return 2
+  fi
   if [ "$code" = 503 ]; then
     retry_after="$(printf '%s\n' "$response" | awk '
       tolower($1) == "retry-after:" {
@@ -1636,9 +1643,37 @@ beat_hold_from_file() {
   grep -q '"from_limit_file": true' "$BEAT" 2> /dev/null
 }
 
+# The spark-gateway caller token for a spark or free lane: read
+# from LOOM_<SLOT>_KEY_SSM into API_KEY when that is set. Unset keeps the
+# keyless endpoint (a vLLM box reached directly). A token that could break the
+# curl config line or the opencode config is refused.
+spark_key() {
+  local key_ssm
+  API_KEY=""
+  key_ssm="$(lane_setting KEY_SSM)"
+  [ -n "$key_ssm" ] || return 0
+  API_KEY="$(ssm_value "$key_ssm")"
+  [ -n "$API_KEY" ] || { READY_REASON="no key readable at $(lane_var KEY_SSM)"; return 1; }
+  [[ "$API_KEY" =~ ^[A-Za-z0-9._~+/=-]+$ ]] ||
+    { API_KEY=""; READY_REASON="the key at $(lane_var KEY_SSM) has characters outside A-Za-z0-9._~+/=-"; return 1; }
+}
+
+# The curl config for the probe: the caller token as a header, or nothing.
+# printf is a builtin, so the token reaches no process's argv.
+spark_curl_config() {
+  [ -z "${API_KEY:-}" ] || printf 'header = "Authorization: Bearer %s"\n' "$API_KEY"
+}
+
+# The variable the agent's provider reads its key from: SPARK_API_KEY with a
+# caller token, "-" (no key) without one.
+spark_key_var() {
+  if [ -n "${API_KEY:-}" ]; then printf 'SPARK_API_KEY'; else printf -- '-'; fi
+}
+
 spark_ready() {
   [[ "$SPARK_URL" =~ ^https?://[A-Za-z0-9.:_-]+(/[A-Za-z0-9._~/-]*)?$ ]] ||
     { READY_REASON="LOOM_SPARK_URL is not set to an http(s) base URL"; return 1; }
+  spark_key || return 1
   limit_held && return 1
   spark_probe
   case $? in
@@ -4532,8 +4567,8 @@ Do not search the whole filesystem (for example, find /). Search within the chec
     openrouter) opencode_agent_continuing OPENROUTER_API_KEY text "$brief_text" ;;
     opencode-go) opencode_agent_continuing OPENCODE_API_KEY text "$brief_text" ;;
     zen) opencode_agent_continuing - text "$brief_text" ;;
-    spark) opencode_agent_continuing - raw "$brief_text" ;;
-    free) opencode_agent_continuing - text "$brief_text" ;;
+    spark) opencode_agent_continuing "$(spark_key_var)" raw "$brief_text" ;;
+    free) opencode_agent_continuing "$(spark_key_var)" text "$brief_text" ;;
     zai) opencode_agent_continuing ZHIPU_API_KEY text "$brief_text" ;;
     workersai) AGENT_EXTRA_ENV="CLOUDFLARE_ACCOUNT_ID=$LANE_ACCOUNT"
       opencode_agent_continuing CLOUDFLARE_API_KEY text "$brief_text" ;;
