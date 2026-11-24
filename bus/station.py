@@ -4099,6 +4099,18 @@ class Station:
     def _verify_repos(self) -> List[str]:
         return [repo for repo in self.s.repos if tickets.REPO_RE.fullmatch(repo)]
 
+    def _verify_pool_issues(self, repo: str, issues: Iterable[Dict[str, Any]]
+                            ) -> Iterator[Tuple[str, Dict[str, Any]]]:
+        """Settle stale handoffs and carry the source's ship date on open ones."""
+        for issue in issues:
+            source = self._verify_source_issue(repo, issue)
+            if source is not issue:
+                if not _verify_active(source):
+                    self._settle_verify_handoff(repo, int(issue["number"]), source)
+                    continue
+                issue["shipped_at"] = self._shipped_stamp(repo, source)
+            yield repo, issue
+
     def _verify_pool(self, attempts: Dict[str, Any], queued_holds: bool = True
                      ) -> Tuple[List[Tuple[str, Dict[str, Any]]], set]:
         """(the tickets due a verify run, oldest ship first; the lanes queued
@@ -4112,14 +4124,7 @@ class Station:
             issues = self._tickets_open(repo)
             if queued_holds:
                 held |= self._queued_lanes(repo, issues, counts)
-            for issue in issues:
-                source = self._verify_source_issue(repo, issue)
-                if source is not issue and not _verify_active(source):
-                    self._settle_verify_handoff(repo, int(issue["number"]), source)
-                    continue
-                if source is not issue:
-                    issue["shipped_at"] = self._shipped_stamp(repo, source)
-                shipped.append((repo, issue))
+            shipped.extend(self._verify_pool_issues(repo, issues))
         shipped = [(repo, issue) for repo, issue in shipped
                     if self._verify_criteria(repo, issue)]
         adapter_tickets = {"%s#%s" % (repo, issue.get("number")) for repo, issue in shipped
@@ -4145,10 +4150,7 @@ class Station:
             if ("%s#%s" % (repo, issue.get("number")) not in adapter_tickets
                     and self._unmeetable_live(repo, source, reads)):
                 continue
-            if source is not issue:
-                issue["shipped_at"] = self._shipped_stamp(repo, source)
-            else:
-                issue["shipped_at"] = self._shipped_stamp(repo, issue)
+            issue["shipped_at"] = self._shipped_stamp(repo, source)
             issue["health_proof"] = health.proof_of(self._paginate(
                 "/repos/%s/issues/%d/comments" % (repo, int(source["number"]))), self.s.authors)
             found.append((repo, issue))
@@ -15288,6 +15290,11 @@ class Station:
                      default=None)
         if newest is not None:
             facts.brain_seen = state["brain_seen"] = newest
+        self._invariant_ticket_facts(facts)
+        self._invariant_scheduled_facts(facts, state)
+        return facts
+
+    def _invariant_ticket_facts(self, facts: invariants.Facts) -> None:
         if any(self.now - since > invariants.HELD_MAX and lane not in facts.no_topup
                for lane, since in facts.held.items()):
             try:
@@ -15323,6 +15330,8 @@ class Station:
             facts.verify_handoff_candidates = None
             facts.verify_due_tickets = None
             facts.verify_handoff_coverage = None
+
+    def _invariant_scheduled_facts(self, facts: invariants.Facts, state: Dict[str, Any]) -> None:
         if not isinstance(state.get("scheduled_workflows"), dict):
             state["scheduled_workflows"] = {}
         read_start = self._pass_counted()
@@ -15332,7 +15341,6 @@ class Station:
             lambda: (self._pass_counted() - read_start >= invariants.SCHEDULED_READ_MAX
                      or self._deferred()), _say)
         facts.unread = {**(facts.unread or {}), invariants.SCHEDULED_WORKFLOW_RED: unread}
-        return facts
 
     def _invariant_runs(self) -> List[invariants.Run]:
         """Each lane run that ended in the last day, timed by its log (the

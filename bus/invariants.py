@@ -569,6 +569,13 @@ def _verify_degraded_covered_by_handoff(step: str, coverage: Optional[bool]) -> 
     return coverage is True and "verify degraded" in step
 
 
+def _brain_failure_evidence(ticks: List[List[Journal]],
+                            coverage: Optional[bool]) -> Tuple[str, ...]:
+    return tuple("Tick %s on %s: %s" % (utc(j.at), j.goal.label, step)
+                 for tick in ticks for j in tick for step in j.steps
+                 if not _verify_degraded_covered_by_handoff(step, coverage))
+
+
 def brain_failing(f: Facts) -> List[Breach]:
     """A brain holder whose two newest ticks each journaled a failed or
     degraded step. One tick may journal on several goals; it is one tick."""
@@ -586,18 +593,12 @@ def brain_failing(f: Facts) -> List[Breach]:
         if len(last) < 2 or not all(any(j.steps for j in t) for t in last):
             continue
         name = holder or "unnamed"
-        evidence = []
-        for tick in last:
-            for j in tick:
-                for s in j.steps:
-                    if _verify_degraded_covered_by_handoff(s, f.verify_handoff_coverage):
-                        continue
-                    evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s)]
+        evidence = _brain_failure_evidence(last, f.verify_handoff_coverage)
         if not evidence:
             continue
         out.append(Breach("brain-failing", name,
                           "Brain %s reported a failed or degraded step two ticks in a row" % name,
-                          tuple(evidence), max(j.at for j in last[-1])))
+                          evidence, max(j.at for j in last[-1])))
     return out
 
 
