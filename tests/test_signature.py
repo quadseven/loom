@@ -92,6 +92,15 @@ class SignatureLineTest(unittest.TestCase):
         self.assertEqual(again.count("Signed: "), 1)
         self.assertEqual(signature.strip("Text.\n\n<!-- m -->"), "Text.\n\n<!-- m -->")
 
+    def test_ordinary_text_comes_back_unchanged(self):
+        for plain in ("Plain words with a | pipe and a b | c.", "Signed: not a signature",
+                      "a <b> tag and 100% done", "line one\nline two"):
+            self.assertEqual(signature.strip(plain), plain)
+            self.assertEqual(signature._clean(plain.replace("\n", " ")),
+                             plain.replace("\n", " "))
+            self.assertEqual(signature.sign(plain, "spark", "m"),
+                             plain + "\n\nSigned: lane-spark, model m")
+
     def test_a_signed_line_inside_the_text_is_kept(self):
         body = "Signed: lane-x, model y\nmore text"
         self.assertEqual(signature.strip(body), body)
