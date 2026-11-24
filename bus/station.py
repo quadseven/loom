@@ -5494,17 +5494,31 @@ class Station:
         self._verify_due_tickets = due_tickets
         return candidates
 
-    def _verify_handoff_candidate(self, repo: str, issue: Dict[str, Any], cutoff: float,
-                                  handoff_tickets: set,
-                                  due_tickets: set) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """Track an active verify item and return an eligible stale Live item."""
+    @staticmethod
+    def _verify_handoff_open(issue: Dict[str, Any]) -> bool:
+        """An open shipped ticket, unproven, unclaimed, and not itself a handoff."""
         names = set(_label_names(issue))
         if (issue.get("state") != "open" or "loom:ticket" not in names
                 or "loom:shipped" not in names or "loom:verified" in names
                 or brain.WAIT_LIVE_EVENT in names
                 or tickets.verify_handoff_source(issue) is not None):
-            return None
-        if issue.get("assignees") or any(name.lower().startswith("claim:") for name in names):
+            return False
+        return not (issue.get("assignees")
+                    or any(name.lower().startswith("claim:") for name in names))
+
+    def _verify_handoff_provable(self, issue: Dict[str, Any], body: str) -> bool:
+        """The ticket names provable criteria and a trusted, unowned brief."""
+        return not (criteria_gate.open_operator_criteria(body) or not proof.criteria(body)
+                    or _ticket_goal(issue) is None
+                    or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
+                    or tickets.owned_elsewhere(issue, self.s.authors,
+                                               self.s.briefers) is not None)
+
+    def _verify_handoff_candidate(self, repo: str, issue: Dict[str, Any], cutoff: float,
+                                  handoff_tickets: set,
+                                  due_tickets: set) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Track an active verify item and return an eligible stale Live item."""
+        if not self._verify_handoff_open(issue):
             return None
         body = str(issue.get("body") or "")
         key = "%s#%d" % (repo, int(issue["number"]))
@@ -5518,10 +5532,7 @@ class Station:
         shipped_at = self._shipped_stamp(repo, issue)
         if shipped_at >= cutoff or self._proven(repo, int(issue["number"])):
             return None
-        if (criteria_gate.open_operator_criteria(body) or not proof.criteria(body)
-                or _ticket_goal(issue) is None
-                or not tickets.brief_author_trusted(issue, self.s.authors, self.s.briefers)
-                or tickets.owned_elsewhere(issue, self.s.authors, self.s.briefers) is not None):
+        if not self._verify_handoff_provable(issue, body):
             return None
         issue["_verify_handoff_shipped_at"] = shipped_at
         return repo, issue
