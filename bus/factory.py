@@ -463,6 +463,24 @@ LANE_KINDS: Dict[str, str] = {
 }
 
 
+def wait_summary(waits: Sequence[str]) -> str:
+    """" (by reason: 3 x its repo is at its open pull request cap, ...)" for a
+    pass that gave every queued ticket no lane, or "" for one ticket: the line
+    names only the first wait, so a reader took it for what stopped the whole
+    pass when each ticket is judged on its own. A reason is the wait with its
+    leading ticket reference and, for After: waits, the blocker removed."""
+    if len(waits) < 2:
+        return ""
+    counts: Dict[str, int] = {}
+    for wait in waits:
+        reason = re.sub(r"^\S+#\d+ (?:waits: |waits )?", "", wait)
+        reason = re.sub(r"^for \S+ to merge", "for another ticket to merge", reason)
+        reason = re.sub(r"#\d+", "#N", reason)
+        counts[reason] = counts.get(reason, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return " (by reason: %s)" % "; ".join("%d x %s" % (n, r) for r, n in ranked[:6])
+
+
 def lane_kind(lane: str) -> Optional[str]:
     """LANE_KINDS for a lane or a numbered slot of one (anthropic-9 is an
     anthropic slot, labels.base_lane); None for a lane it does not know."""
@@ -5438,7 +5456,7 @@ class Factory:
         waits = [self._assign_queued_ticket(repo, issue)
                  for repo, issue in sorted(queued, key=lambda item: tickets.work_order(*item))]
         if waits and all(waits) and MODEL_WAIT not in waits[0]:
-            _say("assigned 0 of %d queued: %s" % (len(waits), waits[0]))
+            _say("assigned 0 of %d queued: %s%s" % (len(waits), waits[0], wait_summary(waits)))
         self._return_hand_offs(found_by_repo)
         self._no_lane_moves(found_by_repo, before)
         self.settled.update(ref for ref, reason in self.known_waits.items()
