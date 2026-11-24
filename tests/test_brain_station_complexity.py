@@ -43,6 +43,10 @@ TARGETS = (
     # AI-REVIEW 2026-11-18 [automated review summary] station complexity (PR #3237):
     # Keep environment parsing below the cap as new settings are added.
     ("bus/station.py", "Settings.from_env"),
+    # PR #3523 complexity findings: 9128eb7b, 27729029, cb2b22bf.
+    ("bus/invariants.py", "brain_failing"),
+    ("bus/station.py", "Station._verify_pool"),
+    ("bus/station.py", "Station._invariant_facts"),
 )
 
 
