@@ -18,6 +18,10 @@ class PackedBriefHeaders(unittest.TestCase):
         self.assertEqual(headers["Priority"], "P1")
         self.assertEqual(headers["Not before"], "2026-01-02T03:04:05Z")
 
+    def test_packed_final_line_without_a_newline_keeps_every_header(self):
+        self.assertEqual(parse("Difficulty: easy Priority: P1"),
+                         ({"Difficulty": "easy", "Priority": "P1"}, ""))
+
     def test_a_bad_value_is_still_refused(self):
         with self.assertRaisesRegex(ValueError, "Difficulty: must be one of easy, medium, hard"):
             parse("Difficulty: hardest\n\nbody")

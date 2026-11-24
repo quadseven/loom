@@ -309,7 +309,7 @@ def parse(body: Optional[str]) -> Tuple[Dict[str, str], str]:
     headers: Dict[str, str] = {}
     i = 0
     pending: list = []
-    while i < len(lines):
+    while pending or i < len(lines):
         if not pending:
             if not HEADER_RE.fullmatch(lines[i].rstrip()):
                 break
