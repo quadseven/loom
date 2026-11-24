@@ -177,13 +177,13 @@ class StationStateSyncAndLiveFloorTest(unittest.TestCase):
                 return [("chain", '{"repos": []}', 5.0)]
 
         class FlakyConn:
-            def __init__(self, fail_second=False):
-                self.fail_second = fail_second
+            def __init__(self, fail_after=None):
+                self.fail_after = fail_after
                 self.calls = 0
 
             def cursor(self):
                 self.calls += 1
-                return FlakyCursor(self.fail_second and self.calls > 1)
+                return FlakyCursor(self.fail_after is not None and self.calls > self.fail_after)
 
             def commit(self):
                 pass
@@ -191,7 +191,7 @@ class StationStateSyncAndLiveFloorTest(unittest.TestCase):
             def close(self):
                 pass
 
-        conns = [FlakyConn(fail_second=True), FlakyConn(fail_second=False)]
+        conns = [FlakyConn(fail_after=2), FlakyConn()]
 
         def fake_connect(_dbapi):
             connects.append(1)
@@ -201,7 +201,10 @@ class StationStateSyncAndLiveFloorTest(unittest.TestCase):
         with patch.object(station_state.transcripts, "connect", fake_connect):
             rows1 = backend.all()
             rows2 = backend.all()
+            self.assertEqual(len(connects), 1)
+            rows3 = backend.all()
         self.assertEqual(len(connects), 2)
+        self.assertEqual(rows3["chain"]["at"], 5.0)
         self.assertEqual(rows1["chain"]["at"], 5.0)
         self.assertEqual(rows2["chain"]["at"], 5.0)
 
