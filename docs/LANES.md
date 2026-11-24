@@ -2735,7 +2735,7 @@ the station never claims a private repo's ticket for one
 (`station.needs_public_repo`), and the runner parks a brief for a private repo
 (`trains_on_prompts` in `lanes/run_lane.sh`), so the rule holds even when only
 the lane's container carries the setting. `LOOM_CODEX_EFFORT` (none, minimal,
-low, medium, high or xhigh) sets a codex lane run's reasoning effort with
+low, medium, high, xhigh or max) sets a codex lane run's reasoning effort with
 `-c model_reasoning_effort=...` over the Codex home's `config.toml`; unset, the
 config's own setting applies. A brain run ignores it.
 

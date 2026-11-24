@@ -114,6 +114,9 @@ class CodexLaneHomeTest(unittest.TestCase):
     def test_loom_codex_effort_sets_the_reasoning_effort_of_a_lane_run(self):
         seen = self.run_agent_cli("lane", LOOM_CODEX_EFFORT="xhigh")
         self.assertIn('-c model_reasoning_effort="xhigh"', seen["args"])
+        # max is above xhigh, and the codex model accepts it.
+        seen = self.run_agent_cli("lane", LOOM_CODEX_EFFORT="max")
+        self.assertIn('-c model_reasoning_effort="max"', seen["args"])
         seen = self.run_agent_cli("lane")
         self.assertNotIn("model_reasoning_effort", seen["args"])
 
