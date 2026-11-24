@@ -485,6 +485,19 @@ class Facts:
     # Goal homes (OWNER/NAME#N) the operator exempted from the roll source-pin
     # pass: roll-pin-off leaves them out (LOOM_ROLL_PIN_EXEMPT).
     roll_exempt: Tuple[str, ...] = ()
+    # Shipped tickets that have a verify handoff ticket (loom#3509): the station
+    # created a read-and-report verify ticket for these, so they no longer count
+    # toward verify degradation.
+    verify_handoff_tickets: Optional[set] = None
+    # Shipped tickets with live criteria older than VERIFY_HANDOFF_DAYS (loom#3509):
+    # candidates for verify handoff tickets.
+    verify_handoff_candidates: Optional[List[Tuple[str, Dict[str, Any]]]] = None
+    # Whether every currently verify-due shipped ticket has an open lane
+    # verify ticket. Unknown stays None and never suppresses a breach.
+    verify_handoff_coverage: Optional[bool] = None
+    # The current verify-due source keys, used to include tickets handed off
+    # during this same station pass in the coverage decision.
+    verify_due_tickets: Optional[set] = None
 
 
 @dataclass(frozen=True)
@@ -552,6 +565,11 @@ def _lanes(count: int) -> str:
 
 
 # -- the invariants ------------------------------------------------------
+def _verify_degraded_covered_by_handoff(step: str, coverage: Optional[bool]) -> bool:
+    """Whether all current verify-due tickets have open lane verify tickets."""
+    return coverage is True and "verify degraded" in step
+
+
 def brain_failing(f: Facts) -> List[Breach]:
     """A brain holder whose two newest ticks each journaled a failed or
     degraded step. One tick may journal on several goals; it is one tick."""
@@ -572,7 +590,12 @@ def brain_failing(f: Facts) -> List[Breach]:
         evidence = []
         for tick in last:
             for j in tick:
-                evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s) for s in j.steps]
+                for s in j.steps:
+                    if _verify_degraded_covered_by_handoff(s, f.verify_handoff_coverage):
+                        continue
+                    evidence += ["Tick %s on %s: %s" % (utc(j.at), j.goal.label, s)]
+        if not evidence:
+            continue
         out.append(Breach("brain-failing", name,
                           "Brain %s reported a failed or degraded step two ticks in a row" % name,
                           tuple(evidence), max(j.at for j in last[-1])))

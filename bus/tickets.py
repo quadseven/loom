@@ -20,6 +20,9 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Se
 from . import answer, human_claims, proof, status
 from .stale_claims import outside_hold
 
+VERIFY_HANDOFF_LABEL = "loom:verify-handoff"
+VERIFY_HANDOFF_RE = re.compile(r"^Verify handoff for #([1-9][0-9]*)[ \t]*$", re.M)
+
 # The runner's own patterns (lanes/run_lane.sh).
 MODEL_RE = re.compile(r"[A-Za-z0-9._:][A-Za-z0-9._:/@-]*")
 # The models the operator forbids on every lane (2026-10-21), each with the
@@ -1015,6 +1018,18 @@ def verify_template(criteria: List[str], live_criteria: Optional[Sequence[str]] 
 def verify_name(repo: str, number: int, stamp: int) -> str:
     """The name of a verify brief; the stamp keeps each run's name its own."""
     return "%s-verify-%d" % (ticket_name(repo, number), stamp)
+
+
+def verify_handoff_source(issue: Dict[str, Any]) -> Optional[int]:
+    """The shipped issue a routable, open lane verify ticket hands off."""
+    if issue.get("state", "open") != "open":
+        return None
+    names = {label.get("name") if isinstance(label, dict) else str(label)
+             for label in issue.get("labels", [])}
+    if not {"loom:ticket", "loom:shipped", VERIFY_HANDOFF_LABEL}.issubset(names):
+        return None
+    match = VERIFY_HANDOFF_RE.search(str(issue.get("body") or ""))
+    return int(match.group(1)) if match else None
 
 
 def merged_first_section(pulls: Iterable[int]) -> str:

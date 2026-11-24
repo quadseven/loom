@@ -96,6 +96,7 @@ decides who acts:
 | `loom:proof-due` | The repo's one rolling Proof due issue (see The evidence close). Never a ticket. |
 | `loom:mutation` | The one rolling report of the weekly spot mutation run (`bus/mutation_run.py`). Never a ticket; a survivor to fix gets its own. |
 | `loom:verified` | The brain verified it live and posted a proof record (see Proof); the ticket is then closed. |
+| `loom:verify-handoff` | The station assigned an older shipped ticket to a separate lane verify ticket. The open verify ticket carries this label; its body links the source, which is left out of `resume verify` until the lane reports back. |
 | `loom:triage` | An open issue triage found not ready as a ticket; the station log line names the missing sections, and no comment is posted (each one emailed the issue's author). The brain rewrites it (`brief --refs`) or marks it `needs:human`. |
 | `loom:rewritten` | The brain wrote a new ticket from this issue, because the issue itself could not become the ticket (see Rewrites in place); the ticket says `Rewritten from issue <number>.` The issue stays open until that ticket is verified or closed as completed, then closes as completed (see Rewritten issues close with their ticket). |
 | `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
@@ -2877,6 +2878,14 @@ shipped and its Live criterion (the acceptance line that starts with
 spends up to a third of its tick on these items: it writes a proof only from
 evidence it saw in the tick, and otherwise leaves a one-line note on the
 ticket naming what evidence is missing.
+
+When a shipped ticket's live check has no proof after 14 days, the station
+creates one open verify ticket under the same goal with the label
+`loom:verify-handoff`. The verify ticket carries the source acceptance
+criteria and is handed through the normal lane verify flow; the station
+reads the source ticket's merged pull requests and applies any proof to the
+source. The source stays out of `resume verify` while its handoff ticket is
+open. A missing read leaves the handoff open for another lane attempt.
 
 Twice a day, for the operator's reading times (10:00 and 21:00 New York),
 the tick adds a short report with the marker `<!-- loom:report v1 -->`: its
