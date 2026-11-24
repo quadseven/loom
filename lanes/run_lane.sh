@@ -1643,7 +1643,7 @@ beat_hold_from_file() {
   grep -q '"from_limit_file": true' "$BEAT" 2> /dev/null
 }
 
-# The spark-gateway caller token for a spark or free lane (infra#5579): read
+# The spark-gateway caller token for a spark or free lane: read
 # from LOOM_<SLOT>_KEY_SSM into API_KEY when that is set. Unset keeps the
 # keyless endpoint (a vLLM box reached directly). A token that could break the
 # curl config line or the opencode config is refused.
