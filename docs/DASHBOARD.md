@@ -260,8 +260,8 @@ already holds. Issues whose Loom ticket is closed or merged are listed to
 check.
 
 `/tiers` (Tiers and allowances, loom#968) shows the whole tier system in
-one page. "Tiers" lists Loom's easy, medium and hard lanes in order and the
-model ladder (`TIERS` and `LADDER` in `bus/factory.py`), each lane with the
+one page. "Tiers" lists Loom's one lane list, cheapest first (no difficulty tiers, loom#3550), and the
+model ladder (`LANE_ORDER` and `LADDER` in `bus/factory.py`), each lane with the
 model it runs and its kind from `LANE_KINDS` (base lanes; a numbered slot
 takes its lane's kind): own hardware (the Sparks), free, subscription or never
 paid (a prepaid credit the operator does not top up), then Grug's review

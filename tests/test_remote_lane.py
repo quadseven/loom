@@ -405,13 +405,6 @@ class ClaimRejectionTests(unittest.TestCase):
         self.assertIn(self.rejection_line("no brief header"), err)
         self.assertIn("scanned 1 repos, found 0 candidates", err)
 
-    def test_a_ticket_outside_the_lanes_tiers_is_named_with_its_reason(self):
-        gh = FakeGitHub(body=BODY.replace("Difficulty: medium", "Difficulty: hard"))
-        got, err = self.claim_err(gh)
-        self.assertIsNone(got)
-        self.assertIn(self.rejection_line("difficulty outside the lane's tiers"), err)
-        self.assertIn("scanned 1 repos, found 0 candidates", err)
-
     def test_a_ticket_with_no_acceptance_box_is_not_claimed(self):
         # loom#2249: a lane run on it is parked unrun by the runner.
         gh = FakeGitHub(body=re.sub(r"## Acceptance criteria\n(- \[ \] .*\n)+", "", BODY))
@@ -597,18 +590,21 @@ class OwnAppLoginTests(unittest.TestCase):
 
 
 class DefaultDifficultyTests(unittest.TestCase):
-    def test_a_ticket_with_no_difficulty_line_is_claimed_at_the_factorys_default_tier(self):
-        # The factory reserves a ticket with no Difficulty: line for Muse at its
-        # default tier (medium); the claim must read it the same way, or Muse is
-        # handed tickets it never takes (2026-10-26).
+    def test_a_ticket_with_no_difficulty_line_is_claimed(self):
+        # The factory reserves a ticket with no Difficulty: line for Muse like
+        # any other; the claim must take it, or Muse is handed tickets it
+        # never takes (2026-10-26).
         gh = FakeGitHub(body=BODY.replace("Difficulty: medium\n\n", "Priority: P2\n\n"))
         got = lane.claim(gh, ["example/project"], now=1000)
         self.assertIsNotNone(got)
         self.assertEqual(got["number"], 4)
 
-    def test_a_hard_ticket_is_still_not_a_muse_ticket(self):
+    def test_a_hard_ticket_is_a_muse_ticket_too(self):
+        # Every lane may try every ticket (loom#3550).
         gh = FakeGitHub(body=BODY.replace("Difficulty: medium", "Difficulty: hard"))
-        self.assertIsNone(lane.claim(gh, ["example/project"], now=1000))
+        got = lane.claim(gh, ["example/project"], now=1000)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["number"], 4)
 
 
 class TakesTest(unittest.TestCase):

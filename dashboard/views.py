@@ -581,10 +581,9 @@ def _factory_tables(states=None):
     """The routing tables from bus.factory, each lane marked with its state now."""
     states = states or {}
     chips = lambda lanes: '<ul class="lane-chips">%s</ul>' % "".join(_lane_chip(name, states) for name in lanes)
-    tiers = ['<table class="factory-tiers"><thead><tr><th>Difficulty</th><th>Lanes, best first</th></tr></thead><tbody>']
-    for name, lanes in factory.TIERS.items():
-        tiers.append('<tr class="factory-tier"><th>%s</th><td>%s</td></tr>' % (html.escape(name.title()), chips(lanes)))
-    tiers.append("</tbody></table>")
+    tiers = ['<table class="factory-tiers"><thead><tr><th>Tickets</th><th>Lanes, cheapest first</th></tr></thead><tbody>',
+             '<tr class="factory-tier"><th>Every ticket</th><td>%s</td></tr>' % chips(factory.LANE_ORDER),
+             "</tbody></table>"]
     ladder = ['<table class="model-ladder"><thead><tr><th>Rung</th><th>Model</th><th>Lanes</th></tr></thead><tbody>']
     for rung, (lanes, model) in enumerate(factory.LADDER, 1):
         ladder.append("<tr><th>%d</th><td>%s</td><td>%s</td></tr>" % (rung, html.escape(model), chips(lanes)))

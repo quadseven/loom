@@ -121,36 +121,35 @@ Neither needs a model:
   stronger model made no commit either for five tickets on 2026-10-13.
   A ticket left briefed for BRIEFED_STALL
   with no lane claiming it does not: it never ran, so it moves to the
-  least-loaded other lane of its tier (a ladder ticket, of its rung), writing
+  least-loaded other lane (a ladder ticket, of its rung), writing
   no rung marker.
+- Every lane may try every ticket (loom#3550): one list, LANE_ORDER, cheapest
+  first (own hardware, free, subscription, never-paid), whatever the
+  ticket's Difficulty: line says or whether it has one. A private repo's
+  ticket never takes a public-only lane (lanes_for).
 - Each pass gives queued tickets (FIRST labels, then priority, then the
-  oldest) free lanes in their difficulty tier, leaving held tickets and
-  tickets without a readable tier queued.
+  oldest) the first free lanes of that list, leaving held tickets queued.
 - A ticket briefed on a lane at a limit (its heartbeat says "limit:", as the
-  spark lane's does while its box is hot) moves at once to a free lane in its
-  difficulty tier (TIERS), or a ladder ticket to a free lane of its own rung.
+  spark lane's does while its box is hot) moves at once to the first free
+  other lane, or a ladder ticket to a free lane of its own rung.
   A limit is not a failure, so it never climbs; with no free lane the ticket
   waits where it is for its lane to come back. A lane whose heartbeat names
   the ticket's Model: among its limited_models (a model ladder lane, up for
   its other models) counts as at a limit for that ticket, and the ladder
   never climbs to a rung whose model is limited on every lane of it.
 - A running ticket on a local lane with no live heartbeat for SILENT_MAX
-  moves like a limit move: to a free lane of its tier (of its Model: for a
+  moves like a limit move: to the first free other lane (of its Model: for a
   pinned ticket), else back to queued. It is no failure and no retry.
-- When no lane of a ticket's tier is up, a limit move or a queued assignment
-  falls back to a free lane of the tiers FALLBACK lists (medium: hard, then
-  easy), and says so in its note. The ticket's Difficulty: line is kept, so
-  its next move takes its own tier again once a lane of it is up.
 - Past the last rung the ticket is left failed for the brain, with a note.
 - A queued ticket pinned to a model no free lane takes, waiting for it
-  past LOOM_PIN_FALLBACK_MINUTES (default 30), takes a free lane of its tier
+  past LOOM_PIN_FALLBACK_MINUTES (default 30), takes the first free lane
   with that lane's own model and loses its Model: line (_pin_fallback,
   loom#3151), unless the pin is hard (hard_pin: a person opened the ticket,
   or it carries class:sensitive or tier:security). It never takes a lane it
   ran on, and falls back at most PIN_FALLBACK_MAX times.
 - A ticket waiting with no lane that takes it (NO_LANE_RE) for
   LOOM_NO_LANE_REROUTE hours (default 6) is rerouted to the first rung the
-  climb rules allow with a free lane in its tier; with none, by
+  climb rules allow with a free lane its repo may run on; with none, by
   NO_LANE_HANDOFF it goes to the hand-off pool (HANDOFF_LABEL), out of its
   goal's in-flight count, with one note (loom#1831, docs/BRAIN.md). An
   unclaimed queued pool ticket takes a lane left free after the rest of the
@@ -218,7 +217,7 @@ PARKED_FIX_WAIT = "parked fix round on lane "
 CAP_WAIT = "its repo is at its open pull request cap"
 # A ticket the factory leaves waiting with no lane that takes it (NO_LANE_RE)
 # this long is rerouted to another rung of the model ladder with a free lane
-# in its tier; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
+# its repo may run on; LOOM_NO_LANE_REROUTE sets the hours (no_lane_reroute). On
 # 2026-10-25, 89 tickets waited so, some since 10-23, and held their goals'
 # in-flight caps the whole time (loom#1831).
 NO_LANE_REROUTE = 6 * 3600
@@ -226,13 +225,17 @@ NO_LANE_REROUTE = 6 * 3600
 # goal's in-flight count for the hand-off pool (HANDOFF_LABEL).
 NO_LANE_HANDOFF = 24 * 3600
 # The wait reasons (Factory.waits) that mean no lane takes the ticket: a
-# queued ticket no free lane of its model or tier takes, a briefed one stalled
-# with no other lane of its rung or tier, or one on a lane at a limit or down
-# with no free lane in its rung or tier.
+# queued ticket no free lane takes (NO_FREE_LANE, or MODEL_WAIT for a pinned
+# one), a briefed one stalled with no other lane of its rung, or one on a lane
+# at a limit or down with no other free lane (of its rung, for a ladder
+# ticket). No reason names a difficulty tier: there are none (loom#3550).
 MODEL_WAIT = "no free lane takes model "
-NO_LANE_RE = re.compile(r"(" + MODEL_WAIT + r"|no free lane in tier "
+NO_FREE_LANE = "no free lane"
+# How a queued ticket got its lane, in its note and the station log.
+BY_COST = "first free lane by cost"
+NO_LANE_RE = re.compile(r"(" + MODEL_WAIT + "|" + NO_FREE_LANE + r"$"
                         r"|stalled on lane \S+: no other lane of its "
-                        r"|on lane \S+, .*: no free lane in its |remote lane \S+ has not pulled it)")
+                        r"|on lane \S+, .*: no (?:other )?free lane|remote lane \S+ has not pulled it)")
 # The hand-off pool the second operator's session works (docs/BRAIN.md).
 HANDOFF_LABEL = labels.HANDOFF
 WAIT_SUPERSEDED = "wait:superseded"
@@ -255,8 +258,8 @@ def no_lane_reroute(env: Optional[Dict[str, str]] = None) -> float:
     return min(hours * 3600, float(NO_LANE_HANDOFF))
 
 
-# A queued ticket pinned to a model with no free lane takes a free lane of its
-# tier, with that lane's own model, after this long (loom#3151). On 2026-11-17
+# A queued ticket pinned to a model with no free lane takes the first free lane
+# by cost, with that lane's own model, after this long (loom#3151). On 2026-11-17
 # one pass assigned 0 of 86 queued tickets, every one pinned to a codex or
 # anthropic model with no lane up (codex demoted, anthropic out of credit),
 # while about 30 lanes of their tiers sat idle. LOOM_PIN_FALLBACK_MINUTES sets
@@ -278,7 +281,7 @@ HARD_PIN_LABELS = ("class:sensitive", "tier:security")
 
 def pin_fallback_after(env: Optional[Dict[str, str]] = None) -> Optional[float]:
     """Seconds a queued pinned ticket waits for its model before it takes a
-    free lane of its tier: the minutes in LOOM_PIN_FALLBACK_MINUTES, None
+    free lane by cost: the minutes in LOOM_PIN_FALLBACK_MINUTES, None
     when that is 0 (off), else PIN_FALLBACK_WAIT."""
     raw = str((os.environ if env is None else env).get("LOOM_PIN_FALLBACK_MINUTES", "")).strip()
     try:
@@ -380,7 +383,7 @@ _REVIEW_MARKINGS_RE = re.compile(r"Elder markings - (\d+) blocking, (\d+) total"
 
 ANTHROPIC = ("anthropic",) + tuple("anthropic-%d" % n for n in range(2, 9))
 # The codex lane and its fifteen slots, all on gpt-6-luna (labels.SLOTS). Every
-# tier and rung that names codex names them all: codex-3 to codex-8 were once
+# list and rung that names codex names them all: codex-3 to codex-8 were once
 # lanes only, beat available and sat idle while medium and hard tickets
 # waited "no free lane in tier" (tests/test_bus_codex_slots.py).
 CODEX = ("codex",) + tuple("codex-%d" % n for n in range(2, 17))
@@ -405,11 +408,14 @@ LADDER: Tuple[Tuple[Tuple[str, ...], str], ...] = (
     (CODEX, "gpt-6-luna"),
     (("claude",) + ANTHROPIC, "claude-opus-5-5"),
 )
-# The lanes a ticket may move to when its lane is at a limit, by its
-# Difficulty: line, best first (docs/MUSE.md, Lane choice; the doc test reads
-# this table). A limit is not a failure, so the move stays in the tier and
-# never climbs the ladder: on 2026-10-13 a private repo's easy ticket on a
-# hot spark lane went up the ladder to claude, the operator's subscription.
+# Every lane may try every ticket (operator, 2026-11-24, loom#3550): one list
+# for all work, cheapest first (docs/MUSE.md, Lane choice; the doc test reads
+# this list). Difficulty: no longer routes. Review on the head, CI, live
+# verification, the merge gate and the model ladder judge the work; on
+# 2026-11-24 the old per-difficulty lists assigned 0 of 176 queued.
+# The Sparks first (operator 2026-10-17: "I wanna use my sparks"): four slots
+# on the operator's own hardware, open to private repos. A ticket a lane
+# fails still climbs the model ladder, so nothing waits on a cheap lane.
 SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # One slot per free provider in the spark-gateway's pool (infra#5617): spark-
 # type slots whose endpoint is the gateway's route pinned to that provider,
@@ -420,39 +426,21 @@ SPARKS = ("spark", "spark-2", "spark-3", "spark-4")
 # free-openrouter, OpenRouter's free models on a cluster runner.
 FREE_POOL = ("free-ollama", "free-gemma", "free-nvidia", "free-kilo", "free-groq",
              "free-openrouter")
-TIERS: Dict[str, Tuple[str, ...]] = {
-    # The operator's priorities: Muse and agy first on public repos, so their
-    # allowances are spent before the rest (2026-10-14); then the Sparks,
-    # much more (2026-10-16): four local slots on the operator's own
-    # hardware, free, and open to private repos. Tiers follow the Artificial
-    # Analysis Intelligence Index (the operator's yardstick).
-    # The Sparks come FIRST in every tier since 2026-10-17 (operator: "I wanna
-    # use my sparks"): both boxes run NVIDIA Nemotron 3.5 Super VL on vLLM
-    # (120B / 12B active; SWE-bench Verified 71.1 and Terminal-Bench 2.1 about
-    # 61 on its model card; 6/6 on assay's agentic_coding). Artificial
-    # Analysis has no listing for it yet. A ticket a Spark fails still climbs
-    # the model ladder, so nothing waits on them.
-    "easy": SPARKS + ("muse", "agy") + FREE_POOL + ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4",
-                      "openrouter", "workersai", "zen", "zai", "copilot"),
-    # The free lanes take medium work too, before the paid ones (operator
-    # 2026-10-19: "I always want my free tier used up"). 84 medium tickets
-    # waited a median 18.5 hours for codex while these sat idle; a ticket a
-    # free model fails still climbs the model ladder.
-    "medium": SPARKS + ("muse", "agy") + FREE_POOL + ("openrouter", "workersai", "zen", "zai")
-              + ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4")
-              + CODEX + ANTHROPIC,
-    # agy takes hard work on public repos (agy stays public only); since
-    # 2026-10-21 it runs its gemini-3.8-flash default there, as codex runs
-    # gpt-6-luna (tickets.FORBIDDEN_MODELS).
-    "hard": SPARKS + ANTHROPIC + ("claude", "agy", "opencode-go", "opencode-go-1", "opencode-go-2",
-                                  "opencode-go-3", "opencode-go-4") + CODEX,
-}
+OPENCODE_GO = ("opencode-go", "opencode-go-1", "opencode-go-2", "opencode-go-3", "opencode-go-4")
+# By cost kind (KINDS): own hardware, then free (operator 2026-10-19: "I
+# always want my free tier used up"), then subscription, then the never-paid
+# anthropic credit last.
+LANE_ORDER: Tuple[str, ...] = (
+    SPARKS
+    + FREE_POOL + ("openrouter", "workersai", "zen", "zai", "copilot")
+    + OPENCODE_GO + CODEX + ("claude", "agy", "muse")
+    + ANTHROPIC)
 # What a lane costs, for the dashboard's Tiers and allowances page (loom#968):
 # own-hardware (the Sparks), free (a free provider's allowance), subscription
 # (a plan with a usage window: claude, codex, opencode-go, agy on the
 # operator's Google plan, muse) or never-paid (a prepaid API credit the
 # operator does not top up, LOOM_NO_TOPUP: the anthropic slots). Every lane
-# TIERS and LADDER name has one (tests/test_bus_factory.py LaneKinds). Base
+# LANE_ORDER and LADDER name has one (tests/test_bus_factory.py LaneKinds). Base
 # lanes only: a numbered slot takes its lane's kind (lane_kind).
 KINDS = ("own-hardware", "free", "subscription", "never-paid")
 LANE_KINDS: Dict[str, str] = {
@@ -525,13 +513,6 @@ STRONG = frozenset({LADDER[-1][1]} | set(HARD_MODELS.values())
 # The equivalent-move marker format is owned by bus/history.py (loom#2457).
 EQUIVALENT_MARKER = history.EQUIVALENT_MARKER
 EQUIVALENT_RE = history.EQUIVALENT_RE
-# When no lane of a ticket's tier is up (each at a limit or down), a tier move
-# takes a free lane of these tiers instead, in order: the next harder tier,
-# then the easier one (docs/MUSE.md, Lane choice). On 2026-10-14 every medium
-# lane was at a limit for hours while claude and the free lanes sat idle.
-# Easy has none (never anthropic or claude) and hard has none (never a free
-# lane or spark).
-FALLBACK: Dict[str, Tuple[str, ...]] = {"medium": ("hard", "easy")}
 # Lanes whose provider may train on prompts: public repos only.
 # opencode-go-4 runs Muse Spark Contributor, which trains on prompts.
 # free-nvidia, free-kilo and free-groq are free providers that may train on prompts.
@@ -557,8 +538,8 @@ ONE_LANE_MAX = 4
 # rung's one lane for a day while two fix rounds and their open pull requests
 # waited on it (2026-10-19).
 RUNG_LIMIT_WAIT = 2 * 3600
-# A tier ticket briefed to a lane that is down, or at a limit lifting further
-# off than this, goes back to the queue when no lane of its tier is free.
+# A ticket briefed to a lane that is down, or at a limit lifting further
+# off than this, goes back to the queue when no other lane is free.
 LIMIT_REQUEUE = 2 * 3600
 # A running ticket on a lane with no live heartbeat for this long moves off it.
 SILENT_MAX = 30 * 60
@@ -1823,25 +1804,26 @@ def without_model(body: str) -> str:
     return MODEL_LINE.sub("", head + "\n", count=1).rstrip("\n") + sep + rest
 
 
-# The tier of a ticket whose Difficulty line is missing or names no tier.
-# Such a ticket was in no tier, so no lane ever took it: one waited a day in
-# the queue (2026-10-21). Medium's FALLBACK reaches both other tiers.
+# What difficulty_of reads for a ticket whose Difficulty line is missing or
+# names none. Difficulty routes nothing (loom#3550): a remote lane's claim
+# brief and the dashboard still show it.
 DEFAULT_DIFFICULTY = "medium"
 
 
 def has_difficulty(issue: Dict[str, Any]) -> bool:
-    """Whether the ticket's own Difficulty: line names a tier (difficulty_of
-    gives DEFAULT_DIFFICULTY in place of one that does not)."""
+    """Whether the ticket's own Difficulty: line names one of
+    tickets.DIFFICULTIES (difficulty_of gives DEFAULT_DIFFICULTY in place of
+    one that does not)."""
     try:
         found = str(tickets.parse(issue.get("body"))[0].get("Difficulty", "")).strip().lower()
     except ValueError:
         return False
-    return found in TIERS
+    return found in tickets.DIFFICULTIES
 
 
 def difficulty_of(issue: Dict[str, Any]) -> str:
     """The ticket's Difficulty: line, DEFAULT_DIFFICULTY when it has none
-    readable or it names no tier."""
+    readable or it names none. Shown, never routed on."""
     if not has_difficulty(issue):
         return DEFAULT_DIFFICULTY
     return str(tickets.parse(issue.get("body"))[0]["Difficulty"]).strip().lower()
@@ -1867,16 +1849,10 @@ def public_only(lane: str) -> bool:
     return needs_public_repo(lane, "")
 
 
-def lanes_of(difficulty: str, private: bool) -> Tuple[str, ...]:
-    """The lanes of a difficulty tier a repo may run on, best first."""
-    return tuple(x for x in TIERS.get(difficulty, ())
-                 if not (private and public_only(x)))
-
-
-def tier_lanes(issue: Dict[str, Any], private: bool) -> Tuple[str, ...]:
-    """The lanes of the ticket's difficulty tier it may run on, best first;
-    none when it has no readable Difficulty: line."""
-    return lanes_of(difficulty_of(issue), private)
+def lanes_for(private: bool) -> Tuple[str, ...]:
+    """The lanes of LANE_ORDER a repo may run on, cheapest first: a private
+    repo's skip the public-only ones."""
+    return tuple(x for x in LANE_ORDER if not (private and public_only(x)))
 
 
 def agy_takes_header(issue: Dict[str, Any], rung_only: bool = False) -> bool:
@@ -2069,7 +2045,7 @@ class Factory:
         self.no_lane_since = dict(no_lane_since or {})
         self.reroute_after = no_lane_reroute() if reroute_after is None else reroute_after
         # How long a queued pinned ticket waits for its model before a free
-        # lane of its tier takes it (pin_fallback_after); None never.
+        # lane by cost takes it (pin_fallback_after); None never.
         self.pin_fallback = pin_fallback_after()
         # The tickets whose no-lane wait ended this pass: a lane took them,
         # they were rerouted, or they went to the hand-off pool. The station
@@ -2208,7 +2184,7 @@ class Factory:
         """Whether the lane may be given a ticket now: not at a limit, its
         heartbeat says available, and not down (self.down, which holds the
         demoted lanes too). Every lane choice reads this one test: a queued
-        ticket's lane, a tier move, a stall move, a rung or model lane. It
+        ticket's lane, a lane move, a stall move, a rung or model lane. It
         once left out self.down, so a demoted lane with a fresh heartbeat was
         given queued tickets and the same pass's step-aside moved each
         straight off again (loom#2430)."""
@@ -2231,7 +2207,7 @@ class Factory:
         `base`, through the station's runner_stops (bus/runners.py
         Runners.stops, the read dispatch itself makes): a slot it stops is
         skipped like a busy one, a normal skip with no note or park, so the
-        next lane of the tier takes the ticket (loom#3211). No reader wired
+        next lane by cost takes the ticket (loom#3211). No reader wired
         stops nothing."""
         if self.runner_stops is None:
             return False
@@ -2240,36 +2216,17 @@ class Factory:
             self._stops_cache[key] = bool(self.runner_stops(lane, repo, base))
         return self._stops_cache[key]
 
-    def _tier_move(self, repo: str, issue: Dict[str, Any],
-                   old: str = "", allow_remote: bool = True) -> Tuple[Optional[str], str]:
-        """(lane, fallback) for a tier move off lane `old`: the first free lane
-        of the ticket's tier, with fallback ""; else, when no lane of its tier
-        is up, the first free lane of its FALLBACK tiers in order, with
-        fallback saying so. (None, "") when it should wait."""
-        private = self._is_private(repo)
-        difficulty = difficulty_of(issue)
+    def _lane_move(self, repo: str, issue: Dict[str, Any],
+                   old: str = "", allow_remote: bool = True) -> Optional[str]:
+        """The first free lane of lanes_for the repo, cheapest first, other
+        than `old`, whatever the ticket's Difficulty: line (loom#3550); None
+        when it should wait."""
         base = base_of(issue)
         agy_ok = agy_takes_header(issue, rung_only=True)
-        own = [x for x in lanes_of(difficulty, private)
-               if x != old and (allow_remote or x not in REMOTE_LANES)
-               and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)]
-        lane = next((x for x in own if self._free(x)), None)
-        if lane is not None or any(self._takes_work(x) for x in own):
-            return lane, ""
-        whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
-        if not all(self._out_hours(x) for x in whole):
-            # A lane of the tier lifts within LIMIT_REQUEUE: wait for it
-            # rather than leave the tier (loom#1224).
-            return None, ""
-        for tier in FALLBACK.get(difficulty, ()):
-            fallback_lanes = [x for x in lanes_of(tier, private)
-                              if x != old and (allow_remote or x not in REMOTE_LANES)
-                              and (x != "agy" or agy_ok)
-                              and not self._runner_stops(x, repo, base)]
-            lane = next((x for x in fallback_lanes if self._free(x)), None)
-            if lane is not None:
-                return lane, "fallback: no %s lane is up" % difficulty
-        return None, ""
+        return next((x for x in lanes_for(self._is_private(repo))
+                     if x != old and (allow_remote or x not in REMOTE_LANES)
+                     and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)
+                     and self._free(x)), None)
 
     def _check_runs(self, repo: str, sha: str) -> List[Dict[str, Any]]:
         """The newest run of each check on the commit, all pages."""
@@ -2861,12 +2818,12 @@ class Factory:
         send-back picks: a ticket with no lane label (a silent-lane requeue
         drops it, and the run's pull request opens after; loom#1095,
         2026-10-21) failed every fix brief on "exactly one lane label", so
-        it moves like a remote-lane ticket and takes a tier lane; any other
+        it moves like a remote-lane ticket and takes the first free lane; any other
         keeps its own lane. Returns what brain.fix returns: False when the
         brief would add nothing and nothing was written."""
         lane = None
         if not _lane(issue) or _lane(issue) in REMOTE_LANES:
-            lane, _ = self._tier_move(repo, issue, allow_remote=False)
+            lane = self._lane_move(repo, issue, allow_remote=False)
             if lane is None:
                 lane = LADDER[0][0][0]
         if lane is not None:
@@ -3953,8 +3910,8 @@ class Factory:
         original_body = str(issue.get("body") or "")
         if not handoff and not stale:
             return original_body
-        lane, _ = self._tier_move(repo, issue, old=_lane(issue) if stale else "",
-                                  allow_remote=False)
+        lane = self._lane_move(repo, issue, old=_lane(issue) if stale else "",
+                               allow_remote=False)
         if lane is None:
             return None
         kept = [label for label in labels
@@ -4981,8 +4938,8 @@ class Factory:
 
     def running(self, repo: str, issue: Dict[str, Any]) -> None:
         """A running ticket whose lane has sent no heartbeat for SILENT_MAX
-        moves like a transient failure but is no failure: a free lane of its
-        tier (of its model, for a Model: ticket), else back to the queue. It
+        moves like a transient failure but is no failure: the first free
+        other lane (of its model, for a Model: ticket), else back to the queue. It
         takes no rung marker and none of its automatic retries. A remote lane
         is left to the remote heartbeat rules, a held ticket to the station."""
         old = _lane(issue)
@@ -4994,12 +4951,12 @@ class Factory:
         self.silent_running.setdefault(old, []).append((repo, number))
         model = issue_model(issue)
         lane = (self._queued_model_lane(repo, model) if model != "unspecified"
-                else self._tier_move(repo, issue, old, allow_remote=False)[0])
+                else self._lane_move(repo, issue, old, allow_remote=False))
         said = ("Not a failure (lane %s has sent no heartbeat for %d minutes): "
                 % (old, silent // 60))
         if lane is None:
             self._status_note(repo, number,
-                              said + "no lane of its tier is free, so the ticket goes back to the queue.")
+                              said + "no other lane is free, so the ticket goes back to the queue.")
             kept = stale_claims.without_own_claim(
                 [x for x in _labels(issue) if x != "loom:running" and not x.startswith("lane:")],
                 brain.trusted_authors())
@@ -5008,7 +4965,7 @@ class Factory:
                  % (repo, number, old, silent // 60))
         else:
             self._status_note(repo, number, said + "the factory moved this ticket to lane "
-                              "%s, %s." % (lane, "in its difficulty tier"
+                              "%s, %s." % (lane, "the first free lane by cost"
                                            if model == "unspecified" else "which takes its model"))
             kept = brain._moved_labels(_labels(issue), lane_state(lane), lane)
             self._relabel(repo, issue, kept)
@@ -5088,9 +5045,9 @@ class Factory:
 
     def _stall_lanes(self, repo: str, issue: Dict[str, Any], rung: int) -> List[str]:
         """The other available lanes a stalled ticket may move to: those of
-        its rung, or of its difficulty tier. Never up the ladder."""
+        its rung, or any lane its repo may run on. Never up the ladder."""
         old = _lane(issue)
-        pool = self._rung_lanes(repo, rung) if rung else tier_lanes(issue, self._is_private(repo))
+        pool = self._rung_lanes(repo, rung) if rung else lanes_for(self._is_private(repo))
         return [x for x in pool if x != old and self._takes_work(x)
                 and (not rung or self._serves(x, CLIMB[rung - 1][1]))
                 and (x != "agy" or agy_takes_header(issue))]
@@ -5152,7 +5109,7 @@ class Factory:
 
     def _unclaimed(self, repo: str, issue: Dict[str, Any]) -> None:
         """A ticket briefed BRIEFED_STALL with no lane claiming it moves to the
-        least-loaded other lane of its tier (or of its rung), with no rung
+        least-loaded other lane (of its rung, for a ladder ticket), with no rung
         marker: it never ran, so it has not failed on any model. With no such
         lane it stays briefed, and the stall is said once, when it starts."""
         number = int(issue["number"])
@@ -5176,8 +5133,7 @@ class Factory:
             # idled with 79 tickets queued (2026-11-17, loom#3158): it waits
             # in the queue instead, where any free lane can take it.
             self._requeue(repo, issue, "briefed %.0f hours on lane %s with no claim, and no "
-                          "other lane of its %s is available" % (hours, old,
-                                                                 "rung" if rung else "tier"))
+                          "other lane%s is available" % (hours, old, " of its rung" if rung else ""))
             return
         lane = pick_lane(lanes, self.load)
         waiting, there = self.load.get(old, 0), self.load.get(lane, 0)
@@ -5218,7 +5174,7 @@ class Factory:
                           "Not a failure (briefed %.0f hours on lane %s with no claim): the "
                           "factory moved this ticket to lane %s, %s." % (
                               hours, old, lane,
-                              "on the same rung" if rung else "in its difficulty tier"))
+                              "on the same rung" if rung else "the least-loaded other lane"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
@@ -5269,13 +5225,6 @@ class Factory:
         _say("moved %s#%d off busy lane %s to %s" % (repo, issue["number"], old, lane))
         return True
 
-    def _out_hours(self, lane: str) -> bool:
-        """Whether the lane takes no work for hours: not available, down, or
-        at a limit that lifts past LIMIT_REQUEUE or has no known end."""
-        if lane in self.limited:
-            return self.limit_until.get(lane, 0) == 0 or self._out_long(lane)
-        return lane in self.down or (self.available is not None and lane not in self.available)
-
     def _out_long(self, lane: str) -> bool:
         """Whether the lane will take no work for over LIMIT_REQUEUE: down, or
         at a limit whose heartbeat says it lifts past that."""
@@ -5307,9 +5256,9 @@ class Factory:
         return "down" if lane in self.down and lane not in self.limited else "at a limit"
 
     def _step_aside(self, repo: str, issue: Dict[str, Any]) -> None:
-        """Move a ticket off a lane at a limit (or down) to the first free lane of its
-        difficulty tier (or of a FALLBACK tier when none of its tier is up),
-        or a ladder ticket to a free lane of its rung, with no rung marker.
+        """Move a ticket off a lane at a limit (or down) to the first free lane
+        its repo may run on (_lane_move), or a ladder ticket to a free lane of
+        its rung, with no rung marker.
         A ladder ticket whose rung serves no lane within RUNG_LIMIT_WAIT
         climbs to its next untried rung instead. With none free it stays where
         it is, for the lane to take once it is back."""
@@ -5319,19 +5268,17 @@ class Factory:
         old = _lane(issue)
         why = self._aside_why(old)
         rung = current_rung(issue)
-        fallback = ""
         if rung:
             lane = next((x for x in self._rung_lanes(repo, rung) if x != old and self._free(x)
                          and self._serves(x, CLIMB[rung - 1][1])), None)
         else:
-            lane, fallback = self._tier_move(repo, issue, old, allow_remote=False)
+            lane = self._lane_move(repo, issue, old, allow_remote=False)
         if lane is None and rung and self._rung_waits_long(repo, rung):
             comments = self._comments(repo, number)
             tried_lanes = {match.group(1) for comment in comments
                            for match in [CLAIMED_RE.match(str(comment.get("body") or ""))]
                            if match}
-            free_lane = next((candidate for candidate in lanes_of(
-                difficulty_of(issue), self._is_private(repo))
+            free_lane = next((candidate for candidate in lanes_for(self._is_private(repo))
                 if lane_kind(candidate) == "free" and candidate not in tried_lanes
                 and self._free(candidate)), None)
             if free_lane is not None:
@@ -5364,11 +5311,11 @@ class Factory:
                 return
         if lane is None and not rung and self._out_long(old):
             # Briefed to a lane that will not take it for hours, it is in no
-            # queue: the queue took each lane of its tier as it freed, and two
+            # queue: the queue took each other lane as it freed, and two
             # tickets sat 18 hours on lanes at a monthly limit (loom#1224).
             until = self.limit_until.get(old)
-            self._status_note(repo, number, "Not a failure (lane %s is %s): no lane of its "
-                              "tier is free, so the ticket goes back to the queue and takes "
+            self._status_note(repo, number, "Not a failure (lane %s is %s): no other lane "
+                              "is free, so the ticket goes back to the queue and takes "
                               "the next one in its turn." % (
                                   old, "at a limit until %s" % time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until))
                                   if until else why))
@@ -5380,10 +5327,10 @@ class Factory:
             _say("queued %s#%d off lane %s, %s" % (repo, number, old, why))
             return
         if lane is None:
-            self._waiting(repo, number, "on lane %s, %s: no free lane in its %s"
-                          % (old, why, "rung" if rung else "tier"))
-            _say("%s#%d waits on lane %s, %s: no free lane in its %s"
-                 % (repo, number, old, why, "rung" if rung else "tier"))
+            wait = "on lane %s, %s: %s" % (old, why, "no free lane in its rung" if rung
+                                           else "no other " + NO_FREE_LANE)
+            self._waiting(repo, number, wait)
+            _say("%s#%d waits %s" % (repo, number, wait))
             return
         body = str(issue.get("body") or "")
         if not rung:
@@ -5399,12 +5346,11 @@ class Factory:
                           "Not a failure (lane %s is %s): the factory moved this "
                           "ticket to lane %s, %s." % (
                               old, why, lane, "on the same rung" if rung else
-                              fallback or "in its difficulty tier"))
+                              "the first free lane by cost"))
         self.load[old] = self.load.get(old, 0) - 1
         self.load[lane] = self.load.get(lane, 0) + 1
         self.actions += 1
-        _say("moved %s#%d off lane %s, %s, to %s%s" % (
-            repo, number, old, why, lane, " (%s)" % fallback if fallback else ""))
+        _say("moved %s#%d off lane %s, %s, to %s" % (repo, number, old, why, lane))
 
     # -- lane load -------------------------------------------------------
     def count_load(self, tickets: Optional[Dict[str, Dict[int, Dict[str, Any]]]] = None) -> None:
@@ -5452,8 +5398,8 @@ class Factory:
         return (lane, equivalent, why) if lane is not None else None
 
     def assign_queued(self) -> None:
-        """Give queued tickets free tier lanes (or FALLBACK lanes when none of
-        the tier is up) across repos in tickets.work_order: FIRST labels,
+        """Give queued tickets the first free lanes by cost (_lane_move)
+        across repos in tickets.work_order: FIRST labels,
         then priority, then the oldest. A pass that gives none a lane can
         summarize the first wait. Pinned model waits log their transitions."""
         found_by_repo = {repo: self._tickets(repo) for repo in self.repos}
@@ -5497,11 +5443,11 @@ class Factory:
 
     def _free_lane_for(self, repo: str, issue: Dict[str, Any]) -> Optional[str]:
         """A free lane a queued ticket could take this pass, by its Model:
-        line or its tier; reads nothing and records nothing."""
+        line or the lane order; reads nothing and records nothing."""
         match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if match:
             return self._queued_model_lane(repo, match.group(1))
-        return self._tier_move(repo, issue)[0]
+        return self._lane_move(repo, issue)
 
     def _assign_queued_ticket(self, repo: str, issue: Dict[str, Any]) -> str:
         """Give one queued ticket a lane: "" when it got one, else why it waits."""
@@ -5535,10 +5481,7 @@ class Factory:
                 self._waiting(repo, issue["number"], "brief headers could not be completed")
                 return "%s waits: brief headers could not be completed" % ref
             return self._assign_remote_queued(repo, issue, assigned, ref)
-        if assigned in REMOTE_LANES:
-            lane, fallback = self._tier_move(repo, issue, old=assigned)
-        else:
-            lane, fallback = self._tier_move(repo, issue)
+        lane = self._lane_move(repo, issue, old=assigned if assigned in REMOTE_LANES else "")
         if lane is None:
             if assigned in REMOTE_LANES and self._is_private(repo):
                 try:
@@ -5552,10 +5495,9 @@ class Factory:
                 if headers is None or "Difficulty" not in headers or "Base" not in headers:
                     self._relabel(repo, issue, [name for name in _labels(issue)
                                                 if not name.startswith("lane:")])
-            self._waiting(repo, issue["number"], "no free lane in tier %s" % difficulty_of(issue))
-            return "%s waits: no free lane in tier %s" % (ref, difficulty_of(issue))
-        tier = difficulty_of(issue) + (", " + fallback if fallback else "")
-        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            self._waiting(repo, issue["number"], NO_FREE_LANE)
+            return "%s waits: %s" % (ref, NO_FREE_LANE)
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, BY_COST):
             self._waiting(repo, issue["number"], "giving it a lane failed")
             return "%s: giving it lane %s failed" % (ref, lane)
         return ""
@@ -5579,15 +5521,12 @@ class Factory:
                  % (ref, assigned, self.reroute_after / 3600))
         else:
             _say("%s: remote lane %s is unavailable; reassigning to a local lane" % (ref, assigned))
-        lane, fallback = self._tier_move(repo, issue, old=assigned, allow_remote=False)
+        lane = self._lane_move(repo, issue, old=assigned, allow_remote=False)
         if lane is None:
             self._waiting(repo, issue["number"], reason)
-            _say("%s: remote lane %s not pulled and no local lane in tier %s is free"
-                 % (ref, assigned, difficulty_of(issue)))
-            return "%s waits: %s and no local lane in tier %s is free" % (
-                ref, reason, difficulty_of(issue))
-        tier = difficulty_of(issue) + (", " + fallback if fallback else "")
-        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+            _say("%s: remote lane %s not pulled and no local lane is free" % (ref, assigned))
+            return "%s waits: %s and no local lane is free" % (ref, reason)
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, BY_COST):
             self._waiting(repo, issue["number"], "giving it a lane failed")
             _say("%s: remote reassignment to lane %s failed" % (ref, lane))
             return "%s: giving it lane %s failed" % (ref, lane)
@@ -5840,30 +5779,18 @@ class Factory:
         return ""
 
     def _fallback_lane(self, repo: str, issue: Dict[str, Any],
-                       skip: Sequence[str] = ()) -> Tuple[Optional[str], str]:
-        """(lane, fallback) for a pin fallback: the first free local lane of
-        the ticket's tier not in `skip`; when no lane of the tier is up, the
-        first free one of its FALLBACK tiers, with fallback saying so."""
-        private = self._is_private(repo)
-        difficulty = difficulty_of(issue)
+                       skip: Sequence[str] = ()) -> Optional[str]:
+        """The lane for a pin fallback: the first free local lane by cost its
+        repo may run on, not in `skip`."""
         base = base_of(issue)
-        own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip
-               and not self._runner_stops(x, repo, base)]
-        lane = next((x for x in own if self._free(x)), None)
-        if lane is not None or any(self._takes_work(x) for x in own):
-            return lane, ""
-        for tier in FALLBACK.get(difficulty, ()):
-            lane = next((x for x in lanes_of(tier, private)
-                         if x not in REMOTE_LANES and x not in skip and self._free(x)
-                         and not self._runner_stops(x, repo, base)), None)
-            if lane is not None:
-                return lane, "fallback: no %s lane is up" % difficulty
-        return None, ""
+        return next((x for x in lanes_for(self._is_private(repo))
+                     if x not in REMOTE_LANES and x not in skip and self._free(x)
+                     and not self._runner_stops(x, repo, base)), None)
 
     def _pin_fallback(self, repo: str, issue: Dict[str, Any], model: str) -> Optional[str]:
         """Brief a queued ticket whose pinned `model` has had no free lane for
         pin_fallback seconds (the station's no_lane_since clock) on a free
-        lane of its tier, with that lane's own model: its Model: line is
+        lane by cost, with that lane's own model: its Model: line is
         removed, so the runner's footer names the model that ran. None when
         it keeps waiting for its model: inside the wait, a hard pin
         (hard_pin), a ladder marker (the rung's model is not a default),
@@ -5875,7 +5802,7 @@ class Factory:
             return None
         if LADDER_RE.search(str(issue.get("body") or "")):
             return None
-        if self._fallback_lane(repo, issue)[0] is None:
+        if self._fallback_lane(repo, issue) is None:
             return None  # nothing to move to: no comment read, every pass
         number = int(issue["number"])
         comments = self._comments(repo, number)
@@ -5885,16 +5812,15 @@ class Factory:
                for c in comments) >= PIN_FALLBACK_MAX:
             return None
         ran = {m.group(1) for c in comments for m in [CLAIMED_RE.match(str(c.get("body") or ""))] if m}
-        lane, fallback = self._fallback_lane(repo, issue, sorted(ran))
+        lane = self._fallback_lane(repo, issue, sorted(ran))
         if lane is None:
             return None
         minutes = waited / 60
-        tier = "%s, pin fallback from model %s after %.0f minutes%s" % (
-            difficulty_of(issue), model, minutes, ", " + fallback if fallback else "")
+        how = "%s, pin fallback from model %s after %.0f minutes" % (BY_COST, model, minutes)
         body = without_model(str(issue.get("body") or ""))
         self.gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": body})
         issue["body"] = body
-        if not self._guarded(self._assign_queued_one, repo, issue, lane, tier):
+        if not self._guarded(self._assign_queued_one, repo, issue, lane, how):
             return "%s: giving it lane %s failed" % (key, lane)
         self._status_note(repo, number,
                           "%s\nNot a failure (no free lane took model %s for %.0f minutes): the "
@@ -5930,27 +5856,29 @@ class Factory:
              % (repo, number, lane, model, pinned))
 
     def _assign_queued_one(self, repo: str, issue: Dict[str, Any], lane: str,
-                           tier: str) -> None:
+                           how: str) -> None:
+        """Brief (or, for a remote lane, reserve) a queued ticket on `lane`,
+        saying `how` it got the lane."""
         number = int(issue["number"])
         if lane in REMOTE_LANES:
             self._ensure_lane_headers(repo, issue)
             self.move(self.gh, repo, number, "queued", lane=lane)
             self._status_note(repo, number,
-                              "The station reserved this queued ticket for remote lane %s (tier %s)."
-                              % (lane, tier))
+                              "The station reserved this queued ticket for remote lane %s (%s)."
+                              % (lane, how))
             issue["labels"] = [{"name": x} for x in brain._moved_labels(
                 _labels(issue), "queued", lane)]
             self.load[lane] = self.load.get(lane, 0) + 1
-            _say("reserved queued %s#%d for remote lane %s (tier %s)"
-                 % (repo, number, lane, tier))
+            _say("reserved queued %s#%d for remote lane %s (%s)"
+                 % (repo, number, lane, how))
             return
         self.move(self.gh, repo, number, "briefed", lane=lane)
         self._status_note(repo, number,
-                          "The station gave this queued ticket lane %s (tier %s)." % (lane, tier))
+                          "The station gave this queued ticket lane %s (%s)." % (lane, how))
         issue["labels"] = [{"name": x} for x in brain._moved_labels(
             _labels(issue), "briefed", lane)]
         self.load[lane] = self.load.get(lane, 0) + 1
-        _say("gave queued %s#%d lane %s (tier %s)" % (repo, number, lane, tier))
+        _say("gave queued %s#%d lane %s (%s)" % (repo, number, lane, how))
 
     def _ensure_lane_headers(self, repo: str, issue: Dict[str, Any]) -> None:
         """Write the full claim header block before reserving a remote lane.
@@ -5960,7 +5888,7 @@ class Factory:
         ticket with only one of the two headers is stranded the same way
         once another path has labelled it for a lane (loom#2717).
         Materialize both headers before adding a lane label: the effective
-        tier, and the repository's default branch as Base:, the same
+        difficulty, and the repository's default branch as Base:, the same
         fallback the lane claim itself uses when it reads the repo.
         """
         body = str(issue.get("body") or "")
@@ -5990,7 +5918,7 @@ class Factory:
         """End the no-lane waits this pass can end. A ticket a lane took
         (LANED_STATES, or a new lane while briefed) is settled. One that has
         waited with no lane (no_lane) for reroute_after is rerouted to another
-        ladder rung with a free lane in its tier (_reroute); with none, by
+        ladder rung with a free lane (_reroute); with none, by
         NO_LANE_HANDOFF it goes to the hand-off pool (_hand_off)."""
         for repo, issues in found.items():
             for number, issue in issues.items():
@@ -6027,18 +5955,18 @@ class Factory:
     def _reroute(self, repo: str, issue: Dict[str, Any], reason: str, age: float) -> bool:
         """Move a queued or briefed ticket pinned to a model no lane takes to
         the first rung climb_rungs allows (never down from a strong model)
-        that has a free lane in the ticket's difficulty tier, for its repo
+        that has a free lane its repo may run on
         (PUBLIC_ONLY) and up for the rung's model (_up_lanes: not at a limit,
         not benched, not out of credit). The note carries the rung marker, as
         a "Not a failure" climb does. True when it moved."""
         number, state, old = int(issue["number"]), _state(issue), _lane(issue)
         match = re.search(r"^Model:\s*(\S+)", str(issue.get("body") or ""), re.M)
         if state not in ("queued", "briefed") or not match:
-            return False  # an unpinned ticket's tier moves are the queue's own
+            return False  # an unpinned ticket's lane moves are the queue's own
         here = next((n for n, (_, model) in enumerate(CLIMB, 1) if model == match.group(1)), 0)
-        tier = set(lanes_of(difficulty_of(issue), self._is_private(repo)))
+        allowed = set(lanes_for(self._is_private(repo)))
         up = self._up_lanes(repo)
-        free = {rung: [x for x in lanes if x in tier and x != old and self._free(x)]
+        free = {rung: [x for x in lanes if x in allowed and x != old and self._free(x)]
                 for rung, lanes in up.items() if rung != here}
         if not any(free.values()):
             return False  # nothing to move to: no comment read, every pass
@@ -6056,8 +5984,7 @@ class Factory:
                           "the factory rerouted this ticket to rung %d, %s on lane %s." % (
                               history.rung_marker(rung), age / 3600, reason, rung, model, lane))
         if state == "queued":
-            self._assign_queued_one(repo, issue, lane, "%s, rerouted to model %s" % (
-                difficulty_of(issue), model))
+            self._assign_queued_one(repo, issue, lane, "rerouted to model %s" % model)
         else:
             self._relabel(repo, issue, [x for x in _labels(issue) if not x.startswith("lane:")]
                           + ["lane:" + lane])
@@ -6085,7 +6012,7 @@ class Factory:
             self.load[old] = self.load.get(old, 0) - 1
         self._status_note(repo, number, (
             "No lane of this Loom took this ticket in %.0f hours (%s), and no other lane or "
-            "model rung its tier allows is free. It leaves the goal's in-flight count for the "
+            "model rung its repo allows is free. It leaves the goal's in-flight count for the "
             "hand-off pool (%s): the second operator's session may claim it. Taking the label "
             "off returns it to this Loom's queue.") % (age / 3600, reason, HANDOFF_LABEL))
         self.actions += 1
@@ -6313,11 +6240,11 @@ class Factory:
         _say("handed off %s#%d: its needs-brain hold went unanswered past %d hours"
              % (repo, number, brain_hold.HOLD_AGE // 3600))
 
-    def tier_lane(self, repo: str, difficulty: str) -> Optional[str]:
-        """The first free lane of the difficulty tier the repo may use, else
-        its least-loaded lane that is up and not at a limit; None when the
-        tier has none. count_load first."""
-        lanes = lanes_of(difficulty, self._is_private(repo))
+    def lane_for(self, repo: str) -> Optional[str]:
+        """The first free lane by cost the repo may use (lanes_for), else its
+        least-loaded lane that is up and not at a limit; None when it has
+        none. count_load first."""
+        lanes = lanes_for(self._is_private(repo))
         free = next((x for x in lanes if self._free(x)), None)
         if free is not None:
             return free
