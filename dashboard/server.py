@@ -1,6 +1,8 @@
 """HTTP routes and server-rendered views for the Loom dashboard."""
 from __future__ import annotations
 
+import gzip
+import hashlib
 import html
 import json
 import logging
@@ -56,8 +58,38 @@ from . import brain_view, chain_view, fleet, floor_lanes, hot_spots
 LOG = logging.getLogger(__name__)
 
 
-def _all_tickets(state):
-    payload = state.response()
+_VIEW_CACHE_MAX = 64
+
+
+def _cached_view(state, version, key, builder):
+    """Cache a rendered view or data structure on `state` keyed by snapshot
+    version; bypassed when `version` is None (e.g. stand-in test states)."""
+    if version is None:
+        return builder()
+    cache = getattr(state, "_view_cache", None)
+    if cache is None or cache[0] != version:
+        cache = (version, {}, threading.Lock())
+        state._view_cache = cache
+    _, store, lock = cache
+    hit = store.get(key)
+    if hit is not None:
+        return hit
+    value = builder()
+    with lock:
+        if len(store) >= _VIEW_CACHE_MAX:
+            store.clear()
+        store[key] = value
+    return value
+
+
+def _usage_stamp(state):
+    return getattr(getattr(state, "usage", None), "received_at", None)
+
+
+def _all_tickets(state, payload=None):
+    payload = state.response() if payload is None else payload
+    if payload.get("models_resolved") and payload.get("all_tickets") is not None:
+        return payload["all_tickets"]
     rows = [row for tickets in payload["tickets"].values() if tickets for row in tickets]
     models = payload.get("footer_models")
     if models is None:
@@ -248,14 +280,24 @@ def _priorities_card(rows):
     return '<section class="card priorities-card"><span class="label">Priorities</span>%s<a href="/tickets">all tickets &rarr;</a></section>' % body
 
 
-def _floor_live(state, rows=None):
+def _floor_live(state, rows=None, payload=None):
     """The Floor's two live fragments, one read of the same state the page
     renders from: the lane strip and the Moving now rows. GET /api/floor/live
     serves them to the page's script (loom.js), which swaps them in each poll."""
-    rows = _all_tickets(state) if rows is None else rows
-    payload = state.response()
-    fixing = floor_lanes.fix_round_refs(payload.get("issue_comments") or [])
-    lanes = _lane_view_data(payload, rows, state=state)["lanes"]
+    payload = state.response() if payload is None else payload
+    version = payload.get("_version")
+    if rows is None and version is not None:
+        return _cached_view(state, version, ("floor_live", _usage_stamp(state)),
+                            lambda: _build_floor_live(state, _all_tickets(state, payload), payload))
+    rows = _all_tickets(state, payload) if rows is None else rows
+    return _build_floor_live(state, rows, payload)
+
+
+def _build_floor_live(state, rows, payload):
+    fixing = payload.get("fix_round_refs")
+    if fixing is None:
+        fixing = floor_lanes.fix_round_refs(payload.get("issue_comments") or [])
+    lanes = _lane_cards_only(payload, rows, state=state)
     order = {name: index for index, name in enumerate(MOVING_ORDER)}
     moving = sorted((row for row in rows if row.get("open", True) and row.get("state") in order),
                     key=lambda row: (order[row["state"]], str(row.get("updated_at") or "")[::-1]))
@@ -564,12 +606,20 @@ def _backlog_raw(state):
     return cached(source)
 
 
+_BACKLOG_DOC_CACHE = [None, None]
+
+
 def _backlog_document(raw):
+    if isinstance(raw, (bytes, bytearray)) and raw is _BACKLOG_DOC_CACHE[0]:
+        return _BACKLOG_DOC_CACHE[1]
     try:
         value = json.loads(raw)
-        return value if isinstance(value, dict) else {}
+        doc = value if isinstance(value, dict) else {}
     except (ValueError, TypeError):
         return {}
+    if isinstance(raw, bytes) and len(raw) > 256:
+        _BACKLOG_DOC_CACHE[0], _BACKLOG_DOC_CACHE[1] = raw, doc
+    return doc
 
 
 def _repo_number(item):
@@ -1214,11 +1264,26 @@ def _handle_brain(handler, state, write=None):
         return handler.send_json(503, {"error": "brain memory storage unavailable"})
 
 
+_COMPRESSIBLE_TYPES = ("text/", "application/json", "image/svg+xml")
+_COMPRESS_MIN_BYTES = 512
+
+
+def _accepts_gzip(handler) -> bool:
+    headers = getattr(handler, "headers", None)
+    return bool(headers and "gzip" in str(headers.get("Accept-Encoding", "")).lower())
+
+
+def _is_compressible(content_type: str) -> bool:
+    return any(content_type.startswith(prefix) for prefix in _COMPRESSIBLE_TYPES)
+
+
 def _handler_for(state):
     """Keep GET dispatch small; route groups are handled by module helpers."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.split("?", 1)[0] not in ("/livez", "/readyz"):
+            path = self.path.split("?", 1)[0]
+            if (path not in ("/livez", "/readyz") and path not in STATIC_ASSETS
+                    and not getattr(state, "_station_state_bg", False)):
                 station_state.sync(state)
             return _dispatch_get(self, state)
 
@@ -1258,9 +1323,18 @@ def _handler_for(state):
         def send_text(self, code, value):
             self.send_bytes(code, value.encode("utf-8"), "text/plain; charset=utf-8")
 
-        def send_bytes(self, code, body, content_type):
+        def send_bytes(self, code, body, content_type, extra_headers=None):
+            headers = dict(extra_headers or {})
+            if (code == 200 and len(body) >= _COMPRESS_MIN_BYTES
+                    and "Content-Encoding" not in headers
+                    and _is_compressible(content_type) and _accepts_gzip(self)):
+                body = gzip.compress(body, compresslevel=5)
+                headers["Content-Encoding"] = "gzip"
+                headers["Vary"] = "Accept-Encoding"
             self.send_response(code)
             self.send_header("Content-Type", content_type)
+            for name, value in headers.items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1366,7 +1440,10 @@ def _dispatch_backlog(handler, state, path, parsed):
     if path == "/backlog":
         if raw is None:
             return handler.send_page(page("Backlog", "backlog", "<p>Backlog source unavailable.</p>", status="Unavailable"), 503)
-        return handler.send_page(_backlog_page(_backlog_document(raw), parsed, state))
+        version = state.response().get("_version")
+        key = ("backlog", id(raw), parsed.query, int(time.monotonic() // 60))
+        return handler.send_page(_cached_view(state, version, key,
+                                              lambda: _backlog_page(_backlog_document(raw), parsed, state)))
     who = needs_you_view.who_param(parse_qs(parsed.query).get("who", [""])[0])
     return handler.send_page(_needs_you(_backlog_document(raw or b"{}"), state, source_missing=raw is None, who=who))
 
@@ -1383,16 +1460,54 @@ STATIC_ASSETS = {
 }
 
 
-def _dispatch_static(handler, path):
+_STATIC_CACHE = {}
+
+
+def _static_entry(path):
     name, content_type = STATIC_ASSETS[path]
     asset = Path(__file__).parent / "static" / name
-    return handler.send_bytes(200, asset.read_bytes(), content_type)
+    mtime_ns = asset.stat().st_mtime_ns
+    cached = _STATIC_CACHE.get(path)
+    if cached is not None and cached[0] == mtime_ns:
+        return cached
+    raw = asset.read_bytes()
+    gz = gzip.compress(raw, compresslevel=6) if _is_compressible(content_type) and len(raw) >= _COMPRESS_MIN_BYTES else None
+    etag = '"%s"' % hashlib.sha256(raw).hexdigest()[:16]
+    entry = (mtime_ns, raw, gz, etag, content_type)
+    _STATIC_CACHE[path] = entry
+    return entry
+
+
+def _dispatch_static(handler, path):
+    _, raw, gz, etag, content_type = _static_entry(path)
+    req_headers = getattr(handler, "headers", None)
+    if req_headers and req_headers.get("If-None-Match") == etag:
+        handler.send_response(304)
+        handler.send_header("ETag", etag)
+        handler.send_header("Cache-Control", "public, max-age=300")
+        handler.end_headers()
+        return
+    headers = {"ETag": etag, "Cache-Control": "public, max-age=300"}
+    if gz is not None and _accepts_gzip(handler):
+        headers["Content-Encoding"] = "gzip"
+        headers["Vary"] = "Accept-Encoding"
+        return handler.send_bytes(200, gz, content_type, headers)
+    if gz is not None:
+        headers["Vary"] = "Accept-Encoding"
+    return handler.send_bytes(200, raw, content_type, headers)
 
 
 def _dispatch_view(handler, state, path, parsed):
+    payload = state.response()
+    version = payload.get("_version")
     if path == "/tickets":
-        return handler.send_page(_tickets(state, parsed))
-    return handler.send_page({"/": _floor, "/goals": _goals, "/tree": _tree}[path](state))
+        key = ("tickets", parsed.query, int(time.monotonic() // 60))
+        return handler.send_page(_cached_view(state, version, key, lambda: _tickets(state, parsed)))
+    if path == "/":
+        key = ("floor", _usage_stamp(state), id(_backlog_raw(state)), len(answers_view.posted(state)))
+        return handler.send_page(_cached_view(state, version, key, lambda: _floor(state)))
+    key = (path, int(time.monotonic() // 60))
+    return handler.send_page(_cached_view(state, version, key, lambda: {"/goals": _goals, "/tree": _tree}[path](state)))
 
 
 def _dispatch_ticket_page(handler, state, path, parsed):
@@ -1472,10 +1587,12 @@ def _dispatch_basic(handler, state, path):
 # requests and two weeks of comments made /api/tickets 164 MB (2026-10-15).
 RAW_SOURCES = ("pull_requests", "issue_comments", "review_comments", "footer_models", "footer_runs",
                "state_entered")
+INTERNAL_SNAPSHOT_KEYS = ("_version", "models_resolved", "all_tickets", "newest_lane_models", "fix_round_refs")
 
 
 def _api_tickets(payload):
-    out = {key: value for key, value in payload.items() if key not in RAW_SOURCES}
+    excluded = set(RAW_SOURCES) | set(INTERNAL_SNAPSHOT_KEYS)
+    out = {key: value for key, value in payload.items() if key not in excluded}
     out["source_counts"] = {key: len(payload.get(key) or ()) for key in RAW_SOURCES}
     return out
 
@@ -1544,27 +1661,32 @@ def _dispatch_tiers(handler, state):
 
 
 def _dispatch_brain_hot_spots(handler, state, path):
-    from datetime import datetime, timezone
     payload = state.response()
-    waits_error = getattr(state, "waits_error", "")
-    if path == "/brains":
-        tickets = [row for rows in payload.get("tickets", {}).values() if rows for row in rows]
-        data = brain_view.build_brains(payload.get("brain_step"),
-                                       payload.get("improving", {}).get("journals", []),
-                                       _merge_lane_rows(payload.get("lanes", [])), tickets,
-                                       payload.get("pull_requests", []), payload.get("issue_comments", []),
-                                       datetime.now(timezone.utc))
-        body, title, active = brain_view.render_brains(data), "Brains", "brains"
-    elif path == "/brain":
-        data = brain_view.build_brain(payload.get("brain_step"), payload.get("brain_step_error"),
-                                      payload.get("improving", {}).get("journals", []),
-                                      payload.get("wait_rows"), waits_error)
-        body, title, active = brain_view.render_brain(data), "Brain", "brain"
-    else:
-        bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or hot_spots.DEFAULT_REVIEW_BOT
-        data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
-        body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
-    return handler.send_page(page(title, active, body, status="stale" if payload.get("stale") else "live"))
+    version = payload.get("_version")
+    key = (path, int(time.monotonic() // 30))
+
+    def render():
+        waits_error = getattr(state, "waits_error", "")
+        if path == "/brains":
+            tickets = [row for rows in payload.get("tickets", {}).values() if rows for row in rows]
+            data = brain_view.build_brains(payload.get("brain_step"),
+                                           payload.get("improving", {}).get("journals", []),
+                                           _merge_lane_rows(payload.get("lanes", [])), tickets,
+                                           payload.get("pull_requests", []), payload.get("issue_comments", []),
+                                           datetime.now(timezone.utc))
+            body, title, active = brain_view.render_brains(data), "Brains", "brains"
+        elif path == "/brain":
+            data = brain_view.build_brain(payload.get("brain_step"), payload.get("brain_step_error"),
+                                          payload.get("improving", {}).get("journals", []),
+                                          payload.get("wait_rows"), waits_error)
+            body, title, active = brain_view.render_brain(data), "Brain", "brain"
+        else:
+            bot = os.environ.get("LOOM_REVIEW_BOT", "").strip() or hot_spots.DEFAULT_REVIEW_BOT
+            data = hot_spots.build_hot_spots(payload, waits_error, datetime.now(timezone.utc), bot)
+            body, title, active = hot_spots.render_hot_spots(data), "Hot spots", "hot-spots"
+        return page(title, active, body, status="stale" if payload.get("stale") else "live")
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def _dispatch_roster(handler, state):
@@ -1572,21 +1694,33 @@ def _dispatch_roster(handler, state):
     down, computed from the journals this snapshot already read."""
     from . import roster
     payload = state.response()
-    data = roster.build_roster(payload.get("improving", {}).get("journals", []),
-                               payload.get("workhorse"), datetime.now(timezone.utc))
-    return handler.send_page(page("Roster", "roster", roster.render_roster(data),
-                                  status="stale" if payload.get("stale") else "live"))
+    version = payload.get("_version")
+    key = ("roster", int(time.monotonic() // 30))
+
+    def render():
+        data = roster.build_roster(payload.get("improving", {}).get("journals", []),
+                                   payload.get("workhorse"), datetime.now(timezone.utc))
+        return page("Roster", "roster", roster.render_roster(data),
+                    status="stale" if payload.get("stale") else "live")
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def _dispatch_fleet(handler, state):
     """The Fleet timeline, from the snapshot the other pages read and the
     station's chain snapshot times; the page itself makes no GitHub request."""
     payload = state.response()
-    lane_rows = _merge_lane_rows(payload.get("lanes") or [])
-    data = fleet.build_fleet(payload, lane_rows, list(getattr(state, "chain_seen", None) or ()),
-                             datetime.now(timezone.utc))
-    return handler.send_page(page("Fleet timeline", "fleet", fleet.render_fleet(data),
-                                  status="stale" if payload.get("stale") else "live"))
+    version = payload.get("_version")
+    chain_seen = list(getattr(state, "chain_seen", None) or ())
+    key = ("fleet", len(chain_seen), chain_seen[-1] if chain_seen else None, int(time.monotonic() // 30))
+
+    def render():
+        lane_rows = _merge_lane_rows(payload.get("lanes") or [])
+        data = fleet.build_fleet(payload, lane_rows, chain_seen, datetime.now(timezone.utc))
+        return page("Fleet timeline", "fleet", fleet.render_fleet(data),
+                    status="stale" if payload.get("stale") else "live")
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def _dispatch_chain(handler, state):
@@ -1599,50 +1733,66 @@ def _dispatch_chain(handler, state):
 
 
 def _dispatch_results(handler, state):
-    from datetime import datetime, timezone
     from . import results
     payload = state.response()
-    body = results.render_results(results.build_results(payload, datetime.now(timezone.utc)))
-    return handler.send_page(page("Results", "results", body,
-                                  status="stale" if payload.get("stale") else "live"))
+    version = payload.get("_version")
+    key = ("results", int(time.monotonic() // 60))
+
+    def render():
+        body = results.render_results(results.build_results(payload, datetime.now(timezone.utc)))
+        return page("Results", "results", body, status="stale" if payload.get("stale") else "live")
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def _dispatch_free(handler, state, parsed):
     from . import free_view
     operator = free_view.operator_login((parse_qs(parsed.query).get("operator") or [""])[0])
     payload = state.response()
-    found = free_view.build(getattr(state, "open_issues", {}) or {}, payload.get("tickets") or {},
-                            operator, payload.get("issue_comments") or [])
+    version = payload.get("_version")
     read_at = getattr(state, "open_issues_read_at", 0)
-    stamp = datetime.fromtimestamp(read_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if read_at else None
-    body = free_view.render(found, operator, stamp, getattr(state, "open_issues_error", ""))
-    return handler.send_page(page("Free to take", "free", body, status="Read only"))
+    key = ("free", read_at, operator)
+
+    def render():
+        found = free_view.build(getattr(state, "open_issues", {}) or {}, payload.get("tickets") or {},
+                                operator, payload.get("issue_comments") or [])
+        stamp = datetime.fromtimestamp(read_at, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if read_at else None
+        body = free_view.render(found, operator, stamp, getattr(state, "open_issues_error", ""))
+        return page("Free to take", "free", body, status="Read only")
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def _send_dashboard_view(handler, state, path):
     payload = state.response()
-    tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
-    status = "stale" if payload["stale"] else "live"
-    if path == "/improving":
-        # The background refresh builds this page's data (loom#2248): a
-        # request renders what it holds and makes no read or join of its
-        # own. Before the first read there is nothing to render, so the
-        # page says what is missing and when it arrives, never false zeros.
-        built = payload.get("improving_built")
-        if built is not None:
-            body = views.render_improving(built)
+    version = payload.get("_version")
+    key = (path, _usage_stamp(state), int(time.monotonic() // 30)) if path == "/lanes" else (path,)
+
+    def render():
+        tickets = [row for rows in payload["tickets"].values() if rows for row in rows]
+        status = "stale" if payload["stale"] else "live"
+        if path == "/improving":
+            # The background refresh builds this page's data (loom#2248): a
+            # request renders what it holds and makes no read or join of its
+            # own. Before the first read there is nothing to render, so the
+            # page says what is missing and when it arrives, never false zeros.
+            built = payload.get("improving_built")
+            if built is not None:
+                body = views.render_improving(built)
+            else:
+                when = html.escape(_next_refresh_text(payload.get("next_refresh_at")))
+                body = ('<p class="empty-state">Improving data has not been read yet: the tick journals '
+                        'and the daily metrics are missing; the dashboard reads them in the background '
+                        'and they refresh %s.</p>' % when)
+            title, active = "Improving", "improving"
         else:
-            when = html.escape(_next_refresh_text(payload.get("next_refresh_at")))
-            body = ('<p class="empty-state">Improving data has not been read yet: the tick journals '
-                    'and the daily metrics are missing; the dashboard reads them in the background '
-                    'and they refresh %s.</p>' % when)
-        title, active = "Improving", "improving"
-    else:
-        body = views.render_lanes(_lane_view_data(payload, tickets, state=state))
-        title, active = "Lanes and models", "lanes"
-    if payload.get("dashboard_errors"):
-        body += '<p class="empty-state">Some dashboard sources could not be read: %s</p>' % html.escape("; ".join(payload["dashboard_errors"]))
-    return handler.send_page(page(title, active, body, status=status))
+            body = views.render_lanes(_lane_view_data(payload, tickets, state=state))
+            title, active = "Lanes and models", "lanes"
+        if payload.get("dashboard_errors"):
+            body += '<p class="empty-state">Some dashboard sources could not be read: %s</p>' % html.escape("; ".join(payload["dashboard_errors"]))
+        return page(title, active, body, status=status)
+
+    return handler.send_page(_cached_view(state, version, key, render))
 
 
 def make_server(host: str = "", port: int = 8080, store: TicketStore = None):
@@ -1775,7 +1925,7 @@ def _scoreboard_rows(prs, tickets):
         if not parsed:
             continue
         ticket = tickets_by_ref.get(parsed[:2])
-        prepared.append({**pr, "tier": ticket.get("difficulty") if ticket else None})
+        prepared.append({**pr, "_parsed_footer": parsed, "tier": ticket.get("difficulty") if ticket else None})
     return prepared
 
 
@@ -1791,12 +1941,19 @@ def _anthropic_share(payload):
     return None
 
 
+def _lane_cards_only(payload, tickets, state=None):
+    prs = payload.get("pull_requests", [])
+    newest_pr_for_lane = payload.get("newest_lane_models")
+    if newest_pr_for_lane is None:
+        newest_pr_for_lane = _newest_lane_models(prs)
+    usage_records = _usage_rows(payload, state)
+    return [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
+            for item in _merge_lane_rows(payload.get("lanes", []))]
+
+
 def _lane_view_data(payload, tickets, state=None):
     prs = payload.get("pull_requests", [])
-    newest_pr_for_lane = _newest_lane_models(prs)
-    usage_records = _usage_rows(payload, state)
-    lanes = [_lane_card(item, tickets, newest_pr_for_lane, usage_records)
-             for item in _merge_lane_rows(payload.get("lanes", []))]
+    lanes = _lane_cards_only(payload, tickets, state=state)
     return {"lanes": lanes, "scoreboard": views.build_scoreboard(_scoreboard_rows(prs, tickets)),
             "anthropic_share": _anthropic_share(payload),
             "scorecard": _scorecard_rows(payload.get("lanes", []))}
