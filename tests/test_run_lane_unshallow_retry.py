@@ -55,6 +55,7 @@ export PATH={bin}:$PATH
 export STUB_CALLS={calls} STUB_COUNT={count} STUB_DEEP={deep}
 export STUB_UNSHALLOW_FAILS={fails}
 TREE=/nowhere BASE_BRANCH=main NET_TIMEOUT=10 LOG={log} TICKET=T1 BRANCH=fix
+commit_msg() {{ printf '%s' "$1"; }}
 {function}
 set +e
 update_fix_branch
@@ -72,7 +73,7 @@ echo "REASON=$UPDATE_REASON"
         result, calls = self.run_update(1)
         self.assertIn("RC=0", result.stdout.splitlines(), result.stderr)
         self.assertEqual(calls.count("fetch -q --unshallow"), 2)
-        self.assertIn(" merge --no-edit origin/main", calls)
+        self.assertIn(" merge --no-edit -m ", calls)
         # Both refusals: no merge is attempted and the reason names the tree,
         # asserted here so this module holds one test that fails on main.
         result, calls = self.run_update(2)
