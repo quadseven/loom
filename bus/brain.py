@@ -5481,6 +5481,18 @@ def _add_hold_criterion(body: str, criterion: str) -> str:
     return body[:end] + newline * 2 + box + (body[end:] or newline)
 
 
+def _external_hold_criterion(body: str, precondition: str, evidence: str) -> Tuple[str, bool]:
+    """Return the criterion to journal and whether it needs to be added."""
+    condition = hold_boxes.EXTERNAL_HOLD_PREFIX + precondition + ". Evidence to lift: "
+    boxes = proof.criteria(body)
+    for checked, line in boxes:
+        if not checked and line.startswith(hold_boxes.EXTERNAL_HOLD_PREFIX):
+            return line, False
+    if any(checked and line.startswith(condition) for checked, line in boxes):
+        return "", False
+    return condition + evidence + ".", True
+
+
 def external_hold(gh: GitHub, repo: str, number: int, precondition: str, evidence: str) -> str:
     """Hold the ticket's open pull request and journal the decision once."""
     precondition, evidence = (" ".join(value.split()).rstrip(".")
@@ -5496,19 +5508,15 @@ def external_hold(gh: GitHub, repo: str, number: int, precondition: str, evidenc
         return ""
 
     body = str(issue.get("body") or "")
-    condition = hold_boxes.EXTERNAL_HOLD_PREFIX + precondition + ". Evidence to lift: "
-    boxes = proof.criteria(body)
-    active = next((line for checked, line in boxes
-                   if not checked and line.startswith(hold_boxes.EXTERNAL_HOLD_PREFIX)), "")
-    if not active and any(checked and line.startswith(condition) for checked, line in boxes):
+    criterion, add_box = _external_hold_criterion(body, precondition, evidence)
+    if not criterion:
         return ""
-    criterion = active or condition + evidence + "."
     link = "https://github.com/%s/pull/%d" % (repo, pull["number"])
     detail = criterion.removeprefix("Hold: do not merge. ")
     note = "External hold stands for %s. %s" % (link, detail)
     _check_written_text(note)
     _check_decision_claim(gh, repo, number, note)
-    if not active:
+    if add_box:
         gh.rest("PATCH", path, {"body": _add_hold_criterion(body, criterion)})
     # Write the guard first. If posting fails, the next tick can journal the
     # existing box without editing the ticket again.

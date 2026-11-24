@@ -16,6 +16,7 @@ TARGETS = (
     # PR 2433's review finding (loom#2415).
     ("bus/brain.py", "_status_pass"),
     ("bus/brain.py", "_split_packed_header_line"),
+    ("bus/brain.py", "external_hold"),
     ("bus/station.py", "Station._deliver_unlinked"),
     ("bus/station.py", "Station._claim"),
     # AI-REVIEW 2026-11-12 [gpt-6-luna/subscription] 3026-Elder-complexity (PR #3026):
