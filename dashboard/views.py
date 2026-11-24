@@ -42,7 +42,12 @@ FOOTER = re.compile(r"^Loom ticket ([A-Za-z0-9-]+)[./]([A-Za-z0-9_.-]+?)(?:#|-)(
 
 def footer(text):
     """(repo, number, lane, model) from a lane pull request footer, or None."""
-    match = FOOTER.search(str(text or ""))
+    if not text:
+        return None
+    raw = text if isinstance(text, str) else str(text)
+    if "Loom ticket " not in raw:
+        return None
+    match = FOOTER.search(raw)
     if not match:
         return None
     owner, name, number, lane, model = match.groups()
@@ -214,20 +219,35 @@ def _improvement_stage(ticket, state, moved):
     return 1 if ticket else 0
 
 
+def parse_pr_footers(prs):
+    """Single-pass extraction of footer_models, footer_runs, and newest_lane_models
+    from a list of pull requests."""
+    by_ticket_model = {}
+    by_ticket_run = {}
+    by_lane = {}
+    for pr in prs:
+        parsed = footer(pr.get("body"))
+        if not parsed:
+            continue
+        key = "%s#%s" % (parsed[0], parsed[1])
+        updated = str(pr.get("updated_at") or "")
+        if key not in by_ticket_model or updated >= by_ticket_model[key][0]:
+            by_ticket_model[key] = (updated, parsed[3])
+        opened = str(pr.get("created_at") or updated)
+        if key not in by_ticket_run or opened >= by_ticket_run[key][0]:
+            by_ticket_run[key] = (opened, parsed[3], pr.get("number"), pr.get("html_url"))
+        lane = parsed[2]
+        if lane not in by_lane or opened >= by_lane[lane]["time"]:
+            by_lane[lane] = {"model": parsed[3], "time": opened}
+    return {key: model for key, (_, model) in by_ticket_model.items()}, by_ticket_run, by_lane
+
+
 def footer_models(prs):
     """Each ticket's model from its newest lane pull request footer, as
     {"owner/name#N": model}: one pass over the pull requests. Matching every
     ticket against every pull request cost 618,472 regex searches, about 5 s
     of CPU, on each page after each refresh (2026-10-15)."""
-    newest = {}
-    for pr in prs:
-        parsed = footer(pr.get("body"))
-        if not parsed:
-            continue
-        key, when = "%s#%s" % (parsed[0], parsed[1]), str(pr.get("updated_at") or "")
-        if key not in newest or when >= newest[key][0]:
-            newest[key] = (when, parsed[3])
-    return {key: model for key, (_, model) in newest.items()}
+    return parse_pr_footers(prs)[0]
 
 
 def footer_runs(prs):
@@ -235,24 +255,14 @@ def footer_runs(prs):
     (opened_at, model, pull request number, pull request URL)}. The runner
     writes the footer when it opens the pull request and never rewrites it
     on a fix push, so the opening time dates the run that model made."""
-    newest = {}
-    for pr in prs:
-        parsed = footer(pr.get("body"))
-        if not parsed:
-            continue
-        key = "%s#%s" % (parsed[0], parsed[1])
-        when = str(pr.get("created_at") or pr.get("updated_at") or "")
-        if key not in newest or when >= newest[key][0]:
-            newest[key] = (when, parsed[3], pr.get("number"), pr.get("html_url"))
-    return newest
+    return parse_pr_footers(prs)[1]
 
 
 def build_scoreboard(pull_requests):
     """Count lane PRs by footer model and difficulty tier."""
     tiers = {}
     for pr in pull_requests:
-        body = str(pr.get("body") or "")
-        parsed = footer(body)
+        parsed = pr.get("_parsed_footer") or footer(pr.get("body"))
         if not parsed:
             continue
         repo, number, lane, model = parsed
