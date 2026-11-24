@@ -5729,6 +5729,159 @@ def _refuse_person_change_request(details: Dict[str, Any]) -> None:
         raise ValueError("blocked: " + ", ".join(blockers))
 
 
+# The approval a merge needs on the current head (loom#3543), the merge
+# gate's independent-review row (scripts/pr-merge-gated.sh): a review check
+# that concluded success, neutral or skipped proves nothing about the code.
+REVIEW_MARKER = re.compile(r"^<!-- fleet:review v1 verdict=(APPROVE|REQUEST_CHANGES) "
+                           r"head=([0-9a-f]{40}) -->[ \t]*$", re.M)
+MARKER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+REVIEW_DECIDES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
+
+
+def _bare_login(login: str) -> str:
+    login = login.strip().lower()
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
+
+
+def _is_app(user: Dict[str, Any]) -> bool:
+    return (str(user.get("login") or "").lower().endswith("[bot]")
+            or user.get("type") == "Bot")
+
+
+# Automated check bots, never a reviewer (the gate's REVIEW_BOTS), and the
+# prefix every fleet agent login carries (agent-meta-muse, agent-openai-dot).
+CHECK_BOTS = frozenset({"github-actions", "copilot", "copilot-pull-request-reviewer",
+                        "dependabot", "renovate"})
+FLEET_PREFIX = "agent-"
+# GitHub lists at most this many commits of a pull request.
+PR_COMMIT_CAP = 250
+
+
+def _bot_standing(reviews: Sequence[Dict[str, Any]], bot: str) -> Optional[Tuple[str, str]]:
+    """The review bot App's latest approve-or-reject review: (state, commit)."""
+    standing: Optional[Tuple[str, str]] = None
+    for review in reviews:
+        user = review.get("user") or {}
+        if (_is_app(user) and _bare_login(str(user.get("login") or "")) == bot
+                and review.get("state") in REVIEW_DECIDES):
+            standing = (str(review["state"]), str(review.get("commit_id") or ""))
+    return standing
+
+
+def _marker_author(comment: Dict[str, Any], barred: Set[str], machines: Set[str]) -> str:
+    """The login whose fleet:review marker this comment may carry, or "" when
+    it cannot count: an App or automation login, a fleet agent, a
+    contributor, an edited comment, one posted through an App, or an author
+    who is not OWNER, MEMBER or COLLABORATOR."""
+    user = comment.get("user") or {}
+    who = _bare_login(str(user.get("login") or ""))
+    if not who or _is_app(user) or who in barred or who in machines:
+        return ""
+    if who.startswith(FLEET_PREFIX) or comment.get("performed_via_github_app"):
+        return ""
+    created = str(comment.get("created_at") or "")
+    if not created or str(comment.get("updated_at") or "") != created:
+        return ""
+    return who if comment.get("author_association") in MARKER_ASSOCIATIONS else ""
+
+
+def _marker_votes(comments: Sequence[Dict[str, Any]], barred: Set[str],
+                  machines: Set[str]) -> Dict[str, Tuple[str, str]]:
+    """Each counted person's latest marker: login -> (verdict, head)."""
+    marks: Dict[str, Tuple[str, str]] = {}
+    for comment in comments:
+        found = REVIEW_MARKER.findall(str(comment.get("body") or ""))
+        who = _marker_author(comment, barred, machines) if found else ""
+        if who:
+            marks[who] = found[-1]
+    return marks
+
+
+def head_approval(reviews: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]],
+                  head: str, bot: str, contributors: Iterable[str],
+                  automation: Iterable[str] = ()) -> str:
+    """"" when the head is approved, else the blocker. Approved means the
+    review bot App's latest approve-or-reject review is APPROVED on `head`,
+    or a person posted a fleet:review marker comment for `head` as their
+    latest marker. That person's author_association is OWNER, MEMBER or
+    COLLABORATOR, they posted it directly (not through a GitHub App) and
+    never edited it, and they are none of `contributors` (the pull request
+    author and every commit's author and committer), none of `automation`
+    (the fleet's own logins), no fleet agent and no check bot. The review
+    bot counts only when it is not a contributor. Its standing
+    CHANGES_REQUESTED on `head` refuses whatever else approved. No other
+    App, and no formal human review, counts."""
+    bot = _bare_login(bot)
+    barred = {_bare_login(x) for x in contributors if x}
+    machines = {_bare_login(x) for x in automation if x} | CHECK_BOTS
+    standing = _bot_standing(reviews, bot)
+    if standing == ("CHANGES_REQUESTED", head):
+        return "%s[bot] requested changes on head %s" % (bot, head[:10])
+    if standing == ("APPROVED", head) and bot not in barred:
+        return ""
+    marks = _marker_votes(comments, barred, machines)
+    if ("APPROVE", head) in marks.values():
+        return ""
+    stale = " (an approval on an older head is stale)" if standing and standing[0] == "APPROVED" \
+        else ""
+    return ("no approval on head %s: needs a %s[bot] APPROVE review on it, or an unedited "
+            "fleet:review marker comment for it from a trusted person who neither opened, "
+            "wrote nor pushed it%s" % (head[:10], bot, stale))
+
+
+def _pr_contributors(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> List[str]:
+    """The pull request author and every commit's author and committer
+    login. Raises ValueError when the commits cannot be read, when GitHub
+    truncated the list (it lists at most PR_COMMIT_CAP), and when a commit's
+    author or committer has no GitHub login: those fields are client-set, so
+    a commit tied to no login has an unknown writer, who may be the
+    approver."""
+    try:
+        commits = gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request commits unreadable, so its authors cannot "
+                         "be kept from approving it (%s)" % err) from err
+    if len(commits) >= PR_COMMIT_CAP:
+        raise ValueError("blocked: the pull request has %d or more commits, more than "
+                         "GitHub lists, so its authors cannot be kept from approving it"
+                         % PR_COMMIT_CAP)
+    logins = [_pr_author(pr)]
+    for commit in commits:
+        for role in ("author", "committer"):
+            login = str(((commit or {}).get(role) or {}).get("login") or "")
+            if not login:
+                raise ValueError("blocked: commit %s has an unknown writer: its %s has no "
+                                 "GitHub login" % (str((commit or {}).get("sha") or "")[:10],
+                                                   role))
+            logins.append(login)
+    return [x for x in logins if x]
+
+
+def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                            details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
+    """Refuse the merge unless head_approval approves the current head. A
+    review, comment or commit list that cannot be read refuses."""
+    from . import factory  # factory imports this module
+    settings = os.environ if env is None else env
+    bot = settings.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    head = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    if not head:
+        raise ValueError("blocked: pull request has no head SHA")
+    try:
+        reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request reviews unreadable, so no approval on "
+                         "the head can be shown (%s)" % err) from err
+    comments = _read_comments(gh, repo, number)
+    contributors = _pr_contributors(gh, repo, number, pr)
+    automation = hold_logins(env) + [settings.get("LOOM_GITHUB_LOGIN", "").strip()]
+    why = head_approval(reviews, comments, head, bot, contributors, automation)
+    if why:
+        raise ValueError("blocked: " + why)
+
+
 def merge_completed(err: Exception) -> bool:
     """Whether merge raised this after GitHub had merged: settling failed,
     the merge did not."""
@@ -5855,11 +6008,13 @@ def merge(gh: GitHub, repo: str, number: int,
         _check_written_text(ADOPT_COMMENT)
         _validate_adopt_pr(gh, repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory

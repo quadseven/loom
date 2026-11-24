@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bus import brain, factory, health, hold_boxes, journal, metrics, notify, proof, station, text, tickets
 from bus.github import GitHub, GitHubError, RateLimited
 from shadow_env import setUpModule, tearDownModule  # noqa: E402,F401
+from head_approved import head_approved  # noqa: E402
 import sub_issue_graphql  # noqa: E402
 
 # The brain's own login in the escalation fixtures: TRUSTED trusts it.
@@ -404,6 +405,7 @@ class BrainTests(unittest.TestCase):
         self.assertIn("brain step write failed", err.getvalue())
 
 
+@head_approved
 class SensitiveResumeTests(unittest.TestCase):
     NOW = datetime(2030, 1, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -3054,7 +3056,254 @@ class DegradedReviewMergeTests(unittest.TestCase):
         self.assertFalse(hasattr(brain, "_clean_luna_verdict"))
 
 
+HEAD = "a" * 40
+OLD_HEAD = "b" * 40
+
+
+class HeadApprovalMergeTests(unittest.TestCase):
+    """The real brain.merge needs an approval on the current head (loom#3543),
+    the merge gate's independent-review row: a grug-tribe[bot] APPROVE on the
+    head, or a trusted human's fleet:review marker comment for it. A skipped
+    or neutral review check is no approval."""
+
+    ENV = {"LOOM_BRIEF_AUTHORS": "example-brain example-lane example-station",
+           "LOOM_GITHUB_LOGIN": "example-station", "LOOM_MERGE_SETTLE_SECONDS": "0"}
+    GREEN = {"name": "unittest", "status": "completed", "conclusion": "success",
+             "id": 1, "started_at": "2030-01-01T00:00:00Z"}
+    ELDER = {"name": factory.DEFAULT_REVIEW_CHECK, "status": "completed",
+             "conclusion": "success", "id": 2, "started_at": "2030-01-01T00:00:00Z"}
+
+    def setUp(self):
+        self.runs = [dict(self.GREEN), dict(self.ELDER)]
+        self.reviews = [self.grug("APPROVED", HEAD)]
+        self.pr_comments = []
+        self.merges = []
+        self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
+                         "committer": {"login": "web-flow"}}]
+
+    @staticmethod
+    def grug(state, commit):
+        return {"id": 7, "state": state, "commit_id": commit,
+                "user": {"login": "grug-tribe[bot]", "type": "Bot"},
+                "author_association": "NONE", "submitted_at": "2030-01-01T13:00:00Z"}
+
+    @staticmethod
+    def marker(login, head=HEAD, association="OWNER", app=None, verdict="APPROVE"):
+        return {"id": 11, "user": {"login": login, "type": "User"},
+                "author_association": association, "performed_via_github_app": app,
+                "created_at": "2030-01-01T13:00:00Z", "updated_at": "2030-01-01T13:00:00Z",
+                "body": "Reviewed.\n<!-- fleet:review v1 verdict=%s head=%s -->\n" % (verdict, head)}
+
+    def transport(self, method, url, headers, body):
+        path = url.split("api.github.com")[-1]
+        if method == "POST" and path == "/graphql":
+            if "pageInfo" in json.loads(body)["query"]:
+                page = {"pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": []}
+                return reply(200, {"data": {"repository": {"pullRequest": {"reviewThreads": page}}}})
+            details = {"isDraft": False, "mergeable": "MERGEABLE",
+                       "headRefName": "loom/9-work", "headRefOid": HEAD,
+                       "headRepository": {"nameWithOwner": REPO},
+                       "commits": {"nodes": [{"commit": {
+                           "committedDate": "2030-01-01T12:45:00Z",
+                           "statusCheckRollup": {"state": "SUCCESS"},
+                           "parents": {"totalCount": 1}}}]},
+                       "reviews": {"nodes": []}, "reviewThreads": {"totalCount": 0, "nodes": []},
+                       "files": {"totalCount": 1, "nodes": [
+                           {"path": "docs/a.md", "deletions": 0, "changeType": "MODIFIED"}]}}
+            return reply(200, {"data": {"repository": {"pullRequest": details}}})
+        if method == "GET" and path == "/repos/%s/pulls/8" % REPO:
+            return reply(200, {"state": "open", "draft": False, "body": "Refs %s#9" % REPO,
+                               "head": {"ref": "loom/9-work", "sha": HEAD,
+                                        "repo": {"full_name": REPO}},
+                               "base": {"ref": "main", "repo": {"full_name": REPO}},
+                               "mergeable": True, "user": {"login": "example-lane"}})
+        if method == "GET" and path.startswith("/repos/%s/compare/" % REPO):
+            return reply(200, {"behind_by": 0})
+        if method == "GET" and path == "/repos/%s/stacks" % REPO:
+            return reply(200, [])
+        if method == "GET" and path.startswith("/repos/%s/commits/%s/check-runs" % (REPO, HEAD)):
+            return reply(200, {"check_runs": self.runs})
+        if method == "GET" and path == "/repos/%s/commits/%s/status" % (REPO, HEAD):
+            return reply(200, {"state": "success", "total_count": 0, "statuses": []})
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/reviews" % REPO):
+            return reply(200, self.reviews)
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/commits" % REPO):
+            return reply(200, self.commits)
+        if method == "GET" and path.startswith("/repos/%s/issues/8/comments" % REPO):
+            return reply(200, self.pr_comments)
+        if method == "GET" and path.startswith("/repos/%s/issues/9/comments" % REPO):
+            return reply(200, [])
+        if method == "GET" and path == "/repos/%s/issues/9" % REPO:
+            return reply(200, {"state": "open", "body": "",
+                               "labels": [{"name": "loom:ticket"}, {"name": "loom:pr"},
+                                          {"name": "docs"}]})
+        if method == "GET" and path.startswith("/repos/%s/pulls/8/files" % REPO):
+            return reply(200, [{"filename": "docs/a.md", "patch": "+A line."}])
+        if method == "GET" and path.startswith("/search/issues"):
+            return reply(200, {"total_count": 0})
+        if method == "GET" and path.startswith("/search/code"):
+            return reply(200, {"total_count": 0, "items": []})
+        if method == "PUT" and path == "/repos/%s/pulls/8/merge" % REPO:
+            self.merges.append(json.loads(body))
+            return reply(200, {"merged": True})
+        if method == "DELETE" and "/git/refs/heads/" in path:
+            return reply(204)
+        if method == "PUT" and path == "/repos/%s/issues/9/labels" % REPO:
+            return reply(200, {})
+        if method == "POST" and path == "/repos/%s/issues/9/comments" % REPO:
+            return reply(201, {})
+        raise AssertionError("unexpected %s %s" % (method, path))
+
+    def merge(self):
+        return brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
+                           env=dict(self.ENV))
+
+    def refused(self, pattern):
+        with self.assertRaisesRegex(ValueError, pattern):
+            self.merge()
+        self.assertEqual(self.merges, [])
+
+    def test_a_skipped_review_check_with_no_approval_does_not_merge(self):
+        self.runs[1]["conclusion"] = "skipped"
+        self.reviews = []
+        self.refused("no approval on head")
+
+    def test_a_neutral_review_check_with_no_approval_does_not_merge(self):
+        self.runs[1]["conclusion"] = "neutral"
+        self.reviews = []
+        self.refused("no approval on head")
+
+    def test_a_review_bot_approval_on_the_head_merges(self):
+        self.assertTrue(self.merge()["merged"])
+        self.assertEqual(self.merges[0]["sha"], HEAD)
+
+    def test_a_successful_review_check_alone_does_not_merge(self):
+        self.reviews = []
+        self.refused("no approval on head")
+
+    def test_a_review_bot_approval_on_an_older_head_does_not_merge(self):
+        self.reviews = [self.grug("APPROVED", OLD_HEAD)]
+        self.refused("no approval on head .*stale")
+
+    def test_a_review_bot_change_request_on_the_head_does_not_merge(self):
+        self.reviews = [self.grug("APPROVED", HEAD), self.grug("CHANGES_REQUESTED", HEAD)]
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("grug-tribe\\[bot\\] requested changes on head")
+
+    def test_an_approval_from_another_app_does_not_merge(self):
+        review = self.grug("APPROVED", HEAD)
+        review["user"] = {"login": "agent-meta-muse[bot]", "type": "Bot"}
+        self.reviews = [review]
+        self.refused("no approval on head")
+
+    def test_a_trusted_human_marker_for_the_head_merges(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner")]
+        self.assertTrue(self.merge()["merged"])
+
+    def test_a_marker_from_the_author_does_not_merge(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-lane")]
+        self.refused("no approval on head")
+
+    def test_a_marker_for_an_older_head_does_not_merge(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner", head=OLD_HEAD)]
+        self.refused("no approval on head")
+
+    def test_a_marker_from_an_app_or_an_untrusted_human_does_not_merge(self):
+        self.reviews = []
+        for comment in (self.marker("agent-openai-dot[bot]"),
+                        self.marker("example-owner", app={"slug": "chatgpt-codex-connector"}),
+                        self.marker("stranger", association="NONE")):
+            self.pr_comments = [comment]
+            self.refused("no approval on head")
+
+    def test_a_later_request_changes_marker_cancels_the_human_approval(self):
+        self.reviews = []
+        self.pr_comments = [self.marker("example-owner"),
+                            self.marker("example-owner", verdict="REQUEST_CHANGES")]
+        self.refused("no approval on head")
+
+    def test_an_edited_marker_does_not_merge(self):
+        # A marker edited after posting could carry a head its author never
+        # reviewed: only an unedited marker counts.
+        self.reviews = []
+        edited = self.marker("example-owner")
+        edited["updated_at"] = "2030-01-01T14:00:00Z"
+        self.pr_comments = [edited]
+        self.refused("no approval on head")
+
+    def test_a_marker_from_a_fleet_or_automation_login_does_not_merge(self):
+        # The merging client (LOOM_GITHUB_LOGIN), this Loom's own logins
+        # (LOOM_BRIEF_AUTHORS, LOOM_TRUSTED_BRIEFERS), a fleet agent login and
+        # a check bot are automation, never an independent reviewer, even
+        # when GitHub reads them as a person with an OWNER association.
+        self.reviews = []
+        for login in ("example-station", "example-brain", "example-briefer",
+                      "agent-openai-dot", "github-actions"):
+            self.pr_comments = [self.marker(login)]
+            with self.subTest(login=login):
+                with self.assertRaisesRegex(ValueError, "no approval on head"):
+                    brain.merge(GitHub("t", transport=self.transport), REPO, 8, (REPO, 9),
+                                env=dict(self.ENV, LOOM_TRUSTED_BRIEFERS="example-briefer"))
+        self.assertEqual(self.merges, [])
+
+    def test_a_marker_from_a_commit_author_or_committer_does_not_merge(self):
+        # Whoever wrote or pushed a commit on the pull request cannot review it.
+        self.reviews = []
+        self.commits.append({"sha": "c" * 40, "author": {"login": "example-owner"},
+                             "committer": {"login": "web-flow"}})
+        self.pr_comments = [self.marker("example-owner")]
+        self.refused("no approval on head")
+        self.commits[-1] = {"sha": "c" * 40, "author": {"login": "example-lane"},
+                            "committer": {"login": "example-owner"}}
+        self.refused("no approval on head")
+
+    def test_a_review_bot_approval_does_not_count_when_it_committed(self):
+        self.commits.append({"sha": "c" * 40, "author": {"login": "grug-tribe[bot]"},
+                             "committer": {"login": "web-flow"}})
+        self.refused("no approval on head")
+
+    def test_a_commit_with_no_github_login_refuses_the_merge(self):
+        # Commit author and committer are client-set: a commit no GitHub
+        # login is tied to has an unknown writer, who may be the approver.
+        for role in ("author", "committer"):
+            self.commits = [{"sha": HEAD, "author": {"login": "example-lane"},
+                             "committer": {"login": "web-flow"}}]
+            self.commits[0][role] = None
+            with self.subTest(role=role):
+                self.refused("unknown writer")
+
+    def test_a_truncated_commit_list_refuses_the_merge(self):
+        # GitHub lists at most 250 commits of a pull request.
+        self.commits = [{"sha": "%040x" % n, "author": {"login": "example-lane"},
+                         "committer": {"login": "web-flow"}} for n in range(250)]
+        self.refused("250 or more commits")
+
+    def test_unreadable_commits_refuse_the_merge(self):
+        inner = self.transport
+
+        def failing(method, url, headers, body):
+            if "/pulls/8/commits" in url:
+                return reply(500, {"message": "boom"})
+            return inner(method, url, headers, body)
+        self.transport = failing
+        self.refused("commits unreadable")
+
+    def test_unreadable_reviews_refuse_the_merge(self):
+        inner = self.transport
+
+        def failing(method, url, headers, body):
+            if "/pulls/8/reviews" in url:
+                return reply(500, {"message": "boom"})
+            return inner(method, url, headers, body)
+        self.transport = failing
+        self.refused("reviews unreadable")
+
+
 class FixTests(unittest.TestCase):
+
     def refused(self, pr, ticket=None, ref=(REPO, 9)):
         fake = Fake(reply(200, pr), reply(200, ticket or fix_ticket()))
         with self.assertRaises(ValueError):
@@ -7637,6 +7886,7 @@ class WaitLabelTests(unittest.TestCase):
         self.assertIn("wait:", labels.MANAGED_PREFIXES)
 
 
+@head_approved
 class FleetHoldTests(unittest.TestCase):
     """loom#2393: a trusted fleet login's plain pull request comment that opens
     "Not merging" or "Hold", made after the last push, stops merge and READY
@@ -7859,6 +8109,7 @@ class FleetHoldTests(unittest.TestCase):
         self.assertEqual(seen, [["example-brain", self.FLEET]])
 
 
+@head_approved
 class FindingGateTests(unittest.TestCase):
     """loom#2988: a trusted login's plain pull request comment that blocks (the
     finding marker, or a "Blocking" line naming a commit) stays open until a
