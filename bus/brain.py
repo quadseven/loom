@@ -507,12 +507,18 @@ def _goal_lines(goals: List[Dict[str, Any]], data: Dict[str, Any], now: datetime
         led = goal_ledger(issue, node, now, authors)
         comments = (node.get("comments") or {}).get("nodes") or []
         still: Optional[quiet.Quiet] = None
-        lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
-                     " - report %s (due %s)" % (
-                         issue["number"], issue.get("title", ""),
-                         led.get("journal", "none"), led.get("report", "none"),
-                         led.get("measure", "none"), led.get("action", "none"),
-                         led["state"], led["due"] or "unknown"))
+        if naming.is_backlog_home(issue):
+            lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s" % (
+                issue["number"], issue.get("title", ""),
+                led.get("journal", "none"), led.get("report", "none"),
+                led.get("measure", "none"), led.get("action", "none")))
+        else:
+            lines.append("- #%s %s - latest journal %s, report %s, measure %s, action %s"
+                         " - report %s (due %s)" % (
+                             issue["number"], issue.get("title", ""),
+                             led.get("journal", "none"), led.get("report", "none"),
+                             led.get("measure", "none"), led.get("action", "none"),
+                             led["state"], led["due"] or "unknown"))
         if gh is not None and repo:
             # loom#483: each goal's unproven count against the limit, beside
             # the brain's own ledger, so the operator sees why new work waits.

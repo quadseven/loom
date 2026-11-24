@@ -134,6 +134,23 @@ class StatusTests(unittest.TestCase):
         self.assertIn("unproven work 3/30", text)
         self.assertNotIn("OVER LIMIT", text)
 
+    def test_backlog_goal_line_omits_report_suffix(self):
+        now = datetime(2030, 1, 1, 20, 0, tzinfo=timezone.utc)
+        goal = {"number": 1, "title": "Backlog: x", "labels": [{"name": "loom:goal"},
+                {"name": "loom:backlog"}], "created_at": "2029-01-01T00:00:00Z"}
+        lines = brain._goal_lines([goal], {"goals": {1: {}}}, now)
+        goal_line = [l for l in lines if l.startswith("- #1")][0]
+        self.assertNotIn("report overdue", goal_line)
+        self.assertNotIn("report due", goal_line)
+
+    def test_regular_goal_line_keeps_report_suffix(self):
+        now = datetime(2030, 1, 1, 20, 0, tzinfo=timezone.utc)
+        goal = {"number": 2, "title": "Goal", "labels": [{"name": "loom:goal"}],
+                "created_at": "2029-01-01T00:00:00Z"}
+        lines = brain._goal_lines([goal], {"goals": {2: {}}}, now)
+        goal_line = [l for l in lines if l.startswith("- #2")][0]
+        self.assertIn("report overdue (due 2029-01-01T15:00:00Z)", goal_line)
+
 
 if __name__ == "__main__":
     unittest.main()
