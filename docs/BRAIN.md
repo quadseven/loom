@@ -2766,6 +2766,7 @@ Tick <UTC time>, <holder>
 - Shipped: <links or none>
 - Shipped backlog: <shipped count and median wait, or not read>
 - Briefed: <links with lanes or none>
+- Fuel: <weekly percent used and reset time for lanes with readings>
 - Waiting: <what is in flight and on whom>
 - Asks: <links or none>
 - Friction: <what slowed the factory this tick, or none>
@@ -2788,6 +2789,10 @@ but a new journal writes `- Friction:`.
 `- Shipped backlog:` copies the count and median wait from the same canonical
 waits read used by the Hot spots page. The brain status command prints the
 same line under `## Shipped backlog`; a failed read stays explicit.
+
+`- Fuel:` comes from the station's usage snapshot on the lane machine.
+A remote brain can copy the line printed by `python3 -m bus.usage --live`
+into its tick. The line marks stale readings.
 
 A step that failed or ran degraded adds a line `- Step <name>: failed <why>`
 or `- Step <name>: degraded <why>` (the step names are in docs/MUSE.md); a

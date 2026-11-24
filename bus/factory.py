@@ -2034,6 +2034,7 @@ class Factory:
         # Lanes whose heartbeat says available; None trusts every lane not
         # at a limit.
         self.available = None if available is None else set(available)
+        self.preferred_lanes: Set[str] = set()
         # The tickets the station holds, "owner/repo#n": held for a factory
         # incident (they keep their running label and lane, but no lane is
         # working them) or refused this pass by the unproven-work gate.
@@ -2225,6 +2226,9 @@ class Factory:
         running ticket."""
         return self._takes_work(lane) and self.load.get(lane, 0) == 0
 
+    def _preferred_first(self, lanes: Iterable[str]) -> List[str]:
+        return sorted(lanes, key=lambda lane: lane not in self.preferred_lanes)
+
     def _runner_stops(self, lane: str, repo: str, base: str) -> bool:
         """Whether the runner ledger stops `repo` on `lane`'s slot for
         `base`, through the station's runner_stops (bus/runners.py
@@ -2252,7 +2256,7 @@ class Factory:
         own = [x for x in lanes_of(difficulty, private)
                if x != old and (allow_remote or x not in REMOTE_LANES)
                and (x != "agy" or agy_ok) and not self._runner_stops(x, repo, base)]
-        lane = next((x for x in own if self._free(x)), None)
+        lane = next((x for x in self._preferred_first(own) if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         whole = own + ([old] if old in lanes_of(difficulty, private) and old not in own else [])
@@ -2265,7 +2269,7 @@ class Factory:
                               if x != old and (allow_remote or x not in REMOTE_LANES)
                               and (x != "agy" or agy_ok)
                               and not self._runner_stops(x, repo, base)]
-            lane = next((x for x in fallback_lanes if self._free(x)), None)
+            lane = next((x for x in self._preferred_first(fallback_lanes) if self._free(x)), None)
             if lane is not None:
                 return lane, "fallback: no %s lane is up" % difficulty
         return None, ""
@@ -5422,7 +5426,7 @@ class Factory:
         """The first lane that takes `model` and is free; with `busy_ok`, the
         first that is merely up and not limited for the model, busy or not."""
         from .station import model_lanes, needs_public_repo
-        return next((candidate for candidate in model_lanes(model)
+        return next((candidate for candidate in self._preferred_first(model_lanes(model))
                      if ((self._takes_work(candidate) and self._serves(candidate, model))
                          if busy_ok else (self._free(candidate) and self._serves(candidate, model)))
                      and (not needs_public_repo(candidate, model)
@@ -5840,11 +5844,11 @@ class Factory:
         base = base_of(issue)
         own = [x for x in lanes_of(difficulty, private) if x not in REMOTE_LANES and x not in skip
                and not self._runner_stops(x, repo, base)]
-        lane = next((x for x in own if self._free(x)), None)
+        lane = next((x for x in self._preferred_first(own) if self._free(x)), None)
         if lane is not None or any(self._takes_work(x) for x in own):
             return lane, ""
         for tier in FALLBACK.get(difficulty, ()):
-            lane = next((x for x in lanes_of(tier, private)
+            lane = next((x for x in self._preferred_first(lanes_of(tier, private))
                          if x not in REMOTE_LANES and x not in skip and self._free(x)
                          and not self._runner_stops(x, repo, base)), None)
             if lane is not None:

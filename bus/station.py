@@ -17102,6 +17102,7 @@ class Station:
         """Give ready queued tickets a free lane after this pass's claims."""
         if self.s.factory_on:
             runner = self._load_factory()
+            runner.preferred_lanes = usage.preferred_weekly_lanes(usage.read_snapshot(self.s.home), self.now)
             runner.assign_queued()
             self._record_waits(runner.waits, runner.settled)
 

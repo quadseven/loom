@@ -80,6 +80,10 @@ easy / medium / hard, then matched to the cheapest lane whose tier fits:
 
 Lanes report their catalogs; new models appear automatically. When a lane
 is near its budget or rate-limited, the dispatcher routes around it.
+When assigning queued work, the station moves an eligible lane up within its
+normal tier or pinned-model order if a fresh reading shows its weekly window
+under half used and resetting in less than 24 hours. A lane with a fresh
+window at its limit gets no preference.
 
 ## October 2026 price changes
 

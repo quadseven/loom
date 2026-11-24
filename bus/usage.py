@@ -583,6 +583,14 @@ def write(home: str, records: List[Dict[str, Any]]) -> str:
     return path
 
 
+def read_snapshot(home: str) -> List[Dict[str, Any]]:
+    try:
+        rows = json.loads((Path(home) / "state" / "usage" / "limits.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
 # -- the command line -----------------------------------------------------
 # A reading older than this, or from a window that has reset since, is not
 # current (dashboard/usage.py STALE_AFTER).
@@ -616,6 +624,26 @@ def stale_reason(row: Dict[str, Any], now: float) -> Optional[str]:
     return None
 
 
+def preferred_weekly_lanes(rows: List[Dict[str, Any]], now: float) -> set[str]:
+    """Lanes with a fresh, under-half weekly window about to reset."""
+    preferred, limited = set(), set()
+    for row in rows:
+        used = row.get("used_pct")
+        observed = _parse(row.get("observed_at"))
+        reset = _parse(row.get("resets_at"))
+        lanes = row.get("lanes")
+        if (not isinstance(used, (int, float)) or isinstance(used, bool)
+                or not isinstance(lanes, list) or observed is None or observed > now
+                or stale_reason(row, now)):
+            continue
+        slots = {lane for lane in lanes if isinstance(lane, str)}
+        if used >= 100:
+            limited.update(slots)
+        if row.get("window") == "weekly" and 0 <= used < 50 and reset is not None and 0 < reset - now < 86400:
+            preferred.update(slots)
+    return preferred - limited
+
+
 def newest_heartbeat(home: str) -> Optional[float]:
     """The newest lane heartbeat time under home, or None."""
     newest = None
@@ -644,6 +672,25 @@ def table(records: List[Dict[str, Any]], now: float) -> List[str]:
             row.get("resets_at") or "unknown", row.get("observed_at") or row.get("as_of") or "unknown",
             row.get("host") or "unknown", row.get("note") or ""))
     return lines
+
+
+def fuel_line(rows: List[Dict[str, Any]], now: float) -> str:
+    """A journal line from numeric weekly readings and their reset times."""
+    figures = []
+    for row in rows:
+        used, lanes = row.get("used_pct"), row.get("lanes")
+        if (row.get("window") != "weekly" or not isinstance(lanes, list)
+                or not isinstance(used, (int, float)) or isinstance(used, bool) or not 0 <= used <= 100):
+            continue
+        names = ", ".join(lane for lane in lanes if lane in labels.LANES)
+        if not names:
+            continue
+        reset = _iso(_parse(row.get("resets_at")))
+        stale = stale_reason(row, now)
+        figures.append("%s weekly %g%% used, resets %s%s" % (
+            names, used, reset.replace("+00:00", "Z") if reset else "at an unknown time",
+            " (stale: %s)" % stale if stale else ""))
+    return "- Fuel: " + " / ".join(figures) if figures else ""
 
 
 def live_url(env: Dict[str, str]) -> str:
@@ -708,6 +755,9 @@ def _live(env: Dict[str, str], now: float) -> int:
         "; over %dh old, so the station has stopped uploading" % (STALE_AFTER // 3600)
         if age > STALE_AFTER else ""))
     print("\n".join(table(rows, now)))
+    fuel = fuel_line(rows, now)
+    if fuel:
+        print(fuel)
     return 0
 
 
