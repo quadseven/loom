@@ -5704,6 +5704,46 @@ FLEET_PREFIX = "agent-"
 PR_COMMIT_CAP = 250
 
 
+def _bot_standing(reviews: Sequence[Dict[str, Any]], bot: str) -> Optional[Tuple[str, str]]:
+    """The review bot App's latest approve-or-reject review: (state, commit)."""
+    standing: Optional[Tuple[str, str]] = None
+    for review in reviews:
+        user = review.get("user") or {}
+        if (_is_app(user) and _bare_login(str(user.get("login") or "")) == bot
+                and review.get("state") in REVIEW_DECIDES):
+            standing = (str(review["state"]), str(review.get("commit_id") or ""))
+    return standing
+
+
+def _marker_author(comment: Dict[str, Any], barred: Set[str], machines: Set[str]) -> str:
+    """The login whose fleet:review marker this comment may carry, or "" when
+    it cannot count: an App or automation login, a fleet agent, a
+    contributor, an edited comment, one posted through an App, or an author
+    who is not OWNER, MEMBER or COLLABORATOR."""
+    user = comment.get("user") or {}
+    who = _bare_login(str(user.get("login") or ""))
+    if not who or _is_app(user) or who in barred or who in machines:
+        return ""
+    if who.startswith(FLEET_PREFIX) or comment.get("performed_via_github_app"):
+        return ""
+    created = str(comment.get("created_at") or "")
+    if not created or str(comment.get("updated_at") or "") != created:
+        return ""
+    return who if comment.get("author_association") in MARKER_ASSOCIATIONS else ""
+
+
+def _marker_votes(comments: Sequence[Dict[str, Any]], barred: Set[str],
+                  machines: Set[str]) -> Dict[str, Tuple[str, str]]:
+    """Each counted person's latest marker: login -> (verdict, head)."""
+    marks: Dict[str, Tuple[str, str]] = {}
+    for comment in comments:
+        found = REVIEW_MARKER.findall(str(comment.get("body") or ""))
+        who = _marker_author(comment, barred, machines) if found else ""
+        if who:
+            marks[who] = found[-1]
+    return marks
+
+
 def head_approval(reviews: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]],
                   head: str, bot: str, contributors: Iterable[str],
                   automation: Iterable[str] = ()) -> str:
@@ -5721,29 +5761,12 @@ def head_approval(reviews: Sequence[Dict[str, Any]], comments: Sequence[Dict[str
     bot = _bare_login(bot)
     barred = {_bare_login(x) for x in contributors if x}
     machines = {_bare_login(x) for x in automation if x} | CHECK_BOTS
-    standing: Optional[Tuple[str, str]] = None
-    for review in reviews:
-        user = review.get("user") or {}
-        if (_is_app(user) and _bare_login(str(user.get("login") or "")) == bot
-                and review.get("state") in REVIEW_DECIDES):
-            standing = (str(review["state"]), str(review.get("commit_id") or ""))
+    standing = _bot_standing(reviews, bot)
     if standing == ("CHANGES_REQUESTED", head):
         return "%s[bot] requested changes on head %s" % (bot, head[:10])
     if standing == ("APPROVED", head) and bot not in barred:
         return ""
-    marks: Dict[str, Tuple[str, str]] = {}
-    for comment in comments:
-        user = comment.get("user") or {}
-        found = REVIEW_MARKER.findall(str(comment.get("body") or ""))
-        who = _bare_login(str(user.get("login") or ""))
-        created = str(comment.get("created_at") or "")
-        if (not found or not who or _is_app(user) or who in barred or who in machines
-                or who.startswith(FLEET_PREFIX)
-                or not created or str(comment.get("updated_at") or "") != created
-                or comment.get("performed_via_github_app")
-                or comment.get("author_association") not in MARKER_ASSOCIATIONS):
-            continue
-        marks[who] = found[-1]
+    marks = _marker_votes(comments, barred, machines)
     if ("APPROVE", head) in marks.values():
         return ""
     stale = " (an approval on an older head is stale)" if standing and standing[0] == "APPROVED" \
