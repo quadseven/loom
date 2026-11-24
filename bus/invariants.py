@@ -2162,11 +2162,10 @@ class Filer:
         self._folded = {}
 
     def _close_cleared_rolls(self, current: Dict[str, Breach]) -> None:
-        """Give an already-clear tracking issue its close before new filings
-        can spend every write. Current breaches and unread facts still win;
-        a newly empty list keeps the ordinary clearing path after filing."""
+        """Clear or close a tracking issue before new filings spend every
+        write. Current breaches and unread facts still win."""
         for key, number in self._listing().items():
-            if self.writes + 2 > WRITES_MAX:
+            if self.writes >= WRITES_MAX:
                 return
             if (key in current or self._rolls.get(key) != number
                     or number in self._listed_closed or number in self._ticketed
@@ -2177,9 +2176,14 @@ class Filer:
                     or TICKET_LABEL in self._label_names(issue)):
                 continue
             body = str(issue.get("body") or "")
+            if ROLL_NONE not in body:
+                self._clear_roll(key, number, issue)
+                continue
             match = CLEAR_SINCE_RE.search(body)
             since = _epoch(match.group(1)) if match else None
-            if ROLL_NONE in body and since is not None and self.now - since >= CLEAR_AFTER:
+            if since is not None and self.now - since >= CLEAR_AFTER:
+                if self.writes + 2 > WRITES_MAX:
+                    continue
                 self._clear_roll(key, number, issue)
 
     def _clear_stale(self, current: Dict[str, Breach]) -> None:
