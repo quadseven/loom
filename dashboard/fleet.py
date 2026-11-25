@@ -115,6 +115,34 @@ def _issue_key(comment: Dict[str, Any]):
     return (str(comment.get("repo") or ""), int(match.group(1))) if match else None
 
 
+def _journal_event(journal, body: str, at: datetime, start: datetime, now: datetime) -> Dict[str, Any]:
+    """One journal beat: full outcome and gist inside [start, now], minimal beat outside."""
+    if start <= at <= now:
+        tick = brain_view._tick(journal)
+        kind = "tick-failed" if tick["outcome"] == "failed" else "tick"
+        return _event(at, kind, "%s: %s" % (tick["outcome"], tick["line"]), beat=True, href=journal.get("html_url"))
+    return _event(at, "tick", "", beat=True, href=journal.get("html_url"))
+
+
+def _add_journal(journal, rows: Dict[str, Dict[str, Any]], seen: set, homes: set,
+                 start: datetime, now: datetime) -> None:
+    if not isinstance(journal, dict):
+        return
+    body = str(journal.get("body") or "")
+    if not body.startswith(JOURNAL_MARKER) or body in seen:
+        return
+    seen.add(body)
+    if journal.get("repo") and journal.get("issue_number"):
+        homes.add((str(journal["repo"]), int(journal["issue_number"])))
+    tick_at, raw_holder = brain_view._tick_header(journal, body)
+    at = _stamp(journal.get("created_at")) or _stamp(tick_at)
+    if at is None:
+        return
+    holder = str(raw_holder).lower()
+    row = rows.setdefault(holder, _row("brain:" + holder, holder, "brain"))
+    _add(row, _journal_event(journal, body, at, start, now))
+
+
 def _journal_rows(journals, start: datetime, now: datetime):
     """One row per journal holder, the documented brains first, and the
     goal homes the journals were read from. A holder outside CADENCES has
@@ -124,24 +152,10 @@ def _journal_rows(journals, start: datetime, now: datetime):
     rows = {key: _row("brain:" + key, label, "brain", cadence=minutes) for key, label, minutes in CADENCES}
     seen, homes = set(), set()
     for journal in journals or []:
-        if not isinstance(journal, dict):
-            continue
-        body = str(journal.get("body") or "")
-        if not body.startswith(JOURNAL_MARKER) or body in seen:
-            continue
-        seen.add(body)
-        if journal.get("repo") and journal.get("issue_number"):
-            homes.add((str(journal["repo"]), int(journal["issue_number"])))
-        tick = brain_view._tick(journal)
-        at = _stamp(journal.get("created_at")) or _stamp(tick["at"])
-        if at is None:
-            continue
-        holder = str(tick["holder"]).lower()
-        row = rows.setdefault(holder, _row("brain:" + holder, holder, "brain"))
-        kind = "tick-failed" if tick["outcome"] == "failed" else "tick"
-        _add(row, _event(at, kind, "%s: %s" % (tick["outcome"], tick["line"]), beat=True, href=journal.get("html_url")))
+        _add_journal(journal, rows, seen, homes, start, now)
     documented = [rows[key] for key, _, _ in CADENCES]
-    others = sorted((row for key, row in rows.items() if key not in {c[0] for c in CADENCES}
+    cadence_keys = {c[0] for c in CADENCES}
+    others = sorted((row for key, row in rows.items() if key not in cadence_keys
                      and any(start <= e["at"] <= now for e in row["_all"])), key=lambda row: row["key"])
     return documented + others, homes
 

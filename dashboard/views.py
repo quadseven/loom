@@ -77,15 +77,15 @@ def build_improvements(journals, tickets, metrics_comments):
     metrics = parse_metrics(metrics_comments)
     latest = metrics[0][1] if metrics else {}
     previous = metrics[1][1] if len(metrics) > 1 else {}
+    index = _TicketIndex(tickets)
     newest_first = sorted(journals, key=lambda row: str(row.get("created_at") or ""), reverse=True)
     records, seen = [], {}
     for journal in newest_first:
-        for record in _journal_records(journal, tickets, latest, previous):
+        for key, record in _journal_records(journal, index, latest, previous):
             # The same friction is often carried from tick to tick: one card
             # per friction, from the newest journal that names it. A ticket
             # briefed from an older journal links that one, so the card
             # keeps the furthest stage any of its journals reached.
-            key = _clean_text(record["friction"])
             kept = seen.get(key)
             if kept is None:
                 seen[key] = record
@@ -100,18 +100,23 @@ def build_improvements(journals, tickets, metrics_comments):
 # where the station's friction intake reads it too (loom#792).
 
 
-def _journal_records(journal, tickets, latest, previous):
+def _journal_records(journal, index, latest, previous):
     records = []
     body = str(journal.get("body") or "")
     if not body.startswith(JOURNAL_MARKER):
         return records
-    for friction in friction_lines(body):
-        ticket = _ticket_for_friction(journal, friction, body, tickets)
+    frictions = friction_lines(body)
+    if not frictions:
+        return records
+    body_cache = {}
+    for friction in frictions:
+        friction_clean = _clean_text(friction)
+        ticket = _ticket_for_friction_indexed(journal, friction, friction_clean, body, index, body_cache)
         state = (ticket or {}).get("state") or "not ticketed"
         moved = _moved_metric(ticket, state, latest, previous)
         stage = _improvement_stage(ticket, state, moved)
-        records.append({"friction": friction, "journal": journal, "ticket": ticket,
-                        "state": state, "moved": moved, "stage": stage})
+        records.append((friction_clean, {"friction": friction, "journal": journal, "ticket": ticket,
+                                         "state": state, "moved": moved, "stage": stage}))
     return records
 
 
@@ -128,6 +133,137 @@ def _find_ticket(tickets, refs):
 # issues): "Noticed in <journal comment link>: "<the Friction line>"".
 _NOTICED = re.compile(r"^[ \t>*-]*Noticed in\b[ \t]*:?(.*)$", re.I | re.M)
 _LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)|<?(https?://[^\s>)]+)>?|(\S*issuecomment-\d+)")
+_WHY_SECTION = re.compile(r"##\s*Why\s*\n(.*?)(?=\n##|\Z)", re.S | re.I)
+_ISSUECOMMENT_ID = re.compile(r"issuecomment-(\w+)")
+_REFS_LINE = re.compile(r"Refs\b([^\n]*)")
+_URL_TOKEN = re.compile(r"https?://[^\s<>)\"'\]]+")
+_WORD_TOKEN = re.compile(r"\w+")
+
+
+class _TicketIndex:
+    """Pre-indexed view of tickets for one build_improvements pass."""
+
+    def __init__(self, tickets):
+        self.tickets = list(tickets)
+        self.by_ref = {}
+        self.by_body_ref = {}
+        self.by_comment_id = {}
+        self.by_refs_token = {}
+        self.by_url = {}
+        self.noticed_by_idx = {}
+        self.why_entries = []
+        self._quote_cache = {}
+        for idx, row in enumerate(self.tickets):
+            self._index_ticket(idx, row)
+
+    def _index_ticket(self, idx, row):
+        self.by_ref.setdefault((row.get("repo"), str(row.get("number"))), row)
+        for ref in row.get("refs") or ():
+            ref_key = tuple(ref) if isinstance(ref, (list, tuple)) else ref
+            self.by_body_ref.setdefault(ref_key, row)
+        ticket_body = str(row.get("body") or "")
+        self._index_body_links(idx, ticket_body)
+        why_match = _WHY_SECTION.search(ticket_body)
+        why_clean = _clean_text(why_match.group(1) if why_match else ticket_body)
+        if why_clean:
+            self.why_entries.append((row, why_clean))
+
+    def _index_body_links(self, idx, ticket_body):
+        noticed = _NOTICED.findall(ticket_body)
+        if noticed:
+            self.noticed_by_idx[idx] = [
+                (line, quote_clean, len(quote_clean.split()) < 3)
+                for line in noticed
+                for quote_clean in (_clean_text(_LINK.sub(" ", line)),)
+            ]
+        for cid in set(_ISSUECOMMENT_ID.findall(ticket_body)):
+            self.by_comment_id.setdefault(cid, []).append(idx)
+        for tok in {tok for tail in _REFS_LINE.findall(ticket_body) for tok in _WORD_TOKEN.findall(tail)}:
+            self.by_refs_token.setdefault(tok, []).append(idx)
+        urls = set()
+        for raw in _URL_TOKEN.findall(ticket_body):
+            urls.add(raw)
+            stripped = raw.rstrip(".,;:!?")
+            if stripped:
+                urls.add(stripped)
+        for url in urls:
+            self.by_url.setdefault(url, []).append(idx)
+
+    def find_ticket(self, refs):
+        for ref in refs:
+            ticket = self.by_ref.get(ref)
+            if ticket is not None:
+                return ticket
+        return None
+
+    def _candidate_indices(self, journal_url, journal_id):
+        if journal_url and not journal_url.startswith(("http://", "https://")):
+            return range(len(self.tickets))
+        if journal_id and not _WORD_TOKEN.fullmatch(journal_id):
+            return range(len(self.tickets))
+        found = set()
+        if journal_url:
+            found.update(self.by_url.get(journal_url, ()))
+        if journal_id:
+            found.update(self.by_comment_id.get(journal_id, ()))
+            found.update(self.by_refs_token.get(journal_id, ()))
+        return sorted(found)
+
+    def _ticket_matches_journal(self, idx, journal_url, journal_id, friction_clean):
+        noticed = [(quote_clean, is_short)
+                   for line, quote_clean, is_short in self.noticed_by_idx.get(idx, ())
+                   if _names_journal(line, journal_url, journal_id)]
+        if noticed:
+            return any(is_short or _why_quotes_friction(quote_clean, friction_clean)
+                       for quote_clean, is_short in noticed)
+        ticket_body = str(self.tickets[idx].get("body") or "")
+        if _names_journal(ticket_body, journal_url, journal_id):
+            return True
+        return bool(journal_id and re.search(r"Refs\b[^\n]*\b" + re.escape(journal_id) + r"\b", ticket_body))
+
+    def ticket_refs_journal(self, journal, friction_clean):
+        journal_url = journal.get("html_url") or ""
+        journal_id = str(journal.get("id") or "")
+        if not journal_url and not journal_id:
+            return None
+        for idx in self._candidate_indices(journal_url, journal_id):
+            if self._ticket_matches_journal(idx, journal_url, journal_id, friction_clean):
+                return self.tickets[idx]
+        return None
+
+    def ticket_quoting_friction(self, friction_clean):
+        if not friction_clean or len(friction_clean) <= 8:
+            return None
+        if friction_clean in self._quote_cache:
+            return self._quote_cache[friction_clean]
+        words = [w for w in friction_clean.split() if len(w) > 3]
+        has_words = len(words) >= 4
+        threshold = len(words) * 0.75
+        found = None
+        for row, why_clean in self.why_entries:
+            if (friction_clean in why_clean or why_clean in friction_clean
+                    or (has_words and sum(1 for w in words if w in why_clean) >= threshold)):
+                found = row
+                break
+        self._quote_cache[friction_clean] = found
+        return found
+
+    def ticket_for_journal_ids(self, journal):
+        if journal.get("repo") and journal.get("issue_number"):
+            return self.by_body_ref.get((journal["repo"], str(journal["issue_number"])))
+        return None
+
+
+def _ticket_for_friction_indexed(journal, friction, friction_clean, body, index, body_cache):
+    ticket = (index.find_ticket(REF.findall(friction))
+              or index.ticket_refs_journal(journal, friction_clean)
+              or index.ticket_quoting_friction(friction_clean))
+    if ticket is not None:
+        return ticket
+    if "body_ticket" not in body_cache:
+        body_cache["body_ticket"] = (index.find_ticket(REF.findall(body))
+                                     or index.ticket_for_journal_ids(journal))
+    return body_cache["body_ticket"]
 
 
 def _names_journal(text, journal_url, journal_id):
@@ -219,27 +355,56 @@ def _improvement_stage(ticket, state, moved):
     return 1 if ticket else 0
 
 
-def parse_pr_footers(prs):
-    """Single-pass extraction of footer_models, footer_runs, and newest_lane_models
-    from a list of pull requests."""
+def _record_pr_footer(pr, parsed, by_ticket_model, by_ticket_run, by_lane):
+    key = "%s#%s" % (parsed[0], parsed[1])
+    updated = str(pr.get("updated_at") or "")
+    if key not in by_ticket_model or updated >= by_ticket_model[key][0]:
+        by_ticket_model[key] = (updated, parsed[3])
+    opened = str(pr.get("created_at") or updated)
+    if key not in by_ticket_run or opened >= by_ticket_run[key][0]:
+        by_ticket_run[key] = (opened, parsed[3], pr.get("number"), pr.get("html_url"))
+    lane = parsed[2]
+    if lane not in by_lane or opened >= by_lane[lane]["time"]:
+        by_lane[lane] = {"model": parsed[3], "time": opened}
+
+
+def _add_scoreboard_pr(tiers, pr, parsed, tickets_by_ref):
+    _, _, lane, model = parsed
+    ticket = tickets_by_ref.get(parsed[:2])
+    raw_tier = (ticket.get("difficulty") if ticket else None) or pr.get("tier") or pr.get("difficulty") or "unknown"
+    tier = str(raw_tier).lower()
+    if tier not in ("easy", "medium", "hard", "frontier"):
+        tier = "unknown"
+    counts = tiers.setdefault(tier, {}).setdefault(
+        model.strip(), {"merged": 0, "open": 0, "closed": 0, "lane": lane.strip()})
+    state = str(pr.get("state") or "open").lower()
+    key = "merged" if state == "closed" and pr.get("merged_at") else state
+    if key in ("merged", "open", "closed"):
+        counts[key] += 1
+
+
+def summarize_prs(prs, tickets=()):
+    """Single-pass extraction of footer_models, footer_runs, newest_lane_models,
+    and scoreboard from pull requests and tickets."""
+    tickets_by_ref = {(row.get("repo"), str(row.get("number"))): row for row in tickets or ()}
     by_ticket_model = {}
     by_ticket_run = {}
     by_lane = {}
+    tiers = {}
     for pr in prs:
         parsed = footer(pr.get("body"))
         if not parsed:
             continue
-        key = "%s#%s" % (parsed[0], parsed[1])
-        updated = str(pr.get("updated_at") or "")
-        if key not in by_ticket_model or updated >= by_ticket_model[key][0]:
-            by_ticket_model[key] = (updated, parsed[3])
-        opened = str(pr.get("created_at") or updated)
-        if key not in by_ticket_run or opened >= by_ticket_run[key][0]:
-            by_ticket_run[key] = (opened, parsed[3], pr.get("number"), pr.get("html_url"))
-        lane = parsed[2]
-        if lane not in by_lane or opened >= by_lane[lane]["time"]:
-            by_lane[lane] = {"model": parsed[3], "time": opened}
-    return {key: model for key, (_, model) in by_ticket_model.items()}, by_ticket_run, by_lane
+        _record_pr_footer(pr, parsed, by_ticket_model, by_ticket_run, by_lane)
+        _add_scoreboard_pr(tiers, pr, parsed, tickets_by_ref)
+    return {key: model for key, (_, model) in by_ticket_model.items()}, by_ticket_run, by_lane, tiers
+
+
+def parse_pr_footers(prs):
+    """Single-pass extraction of footer_models, footer_runs, and newest_lane_models
+    from a list of pull requests."""
+    models, runs, by_lane, _ = summarize_prs(prs)
+    return models, runs, by_lane
 
 
 def footer_models(prs):
