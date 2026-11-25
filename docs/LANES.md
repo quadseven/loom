@@ -256,7 +256,12 @@ unset variables.
   127 as `validation environment unavailable: ...`), opens no pull request
   and pushes nothing to the ticket's branch or an open pull request. The
   edits go to a side branch `<branch>-unvalidated-<time>` so they can be
-  recovered.
+  recovered. When that branch is ahead of the default branch and no later
+  attempt opened a pull request or kept a newer branch, the next new brief's
+  "Earlier attempt" section names it with the failing tests from the reason
+  (at most 10, plain test names only), and the runner merges it before the
+  agent starts, as it does a `-timedout-` branch. A fix brief resumes only a
+  `-timedout-` branch.
 - Every step runs like an API-lane agent: an emptied environment, a scratch
   HOME (`run/<lane>-check`), under `sandbox-exec`, with no access to the
   runner's HOME, but with the network and the writes outside HOME a step's
