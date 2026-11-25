@@ -5164,7 +5164,9 @@ class CorruptStateTest(Base):
         # The invariant pass also reads the completed scheduled workflow runs.
         # The invariant pass reads open tickets for verify handoff coverage
         # and stale live checks (loom#3509).
-        self.assertEqual(self.run_pass().requests, 24)
+        # The factory release reads the queued wait:incident tickets the hold
+        # ledger does not know, once every 15 minutes (loom#3573).
+        self.assertEqual(self.run_pass().requests, 25)
 
 
 class TicketsTest(unittest.TestCase):
