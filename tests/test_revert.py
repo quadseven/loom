@@ -700,7 +700,7 @@ class StationStep(Base):
         self.assertIn("lane:opencode-go", [x["name"] for x in made["labels"]])
         self.assertTrue(made["body"].startswith("Difficulty: easy\n"))
 
-    def test_with_no_easy_lane_up_the_next_tier_takes_the_revert(self):
+    def test_with_spark_at_a_limit_the_next_free_lane_takes_the_revert(self):
         self.green_base()
         self.gh.merge("m1", 41, 4, run("red", ago=4000), ago=4100)
         on = self.station(True)
@@ -714,7 +714,7 @@ class StationStep(Base):
             on.watch_default_branches()
         made = self.revert_tickets()[0]
         self.assertIn("lane:codex-2", [x["name"] for x in made["labels"]])
-        self.assertTrue(made["body"].startswith("Difficulty: medium\n"))
+        self.assertTrue(made["body"].startswith("Difficulty: easy\n"))
 
     def test_with_no_lane_up_the_revert_waits(self):
         self.green_base()

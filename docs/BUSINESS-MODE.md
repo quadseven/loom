@@ -52,7 +52,7 @@ Read these first: `docs/OVERVIEW.md`, `docs/SDLC.md`, `docs/BRAIN.md`,
   `loom:verified`. Holds are `wait:*` and `needs:human`. Claims are
   `claim:<name>`.
 - **Station.** One process, every minute: claims tickets for free lanes by
-  difficulty tier, writes briefs, runs the factory, posts status.
+  cost (every lane may try every ticket), writes briefs, runs the factory, posts status.
 - **Brain.** Every 30 minutes: writes tickets, reviews and merges, verifies,
   journals. Many brains may share the duty; one lock decides who acts.
 - **Lanes.** One runner script (`lanes/run_lane.sh`) runs each lane's AI CLI on

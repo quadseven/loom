@@ -43,19 +43,15 @@ UNKNOWN = {"state": "unknown", "text": "unknown", "until": None}
 
 def tier_list(env: Optional[Mapping[str, str]] = None,
               model_of: Callable[..., Optional[str]] = lane_model) -> List[Dict[str, Any]]:
-    """Loom's tiers in order (easy, medium, hard), then the model ladder:
-    [{name, title, entries: [{lane, model, kind}]}]. A hard entry runs the
-    lane's HARD_MODELS model when it has one; any other runs the lane's
-    configured model (LOOM_<LANE>_MODEL), None when this process has none.
-    Ladder entries carry their rung."""
+    """Loom's one lane list, cheapest first (factory.LANE_ORDER: every lane
+    may try every ticket, loom#3550), then the model ladder:
+    [{name, title, entries: [{lane, model, kind}]}]. A lane entry runs the
+    lane's configured model (LOOM_<LANE>_MODEL), None when this process has
+    none. Ladder entries carry their rung."""
     env = os.environ if env is None else env
-    out = []
-    for name, lanes in factory.TIERS.items():
-        entries = []
-        for lane in lanes:
-            model = factory.HARD_MODELS.get(lane) if name == "hard" else None
-            entries.append({"lane": lane, "model": model or model_of(lane, env), "kind": factory.lane_kind(lane)})
-        out.append({"name": name, "title": name.title(), "entries": entries})
+    entries = [{"lane": lane, "model": model_of(lane, env), "kind": factory.lane_kind(lane)}
+               for lane in factory.LANE_ORDER]
+    out = [{"name": "lanes", "title": "Lanes by cost", "entries": entries}]
     ladder = [{"rung": rung, "lane": lane, "model": model, "kind": factory.lane_kind(lane)}
               for rung, (lanes, model) in enumerate(factory.LADDER, 1) for lane in lanes]
     out.append({"name": "ladder", "title": "Model ladder", "entries": ladder})
@@ -305,9 +301,9 @@ def _usage_allowance(slots: Sequence[str], readings: SourceState, now: datetime)
 
 
 def _tier_slots() -> Dict[str, List[str]]:
-    """{lane: its slots named in TIERS or LADDER}, lanes in tier order."""
+    """{lane: its slots named in LANE_ORDER or LADDER}, lanes in that order."""
     out: Dict[str, List[str]] = {}
-    named = [lane for lanes in factory.TIERS.values() for lane in lanes]
+    named = list(factory.LANE_ORDER)
     named += [lane for lanes, _ in factory.LADDER for lane in lanes]
     for slot in named:
         slots = out.setdefault(labels.base_lane(slot), [])
@@ -493,7 +489,7 @@ def _tiers_html(data: Dict[str, Any], now: datetime) -> str:
     parts = [_tier_html(tier) for tier in data["tiers"]]
     parts.append('<div class="tiers-tier" id="tier-grug"><h3>Grug review order</h3>%s</div>' % listed)
     return _section("tiers", "Tiers",
-                    "Loom tries a ticket's lanes in this order, by its difficulty, and a stuck ticket climbs the "
+                    "Loom gives every ticket the first free lane in this order, cheapest first, and a stuck ticket climbs the "
                     "model ladder. Each lane is marked free, own hardware, subscription or never paid (a prepaid "
                     "credit that is not topped up).", '<div class="tiers-grid">%s</div>' % "".join(parts))
 

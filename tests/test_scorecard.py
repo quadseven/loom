@@ -456,7 +456,7 @@ class FactoryStepAside(FactoryBase):
         why = "3 bad outcomes in 7 days (1 reverts, 2 failed deploys)"
         with mock.patch("bus.factory._say"):
             self.go(demoted={"spark-2": why},
-                    available=[x for x in factory.TIERS["medium"] if x != "spark-2"])
+                    available=[x for x in factory.LANE_ORDER if x != "spark-2"])
         self.assertNotEqual(self.lane(7), "spark-2")
         self.assertIn("lane spark-2 is demoted (%s; the operator clears it)" % why,
                       self.gh.comments[7][-1]["body"])
@@ -476,10 +476,10 @@ class FactoryStepAside(FactoryBase):
         # step-aside moved it straight back ("The station gave this queued
         # ticket lane X" then "Not a failure (lane X is demoted ...)").
         self.queued(7)
-        first = factory.TIERS["medium"][0]
+        first = factory.LANE_ORDER[0]
         why = "3 bad outcomes in 7 days (1 reverts, 2 failed deploys)"
         worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
-                                 available=list(factory.TIERS["medium"]),
+                                 available=list(factory.LANE_ORDER),
                                  demoted={first: why})
         with mock.patch("bus.factory._say"):
             worker.assign_queued()
@@ -491,7 +491,7 @@ class FactoryStepAside(FactoryBase):
 
     def test_a_queued_ticket_whose_only_up_lane_is_demoted_waits(self):
         self.queued(7)
-        first = factory.TIERS["medium"][0]
+        first = factory.LANE_ORDER[0]
         worker = factory.Factory(self.gh, [FACTORY_REPO], FACTORY_NOW, trusted=["alice-example"],
                                  available=[first], demoted={first: "bad work"})
         with mock.patch("bus.factory._say"):
@@ -500,15 +500,15 @@ class FactoryStepAside(FactoryBase):
         self.assertNotIn("lane:" + first, [x["name"] for x in self.gh.issues[7]["labels"]])
 
     def test_a_step_aside_never_moves_a_ticket_onto_a_demoted_lane(self):
-        # The tier move off a limited lane skipped only limited and
+        # The lane move off a limited lane skipped only limited and
         # unavailable lanes: it picked the demoted one, which bounced it on.
         self.gh.ticket(7, "briefed", lane="codex", body="Difficulty: medium\n\n## Why\nx\n")
         self.gh.events[7] = [{"event": "labeled", "label": {"name": "loom:briefed"},
                               "created_at": factory_iso(60)}]
-        first = factory.TIERS["medium"][0]
+        first = factory.LANE_ORDER[0]
         with mock.patch("bus.factory._say"):
             self.go(limited=["codex"], demoted={first: "bad work"},
-                    available=list(factory.TIERS["medium"]))
+                    available=list(factory.LANE_ORDER))
         self.assertNotIn(self.lane(7), (first, "codex"))
         self.assertNotIn("is demoted", self.notes(7))
 
