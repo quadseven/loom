@@ -8,6 +8,7 @@ from bus import factory
 from bus.github import GitHubError
 from test_bus_factory import FakeGitHub, ME, NOW, REPO, STRANGER, iso
 from shadow_env import setUpModule, tearDownModule  # noqa: F401
+from head_approved import head_approved  # noqa: E402
 
 class Client:
     def __init__(self, stacks):
@@ -173,6 +174,7 @@ class TrustAndOverlap(TestCase):
         self.assertTrue(self.guard_completed)
 
 
+@head_approved
 class StackLanding(TestCase):
     """Exercise the real factory landing boundary and its real merge backstop."""
 

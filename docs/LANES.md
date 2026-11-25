@@ -650,8 +650,8 @@ models.dev marks deprecated). A missing model is a limit on that model for
 24 hours, with `model <id> not found by the agent CLI` in the heartbeat. It reads
 `LOOM_REPOS`,
 `LOOM_BRIEF_AUTHORS` and `LOOM_REPO_OWNERS` from the environment of the
-install (empty `LOOM_REPOS` keeps it idle) and uses `LOOM_GITHUB_TOKEN`,
-`GITHUB_TOKEN` or `gh auth token`. docs/BRAIN.md has the rules.
+install (empty `LOOM_REPOS` keeps it idle) and calls GitHub only as its
+GitHub App (below). docs/BRAIN.md has the rules.
 
 GitHub App: with `LOOM_GITHUB_APP_ID`, `LOOM_GITHUB_APP_INSTALLATION_ID` and
 `LOOM_GITHUB_APP_KEY_SSM` (the name of the SSM parameter that holds the App's
@@ -669,7 +669,9 @@ written is a lane agent's per-run gh store, below)
 and the next pass reuses it until 5 minutes before expiry; the ETags cached on
 the last pass then answer 304 (loom#1306). A 401 deletes the file. Mints count under `app token` in the
 requests line, and the budget line reads `GitHub App budget`. With any of the
-three unset, the token above is used as before. Instead of SSM, the station
+three unset, a `bus` command run by hand uses the token above as before, but
+the station pass, a brain tick and a lane run refuse to start (below).
+Instead of SSM, the station
 and the brain can read the key from a file: set `LOOM_GITHUB_APP_KEY_FILE` to
 its path (it wins when both are set). `lanes/mac/install.sh` writes it into
 both plists, refuses a key file readable by group or others (it must be mode
@@ -704,10 +706,36 @@ into every lane and `LOOM_BRAIN_GITHUB_APP_*` into the brain, each as that
 launchd job's own `LOOM_GITHUB_APP_*`; the brain keeps the station's App until
 it has its own, and half an App's settings install nothing.
 `python3 -m bus app token` prints the installation token of the App those
-settings name, and fails with no output without them. A lane with the
-settings drops any personal `GH_TOKEN` or `GITHUB_TOKEN`, mints a token at the
+settings name, and fails with no output without them.
+
+Fail closed (loom#3083): plain `gh` falls back to any stored login when its
+token is empty, so an agent could act as a person unseen. `lanes/run_lane.sh`,
+`lanes/mac/brain.sh` and `lanes/mac/station.sh` each source
+`lanes/github_auth.sh` before their first GitHub call. It stops the process,
+with a message, when it finds an ambient `GH_TOKEN` (even an empty one) or a
+`GH_CONFIG_DIR` that is not an empty directory. Otherwise it points
+`GH_CONFIG_DIR` at a fresh empty directory (removed on exit), puts
+`lanes/github-bin` first on `PATH`, and sets git's only github.com credential
+helper to `lanes/github-bin/git-credential-loom`, with pushes to SSH remotes
+sent over https. That helper answers with the process's own App token, or
+tells git to quit without one. `lanes/github-bin/gh` runs the real `gh` only
+with an App installation token (`ghs_...`) in `GH_TOKEN` and an empty config
+directory. It refuses `gh auth login`, `refresh`, `setup-git`, `switch` and
+`token`. `lanes/fleet-token` is the one token helper: it prints only the token
+and exits 1 with empty output on every failure, which covers no App named, a
+missing or empty installation id or key, GitHub refusing, or a reply with no
+token. The station mints before its deploy step and reuses its
+`state/station/app-token.json` (`bus app token --cache-file`). Its Python pass
+refuses to start without the App settings, and a pass whose mint fails reads
+nothing from GitHub. A brain tick mints before it takes the lock and again
+once it holds it. Two reads still use the operator's own token on purpose:
+the pin pass (`bus/pin.py`, loom#612) and the operator budget sample
+(`bus/operator_budget.py`). Each reads `LOOM_GITHUB_TOKEN` from its own
+environment, since the wrapper refuses `gh auth token`.
+
+A lane drops nothing quietly: it mints a token at the
 start of each run and again after its agent (a token lasts an hour), clones
-over https with `gh` as git's credential helper, and runs its agent without
+over https with the credential helper above, and runs its agent without
 the token in its environment, the App settings or that helper; a failed mint
 parks the run `[transient]` before anything is posted. So that the agent's own
 `gh` calls spend the App's budget and not the operator's (loom#665), each run
@@ -715,8 +743,10 @@ writes the token into a fresh gh config directory, `$LOOM_HOME/run/<lane>-gh.*`
 (mode 700, the token in its `hosts.yml`), points the agent's `GH_CONFIG_DIR`
 at it and removes it when the agent exits. The brief tells the agent not to
 poll pull request checks or reviews, and the run's log records
-`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output. `lanes/mac/brain.sh` mints once per
-tick, after the lock, and gives every rung that token as `GH_TOKEN`,
+`<ticket> agent gh calls: N`, the `gh` commands counted in the agent's output.
+The agent's `gh` is the real one (the wrapper is dropped from its `PATH`), so
+it reads only that store. `lanes/mac/brain.sh` mints before the lock and
+again after it, and gives every rung that token as `GH_TOKEN`,
 `GITHUB_TOKEN` and `LOOM_GITHUB_TOKEN`; a failed mint, or a
 `LOOM_BRAIN_MINUTES` over 50, runs no rung. The station trusts its own App's
 login by itself, so the brain's and the lanes' logins (`<slug>[bot]`) go in
@@ -775,8 +805,8 @@ inbox never means a briefed ticket is stale. Not load:
 
 A running ticket is always load; one whose run ended is settled to
 `loom:failed` (`settle_ended_runs`). A briefed ticket no lane claims for
-`BRIEFED_STALL` (2 hours) moves to a free or shorter lane of its tier or
-rung. With no such lane it goes back to `loom:queued` with no lane label
+`BRIEFED_STALL` (2 hours) moves to a free or shorter other lane (of its
+rung, for a ladder ticket). With no such lane it goes back to `loom:queued` with no lane label
 (a status note says why; it is not a failure and takes no rung marker), so
 it stops holding its lane and any free lane can take it from the queue. A
 ticket whose brief sits in a lane inbox is never settled this way.
@@ -907,12 +937,12 @@ file list, its markers in the tree; the runner completes the merge, or parks
 the brief with "conflict markers left in FILES".
 A lane at a limit (its heartbeat reason starts `limit:`, as the spark lane's
 does while its box is hot) is not failing: a ticket briefed on it moves at
-once to a free lane in its difficulty tier (docs/MUSE.md, Lane choice), with
+once to the first free other lane (docs/MUSE.md, Lane choice), with
 no rung marker, or a ticket on a ladder rung to a free lane of that rung; with
 none free it waits where it is for its lane to come back. A `loom:running`
 ticket on a local lane with no live heartbeat for 30 minutes (an unloaded or
 crashed lane, or a machine that is off) moves the same way, with a comment
-naming the lane and how long it was silent: to a free lane of its tier, or of
+naming the lane and how long it was silent: to the first free other lane, or of
 its Model, else back to `loom:queued`. It is no failure and no retry, so it
 never climbs, and the station's `silent-lane` invariant lists the lane.
 A lane deep in a run is not silent: its runner writes the heartbeat between
@@ -1286,7 +1316,7 @@ and the brain passes it to a sandboxed rung. Muse sets the same value
 
 A slot of a lane that is not Anthropic (`anthropic*` and `claude` never take
 one), is free, and has no build work (no briefed ticket claimed for it and no
-queued ticket of its tier or model) is handed one verify run instead of
+queued ticket it or its model may take) is handed one verify run instead of
 idling: the oldest shipped ticket without a proof, at most once per 6 hours
 per ticket, on a public repo only. The brief carries `Deliverable: verify`.
 A shipped ticket that has waited 2 hours since its ship does not wait for an
@@ -2749,6 +2779,16 @@ What changes in a pod:
 - `LOOM_DROP_TREES=1`: each run's tree, the runner's files beside it and the
   scratch homes are removed when the run ends, whatever its outcome
   (`drop_run_scratch`). Logs and the brief stay under `LOOM_HOME`.
+- A drain on SIGTERM: a stopping pod starts no runner and marks
+  `run/<slot>.drain`, so each runner takes no new brief. It waits
+  `LOOM_POD_DRAIN_SECONDS` (default 240) for the runs in flight, then stops
+  each agent still running and waits `LOOM_POD_PRESERVE_SECONDS` (default
+  90) while its runner keeps the run (`keep_drained_run`): the edits go to a
+  `-timedout-` branch, the brief gains an "Earlier attempt" section naming
+  it, and the brief stays in the inbox. With `LOOM_HOME` on a volume that
+  outlives the pod, the next pod's runner takes the same brief and merges the
+  branch, and the station keeps the ticket running. The pod's termination
+  grace period must cover both waits.
 - `LOOM_SSM_DIR`: a folder under HOME holding a copy of each SSM parameter
   the pod reads, at the parameter's name (`/a/b` is `$LOOM_SSM_DIR/a/b`),
   kept in step with SSM by the cluster. `ssm_value` reads the file and makes

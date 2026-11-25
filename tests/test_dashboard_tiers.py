@@ -146,31 +146,28 @@ def row(rows, provider, model, source=None):
 
 
 class TierList(unittest.TestCase):
-    def test_every_tier_is_listed_in_order_then_the_ladder_each_entry_with_lane_model_and_kind(self):
+    def test_the_one_lane_list_is_listed_then_the_ladder_each_entry_with_lane_model_and_kind(self):
         env = {"LOOM_SPARK_MODEL": "coder-120b", "LOOM_CODEX_MODEL": "gpt-6-luna"}
         listed = tiers.tier_list(env)
-        self.assertEqual([t["name"] for t in listed], list(factory.TIERS) + ["ladder"])
-        for tier in listed[:-1]:
-            self.assertEqual([e["lane"] for e in tier["entries"]], list(factory.TIERS[tier["name"]]))
-            for entry in tier["entries"]:
-                self.assertEqual(entry["kind"], factory.lane_kind(entry["lane"]))
-        hard = {e["lane"]: e for e in listed[2]["entries"]}
-        # No hard-tier pin since 2026-10-21: codex runs its gpt-6-luna setting.
-        self.assertEqual(hard["codex"]["model"], "gpt-6-luna")
-        easy = {e["lane"]: e for e in listed[0]["entries"]}
-        medium = {e["lane"]: e for e in listed[1]["entries"]}
+        # No difficulty tiers (loom#3550): one list, cheapest first.
+        self.assertEqual([t["name"] for t in listed], ["lanes", "ladder"])
+        self.assertEqual([e["lane"] for e in listed[0]["entries"]], list(factory.LANE_ORDER))
+        for entry in listed[0]["entries"]:
+            self.assertEqual(entry["kind"], factory.lane_kind(entry["lane"]))
+        lanes = {e["lane"]: e for e in listed[0]["entries"]}
         # A lane's own setting, or its provider's for a numbered slot.
-        self.assertEqual(easy["spark-2"]["model"], "coder-120b")
-        self.assertEqual(medium["codex-2"]["model"], "gpt-6-luna")
-        self.assertIsNone(easy["zen"]["model"])
+        self.assertEqual(lanes["codex"]["model"], "gpt-6-luna")
+        self.assertEqual(lanes["spark-2"]["model"], "coder-120b")
+        self.assertEqual(lanes["codex-2"]["model"], "gpt-6-luna")
+        self.assertIsNone(lanes["zen"]["model"])
         ladder = listed[-1]["entries"]
         self.assertEqual([(e["rung"], e["lane"], e["model"]) for e in ladder],
                          [(n, lane, model) for n, (lanes, model) in enumerate(factory.LADDER, 1) for lane in lanes])
 
-    def test_the_page_lists_the_tiers_in_order_with_each_kind_and_grugs_order(self):
+    def test_the_page_lists_the_lanes_and_ladder_in_order_with_each_kind_and_grugs_order(self):
         body = page()
         listed = panel(body, "tiers")
-        positions = [listed.index('id="tier-%s"' % name) for name in list(factory.TIERS) + ["ladder", "grug"]]
+        positions = [listed.index('id="tier-%s"' % name) for name in ("lanes", "ladder", "grug")]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("own hardware", listed)
         self.assertIn("never paid", listed)
@@ -278,10 +275,10 @@ class ModelRows(unittest.TestCase):
         # With no failed run nothing can be a hidden limit: every run finished.
         self.assertEqual(row(rows, "anthropic", "claude-opus-5-5")["w24"]["success"], 1.0)
 
-    def test_every_lane_in_the_tiers_has_a_loom_row_even_with_no_runs(self):
+    def test_every_listed_lane_has_a_loom_row_even_with_no_runs(self):
         rows = self.rows(loom_runs=good([RUNS[0]]))
         lanes = {r["provider"] for r in rows if r["source"] == "loom"}
-        wanted = {labels.base_lane(lane) for lanes in factory.TIERS.values() for lane in lanes}
+        wanted = {labels.base_lane(lane) for lane in factory.LANE_ORDER}
         self.assertEqual(wanted - lanes, set())
         anthropic = [r for r in rows if r["source"] == "loom" and r["provider"] == "anthropic"]
         self.assertEqual(len(anthropic), 1)

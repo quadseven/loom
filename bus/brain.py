@@ -4111,7 +4111,7 @@ def _rebrief_regressed(gh: GitHub, repo: str, issue: Dict[str, Any], title: str,
     _check_written_text(new)
     tickets.parse(new)
     if lane and lane in REMOTE_LANES:
-        _check_remote_queue(gh, repo, number, issue, lane, body=new)
+        _check_remote_queue(gh, repo, number, issue, lane)
     state = "queued" if (not lane or lane in REMOTE_LANES) else "briefed"
     kept = _moved_labels(_labels(issue), state, lane)
     gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
@@ -5471,6 +5471,61 @@ def restate_live(gh: GitHub, repo: str, number: int, text: str,
         gh.rest("PATCH", "/repos/%s/issues/%d" % (repo, number), {"body": new})
 
 
+def _add_hold_criterion(body: str, criterion: str) -> str:
+    heading = re.search(r"(?m)^## Acceptance criteria[ \t]*(?=\r?$)", body)
+    newline = "\r\n" if "\r\n" in body else "\n"
+    box = "- [ ] " + criterion
+    if heading is None:
+        return body + newline * 2 + "## Acceptance criteria" + newline * 2 + box + newline
+    end = heading.end()
+    return body[:end] + newline * 2 + box + (body[end:] or newline)
+
+
+def _external_hold_criterion(body: str, precondition: str, evidence: str) -> Tuple[str, bool]:
+    """Return the criterion to journal and whether it needs to be added."""
+    condition = hold_boxes.EXTERNAL_HOLD_PREFIX + precondition + ". Evidence to lift: "
+    boxes = proof.criteria(body)
+    for checked, line in boxes:
+        if not checked and line.startswith(hold_boxes.EXTERNAL_HOLD_PREFIX):
+            return line, False
+    if any(checked and line.startswith(condition) for checked, line in boxes):
+        return "", False
+    return condition + evidence + ".", True
+
+
+def external_hold(gh: GitHub, repo: str, number: int, precondition: str, evidence: str) -> str:
+    """Hold the ticket's open pull request and journal the decision once."""
+    precondition, evidence = (" ".join(value.split()).rstrip(".")
+                              for value in (precondition, evidence))
+    if not all(text.has_reason(value) for value in (precondition, evidence)):
+        raise ValueError("an external hold needs a precondition and evidence that lifts it")
+    path = "/repos/%s/issues/%d" % (repo, number)
+    issue = _open_issue(gh, repo, number)
+    if "loom:ticket" not in _labels(issue):
+        raise ValueError("an external hold requires a Loom ticket")
+    pull = _ticket_prs(repo, gh.paginate("/repos/%s/pulls?state=open" % repo)).get(number)
+    if pull is None:
+        return ""
+
+    body = str(issue.get("body") or "")
+    criterion, add_box = _external_hold_criterion(body, precondition, evidence)
+    if not criterion:
+        return ""
+    link = "https://github.com/%s/pull/%d" % (repo, pull["number"])
+    detail = criterion.removeprefix("Hold: do not merge. ")
+    note = "External hold stands for %s. %s" % (link, detail)
+    _check_written_text(note)
+    _check_decision_claim(gh, repo, number, note)
+    if add_box:
+        gh.rest("PATCH", path, {"body": _add_hold_criterion(body, criterion)})
+    # Write the guard first. If posting fails, the next tick can journal the
+    # existing box without editing the ticket again.
+    if any(comment.get("body") == note for comment in gh.paginate(path + "/comments")):
+        return ""
+    posted = notify.post(gh, repo, number, note, notify.NOTE).data or {}
+    return str(posted.get("body") or "")
+
+
 def _set_model(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
                model: str) -> None:
     """Rewrite the ticket body's Model: line; done before the labels change so
@@ -5539,42 +5594,27 @@ def _open_or_merged_pull(gh: GitHub, repo: str, branch: str) -> Optional[Dict[st
     return None
 
 
-def _check_remote_tier(body: str, lane: str) -> None:
-    """Refuse a remote lane brief whose difficulty the lane does not run."""
-    try:
-        difficulty = tickets.parse(body)[0].get("Difficulty", "")
-    except ValueError:
-        difficulty = ""
-    if difficulty not in REMOTE_LANES[lane]["tiers"]:
-        raise ValueError("difficulty %r is not one of %s: remote lane %s "
-                         "only runs %s" % (difficulty or "none", ", ".join(DIFFICULTIES),
-                                          lane, ", ".join(REMOTE_LANES[lane]["tiers"])))
-
-
 def _check_remote_lane(gh: GitHub, repo: str, body: str, lane: str) -> None:
     """Refuse a brief to a remote lane the lane could never claim: a private repo
-    for a public-only lane, or a difficulty tier the lane does not run.
+    for a public-only lane. Every lane takes every difficulty (loom#3550).
     Called when a new ticket is filed, so a branch check is not yet possible."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
-    _check_remote_tier(body, lane)
 
 
 def _check_remote_queue(gh: GitHub, repo: str, number: int, issue: Dict[str, Any],
-                        lane: str, body: Optional[str] = None) -> None:
+                        lane: str) -> None:
     """Refuse a queued move to a remote lane that the lane could never claim:
-    a private repo for a public-only lane, a ticket whose branch already has a
-    pull request (a fix round, which remote lanes do not run), or a difficulty
-    tier the lane does not run. The body is checked when the caller has it
-    (re-briefing a regression ticket); omitted for a plain queued move."""
+    a private repo for a public-only lane, or a ticket whose branch already
+    has a pull request (a fix round, which remote lanes do not run). Every
+    lane takes every difficulty (loom#3550)."""
     repo_info = gh.rest("GET", "/repos/%s" % repo).data or {}
     if REMOTE_LANES[lane].get("scope") == "public" and repo_info.get("private") is not False:
         raise ValueError("this repo is private: remote lane %s takes public repos only" % lane)
     branch = tickets.branch_for(number, str(issue.get("title") or ""))
     if _open_or_merged_pull(gh, repo, branch) is not None:
         raise ValueError("ticket branch %s already has a pull request" % branch)
-    _check_remote_tier(str(issue.get("body") or "") if body is None else body, lane)
 
 
 def move(gh: GitHub, repo: str, number: int, state: str,
@@ -5672,6 +5712,159 @@ def _refuse_person_change_request(details: Dict[str, Any]) -> None:
     blockers = merge_verdict.person_blockers(details)
     if blockers:
         raise ValueError("blocked: " + ", ".join(blockers))
+
+
+# The approval a merge needs on the current head (loom#3543), the merge
+# gate's independent-review row (scripts/pr-merge-gated.sh): a review check
+# that concluded success, neutral or skipped proves nothing about the code.
+REVIEW_MARKER = re.compile(r"^<!-- fleet:review v1 verdict=(APPROVE|REQUEST_CHANGES) "
+                           r"head=([0-9a-f]{40}) -->[ \t]*$", re.M)
+MARKER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+REVIEW_DECIDES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
+
+
+def _bare_login(login: str) -> str:
+    login = login.strip().lower()
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    return login[:-len("[bot]")] if login.endswith("[bot]") else login
+
+
+def _is_app(user: Dict[str, Any]) -> bool:
+    return (str(user.get("login") or "").lower().endswith("[bot]")
+            or user.get("type") == "Bot")
+
+
+# Automated check bots, never a reviewer (the gate's REVIEW_BOTS), and the
+# prefix every fleet agent login carries (agent-meta-muse, agent-openai-dot).
+CHECK_BOTS = frozenset({"github-actions", "copilot", "copilot-pull-request-reviewer",
+                        "dependabot", "renovate"})
+FLEET_PREFIX = "agent-"
+# GitHub lists at most this many commits of a pull request.
+PR_COMMIT_CAP = 250
+
+
+def _bot_standing(reviews: Sequence[Dict[str, Any]], bot: str) -> Optional[Tuple[str, str]]:
+    """The review bot App's latest approve-or-reject review: (state, commit)."""
+    standing: Optional[Tuple[str, str]] = None
+    for review in reviews:
+        user = review.get("user") or {}
+        if (_is_app(user) and _bare_login(str(user.get("login") or "")) == bot
+                and review.get("state") in REVIEW_DECIDES):
+            standing = (str(review["state"]), str(review.get("commit_id") or ""))
+    return standing
+
+
+def _marker_author(comment: Dict[str, Any], barred: Set[str], machines: Set[str]) -> str:
+    """The login whose fleet:review marker this comment may carry, or "" when
+    it cannot count: an App or automation login, a fleet agent, a
+    contributor, an edited comment, one posted through an App, or an author
+    who is not OWNER, MEMBER or COLLABORATOR."""
+    user = comment.get("user") or {}
+    who = _bare_login(str(user.get("login") or ""))
+    if not who or _is_app(user) or who in barred or who in machines:
+        return ""
+    if who.startswith(FLEET_PREFIX) or comment.get("performed_via_github_app"):
+        return ""
+    created = str(comment.get("created_at") or "")
+    if not created or str(comment.get("updated_at") or "") != created:
+        return ""
+    return who if comment.get("author_association") in MARKER_ASSOCIATIONS else ""
+
+
+def _marker_votes(comments: Sequence[Dict[str, Any]], barred: Set[str],
+                  machines: Set[str]) -> Dict[str, Tuple[str, str]]:
+    """Each counted person's latest marker: login -> (verdict, head)."""
+    marks: Dict[str, Tuple[str, str]] = {}
+    for comment in comments:
+        found = REVIEW_MARKER.findall(str(comment.get("body") or ""))
+        who = _marker_author(comment, barred, machines) if found else ""
+        if who:
+            marks[who] = found[-1]
+    return marks
+
+
+def head_approval(reviews: Sequence[Dict[str, Any]], comments: Sequence[Dict[str, Any]],
+                  head: str, bot: str, contributors: Iterable[str],
+                  automation: Iterable[str] = ()) -> str:
+    """"" when the head is approved, else the blocker. Approved means the
+    review bot App's latest approve-or-reject review is APPROVED on `head`,
+    or a person posted a fleet:review marker comment for `head` as their
+    latest marker. That person's author_association is OWNER, MEMBER or
+    COLLABORATOR, they posted it directly (not through a GitHub App) and
+    never edited it, and they are none of `contributors` (the pull request
+    author and every commit's author and committer), none of `automation`
+    (the fleet's own logins), no fleet agent and no check bot. The review
+    bot counts only when it is not a contributor. Its standing
+    CHANGES_REQUESTED on `head` refuses whatever else approved. No other
+    App, and no formal human review, counts."""
+    bot = _bare_login(bot)
+    barred = {_bare_login(x) for x in contributors if x}
+    machines = {_bare_login(x) for x in automation if x} | CHECK_BOTS
+    standing = _bot_standing(reviews, bot)
+    if standing == ("CHANGES_REQUESTED", head):
+        return "%s[bot] requested changes on head %s" % (bot, head[:10])
+    if standing == ("APPROVED", head) and bot not in barred:
+        return ""
+    marks = _marker_votes(comments, barred, machines)
+    if ("APPROVE", head) in marks.values():
+        return ""
+    stale = " (an approval on an older head is stale)" if standing and standing[0] == "APPROVED" \
+        else ""
+    return ("no approval on head %s: needs a %s[bot] APPROVE review on it, or an unedited "
+            "fleet:review marker comment for it from a trusted person who neither opened, "
+            "wrote nor pushed it%s" % (head[:10], bot, stale))
+
+
+def _pr_contributors(gh: GitHub, repo: str, number: int, pr: Dict[str, Any]) -> List[str]:
+    """The pull request author and every commit's author and committer
+    login. Raises ValueError when the commits cannot be read, when GitHub
+    truncated the list (it lists at most PR_COMMIT_CAP), and when a commit's
+    author or committer has no GitHub login: those fields are client-set, so
+    a commit tied to no login has an unknown writer, who may be the
+    approver."""
+    try:
+        commits = gh.paginate("/repos/%s/pulls/%d/commits" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request commits unreadable, so its authors cannot "
+                         "be kept from approving it (%s)" % err) from err
+    if len(commits) >= PR_COMMIT_CAP:
+        raise ValueError("blocked: the pull request has %d or more commits, more than "
+                         "GitHub lists, so its authors cannot be kept from approving it"
+                         % PR_COMMIT_CAP)
+    logins = [_pr_author(pr)]
+    for commit in commits:
+        for role in ("author", "committer"):
+            login = str(((commit or {}).get(role) or {}).get("login") or "")
+            if not login:
+                raise ValueError("blocked: commit %s has an unknown writer: its %s has no "
+                                 "GitHub login" % (str((commit or {}).get("sha") or "")[:10],
+                                                   role))
+            logins.append(login)
+    return [x for x in logins if x]
+
+
+def _refuse_unapproved_head(gh: GitHub, repo: str, number: int, pr: Dict[str, Any],
+                            details: Dict[str, Any], env: Optional[Dict[str, str]]) -> None:
+    """Refuse the merge unless head_approval approves the current head. A
+    review, comment or commit list that cannot be read refuses."""
+    from . import factory  # factory imports this module
+    settings = os.environ if env is None else env
+    bot = settings.get("LOOM_REVIEW_BOT", "").strip() or factory.DEFAULT_REVIEW_BOT
+    head = str(details.get("headRefOid") or (pr.get("head") or {}).get("sha") or "")
+    if not head:
+        raise ValueError("blocked: pull request has no head SHA")
+    try:
+        reviews = gh.paginate("/repos/%s/pulls/%d/reviews" % (repo, number))
+    except GitHubError as err:
+        raise ValueError("blocked: pull request reviews unreadable, so no approval on "
+                         "the head can be shown (%s)" % err) from err
+    comments = _read_comments(gh, repo, number)
+    contributors = _pr_contributors(gh, repo, number, pr)
+    automation = hold_logins(env) + [settings.get("LOOM_GITHUB_LOGIN", "").strip()]
+    why = head_approval(reviews, comments, head, bot, contributors, automation)
+    if why:
+        raise ValueError("blocked: " + why)
 
 
 def merge_completed(err: Exception) -> bool:
@@ -5800,11 +5993,13 @@ def merge(gh: GitHub, repo: str, number: int,
         _check_written_text(ADOPT_COMMENT)
         _validate_adopt_pr(gh, repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         association: Optional[Tuple[str, int]] = None
     else:
         pr, details = _await_settled(gh, repo, number, pr, details, env)
         _validate_merge_pr(repo, pr, details, env)
         _refuse_person_change_request(details)
+        _refuse_unapproved_head(gh, repo, number, pr, details, env)
         held = _refuse_unheld_answers(gh, repo, number, details, env)
         if change_class.class_of(pr) == "sensitive":
             from . import factory
@@ -9431,6 +9626,10 @@ def parser() -> argparse.ArgumentParser:
     hu = sub.add_parser("human"); hu.add_argument("issue"); hu.add_argument("--file", required=True)
     m = sub.add_parser("move"); m.add_argument("ticket"); m.add_argument("--to", choices=STATES, required=True); m.add_argument("--lane"); m.add_argument("--note"); m.add_argument("--proof"); m.add_argument("--model")
     lv = sub.add_parser("live"); lv.add_argument("ticket"); lv.add_argument("--text", required=True)
+    eh = sub.add_parser("external-hold", help="record an external hold on a ticket's open pull request")
+    eh.add_argument("ticket")
+    eh.add_argument("--precondition", required=True)
+    eh.add_argument("--evidence", required=True)
     pr = sub.add_parser("prioritize"); pr.add_argument("ticket"); pr.add_argument("--priority", choices=tickets.PRIORITIES); pr.add_argument("--difficulty", choices=DIFFICULTIES); pr.add_argument("--note")
     mg = sub.add_parser("merge"); mg.add_argument("pull_request"); mg.add_argument("--ticket"); mg.add_argument("--adopt", action="store_true")
     au = sub.add_parser("audit"); au.add_argument("ticket"); au.add_argument("--result", choices=audit.RESULTS, required=True); au.add_argument("--note", required=True)
@@ -9532,6 +9731,13 @@ def _cmd_move(gh: GitHub, args: argparse.Namespace) -> None:
 def _cmd_live(gh: GitHub, args: argparse.Namespace) -> None:
     repo, number = _ref(args.ticket, "ticket")
     restate_live(gh, repo, number, args.text)
+
+
+def _cmd_external_hold(gh: GitHub, args: argparse.Namespace) -> None:
+    repo, number = _ref(args.ticket, "ticket")
+    note = external_hold(gh, repo, number, args.precondition, args.evidence)
+    if note:
+        print(note)
 
 
 def _cmd_prioritize(gh: GitHub, args: argparse.Namespace) -> None:
@@ -9644,7 +9850,7 @@ def _cmd_resume(gh: GitHub, args: argparse.Namespace) -> int:
 
 
 COMMANDS = {"status": _cmd_status, "brief": _cmd_brief, "move": _cmd_move,
-            "prioritize": _cmd_prioritize, "live": _cmd_live,
+            "prioritize": _cmd_prioritize, "live": _cmd_live, "external-hold": _cmd_external_hold,
             "close": _cmd_close, "audit": _cmd_audit, "audit-close": _cmd_audit_close,
             "proof": _cmd_proof,
             "merge": _cmd_merge, "reply": _cmd_reply,

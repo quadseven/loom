@@ -439,7 +439,7 @@ class Facts:
     # tops up (LOOM_NO_TOPUP): the hold lasts until the credit renews, and
     # nothing is briefed onto them meanwhile, so it is no breach.
     no_topup: Optional[Tuple[str, ...]] = None
-    # (ticket, the lanes of its difficulty tier) for each queued ticket.
+    # (ticket, the lanes it may run on) for each queued ticket.
     queued: Optional[List[Tuple[Ref, Tuple[str, ...]]]] = None
     # Each goal home with its epics and the open tickets under none.
     shapes: Optional[List[GoalShape]] = None

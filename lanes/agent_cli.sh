@@ -68,13 +68,19 @@ codex_lane_home() {
 }
 
 claude_lane_print() {
+  # The brief is the first argument; any further arguments are CLI options.
+  local brief="$1"
+  shift
   if [ -n "${LOOM_CLAUDE_AUTH_FILE:-}" ] && [ -f "$LOOM_CLAUDE_AUTH_FILE" ]; then
     # A cluster pod has no operator settings file. In print mode the CLI
     # needs permission to edit and run tests. The pod is the isolation.
-    CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
-      claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$@" < /dev/null
+    # --allowedTools takes a list, so the brief goes over stdin: written
+    # after it, the CLI read the brief as a tool name and exited with no
+    # prompt on every run.
+    printf '%s' "$brief" | CLAUDE_CODE_OAUTH_TOKEN="$(cat "$LOOM_CLAUDE_AUTH_FILE")" timeout "$AGENT_TIMEOUT" \
+      claude -p --model "$MODEL" --permission-mode acceptEdits --allowedTools Bash "$@"
   else
-    timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$@" < /dev/null
+    timeout "$AGENT_TIMEOUT" claude -p --model "$MODEL" "$@" "$brief" < /dev/null
   fi
 }
 
@@ -84,7 +90,7 @@ claude_lane_cli() {
     claude_lane_print "$1"
     return $?
   fi
-  claude_lane_print --output-format stream-json --verbose "$1" |
+  claude_lane_print "$1" --output-format stream-json --verbose |
     (unset CLAUDE_CODE_OAUTH_TOKEN; cd "$root" && python3 -EsB -m bus.meter \
       --claude-stream "$LOOM_HOME/state/usage/$slot.meter.json")
   return "${PIPESTATUS[0]}"

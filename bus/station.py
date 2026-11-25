@@ -721,6 +721,15 @@ CLAIM_REQUEST_SHARE = 1 / 2
 # 35 pull request state reads for the settle step, five writes, the
 # listing. The budget floor still stops writing outright.
 INVARIANT_WRITE_RESERVE = 100
+# Requests the factory (run_factory: merge ready lane pull requests, bring
+# behind ones up to date, send conflicts and change requests back as fix
+# rounds) may spend past the pass target. It runs after the claim pass on
+# every pass, not as a loop step: on 2026-11-24 the steps before the loop
+# spent the target pass after pass, the loop broke at its first step, and the
+# factory ran a few times a day while approved, green lane pull requests
+# filled their repos' open pull request caps (loom#3534). The factory is due
+# every factory.FACTORY_CHECK seconds, and the budget floor still skips it.
+FACTORY_REQUEST_RESERVE = 250
 # A repo with no briefed, running or pr ticket is scanned this often at most.
 IDLE_SCAN = 600
 # Conditional-request answers unused this long are removed.
@@ -828,6 +837,9 @@ STEP_ROTATION_FILE = "step-rotation.json"
 # pause needs no reload. A bulk cleanup holds triage, rewrite and the
 # outside-epic move this way, so its relabels draw no bot comments.
 PAUSED_STEPS_FILE = "paused_steps.txt"
+# Steps that run on every pass outside the step loop, which LOOM_PAUSED_STEPS
+# can still hold (loom#3534).
+EVERY_PASS_STEPS = ("run_factory",)
 # A pass step that takes this long is logged with its time and requests, so a
 # long pass names its cause: on 2026-10-24 passes ran 25 to 98 minutes and
 # 3000 to 6300 requests, and nothing said which step spent them.
@@ -3668,7 +3680,7 @@ class Station:
         self._cap_held = set()
         self._repair_flying = {}
         # A runaway held because one dead lane kept failing it goes back to a
-        # free lane of its tier on its own (loom#565), before claims.
+        # free lane on its own (loom#565), before claims.
         self._release_dead_lane_runaways(free)
         # A starved shipped ticket takes one free lane ahead of build work.
         free = self._reserve_verify(free)
@@ -3721,10 +3733,10 @@ class Station:
     def _release_dead_lane_runaways(self, free: List[str]) -> None:
         """Release runaway holds caused by one dead lane: every attempt since
         the ticket's last brief ran on a lane with an open runs-and-none-done
-        invariant. The hold is released and the ticket briefed to a free lane
-        of its difficulty tier, with a comment naming the lane fault. This is
+        invariant. The hold is released and the ticket briefed to the first
+        free lane by cost, with a comment naming the lane fault. This is
         not a failure: no rung marker, no ladder move, no failure recorded.
-        With no free lane in its tier the ticket stays held and the comment
+        With no free lane the ticket stays held and the comment
         says why. A runaway whose attempts spread across lanes keeps its hold
         for the brain, as before."""
         runaways: List[Tuple[str, Dict[str, Any]]] = []
@@ -3774,23 +3786,23 @@ class Station:
         reviewed = [str(c.get("body") or "") for c in comments
                     if str(c.get("body") or "").startswith(marker)]
         # The marker starts both comments: only a release ends the review. A
-        # hold that stayed for want of a free tier lane is reviewed again each
-        # pass, and released once a lane of its tier is free (loom#2583).
+        # hold that stayed for want of a free lane is reviewed again each
+        # pass, and released once another lane is free (loom#2583).
         if any(DEAD_LANE_RELEASED in body for body in reviewed):
             return
         if repo not in self._publics:
             self._publics[repo] = self._public(repo)
-        tier = factory.tier_lanes(issue, not self._publics[repo])
-        target = next((x for x in tier if x in free and x not in used), None)
+        allowed = factory.lanes_for(not self._publics[repo])
+        target = next((x for x in allowed if x in free and x not in used), None)
         if target is None:
-            # Said once: a later pass with no free tier lane posts nothing.
+            # Said once: a later pass with no free lane posts nothing.
             if not reviewed:
                 self._comment(repo, number,
                               "%s\nRunaway hold reviewed: every attempt since the last brief "
                               "ran on lane %s, which has an open runs-and-none-done invariant "
-                              "(#%d); but no lane of its difficulty tier is free, so the hold "
+                              "(#%d); but no other lane is free, so the hold "
                               "stays." % (marker, lane, inv_number), notify.RUNAWAY)
-                _say("%s#%d stays held: its dead lane %s has no free tier lane"
+                _say("%s#%d stays held: its dead lane %s has no other free lane"
                      % (repo, number, lane))
             return
         names = self._drop_claim(n for n in names
@@ -3803,8 +3815,8 @@ class Station:
         self._comment(repo, number,
                       "%s\n%s: every attempt since the last brief ran on "
                       "lane %s, which has an open runs-and-none-done invariant (#%d: %s). "
-                      "This is not a failure: the ticket is briefed to lane %s, in its "
-                      "difficulty tier." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
+                      "This is not a failure: the ticket is briefed to lane %s, the first "
+                      "free lane by cost." % (marker, DEAD_LANE_RELEASED, lane, inv_number,
                                             inv_title, target),
                       notify.RUNAWAY)
         used.add(target)
@@ -4062,7 +4074,7 @@ class Station:
     def _queued_lanes(self, repo: str, issues: List[Dict[str, Any]],
                       counts: Dict[Tuple[str, int], int]) -> set:
         """The lanes a queued ticket of the repo may be given: its model's
-        lanes, else its difficulty tier's. A ticket the unproven-work gate
+        lanes, else any lane its repo may run on. A ticket the unproven-work gate
         refuses wants no lane: holding its lanes from verify runs too left
         the goal's shipped work stuck over the limit (2026-10-18)."""
         limit = brain.unverified_limit()
@@ -4076,7 +4088,7 @@ class Station:
             if model:
                 lanes.update(model_lanes(model.group(1)))
             else:
-                lanes.update(factory.lanes_of(factory.difficulty_of(issue), not self._public(repo)))
+                lanes.update(factory.lanes_for(not self._public(repo)))
         if not self._code_ready("workersai"):
             lanes.discard("workersai")
         return lanes
@@ -7083,7 +7095,7 @@ class Station:
                      self.watch_brain, self.upload_transcripts, self.post_brain_memory,
                      self.publish_handoff, self.relay_operator,
                      self.watch_default_branches, self.watch_deploys, self.score_lanes,
-                     self.refresh_bench, self.run_factory, self.lift_brain_holds,
+                     self.refresh_bench, self.lift_brain_holds,
                      # The move first, so the invariants read a goal whose
                      # tickets sit under an epic.
                      self.move_outside_tickets, self.check_invariants,
@@ -7149,7 +7161,17 @@ class Station:
         """The step names LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this
         pass, read again each pass so a pause or its removal needs no reload.
         An unreadable file pauses nothing; an unknown name is logged and
-        ignored, never raised."""
+        ignored, never raised. The steps run outside the loop on every pass
+        (EVERY_PASS_STEPS) are known names too."""
+        names = self._paused_names()
+        known = {step.__name__ for step in steps} | set(EVERY_PASS_STEPS)
+        for name in sorted(names - known):
+            _say("unknown paused step %s, ignored" % name)
+        return names & known
+
+    def _paused_names(self) -> Set[str]:
+        """Every name LOOM_PAUSED_STEPS and PAUSED_STEPS_FILE hold this pass,
+        known or not."""
         names = os.environ.get("LOOM_PAUSED_STEPS", "").split()
         try:
             with open(os.path.join(self.state, PAUSED_STEPS_FILE)) as fh:
@@ -7158,10 +7180,31 @@ class Station:
             pass
         except (OSError, UnicodeDecodeError) as err:
             _say("could not read %s: %s" % (PAUSED_STEPS_FILE, err))
-        known = {step.__name__ for step in steps}
-        for name in sorted(set(names) - known):
-            _say("unknown paused step %s, ignored" % name)
-        return set(names) & known
+        return set(names)
+
+    def _run_factory_every_pass(self) -> None:
+        """Run the factory (run_factory) once a pass, past the pass target
+        by FACTORY_REQUEST_RESERVE at most (loom#3534). The budget floor and
+        LOOM_PAUSED_STEPS still skip it. A read carried over at the reserve,
+        or a GitHub or disk failure, is logged and the pass goes on."""
+        if self.budget_low() is not None:
+            return
+        if "run_factory" in self._paused_names():
+            _say("step run_factory paused (LOOM_PAUSED_STEPS)")
+            return
+        target = getattr(self.gh, "target", None)
+        has_target = isinstance(target, int) and not isinstance(target, bool)
+        if has_target:
+            self.gh.target = max(target, self._pass_counted()) + FACTORY_REQUEST_RESERVE
+        try:
+            self._timed(self.run_factory)
+        except RateLimited:
+            raise
+        except (GitHubError, OSError, ValueError) as err:
+            _say("run_factory failed: %s" % err)
+        finally:
+            if has_target:
+                self.gh.target = target
 
     def _note_every_pass(self) -> None:
         """The missing-evidence note pass, run every pass ahead of the step
@@ -15400,8 +15443,8 @@ class Station:
         return journals, posts
 
     def _invariant_queued(self) -> List[Tuple[invariants.Ref, Tuple[str, ...]]]:
-        """Each trusted, truly queued ticket and the lanes of its difficulty
-        tier: loom:queued its only state label, and not another operator's.
+        """Each trusted, truly queued ticket and the lanes it may run on
+        (factory.lanes_for): loom:queued its only state label, and not another operator's.
         A ticket still marked queued beside a later state (shipped, merged)
         or claimed by another operator waits for no lane; counting those
         named shipped tickets as queued (loom#399)."""
@@ -15421,7 +15464,7 @@ class Station:
                 ref = self._invariant_ref(repo, int(issue["number"]))
                 if repo not in self._publics:
                     self._publics[repo] = self._public(repo)
-                out.append((ref, factory.tier_lanes(issue, not self._publics[repo])))
+                out.append((ref, factory.lanes_for(not self._publics[repo])))
         return out
 
     def _invariant_headerless(self) -> List[invariants.Ref]:
@@ -18916,6 +18959,10 @@ class Station:
                     raise
                 except (GitHubError, OSError) as err:
                     _say("claim_new failed: %s" % err)
+            # Lane pull requests land, catch up with base and go back for fix
+            # rounds every pass the factory is due: after the claims, so they
+            # keep their share, and past the target by its reserve.
+            self._run_factory_every_pass()
             # Again after the claims, for a ticket claimed in this pass.
             self._feed_lanes()
             try:
@@ -19201,8 +19248,9 @@ def _locked_pass(settings: Settings, state: str, gh: Optional[GitHub],
     so the inbox marks its events done only after a pass that ran."""
     use_launchd = gh is None
     if gh is None:
-        from .github import auth_from_env
-        gh = GitHub(auth_from_env())
+        # The station calls GitHub only as its App (loom#3083).
+        from .github import app_auth_from_env
+        gh = GitHub(app_auth_from_env())
         gh.status_in_body = True
         hooks.setdefault("operator_reader", operator_budget.read_core)
     if gh.cache_dir is None:

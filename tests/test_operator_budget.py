@@ -280,7 +280,7 @@ class IntegrationTests(unittest.TestCase):
             with mock.patch.object(station, "Station") as constructor, \
                  mock.patch.object(station, "_trust_app_login"), \
                  mock.patch.object(station, "GitHub", return_value=gh), \
-                 mock.patch("bus.github.auth_from_env", return_value="synthetic-test-credential") as auth:
+                 mock.patch("bus.github.app_auth_from_env", return_value="synthetic-test-credential") as auth:
                 station._locked_pass(settings, "unused", gh if supplied else None, {})
                 if supplied:
                     self.assertNotIn("operator_reader", constructor.call_args.kwargs)

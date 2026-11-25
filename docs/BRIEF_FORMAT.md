@@ -20,7 +20,7 @@ operator wrote the line), or it carries `class:sensitive` or `tier:security`.
 Any other pin (one a brain's App wrote when it briefed, or the model ladder
 wrote when it climbed) is a default: a queued ticket whose pinned model has
 had no free lane for `LOOM_PIN_FALLBACK_MINUTES` (default 30, `0` turns it
-off) takes a free lane of its difficulty tier with that lane's own model,
+off) takes the first free lane by cost with that lane's own model,
 and loses the line (docs/BRAIN.md, Tickets no lane takes).
 
 When a ticket body says `Builds on #N`, briefing reads open pull request N and

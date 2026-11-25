@@ -102,7 +102,7 @@ decides who acts:
 | `needs:human` | Only a person can do this; one comment names the exact thing needed and its `Kind:` (money, hardware, account, credential, physical, or a decision nobody has made). Never work the factory can do with the repo, the GitHub API, logs or a diagnosis, and never a ticket the unproven-work gate only delays. |
 | `loom:answer-pending` | An operator answered the item's ask on the dashboard's Needs you page (`<!-- loom:answer v1 -->` comment, `bus/answer.py`); the station has not read it yet. The factory reads it on its next pass and takes the label off (see Operator answers). |
 | `wait:gate`, `wait:model-limit`, `wait:lane`, `wait:incident`, `wait:after`, `wait:blocked`, `wait:superseded`, `wait:window`, `wait:live-event` | Why a ticket waits: the unproven-work gate holds its goal, its model or lane is at a limit, no free lane takes its model, it is held for a factory incident, another ticket must merge first, its brief's Blocked on section or GitHub's own blocked-by link names an issue still open (the factory gives such a queued ticket no lane, and the station claims no such briefed one), its brief says another issue supersedes it (the factory gives it no lane), a deploy or roll window, or (`wait:live-event`, on a shipped ticket) its Live box needs a rare event the log has not shown in 7 days since it shipped. The station sets at most one, only when the reason changes, and the claim or any state move clears it. A label, not a comment: comments email the operator. |
-| `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its tier allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither, with one exception: an unclaimed queued ticket in the pool takes a lane left free after every other queued ticket had its turn, and loses the label (see Tickets no lane takes). The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; a claimed ticket stays in the pool, and taking the label off returns the ticket to this Loom. |
+| `handoff:claude` | The hand-off pool, machine-readable. Two routes lead into it: a ticket no lane of this Loom took for a day, with no other lane or model rung its repo allows free (see Tickets no lane takes), which is `loom:queued` with no lane and holds no slot of its goal's in-flight cap (one at `loom:pr` still counts); and a ticket whose fix rounds stopped on the same failures, with no rung of the model ladder left or the round cap reached on its rung (see the station's hand-back below), which is `loom:failed` with one note naming what still fails. The factory moves neither, with one exception: an unclaimed queued ticket in the pool takes a lane left free after every other queued ticket had its turn, and loses the label (see Tickets no lane takes). The second operator's session works this pool (its goal issue, #1036) and may claim such a ticket at any state; a claimed ticket stays in the pool, and taking the label off returns the ticket to this Loom. |
 | `lane:<name>` | One per lane (`lane:codex`, `lane:agy`, ...). |
 | `loom:lanes` | The one issue in this repo that holds lane status. |
 | `needs:human` | An ask for the operator (see Asks). |
@@ -446,6 +446,12 @@ read fails closed (`OWNER/NAME#N unreadable`). The refusal names the ticket
 and the box (`blocked: OWNER/NAME#N unticked hold-before-merge box '...'`),
 and `bus.brain status` shows the same blocker instead of READY. Tick the box
 once its proof is in, then merge.
+
+When a brain records an external hold, `bus.brain external-hold` adds the
+box to the ticket and posts the decision with a link to its open pull
+request. The factory skips judging and branch hygiene for a pull request
+while its own ticket has an unticked hold box. It releases any landing lock
+that pull request holds.
 
 ## Onboarding a repo
 
@@ -1734,9 +1740,9 @@ the next tick.
 ## Tickets no lane takes
 
 A ticket the factory leaves waiting because no lane takes it (no free lane
-takes its model, no free lane in its tier, or on a lane at a limit with no
-free lane in its rung or tier; a briefed ticket stalled with no other lane of
-its rung or tier goes back to the queue instead, docs/LANES.md)
+takes its model, no free lane at all, or on a lane at a limit with no other
+free lane, of its rung for a ladder ticket; a briefed ticket stalled with no
+other lane goes back to the queue instead, docs/LANES.md)
 does not hold a slot under its goal's in-flight cap. On 2026-10-25, 89 tickets
 waited so, some for two days, and a goal at its cap had every triage rewrite
 skipped (loom#1831). The station keeps when each such ticket first waited
@@ -1745,8 +1751,8 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
 
 - After `LOOM_PIN_FALLBACK_MINUTES` minutes (default 30; `0` turns it off) a
   queued ticket pinned to a model no free lane takes is given the first free
-  lane of its difficulty tier (or of its FALLBACK tiers when none of its tier
-  is up), for its repo, with that lane's own model: the factory takes its
+  lane by cost (docs/MUSE.md, Lane choice), for its repo, with that lane's
+  own model: the factory takes its
   `Model:` line off, so the pull request footer names the model that ran
   (loom#3151). Its pinned model is still tried first on every pass. It never
   takes a lane it already ran on, and falls back at most twice
@@ -1758,12 +1764,11 @@ no-lane reasons and dropped when a lane takes it), and the factory acts on it:
   `class:sensitive` or `tier:security` (docs/BRIEF_FORMAT.md). No demotion is
   lifted and no credit spent: the fallback routes around both. On
   2026-11-17 one pass assigned 0 of 86 queued tickets, each pinned to a codex
-  or anthropic model with no lane up, while about 30 lanes of their tiers sat
-  idle.
+  or anthropic model with no lane up, while about 30 other lanes sat idle.
 - After `LOOM_NO_LANE_REROUTE` hours (default 6, at most 24) a ticket pinned
   to a model moves to the first rung of the model ladder the climb rules allow
-  (never down from a strong model) that has a free lane in its difficulty
-  tier, for its repo (public-only lanes never take a private repo's work) and
+  (never down from a strong model) that has a free lane
+  for its repo (public-only lanes never take a private repo's work) and
   up for the rung's model (not at a limit, benched or out of credit). So codex
   runs gpt-6-luna and no lane outside the ladder is chosen. The status
   comment says `Not a failure` with the rung marker, as a ladder move does.
@@ -1972,6 +1977,28 @@ For a sensitive pull request that would otherwise be READY, status
 also checks the named review run on the head and blocks it unless that run
 completed with `success`. A tick takes that line as given instead of
 re-reading the review list. `bus.brain merge` keeps its own checks.
+
+`bus.brain merge`, the factory's merge path, also needs an approval on the
+current head (loom#3543), the merge gate's `independent-review` row: the
+review bot app's newest approve-or-reject review is `APPROVED` with the head
+as its commit, or a person whose author association is `OWNER`, `MEMBER` or
+`COLLABORATOR` posted an issue comment directly (not through a GitHub App),
+never edited it (`updated_at` equals `created_at`), and its newest marker
+line is `<!-- fleet:review v1 verdict=APPROVE head=<40-hex head sha> -->`
+for the head. Nobody who opened the pull request or authored or committed
+any of its commits approves it, the review bot included. Commit author and
+committer are client-set, so a commit whose author or committer has no
+GitHub login (an unknown writer) refuses, and so does a pull request of 250
+or more commits, past what GitHub lists. No automation login
+approves by marker: `LOOM_GITHUB_LOGIN`, `LOOM_BRIEF_AUTHORS`,
+`LOOM_TRUSTED_BRIEFERS`, any `agent-` login, any App and the check bots
+(github-actions, copilot, dependabot, renovate). A review check that
+concluded success, neutral or skipped is no approval, an approval on an
+older head is stale, and the review bot's standing `CHANGES_REQUESTED` on
+the head refuses whatever else approved. A review, comment or commit list
+that cannot be read refuses. The refusal reads
+`blocked: no approval on head ...` or `blocked: grug-tribe[bot] requested
+changes on head ...`.
 When a trusted brain fix is still pending on the linked ticket, status adds
 `pending brain fix` to the blockers instead of marking the pull request READY.
 A pending fix whose round has nothing left to fix is cancelled at merge time

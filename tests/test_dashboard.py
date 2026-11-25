@@ -574,20 +574,20 @@ class LanesAndImprovingTest(unittest.TestCase):
         from unittest.mock import patch
         from bus import factory
         from dashboard.views import render_lanes
-        with patch.dict(factory.TIERS, {"easy": ("test-lane",)}):
+        with patch.object(factory, "LANE_ORDER", ("test-lane",)):
             body = render_lanes({"lanes": [], "scoreboard": {}})
         self.assertIn('<table class="factory-tiers">', body)
-        self.assertIn('<th>Easy</th><td><ul class="lane-chips"><li class="lane-chip lane-unknown"', body)
+        self.assertIn('<th>Every ticket</th><td><ul class="lane-chips"><li class="lane-chip lane-unknown"', body)
         self.assertIn("test-lane", body)
         self.assertIn('<table class="model-ladder">', body)
 
-    def test_tier_table_has_one_row_for_each_factory_tier(self):
+    def test_lane_table_has_one_row_for_every_ticket(self):
+        # No difficulty tiers (loom#3550): one row, no Easy/Medium/Hard.
         from dashboard.views import render_lanes
-        from bus import factory
         body = render_lanes({"lanes": [], "scoreboard": {}})
-        self.assertEqual(body.count('<tr class="factory-tier">'), len(factory.TIERS))
-        for tier in factory.TIERS:
-            self.assertIn("<th>%s</th>" % tier.title(), body)
+        self.assertEqual(body.count('<tr class="factory-tier">'), 1)
+        for tier in ("Easy", "Medium", "Hard"):
+            self.assertNotIn("<th>%s</th>" % tier, body)
 
     def test_pull_request_footer_and_models_scoreboard(self):
         from dashboard import views

@@ -637,7 +637,15 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    Read its latest run log tail and record one decision on the ticket: factory
    fault (file a factory ticket and keep the runaway hold), brief problem
    (rewrite the brief, then clear `loom:runaway`), or model limit (escalate
-   once with the reason, then clear `loom:runaway`). Do not clear a factory
+   once with the reason, then clear `loom:runaway`), or external hold (an
+   unmet precondition that no lane can fix). For an external hold with an
+   open pull request, run `python3 -m bus.brain external-hold OWNER/NAME#N
+   --precondition TEXT --evidence TEXT`. Give the unmet precondition and the
+   concrete evidence that would lift the hold. The command adds one unticked
+   merge hold box and posts the decision with the pull request link on the
+   ticket. Include the printed decision in the tick journal. If there is no
+   open pull request, record the decision on the ticket as usual. Keep
+   `loom:runaway` while the external hold stands. Do not clear a factory
    fault hold until its fix ships. A held ticket is `loom:failed`, never a
    live claim: its last run has ended, and once the hold is cleared the
    factory moves it up the model ladder.
@@ -717,6 +725,8 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
    `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE --model MODEL --note TEXT`
    (lane and model by Lane choice), where TEXT starts with the line
    `<!-- loom:rung 0 -->`, which starts its ladder again.
+   If a failed ticket waits on an external precondition, record the hold
+   as in step 2 and leave the pull request open.
    Re-brief any other failed ticket with a sharper brief or another
    lane using `python3 -m bus.brain move OWNER/NAME#N --to briefed --lane LANE`,
    or close it with
@@ -969,69 +979,56 @@ tick's elapsed line first (Rules, 11): read it before deciding what fits.
 
 ## Lane choice
 
-Choose only lanes that lane status shows as available, by the ticket's
-`Difficulty:` line (the north star, loom#30: at most half of runs on
-Anthropic credits, easy work on the free lanes and Spark, the credit spent
-on hard work):
+Choose only lanes that lane status shows as available. There are no
+difficulty tiers (the operator, 2026-11-24, loom#3550): every lane may try
+every ticket, and review on the head, CI, live verification, the merge gate
+and the model ladder judge the work. A ticket's `Difficulty:` line routes
+nothing, and a ticket without one gets a lane like any other. The factory
+gives each ticket the first free lane of one list, cheapest first (the
+tuple `LANE_ORDER` in bus/factory.py):
 
-- Easy: `spark` to `spark-4` first (the operator's priority since
-  2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
+- Every ticket: `spark` to `spark-4` first (own hardware, the operator's
+  priority since 2026-10-17: two slots per Spark box, `LOOM_SPARK_URL` and
   `LOOM_SPARK_2_URL` to `LOOM_SPARK_4_URL`, Nemotron 3.5 Super VL on vLLM,
-  model `spark/...`, any repo, private ones included) when lane status shows
-  them available; then on a public repo muse, then agy (muse runs
-  remotely); then the free lane, one slot per free provider (`free-ollama`,
-  `free-gemma`, `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`) at its pinned
-  route on the spark-gateway, each waiting out its own provider's reset
-  (free-ollama is Ollama Cloud and free-gemma is Gemma, both on any repo); else a
-  free lane: opencode-go, or openrouter, workersai, zen, zai, agy,
-  opencode-go-4, muse, copilot, free-nvidia, free-kilo, free-groq and free-openrouter on public repos only
-  (opencode-go-4 is Muse Spark, which trains on prompts; free-nvidia to free-groq
-  are NVIDIA NIM, Kilo and Groq, and free-openrouter is OpenRouter's free models).
-  Never anthropic or claude for an easy ticket.
-- Medium: a spark slot first (any repo); then on a public repo muse, then
-  agy; then a free provider slot (`free-ollama`, `free-gemma`, or on a
-  public repo `free-nvidia`, `free-kilo`, `free-groq`, `free-openrouter`); then on a public
-  repo the other free lanes, openrouter, workersai, zen and zai (the
-  operator wants every free tier used up, 2026-10-19); then opencode-go (its strong tier; opencode-go-4 on public repos only) or codex; an
-  anthropic slot only when every spark, codex and opencode-go slot already
-  holds work.
-- Hard: a spark slot first, then anthropic, claude, agy (public repos only),
-  opencode-go (its strong tier) or codex, never a free lane. A hard ticket a spark
-  fails climbs the model ladder. Keep the anthropic slots busy with hard work
-  while the credit lasts. Tiers follow the Artificial Analysis Intelligence
-  Index: a lane's model goes in the tier its score supports.
+  model `spark/...`, any repo, private ones included); then the free lanes
+  (the operator wants every free tier used up, 2026-10-19): one slot per
+  free provider (`free-ollama`, `free-gemma`, `free-nvidia`, `free-kilo`,
+  `free-groq`, `free-openrouter`) at its pinned route on the spark-gateway,
+  each waiting out its own provider's reset, then openrouter, workersai,
+  zen, zai and copilot; then the subscriptions: opencode-go and its slots,
+  codex, claude, agy, muse (muse runs remotely); then the never-paid
+  anthropic slots last. free-ollama is Ollama Cloud and free-gemma is Gemma,
+  both on any repo. These lanes take work on public repos only: zen, zai,
+  agy, copilot, opencode-go-4, muse, free-nvidia, free-kilo, free-groq,
+  free-openrouter. opencode-go-4 is Muse Spark, which trains on prompts;
+  free-nvidia to free-groq are NVIDIA NIM, Kilo and Groq, and free-openrouter
+  is OpenRouter's free models.
+
+A ticket a lane fails climbs the model ladder, so nothing waits on a cheap
+lane. Quotas and lane limits still apply.
 
 Codex runs gpt-6-luna only and agy the gemini-3.8-flash family only (the
-operator, 2026-10-21). A hard ticket with no `Model:` line runs its lane's
-default; the table `HARD_MODELS` next to `TIERS` in bus/factory.py is empty,
+operator, 2026-10-21). A ticket with no `Model:` line runs its lane's
+default; the table `HARD_MODELS` in bus/factory.py is empty,
 and so is `EQUIVALENTS`: a ticket pinned to claude-opus-5-5 waits for an
 Anthropic lane and never goes to agy on an equivalent. A queued ticket whose
-pin is a default, not a hard pin, takes a free lane of its tier with that
+pin is a default, not a hard pin, takes the first free lane with that
 lane's own model once its model had no free lane for
 `LOOM_PIN_FALLBACK_MINUTES` (docs/BRAIN.md, Tickets no lane takes). A `Model:` line naming gpt-6-sol or a
 gemini-4-argon model reads as gpt-6-luna or gemini-3.8-flash-high, and the
 brain writes the same stand-in (`FORBIDDEN_MODELS` in bus/tickets.py).
 
-When no lane of a ticket's tier is up (every one at a limit or down), the
-factory's tier moves (a ticket off a lane at a limit, a queued ticket getting
-its lane) fall back to the next harder tier's free lanes, then the easier
-tier's (the table `FALLBACK` next to `TIERS` in bus/factory.py), keeping
-private repos off the public-only lanes. Medium falls back to hard, then
-easy: claude when it is free, else spark or a free lane. Easy and hard have
-no fallback, for the rules above. A fallback move says so in its note
-("fallback: no medium lane is up"); the ticket keeps its `Difficulty:` line,
-so its next move takes its own tier again once a lane of it is up. A tier
-with a lane up but busy is waited for, not fallen back from, and so is a
-tier whose lanes are down or at a limit but one of them lifts within two
-hours (`LIMIT_REQUEUE`); a lane at a limit with no known end counts as out
-for hours. A move off a lane at a limit names when it lifts in its note. A
-ticket marked `needs-brain` or `loom:runaway` is held for the brain, and no
-such move touches it.
+A ticket off a lane at a limit or down takes the first free other lane of
+the list, keeping private repos off the public-only lanes. With every other
+lane busy, or down or at a limit, it waits for its own lane. A lane at a
+limit with no known end counts as out for hours. A move off a lane at a
+limit names when it lifts in its note. A ticket marked `needs-brain` or
+`loom:runaway` is held for the brain, and no such move touches it.
 A ticket briefed to a lane that is down, or at a limit lifting more than
-two hours off (`LIMIT_REQUEUE`), does not wait on it when no lane of its
-tier is free: it goes back to `loom:queued` with no lane, and takes the next
-free lane of its tier in the queue's order (priority, then age). A ladder
-ticket keeps its rung's rules.
+two hours off (`LIMIT_REQUEUE`), does not wait on it when no other lane is
+free: it goes back to `loom:queued` with no lane, and takes the next free
+lane in the queue's order (priority, then age). A ladder ticket keeps its
+rung's rules.
 
 An anthropic slot whose heartbeat says "out of credit" is unavailable. Do not
 brief, re-brief, move a limit-held ticket, or climb the ladder onto it until
@@ -1039,9 +1036,8 @@ its hold expires. When the API credit is gone, route hard work to codex and
 the claude lane.
 
 Spark takes one ticket at a time and steps aside while its box is hot: the
-factory moves its waiting tickets to a free lane in the same tier as above
-(the table `TIERS` in bus/factory.py), never up the ladder, so brief it only
-when lane status shows it available.
+factory moves its waiting tickets to the first free other lane as above,
+never up the ladder, so brief it only when lane status shows it available.
 
 Slots are extra copies of a lane on the same provider: anthropic-2 to
 anthropic-8 are anthropic, codex-2 is codex, opencode-go-2 to opencode-go-4 are
