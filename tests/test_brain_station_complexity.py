@@ -48,6 +48,11 @@ TARGETS = (
     ("bus/invariants.py", "brain_failing"),
     ("bus/station.py", "Station._verify_pool"),
     ("bus/station.py", "Station._invariant_facts"),
+    # AI-REVIEW 2026-11-24 [gpt-6-luna/subscription] complexity notes 1-3 (PR #3549):
+    # Keep merge selection and the extracted closed-PR pass under the cap.
+    ("bus/station.py", "Station._verify_before_build"),
+    ("bus/station.py", "Station._move_queued_merged"),
+    ("bus/station.py", "Station._reconcile_closed_pulls"),
 )
 
 

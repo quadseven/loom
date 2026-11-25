@@ -6045,6 +6045,21 @@ class Station:
             "/repos/%s/issues/%d/comments" % (repo, number))
             if isinstance(c, dict) and tickets._login(c.get("user")) in allowed]
 
+    def _fresh_merged_pulls(self, repo: str, number: int, merged: List[Dict[str, Any]],
+                            *, exclude_refuted: bool = False) -> List[Dict[str, Any]]:
+        """Keep merges the station has yet to judge, if no fix round or
+        no-change answer already sent this ticket back for work."""
+        if not merged:
+            return []
+        texts = self._status_texts(repo, number)
+        if any(t.startswith(tickets.FIX_MARKER) or no_change.MARKER in t for t in texts):
+            return []
+        judged = set(tickets.judged_pulls(texts))
+        if exclude_refuted:
+            judged.update(tickets.rejected_pulls(texts))
+        return [pr for pr in merged if isinstance(pr.get("number"), int)
+                and pr["number"] not in judged]
+
     def _verify_before_build(self, repo: str, issue: Dict[str, Any]) -> bool:
         """Send a ticket to a verify run instead of a build lane when a pull
         request that merged into the default branch already covers it (loom#1385).
@@ -6070,18 +6085,7 @@ class Station:
             return False
         number = int(issue["number"])
         merged = self._merged_linked(repo, issue) or self._merged_cited(repo, issue)
-        if not merged:
-            return False
-        texts = self._status_texts(repo, number)
-        if any(t.startswith(tickets.FIX_MARKER) for t in texts):
-            return False
-        if any(no_change.MARKER in t for t in texts):
-            # A no-change answer already judged this ticket's boxes
-            # unproven and sent it back for them: that judgment stands.
-            return False
-        judged = set(tickets.judged_pulls(texts))
-        fresh = [pr for pr in merged if isinstance(pr.get("number"), int)
-                 and pr["number"] not in judged]
+        fresh = self._fresh_merged_pulls(repo, number, merged)
         if not fresh:
             return False
         pr = fresh[0]
@@ -6122,20 +6126,9 @@ class Station:
             return False
         if self._owned_elsewhere(repo, issue):
             return False
-        merged = self._merged_linked(repo, issue)
-        if not merged:
-            return False
         number = int(issue["number"])
-        texts = self._status_texts(repo, number)
-        if any(t.startswith(tickets.FIX_MARKER) for t in texts):
-            return False
-        if any(no_change.MARKER in t for t in texts):
-            return False
-        judged = set(tickets.judged_pulls(texts)) | set(tickets.rejected_pulls(texts))
-        fresh = [pr for pr in merged if isinstance(pr.get("number"), int)
-                 and pr["number"] not in judged]
-        if not fresh:
-            return False
+        merged = self._merged_linked(repo, issue)
+        fresh = self._fresh_merged_pulls(repo, number, merged, exclude_refuted=True)
         pr = next((pr for pr in fresh if self._deliver_trusted_author(repo, issue, pr)), None)
         if pr is None:
             return False
@@ -6872,6 +6865,12 @@ class Station:
         unlinked = self._unlinked_tickets(repo, tickets_by_number, open_tickets)
         if not tickets_by_number and not unlinked:
             return
+        self._reconcile_closed_pulls(repo, tickets_by_number, unlinked, open_prs)
+
+    def _reconcile_closed_pulls(self, repo: str, tickets_by_number: Dict[int, Dict[str, Any]],
+                                unlinked: Dict[int, Dict[str, Any]],
+                                open_prs: List[Dict[str, Any]]) -> None:
+        """Apply closed PR outcomes before checking for older deliveries or gone PRs."""
         waiting = {n: t for n, t in tickets_by_number.items()
                    if not any(_linked_pr(t, repo, p) for p in open_prs)}
         # Fetch ALL closed PRs (paginated). The reconcile window uses only the
@@ -6879,17 +6878,17 @@ class Station:
         # list to find merged PRs beyond the 100-item window.
         all_closed = self._paginate("/repos/%s/pulls?state=closed&sort=updated"
                                     "&direction=desc&per_page=100" % repo)
-        closed = all_closed[:100] if isinstance(all_closed, list) else []
+        closed = all_closed[:100]
         for pr in closed:
-                merged = self._terminal_label(pr) == "loom:merged"
-                pool = tickets_by_number if merged else waiting
-                landed = [other for other in closed if other is not pr and isinstance(other, dict)
-                          and self._terminal_label(other) == "loom:merged"
-                          and self._pr_ticket_number(repo, other) == self._pr_ticket_number(repo, pr)
-                          ] if merged else []
-                self._reconcile_pr_ticket(repo, pr, pool, landed)
-                if merged:
-                    self._deliver_unlinked(repo, pr, unlinked)
+            merged = self._terminal_label(pr) == "loom:merged"
+            pool = tickets_by_number if merged else waiting
+            landed = [other for other in closed if other is not pr and isinstance(other, dict)
+                      and self._terminal_label(other) == "loom:merged"
+                      and self._pr_ticket_number(repo, other) == self._pr_ticket_number(repo, pr)
+                      ] if merged else []
+            self._reconcile_pr_ticket(repo, pr, pool, landed)
+            if merged:
+                self._deliver_unlinked(repo, pr, unlinked)
         # Check the remaining queued or briefed tickets for an earlier
         # merge before any lane can claim them (loom#3547).
         for ticket in unlinked.values():
