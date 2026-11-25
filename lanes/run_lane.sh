@@ -2828,14 +2828,16 @@ incident_file() { printf '%s/%s-%s' "$INCIDENT_DIR" "$(printf '%s' "$REPO" | tr 
 # state dir. The state dir only knows what this machine filed, so a pass on
 # another host (a cluster runner, a second Mac) never closed an incident the
 # station host filed, and the tickets stayed held until that one host ran
-# again. Only a public repo has a title another host can rebuild: a private
-# repo's subject is a random alias kept per host unless the shared alias
-# key is readable (incident_subject).
+# again. A private repo's title carries the alias derived from its GitHub id
+# (incident_subject), which every host rebuilds alike.
 shared_incident_number() {  # kind
   local listed subject
-  # A private repo's title is rebuildable only when the shared alias key is
-  # readable (incident_subject then derives the alias from it).
-  subject="$(incident_subject shared-only)" || return 1
+  # No derived alias (the repo id could not be read): only a host-local
+  # alias is left, which no other host's title matches. Say so in the log.
+  if ! subject="$(incident_subject shared-only)"; then
+    echo "could not name this repo's $1 incident; another host's incident stays open until a pass that can" >> "${LOG:-/dev/null}"
+    return 1
+  fi
   if ! listed="$(TITLE="Factory incident: $subject validation $1" MARKER="$INCIDENT_MARKER"     gh issue list --repo "$FACTORY_REPO" --state open --limit 200     --json number,title,body     --jq '.[] | select(.title == env.TITLE and (.body | contains(env.MARKER))) | .number'     2>>"$LOG")"; then
     echo "could not read the open $1 incidents on $FACTORY_REPO; a stale one stays open until the next pass" >> "$LOG"
     return 1
@@ -2862,7 +2864,11 @@ resolve_factory_incidents() {
     else
       number=""
       case "$kind" in
-        base-check|contract) number="$(shared_incident_number "$kind")" ;;
+        base-check|contract)
+          number="$(shared_incident_number "$kind")"
+          [ -n "$number" ] ||
+            echo "found no open $kind incident for this repo on ${FACTORY_REPO:-the factory repo} to close" >> "${LOG:-/dev/null}"
+          ;;
       esac
       [ -n "$number" ] || continue
     fi
@@ -2886,24 +2892,31 @@ repo_is_public() { [ "${REPO_PRIVATE:-}" = false ]; }
 incident_ticket() {
   if repo_is_public; then printf '%s' "$TICKET"; else printf 'a private repo ticket'; fi
 }
+# The alias every lane host and the station derive from the repo's GitHub id
+# (bus/incident_probe.py repo_alias), so a pass on any host rebuilds a private
+# repo's incident title and closes an incident another host filed. It needs no
+# shared secret: the shared key it replaced was never created, so a cluster
+# lane could not find the incident and skipped the close silently (loom#3573).
+derived_repo_alias() {
+  local id
+  id="$(timeout "${NET_TIMEOUT:-30}" gh api "repos/$REPO" --jq .id 2>>"${LOG:-/dev/null}")" || return 1
+  case "$id" in ''|*[!0-9]*) return 1 ;; esac
+  PYTHONPATH="${LOOM_ROOT:-.}" python3 -B -m bus.incident_probe alias "$id" 2>>"${LOG:-/dev/null}"
+}
 incident_subject() {  # [shared-only]
   local file alias
   if repo_is_public; then printf '%s' "$REPO"; return 0; fi
-  # Pipe the shared key straight to the signer. Strip trailing newlines
-  # as shell command substitution did so existing shared titles still match.
-  if alias="$(ssm_value "${LOOM_INCIDENT_ALIAS_SSM:-/loom/incident-alias-key}" |
-    REPO_NAME="$REPO" python3 -B -c '
-import hmac, os, sys
-
-key = sys.stdin.buffer.read().rstrip(b"\n")
-if not key:
-    sys.exit(1)
-print(hmac.digest(key, os.environ["REPO_NAME"].encode(), "sha256").hex()[:8])
-')"; then
+  if alias="$(derived_repo_alias)" && [[ "$alias" =~ ^[0-9a-f]{8}$ ]]; then
     printf 'private repo %s' "$alias"
     return 0
   fi
-  [ "${1:-}" != shared-only ] || return 1
+  if [ "${1:-}" = shared-only ]; then
+    echo "could not derive this private repo's incident alias (its GitHub id could not be read); another host's incident cannot be found by title" >> "${LOG:-/dev/null}"
+    return 1
+  fi
+  # Only this host's own state file closes an incident filed under this
+  # fallback alias, so say so.
+  echo "could not derive this private repo's incident alias; using this host's own alias" >> "${LOG:-/dev/null}"
   file="$INCIDENT_DIR/$(printf '%s' "$REPO" | tr '/' '_').alias"
   if [ ! -s "$file" ]; then
     mkdir -p "$INCIDENT_DIR" && od -An -N4 -tx1 /dev/urandom | tr -cd '0-9a-f' > "$file" || return 1
