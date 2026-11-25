@@ -15,6 +15,7 @@ from . import journal_check
 from . import notify as _notify
 from . import quiet as _quiet
 from . import text as _text
+from . import usage
 from .github import GitHub
 from .handoff import (EARLIER_CLOSE, EARLIER_OPEN, JOURNAL_MARKER as _MARKER, _TICK,
                       journal_holder, split_journal)
@@ -215,6 +216,20 @@ def with_shipped_backlog(text: str, now: Optional[datetime] = None) -> str:
                 return text
             current = current.rstrip("\n") + "\n" + line + "\n"
     return current + (marker + earlier if marker else "")
+
+
+def _with_fuel(text: str, now: Optional[datetime]) -> str:
+    home = os.environ.get("LOOM_HOME") or os.path.join(os.path.expanduser("~"), "loom")
+    line = usage.fuel_line(usage.read_snapshot(home), (now or datetime.now(timezone.utc)).timestamp())
+    if not line:
+        return text
+    current, marker, earlier = text.partition(EARLIER_OPEN)
+    found = re.search(r"(?m)^- Fuel:.*$", current)
+    if found:
+        current = current[:found.start()] + line + current[found.end():]
+    else:
+        current = current.rstrip("\n") + "\n" + line + "\n"
+    return current + marker + earlier
 
 
 # A handoff marker the brain wrote as a list item: GitHub hides the comment
@@ -423,6 +438,7 @@ def post(gh: GitHub, repo: str, issue_number: int, text: str,
     if text.startswith(JOURNAL_MARKER):
         text = with_tick(text, holder, now)
         text = with_shipped_backlog(text, now)
+        text = _with_fuel(text, now)
         _text.check(text)
         mine, previous = _journal_context(gh, repo, issue_number, text)
         # The tick's step timings are a log line, not a comment on the goal
