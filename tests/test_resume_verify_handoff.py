@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -181,6 +182,25 @@ class VerifyHandoffTest(unittest.TestCase):
             [(REPO, self.source), (REPO, handoff)], {}, T0, check_live=False)
         self.assertEqual([issue["number"] for _, issue in station_due],
                          [self.source["number"]])
+
+    def test_resume_hands_log_window_verifies_only_to_a_brain_with_evidence_access(self):
+        self.source["body"] = ("## Acceptance criteria\n"
+                                "- [ ] Live: step check_invariants in every 2-hour window.\n")
+        now = brain._stamp(stamp(T0))
+        due = [(now - timedelta(hours=24), REPO, self.source)]
+        read = {REPO: {"sensitive": [], "epics": [], "verify": due, "audit": []}}
+
+        unavailable = "\n".join(brain._resume_tail(self.gh, [REPO], read, now, {}))
+        self.assertIn("skip verify %s#100" % REPO, unavailable)
+        self.assertIn("no evidence endpoint", unavailable)
+        self.assertNotIn("resume verify %s#100" % REPO, unavailable)
+
+        available = "\n".join(brain._resume_tail(
+            self.gh, [REPO], read, now,
+            {"LOOM_EVIDENCE_URL": "http://evidence.example.com:7341",
+             "LOOM_EVIDENCE_TOKEN": "read-only-test-token"}))
+        self.assertIn("resume verify %s#100" % REPO, available)
+        self.assertNotIn("skip verify %s#100" % REPO, available)
 
     def test_station_verify_pool_dispatches_the_child_and_not_its_source(self):
         self.station._create_verify_handoff_ticket(REPO, self.source, self.shipped_at)

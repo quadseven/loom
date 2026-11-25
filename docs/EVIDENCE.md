@@ -61,3 +61,11 @@ counted in `dropped`.
 Requests use `/evidence/logs?source=NAME&match=TEXT&since=HOURS` or
 `/evidence/query?name=NAME&PARAM=VALUE`. Every call requires
 `Authorization: Bearer <token>`.
+
+Brain clients that can reach the service set `LOOM_EVIDENCE_URL` to its base
+URL (for example, `http://your-server.internal:7341`) and
+`LOOM_EVIDENCE_TOKEN` to the read-only bearer token in their private runtime
+environment. Do not put the token in the checkout. `resume` hands off criteria
+that name logs, SQL, or a recurring named step only when both variables are
+set; otherwise it prints a skip line so a brain without evidence access does
+not claim that work.
